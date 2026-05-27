@@ -2436,14 +2436,3 @@ capability_revoke
 如果团队按照本文档推进，第一阶段应优先做出一个可运行的 coding-agent demo，用最小系统验证：process、object memory、capability、human interrupt、JIT tool 和 audit trace 是否能自然协作。
 
 
-
-## 附录
-
-可以使用如下环境进行测试
-
-OPENAI_CODING_AGENT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-
-OPENAI_LANGUAGE_MODEL=qwen3.7-max
-
-OPENAI_API_KEY=sk-0f39ca1c2c2343a9972483cdae6c1fc4
-
