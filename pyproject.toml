@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-libos"
+version = "0.1.0"
+description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Agent libOS contributors" }]
+dependencies = []
+
+[project.scripts]
+agent-libos = "agent_libos.api.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_libos"]
+

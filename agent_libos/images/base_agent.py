@@ -1,0 +1,40 @@
+from __future__ import annotations
+
+from agent_libos.models import AgentImage
+
+
+DEFAULT_IMAGES = {
+    "base-agent:v0": AgentImage(
+        image_id="base-agent:v0",
+        name="base-agent",
+        version="v0",
+        system_prompt="General purpose Agent libOS process image.",
+        context_policy="plan_first",
+    ),
+    "coding-agent:v0": AgentImage(
+        image_id="coding-agent:v0",
+        name="coding-agent",
+        version="v0",
+        system_prompt="Software engineering process image for repository inspection, patch planning, and test execution.",
+        default_tools=["parse_pytest_log"],
+        context_policy="error_debug",
+        safety_profile="coding",
+    ),
+    "toolmaker-agent:v0": AgentImage(
+        image_id="toolmaker-agent:v0",
+        name="toolmaker-agent",
+        version="v0",
+        system_prompt="Ephemeral tool generation and validation image.",
+        context_policy="minimal",
+        safety_profile="toolmaker",
+    ),
+    "review-agent:v0": AgentImage(
+        image_id="review-agent:v0",
+        name="review-agent",
+        version="v0",
+        system_prompt="Review and validation image.",
+        context_policy="evidence_first",
+        safety_profile="review",
+    ),
+}
+
