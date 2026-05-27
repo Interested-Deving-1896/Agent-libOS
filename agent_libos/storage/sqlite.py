@@ -739,8 +739,12 @@ class SQLiteStore:
         return ToolSpec(
             name=data["name"],
             description=data.get("description", ""),
+            version=data.get("version", "1.0.0"),
             input_schema=data.get("input_schema", {}),
             output_schema=data.get("output_schema", {}),
+            policy=data.get("policy", {}),
+            tags=data.get("tags", []),
+            metadata=data.get("metadata", {}),
             required_capabilities=data.get("required_capabilities", []),
             side_effects=data.get("side_effects", []),
         )

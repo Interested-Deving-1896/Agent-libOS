@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import HumanApprovalRequired, NotFound, SandboxError, ValidationError
+from agent_libos.exceptions import HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -23,10 +23,8 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
+from agent_libos.tools.base import BaseAgentTool, ToolContext
 from agent_libos.tools.sandbox import PythonSubprocessSandbox, SandboxBackend
-
-
-StaticHandler = Callable[[dict[str, Any]], Any]
 
 
 class ToolBroker:
@@ -39,6 +37,7 @@ class ToolBroker:
         audit: AuditManager,
         events: EventBus,
         sandbox: SandboxBackend | None = None,
+        workspace_root: str | Path | None = None,
     ):
         self.store = store
         self.memory = memory
@@ -47,37 +46,38 @@ class ToolBroker:
         self.audit = audit
         self.events = events
         self.sandbox = sandbox or PythonSubprocessSandbox()
-        self._handlers: dict[str, StaticHandler] = {}
+        self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
+        self._tools: dict[str, BaseAgentTool] = {}
+        self._tool_ids_by_name: dict[str, str] = {}
         self._handles: dict[str, ToolHandle] = {}
         self._jit_sources: dict[str, str] = {}
 
-    def register_static(
+    def register_tool(
         self,
-        name: str,
-        handler: StaticHandler,
-        description: str = "",
-        input_schema: dict[str, Any] | None = None,
-        output_schema: dict[str, Any] | None = None,
-        side_effects: list[str] | None = None,
+        tool: BaseAgentTool,
         registered_by: str = "runtime",
+        scope: str = "static",
+        ephemeral: bool = False,
     ) -> ToolHandle:
         tool_id = new_id("tool")
-        spec = ToolSpec(
-            name=name,
-            description=description,
-            input_schema=input_schema or {},
-            output_schema=output_schema or {},
-            side_effects=side_effects or [],
-        )
-        handle = ToolHandle(tool_id=tool_id, name=name, capability_id=None, scope="static")
-        self._handlers[tool_id] = handler
+        spec = tool.spec()
+        if spec.name in self._tool_ids_by_name:
+            raise ValueError(f"tool already registered: {spec.name}")
+        handle = ToolHandle(tool_id=tool_id, name=spec.name, capability_id=None, scope=scope)
+        self._tools[tool_id] = tool
+        self._tool_ids_by_name[spec.name] = tool_id
         self._handles[tool_id] = handle
-        self.store.insert_tool(handle, spec, registered_by=registered_by, created_at=utc_now(), ephemeral=False)
+        self.store.insert_tool(handle, spec, registered_by=registered_by, created_at=utc_now(), ephemeral=ephemeral)
         self.audit.record(
             actor=registered_by,
-            action="tool.register_static",
+            action="tool.register",
             target=f"tool:{tool_id}",
-            decision={"name": name, "side_effects": side_effects or []},
+            decision={
+                "name": spec.name,
+                "version": spec.version,
+                "policy": spec.policy,
+                "tags": spec.tags,
+            },
         )
         return handle
 
@@ -189,6 +189,7 @@ class ToolBroker:
         handle = ToolHandle(tool_id=tool_id, name=candidate.spec.name, capability_id=cap.cap_id, scope=scope)
         self._jit_sources[tool_id] = candidate.source_code
         self._handles[tool_id] = handle
+        self._tool_ids_by_name[candidate.spec.name] = tool_id
         self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
         candidate.status = ToolCandidateStatus.REGISTERED
         candidate.updated_at = utc_now()
@@ -236,10 +237,42 @@ class ToolBroker:
             payload={"call_id": call_id, "args": args},
         )
         try:
-            if handle.tool_id in self._handlers:
-                payload = self._handlers[handle.tool_id](args)
+            if handle.tool_id in self._tools:
+                tool_result = self._tools[handle.tool_id].invoke(args, self._context(pid, handle, call_id))
+                if not tool_result.ok:
+                    error_message = tool_result.error.message if tool_result.error else tool_result.content
+                    self.events.emit(
+                        EventType.TOOL_FAILED,
+                        source=resource,
+                        target=pid,
+                        payload={"call_id": call_id, "error": error_message, "tool_result": tool_result.model_dump(mode="json")},
+                    )
+                    self.audit.record(
+                        actor=pid,
+                        action="tool.call",
+                        target=resource,
+                        decision={"ok": False, "tool_result": tool_result.model_dump(mode="json")},
+                    )
+                    return ToolCallResult(
+                        call_id=call_id,
+                        tool_id=handle.tool_id,
+                        result_handle=None,
+                        payload=tool_result.model_dump(mode="json"),
+                        ok=False,
+                        error=error_message,
+                    )
+                payload = tool_result.data
+                result_payload = {
+                    "tool_id": handle.tool_id,
+                    "tool_name": handle.name,
+                    "result": payload,
+                    "content": tool_result.content,
+                    "artifacts": [artifact.model_dump(mode="json") for artifact in tool_result.artifacts],
+                    "metadata": tool_result.metadata,
+                }
             elif handle.tool_id in self._jit_sources:
                 payload = self.sandbox.run_source(self._jit_sources[handle.tool_id], args)
+                result_payload = {"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload}
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
         except Exception as exc:
@@ -260,7 +293,7 @@ class ToolBroker:
         result_handle = self.memory.create_object(
             pid=pid,
             type=ObjectType.TOOL_RESULT,
-            payload={"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload},
+            payload=result_payload,
             metadata=ObjectMetadata(title=f"Tool result: {handle.name}", tags=["tool_result", handle.name]),
             immutable=True,
         )
@@ -290,22 +323,57 @@ class ToolBroker:
             return tool
         if tool in self._handles:
             return self._handles[tool]
-        for handle in self._handles.values():
-            if handle.name == tool:
-                return handle
+        if tool in self._tool_ids_by_name:
+            return self._handles[self._tool_ids_by_name[tool]]
         for row in self.store.list_tools():
             if row["tool_id"] == tool or row["name"] == tool:
+                if row["tool_id"] not in self._tools and row["tool_id"] not in self._jit_sources:
+                    raise NotFound(f"tool implementation not loaded: {row['tool_id']}")
                 handle = ToolHandle(tool_id=row["tool_id"], name=row["name"], capability_id=None, scope=row["scope"])
                 self._handles[handle.tool_id] = handle
+                self._tool_ids_by_name.setdefault(handle.name, handle.tool_id)
                 return handle
         raise NotFound(f"tool not found: {tool}")
 
     def list(self) -> list[dict[str, Any]]:
         return self.store.list_tools()
 
+    def openai_tool_schemas(self) -> list[dict[str, Any]]:
+        schemas = [tool.to_openai_chat_tool() for tool in self._tools.values()]
+        for tool_id in self._jit_sources:
+            spec = self.store.get_tool_spec(tool_id)
+            if spec is None:
+                continue
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.input_schema,
+                    },
+                }
+            )
+        return schemas
+
+    def _context(self, pid: str, handle: ToolHandle, call_id: str) -> ToolContext:
+        tool = self._tools[handle.tool_id]
+        return ToolContext(
+            trace_id=call_id,
+            call_id=call_id,
+            pid=pid,
+            workspace_id=str(self.workspace_root),
+            runtime=getattr(self, "runtime", None),
+            granted_permissions=set(tool.policy.permissions),
+            metadata={
+                "tool_id": handle.tool_id,
+                "tool_name": handle.name,
+                "confirmed": True,
+            },
+        )
+
     def _get_candidate(self, candidate_id: str) -> ToolCandidate:
         candidate = self.store.get_tool_candidate(candidate_id)
         if candidate is None:
             raise NotFound(f"tool candidate not found: {candidate_id}")
         return candidate
-

@@ -9,6 +9,7 @@ DEFAULT_IMAGES = {
         name="base-agent",
         version="v0",
         system_prompt="General purpose Agent libOS process image.",
+        default_tools=["create_memory_object", "human_output", "process_exit"],
         context_policy="plan_first",
     ),
     "coding-agent:v0": AgentImage(
@@ -16,7 +17,7 @@ DEFAULT_IMAGES = {
         name="coding-agent",
         version="v0",
         system_prompt="Software engineering process image for repository inspection, patch planning, and test execution.",
-        default_tools=["parse_pytest_log"],
+        default_tools=["create_memory_object", "human_output", "parse_pytest_log", "process_exit", "read_text_file"],
         context_policy="error_debug",
         safety_profile="coding",
     ),
@@ -37,4 +38,3 @@ DEFAULT_IMAGES = {
         safety_profile="review",
     ),
 }
-

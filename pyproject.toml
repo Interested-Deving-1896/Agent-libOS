@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Agent libOS contributors" }]
-dependencies = []
+dependencies = [
+    "openai>=2.38.0",
+    "pydantic>=2.13.4",
+]
 
 [project.scripts]
 agent-libos = "agent_libos.api.cli:main"

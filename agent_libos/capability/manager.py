@@ -143,7 +143,7 @@ class CapabilityManager:
     ) -> dict:
         return {"resource": resource, "rights": [str(right) for right in rights], **kwargs}
 
-    def tool_call(self, tool: str, rights: Iterable[str | CapabilityRight] | None = None, **kwargs) -> dict:
+    def tool_execute(self, tool: str, rights: Iterable[str | CapabilityRight] | None = None, **kwargs) -> dict:
         resource = tool if tool.startswith("tool:") else f"tool:{tool}"
         return self.spec(resource, rights or [CapabilityRight.EXECUTE], **kwargs)
 

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.images import DEFAULT_IMAGES
+from agent_libos.llm.client import LLMClient
+from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import AgentImage
 from agent_libos.runtime.audit_manager import AuditManager
@@ -18,24 +19,45 @@ from agent_libos.skills.linker import SkillLinker
 from agent_libos.skills.registry import RuntimeSkillRegistry
 from agent_libos.storage import SQLiteStore
 from agent_libos.tools.broker import ToolBroker
+from agent_libos.tools.builtin import (
+    CreateMemoryObjectTool,
+    EchoTool,
+    HumanOutputTool,
+    ParsePytestLogTool,
+    ProcessExitTool,
+    ReadTextFileTool,
+    WriteTextFileTool,
+)
 
 
 class Runtime:
-    def __init__(self, store: SQLiteStore):
+    def __init__(self, store: SQLiteStore, llm_client: LLMClient | None = None):
+        self.workspace_root = Path.cwd().resolve()
         self.store = store
         self.audit = AuditManager(store)
         self.events = EventBus(store)
         self.capability = CapabilityManager(store, self.audit, self.events)
         self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events)
         self.human = HumanObjectManager(store, self.capability, self.audit, self.events)
-        self.tools = ToolBroker(store, self.memory, self.capability, self.human, self.audit, self.events)
+        self.tools = ToolBroker(
+            store,
+            self.memory,
+            self.capability,
+            self.human,
+            self.audit,
+            self.events,
+            workspace_root=self.workspace_root,
+        )
+        self.tools.runtime = self
         self.process = ProcessManager(store, self.memory, self.capability, self.audit, self.events)
         self.scheduler = SimpleScheduler(store, self.audit)
         self.checkpoint = CheckpointManager(store, self.audit, self.events)
         self.skill_registry = RuntimeSkillRegistry()
         self.skills = SkillLinker(store, self.skill_registry, self.audit)
         self.images: dict[str, AgentImage] = dict(DEFAULT_IMAGES)
+        self.llm = LLMProcessExecutor(self, llm_client)
         self._register_builtin_tools()
+        self.process.add_after_spawn_hook(self._grant_default_tool_capabilities)
 
     @classmethod
     def open(cls, target: str | Path = "local") -> "Runtime":
@@ -45,6 +67,21 @@ class Runtime:
 
     def close(self) -> None:
         self.store.close()
+
+    def run_process_once(self, pid: str) -> dict[str, Any]:
+        return self.llm.run_once(pid)
+
+    def run_next_process_once(self) -> Any:
+        return self.scheduler.run_once(self.run_process_once)
+
+    def run_until_idle(self, max_quanta: int = 25) -> list[Any]:
+        results: list[Any] = []
+        for _ in range(max_quanta):
+            result = self.run_next_process_once()
+            if result is None:
+                break
+            results.append(result)
+        return results
 
     def register_image(self, image: AgentImage) -> None:
         self.images[image.image_id] = image
@@ -58,36 +95,25 @@ class Runtime:
     def get_image(self, image_id: str) -> AgentImage:
         return self.images[image_id]
 
-    def _register_builtin_tools(self) -> None:
-        self.tools.register_static(
-            name="echo",
-            handler=lambda args: args,
-            description="Return arguments unchanged.",
-        )
-        self.tools.register_static(
-            name="parse_pytest_log",
-            handler=self._parse_pytest_log,
-            description="Parse pytest output into a small structured failure summary.",
-            input_schema={"type": "object", "properties": {"log": {"type": "string"}}},
-            output_schema={"type": "object"},
-        )
+    def _grant_default_tool_capabilities(self, pid: str, image_id: str) -> None:
+        image = self.images.get(image_id) or self.images["base-agent:v0"]
+        tool_names = {"process_exit", "create_memory_object", *image.default_tools}
+        for tool_name in sorted(tool_names):
+            try:
+                self.tools.grant_execute(pid, tool_name, issued_by=f"image:{image_id}")
+            except Exception as exc:
+                self.audit.record(
+                    actor="runtime",
+                    action="image.default_tool_grant_failed",
+                    target=f"process:{pid}",
+                    decision={"tool": tool_name, "error": str(exc)},
+                )
 
-    def _parse_pytest_log(self, args: dict[str, Any]) -> dict[str, Any]:
-        log = args.get("log", "")
-        failed: list[str] = []
-        errors: list[str] = []
-        assertions: list[str] = []
-        for line in log.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("FAILED "):
-                failed.append(stripped)
-            elif re.match(r"^E\s+", stripped):
-                errors.append(stripped[2:])
-            elif "AssertionError" in stripped:
-                assertions.append(stripped)
-        return {
-            "failed": failed,
-            "errors": errors,
-            "assertions": assertions,
-            "failure_count": len(failed) or len(assertions) or len(errors),
-        }
+    def _register_builtin_tools(self) -> None:
+        self.tools.register_tool(EchoTool(), registered_by="runtime")
+        self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
+        self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
+        self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
+        self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
+        self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
+        self.tools.register_tool(HumanOutputTool(), registered_by="runtime")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
@@ -41,6 +42,10 @@ class ProcessManager:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self._after_spawn_hooks: list[Callable[[str, str], None]] = []
+
+    def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
+        self._after_spawn_hooks.append(hook)
 
     def spawn(
         self,
@@ -89,6 +94,7 @@ class ProcessManager:
             output_refs=[goal_handle.oid],
             decision={"image": image},
         )
+        self._run_after_spawn_hooks(pid, image)
         return pid
 
     def fork(
@@ -157,6 +163,7 @@ class ProcessManager:
             output_refs=[goal_handle.oid],
             decision={"mode": fork_mode.value, "image": child.image_id},
         )
+        self._run_after_spawn_hooks(child_pid, child.image_id)
         return child_pid
 
     def exec(
@@ -334,3 +341,6 @@ class ProcessManager:
             return ViewMode.READ_ONLY
         return ViewMode.READ_ONLY
 
+    def _run_after_spawn_hooks(self, pid: str, image_id: str) -> None:
+        for hook in self._after_spawn_hooks:
+            hook(pid, image_id)

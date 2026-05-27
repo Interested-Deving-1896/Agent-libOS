@@ -19,6 +19,16 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("audit", help="Print audit trace")
     sub.add_parser("processes", help="Print process table")
     sub.add_parser("tools", help="Print registered tools")
+    spawn_parser = sub.add_parser("spawn", help="Spawn a process")
+    spawn_parser.add_argument("--image", default="base-agent:v0")
+    spawn_parser.add_argument("--goal", required=True)
+    llm_once_parser = sub.add_parser("llm-once", help="Run one LLM quantum for a process")
+    llm_once_parser.add_argument("pid")
+    run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
+    run_parser.add_argument("--max-quanta", type=int, default=25)
+    grant_tool_parser = sub.add_parser("grant-tool", help="Grant a process execute capability for a tool")
+    grant_tool_parser.add_argument("pid")
+    grant_tool_parser.add_argument("tool")
     args = parser.parse_args(argv)
 
     runtime = Runtime.open(args.db)
@@ -33,6 +43,16 @@ def main(argv: list[str] | None = None) -> None:
             _print_json([process.__dict__ for process in runtime.process.list()])
         elif args.command == "tools":
             _print_json(runtime.tools.list())
+        elif args.command == "spawn":
+            pid = runtime.process.spawn(image=args.image, goal=args.goal)
+            _print_json({"pid": pid, "image": args.image, "goal": args.goal})
+        elif args.command == "llm-once":
+            _print_json(runtime.run_process_once(args.pid))
+        elif args.command == "run":
+            _print_json(runtime.run_until_idle(max_quanta=args.max_quanta))
+        elif args.command == "grant-tool":
+            cap_id = runtime.tools.grant_execute(args.pid, args.tool, issued_by="cli")
+            _print_json({"pid": args.pid, "tool": args.tool, "capability_id": cap_id})
     finally:
         runtime.close()
 
@@ -102,19 +122,29 @@ def run(args):
     jit_result = runtime.tools.call(root, jit_tool, {"log": log}) if jit_tool is not None else None
 
     checkpoint = runtime.checkpoint.checkpoint(root, "before high-risk patch application")
-    patch_tool = runtime.tools.register_static(
-        name="apply_patch_preview",
-        handler=lambda args: {"accepted": True, "patch": args.get("patch"), "mode": "preview"},
-        description="Preview a patch application. Demo tool only.",
-        side_effects=["filesystem_write"],
-    )
     approval_request = None
     try:
-        runtime.tools.call(root, patch_tool, {"patch": "change add() expected value"})
+        runtime.tools.call(
+            root,
+            "write_text_file",
+            {
+                "path": "agent_outputs/demo_patch_preview.txt",
+                "content": "change add() expected value\n",
+                "overwrite": True,
+            },
+        )
     except HumanApprovalRequired as exc:
         approval_request = exc.request_id
         runtime.human.approve(exc.request_id, {"approved": True, "reason": "demo approval"})
-    approved_call = runtime.tools.call(root, patch_tool, {"patch": "change add() expected value"})
+    approved_call = runtime.tools.call(
+        root,
+        "write_text_file",
+        {
+            "path": "agent_outputs/demo_patch_preview.txt",
+            "content": "change add() expected value\n",
+            "overwrite": True,
+        },
+    )
     report_handle = runtime.memory.create_object(
         root,
         ObjectType.SUMMARY,
@@ -147,4 +177,3 @@ def _print_json(value: Any) -> None:
 
 if __name__ == "__main__":
     main()
-

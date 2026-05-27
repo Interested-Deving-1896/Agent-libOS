@@ -404,8 +404,12 @@ class HumanRequest:
 class ToolSpec:
     name: str
     description: str
+    version: str = "1.0.0"
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    policy: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     required_capabilities: list[dict[str, Any]] = field(default_factory=list)
     side_effects: list[str] = field(default_factory=list)
 
@@ -456,4 +460,3 @@ class Checkpoint:
     pid: PID
     reason: str
     created_at: str
-

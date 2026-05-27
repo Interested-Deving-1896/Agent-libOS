@@ -35,10 +35,44 @@ uv run agent-libos demo
 You can also create a local runtime database:
 
 ```bash
-uv run agent-libos init --db .agent_libos.sqlite
-uv run agent-libos demo --db .agent_libos.sqlite
-uv run agent-libos audit --db .agent_libos.sqlite
+uv run agent-libos --db .agent_libos.sqlite init
+uv run agent-libos --db .agent_libos.sqlite demo
+uv run agent-libos --db .agent_libos.sqlite audit
 ```
+
+## LLM Execution
+
+Runnable processes can be executed by an OpenAI-compatible chat completion
+endpoint. Keep credentials in a local `.env` file:
+
+```bash
+OPENAI_CODING_AGENT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_LANGUAGE_MODEL=qwen3.7-max
+OPENAI_API_KEY=...
+```
+
+Then spawn and run processes through uv:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Analyze the pytest failure log"
+uv run agent-libos --db .agent_libos.sqlite grant-tool <pid> write_text_file
+uv run agent-libos --db .agent_libos.sqlite run --max-quanta 5
+```
+
+For a one-shot document summary demo, spawn an Agent process that reads a
+workspace document and speaks a one-sentence overview to the terminal:
+
+```bash
+uv run python scripts/llm_summarize_document.py agent_libos_design_doc.md --trace
+```
+
+Each LLM quantum materializes the process MemoryView, sends it with the
+AgentImage system prompt, exposes registered Skills/Tools Layer tools as OpenAI
+tool schemas, executes the last valid tool call, and dispatches it through the
+same capability, human approval, tool broker, checkpoint, and audit path as the
+SDK.
+Free-form assistant text is allowed; if a provider cannot emit tool calls, the
+runtime falls back to parsing the final JSON action object in the text.
 
 ## Dependency Management
 
