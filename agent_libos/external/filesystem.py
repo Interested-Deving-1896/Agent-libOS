@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import CapabilityDenied, NotFound
+from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound
 from agent_libos.models import Capability, CapabilityRight, EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -34,12 +36,14 @@ class FilesystemAdapter:
         events: EventBus,
         root: str | Path,
         namespace: str = "workspace",
+        human: Any | None = None,
     ):
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
         self.root = Path(root).resolve()
         self.namespace = namespace
+        self.human = human
 
     def read_text(
         self,
@@ -83,14 +87,22 @@ class FilesystemAdapter:
     ) -> FileWriteResult:
         target, relative = self._resolve(path)
         resource = self.resource_for(relative)
-        self.capabilities.require(pid, resource, CapabilityRight.WRITE)
+        consumed_once = self._require_write(
+            pid=pid,
+            resource=resource,
+            target=target,
+            relative=relative,
+            text=text,
+            encoding=encoding,
+            overwrite=overwrite,
+        )
         created = not target.exists()
         if target.exists() and not target.is_file():
             raise CapabilityDenied(f"path is not a file: {relative}")
         if target.exists() and not overwrite:
             raise FileExistsError(f"file already exists: {relative}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding=encoding)
+        target.write_text(text, encoding=encoding, newline="\n")
         bytes_written = len(text.encode(encoding))
         self.events.emit(
             EventType.EXTERNAL_WRITE,
@@ -104,6 +116,13 @@ class FilesystemAdapter:
             target=resource,
             decision={"path": relative, "bytes_written": bytes_written, "created": created},
         )
+        if consumed_once:
+            self.capabilities.consume_allow_once(
+                subject=pid,
+                resource=resource,
+                right=CapabilityRight.WRITE,
+                used_by="filesystem",
+            )
         return FileWriteResult(path=relative, bytes_written=bytes_written, created=created)
 
     def grant_workspace(
@@ -149,3 +168,107 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path escapes filesystem adapter root: {path}")
         relative = target.relative_to(self.root).as_posix()
         return target, relative
+
+    def _require_write(
+        self,
+        pid: str,
+        resource: str,
+        target: Path,
+        relative: str,
+        text: str,
+        encoding: str,
+        overwrite: bool,
+    ) -> bool:
+        policy = self.capabilities.permission_policy(pid, resource, CapabilityRight.WRITE)
+        if policy == CapabilityManager.ALWAYS_ALLOW:
+            return False
+        if policy == CapabilityManager.ALLOW_ONCE:
+            return True
+        if policy == CapabilityManager.ALWAYS_DENY:
+            raise CapabilityDenied(f"{pid} denied write on {resource}")
+        if policy == CapabilityManager.ASK_EACH_TIME:
+            if self.human is None:
+                raise CapabilityDenied(f"{pid} requires human approval for write on {resource}")
+            request_id = self.human.query(
+                pid=pid,
+                human="owner",
+                request={
+                    "type": "external_operation_approval",
+                    "question": f"Allow this process to write {relative}?",
+                    "requested_once_capability": {
+                        "subject": pid,
+                        "resource": resource,
+                        "rights": [CapabilityRight.WRITE.value],
+                    },
+                    "context": {
+                        **self._write_approval_context(
+                            pid=pid,
+                            resource=resource,
+                            target=target,
+                            relative=relative,
+                            text=text,
+                            encoding=encoding,
+                            overwrite=overwrite,
+                        ),
+                    },
+                },
+                blocking=True,
+            )
+            raise HumanApprovalRequired(
+                request_id=request_id,
+                message=f"{pid} is waiting for per-use human approval to write {resource}",
+            )
+        raise CapabilityDenied(f"{pid} lacks write on {resource}")
+
+    def _write_approval_context(
+        self,
+        pid: str,
+        resource: str,
+        target: Path,
+        relative: str,
+        text: str,
+        encoding: str,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        encoded = text.encode(encoding)
+        preview, preview_truncated = self._preview_text(text)
+        target_state = self._target_state(target)
+        will_overwrite = bool(target_state["exists"] and target_state["kind"] == "file")
+        return {
+            "adapter": "filesystem",
+            "primitive": "runtime.filesystem.write_text",
+            "operation": "write_text",
+            "pid": pid,
+            "workspace_root": str(self.root),
+            "path": relative,
+            "absolute_path": str(target),
+            "resource": resource,
+            "right": CapabilityRight.WRITE.value,
+            "grant_scope": "one_time",
+            "encoding": encoding,
+            "overwrite": overwrite,
+            "will_create": not target_state["exists"],
+            "will_overwrite": will_overwrite,
+            "content_bytes": len(encoded),
+            "content_sha256": hashlib.sha256(encoded).hexdigest(),
+            "content_preview": preview,
+            "content_preview_chars": len(preview),
+            "content_preview_truncated": preview_truncated,
+            "target": target_state,
+        }
+
+    def _preview_text(self, text: str, limit: int = 500) -> tuple[str, bool]:
+        preview = text[:limit]
+        return preview, len(text) > limit
+
+    def _target_state(self, target: Path) -> dict[str, Any]:
+        if not target.exists():
+            return {"exists": False, "kind": "missing"}
+        stat = target.stat()
+        kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
+        return {
+            "exists": True,
+            "kind": kind,
+            "size_bytes": stat.st_size if target.is_file() else None,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        }

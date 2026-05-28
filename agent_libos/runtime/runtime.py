@@ -22,11 +22,14 @@ from agent_libos.storage import SQLiteStore
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.builtin import (
     CreateMemoryObjectTool,
+    CreateObjectFromFileTool,
     EchoTool,
     HumanOutputTool,
     ParsePytestLogTool,
     ProcessExitTool,
     ReadTextFileTool,
+    RequestPermissionTool,
+    WriteObjectToFileTool,
     WriteTextFileTool,
 )
 
@@ -40,7 +43,13 @@ class Runtime:
         self.capability = CapabilityManager(store, self.audit, self.events)
         self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events)
         self.human = HumanObjectManager(store, self.capability, self.audit, self.events)
-        self.filesystem = FilesystemAdapter(self.capability, self.audit, self.events, root=self.workspace_root)
+        self.filesystem = FilesystemAdapter(
+            self.capability,
+            self.audit,
+            self.events,
+            root=self.workspace_root,
+            human=self.human,
+        )
         self.tools = ToolBroker(
             store,
             self.memory,
@@ -59,7 +68,7 @@ class Runtime:
         self.images: dict[str, AgentImage] = dict(DEFAULT_IMAGES)
         self.llm = LLMProcessExecutor(self, llm_client)
         self._register_builtin_tools()
-        self.process.add_after_spawn_hook(self._grant_default_tool_capabilities)
+        self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
 
     @classmethod
     def open(cls, target: str | Path = "local") -> "Runtime":
@@ -97,19 +106,18 @@ class Runtime:
     def get_image(self, image_id: str) -> AgentImage:
         return self.images[image_id]
 
-    def _grant_default_tool_capabilities(self, pid: str, image_id: str) -> None:
+    def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
         image = self.images.get(image_id) or self.images["base-agent:v0"]
         tool_names = {"process_exit", "create_memory_object", *image.default_tools}
-        for tool_name in sorted(tool_names):
-            try:
-                self.tools.grant_execute(pid, tool_name, issued_by=f"image:{image_id}")
-            except Exception as exc:
-                self.audit.record(
-                    actor="runtime",
-                    action="image.default_tool_grant_failed",
-                    target=f"process:{pid}",
-                    decision={"tool": tool_name, "error": str(exc)},
-                )
+        try:
+            self.tools.configure_process_tools(pid, sorted(tool_names), assigned_by=f"image:{image_id}")
+        except Exception as exc:
+            self.audit.record(
+                actor="runtime",
+                action="image.default_tool_configure_failed",
+                target=f"process:{pid}",
+                decision={"tools": sorted(tool_names), "error": str(exc)},
+            )
         for spec in image.required_capabilities:
             try:
                 self.capability.grant(
@@ -134,7 +142,10 @@ class Runtime:
         self.tools.register_tool(EchoTool(), registered_by="runtime")
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
+        self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
         self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
+        self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
+        self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")

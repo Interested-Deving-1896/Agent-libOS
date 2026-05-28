@@ -9,6 +9,7 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 
 
 class CreateMemoryObjectArgs(BaseModel):
+    name: str | None = Field(default=None, description="Optional globally unique object name.")
     type: str = Field(description="Agent libOS object type, for example summary, plan, observation, or artifact.")
     payload: Any = Field(description="Structured payload to store.")
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -17,6 +18,7 @@ class CreateMemoryObjectArgs(BaseModel):
 
 class CreateMemoryObjectOutput(BaseModel):
     oid: str
+    name: str
     type: str
 
 
@@ -50,11 +52,13 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             payload=args.payload,
             metadata=metadata,
             immutable=args.immutable,
+            name=args.name,
         )
+        obj = runtime.memory.get_object(ctx.pid, handle)
         process = runtime.process.get(ctx.pid)
         if process.memory_view is None:
             process.memory_view = runtime.memory.create_view(ctx.pid, [handle], mode=ViewMode.READ_ONLY)
         elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
             process.memory_view.roots.append(handle)
         runtime.store.update_process(process)
-        return CreateMemoryObjectOutput(oid=handle.oid, type=args.type)
+        return CreateMemoryObjectOutput(oid=handle.oid, name=obj.name, type=args.type)

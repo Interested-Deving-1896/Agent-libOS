@@ -5,8 +5,6 @@ from uuid import uuid4
 
 from agent_libos import Runtime
 from agent_libos.api.cli import DEMO_PATCH_PREVIEW_CONTENT, DEMO_PATCH_PREVIEW_PATH, run_demo
-from agent_libos.exceptions import HumanApprovalRequired
-from agent_libos.models import HumanRequestStatus, ProcessStatus
 
 
 class DemoContractTests(unittest.TestCase):
@@ -39,14 +37,14 @@ class DemoContractTests(unittest.TestCase):
         tool_names = [entry["tool"] for entry in result["tool_sequence"]]
         self.assertIn("parse_pytest_log", tool_names)
         self.assertIn("extract_failed_tests", tool_names)
-        self.assertGreaterEqual(tool_names.count("write_text_file"), 3)
+        self.assertGreaterEqual(tool_names.count("write_text_file"), 2)
 
         report = self.runtime.store.get_object(result["final_report_oid"])
         self.assertIsNotNone(report)
         assert report is not None
         payload = report.payload
         self.assertEqual(payload["problem"]["failed_test"], "tests/test_math.py::test_add")
-        self.assertEqual(payload["authorization"]["tool_execute_approval_request"], result["approval_request"])
+        self.assertEqual(payload["authorization"]["filesystem_write_approval_request"], result["approval_request"])
         self.assertFalse(payload["authorization"]["filesystem_write_denied_before_grant"]["ok"])
         self.assertEqual(payload["external_side_effects"][0]["path"], DEMO_PATCH_PREVIEW_PATH)
         self.assertTrue(payload["target_file"]["content_matches"])
@@ -68,25 +66,16 @@ class DemoContractTests(unittest.TestCase):
         self.assertIn("human_query", event_types)
         self.assertIn("human_response", event_types)
 
-    def test_missing_tool_execute_requests_human_approval(self) -> None:
-        pid = self.runtime.process.spawn(image="review-agent:v0", goal="write a demo file")
+    def test_tool_outside_process_tool_table_is_denied_without_human_approval(self) -> None:
+        pid = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="write a demo file")
         path = f"agent_outputs/demo_missing_tool_{uuid4().hex}.txt"
 
-        with self.assertRaises(HumanApprovalRequired) as caught:
-            self.runtime.tools.call(pid, "write_text_file", {"path": path, "content": "denied"})
+        result = self.runtime.tools.call(pid, "write_text_file", {"path": path, "content": "denied"})
 
-        request = self.runtime.human.get(caught.exception.request_id)
-        self.assertEqual(request.status, HumanRequestStatus.PENDING)
-        self.assertEqual(request.pid, pid)
-        self.assertEqual(request.payload["requested_capability"]["subject"], pid)
-        self.assertEqual(request.payload["requested_capability"]["rights"], ["execute"])
-        self.assertIn("tool:", request.payload["requested_capability"]["resource"])
-
-        process = self.runtime.process.get(pid)
-        self.assertEqual(process.status, ProcessStatus.WAITING_HUMAN)
-        self.assertIn("waiting for human request", process.status_message or "")
+        self.assertFalse(result.ok)
+        self.assertIn("not in process tool table", result.error or "")
         self.assertFalse((self.runtime.workspace_root / path).exists())
-        self.assertIn("human.query", [record.action for record in self.runtime.audit.trace()])
+        self.assertNotIn("human.query", [record.action for record in self.runtime.audit.trace()])
 
 
 if __name__ == "__main__":

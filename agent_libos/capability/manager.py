@@ -12,6 +12,14 @@ from agent_libos.storage import SQLiteStore
 
 
 class CapabilityManager:
+    POLICY_KEY = "permission_policy"
+    ALWAYS_ALLOW = "always_allow"
+    ALWAYS_DENY = "always_deny"
+    ASK_EACH_TIME = "ask_each_time"
+    ALLOW_ONCE = "allow_once"
+    MISSING = "missing"
+    POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
+
     def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus):
         self.store = store
         self.audit = audit
@@ -82,22 +90,77 @@ class CapabilityManager:
         return revoked
 
     def check(self, subject: str, resource: str, right: str | CapabilityRight) -> bool:
-        requested_right = str(right)
-        now = utc_now()
-        for cap in self.store.list_capabilities(subject=subject):
-            if cap.revoked:
-                continue
-            if cap.expires_at is not None and cap.expires_at <= now:
-                continue
-            if not self._resource_matches(cap.resource, resource):
-                continue
-            if "*" in cap.rights or requested_right in cap.rights:
-                return True
-        return False
+        return self.permission_policy(subject, resource, right) in {self.ALWAYS_ALLOW, self.ALLOW_ONCE}
 
     def require(self, subject: str, resource: str, right: str | CapabilityRight) -> None:
-        if not self.check(subject, resource, right):
-            raise CapabilityDenied(f"{subject} lacks {right} on {resource}")
+        requested_right = str(right)
+        policy = self.permission_policy(subject, resource, right)
+        if policy in {self.ALWAYS_ALLOW, self.ALLOW_ONCE}:
+            return
+        if policy == self.ALWAYS_DENY:
+            raise CapabilityDenied(f"{subject} denied {requested_right} on {resource}")
+        if policy == self.ASK_EACH_TIME:
+            raise CapabilityDenied(f"{subject} requires human approval for {requested_right} on {resource}")
+        raise CapabilityDenied(f"{subject} lacks {requested_right} on {resource}")
+
+    def permission_policy(self, subject: str, resource: str, right: str | CapabilityRight) -> str:
+        matches = self._matching_capabilities(subject, resource, right)
+        if not matches:
+            return self.MISSING
+        cap = matches[0]
+        return str(cap.constraints.get(self.POLICY_KEY) or self.ALWAYS_ALLOW)
+
+    def set_permission_policy(
+        self,
+        subject: str,
+        resource: str,
+        rights: Iterable[str | CapabilityRight],
+        policy: str,
+        issued_by: str = "human:owner",
+        constraints: dict | None = None,
+    ) -> Capability:
+        if policy not in self.POLICY_VALUES:
+            raise ValueError(f"unknown permission policy: {policy}")
+        merged_constraints = dict(constraints or {})
+        merged_constraints[self.POLICY_KEY] = policy
+        cap = self.grant(
+            subject=subject,
+            resource=resource,
+            rights=rights,
+            issued_by=issued_by,
+            constraints=merged_constraints,
+        )
+        self.audit.record(
+            actor=issued_by,
+            action="capability.permission_policy",
+            target=f"{subject}:{resource}",
+            capability_refs=[cap.cap_id],
+            decision={"policy": policy, "rights": sorted(cap.rights)},
+        )
+        return cap
+
+    def grant_once(
+        self,
+        subject: str,
+        resource: str,
+        rights: Iterable[str | CapabilityRight],
+        issued_by: str = "human:owner",
+        constraints: dict | None = None,
+    ) -> Capability:
+        return self.set_permission_policy(
+            subject=subject,
+            resource=resource,
+            rights=rights,
+            policy=self.ALLOW_ONCE,
+            issued_by=issued_by,
+            constraints=constraints,
+        )
+
+    def consume_allow_once(self, subject: str, resource: str, right: str | CapabilityRight, used_by: str) -> None:
+        for cap in self._matching_capabilities(subject, resource, right):
+            if cap.constraints.get(self.POLICY_KEY) == self.ALLOW_ONCE:
+                self.revoke(cap.cap_id, revoked_by=used_by, reason="one-time permission consumed")
+                return
 
     def assert_handle(self, subject: str, handle: ObjectHandle, right: str | CapabilityRight) -> None:
         requested = str(right)
@@ -168,3 +231,20 @@ class CapabilityManager:
         if granted.endswith(":*"):
             return requested.startswith(granted[:-1])
         return False
+
+    def _matching_capabilities(self, subject: str, resource: str, right: str | CapabilityRight) -> list[Capability]:
+        requested_right = str(right)
+        now = utc_now()
+        matches: list[Capability] = []
+        for cap in self.store.list_capabilities(subject=subject):
+            if cap.revoked:
+                continue
+            if cap.expires_at is not None and cap.expires_at <= now:
+                continue
+            if not self._resource_matches(cap.resource, resource):
+                continue
+            if "*" not in cap.rights and requested_right not in cap.rights:
+                continue
+            matches.append(cap)
+        matches.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
+        return matches

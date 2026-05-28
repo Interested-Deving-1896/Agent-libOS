@@ -99,7 +99,12 @@ def _process_section(process: AgentProcess) -> str:
 
 def _capability_section(capabilities: list[Capability]) -> str:
     visible = [
-        {"resource": cap.resource, "rights": sorted(cap.rights), "expires_at": cap.expires_at}
+        {
+            "resource": cap.resource,
+            "rights": sorted(cap.rights),
+            "permission_policy": cap.constraints.get("permission_policy", "always_allow"),
+            "expires_at": cap.expires_at,
+        }
         for cap in capabilities
         if not cap.revoked
     ]

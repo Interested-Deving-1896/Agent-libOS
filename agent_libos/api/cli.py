@@ -5,7 +5,6 @@ import json
 from collections import Counter
 from typing import Any
 
-from agent_libos.exceptions import HumanApprovalRequired
 from agent_libos.models import CapabilityRight, ForkMode, MemoryViewSpec, ObjectMetadata, ObjectType, ToolCallResult, ViewMode
 from agent_libos.runtime.runtime import Runtime
 
@@ -30,7 +29,8 @@ def main(argv: list[str] | None = None) -> None:
     llm_once_parser.add_argument("pid")
     run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
     run_parser.add_argument("--max-quanta", type=int, default=25)
-    grant_tool_parser = sub.add_parser("grant-tool", help="Grant a process execute capability for a tool")
+    sub.add_parser("human", help="Process pending human messages in terminal order")
+    grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
     grant_tool_parser.add_argument("pid")
     grant_tool_parser.add_argument("tool")
     args = parser.parse_args(argv)
@@ -55,8 +55,9 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "run":
             _print_json(runtime.run_until_idle(max_quanta=args.max_quanta))
         elif args.command == "grant-tool":
-            cap_id = runtime.tools.grant_execute(args.pid, args.tool, issued_by="cli")
-            _print_json({"pid": args.pid, "tool": args.tool, "capability_id": cap_id})
+            raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
+        elif args.command == "human":
+            _print_json([request.__dict__ for request in runtime.human.drain_terminal_queue()])
     finally:
         runtime.close()
 
@@ -91,7 +92,6 @@ def run_demo(runtime: Runtime) -> dict[str, Any]:
         mode=ForkMode.WORKER,
     )
     parse_tool = runtime.tools.resolve("parse_pytest_log")
-    runtime.tools.grant_execute(worker, parse_tool, issued_by="demo")
     parsed = runtime.tools.call(worker, parse_tool, {"log": log})
     tool_sequence.append(_tool_call_summary("parse_pytest_log", worker, parsed))
     runtime.process.exit(worker, parsed.result_handle)
@@ -130,41 +130,33 @@ def run(args):
         tool_sequence.append(_tool_call_summary("extract_failed_tests", root, jit_result))
 
     checkpoint = runtime.checkpoint.checkpoint(root, "before high-risk patch application")
-    approval_request = None
     write_args = {
         "path": DEMO_PATCH_PREVIEW_PATH,
         "content": DEMO_PATCH_PREVIEW_CONTENT,
         "overwrite": True,
     }
-    try:
-        runtime.tools.call(root, "write_text_file", write_args)
-    except HumanApprovalRequired as exc:
-        approval_request = exc.request_id
-        runtime.human.approve(exc.request_id, {"approved": True, "reason": "demo approval"})
-        tool_sequence.append(
-            {
-                "pid": root,
-                "tool": "write_text_file",
-                "ok": False,
-                "waiting_human": True,
-                "approval_request": approval_request,
-                "reason": "missing tool execute capability",
-            }
-        )
-    if approval_request is None:
-        raise RuntimeError("demo expected missing write_text_file execute capability to request human approval")
-
     denied_without_filesystem = runtime.tools.call(root, "write_text_file", write_args)
     tool_sequence.append(_tool_call_summary("write_text_file", root, denied_without_filesystem))
     if denied_without_filesystem.ok:
         raise RuntimeError("demo expected write_text_file to fail before filesystem write capability was granted")
 
-    runtime.filesystem.grant_path(
-        root,
-        DEMO_PATCH_PREVIEW_PATH,
-        [CapabilityRight.WRITE],
-        issued_by="human:owner",
+    filesystem_resource = runtime.filesystem.resource_for(DEMO_PATCH_PREVIEW_PATH)
+    approval_request = runtime.human.query(
+        pid=root,
+        human="owner",
+        request={
+            "type": "approval",
+            "question": f"Grant workspace write capability for {DEMO_PATCH_PREVIEW_PATH}?",
+            "requested_capability": {
+                "subject": root,
+                "resource": filesystem_resource,
+                "rights": [CapabilityRight.WRITE.value],
+            },
+            "context": {"path": DEMO_PATCH_PREVIEW_PATH, "tool": "write_text_file"},
+        },
+        blocking=True,
     )
+    runtime.human.approve(approval_request, {"approved": True, "reason": "demo filesystem write approval"})
     approved_call = runtime.tools.call(root, "write_text_file", write_args)
     tool_sequence.append(_tool_call_summary("write_text_file", root, approved_call))
     target = runtime.workspace_root / DEMO_PATCH_PREVIEW_PATH
@@ -175,12 +167,11 @@ def run(args):
 
     audit_records = runtime.audit.trace()
     audit_summary = dict(Counter(record.action for record in audit_records))
-    filesystem_resource = runtime.filesystem.resource_for(DEMO_PATCH_PREVIEW_PATH)
     report_payload = {
         "summary": (
             "Analyzed a failing pytest log, extracted the failed test, checkpointed before the write, "
-            "requested human approval for tool execution, verified filesystem denial before external-resource "
-            "authorization, and wrote a patch preview file."
+            "verified filesystem denial before external-resource authorization, requested human approval for workspace write, "
+            "and wrote a patch preview file."
         ),
         "problem": {
             "failed_test": "tests/test_math.py::test_add",
@@ -199,7 +190,7 @@ def run(args):
         ],
         "tool_sequence": tool_sequence,
         "authorization": {
-            "tool_execute_approval_request": approval_request,
+            "filesystem_write_approval_request": approval_request,
             "filesystem_write_resource": filesystem_resource,
             "filesystem_write_granted_by": "human:owner",
             "filesystem_write_denied_before_grant": {

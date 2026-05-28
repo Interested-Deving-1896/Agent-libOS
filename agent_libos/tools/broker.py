@@ -10,7 +10,6 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
-    CapabilityRight,
     EventType,
     ObjectMetadata,
     ObjectType,
@@ -82,15 +81,46 @@ class ToolBroker:
         )
         return handle
 
-    def grant_execute(self, pid: str, tool: ToolHandle | str, issued_by: str = "tool_broker") -> str:
-        handle = self.resolve(tool)
-        cap = self.capabilities.grant(
-            subject=pid,
-            resource=f"tool:{handle.tool_id}",
-            rights=[CapabilityRight.EXECUTE],
-            issued_by=issued_by,
+    def configure_process_tools(
+        self,
+        pid: str,
+        tools: builtins.list[ToolHandle | str],
+        assigned_by: str = "tool_broker",
+    ) -> dict[str, str]:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        table: dict[str, str] = {}
+        for tool in tools:
+            handle = self.resolve(tool)
+            table[handle.name] = handle.tool_id
+        process.tool_table = table
+        process.updated_at = utc_now()
+        self.store.update_process(process)
+        self.audit.record(
+            actor=assigned_by,
+            action="process.tools.configure",
+            target=f"process:{pid}",
+            decision={"tools": sorted(table)},
         )
-        return cap.cap_id
+        return table
+
+    def grant_execute(self, pid: str, tool: ToolHandle | str, issued_by: str = "tool_broker") -> str:
+        handle = self.resolve(tool, pid=pid)
+        if not self._process_has_tool(pid, handle):
+            raise ValidationError(
+                "tool execute capabilities are not used in the current MVP; configure process tools at creation time"
+            )
+        self.audit.record(
+            actor=issued_by,
+            action="tool.execute_grant_ignored",
+            target=f"tool:{handle.tool_id}",
+            decision={
+                "tool": handle.name,
+                "reason": "tool calls are allowed by process tool table, not execute capability",
+            },
+        )
+        return handle.tool_id
 
     def propose(
         self,
@@ -181,13 +211,7 @@ class ToolBroker:
                 raise ValidationError("; ".join(validation.errors))
             candidate = self._get_candidate(candidate_id)
         tool_id = new_id("tool")
-        cap = self.capabilities.grant(
-            subject=pid,
-            resource=f"tool:{tool_id}",
-            rights=[CapabilityRight.EXECUTE],
-            issued_by=approver,
-        )
-        handle = ToolHandle(tool_id=tool_id, name=candidate.spec.name, capability_id=cap.cap_id, scope=scope)
+        handle = ToolHandle(tool_id=tool_id, name=candidate.spec.name, capability_id=None, scope=scope)
         self._jit_sources[tool_id] = candidate.source_code
         self._handles[tool_id] = handle
         self._tool_ids_by_name[candidate.spec.name] = tool_id
@@ -204,31 +228,34 @@ class ToolBroker:
             actor=approver,
             action="tool.register",
             target=f"tool:{tool_id}",
-            capability_refs=[cap.cap_id],
             decision={"candidate_id": candidate_id, "scope": scope},
         )
         return handle
 
     def call(self, pid: str, tool: ToolHandle | str, args: dict[str, Any]) -> ToolCallResult:
-        handle = self.resolve(tool)
+        handle = self.resolve(tool, pid=pid)
         resource = f"tool:{handle.tool_id}"
-        if not self.capabilities.check(pid, resource, CapabilityRight.EXECUTE):
-            request_id = self.human.query(
-                pid=pid,
-                human="owner",
-                request={
-                    "type": "approval",
-                    "question": f"Grant execute capability for tool {handle.name}?",
-                    "requested_capability": {
-                        "subject": pid,
-                        "resource": resource,
-                        "rights": [CapabilityRight.EXECUTE.value],
-                    },
-                    "context": {"tool_id": handle.tool_id, "tool_name": handle.name},
-                },
-                blocking=True,
+        if not self._process_has_tool(pid, handle):
+            call_id = new_id("tcall")
+            error = f"tool is not in process tool table: {handle.name}"
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={"call_id": call_id, "error": error, "policy_decision": "deny"},
             )
-            raise HumanApprovalRequired(request_id, f"tool execution requires approval: {handle.name}")
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "deny",
+                    "policy_reason": "tool_not_in_process_table",
+                },
+            )
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
 
         call_id = new_id("tcall")
         self.events.emit(
@@ -252,7 +279,12 @@ class ToolBroker:
                         actor=pid,
                         action="tool.call",
                         target=resource,
-                        decision={"ok": False, "tool_result": tool_result.model_dump(mode="json")},
+                        decision={
+                            "ok": False,
+                            "tool": handle.name,
+                            "policy_decision": "allow",
+                            "tool_result": tool_result.model_dump(mode="json"),
+                        },
                     )
                     return ToolCallResult(
                         call_id=call_id,
@@ -276,6 +308,19 @@ class ToolBroker:
                 result_payload = {"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload}
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
+        except HumanApprovalRequired as exc:
+            self.audit.record(
+                actor=pid,
+                action="tool.call_waiting_human",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "require_human_approval",
+                    "request_id": exc.request_id,
+                },
+            )
+            raise
         except Exception as exc:
             self.events.emit(
                 EventType.TOOL_FAILED,
@@ -287,7 +332,7 @@ class ToolBroker:
                 actor=pid,
                 action="tool.call",
                 target=resource,
-                decision={"ok": False, "error": str(exc)},
+                decision={"ok": False, "tool": handle.name, "policy_decision": "allow", "error": str(exc)},
             )
             return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=str(exc))
 
@@ -309,7 +354,7 @@ class ToolBroker:
             action="tool.call",
             target=resource,
             output_refs=[result_handle.oid],
-            decision={"ok": True, "tool": handle.name},
+            decision={"ok": True, "tool": handle.name, "policy_decision": "allow"},
         )
         return ToolCallResult(
             call_id=call_id,
@@ -319,9 +364,15 @@ class ToolBroker:
             ok=True,
         )
 
-    def resolve(self, tool: ToolHandle | str) -> ToolHandle:
+    def resolve(self, tool: ToolHandle | str, pid: str | None = None) -> ToolHandle:
         if isinstance(tool, ToolHandle):
             return tool
+        if pid is not None:
+            process = self.store.get_process(pid)
+            if process is not None and tool in process.tool_table:
+                tool_id = process.tool_table[tool]
+                if tool_id in self._handles:
+                    return self._handles[tool_id]
         if tool in self._handles:
             return self._handles[tool]
         if tool in self._tool_ids_by_name:
@@ -339,9 +390,15 @@ class ToolBroker:
     def list(self) -> builtins.list[dict[str, Any]]:
         return self.store.list_tools()
 
-    def openai_tool_schemas(self) -> builtins.list[dict[str, Any]]:
-        schemas = [tool.to_openai_chat_tool() for tool in self._tools.values()]
-        for tool_id in self._jit_sources:
+    def openai_tool_schemas(self, pid: str | None = None) -> builtins.list[dict[str, Any]]:
+        tool_ids = self._visible_tool_ids(pid) if pid is not None else set(self._tools)
+        schemas: builtins.list[dict[str, Any]] = []
+        for tool_id in tool_ids:
+            if tool_id in self._tools:
+                schemas.append(self._tools[tool_id].to_openai_chat_tool())
+                continue
+            if tool_id not in self._jit_sources:
+                continue
             spec = self.store.get_tool_spec(tool_id)
             if spec is None:
                 continue
@@ -378,3 +435,15 @@ class ToolBroker:
         if candidate is None:
             raise NotFound(f"tool candidate not found: {candidate_id}")
         return candidate
+
+    def _process_has_tool(self, pid: str, handle: ToolHandle) -> bool:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        return process.tool_table.get(handle.name) == handle.tool_id
+
+    def _visible_tool_ids(self, pid: str) -> set[str]:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        return set(process.tool_table.values())

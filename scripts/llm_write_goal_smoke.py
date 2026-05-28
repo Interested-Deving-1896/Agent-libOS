@@ -23,7 +23,6 @@ def main() -> None:
             f"with exactly this content: {args.content!r}. After the file is written, exit."
         )
         pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
-        runtime.tools.grant_execute(pid, "write_text_file", issued_by="smoke-test")
         runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="smoke-test")
         results = runtime.run_until_idle(max_quanta=args.max_quanta)
         target = runtime.workspace_root / args.path

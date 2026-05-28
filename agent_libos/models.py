@@ -160,6 +160,7 @@ class HumanRequestStatus(StrEnum):
     REJECTED = "rejected"
     EDITED = "edited"
     CANCELLED = "cancelled"
+    DELIVERED = "delivered"
 
 
 class ToolCandidateStatus(StrEnum):
@@ -201,6 +202,7 @@ class Provenance:
 @dataclass(frozen=True)
 class AgentObject:
     oid: OID
+    name: str
     type: ObjectType
     schema_version: str
     payload: Any
@@ -234,10 +236,12 @@ class ObjectQuery:
     tags: list[str] = field(default_factory=list)
     text: str | None = None
     limit: int = 50
+    name: str | None = None
 
 
 @dataclass
 class ObjectPatch:
+    name: str | None = None
     payload: Any | None = None
     metadata: ObjectMetadata | None = None
     provenance: Provenance | None = None

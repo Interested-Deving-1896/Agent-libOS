@@ -60,6 +60,7 @@ class SQLiteStore:
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._object_payloads: dict[str, Any] = {}
         self.initialize()
 
     def close(self) -> None:
@@ -71,6 +72,7 @@ class SQLiteStore:
                 """
                 CREATE TABLE IF NOT EXISTS objects (
                   oid TEXT PRIMARY KEY,
+                  name TEXT NOT NULL UNIQUE,
                   type TEXT NOT NULL,
                   schema_version TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
@@ -195,6 +197,7 @@ class SQLiteStore:
                 );
                 """
             )
+            self._ensure_object_name_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -208,15 +211,20 @@ class SQLiteStore:
             return list(self.conn.execute(sql, tuple(params)))
 
     def insert_object(self, obj: AgentObject) -> None:
+        self._object_payloads[obj.oid] = obj.payload
         self._execute(
             """
-            INSERT INTO objects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO objects (
+                oid, name, type, schema_version, payload_json, metadata_json,
+                provenance_json, version, immutable, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obj.oid,
+                obj.name,
                 obj.type.value,
                 obj.schema_version,
-                dumps(obj.payload),
+                dumps(self._memory_payload_marker(present=True)),
                 dumps(obj.metadata),
                 dumps(obj.provenance),
                 obj.version,
@@ -228,18 +236,20 @@ class SQLiteStore:
         )
 
     def update_object(self, obj: AgentObject) -> None:
+        self._object_payloads[obj.oid] = obj.payload
         self._execute(
             """
             UPDATE objects
-               SET type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
+               SET name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
                    provenance_json = ?, version = ?, immutable = ?, created_by = ?,
                    created_at = ?, updated_at = ?
              WHERE oid = ?
             """,
             (
+                obj.name,
                 obj.type.value,
                 obj.schema_version,
-                dumps(obj.payload),
+                dumps(self._memory_payload_marker(present=True)),
                 dumps(obj.metadata),
                 dumps(obj.provenance),
                 obj.version,
@@ -253,10 +263,31 @@ class SQLiteStore:
 
     def get_object(self, oid: str) -> AgentObject | None:
         rows = self._query("SELECT * FROM objects WHERE oid = ?", (oid,))
-        return self._row_to_object(rows[0]) if rows else None
+        if not rows or oid not in self._object_payloads:
+            return None
+        return self._row_to_object(rows[0])
+
+    def get_object_by_name(self, name: str) -> AgentObject | None:
+        rows = self._query("SELECT * FROM objects WHERE name = ?", (name,))
+        if not rows or rows[0]["oid"] not in self._object_payloads:
+            return None
+        return self._row_to_object(rows[0])
 
     def list_objects(self) -> list[AgentObject]:
-        return [self._row_to_object(row) for row in self._query("SELECT * FROM objects")]
+        return [
+            self._row_to_object(row)
+            for row in self._query("SELECT * FROM objects")
+            if row["oid"] in self._object_payloads
+        ]
+
+    def list_object_oids_created_by(self, created_by: str) -> list[str]:
+        rows = self._query("SELECT oid FROM objects WHERE created_by = ? ORDER BY created_at", (created_by,))
+        return [str(row["oid"]) for row in rows]
+
+    def delete_object(self, oid: str) -> None:
+        self._object_payloads.pop(oid, None)
+        self._execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
+        self._execute("DELETE FROM objects WHERE oid = ?", (oid,))
 
     def insert_link(self, link: ObjectLink) -> None:
         self._execute(
@@ -586,7 +617,7 @@ class SQLiteStore:
             cur = self.conn.cursor()
             for table in self.SNAPSHOT_TABLES:
                 cur.execute(f"DELETE FROM {table}")
-                rows = snapshot.get(table, [])
+                rows = self._normalize_restore_rows(table, snapshot.get(table, []))
                 if not rows:
                     continue
                 columns = list(rows[0].keys())
@@ -598,6 +629,27 @@ class SQLiteStore:
                         tuple(row[column] for column in columns),
                     )
             self.conn.commit()
+
+    def _ensure_object_name_schema(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(objects)")}
+        if "name" not in columns:
+            self.conn.execute("ALTER TABLE objects ADD COLUMN name TEXT")
+            self.conn.execute("UPDATE objects SET name = oid WHERE name IS NULL OR name = ''")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_name ON objects(name)")
+
+    def _normalize_restore_rows(self, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if table != "objects":
+            return rows
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item.setdefault("name", item.get("oid"))
+            item["payload_json"] = dumps(self._memory_payload_marker(present=False))
+            normalized.append(item)
+        return normalized
+
+    def _memory_payload_marker(self, present: bool) -> dict[str, Any]:
+        return {"storage": "runtime_memory", "present": present}
 
     def _process_params(self, process: AgentProcess) -> tuple[Any, ...]:
         return (
@@ -626,9 +678,10 @@ class SQLiteStore:
         provenance = Provenance(**loads(row["provenance_json"], {}))
         return AgentObject(
             oid=row["oid"],
+            name=row["name"],
             type=ObjectType(row["type"]),
             schema_version=row["schema_version"],
-            payload=loads(row["payload_json"]),
+            payload=self._object_payloads[row["oid"]],
             metadata=metadata,
             provenance=provenance,
             version=row["version"],

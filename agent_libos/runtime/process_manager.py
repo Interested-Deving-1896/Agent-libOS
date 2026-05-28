@@ -295,6 +295,7 @@ class ProcessManager:
             output_refs=[result.oid] if result else [],
             decision={"status": process.status.value, "message": message},
         )
+        self.memory.release_process_owned(pid, preserve_oids={result.oid} if result is not None else set())
 
     def get(self, pid: str) -> AgentProcess:
         return self._get(pid)

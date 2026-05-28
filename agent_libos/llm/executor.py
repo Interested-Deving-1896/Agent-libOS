@@ -9,6 +9,8 @@ from agent_libos.llm.client import LLMClient
 from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import (
+    EventType,
+    HumanRequestStatus,
     ObjectHandle,
     ProcessStatus,
     ViewMode,
@@ -22,11 +24,14 @@ class LLMProcessExecutor:
     def __init__(self, runtime: "Runtime", client: LLMClient | None = None):
         self.runtime = runtime
         self.client = client or LLMClient.from_env()
+        self._pending_human_actions: dict[str, dict[str, Any]] = {}
 
     def run_once(self, pid: str) -> dict[str, Any]:
         process = self.runtime.process.get(pid)
         if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
             return {"ok": False, "skipped": True, "status": process.status.value}
+        if pid in self._pending_human_actions:
+            return self._resume_pending_human_action(pid)
         image = self.runtime.images.get(process.image_id) or self.runtime.images["base-agent:v0"]
         if process.memory_view is None:
             process.memory_view = self.runtime.memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
@@ -60,21 +65,26 @@ class LLMProcessExecutor:
             decision={"messages": len(messages), "policy": image.context_policy},
         )
         try:
-            completion = self.client.complete_action(messages, tools=self.runtime.tools.openai_tool_schemas())
+            completion = self.client.complete_action(messages, tools=self.runtime.tools.openai_tool_schemas(pid))
             action = self._completion_to_action(completion.content, completion.tool_calls)
-            result = self.dispatch(pid, action)
-            self.runtime.audit.record(
-                actor=pid,
-                action="llm.action",
-                target=action.get("action"),
-                decision={
-                    "action": action,
-                    "result": result,
-                    "content_preview": completion.content[:500],
-                    "tool_call_count": len(completion.tool_calls),
-                },
+            try:
+                result = self.dispatch(pid, action)
+            except HumanApprovalRequired as exc:
+                return self._wait_for_human_action(
+                    pid=pid,
+                    action=action,
+                    request_id=exc.request_id,
+                    message=str(exc),
+                    content_preview=completion.content[:500],
+                    tool_call_count=len(completion.tool_calls),
+                )
+            return self._completed_action_result(
+                pid=pid,
+                action=action,
+                result=result,
+                content_preview=completion.content[:500],
+                tool_call_count=len(completion.tool_calls),
             )
-            return {"ok": True, "action": action, "result": result}
         except HumanApprovalRequired as exc:
             self.runtime.audit.record(
                 actor=pid,
@@ -92,6 +102,129 @@ class LLMProcessExecutor:
                 decision={"error": str(exc)},
             )
             return {"ok": False, "error": str(exc)}
+
+    def _completed_action_result(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        result: dict[str, Any],
+        content_preview: str,
+        tool_call_count: int,
+        resumed_after_human: bool = False,
+    ) -> dict[str, Any]:
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.action",
+            target=action.get("action"),
+            decision={
+                "action": action,
+                "result": result,
+                "content_preview": content_preview,
+                "tool_call_count": tool_call_count,
+                "resumed_after_human": resumed_after_human,
+            },
+        )
+        payload = {"ok": True, "action": action, "result": result}
+        if resumed_after_human:
+            payload["resumed_after_human"] = True
+        return payload
+
+    def _wait_for_human_action(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        request_id: str,
+        message: str,
+        content_preview: str,
+        tool_call_count: int,
+    ) -> dict[str, Any]:
+        self._pending_human_actions[pid] = {
+            "request_id": request_id,
+            "action": dict(action),
+            "content_preview": content_preview,
+            "tool_call_count": tool_call_count,
+        }
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.action_waiting_human",
+            target=f"human_request:{request_id}",
+            decision={
+                "request_id": request_id,
+                "action": action,
+                "message": message,
+                "tool_call_count": tool_call_count,
+            },
+        )
+        return {"ok": False, "waiting_human": True, "request_id": request_id}
+
+    def _resume_pending_human_action(self, pid: str) -> dict[str, Any]:
+        pending = self._pending_human_actions[pid]
+        request_id = str(pending["request_id"])
+        request = self.runtime.human.get(request_id)
+        if request.status == HumanRequestStatus.PENDING:
+            return {"ok": False, "waiting_human": True, "request_id": request_id}
+
+        action = dict(pending["action"])
+        self._pending_human_actions.pop(pid, None)
+        if request.status == HumanRequestStatus.APPROVED:
+            try:
+                result = self.dispatch(pid, action)
+            except HumanApprovalRequired as exc:
+                return self._wait_for_human_action(
+                    pid=pid,
+                    action=action,
+                    request_id=exc.request_id,
+                    message=str(exc),
+                    content_preview=str(pending.get("content_preview", "")),
+                    tool_call_count=int(pending.get("tool_call_count", 0)),
+                )
+            return self._completed_action_result(
+                pid=pid,
+                action=action,
+                result=result,
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+                resumed_after_human=True,
+            )
+
+        error = f"human rejected approval request {request_id}"
+        self._emit_pending_action_rejected(pid, action, request_id, error)
+        result = {"ok": False, "tool_id": None, "result_oid": None, "payload": None, "error": error}
+        return self._completed_action_result(
+            pid=pid,
+            action=action,
+            result=result,
+            content_preview=str(pending.get("content_preview", "")),
+            tool_call_count=int(pending.get("tool_call_count", 0)),
+            resumed_after_human=True,
+        )
+
+    def _emit_pending_action_rejected(self, pid: str, action: dict[str, Any], request_id: str, error: str) -> None:
+        tool_name = str(action.get("action"))
+        source = f"tool:{tool_name}"
+        try:
+            handle = self.runtime.tools.resolve(tool_name, pid=pid)
+            source = f"tool:{handle.tool_id}"
+        except Exception:
+            pass
+        self.runtime.events.emit(
+            EventType.TOOL_FAILED,
+            source=source,
+            target=pid,
+            payload={
+                "error": error,
+                "tool_name": tool_name,
+                "request_id": request_id,
+                "policy_decision": "deny",
+                "policy_reason": "human_rejected_per_use_approval",
+            },
+        )
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.pending_action_rejected",
+            target=tool_name,
+            decision={"request_id": request_id, "action": action, "error": error},
+        )
 
     def _completion_to_action(self, content: str, tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
         if tool_calls:

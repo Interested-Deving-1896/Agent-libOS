@@ -4,7 +4,7 @@ import unittest
 from uuid import uuid4
 
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight
+from agent_libos.models import CapabilityRight, ForkMode, HumanRequestStatus
 
 
 class ExternalBoundaryTests(unittest.TestCase):
@@ -19,7 +19,6 @@ class ExternalBoundaryTests(unittest.TestCase):
     def test_read_file_tool_cannot_bypass_filesystem_capability(self) -> None:
         path = self._write_workspace_fixture("hello from workspace")
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="read a file")
-        self.runtime.tools.grant_execute(pid, "read_text_file", issued_by="test")
 
         denied = self.runtime.tools.call(pid, "read_text_file", {"path": path})
         self.assertFalse(denied.ok)
@@ -36,7 +35,6 @@ class ExternalBoundaryTests(unittest.TestCase):
         path = f"agent_outputs/boundary_write_{uuid4().hex}.txt"
         target = self.runtime.workspace_root / path
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="write a file")
-        self.runtime.tools.grant_execute(pid, "write_text_file", issued_by="test")
 
         denied = self.runtime.tools.call(pid, "write_text_file", {"path": path, "content": "denied"})
         self.assertFalse(denied.ok)
@@ -50,7 +48,6 @@ class ExternalBoundaryTests(unittest.TestCase):
 
     def test_human_output_tool_cannot_bypass_human_capability(self) -> None:
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="speak to the human")
-        self.runtime.tools.grant_execute(pid, "human_output", issued_by="test")
 
         denied = self.runtime.tools.call(pid, "human_output", {"message": "denied"})
         self.assertFalse(denied.ok)
@@ -60,7 +57,52 @@ class ExternalBoundaryTests(unittest.TestCase):
         allowed = self.runtime.tools.call(pid, "human_output", {"message": "allowed"})
         self.assertTrue(allowed.ok)
         self.assertEqual(self.human_output, ["allowed"])
+        self.assertEqual(self.runtime.human.list(pid)[0].status, HumanRequestStatus.DELIVERED)
         self.assertIn("human.output", self._audit_actions())
+
+    def test_process_cannot_call_tool_outside_creation_tool_table(self) -> None:
+        pid = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="call unavailable tool")
+
+        denied = self.runtime.tools.call(pid, "write_text_file", {"path": "agent_outputs/no_tool.txt", "content": "x"})
+
+        self.assertFalse(denied.ok)
+        self.assertIn("not in process tool table", denied.error or "")
+        self.assertNotIn("human.query", self._audit_actions())
+
+    def test_path_escape_is_denied_by_filesystem_primitive(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="escape workspace")
+        self.runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="test")
+
+        denied = self.runtime.tools.call(pid, "write_text_file", {"path": "../outside.txt", "content": "denied"})
+
+        self.assertFalse(denied.ok)
+        self.assertIn("escapes filesystem adapter root", denied.error or "")
+        self.assertNotIn("external.filesystem.write_text", self._audit_actions())
+
+    def test_revoked_filesystem_capability_denies_write(self) -> None:
+        path = f"agent_outputs/revoked_write_{uuid4().hex}.txt"
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="revoked write")
+        cap = self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by="test")
+        self.runtime.capability.revoke(cap.cap_id, revoked_by="test", reason="boundary test")
+
+        denied = self.runtime.tools.call(pid, "write_text_file", {"path": path, "content": "denied"})
+
+        self.assertFalse(denied.ok)
+        self.assertFalse((self.runtime.workspace_root / path).exists())
+        self.assertNotIn("external.filesystem.write_text", self._audit_actions())
+
+    def test_fork_does_not_inherit_parent_filesystem_write_capability(self) -> None:
+        path = f"agent_outputs/fork_write_{uuid4().hex}.txt"
+        parent = self.runtime.process.spawn(image="review-agent:v0", goal="parent")
+        self.runtime.filesystem.grant_path(parent, path, [CapabilityRight.WRITE], issued_by="test")
+        child = self.runtime.process.fork(parent, goal="child", mode=ForkMode.WORKER)
+
+        denied = self.runtime.tools.call(child, "write_text_file", {"path": path, "content": "denied"})
+        allowed = self.runtime.tools.call(parent, "write_text_file", {"path": path, "content": "allowed"})
+
+        self.assertFalse(denied.ok)
+        self.assertTrue(allowed.ok)
+        self.assertEqual((self.runtime.workspace_root / path).read_text(encoding="utf-8"), "allowed")
 
     def _write_workspace_fixture(self, content: str) -> str:
         path = f"agent_outputs/boundary_read_{uuid4().hex}.txt"

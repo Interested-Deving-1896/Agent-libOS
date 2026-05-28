@@ -4,7 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import CapabilityDenied, NotFound
+from agent_libos.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
     EventType,
@@ -52,14 +52,19 @@ class ObjectMemoryManager:
         metadata: ObjectMetadata | None = None,
         immutable: bool = True,
         provenance: Provenance | None = None,
+        name: str | None = None,
     ) -> ObjectHandle:
         now = utc_now()
         obj_type = ObjectType(object_type)
+        oid = new_id("obj")
+        object_name = self._normalize_name(name or self._default_name(obj_type, oid))
+        self._require_unique_name(object_name)
         meta = metadata or ObjectMetadata(token_estimate=estimate_tokens(payload))
         if meta.token_estimate is None:
             meta.token_estimate = estimate_tokens(payload)
         obj = AgentObject(
-            oid=new_id("obj"),
+            oid=oid,
+            name=object_name,
             type=obj_type,
             schema_version="1",
             payload=payload,
@@ -87,7 +92,7 @@ class ObjectMemoryManager:
             EventType.OBJECT_CREATED,
             source=pid,
             target=pid,
-            payload={"oid": obj.oid, "type": obj.type.value},
+            payload={"oid": obj.oid, "name": obj.name, "type": obj.type.value},
         )
         self.audit.record(
             actor=pid,
@@ -95,6 +100,7 @@ class ObjectMemoryManager:
             target=f"object:{obj.oid}",
             output_refs=[obj.oid],
             capability_refs=[handle.capability_id],
+            decision={"name": obj.name, "type": obj.type.value},
         )
         return handle
 
@@ -112,6 +118,44 @@ class ObjectMemoryManager:
         )
         return obj
 
+    def get_object_by_name(self, pid: str, name: str) -> AgentObject:
+        obj = self.store.get_object_by_name(self._normalize_name(name))
+        if obj is None:
+            raise NotFound(f"object not found: {name}")
+        self.capabilities.require(pid, f"object:{obj.oid}", ObjectRight.READ)
+        self.audit.record(
+            actor=pid,
+            action="memory.get_object_by_name",
+            target=f"object:{obj.name}",
+            input_refs=[obj.oid],
+            decision={"name": obj.name, "oid": obj.oid},
+        )
+        return obj
+
+    def handle_for_name(
+        self,
+        pid: str,
+        name: str,
+        rights: set[str] | list[str] | tuple[str, ...] | None = None,
+        issued_by: str = "memory.name",
+    ) -> ObjectHandle:
+        obj = self.store.get_object_by_name(self._normalize_name(name))
+        if obj is None:
+            raise NotFound(f"object not found: {name}")
+        requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
+        for right in requested:
+            self.capabilities.require(pid, f"object:{obj.oid}", right)
+        handle = self.capabilities.handle_for_object(pid, obj.oid, requested, issued_by=issued_by)
+        self.audit.record(
+            actor=pid,
+            action="memory.handle_for_name",
+            target=f"object:{obj.name}",
+            output_refs=[obj.oid],
+            capability_refs=[handle.capability_id],
+            decision={"name": obj.name, "rights": sorted(requested)},
+        )
+        return handle
+
     def update_object(self, pid: str, handle: ObjectHandle, patch: ObjectPatch) -> ObjectHandle:
         self.capabilities.assert_handle(pid, handle, ObjectRight.WRITE)
         current = self.store.get_object(handle.oid)
@@ -119,8 +163,13 @@ class ObjectMemoryManager:
             raise NotFound(f"object not found: {handle.oid}")
         if current.immutable:
             raise CapabilityDenied(f"immutable object cannot be updated: {handle.oid}")
+        next_name = current.name
+        if patch.name is not None:
+            next_name = self._normalize_name(patch.name)
+            self._require_unique_name(next_name, except_oid=current.oid)
         updated = replace(
             current,
+            name=next_name,
             payload=current.payload if patch.payload is None else patch.payload,
             metadata=current.metadata if patch.metadata is None else patch.metadata,
             provenance=current.provenance if patch.provenance is None else patch.provenance,
@@ -132,7 +181,7 @@ class ObjectMemoryManager:
             EventType.OBJECT_UPDATED,
             source=pid,
             target=pid,
-            payload={"oid": updated.oid, "version": updated.version},
+            payload={"oid": updated.oid, "name": updated.name, "version": updated.version},
         )
         self.audit.record(
             actor=pid,
@@ -141,6 +190,7 @@ class ObjectMemoryManager:
             input_refs=[updated.oid],
             output_refs=[updated.oid],
             capability_refs=[handle.capability_id],
+            decision={"name": updated.name, "version": updated.version},
         )
         return handle
 
@@ -182,6 +232,8 @@ class ObjectMemoryManager:
     def query_objects(self, pid: str, query: ObjectQuery) -> list[ObjectHandle]:
         results: list[ObjectHandle] = []
         for obj in self.store.list_objects():
+            if query.name is not None and obj.name != self._normalize_name(query.name):
+                continue
             if query.type is not None and obj.type.value != str(query.type):
                 continue
             if query.tags and not set(query.tags).issubset(set(obj.metadata.tags)):
@@ -327,6 +379,28 @@ class ObjectMemoryManager:
         )
         return snapshot_id
 
+    def release_process_owned(self, pid: str, preserve_oids: set[str] | None = None) -> list[str]:
+        preserve = set(preserve_oids or set())
+        released: list[str] = []
+        for oid in self.store.list_object_oids_created_by(pid):
+            if oid in preserve:
+                obj = self.store.get_object(oid)
+                if obj is not None:
+                    self.store.update_object(replace(obj, created_by=f"process_result:{pid}"))
+                continue
+            self.store.delete_object(oid)
+            released.append(oid)
+        if released or preserve:
+            self.audit.record(
+                actor="memory",
+                action="memory.release_process_owned",
+                target=f"process:{pid}",
+                input_refs=released,
+                output_refs=sorted(preserve),
+                decision={"released": released, "preserved": sorted(preserve)},
+            )
+        return released
+
     def materialize_context(
         self,
         pid: str,
@@ -377,6 +451,7 @@ class ObjectMemoryManager:
     def _search_text(self, obj: AgentObject) -> str:
         return " ".join(
             [
+                obj.name,
                 obj.metadata.title or "",
                 obj.metadata.summary or "",
                 " ".join(obj.metadata.tags),
@@ -400,4 +475,18 @@ class ObjectMemoryManager:
     def _render_object(self, obj: AgentObject) -> str:
         title = f" title={obj.metadata.title!r}" if obj.metadata.title else ""
         summary = f"\nsummary: {obj.metadata.summary}" if obj.metadata.summary else ""
-        return f"[{obj.oid}] type={obj.type.value} version={obj.version}{title}{summary}\npayload: {obj.payload!r}"
+        return f"[{obj.oid}] name={obj.name!r} type={obj.type.value} version={obj.version}{title}{summary}\npayload: {obj.payload!r}"
+
+    def _default_name(self, object_type: ObjectType, oid: str) -> str:
+        return f"{object_type.value}:{oid}"
+
+    def _normalize_name(self, name: str) -> str:
+        normalized = name.strip()
+        if not normalized:
+            raise ValidationError("object name must be non-empty")
+        return normalized
+
+    def _require_unique_name(self, name: str, except_oid: str | None = None) -> None:
+        existing = self.store.get_object_by_name(name)
+        if existing is not None and existing.oid != except_oid:
+            raise ValidationError(f"object name already exists: {name}")
