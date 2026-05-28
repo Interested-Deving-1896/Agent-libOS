@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.external import FilesystemAdapter
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.images import DEFAULT_IMAGES
 from agent_libos.llm.client import LLMClient
@@ -39,6 +40,7 @@ class Runtime:
         self.capability = CapabilityManager(store, self.audit, self.events)
         self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events)
         self.human = HumanObjectManager(store, self.capability, self.audit, self.events)
+        self.filesystem = FilesystemAdapter(self.capability, self.audit, self.events, root=self.workspace_root)
         self.tools = ToolBroker(
             store,
             self.memory,
@@ -107,6 +109,25 @@ class Runtime:
                     action="image.default_tool_grant_failed",
                     target=f"process:{pid}",
                     decision={"tool": tool_name, "error": str(exc)},
+                )
+        for spec in image.required_capabilities:
+            try:
+                self.capability.grant(
+                    subject=pid,
+                    resource=spec["resource"],
+                    rights=spec.get("rights", []),
+                    issued_by=f"image:{image_id}",
+                    constraints=spec.get("constraints"),
+                    expires_at=spec.get("expires_at"),
+                    delegable=spec.get("delegable", False),
+                    revocable=spec.get("revocable", True),
+                )
+            except Exception as exc:
+                self.audit.record(
+                    actor="runtime",
+                    action="image.default_capability_grant_failed",
+                    target=f"process:{pid}",
+                    decision={"capability": spec, "error": str(exc)},
                 )
 
     def _register_builtin_tools(self) -> None:

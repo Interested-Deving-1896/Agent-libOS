@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from uuid import uuid4
 
 from agent_libos import Runtime
-from agent_libos.models import ProcessStatus
+from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.serde import to_jsonable
 
 
@@ -25,6 +24,7 @@ def main() -> None:
         )
         pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
         runtime.tools.grant_execute(pid, "write_text_file", issued_by="smoke-test")
+        runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="smoke-test")
         results = runtime.run_until_idle(max_quanta=args.max_quanta)
         target = runtime.workspace_root / args.path
         file_exists = target.exists()

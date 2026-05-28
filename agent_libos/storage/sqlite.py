@@ -578,7 +578,7 @@ class SQLiteStore:
         snapshot: dict[str, list[dict[str, Any]]] = {}
         with self._lock:
             for table in self.SNAPSHOT_TABLES:
-                snapshot[table] = [dict(row) for row in self.conn.execute(f"SELECT * FROM {table}")]
+                snapshot[table] = [self._row_to_dict(row) for row in self.conn.execute(f"SELECT * FROM {table}")]
         return snapshot
 
     def restore_tables(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
@@ -617,6 +617,9 @@ class SQLiteStore:
             process.created_at,
             process.updated_at,
         )
+
+    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {key: row[key] for key in row.keys()}
 
     def _row_to_object(self, row: sqlite3.Row) -> AgentObject:
         metadata = ObjectMetadata(**loads(row["metadata_json"], {}))

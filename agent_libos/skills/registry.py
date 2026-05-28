@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import builtins
+
 from agent_libos.exceptions import NotFound
 from agent_libos.skills.schema import SkillSpec
 
@@ -18,6 +20,5 @@ class RuntimeSkillRegistry:
         except KeyError as exc:
             raise NotFound(f"skill not found: {skill_id}") from exc
 
-    def list(self) -> list[SkillSpec]:
-        return list(self._skills.values())
-
+    def list(self) -> builtins.list[SkillSpec]:
+        return builtins.list(self._skills.values())

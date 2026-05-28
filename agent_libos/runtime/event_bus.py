@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from typing import Any
 
 from agent_libos.ids import new_id, utc_now
@@ -13,7 +14,7 @@ class EventBus:
 
     def emit(
         self,
-        type: EventType | str,
+        event_type: EventType | str,
         source: str,
         target: str | None = None,
         payload: dict[str, Any] | None = None,
@@ -23,7 +24,7 @@ class EventBus:
     ) -> Event:
         event = Event(
             event_id=new_id("evt"),
-            type=EventType(type),
+            type=EventType(event_type),
             source=source,
             target=target,
             payload=payload or {},
@@ -35,6 +36,5 @@ class EventBus:
         self.store.insert_event(event)
         return event
 
-    def list(self, target: str | None = None) -> list[Event]:
+    def list(self, target: str | None = None) -> builtins.list[Event]:
         return self.store.list_events(target=target)
-

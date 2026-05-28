@@ -142,6 +142,9 @@ class EventType(StrEnum):
     CAPABILITY_REVOKED = "capability_revoked"
     CHECKPOINT_CREATED = "checkpoint_created"
     ROLLBACK = "rollback"
+    EXTERNAL_READ = "external_read"
+    EXTERNAL_WRITE = "external_write"
+    HUMAN_OUTPUT = "human_output"
 
 
 class EventPriority(StrEnum):

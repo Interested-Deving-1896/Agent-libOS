@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from collections.abc import Callable
 from typing import Any, Iterable
 
@@ -42,7 +43,7 @@ class ProcessManager:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
-        self._after_spawn_hooks: list[Callable[[str, str], None]] = []
+        self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
 
     def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
         self._after_spawn_hooks.append(hook)
@@ -51,7 +52,7 @@ class ProcessManager:
         self,
         image: str = "base-agent:v0",
         goal: dict[str, Any] | str | ObjectHandle | None = None,
-        capabilities: list[dict[str, Any]] | None = None,
+        capabilities: builtins.list[dict[str, Any]] | None = None,
         resource_budget: ResourceBudget | None = None,
     ) -> str:
         now = utc_now()
@@ -102,7 +103,7 @@ class ProcessManager:
         parent: str,
         goal: dict[str, Any] | str | ObjectHandle,
         memory_view: MemoryView | MemoryViewSpec | None = None,
-        capabilities: list[dict[str, Any]] | None = None,
+        capabilities: builtins.list[dict[str, Any]] | None = None,
         image: str | None = None,
         mode: ForkMode | str = ForkMode.RESTRICTED,
     ) -> str:
@@ -135,13 +136,13 @@ class ProcessManager:
         )
         self.store.insert_process(child)
         goal_handle = self._ensure_goal(child_pid, goal)
-        parent_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
+        source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
         if isinstance(memory_view, MemoryView):
-            parent_view = memory_view
+            source_view = memory_view
             spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
         else:
             spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
-        child_view = self.memory.fork_view(parent, child_pid, parent_view, spec)
+        child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
         child_view.roots.append(goal_handle)
         child.goal_oid = goal_handle.oid
         child.memory_view = child_view
@@ -177,8 +178,8 @@ class ProcessManager:
         process = self._get(pid)
         old_image = process.image_id
         if not preserve_capabilities:
-            kept: list[str] = []
-            for cap_id in list(process.capabilities):
+            kept: builtins.list[str] = []
+            for cap_id in builtins.list(process.capabilities):
                 cap = self.store.get_capability(cap_id)
                 if cap is None:
                     continue
@@ -298,7 +299,7 @@ class ProcessManager:
     def get(self, pid: str) -> AgentProcess:
         return self._get(pid)
 
-    def list(self) -> list[AgentProcess]:
+    def list(self) -> builtins.list[AgentProcess]:
         return self.store.list_processes()
 
     def _get(self, pid: str) -> AgentProcess:
@@ -313,7 +314,7 @@ class ProcessManager:
         payload = {"text": goal or "Run agent process"} if isinstance(goal, str) or goal is None else goal
         return self.memory.create_object(
             pid=pid,
-            type=ObjectType.GOAL,
+            object_type=ObjectType.GOAL,
             payload=payload,
             metadata=ObjectMetadata(title="Process goal", tags=["goal"]),
             immutable=True,

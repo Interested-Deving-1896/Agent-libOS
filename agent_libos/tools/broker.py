@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 from typing import Any
 
@@ -96,8 +97,8 @@ class ToolBroker:
         pid: str,
         spec: ToolSpec | dict[str, Any],
         source_code: str,
-        tests: list[dict[str, Any]] | None = None,
-        requested_capabilities: list[dict[str, Any]] | None = None,
+        tests: builtins.list[dict[str, Any]] | None = None,
+        requested_capabilities: builtins.list[dict[str, Any]] | None = None,
     ) -> str:
         tool_spec = spec if isinstance(spec, ToolSpec) else ToolSpec(**spec)
         now = utc_now()
@@ -115,9 +116,9 @@ class ToolBroker:
         )
         self.store.insert_tool_candidate(candidate)
         candidate_obj = self.memory.create_object(
-            pid,
-            ObjectType.TOOL_CANDIDATE,
-            {
+            pid=pid,
+            object_type=ObjectType.TOOL_CANDIDATE,
+            payload={
                 "candidate_id": candidate.candidate_id,
                 "spec": {
                     "name": tool_spec.name,
@@ -292,7 +293,7 @@ class ToolBroker:
 
         result_handle = self.memory.create_object(
             pid=pid,
-            type=ObjectType.TOOL_RESULT,
+            object_type=ObjectType.TOOL_RESULT,
             payload=result_payload,
             metadata=ObjectMetadata(title=f"Tool result: {handle.name}", tags=["tool_result", handle.name]),
             immutable=True,
@@ -335,10 +336,10 @@ class ToolBroker:
                 return handle
         raise NotFound(f"tool not found: {tool}")
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self) -> builtins.list[dict[str, Any]]:
         return self.store.list_tools()
 
-    def openai_tool_schemas(self) -> list[dict[str, Any]]:
+    def openai_tool_schemas(self) -> builtins.list[dict[str, Any]]:
         schemas = [tool.to_openai_chat_tool() for tool in self._tools.values()]
         for tool_id in self._jit_sources:
             spec = self.store.get_tool_spec(tool_id)

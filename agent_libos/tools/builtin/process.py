@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from agent_libos.models import ObjectMetadata, ObjectType
+from agent_libos.models import ObjectHandle, ObjectMetadata, ObjectType
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 
@@ -46,22 +46,24 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
     tags = ["process", "lifecycle"]
 
     def run(self, args: ProcessExitArgs, ctx: ToolContext) -> ProcessExitOutput:
-        if ctx.runtime is None:
+        runtime = ctx.runtime
+        if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        result_handle = None
+        result_handle: ObjectHandle | None = None
         if args.result_oid:
-            result_handle = ctx.runtime.capability.handle_for_object(
+            result_handle = runtime.capability.handle_for_object(
                 ctx.pid,
                 args.result_oid,
                 {"read", "materialize", "link", "diff"},
                 issued_by="process_exit_tool",
             )
         elif args.payload is not None:
-            result_handle = ctx.runtime.memory.create_object(
+            result_handle = runtime.memory.create_object(
                 pid=ctx.pid,
-                type=ObjectType.SUMMARY,
+                object_type=ObjectType.SUMMARY,
                 payload=args.payload,
                 metadata=ObjectMetadata(title="Process final result", tags=["final"]),
             )
-        ctx.runtime.process.exit(ctx.pid, result=result_handle, message=args.message)
-        return ProcessExitOutput(status="exited", result_oid=result_handle.oid if result_handle else None)
+        runtime.process.exit(ctx.pid, result=result_handle, message=args.message)
+        result_oid = result_handle.oid if result_handle is not None else None
+        return ProcessExitOutput(status="exited", result_oid=result_oid)

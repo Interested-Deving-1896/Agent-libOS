@@ -10,6 +10,5 @@ dist/
 build/
 *.egg-info/
 agent_outputs/
-.env
 .idea
 .vscode

@@ -3,7 +3,7 @@ from __future__ import annotations
 from agent_libos.models import AgentImage
 
 
-DEFAULT_IMAGES = {
+DEFAULT_IMAGES: dict[str, AgentImage] = {
     "base-agent:v0": AgentImage(
         image_id="base-agent:v0",
         name="base-agent",
@@ -11,6 +11,7 @@ DEFAULT_IMAGES = {
         system_prompt="General purpose Agent libOS process image.",
         default_tools=["create_memory_object", "human_output", "process_exit"],
         context_policy="plan_first",
+        required_capabilities=[{"resource": "human:owner", "rights": ["write"]}],
     ),
     "coding-agent:v0": AgentImage(
         image_id="coding-agent:v0",
@@ -20,6 +21,10 @@ DEFAULT_IMAGES = {
         default_tools=["create_memory_object", "human_output", "parse_pytest_log", "process_exit", "read_text_file"],
         context_policy="error_debug",
         safety_profile="coding",
+        required_capabilities=[
+            {"resource": "human:owner", "rights": ["write"]},
+            {"resource": "filesystem:workspace:*", "rights": ["read"]},
+        ],
     ),
     "toolmaker-agent:v0": AgentImage(
         image_id="toolmaker-agent:v0",

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+from collections import Counter
 from typing import Any
 
 from agent_libos.exceptions import HumanApprovalRequired
-from agent_libos.models import ForkMode, MemoryViewSpec, ObjectMetadata, ObjectType, ViewMode
+from agent_libos.models import CapabilityRight, ForkMode, MemoryViewSpec, ObjectMetadata, ObjectType, ToolCallResult, ViewMode
 from agent_libos.runtime.runtime import Runtime
+
+
+DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
+DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -58,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def run_demo(runtime: Runtime) -> dict[str, Any]:
+    tool_sequence: list[dict[str, Any]] = []
     root = runtime.process.spawn(
         image="coding-agent:v0",
         goal={"text": "Fix failing tests in this repository"},
@@ -69,9 +74,9 @@ def run_demo(runtime: Runtime) -> dict[str, Any]:
     ==================== 1 failed, 3 passed in 0.12s ====================
     """.strip()
     log_handle = runtime.memory.create_object(
-        root,
-        ObjectType.ERROR_TRACE,
-        {"log": log},
+        pid=root,
+        object_type=ObjectType.ERROR_TRACE,
+        payload={"log": log},
         metadata=ObjectMetadata(title="pytest failure log", tags=["pytest", "failure"]),
     )
     root_proc = runtime.process.get(root)
@@ -88,6 +93,7 @@ def run_demo(runtime: Runtime) -> dict[str, Any]:
     parse_tool = runtime.tools.resolve("parse_pytest_log")
     runtime.tools.grant_execute(worker, parse_tool, issued_by="demo")
     parsed = runtime.tools.call(worker, parse_tool, {"log": log})
+    tool_sequence.append(_tool_call_summary("parse_pytest_log", worker, parsed))
     runtime.process.exit(worker, parsed.result_handle)
     worker_result = runtime.process.wait(root, worker)
     if worker_result.result is not None:
@@ -120,43 +126,120 @@ def run(args):
     validation = runtime.tools.validate(candidate)
     jit_tool = runtime.tools.register(root, candidate) if validation.ok else None
     jit_result = runtime.tools.call(root, jit_tool, {"log": log}) if jit_tool is not None else None
+    if jit_result is not None:
+        tool_sequence.append(_tool_call_summary("extract_failed_tests", root, jit_result))
 
     checkpoint = runtime.checkpoint.checkpoint(root, "before high-risk patch application")
     approval_request = None
+    write_args = {
+        "path": DEMO_PATCH_PREVIEW_PATH,
+        "content": DEMO_PATCH_PREVIEW_CONTENT,
+        "overwrite": True,
+    }
     try:
-        runtime.tools.call(
-            root,
-            "write_text_file",
-            {
-                "path": "agent_outputs/demo_patch_preview.txt",
-                "content": "change add() expected value\n",
-                "overwrite": True,
-            },
-        )
+        runtime.tools.call(root, "write_text_file", write_args)
     except HumanApprovalRequired as exc:
         approval_request = exc.request_id
         runtime.human.approve(exc.request_id, {"approved": True, "reason": "demo approval"})
-    approved_call = runtime.tools.call(
+        tool_sequence.append(
+            {
+                "pid": root,
+                "tool": "write_text_file",
+                "ok": False,
+                "waiting_human": True,
+                "approval_request": approval_request,
+                "reason": "missing tool execute capability",
+            }
+        )
+    if approval_request is None:
+        raise RuntimeError("demo expected missing write_text_file execute capability to request human approval")
+
+    denied_without_filesystem = runtime.tools.call(root, "write_text_file", write_args)
+    tool_sequence.append(_tool_call_summary("write_text_file", root, denied_without_filesystem))
+    if denied_without_filesystem.ok:
+        raise RuntimeError("demo expected write_text_file to fail before filesystem write capability was granted")
+
+    runtime.filesystem.grant_path(
         root,
-        "write_text_file",
-        {
-            "path": "agent_outputs/demo_patch_preview.txt",
-            "content": "change add() expected value\n",
-            "overwrite": True,
-        },
+        DEMO_PATCH_PREVIEW_PATH,
+        [CapabilityRight.WRITE],
+        issued_by="human:owner",
     )
-    report_handle = runtime.memory.create_object(
-        root,
-        ObjectType.SUMMARY,
-        {
-            "worker_result_oid": worker_result.result.oid if worker_result.result else None,
-            "jit_result": jit_result.payload if jit_result else None,
-            "approved_call": approved_call.payload,
-            "checkpoint": checkpoint,
+    approved_call = runtime.tools.call(root, "write_text_file", write_args)
+    tool_sequence.append(_tool_call_summary("write_text_file", root, approved_call))
+    target = runtime.workspace_root / DEMO_PATCH_PREVIEW_PATH
+    target_exists = target.exists()
+    target_content_matches = target_exists and target.read_text(encoding="utf-8") == DEMO_PATCH_PREVIEW_CONTENT
+    if not approved_call.ok or not target_content_matches:
+        raise RuntimeError("demo write_text_file contract failed")
+
+    audit_records = runtime.audit.trace()
+    audit_summary = dict(Counter(record.action for record in audit_records))
+    filesystem_resource = runtime.filesystem.resource_for(DEMO_PATCH_PREVIEW_PATH)
+    report_payload = {
+        "summary": (
+            "Analyzed a failing pytest log, extracted the failed test, checkpointed before the write, "
+            "requested human approval for tool execution, verified filesystem denial before external-resource "
+            "authorization, and wrote a patch preview file."
+        ),
+        "problem": {
+            "failed_test": "tests/test_math.py::test_add",
+            "assertion": "AssertionError: assert 5 == 4",
+            "source": "synthetic pytest failure log",
         },
+        "evidence": [
+            {"kind": "pytest_log", "oid": log_handle.oid, "title": "pytest failure log"},
+            {
+                "kind": "worker_parse_result",
+                "oid": worker_result.result.oid if worker_result.result else None,
+                "payload": parsed.payload,
+            },
+            {"kind": "jit_extract_result", "payload": jit_result.payload if jit_result else None},
+            {"kind": "filesystem_denial", "payload": denied_without_filesystem.payload, "error": denied_without_filesystem.error},
+        ],
+        "tool_sequence": tool_sequence,
+        "authorization": {
+            "tool_execute_approval_request": approval_request,
+            "filesystem_write_resource": filesystem_resource,
+            "filesystem_write_granted_by": "human:owner",
+            "filesystem_write_denied_before_grant": {
+                "ok": denied_without_filesystem.ok,
+                "error": denied_without_filesystem.error,
+            },
+        },
+        "external_side_effects": [
+            {
+                "adapter": "filesystem",
+                "action": "write_text",
+                "path": DEMO_PATCH_PREVIEW_PATH,
+                "bytes_written": approved_call.payload.get("bytes_written") if isinstance(approved_call.payload, dict) else None,
+                "audit_action": "external.filesystem.write_text",
+            }
+        ],
+        "checkpoint": checkpoint,
+        "write_result": _tool_call_summary("write_text_file", root, approved_call),
+        "target_file": {
+            "path": DEMO_PATCH_PREVIEW_PATH,
+            "exists": target_exists,
+            "content_matches": target_content_matches,
+        },
+        "audit_summary": audit_summary,
+        "limits": "This demo writes a patch preview only; it is not a production automatic repair system.",
+        "next_steps": [
+            "Review the patch preview.",
+            "Add real repository tests for the suspected math assertion.",
+            "Implement policy decisions for side-effect tools before expanding external adapters.",
+        ],
+    }
+    report_handle = runtime.memory.create_object(
+        pid=root,
+        object_type=ObjectType.SUMMARY,
+        payload=report_payload,
         metadata=ObjectMetadata(title="coding-agent demo final report", tags=["demo", "report"]),
     )
     runtime.process.exit(root, report_handle)
+    final_audit_records = runtime.audit.trace()
+    final_audit_summary = dict(Counter(record.action for record in final_audit_records))
     return {
         "root": root,
         "worker": worker,
@@ -165,9 +248,30 @@ def run(args):
         "jit_validation_ok": validation.ok,
         "jit_result": jit_result.payload if jit_result else None,
         "approval_request": approval_request,
+        "filesystem_write_denial": _tool_call_summary("write_text_file", root, denied_without_filesystem),
         "checkpoint": checkpoint,
+        "tool_sequence": tool_sequence,
+        "write_result": _tool_call_summary("write_text_file", root, approved_call),
+        "write_path": DEMO_PATCH_PREVIEW_PATH,
+        "target_file_exists": target_exists,
+        "target_file_content_matches": target_content_matches,
         "final_report_oid": report_handle.oid,
-        "audit_records": len(runtime.audit.trace()),
+        "final_report": report_payload,
+        "audit_records": len(final_audit_records),
+        "audit_summary": final_audit_summary,
+    }
+
+
+def _tool_call_summary(tool: str, pid: str, result: ToolCallResult) -> dict[str, Any]:
+    return {
+        "pid": pid,
+        "tool": tool,
+        "ok": result.ok,
+        "tool_id": result.tool_id,
+        "call_id": result.call_id,
+        "result_oid": result.result_handle.oid if result.result_handle else None,
+        "payload": result.payload,
+        "error": result.error,
     }
 
 

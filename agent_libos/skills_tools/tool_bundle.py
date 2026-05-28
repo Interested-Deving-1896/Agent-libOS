@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, field
 
 from agent_libos.exceptions import NotFound
@@ -28,6 +29,5 @@ class ToolBundleManager:
         except KeyError as exc:
             raise NotFound(f"tool bundle not found: {bundle_id}") from exc
 
-    def list(self) -> list[ToolBundle]:
-        return list(self._bundles.values())
-
+    def list(self) -> builtins.list[ToolBundle]:
+        return builtins.list(self._bundles.values())

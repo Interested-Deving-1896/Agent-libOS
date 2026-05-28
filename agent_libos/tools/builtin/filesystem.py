@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import BaseModel, Field
 
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
@@ -37,7 +35,8 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     name = "read_text_file"
     description = (
         "Read UTF-8 text from a file under the runtime workspace root. "
-        "This is a Skills/Tools Layer wrapper around workspace filesystem reads."
+        "This is a Skills/Tools Layer wrapper around the libOS filesystem primitive; "
+        "the primitive enforces filesystem read capability, path containment, audit, and events."
     )
     args_schema = ReadTextFileArgs
     output_schema = ReadTextFileOutput
@@ -52,25 +51,16 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     tags = ["filesystem", "workspace", "read"]
 
     def run(self, args: ReadTextFileArgs, ctx: ToolContext) -> ReadTextFileOutput:
-        workspace = _workspace(ctx)
-        target = _resolve_workspace_path(workspace, args.path)
-        if not target.exists():
-            raise ToolExecutionError(
-                "File does not exist.",
-                code=ToolErrorCode.EXECUTION_ERROR,
-                details={"path": str(target.relative_to(workspace))},
-            )
-        if not target.is_file():
-            raise ToolExecutionError(
-                "Path is not a file.",
-                code=ToolErrorCode.EXECUTION_ERROR,
-                details={"path": str(target.relative_to(workspace))},
-            )
-        raw = target.read_bytes()
-        truncated = len(raw) > args.max_bytes
-        selected = raw[: args.max_bytes]
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         try:
-            content = selected.decode(args.encoding)
+            result = runtime.filesystem.read_text(
+                pid=ctx.pid,
+                path=args.path,
+                encoding=args.encoding,
+                max_bytes=args.max_bytes,
+            )
         except UnicodeDecodeError as exc:
             raise ToolExecutionError(
                 "File could not be decoded with the requested encoding.",
@@ -78,10 +68,10 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
                 details={"encoding": args.encoding, "error": str(exc)},
             ) from exc
         return ReadTextFileOutput(
-            path=str(target.relative_to(workspace)),
-            content=content,
-            bytes_read=len(selected),
-            truncated=truncated,
+            path=result.path,
+            content=result.content,
+            bytes_read=result.bytes_read,
+            truncated=result.truncated,
         )
 
 
@@ -89,7 +79,8 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
     name = "write_text_file"
     description = (
         "Write UTF-8 text to a file under the runtime workspace root. "
-        "This is a Skills/Tools Layer wrapper around filesystem side effects, not a kernel syscall."
+        "This is a Skills/Tools Layer wrapper around the libOS filesystem primitive; "
+        "the primitive enforces filesystem write capability, path containment, audit, and events."
     )
     args_schema = WriteTextFileArgs
     output_schema = WriteTextFileOutput
@@ -104,45 +95,25 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
     tags = ["filesystem", "workspace", "side_effect"]
 
     def run(self, args: WriteTextFileArgs, ctx: ToolContext) -> WriteTextFileOutput:
-        workspace = _workspace(ctx)
-        target = _resolve_workspace_path(workspace, args.path)
-        created = not target.exists()
-        if target.exists() and not args.overwrite:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        try:
+            result = runtime.filesystem.write_text(
+                pid=ctx.pid,
+                path=args.path,
+                text=args.content,
+                encoding=args.encoding,
+                overwrite=args.overwrite,
+            )
+        except FileExistsError as exc:
             raise ToolExecutionError(
                 "File already exists and overwrite is false.",
                 code=ToolErrorCode.EXECUTION_ERROR,
-                details={"path": str(target.relative_to(workspace))},
-            )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(args.content, encoding=args.encoding)
+                details={"path": args.path},
+            ) from exc
         return WriteTextFileOutput(
-            path=str(target.relative_to(workspace)),
-            bytes_written=len(args.content.encode(args.encoding)),
-            created=created,
+            path=result.path,
+            bytes_written=result.bytes_written,
+            created=result.created,
         )
-
-
-def _workspace(ctx: ToolContext) -> Path:
-    if ctx.workspace_id is None:
-        raise ToolExecutionError(
-            "No workspace is available for filesystem access.",
-            code=ToolErrorCode.PERMISSION_DENIED,
-        )
-    return Path(ctx.workspace_id).resolve()
-
-
-def _resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
-    path = Path(raw_path)
-    if path.is_absolute():
-        raise ToolExecutionError(
-            "Path must be relative to the workspace root.",
-            code=ToolErrorCode.PERMISSION_DENIED,
-        )
-    target = (workspace / path).resolve()
-    if target != workspace and workspace not in target.parents:
-        raise ToolExecutionError(
-            "Path escapes workspace.",
-            code=ToolErrorCode.PERMISSION_DENIED,
-            details={"path": raw_path},
-        )
-    return target

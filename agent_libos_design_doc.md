@@ -1,8 +1,11 @@
 # Agent libOS 设计文档
 
+`本文档部分内容可能已经过时`
+
 ## 0. 文档目的
 
-本文档用于指导团队实现一个以 **Agent Process** 为核心抽象的 Agent libOS 框架。该框架不以传统 LLM 聊天界面为中心，而是将 Agent 建模为长期运行、可调度、可中断、可扩展、可审计的执行主体。
+本文档用于指导团队实现一个以 **Agent Process** 为核心抽象的 Agent libOS 框架。该框架不以传统 LLM 聊天界面为中心，而是将
+Agent 建模为长期运行、可调度、可中断、可扩展、可审计的执行主体。
 
 系统目标是提供一组 Agent-native 的运行时原语，使 Agent 能够：
 
@@ -217,14 +220,14 @@ Skills / Tools Layer 位于 Agent personality 与 Agent LibOS 之间，承担类
 
    每个暴露给模型的 tool/action 都必须有清晰的：
 
-   - 名称；
-   - 使用场景；
-   - 输入 schema；
-   - 输出 schema；
-   - 权限需求；
-   - 副作用说明；
-   - 失败模式；
-   - 示例。
+    - 名称；
+    - 使用场景；
+    - 输入 schema；
+    - 输出 schema；
+    - 权限需求；
+    - 副作用说明；
+    - 失败模式；
+    - 示例。
 
 3. **组合常用工作流**
 
@@ -237,10 +240,11 @@ Skills / Tools Layer 位于 Agent personality 与 Agent LibOS 之间，承担类
    inspect_process_status(pid)
    rollback_to_last_safe_checkpoint()
    ```
-   
+
 4. **隔离模型与底层复杂性**
 
-   Agent 不应直接调用 `capability.grant`、`checkpoint.restore`、`memory.merge_view` 等危险或复杂原语，尽管原语内部有 PolicyEngine 检查。此类能力应通过受限 tool 或 skill 暴露。
+   Agent 不应直接调用 `capability.grant`、`checkpoint.restore`、`memory.merge_view` 等危险或复杂原语，尽管原语内部有
+   PolicyEngine 检查。此类能力应通过受限 tool 或 skill 暴露。
 
 5. **支持领域专用能力包**
 
@@ -269,7 +273,8 @@ Skills / Tools Layer 位于 Agent personality 与 Agent LibOS 之间，承担类
 
 6. **作为 JIT tool 的落点**
 
-   Agent 生成的新工具不应直接进入 libOS，而应进入 Skills / Tools Layer 的 registry。ToolBroker 负责验证和注册，Skills / Tools Layer 负责将其包装成 LLM 可用 action。
+   Agent 生成的新工具不应直接进入 libOS，而应进入 Skills / Tools Layer 的 registry。ToolBroker 负责验证和注册，Skills /
+   Tools Layer 负责将其包装成 LLM 可用 action。
 
 ### 2.4 关键数据流
 
@@ -365,22 +370,22 @@ class ProcessStatus(Enum):
 ```python
 class ProcessAPI:
     def fork(
-        self,
-        parent: PID,
-        goal: ObjectHandle,
-        memory_view: MemoryViewSpec,
-        capabilities: CapabilitySpec,
-        image: AgentImageRef | None = None,
-        mode: ForkMode = ForkMode.RESTRICTED,
+            self,
+            parent: PID,
+            goal: ObjectHandle,
+            memory_view: MemoryViewSpec,
+            capabilities: CapabilitySpec,
+            image: AgentImageRef | None = None,
+            mode: ForkMode = ForkMode.RESTRICTED,
     ) -> PID: ...
 
     def exec(
-        self,
-        pid: PID,
-        image: AgentImageRef,
-        args: dict,
-        preserve_memory: bool = True,
-        preserve_capabilities: bool = False,
+            self,
+            pid: PID,
+            image: AgentImageRef,
+            args: dict,
+            preserve_memory: bool = True,
+            preserve_capabilities: bool = False,
     ) -> None: ...
 
     def wait(self, pid: PID, child: PID, timeout: Duration | None = None) -> ProcessResult: ...
@@ -675,69 +680,69 @@ class ViewMode(Enum):
 ```python
 class ObjectMemoryAPI:
     def create_object(
-        self,
-        pid: PID,
-        type: ObjectType,
-        payload: Any,
-        metadata: ObjectMetadata | None = None,
-        immutable: bool = True,
+            self,
+            pid: PID,
+            type: ObjectType,
+            payload: Any,
+            metadata: ObjectMetadata | None = None,
+            immutable: bool = True,
     ) -> ObjectHandle: ...
 
     def get_object(self, pid: PID, handle: ObjectHandle) -> AgentObject: ...
 
     def update_object(
-        self,
-        pid: PID,
-        handle: ObjectHandle,
-        patch: ObjectPatch,
+            self,
+            pid: PID,
+            handle: ObjectHandle,
+            patch: ObjectPatch,
     ) -> ObjectHandle: ...
 
     def link_objects(
-        self,
-        pid: PID,
-        src: ObjectHandle,
-        relation: RelationType,
-        dst: ObjectHandle,
-        metadata: dict | None = None,
+            self,
+            pid: PID,
+            src: ObjectHandle,
+            relation: RelationType,
+            dst: ObjectHandle,
+            metadata: dict | None = None,
     ) -> None: ...
 
     def query_objects(
-        self,
-        pid: PID,
-        query: ObjectQuery,
+            self,
+            pid: PID,
+            query: ObjectQuery,
     ) -> list[ObjectHandle]: ...
 
     def create_view(
-        self,
-        pid: PID,
-        roots: list[ObjectHandle],
-        mode: ViewMode,
-        filters: list[ObjectFilter] | None = None,
+            self,
+            pid: PID,
+            roots: list[ObjectHandle],
+            mode: ViewMode,
+            filters: list[ObjectFilter] | None = None,
     ) -> MemoryView: ...
 
     def fork_view(
-        self,
-        parent_pid: PID,
-        child_pid: PID,
-        parent_view: MemoryView,
-        spec: MemoryViewSpec,
+            self,
+            parent_pid: PID,
+            child_pid: PID,
+            parent_view: MemoryView,
+            spec: MemoryViewSpec,
     ) -> MemoryView: ...
 
     def merge_view(
-        self,
-        parent_pid: PID,
-        child_view: MemoryView,
-        policy: MergePolicy,
+            self,
+            parent_pid: PID,
+            child_view: MemoryView,
+            policy: MergePolicy,
     ) -> MergeResult: ...
 
     def snapshot_view(self, pid: PID, view: MemoryView) -> SnapshotID: ...
 
     def materialize_context(
-        self,
-        pid: PID,
-        view: MemoryView,
-        policy: ContextPolicy,
-        budget_tokens: int,
+            self,
+            pid: PID,
+            view: MemoryView,
+            policy: ContextPolicy,
+            budget_tokens: int,
     ) -> MaterializedContext: ...
 ```
 
@@ -841,19 +846,19 @@ class EventType(Enum):
 ```python
 class EventAPI:
     def send(
-        self,
-        source: ActorRef,
-        target: ActorRef,
-        type: EventType,
-        payload: dict,
-        priority: EventPriority = EventPriority.NORMAL,
+            self,
+            source: ActorRef,
+            target: ActorRef,
+            type: EventType,
+            payload: dict,
+            priority: EventPriority = EventPriority.NORMAL,
     ) -> EventID: ...
 
     def recv(
-        self,
-        pid: PID,
-        filter: EventFilter | None = None,
-        timeout: Duration | None = None,
+            self,
+            pid: PID,
+            filter: EventFilter | None = None,
+            timeout: Duration | None = None,
     ) -> Event | None: ...
 
     def poll(self, pid: PID, filter: EventFilter | None = None) -> list[Event]: ...
@@ -861,12 +866,12 @@ class EventAPI:
     def subscribe(self, pid: PID, filter: EventFilter) -> SubscriptionID: ...
 
     def interrupt(
-        self,
-        source: ActorRef,
-        target_pid: PID,
-        signal: ProcessSignal,
-        payload: dict | None = None,
-        priority: EventPriority = EventPriority.HIGH,
+            self,
+            source: ActorRef,
+            target_pid: PID,
+            signal: ProcessSignal,
+            payload: dict | None = None,
+            priority: EventPriority = EventPriority.HIGH,
     ) -> EventID: ...
 
     def ack(self, pid: PID, event_id: EventID) -> None: ...
@@ -876,12 +881,12 @@ class EventAPI:
 
 中断分为四类：
 
-| 类型 | 处理方式 | 示例 |
-|---|---|---|
-| Immediate | 立即抢占 | 停止删除文件、撤销网络调用 |
-| SafePoint | 到安全点处理 | 修改目标、切换策略 |
-| Deferred | 延迟生效 | 更新偏好、补充背景信息 |
-| Informational | 不改变执行 | 查询状态、请求解释 |
+| 类型            | 处理方式   | 示例            |
+|---------------|--------|---------------|
+| Immediate     | 立即抢占   | 停止删除文件、撤销网络调用 |
+| SafePoint     | 到安全点处理 | 修改目标、切换策略     |
+| Deferred      | 延迟生效   | 更新偏好、补充背景信息   |
+| Informational | 不改变执行  | 查询状态、请求解释     |
 
 ```python
 class InterruptClass(Enum):
@@ -960,46 +965,46 @@ class Right(Enum):
 ```python
 class CapabilityAPI:
     def request(
-        self,
-        pid: PID,
-        resource: ResourceRef,
-        rights: set[Right],
-        reason: str,
-        duration: Duration | None = None,
+            self,
+            pid: PID,
+            resource: ResourceRef,
+            rights: set[Right],
+            reason: str,
+            duration: Duration | None = None,
     ) -> CapabilityDecision: ...
 
     def grant(
-        self,
-        issuer: ActorRef,
-        subject: ActorRef,
-        resource: ResourceRef,
-        rights: set[Right],
-        constraints: list[CapabilityConstraint] | None = None,
-        duration: Duration | None = None,
+            self,
+            issuer: ActorRef,
+            subject: ActorRef,
+            resource: ResourceRef,
+            rights: set[Right],
+            constraints: list[CapabilityConstraint] | None = None,
+            duration: Duration | None = None,
     ) -> Capability: ...
 
     def revoke(self, issuer: ActorRef, cap_id: CapabilityID, reason: str) -> None: ...
 
     def check(
-        self,
-        subject: ActorRef,
-        resource: ResourceRef,
-        right: Right,
-        context: dict | None = None,
+            self,
+            subject: ActorRef,
+            resource: ResourceRef,
+            right: Right,
+            context: dict | None = None,
     ) -> bool: ...
 
     def delegate(
-        self,
-        pid: PID,
-        cap_id: CapabilityID,
-        target: ActorRef,
-        attenuation: CapabilityAttenuation,
+            self,
+            pid: PID,
+            cap_id: CapabilityID,
+            target: ActorRef,
+            attenuation: CapabilityAttenuation,
     ) -> Capability: ...
 
     def attenuate(
-        self,
-        cap: Capability,
-        attenuation: CapabilityAttenuation,
+            self,
+            cap: Capability,
+            attenuation: CapabilityAttenuation,
     ) -> Capability: ...
 ```
 
@@ -1067,12 +1072,12 @@ Skill 不应直接等同于 Tool。
 
 区别：
 
-| 概念 | 类比 | 作用 |
-|---|---|---|
-| Tool | function call / external service | 访问外部世界，可能有副作用 |
-| Skill | dynamic library | 增强 Agent 内部能力、策略和领域知识 |
-| AgentImage | executable image | 定义进程执行身份和默认行为 |
-| Subagent | child process | 隔离执行子任务 |
+| 概念         | 类比                               | 作用                    |
+|------------|----------------------------------|-----------------------|
+| Tool       | function call / external service | 访问外部世界，可能有副作用         |
+| Skill      | dynamic library                  | 增强 Agent 内部能力、策略和领域知识 |
+| AgentImage | executable image                 | 定义进程执行身份和默认行为         |
+| Subagent   | child process                    | 隔离执行子任务               |
 
 ### 3.6.3 SkillObject
 
@@ -1098,24 +1103,24 @@ class SkillObject:
 ```python
 class SkillAPI:
     def discover(
-        self,
-        pid: PID,
-        query: SkillQuery,
+            self,
+            pid: PID,
+            query: SkillQuery,
     ) -> list[SkillRef]: ...
 
     def load(
-        self,
-        pid: PID,
-        skill: SkillRef,
-        mode: SkillLoadMode = SkillLoadMode.LAZY,
+            self,
+            pid: PID,
+            skill: SkillRef,
+            mode: SkillLoadMode = SkillLoadMode.LAZY,
     ) -> SkillHandle: ...
 
     def unload(self, pid: PID, handle: SkillHandle) -> None: ...
 
     def resolve(
-        self,
-        pid: PID,
-        symbol: str,
+            self,
+            pid: PID,
+            symbol: str,
     ) -> SkillSymbol | None: ...
 
     def verify(self, skill: SkillRef) -> VerificationResult: ...
@@ -1210,31 +1215,31 @@ class ToolHandle:
 ```python
 class ToolAPI:
     def call(
-        self,
-        pid: PID,
-        tool: ToolHandle,
-        args: dict,
-        timeout: Duration | None = None,
+            self,
+            pid: PID,
+            tool: ToolHandle,
+            args: dict,
+            timeout: Duration | None = None,
     ) -> ToolCallID: ...
 
     def get_result(self, pid: PID, call_id: ToolCallID) -> ToolResultObject: ...
 
     def propose(
-        self,
-        pid: PID,
-        spec: ToolSpec,
-        source_code: str,
-        tests: list[ToolTest],
-        requested_capabilities: list[CapabilityRequirement],
+            self,
+            pid: PID,
+            spec: ToolSpec,
+            source_code: str,
+            tests: list[ToolTest],
+            requested_capabilities: list[CapabilityRequirement],
     ) -> ToolCandidateID: ...
 
     def validate(self, candidate: ToolCandidateID) -> ValidationResult: ...
 
     def register(
-        self,
-        approver: ActorRef,
-        candidate: ToolCandidateID,
-        scope: ToolScope,
+            self,
+            approver: ActorRef,
+            candidate: ToolCandidateID,
+            scope: ToolScope,
     ) -> ToolHandle: ...
 
     def revoke(self, issuer: ActorRef, tool_id: ToolID, reason: str) -> None: ...
@@ -1345,54 +1350,54 @@ class HumanRequestType(Enum):
 ```python
 class HumanAPI:
     def query(
-        self,
-        pid: PID,
-        human: HumanID,
-        request: HumanRequest,
+            self,
+            pid: PID,
+            human: HumanID,
+            request: HumanRequest,
     ) -> HumanRequestID: ...
 
     def receive_response(
-        self,
-        request_id: HumanRequestID,
-        response: HumanResponse,
+            self,
+            request_id: HumanRequestID,
+            response: HumanResponse,
     ) -> None: ...
 
     def interrupt(
-        self,
-        human: HumanID,
-        target_pid: PID,
-        signal: ProcessSignal,
-        payload: dict | None = None,
+            self,
+            human: HumanID,
+            target_pid: PID,
+            signal: ProcessSignal,
+            payload: dict | None = None,
     ) -> EventID: ...
 
     def inspect(
-        self,
-        human: HumanID,
-        pid: PID,
-        scope: InspectScope,
+            self,
+            human: HumanID,
+            pid: PID,
+            scope: InspectScope,
     ) -> InspectionResult: ...
 
     def approve(
-        self,
-        human: HumanID,
-        request_id: HumanRequestID,
-        decision: ApprovalDecision,
+            self,
+            human: HumanID,
+            request_id: HumanRequestID,
+            decision: ApprovalDecision,
     ) -> None: ...
 
     def grant_capability(
-        self,
-        human: HumanID,
-        pid: PID,
-        resource: ResourceRef,
-        rights: set[Right],
-        constraints: list[CapabilityConstraint],
+            self,
+            human: HumanID,
+            pid: PID,
+            resource: ResourceRef,
+            rights: set[Right],
+            constraints: list[CapabilityConstraint],
     ) -> Capability: ...
 
     def revoke_capability(
-        self,
-        human: HumanID,
-        cap_id: CapabilityID,
-        reason: str,
+            self,
+            human: HumanID,
+            cap_id: CapabilityID,
+            reason: str,
     ) -> None: ...
 ```
 
@@ -1448,10 +1453,10 @@ class CheckpointAPI:
     def restore(self, pid: PID, checkpoint: CheckpointID) -> None: ...
 
     def rollback(
-        self,
-        pid: PID,
-        checkpoint: CheckpointID,
-        rollback_policy: RollbackPolicy,
+            self,
+            pid: PID,
+            checkpoint: CheckpointID,
+            rollback_policy: RollbackPolicy,
     ) -> RollbackResult: ...
 
     def diff(self, a: CheckpointID, b: CheckpointID) -> CheckpointDiff: ...
@@ -1669,10 +1674,10 @@ class PolicyDecision(Enum):
 ```python
 class PolicyEngine:
     def evaluate_action(
-        self,
-        pid: PID,
-        action: ActionProposal,
-        context: PolicyContext,
+            self,
+            pid: PID,
+            action: ActionProposal,
+            context: PolicyContext,
     ) -> PolicyDecisionBundle: ...
 ```
 
@@ -1953,84 +1958,90 @@ MVP 可使用：
 ## 9.2 表结构草案
 
 ```sql
-CREATE TABLE objects (
-  oid TEXT PRIMARY KEY,
-  type TEXT NOT NULL,
-  schema_version TEXT NOT NULL,
-  payload_ref TEXT,
-  payload_json JSONB,
-  metadata JSONB NOT NULL,
-  provenance JSONB NOT NULL,
-  version INTEGER NOT NULL,
-  immutable BOOLEAN NOT NULL,
-  created_by TEXT NOT NULL,
-  created_at TIMESTAMP NOT NULL,
-  updated_at TIMESTAMP NOT NULL
+CREATE TABLE objects
+(
+    oid            TEXT PRIMARY KEY,
+    type           TEXT      NOT NULL,
+    schema_version TEXT      NOT NULL,
+    payload_ref    TEXT,
+    payload_json   JSONB,
+    metadata       JSONB     NOT NULL,
+    provenance     JSONB     NOT NULL,
+    version        INTEGER   NOT NULL,
+    immutable      BOOLEAN   NOT NULL,
+    created_by     TEXT      NOT NULL,
+    created_at     TIMESTAMP NOT NULL,
+    updated_at     TIMESTAMP NOT NULL
 );
 
-CREATE TABLE object_links (
-  id TEXT PRIMARY KEY,
-  src_oid TEXT NOT NULL,
-  relation TEXT NOT NULL,
-  dst_oid TEXT NOT NULL,
-  metadata JSONB,
-  created_by TEXT NOT NULL,
-  created_at TIMESTAMP NOT NULL
+CREATE TABLE object_links
+(
+    id         TEXT PRIMARY KEY,
+    src_oid    TEXT      NOT NULL,
+    relation   TEXT      NOT NULL,
+    dst_oid    TEXT      NOT NULL,
+    metadata   JSONB,
+    created_by TEXT      NOT NULL,
+    created_at TIMESTAMP NOT NULL
 );
 
-CREATE TABLE processes (
-  pid TEXT PRIMARY KEY,
-  parent_pid TEXT,
-  image_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  goal_oid TEXT,
-  memory_view_id TEXT,
-  capabilities JSONB,
-  loaded_skills JSONB,
-  tool_table JSONB,
-  event_cursor TEXT,
-  created_at TIMESTAMP NOT NULL,
-  updated_at TIMESTAMP NOT NULL
+CREATE TABLE processes
+(
+    pid            TEXT PRIMARY KEY,
+    parent_pid     TEXT,
+    image_id       TEXT      NOT NULL,
+    status         TEXT      NOT NULL,
+    goal_oid       TEXT,
+    memory_view_id TEXT,
+    capabilities   JSONB,
+    loaded_skills  JSONB,
+    tool_table     JSONB,
+    event_cursor   TEXT,
+    created_at     TIMESTAMP NOT NULL,
+    updated_at     TIMESTAMP NOT NULL
 );
 
-CREATE TABLE events (
-  event_id TEXT PRIMARY KEY,
-  type TEXT NOT NULL,
-  source TEXT NOT NULL,
-  target TEXT,
-  payload JSONB NOT NULL,
-  priority INTEGER NOT NULL,
-  created_at TIMESTAMP NOT NULL,
-  correlation_id TEXT,
-  causality JSONB
+CREATE TABLE events
+(
+    event_id       TEXT PRIMARY KEY,
+    type           TEXT      NOT NULL,
+    source         TEXT      NOT NULL,
+    target         TEXT,
+    payload        JSONB     NOT NULL,
+    priority       INTEGER   NOT NULL,
+    created_at     TIMESTAMP NOT NULL,
+    correlation_id TEXT,
+    causality      JSONB
 );
 
-CREATE TABLE capabilities (
-  cap_id TEXT PRIMARY KEY,
-  subject TEXT NOT NULL,
-  resource TEXT NOT NULL,
-  rights JSONB NOT NULL,
-  constraints JSONB,
-  issued_by TEXT NOT NULL,
-  issued_at TIMESTAMP NOT NULL,
-  expires_at TIMESTAMP,
-  delegable BOOLEAN NOT NULL,
-  revocable BOOLEAN NOT NULL,
-  revoked BOOLEAN NOT NULL DEFAULT FALSE
+CREATE TABLE capabilities
+(
+    cap_id      TEXT PRIMARY KEY,
+    subject     TEXT      NOT NULL,
+    resource    TEXT      NOT NULL,
+    rights      JSONB     NOT NULL,
+    constraints JSONB,
+    issued_by   TEXT      NOT NULL,
+    issued_at   TIMESTAMP NOT NULL,
+    expires_at  TIMESTAMP,
+    delegable   BOOLEAN   NOT NULL,
+    revocable   BOOLEAN   NOT NULL,
+    revoked     BOOLEAN   NOT NULL DEFAULT FALSE
 );
 
-CREATE TABLE audit_records (
-  record_id TEXT PRIMARY KEY,
-  timestamp TIMESTAMP NOT NULL,
-  actor TEXT NOT NULL,
-  action TEXT NOT NULL,
-  target TEXT,
-  input_refs JSONB,
-  output_refs JSONB,
-  capability_refs JSONB,
-  decision JSONB,
-  correlation_id TEXT,
-  parent_record_id TEXT
+CREATE TABLE audit_records
+(
+    record_id        TEXT PRIMARY KEY,
+    timestamp        TIMESTAMP NOT NULL,
+    actor            TEXT      NOT NULL,
+    action           TEXT      NOT NULL,
+    target           TEXT,
+    input_refs       JSONB,
+    output_refs      JSONB,
+    capability_refs  JSONB,
+    decision         JSONB,
+    correlation_id   TEXT,
+    parent_record_id TEXT
 );
 ```
 
@@ -2362,8 +2373,11 @@ MVP 可用 Docker，但接口要抽象为：
 ```python
 class SandboxBackend:
     def build(...): ...
+
     def run(...): ...
+
     def inspect(...): ...
+
     def destroy(...): ...
 ```
 
@@ -2389,7 +2403,8 @@ class SandboxBackend:
 
 ## 16. 总结
 
-本框架的核心不是再做一个 workflow engine，也不是再做一个 tool-calling agent 框架，而是实现一个 Agent-native libOS 以及其上的 LLM-facing Skills / Tools Layer：
+本框架的核心不是再做一个 workflow engine，也不是再做一个 tool-calling agent 框架，而是实现一个 Agent-native libOS 以及其上的
+LLM-facing Skills / Tools Layer：
 
 ```text
 Agent Process
@@ -2404,7 +2419,8 @@ Agent Process
   + Audit Trace
 ```
 
-其中，libOS 提供稳定、可审计、受 capability 管控的底层原语；Skills / Tools Layer 则把这些原语包装成 LLM 能够可靠使用的 actions、skills、tool bundles 和 workflow macros。
+其中，libOS 提供稳定、可审计、受 capability 管控的底层原语；Skills / Tools Layer 则把这些原语包装成 LLM 能够可靠使用的
+actions、skills、tool bundles 和 workflow macros。
 
 最有辨识度的原语是：
 
@@ -2431,8 +2447,10 @@ capability_revoke
 
 最重要的内存原则是：
 
-> Agent memory is not byte-addressed memory and not a filesystem namespace; it is a typed, capability-protected, versioned object graph from which execution contexts are materialized.
+> Agent memory is not byte-addressed memory and not a filesystem namespace; it is a typed, capability-protected,
+> versioned object graph from which execution contexts are materialized.
 
-如果团队按照本文档推进，第一阶段应优先做出一个可运行的 coding-agent demo，用最小系统验证：process、object memory、capability、human interrupt、JIT tool 和 audit trace 是否能自然协作。
+如果团队按照本文档推进，第一阶段应优先做出一个可运行的 coding-agent demo，用最小系统验证：process、object
+memory、capability、human interrupt、JIT tool 和 audit trace 是否能自然协作。
 
 

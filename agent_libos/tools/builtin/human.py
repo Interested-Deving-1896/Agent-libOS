@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
+from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 
 class HumanOutputArgs(BaseModel):
@@ -20,7 +20,8 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     name = "human_output"
     description = (
         "Present a message to the human operator. MVP implementation writes to the terminal. "
-        "This is a Skills/Tools Layer wrapper around HumanObject output."
+        "This is a Skills/Tools Layer wrapper around the libOS HumanObject output primitive; "
+        "the primitive enforces human write capability, audit, and events."
     )
     args_schema = HumanOutputArgs
     output_schema = HumanOutputResult
@@ -35,10 +36,13 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     tags = ["human", "terminal", "output"]
 
     def run(self, args: HumanOutputArgs, ctx: ToolContext) -> HumanOutputResult:
-        if args.channel != "terminal":
-            # Keep the MVP simple while preserving a future channel field.
-            channel = "terminal"
-        else:
-            channel = args.channel
-        print(args.message, flush=True)
-        return HumanOutputResult(delivered=True, channel=channel, chars=len(args.message))
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        result = runtime.human.output(
+            pid=ctx.pid,
+            message=args.message,
+            human="owner",
+            channel=args.channel,
+        )
+        return HumanOutputResult(**result)

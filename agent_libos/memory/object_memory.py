@@ -7,7 +7,6 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.exceptions import CapabilityDenied, NotFound
 from agent_libos.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
-    CapabilityRight,
     EventType,
     MaterializedContext,
     MemoryView,
@@ -48,14 +47,14 @@ class ObjectMemoryManager:
     def create_object(
         self,
         pid: str,
-        type: ObjectType | str,
+        object_type: ObjectType | str,
         payload: Any,
         metadata: ObjectMetadata | None = None,
         immutable: bool = True,
         provenance: Provenance | None = None,
     ) -> ObjectHandle:
         now = utc_now()
-        obj_type = ObjectType(type)
+        obj_type = ObjectType(object_type)
         meta = metadata or ObjectMetadata(token_estimate=estimate_tokens(payload))
         if meta.token_estimate is None:
             meta.token_estimate = estimate_tokens(payload)
@@ -402,4 +401,3 @@ class ObjectMemoryManager:
         title = f" title={obj.metadata.title!r}" if obj.metadata.title else ""
         summary = f"\nsummary: {obj.metadata.summary}" if obj.metadata.summary else ""
         return f"[{obj.oid}] type={obj.type.value} version={obj.version}{title}{summary}\npayload: {obj.payload!r}"
-

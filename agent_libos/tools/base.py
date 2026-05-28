@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from agent_libos.exceptions import CapabilityDenied, NotFound
 from agent_libos.models import ToolSpec
 
 InputT = TypeVar("InputT", bound=BaseModel)
@@ -210,6 +211,20 @@ class BaseAgentTool(ABC, Generic[InputT]):
                 message=str(exc),
                 retryable=exc.retryable,
                 details=exc.details,
+                metadata=self._base_metadata(ctx, started_at),
+            )
+        except CapabilityDenied as exc:
+            return ToolResult.failure(
+                code=ToolErrorCode.PERMISSION_DENIED,
+                message=str(exc),
+                details={"error_type": type(exc).__name__},
+                metadata=self._base_metadata(ctx, started_at),
+            )
+        except NotFound as exc:
+            return ToolResult.failure(
+                code=ToolErrorCode.EXECUTION_ERROR,
+                message=str(exc),
+                details={"error_type": type(exc).__name__},
                 metadata=self._base_metadata(ctx, started_at),
             )
         except Exception as exc:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import builtins
+from collections.abc import Callable
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.models import CapabilityRight
 from agent_libos.exceptions import NotFound
 from agent_libos.ids import new_id, utc_now
 from agent_libos.models import (
@@ -24,11 +27,13 @@ class HumanObjectManager:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
+        output_sink: Callable[[str], None] | None = None,
     ):
         self.store = store
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.output_sink = output_sink or (lambda message: print(message, flush=True))
 
     def query(
         self,
@@ -115,13 +120,38 @@ class HumanObjectManager:
         )
         return event.event_id
 
+    def output(
+        self,
+        pid: str,
+        message: str,
+        human: str = "owner",
+        channel: str = "terminal",
+    ) -> dict[str, Any]:
+        selected_channel = "terminal" if channel != "terminal" else channel
+        resource = f"human:{human}"
+        self.capabilities.require(pid, resource, CapabilityRight.WRITE)
+        self.output_sink(message)
+        self.events.emit(
+            EventType.HUMAN_OUTPUT,
+            source=pid,
+            target=resource,
+            payload={"channel": selected_channel, "chars": len(message)},
+        )
+        self.audit.record(
+            actor=pid,
+            action="human.output",
+            target=resource,
+            decision={"channel": selected_channel, "chars": len(message)},
+        )
+        return {"delivered": True, "channel": selected_channel, "chars": len(message)}
+
     def get(self, request_id: str) -> HumanRequest:
         request = self.store.get_human_request(request_id)
         if request is None:
             raise NotFound(f"human request not found: {request_id}")
         return request
 
-    def list(self, pid: str | None = None) -> list[HumanRequest]:
+    def list(self, pid: str | None = None) -> builtins.list[HumanRequest]:
         return self.store.list_human_requests(pid=pid)
 
     def _decide(
@@ -140,15 +170,26 @@ class HumanObjectManager:
         self.store.update_human_request(request)
         if status == HumanRequestStatus.APPROVED:
             cap_spec = request.payload.get("requested_capability")
-            if cap_spec:
+            if isinstance(cap_spec, dict):
+                resource = cap_spec.get("resource")
+                if not isinstance(resource, str):
+                    raise ValueError("requested capability must include a string resource")
+                subject = cap_spec.get("subject", request.pid)
+                if not isinstance(subject, str):
+                    subject = request.pid
+                rights = cap_spec.get("rights", ["execute"])
+                if not isinstance(rights, list):
+                    rights = ["execute"]
+                constraints = cap_spec.get("constraints")
+                expires_at = cap_spec.get("expires_at")
                 self.capabilities.grant(
-                    subject=cap_spec.get("subject", request.pid),
-                    resource=cap_spec["resource"],
-                    rights=cap_spec.get("rights", ["execute"]),
+                    subject=subject,
+                    resource=resource,
+                    rights=rights,
                     issued_by=responder,
-                    constraints=cap_spec.get("constraints"),
-                    expires_at=cap_spec.get("expires_at"),
-                    delegable=cap_spec.get("delegable", False),
+                    constraints=constraints if isinstance(constraints, dict) else None,
+                    expires_at=expires_at if isinstance(expires_at, str) else None,
+                    delegable=bool(cap_spec.get("delegable", False)),
                 )
         process = self.store.get_process(request.pid)
         if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
@@ -169,4 +210,3 @@ class HumanObjectManager:
             decision={"status": status.value, "decision": decision},
         )
         return request
-

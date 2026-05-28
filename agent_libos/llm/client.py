@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agent_libos.exceptions import LibOSError
 
@@ -132,18 +132,21 @@ class LLMClient:
         client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
         kwargs = self._action_payload(messages, tools, temperature, max_tokens, force_enable_thinking=force_enable_thinking)
         try:
-            completion = client.chat.completions.create(**kwargs)
+            completion = cast(Any, client.chat.completions.create(**kwargs))
         except (APIError, OpenAIError) as exc:
             raise LLMError(f"OpenAI SDK request failed: {exc}") from exc
         message = completion.choices[0].message
         content = message.content or ""
         tool_calls = []
         for call in message.tool_calls or []:
+            function = getattr(call, "function", None)
+            if function is None:
+                continue
             tool_calls.append(
                 {
                     "id": call.id,
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
+                    "name": function.name,
+                    "arguments": function.arguments,
                 }
             )
         return LLMCompletion(content=content, tool_calls=tool_calls, raw=completion)
@@ -182,6 +185,8 @@ class LLMClient:
         return True
 
     def _post_chat_completions(self, payload: dict[str, Any]) -> str:
+        if not self.base_url:
+            raise LLMError("OPENAI_CODING_AGENT_BASE_URL or OPENAI_BASE_URL is not configured")
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -218,6 +223,8 @@ class LLMClient:
         return text
 
     def _post_chat_completions_payload(self, payload: dict[str, Any]) -> LLMCompletion:
+        if not self.base_url:
+            raise LLMError("OPENAI_CODING_AGENT_BASE_URL or OPENAI_BASE_URL is not configured")
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
