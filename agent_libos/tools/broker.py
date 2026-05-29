@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 from pathlib import Path
 from typing import Any
@@ -233,6 +234,13 @@ class ToolBroker:
         return handle
 
     def call(self, pid: str, tool: ToolHandle | str, args: dict[str, Any]) -> ToolCallResult:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.acall(pid, tool, args))
+        raise RuntimeError("Cannot call ToolBroker.call() inside a running event loop. Use await acall(...).")
+
+    async def acall(self, pid: str, tool: ToolHandle | str, args: dict[str, Any]) -> ToolCallResult:
         handle = self.resolve(tool, pid=pid)
         resource = f"tool:{handle.tool_id}"
         if not self._process_has_tool(pid, handle):
@@ -266,7 +274,7 @@ class ToolBroker:
         )
         try:
             if handle.tool_id in self._tools:
-                tool_result = self._tools[handle.tool_id].invoke(args, self._context(pid, handle, call_id))
+                tool_result = await self._tools[handle.tool_id].ainvoke(args, self._context(pid, handle, call_id))
                 if not tool_result.ok:
                     error_message = tool_result.error.message if tool_result.error else tool_result.content
                     self.events.emit(
@@ -304,7 +312,7 @@ class ToolBroker:
                     "metadata": tool_result.metadata,
                 }
             elif handle.tool_id in self._jit_sources:
-                payload = self.sandbox.run_source(self._jit_sources[handle.tool_id], args)
+                payload = await asyncio.to_thread(self.sandbox.run_source, self._jit_sources[handle.tool_id], args)
                 result_payload = {"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload}
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")

@@ -257,9 +257,9 @@ class FilesystemAdapter:
             "target": target_state,
         }
 
-    def _preview_text(self, text: str, limit: int = 500) -> tuple[str, bool]:
+    def _preview_text(self, text: str, limit: int = 256) -> tuple[str, bool]:
         preview = text[:limit]
-        return preview, len(text) > limit
+        return repr(preview), len(text) > limit
 
     def _target_state(self, target: Path) -> dict[str, Any]:
         if not target.exists():

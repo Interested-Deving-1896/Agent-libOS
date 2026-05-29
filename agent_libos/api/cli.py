@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from collections import Counter
 from typing import Any
@@ -51,9 +52,9 @@ def main(argv: list[str] | None = None) -> None:
             pid = runtime.process.spawn(image=args.image, goal=args.goal)
             _print_json({"pid": pid, "image": args.image, "goal": args.goal})
         elif args.command == "llm-once":
-            _print_json(runtime.run_process_once(args.pid))
+            _print_json(asyncio.run(runtime.arun_process_once(args.pid)))
         elif args.command == "run":
-            _print_json(runtime.run_until_idle(max_quanta=args.max_quanta))
+            _print_json(asyncio.run(runtime.arun_until_idle(max_quanta=args.max_quanta)))
         elif args.command == "grant-tool":
             raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
         elif args.command == "human":

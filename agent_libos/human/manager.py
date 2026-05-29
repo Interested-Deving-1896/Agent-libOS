@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 from collections.abc import Callable
 from typing import Any
@@ -226,6 +227,21 @@ class HumanObjectManager:
             return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
         return self.reject(request.request_id, {"approved": False, "source": "terminal_queue"})
 
+    async def aprocess_next_terminal(
+        self,
+        human: str = "owner",
+        auto_approve: bool | None = None,
+        auto_policy: str | None = None,
+        input_fn: Callable[[str], str] | None = None,
+    ) -> HumanRequest | None:
+        return await asyncio.to_thread(
+            self.process_next_terminal,
+            human=human,
+            auto_approve=auto_approve,
+            auto_policy=auto_policy,
+            input_fn=input_fn,
+        )
+
     def drain_terminal_queue(
         self,
         human: str = "owner",
@@ -236,6 +252,25 @@ class HumanObjectManager:
         processed: builtins.list[HumanRequest] = []
         while True:
             request = self.process_next_terminal(
+                human=human,
+                auto_approve=auto_approve,
+                auto_policy=auto_policy,
+                input_fn=input_fn,
+            )
+            if request is None:
+                return processed
+            processed.append(request)
+
+    async def adrain_terminal_queue(
+        self,
+        human: str = "owner",
+        auto_approve: bool | None = None,
+        auto_policy: str | None = None,
+        input_fn: Callable[[str], str] | None = None,
+    ) -> builtins.list[HumanRequest]:
+        processed: builtins.list[HumanRequest] = []
+        while True:
+            request = await self.aprocess_next_terminal(
                 human=human,
                 auto_approve=auto_approve,
                 auto_policy=auto_policy,
@@ -413,7 +448,7 @@ class HumanObjectManager:
         if not isinstance(context, dict):
             return question
         capability = request.payload.get("requested_once_capability")
-        lines = [question, "", "Operation details:"]
+        lines = ["Operation details:"]
         for label, key in [
             ("process", "pid"),
             ("primitive", "primitive"),
@@ -446,7 +481,8 @@ class HumanObjectManager:
             truncated = bool(context.get("content_preview_truncated"))
             lines.append(f"- content preview{' (truncated)' if truncated else ''}:")
             lines.append(self._indent_block(preview))
-        return "\n".join(lines) + "\n"
+        lines.append(question)
+        return "\n".join(lines)
 
     def _indent_block(self, text: str) -> str:
         if not text:

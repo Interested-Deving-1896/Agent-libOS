@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from uuid import uuid4
 
@@ -15,7 +16,10 @@ def main() -> None:
     parser.add_argument("--content", default="Agent libOS LLM write-file smoke test passed.\n")
     parser.add_argument("--max-quanta", type=int, default=5)
     args = parser.parse_args()
+    asyncio.run(amain(args))
 
+
+async def amain(args: argparse.Namespace) -> None:
     runtime = Runtime.open("local")
     try:
         goal = (
@@ -24,7 +28,7 @@ def main() -> None:
         )
         pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
         runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="smoke-test")
-        results = runtime.run_until_idle(max_quanta=args.max_quanta)
+        results = await runtime.arun_until_idle(max_quanta=args.max_quanta)
         target = runtime.workspace_root / args.path
         file_exists = target.exists()
         actual_content = target.read_text(encoding="utf-8") if file_exists else None

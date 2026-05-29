@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import sys
+import asyncio
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 from agent_libos import Runtime
@@ -52,12 +51,14 @@ def main() -> None:
         default=None,
         help="Automatically answer the Agent's permission-policy request.",
     )
-    parser.add_argument("--trace", action="store_true", help="Print process status and actions to stderr after the run.")
     args = parser.parse_args()
 
     if args.max_bytes < 1 or args.max_bytes > MAX_READ_BYTES:
         parser.error(f"--max-bytes must be between 1 and {MAX_READ_BYTES}")
+    asyncio.run(amain(args))
 
+
+async def amain(args: argparse.Namespace) -> None:
     runtime = Runtime.open(args.db)
     try:
         document_path = _workspace_relative_document(args.document, runtime.workspace_root)
@@ -75,24 +76,13 @@ def main() -> None:
         permission_policy = args.permission_policy
         if permission_policy is None and args.auto_approve:
             permission_policy = CapabilityManager.ALWAYS_ALLOW
-        results = _run_agent(
-            runtime=runtime,
-            pid=pid,
+        await runtime.arun_until_idle(
             max_quanta=args.max_quanta,
-            auto_approve=args.auto_approve,
-            permission_policy=permission_policy,
-            trace=args.trace,
+            human_auto_approve=True if args.auto_approve else None,
+            human_auto_policy=permission_policy,
         )
         process = runtime.process.get(pid)
         output_exists = (runtime.workspace_root / output_path).exists()
-
-        if args.trace:
-            actions = ", ".join(action for action in _action_names(results) if action) or "none"
-            print(f"pid={pid}", file=sys.stderr)
-            print(f"status={process.status.value}", file=sys.stderr)
-            print(f"output={output_path}", file=sys.stderr)
-            print(f"output_exists={output_exists}", file=sys.stderr)
-            print(f"actions={actions}", file=sys.stderr)
 
         if process.status == ProcessStatus.FAILED:
             raise SystemExit(f"Agent process failed: {process.status_message}")
@@ -137,14 +127,15 @@ def _build_goal(*, document_path: str, output_path: str, language: str, max_byte
     output_resource = f"filesystem:workspace:{output_path}"
     return "\n".join(
         [
-            "Read a workspace document, write a one-sentence summary file, and tell the human the output filename.",
+            "Read a workspace document, write a summary file, and tell the human the output filename.",
             "",
             "Required tool sequence:",
             f"1. First call read_text_file with path={document_path!r} and max_bytes={max_bytes}.",
-            f"2. After the read_text_file result is visible in materialized context, write exactly one sentence in {language} to {output_path!r} using write_text_file.",
-            f"3. After the write_text_file result is visible and successful, call human_output with exactly this filename: {output_path!r}.",
-            "4. If the write always cannot be completed, call human_output with one concise sentence explaining why no summary file was written.",
-            "5. Finally call process_exit with a compact final payload containing output_path and either written=true or written=false with reason.",
+            f"2. Then call request_permission for resource={output_resource!r}, rights=['write'], and reason='write the summary file'.",
+            f"3. After the permission response is visible, write one {language} sentence to {output_path!r} using write_text_file.",
+            f"4. After the write_text_file result is visible and successful, call human_output with exactly this filename: {output_path!r}.",
+            "5. If permission is denied or the write cannot be completed, call human_output with one concise sentence explaining why no summary file was written.",
+            "6. Finally call process_exit with a compact final payload containing output_path and either written=true or written=false with reason.",
             "",
             "Do not summarize before reading the file. Do not call read_text_file again if a result for this path is already visible. If the read result is truncated, summarize only the visible content. Do not choose a different output path.",
         ]
@@ -153,49 +144,6 @@ def _build_goal(*, document_path: str, output_path: str, language: str, max_byte
 
 def _context_budget(max_bytes: int) -> int:
     return min(120_000, max(8_000, max_bytes + 12_000))
-
-
-def _run_agent(
-    *,
-    runtime: Runtime,
-    pid: str,
-    max_quanta: int,
-    auto_approve: bool,
-    permission_policy: str | None,
-    trace: bool,
-) -> list[Any]:
-    results: list[Any] = []
-    for _ in range(max_quanta):
-        result = runtime.run_next_process_once()
-        if result is None:
-            processed = runtime.human.drain_terminal_queue(
-                auto_approve=True if auto_approve else None,
-                auto_policy=permission_policy,
-            )
-            if processed:
-                if trace:
-                    print(f"human_requests={','.join(request.request_id for request in processed)}", file=sys.stderr)
-                continue
-            break
-        results.append(result)
-
-        processed = runtime.human.drain_terminal_queue(
-            auto_approve=True if auto_approve else None,
-            auto_policy=permission_policy,
-        )
-        if trace and processed:
-            print(f"human_requests={','.join(request.request_id for request in processed)}", file=sys.stderr)
-
-        process = runtime.process.get(pid)
-        if process.status in {
-            ProcessStatus.EXITED,
-            ProcessStatus.FAILED,
-            ProcessStatus.KILLED,
-            ProcessStatus.PAUSED,
-        }:
-            break
-
-    return results
 
 
 def _had_permission_rejection(runtime: Runtime, pid: str) -> bool:
@@ -207,17 +155,6 @@ def _had_permission_rejection(runtime: Runtime, pid: str) -> bool:
         if isinstance(request.payload.get("requested_once_capability"), dict):
             return True
     return False
-
-
-def _action_names(results: list[Any]) -> list[str | None]:
-    names: list[str | None] = []
-    for result in results:
-        if not isinstance(result, dict):
-            names.append(None)
-            continue
-        action = result.get("action")
-        names.append(action.get("action") if isinstance(action, dict) else None)
-    return names
 
 
 if __name__ == "__main__":

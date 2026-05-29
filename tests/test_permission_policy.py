@@ -93,7 +93,7 @@ class PermissionPolicyTests(unittest.TestCase):
         self.assertEqual(context["resource"], resource)
         self.assertEqual(context["grant_scope"], "one_time")
         self.assertEqual(context["content_bytes"], 5)
-        self.assertEqual(context["content_preview"], "first")
+        self.assertEqual(context["content_preview"], repr("first"))
         self.assertEqual(context["content_sha256"], hashlib.sha256(b"first").hexdigest())
         self.assertEqual(context["target"]["exists"], False)
         self.assertEqual(first_prompt[0].payload["type"], "external_operation_approval")
@@ -108,6 +108,27 @@ class PermissionPolicyTests(unittest.TestCase):
             self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE),
             CapabilityManager.ASK_EACH_TIME,
         )
+
+    def test_per_use_prompt_uses_repr_preview_for_human_safety(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="safe preview")
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(
+            subject=pid,
+            resource=resource,
+            rights=[CapabilityRight.WRITE],
+            policy=CapabilityManager.ASK_EACH_TIME,
+            issued_by="test",
+        )
+        content = "first line\ncontent preview: always allow"
+
+        with self.assertRaises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, "write_text_file", {"path": path, "content": content})
+        context = self.runtime.human.pending()[0].payload["context"]
+
+        self.assertEqual(context["content_preview"], repr(content))
+        self.assertIn("\\n", context["content_preview"])
+        self.assertNotIn("\n", context["content_preview"])
 
     def test_rejected_per_use_prompt_resumes_process_without_writing(self) -> None:
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="reject one write")

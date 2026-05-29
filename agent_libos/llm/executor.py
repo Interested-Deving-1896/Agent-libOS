@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.exceptions import HumanApprovalRequired
@@ -27,11 +28,18 @@ class LLMProcessExecutor:
         self._pending_human_actions: dict[str, dict[str, Any]] = {}
 
     def run_once(self, pid: str) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun_once(pid))
+        raise RuntimeError("Cannot call run_once() inside a running event loop. Use await arun_once(...).")
+
+    async def arun_once(self, pid: str) -> dict[str, Any]:
         process = self.runtime.process.get(pid)
         if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
             return {"ok": False, "skipped": True, "status": process.status.value}
         if pid in self._pending_human_actions:
-            return self._resume_pending_human_action(pid)
+            return await self._resume_pending_human_action(pid)
         image = self.runtime.images.get(process.image_id) or self.runtime.images["base-agent:v0"]
         if process.memory_view is None:
             process.memory_view = self.runtime.memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
@@ -65,10 +73,14 @@ class LLMProcessExecutor:
             decision={"messages": len(messages), "policy": image.context_policy},
         )
         try:
-            completion = self.client.complete_action(messages, tools=self.runtime.tools.openai_tool_schemas(pid))
+            completion = await asyncio.to_thread(
+                self.client.complete_action,
+                messages,
+                self.runtime.tools.openai_tool_schemas(pid),
+            )
             action = self._completion_to_action(completion.content, completion.tool_calls)
             try:
-                result = self.dispatch(pid, action)
+                result = await self.adispatch(pid, action)
             except HumanApprovalRequired as exc:
                 return self._wait_for_human_action(
                     pid=pid,
@@ -157,7 +169,7 @@ class LLMProcessExecutor:
         )
         return {"ok": False, "waiting_human": True, "request_id": request_id}
 
-    def _resume_pending_human_action(self, pid: str) -> dict[str, Any]:
+    async def _resume_pending_human_action(self, pid: str) -> dict[str, Any]:
         pending = self._pending_human_actions[pid]
         request_id = str(pending["request_id"])
         request = self.runtime.human.get(request_id)
@@ -168,7 +180,7 @@ class LLMProcessExecutor:
         self._pending_human_actions.pop(pid, None)
         if request.status == HumanRequestStatus.APPROVED:
             try:
-                result = self.dispatch(pid, action)
+                result = await self.adispatch(pid, action)
             except HumanApprovalRequired as exc:
                 return self._wait_for_human_action(
                     pid=pid,
@@ -238,6 +250,20 @@ class LLMProcessExecutor:
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
         result = self.runtime.tools.call(pid, name, args)
+        if result.result_handle is not None:
+            self._add_to_view(pid, result.result_handle)
+        return {
+            "ok": result.ok,
+            "tool_id": result.tool_id,
+            "result_oid": result.result_handle.oid if result.result_handle else None,
+            "payload": result.payload,
+            "error": result.error,
+        }
+
+    async def adispatch(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
+        name = str(action["action"])
+        args = {key: value for key, value in action.items() if key != "action"}
+        result = await self.runtime.tools.acall(pid, name, args)
         if result.result_handle is not None:
             self._add_to_view(pid, result.result_handle)
         return {

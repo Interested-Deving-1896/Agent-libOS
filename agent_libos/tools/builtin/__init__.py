@@ -1,4 +1,5 @@
 from agent_libos.tools.builtin.basic import EchoTool, ParsePytestLogTool
+from agent_libos.tools.builtin.clock import GetCurrentTimeTool, SleepTool
 from agent_libos.tools.builtin.filesystem import ReadTextFileTool, WriteTextFileTool
 from agent_libos.tools.builtin.human import HumanOutputTool
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
@@ -10,11 +11,13 @@ __all__ = [
     "CreateMemoryObjectTool",
     "CreateObjectFromFileTool",
     "EchoTool",
+    "GetCurrentTimeTool",
     "HumanOutputTool",
     "ParsePytestLogTool",
     "ProcessExitTool",
     "ReadTextFileTool",
     "RequestPermissionTool",
+    "SleepTool",
     "WriteObjectToFileTool",
     "WriteTextFileTool",
 ]

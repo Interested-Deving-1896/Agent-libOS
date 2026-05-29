@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -26,7 +27,10 @@ def main() -> None:
     parser.add_argument("--max-quanta", type=int, default=5)
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
+    asyncio.run(amain(args))
 
+
+async def amain(args: argparse.Namespace) -> None:
     runtime = Runtime.open(args.db)
     try:
         source = _workspace_relative(args.source, runtime.workspace_root)
@@ -74,14 +78,7 @@ def main() -> None:
         runtime.filesystem.grant_path(pid, source, [CapabilityRight.READ], issued_by="object_copy_smoke")
         runtime.filesystem.grant_path(pid, target, [CapabilityRight.WRITE], issued_by="object_copy_smoke")
 
-        results = []
-        for _ in range(args.max_quanta):
-            result = runtime.run_next_process_once()
-            if result is None:
-                break
-            results.append(result)
-            if runtime.process.get(pid).status == ProcessStatus.EXITED:
-                break
+        results = await runtime.arun_until_idle(max_quanta=args.max_quanta)
 
         if runtime.process.get(pid).status != ProcessStatus.EXITED:
             raise SystemExit(f"process did not exit after {args.max_quanta} quanta")

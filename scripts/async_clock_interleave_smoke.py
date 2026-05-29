@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from agent_libos import Runtime
+from agent_libos.llm.client import LLMCompletion
+from agent_libos.models import ProcessStatus
+
+
+@dataclass
+class ProcessPlan:
+    label: str
+    actions: list[dict[str, Any]]
+
+
+async def run_interleaved_clock_demo(
+    *,
+    db: str = "local",
+    iterations: int = 3,
+    interval_s: float = 0.2,
+    offset_s: float | None = None,
+    timezone: str = "Asia/Shanghai",
+    echo: bool = True,
+) -> dict[str, Any]:
+    runtime = Runtime.open(db)
+    outputs: list[dict[str, Any]] = []
+    output_lock = threading.Lock()
+    client = InterleavingClockClient()
+    runtime.llm.client = client
+
+    def output_sink(message: str) -> None:
+        label_match = re.match(r"^\[(?P<label>[^\]]+)\]", message)
+        entry = {
+            "monotonic": time.monotonic(),
+            "label": label_match.group("label") if label_match else None,
+            "message": message,
+        }
+        with output_lock:
+            outputs.append(entry)
+        if echo:
+            print(message, flush=True)
+
+    runtime.human.output_sink = output_sink
+    try:
+        offset = interval_s / 2 if offset_s is None else offset_s
+        pid_a = runtime.process.spawn(
+            image="base-agent:v0",
+            goal=f"Process A: output the current time {iterations} times, sleeping between outputs.",
+        )
+        pid_b = runtime.process.spawn(
+            image="base-agent:v0",
+            goal=f"Process B: sleep {offset:.3f}s first, then output the current time {iterations} times.",
+        )
+        client.configure(
+            pid_a,
+            label="A",
+            iterations=iterations,
+            interval_s=interval_s,
+            initial_delay_s=0.0,
+            timezone=timezone,
+        )
+        client.configure(
+            pid_b,
+            label="B",
+            iterations=iterations,
+            interval_s=interval_s,
+            initial_delay_s=offset,
+            timezone=timezone,
+        )
+
+        max_quanta = 2 * (iterations * 3 + 2)
+        results = await runtime.arun_until_idle(max_quanta=max_quanta)
+        statuses = {pid_a: runtime.process.get(pid_a).status, pid_b: runtime.process.get(pid_b).status}
+        expected_labels = [label for _ in range(iterations) for label in ("A", "B")]
+        actual_labels = [entry["label"] for entry in outputs if entry["label"] in {"A", "B"}]
+        report = {
+            "pids": {"A": pid_a, "B": pid_b},
+            "iterations": iterations,
+            "interval_s": interval_s,
+            "offset_s": offset,
+            "timezone": timezone,
+            "outputs": outputs,
+            "expected_order": expected_labels,
+            "actual_order": actual_labels,
+            "interleaved": actual_labels == expected_labels,
+            "process_statuses": {pid: status.value for pid, status in statuses.items()},
+            "scheduler_results": len(results),
+            "model_calls": client.calls,
+        }
+        if any(status != ProcessStatus.EXITED for status in statuses.values()):
+            raise RuntimeError(f"processes did not exit cleanly: {report['process_statuses']}")
+        if not report["interleaved"]:
+            raise RuntimeError(f"unexpected output order: {actual_labels}, expected {expected_labels}")
+        return report
+    finally:
+        runtime.close()
+
+
+class InterleavingClockClient:
+    def __init__(self) -> None:
+        self._plans: dict[str, ProcessPlan] = {}
+        self._lock = threading.Lock()
+        self.calls = 0
+
+    def configure(
+        self,
+        pid: str,
+        *,
+        label: str,
+        iterations: int,
+        interval_s: float,
+        initial_delay_s: float,
+        timezone: str,
+    ) -> None:
+        actions: list[dict[str, Any]] = []
+        if initial_delay_s > 0:
+            actions.append({"action": "sleep", "seconds": initial_delay_s})
+        for iteration in range(1, iterations + 1):
+            actions.append({"action": "get_current_time", "timezone": timezone})
+            actions.append({"action": "human_output", "label": label, "iteration": iteration, "from_last_time": True})
+            if iteration < iterations:
+                actions.append({"action": "sleep", "seconds": interval_s})
+        actions.append({"action": "process_exit", "payload": {"label": label, "iterations": iterations}})
+        self._plans[pid] = ProcessPlan(label=label, actions=actions)
+
+    def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        pid = self._pid_from_messages(messages)
+        with self._lock:
+            self.calls += 1
+            plan = self._plans.get(pid)
+            if plan is None:
+                raise AssertionError(f"no action plan registered for pid {pid}")
+            if not plan.actions:
+                raise AssertionError(f"no planned action remains for pid {pid}")
+            action = dict(plan.actions.pop(0))
+        if action.pop("from_last_time", False):
+            iso8601 = self._last_tool_time(messages)
+            label = action.pop("label")
+            iteration = action.pop("iteration")
+            action["message"] = f"[{label}] iteration={iteration} time={iso8601}"
+            action["channel"] = "terminal"
+        name = str(action["action"])
+        args = {key: value for key, value in action.items() if key != "action"}
+        return LLMCompletion(
+            content="",
+            tool_calls=[{"id": f"clock_{self.calls}", "name": name, "arguments": json.dumps(args)}],
+        )
+
+    def _pid_from_messages(self, messages: list[dict[str, str]]) -> str:
+        text = "\n".join(message.get("content", "") for message in messages)
+        match = re.search(r"^- pid: (?P<pid>\S+)", text, flags=re.MULTILINE)
+        if not match:
+            raise AssertionError("prompt did not include process pid")
+        return match.group("pid")
+
+    def _last_tool_time(self, messages: list[dict[str, str]]) -> str:
+        text = "\n".join(message.get("content", "") for message in messages)
+        matches = re.findall(
+            r"tool_name[\"']:\s*[\"']get_current_time[\"'].*?iso8601[\"']:\s*[\"']([^\"']+)[\"']",
+            text,
+            flags=re.DOTALL,
+        )
+        if not matches:
+            raise AssertionError("prompt did not include a get_current_time tool result")
+        return matches[-1]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run two async-scheduled processes that alternate current-time output.")
+    parser.add_argument("--db", default="local", help="Runtime SQLite database path, or 'local' for in-memory.")
+    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--interval", type=float, default=0.2)
+    parser.add_argument("--offset", type=float, default=None)
+    parser.add_argument("--timezone", default="Asia/Shanghai")
+    parser.add_argument("--quiet", action="store_true", help="Only print the final JSON report.")
+    args = parser.parse_args()
+    report = asyncio.run(
+        run_interleaved_clock_demo(
+            db=args.db,
+            iterations=args.iterations,
+            interval_s=args.interval,
+            offset_s=args.offset,
+            timezone=args.timezone,
+            echo=not args.quiet,
+        )
+    )
+    print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+
+
+if __name__ == "__main__":
+    main()

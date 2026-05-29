@@ -2,109 +2,173 @@
 
 An experimental Agent-native libOS runtime written in Python.
 
-Agent libOS models an agent as a long-running, schedulable, interruptible, capability-controlled `AgentProcess`, not as a single chat request or workflow thread. The current codebase is an MVP implementation of [agent_libos_design_doc.md](agent_libos_design_doc.md).
+Agent libOS models an agent as a long-running, schedulable, interruptible, capability-controlled `AgentProcess`, not as a single chat request or workflow thread. The codebase is an MVP implementation of the ideas in [agent_libos_design_doc.md](agent_libos_design_doc.md).
 
-Working in progress.
+This project is still in active development.
 
-## Features & TODOs
+## Current MVP
 
-Legend:
+### Runtime
 
-- `[x]` implemented in the current MVP.
-- `[~]` implemented partially or with a local-only prototype.
-- `[ ]` planned.
+- Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`, `resume`, `exit`.
+- Async process supervisor: `Runtime.arun_until_idle()` automatically keeps runnable processes moving.
+- Human queue integration is part of the runtime supervisor by default. If a primitive blocks on human approval, the process enters `WAITING_HUMAN`; the runtime processes human terminal messages, wakes the process, and resumes the pending action.
+- Single-step APIs remain available for tests and debugging: `run_next_process_once()` / `arun_next_process_once()` do not drain the human queue.
+- Agent images configure process-visible tool tables at process creation time.
+- Event bus and audit trace cover process, object memory, capabilities, tools, human requests, checkpoints, and external primitive access.
+- SQLite stores process/object metadata, events, audit records, capabilities, human requests, tools, candidates, and checkpoints.
 
-### Core Runtime
+### Object Memory
 
-- [x] Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`, `resume`, `exit`.
-- [x] Simple runnable-process scheduler with one LLM quantum per process turn.
-- [x] Agent images with default tools, context policy, safety profile, and required capabilities.
-- [x] Typed object memory with object handles, links, views, materialization, snapshots, and merge.
-- [x] Object Memory objects have globally unique names; authorized processes can resolve objects by name without treating names as capabilities.
-- [x] Object payloads live in runtime memory, not SQLite; SQLite stores only object directory metadata, and process-owned memory is released on process exit unless retained as the process result.
-- [x] Capability manager for object access, tool execution, external resources, and revocation.
-- [x] Event bus and audit trace for process, memory, capability, tool, human, checkpoint, and external access events.
-- [x] SQLite-backed runtime store for processes, objects, links, capabilities, events, audit records, human requests, tools, candidates, and checkpoints.
-- [~] Checkpoint and rollback for runtime state.
-- [ ] Distributed scheduling and durable multi-worker process execution.
-- [ ] Quotas for CPU, wall time, memory, token budget, child processes, and external side effects.
+- Typed Object Memory with handles, links, views, materialized context, snapshots, and merge scaffolding.
+- Every Object has a globally unique `name`; authorized processes can resolve by name, but a name is not itself a capability.
+- Object payloads live in runtime memory, not SQLite. SQLite stores directory metadata and a runtime-memory marker only.
+- Process-owned memory is released on process exit unless retained as the process result.
+- File/Object bridge tools can move file content into and out of Object Memory without returning the concrete content to the process-visible tool result.
 
-### Skills / Tools Layer
+### Tools And Primitives
 
-- [x] `BaseAgentTool` model with Pydantic input/output schemas, policy metadata, timeout handling, and OpenAI-compatible tool schema generation.
-- [x] ToolBroker registration, process tool-table visibility checks, result object creation, event emission, and audit logging.
-- [x] Built-in tools:
-  - `create_memory_object`
-  - `process_exit`
-  - `request_permission`
-  - `create_object_from_file`
-  - `write_object_to_file`
-  - `read_text_file`
-  - `write_text_file`
-  - `human_output`
-  - `parse_pytest_log`
-  - `echo`
-- [x] LLM-facing tools are wrappers over libOS primitives, not the security boundary themselves.
-- [x] `read_text_file` and `write_text_file` now call the libOS filesystem primitive instead of touching the host filesystem directly.
-- [x] `human_output` now calls the HumanObject output primitive instead of writing to the terminal directly.
-- [x] `request_permission` wraps the human permission-request primitive so an Agent can ask for `always_allow`, `always_deny`, or `ask_each_time` policy on a capability resource.
-- [~] Ephemeral Python JIT tools with sandboxed validation and registration.
-- [~] Skills/tools registries and bundles as local scaffolding.
-- [ ] Persistent signed tool registry.
-- [ ] Production sandbox profiles for JIT tools and high-risk tools.
-- [ ] Rich tool policy engine for confirmation, checkpointing, retry, compensation, and capability attenuation.
-- [ ] MCP adapter and richer tool transport formats.
+LLM-facing tools are stable wrappers over libOS primitives. They are similar to libc calls: ergonomic and model-facing, but not the security boundary.
+
+Built-in tools currently include:
+
+- `create_memory_object`
+- `create_object_from_file`
+- `write_object_to_file`
+- `get_current_time`
+- `sleep`
+- `read_text_file`
+- `write_text_file`
+- `request_permission`
+- `human_output`
+- `parse_pytest_log`
+- `process_exit`
+- `echo`
+
+Important boundary rules:
+
+- A process can call only tools in its process tool table.
+- Tool call visibility is not an external-resource grant.
+- Filesystem read/write checks happen in the filesystem primitive.
+- Human output and human approval checks happen in the HumanObject primitive.
+- Clock `sleep` is async, so one sleeping process does not block other runnable processes.
+
+### Permissions And Human Queue
+
+Permission requests are ordinary process actions mediated by the human queue:
+
+- `request_permission` asks the human to choose a policy for a resource/right pair.
+- The human can choose `always_allow`, `always_deny`, or `ask_each_time`.
+- With `ask_each_time`, the relevant primitive creates a per-use human approval request when the operation is attempted.
+- Per-use approval grants a one-shot capability that is consumed after one successful primitive call.
+- Rejection does not crash the runtime; the process resumes and can report why it could not complete.
+- Approval context includes path, resource, overwrite risk, byte count, SHA-256, target state, and a `repr()`-escaped content preview.
 
 ### LLM Execution
 
-- [x] OpenAI-compatible chat completions client using `.env` configuration.
-- [x] OpenAI tool calls generated from registered Skills/Tools Layer tools.
-- [x] Free-form model text is allowed; the runtime executes the last legal tool call.
-- [x] Fallback JSON action parser for providers that cannot emit tool calls.
-- [x] System prompt aligned with the libOS model: tool calls are libc-like wrappers over libOS primitives, not syscalls.
-- [x] Real-model smoke scripts for file-writing and document-summary goals.
-- [ ] Streaming model output.
-- [ ] Multi-turn tool result compaction and long-context paging.
-- [ ] Model/provider conformance test suite.
+- OpenAI-compatible chat completions client using `.env` configuration.
+- OpenAI tool-call schemas generated from the current process tool table.
+- The runtime executes the selected legal tool call for each quantum.
+- Free-form model text is allowed, but only tool calls or fallback JSON actions have side effects.
+- Model calls run off the event loop, and tool dispatch has async support.
 
-### External Objects and Human Objects
+### Security Properties Covered By Tests
 
-- [x] Filesystem adapter as a libOS external-object primitive with workspace containment, capability checks, events, and audit records.
-- [x] HumanObject manager with queued query, approve, reject, interrupt, and output primitives.
-- [x] Human terminal queue for processing pending human-facing messages in order.
-- [x] Permission requests are handled through the human queue; `ask_each_time` causes the filesystem write primitive to create a per-use human approval request.
-- [~] Shell/browser/git/database external adapters are placeholders or local stubs.
-- [ ] ExternalRef objects with snapshots and provenance.
-- [ ] Browser, git, database, mail, calendar, search, and API-service adapters.
-- [ ] Human role/authority profiles.
-- [ ] Interrupt delivery policies and human availability model.
+- Object handles are capability-protected; OIDs or object names alone do not grant access.
+- Tool tables and external-resource capabilities are independent.
+- Tools cannot bypass filesystem or human primitive checks.
+- Path containment, revoked capabilities, fork attenuation, tool-table denial, JIT scope, and dangerous JIT imports are covered by tests.
+- Built-in LLM-facing tools are checked so they do not directly touch host filesystem, terminal, network, shell, database, or secrets.
 
-### Security
+## Quick Start
 
-- [x] Object handles are capability-protected; OIDs alone do not grant access.
-- [x] Process-visible tools are fixed by the AgentImage/tool table at process creation time.
-- [x] Tool calls in a process tool table are allowed; security checks happen at libOS primitives.
-- [x] External filesystem read/write requires filesystem capability at the primitive layer.
-- [x] Filesystem write permission supports `always_allow`, `always_deny`, and `ask_each_time`; per-use approval grants are consumed after one successful primitive call.
-- [x] Human output requires `human:owner` write capability at the primitive layer.
-- [x] External access is audited at the libOS primitive boundary.
-- [x] Boundary tests verify that tools cannot bypass filesystem or human capability checks, path containment, revoked capabilities, fork attenuation, or JIT process scope.
-- [~] JIT tool sandbox blocks selected dangerous imports and executes candidate code out of process.
-- [ ] Strong isolation for filesystem, network, environment variables, CPU, memory, and wall time.
-- [ ] Multi-tenant policy engine.
-- [ ] Secret redaction and credential access policy.
-- [ ] Formal side effect compensation model.
+Install dependencies:
 
-### CLI, Scripts, and Tests
+```bash
+uv sync
+```
 
-- [x] `agent-libos` CLI for init, demo, audit, process listing, tool listing, spawn, LLM run, and terminal human queue processing.
-- [x] Demo flow covering process, memory, worker fork, JIT parser, checkpoint, human approval, tool call, filesystem capability denial before grant, write result, final report, and audit trace.
-- [x] `scripts/llm_summarize_document.py`: start an Agent process that reads a workspace document, requests write permission, writes a one-sentence summary when allowed, and reports the output filename or denial reason.
-- [x] `scripts/llm_write_goal_smoke.py`: real-model smoke test for writing a workspace file.
-- [x] Unit tests for external safety boundaries and the demo contract.
-- [ ] Broader regression tests for process/memory/checkpoint/JIT/LLM behavior.
-- [ ] CI workflow.
-- [ ] API reference documentation.
+Run tests:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+Run the deterministic local demo:
+
+```bash
+uv run agent-libos demo
+```
+
+The demo does not call a real model. It covers process spawn/fork, Object Memory, a JIT parser, checkpointing, capability denial before grant, human approval, filesystem write, final report object creation, and audit trace generation.
+
+Use a persistent local runtime database:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite init
+uv run agent-libos --db .agent_libos.sqlite demo
+uv run agent-libos --db .agent_libos.sqlite audit
+uv run agent-libos --db .agent_libos.sqlite processes
+uv run agent-libos --db .agent_libos.sqlite tools
+```
+
+## LLM Configuration
+
+Create a local `.env` file for real-model execution:
+
+```bash
+OPENAI_CODING_AGENT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_LANGUAGE_MODEL=qwen3.7-max
+OPENAI_API_KEY=...
+```
+
+Spawn and run a process:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Write a short summary of README.md"
+uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
+```
+
+`agent-libos run` uses the high-level async supervisor, so human terminal messages are processed as part of runtime execution. For manual queue processing, the lower-level command still exists:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite human
+```
+
+## Example Scripts
+
+Summarize a workspace document through an Agent process:
+
+```bash
+uv run python scripts/llm_summarize_document.py README.md --auto-approve
+```
+
+Choose the permission policy explicitly for non-interactive runs:
+
+```bash
+uv run python scripts/llm_summarize_document.py README.md --permission-policy always_allow --auto-approve
+uv run python scripts/llm_summarize_document.py README.md --permission-policy always_deny --auto-approve
+```
+
+Run the real-model write-file smoke test:
+
+```bash
+uv run python scripts/llm_write_goal_smoke.py
+```
+
+Copy a workspace text file through named Object Memory without materializing the file content into the process prompt:
+
+```bash
+uv run python scripts/object_memory_file_copy_smoke.py
+```
+
+Run two async-scheduled processes that use `sleep` to alternate current-time output:
+
+```bash
+uv run python scripts/async_clock_interleave_smoke.py --iterations 3 --interval 0.2
+```
+
+Expected output order is `A, B, A, B, ...`, showing that one process sleeping does not block the other process.
 
 ## Architecture
 
@@ -116,6 +180,7 @@ Agent Personality / Application
      - macro actions
      - skill metadata
   -> Agent libOS Runtime
+     - AsyncProcessScheduler
      - ProcessManager
      - ObjectMemoryManager
      - ToolBroker
@@ -130,114 +195,51 @@ Agent Personality / Application
      - SQLite
      - local workspace filesystem
      - subprocess sandbox
-     - terminal human sink
+     - terminal human queue
 ```
 
-The important boundary is between LLM-facing tools and libOS primitives. A tool is a stable model-facing wrapper, similar to a libc function. The actual security checks and host interaction live in libOS primitives such as `FilesystemAdapter.read_text`, `FilesystemAdapter.write_text`, and `HumanObjectManager.output`.
+The key design boundary is between model-facing tools and libOS primitives. For example, `write_text_file` can be visible in a process tool table, but `FilesystemAdapter.write_text()` still enforces workspace containment, resource capability or permission policy, human approval if needed, events, and audit logging.
 
-For example, `write_text_file` is callable only if it is present in the process tool table, which is derived from the AgentImage when the process is created. The tool call itself is allowed once visible to the process, but the filesystem primitive still requires:
+Putting a tool in a process table does not grant access to files, humans, shell, network, secrets, or other host resources.
 
-- write capability on the target filesystem resource.
+## Runtime Execution Model
 
-Putting a tool in the process table does not grant access to files, humans, shell, network, secrets, or other host resources.
+High-level execution:
 
-## Quick Start
-
-### 1. Install Dependencies
-
-This project is managed with uv:
-
-```bash
-uv sync
+```python
+results = await runtime.arun_until_idle(max_quanta=10)
 ```
 
-### 2. Run Tests
+By default this does three things:
 
-```bash
-uv run python -m unittest discover -s tests -v
+1. Runs all runnable processes asynchronously.
+2. Processes pending human terminal messages when processes are waiting on human input.
+3. Wakes resumed processes and continues until no runnable or human-resumable work remains, or the quantum budget is exhausted.
+
+For debugging a pending approval state, opt out explicitly:
+
+```python
+results = await runtime.arun_until_idle(max_quanta=1, process_human_queue=False)
 ```
 
-### 3. Run the Local Demo
+Single-step APIs also remain available:
 
-```bash
-uv run agent-libos demo
+```python
+result = await runtime.arun_next_process_once()
 ```
 
-The demo is deterministic and does not call a real model. It analyzes a synthetic pytest failure, forks a worker, validates and calls a JIT parser, checkpoints before writing, verifies that filesystem write is denied before the external-resource capability is granted, requests human approval for workspace write capability, writes `agent_outputs/demo_patch_preview.txt`, and returns a final report object with the tool sequence, authorization records, external side effect, and audit summary.
+## How To Write Agent libOS Tools
 
-You can also create and inspect a persistent local runtime database:
-
-```bash
-uv run agent-libos --db .agent_libos.sqlite init
-uv run agent-libos --db .agent_libos.sqlite demo
-uv run agent-libos --db .agent_libos.sqlite audit
-uv run agent-libos --db .agent_libos.sqlite processes
-uv run agent-libos --db .agent_libos.sqlite tools
-uv run agent-libos --db .agent_libos.sqlite human
-```
-
-## LLM Execution
-
-Runnable processes can be executed by an OpenAI-compatible chat completion endpoint. Keep credentials in a local `.env` file:
-
-```bash
-OPENAI_CODING_AGENT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-OPENAI_LANGUAGE_MODEL=qwen3.7-max
-OPENAI_API_KEY=...
-```
-
-Spawn a process and run the LLM scheduler:
-
-```bash
-uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Analyze the pytest failure log"
-uv run agent-libos --db .agent_libos.sqlite run --max-quanta 5
-```
-
-The process tool list is fixed by the AgentImage at creation time. High-risk external effects still need external-resource capability at the libOS primitive layer.
-Processes can use `request_permission` to ask the human for a permission policy. If the human chooses `ask_each_time`, the relevant primitive asks again for each use and only receives a one-shot grant when that specific operation is approved.
-
-## Example Scripts
-
-Summarize a workspace document through an Agent process:
-
-```bash
-uv run python scripts/llm_summarize_document.py agent_libos_design_doc.md --trace
-```
-
-For non-interactive runs, choose the human permission-policy response explicitly:
-
-```bash
-uv run python scripts/llm_summarize_document.py README.md --permission-policy always_allow --auto-approve --trace
-```
-
-Run the real-model write-file smoke test:
-
-```bash
-uv run python scripts/llm_write_goal_smoke.py
-```
-
-The smoke test uses the `coding-agent:v0` process tool table, which includes `write_text_file`, and explicitly grants workspace filesystem write capability.
-
-Copy a workspace text file through named Object Memory without materializing the file content into the process prompt:
-
-```bash
-uv run python scripts/object_memory_file_copy_smoke.py --trace
-```
-
-## How to Write Agent libOS Tools
-
-Tools live in the Skills / Tools Layer and should not directly access host resources.
-
-Use this pattern:
+Tools should not directly access host resources. Use this pattern:
 
 1. Define a Pydantic input schema and optional output schema.
-2. Subclass `SyncAgentTool` or `BaseAgentTool`.
+2. Subclass `SyncAgentTool` for blocking local code or `BaseAgentTool` for async code.
 3. Keep validation and model-facing ergonomics in the tool.
-4. Call `ctx.runtime.<primitive>` for process, memory, filesystem, human, or other libOS operations.
-5. Let libOS primitives enforce capability checks, containment, audit, event emission, checkpointing, and future policy hooks.
+4. Call `ctx.runtime.<primitive>` for process, memory, filesystem, human, clock, or other libOS operations.
+5. Let primitives enforce capability checks, containment, audit, event emission, checkpointing, and policy hooks.
 6. Register the tool through `Runtime._register_builtin_tools()` or a ToolBroker-backed registry.
 
-Do not put direct filesystem, terminal, network, shell, browser, database, or credential access inside a tool implementation unless that code is itself the libOS primitive or a sandbox backend.
+Do not put direct filesystem, terminal, network, shell, browser, database, or credential access inside a model-facing tool unless that code is itself the libOS primitive or a sandbox backend.
 
 ## Module Map
 
@@ -245,12 +247,12 @@ Do not put direct filesystem, terminal, network, shell, browser, database, or cr
 agent_libos/
   api/             CLI entry points and demo orchestration
   capability/      Capability grant, revoke, check, and object handles
-  external/        External-object adapters such as filesystem and shell
+  external/        External-object primitives such as filesystem and clock
   human/           HumanObject query, approval, interrupt, and output primitives
   images/          Built-in AgentImage definitions
   llm/             Prompt, context, OpenAI-compatible client, executor, action parser
   memory/          Typed Object Memory and MemoryView implementation
-  runtime/         Runtime composition, process manager, scheduler, events, checkpoints, audit
+  runtime/         Runtime composition, async scheduler, process manager, events, checkpoints, audit
   skills/          Skill schema, registry, verifier, linker scaffolding
   skills_tools/    Tool/action registry and bundle scaffolding
   storage/         SQLite persistence
@@ -263,19 +265,19 @@ tests/             Safety-boundary and regression tests
 
 Near-term priorities:
 
-- Expand tests for process lifecycle, memory view semantics, checkpoint rollback, JIT registration, and LLM executor behavior.
-- Move remaining external-object placeholders behind capability-aware primitives.
-- Introduce explicit policy decisions for external side effects: allow, deny, require human approval, require checkpoint, or require sandbox.
-- Add a production-grade sandbox boundary for JIT tools.
-- Add ExternalRef objects and snapshots for external resources entering Object Memory.
-- Add CI and API documentation.
+- LLM executor conformance tests for provider edge cases and tool-call formats.
+- Tool result compaction and long-context paging.
+- Stronger checkpoint/rollback tests.
+- Audit querying by pid, capability, tool, external resource, and time range.
+- More complete terminal human queue UX.
+- Production-grade sandbox profiles for JIT and high-risk tools.
 
 Longer-term directions:
 
 - Persistent signed skill/tool registry.
-- Distributed process scheduler.
+- Distributed process scheduling.
 - Rich human role and authority model.
-- Tool result compaction and context paging.
+- ExternalRef objects and snapshots for external resources.
 - Multi-tenant runtime policy.
 - MCP-compatible tool exposure.
 
