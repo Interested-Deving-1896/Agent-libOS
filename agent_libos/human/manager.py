@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.models import CapabilityRight
-from agent_libos.exceptions import NotFound
+from agent_libos.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
 from agent_libos.ids import new_id, utc_now
 from agent_libos.models import (
     EventType,
@@ -101,6 +101,43 @@ class HumanObjectManager:
             },
             blocking=blocking,
         )
+
+    def ask(
+        self,
+        pid: str,
+        question: str,
+        human: str = "owner",
+        context: dict[str, Any] | None = None,
+        blocking: bool = True,
+    ) -> str:
+        resource = f"human:{human}"
+        self.capabilities.require(pid, resource, CapabilityRight.WRITE)
+        return self.query(
+            pid=pid,
+            human=human,
+            request={
+                "type": "question",
+                "question": question,
+                "context": context or {},
+            },
+            blocking=blocking,
+        )
+
+    def answer_for_request(self, request_id: str) -> str:
+        request = self.get(request_id)
+        if request.payload.get("type") != "question":
+            raise ValidationError(f"human request is not a question: {request_id}")
+        if request.status == HumanRequestStatus.PENDING:
+            raise HumanResponseRequired(
+                request_id=request_id,
+                message=f"{request.pid} is waiting for human answer to {request_id}",
+            )
+        if request.status != HumanRequestStatus.APPROVED:
+            raise CapabilityDenied(f"human question {request_id} was not answered: {request.status.value}")
+        decision = request.decision or {}
+        if "answer" not in decision:
+            raise ValidationError(f"human question {request_id} has no answer")
+        return str(decision["answer"])
 
     def approve(
         self,
@@ -196,6 +233,7 @@ class HumanObjectManager:
         human: str = "owner",
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
+        auto_answer: str | None = None,
         input_fn: Callable[[str], str] | None = None,
     ) -> HumanRequest | None:
         pending = self.pending(human=human)
@@ -206,6 +244,16 @@ class HumanObjectManager:
         if request_type == "output":
             return self._deliver_output_request(request)
         question = self._terminal_question(request)
+        if request_type == "question":
+            answer = self._select_text_answer(
+                question=question,
+                auto_answer=auto_answer,
+                input_fn=input_fn,
+            )
+            return self.approve(
+                request.request_id,
+                {"approved": True, "answer": answer, "source": "terminal_queue"},
+            )
         if request_type == "permission_request":
             policy = self._select_permission_policy(
                 question=question,
@@ -232,6 +280,7 @@ class HumanObjectManager:
         human: str = "owner",
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
+        auto_answer: str | None = None,
         input_fn: Callable[[str], str] | None = None,
     ) -> HumanRequest | None:
         return await asyncio.to_thread(
@@ -239,6 +288,7 @@ class HumanObjectManager:
             human=human,
             auto_approve=auto_approve,
             auto_policy=auto_policy,
+            auto_answer=auto_answer,
             input_fn=input_fn,
         )
 
@@ -247,6 +297,7 @@ class HumanObjectManager:
         human: str = "owner",
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
+        auto_answer: str | None = None,
         input_fn: Callable[[str], str] | None = None,
     ) -> builtins.list[HumanRequest]:
         processed: builtins.list[HumanRequest] = []
@@ -255,6 +306,7 @@ class HumanObjectManager:
                 human=human,
                 auto_approve=auto_approve,
                 auto_policy=auto_policy,
+                auto_answer=auto_answer,
                 input_fn=input_fn,
             )
             if request is None:
@@ -266,6 +318,7 @@ class HumanObjectManager:
         human: str = "owner",
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
+        auto_answer: str | None = None,
         input_fn: Callable[[str], str] | None = None,
     ) -> builtins.list[HumanRequest]:
         processed: builtins.list[HumanRequest] = []
@@ -274,6 +327,7 @@ class HumanObjectManager:
                 human=human,
                 auto_approve=auto_approve,
                 auto_policy=auto_policy,
+                auto_answer=auto_answer,
                 input_fn=input_fn,
             )
             if request is None:
@@ -442,6 +496,14 @@ class HumanObjectManager:
 
     def _terminal_question(self, request: HumanRequest) -> str:
         question = str(request.payload.get("question") or request.payload)
+        if request.payload.get("type") == "question":
+            context = request.payload.get("context")
+            if not isinstance(context, dict) or not context:
+                return question
+            lines = [question, "Context:"]
+            for key in sorted(context):
+                lines.append(f"- {key}: {context[key]!r}")
+            return "\n".join(lines)
         if request.payload.get("type") != "external_operation_approval":
             return question
         context = request.payload.get("context")
@@ -501,6 +563,18 @@ class HumanObjectManager:
             return answer in {"y", "yes"}
         self.output_sink(f"{question} [{'approved' if auto_approve else 'rejected'}]")
         return auto_approve
+
+    def _select_text_answer(
+        self,
+        question: str,
+        auto_answer: str | None,
+        input_fn: Callable[[str], str] | None,
+    ) -> str:
+        if auto_answer is not None:
+            self.output_sink(f"{question} [answer={auto_answer!r}]")
+            return auto_answer
+        reader = input_fn or input
+        return reader(f"{question} ")
 
     def _deliver_output_request(self, request: HumanRequest) -> HumanRequest:
         message = str(request.payload.get("message", ""))

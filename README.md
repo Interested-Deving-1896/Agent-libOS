@@ -40,6 +40,7 @@ Built-in tools currently include:
 - `read_text_file`
 - `write_text_file`
 - `request_permission`
+- `ask_human`
 - `human_output`
 - `parse_pytest_log`
 - `process_exit`
@@ -51,6 +52,7 @@ Important boundary rules:
 - Tool call visibility is not an external-resource grant.
 - Filesystem read/write checks happen in the filesystem primitive.
 - Human output and human approval checks happen in the HumanObject primitive.
+- `ask_human` creates a blocking HumanObject question and returns the answer only after the human queue responds.
 - Clock `sleep` is async, so one sleeping process does not block other runnable processes.
 
 ### Permissions And Human Queue
@@ -61,6 +63,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 - The human can choose `always_allow`, `always_deny`, or `ask_each_time`.
 - With `ask_each_time`, the relevant primitive creates a per-use human approval request when the operation is attempted.
 - Per-use approval grants a one-shot capability that is consumed after one successful primitive call.
+- Ordinary human questions use the same queue: a process waiting on `ask_human` stays in `WAITING_HUMAN` until the terminal queue supplies an answer.
 - Rejection does not crash the runtime; the process resumes and can report why it could not complete.
 - Approval context includes path, resource, overwrite risk, byte count, SHA-256, target state, and a `repr()`-escaped content preview.
 
@@ -169,6 +172,30 @@ uv run python scripts/async_clock_interleave_smoke.py --iterations 3 --interval 
 ```
 
 Expected output order is `A, B, A, B, ...`, showing that one process sleeping does not block the other process.
+
+Ask the human which workspace file to view, then show that file's content:
+
+```bash
+uv run python scripts/ask_file_then_show.py
+```
+
+For non-interactive testing:
+
+```bash
+uv run python scripts/ask_file_then_show.py --auto-answer README.md
+```
+
+Run a traditional human/LLM terminal chat through the script-local `ChatImage`, using `ask_human` and `human_output`:
+
+```bash
+uv run python scripts/human_llm_chat.py
+```
+
+For a deterministic local smoke run without calling a model:
+
+```bash
+uv run python scripts/human_llm_chat.py --mock --auto-message hello --auto-message /exit
+```
 
 ## Architecture
 

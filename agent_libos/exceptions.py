@@ -19,6 +19,10 @@ class HumanApprovalRequired(LibOSError):
         self.request_id = request_id
 
 
+class HumanResponseRequired(HumanApprovalRequired):
+    pass
+
+
 class PolicyDenied(LibOSError):
     pass
 
@@ -33,4 +37,3 @@ class ValidationError(LibOSError):
 
 class SandboxError(LibOSError):
     pass
-

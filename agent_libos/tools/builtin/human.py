@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import threading
+from typing import Any
+
 from pydantic import BaseModel, Field
 
+from agent_libos.exceptions import HumanResponseRequired
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 
@@ -14,6 +19,21 @@ class HumanOutputResult(BaseModel):
     delivered: bool
     channel: str
     chars: int
+
+
+class AskHumanArgs(BaseModel):
+    question: str = Field(description="Question to ask the human operator.")
+    context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional structured context shown with the question.",
+    )
+    human: str = Field(default="owner", description="Human recipient name.")
+
+
+class AskHumanResult(BaseModel):
+    request_id: str
+    answer: str
+    status: str
 
 
 class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
@@ -46,3 +66,69 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
             channel=args.channel,
         )
         return HumanOutputResult(**result)
+
+
+class AskHumanTool(SyncAgentTool[AskHumanArgs]):
+    name = "ask_human"
+    description = (
+        "Ask the human operator a question and return the human's answer. "
+        "This blocks the process through the libOS HumanObject queue until the answer is available."
+    )
+    args_schema = AskHumanArgs
+    output_schema = AskHumanResult
+    version = "1.0.0"
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        requires_confirmation=False,
+        permissions={"human.ask"},
+        timeout_s=2.0,
+    )
+    tags = ["human", "terminal", "question"]
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._pending_by_key: dict[str, str] = {}
+
+    def run(self, args: AskHumanArgs, ctx: ToolContext) -> AskHumanResult:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        key = self._pending_key(ctx.pid, args)
+        with self._lock:
+            request_id = self._pending_by_key.get(key)
+        if request_id is None:
+            request_id = runtime.human.ask(
+                pid=ctx.pid,
+                human=args.human,
+                question=args.question,
+                context=args.context,
+                blocking=True,
+            )
+            with self._lock:
+                self._pending_by_key[key] = request_id
+            raise HumanResponseRequired(
+                request_id=request_id,
+                message=f"{ctx.pid} is waiting for human answer to {request_id}",
+            )
+
+        try:
+            answer = runtime.human.answer_for_request(request_id)
+        except HumanResponseRequired:
+            raise
+        except Exception:
+            with self._lock:
+                self._pending_by_key.pop(key, None)
+            raise
+        with self._lock:
+            self._pending_by_key.pop(key, None)
+        return AskHumanResult(request_id=request_id, answer=answer, status="answered")
+
+    def _pending_key(self, pid: str, args: AskHumanArgs) -> str:
+        payload = {
+            "pid": pid,
+            "human": args.human,
+            "question": args.question,
+            "context": args.context,
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)

@@ -23,6 +23,7 @@ from agent_libos.skills.registry import RuntimeSkillRegistry
 from agent_libos.storage import SQLiteStore
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.builtin import (
+    AskHumanTool,
     CreateMemoryObjectTool,
     CreateObjectFromFileTool,
     EchoTool,
@@ -104,6 +105,7 @@ class Runtime:
         human: str = "owner",
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
+        human_auto_answer: str | None = None,
         human_input_fn: Callable[[str], str] | None = None,
     ) -> list[Any]:
         try:
@@ -116,6 +118,7 @@ class Runtime:
                     human=human,
                     human_auto_approve=human_auto_approve,
                     human_auto_policy=human_auto_policy,
+                    human_auto_answer=human_auto_answer,
                     human_input_fn=human_input_fn,
                 )
             )
@@ -123,12 +126,13 @@ class Runtime:
 
     async def arun_until_idle(
         self,
-        max_quanta: int = 25,
+        max_quanta: int = 4096,
         *,
         process_human_queue: bool = True,
         human: str = "owner",
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
+        human_auto_answer: str | None = None,
         human_input_fn: Callable[[str], str] | None = None,
     ) -> list[Any]:
         results: list[Any] = []
@@ -143,6 +147,7 @@ class Runtime:
                 human=human,
                 auto_approve=human_auto_approve,
                 auto_policy=human_auto_policy,
+                auto_answer=human_auto_answer,
                 input_fn=human_input_fn,
             )
             if not processed:
@@ -212,4 +217,5 @@ class Runtime:
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
         self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
+        self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")

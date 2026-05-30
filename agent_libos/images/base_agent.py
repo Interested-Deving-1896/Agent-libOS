@@ -10,6 +10,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         version="v0",
         system_prompt="General purpose Agent libOS process image.",
         default_tools=[
+            "ask_human",
             "create_memory_object",
             "get_current_time",
             "human_output",
@@ -26,6 +27,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         version="v0",
         system_prompt="Software engineering process image for repository inspection, patch planning, and test execution.",
         default_tools=[
+            "ask_human",
             "create_memory_object",
             "create_object_from_file",
             "get_current_time",
@@ -59,6 +61,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         version="v0",
         system_prompt="Review and validation image.",
         default_tools=[
+            "ask_human",
             "create_object_from_file",
             "get_current_time",
             "human_output",
