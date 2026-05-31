@@ -344,10 +344,10 @@ class AuditRecord:
 
 @dataclass
 class ResourceBudget:
-    max_tool_calls: int = 100
+    max_tool_calls: int = 256
     max_child_processes: int = 16
     max_runtime_seconds: int | None = None
-    max_materialized_tokens: int = 8000
+    max_materialized_tokens: int = 65536
 
 
 @dataclass(frozen=True)

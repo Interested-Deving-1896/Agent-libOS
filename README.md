@@ -19,6 +19,7 @@ This project is still in active development.
 - Agent images configure process-visible tool tables at process creation time.
 - Event bus and audit trace cover process, object memory, capabilities, tools, human requests, checkpoints, and external primitive access.
 - SQLite stores process/object metadata, events, audit records, capabilities, human requests, tools, candidates, and checkpoints.
+- External primitives use an injectable Resource Provider Substrate. The default substrate is local host OS backed, but filesystem, clock/sleep, and shell providers can be replaced without changing tool schemas or capability checks.
 
 ### Object Memory
 
@@ -88,6 +89,10 @@ Permission requests are ordinary process actions mediated by the human queue:
 - The runtime executes the selected legal tool call for each quantum.
 - Free-form model text is allowed, but only tool calls or fallback JSON actions have side effects.
 - Model calls run off the event loop, and tool dispatch has async support.
+
+### Built-In Coding Image
+
+`coding-agent:v0` is the practical repository-engineering image. It starts with read-only workspace authority and human-output authority, but no default write/delete authority. Its prompt tells the agent to orient with directory/file reads, preserve plans and evidence in Object Memory, fork narrow child workers for independent analysis, request least-privilege permissions for edits, use file/Object bridge tools for large content movement, parse pytest logs when available, and exit with a structured summary of changes, evidence, verification, residual risks, and follow-up.
 
 ### Security Properties Covered By Tests
 
@@ -231,17 +236,22 @@ Agent Personality / Application
      - EventBus
      - CheckpointManager
      - AuditManager
-  -> Host Runtime
-     - OpenAI-compatible model API
-     - SQLite
+  -> Resource Provider Substrate
+     - filesystem provider
+     - clock/sleep provider
+     - shell provider
+  -> Host Runtime / Provider Backend
      - local workspace filesystem
-     - subprocess sandbox
-     - terminal human queue
+     - host clock
+     - subprocess backend
+     - future remote, container, WASM, or service-backed providers
 ```
 
 The key design boundary is between model-facing tools and libOS primitives. For example, `write_text_file` can be visible in a process tool table, but `FilesystemAdapter.write_text()` still enforces workspace containment, resource capability or permission policy, human approval if needed, events, and audit logging.
 
 Putting a tool in a process table does not grant access to files, humans, shell, network, secrets, or other host resources.
+
+External primitives are not themselves the host implementation. They own libOS semantics: capability checks, human approval, event emission, and audit records. Concrete host calls live behind `agent_libos.substrate` providers such as `LocalFilesystemProvider`, `LocalClockProvider`, and `LocalShellProvider`.
 
 ## Runtime Execution Model
 
@@ -296,6 +306,7 @@ agent_libos/
   runtime/         Runtime composition, async scheduler, process manager, events, checkpoints, audit
   skills/          Skill schema, registry, verifier, linker scaffolding
   skills_tools/    Tool/action registry and bundle scaffolding
+  substrate/        Resource provider interfaces and the default local host-backed implementation
   storage/         SQLite persistence
   tools/           Tool base classes, ToolBroker, sandbox, and built-in tools
 scripts/           Real-model smoke and demo scripts

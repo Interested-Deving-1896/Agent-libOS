@@ -1499,6 +1499,19 @@ ExternalObjectAdapters:
   APIServiceAdapter
 ```
 
+ExternalObjectAdapter 不应直接等同于底层 Host OS 调用。Adapter 负责 libOS 语义，例如 capability 检查、人类授权、审计和事件；
+真正的资源访问应委托给可替换的 Resource Provider Substrate：
+
+```python
+class ResourceProviderSubstrate:
+    filesystem: FilesystemProvider
+    clock: ClockProvider
+    shell: ShellProvider
+```
+
+MVP 默认实现可以是本地 host-backed provider；后续可以替换为容器、远程执行环境、WASM sandbox、云对象存储或其它
+Resource Provider Substrate，而不改变 Agent 可见工具、process capability 模型和 audit/event 语义。
+
 ### 3.10.2 ExternalObjectRef
 
 ```python
@@ -2450,5 +2463,4 @@ capability_revoke
 
 如果团队按照本文档推进，第一阶段应优先做出一个可运行的 coding-agent demo，用最小系统验证：process、object
 memory、capability、human interrupt、JIT tool 和 audit trace 是否能自然协作。
-
 

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
+import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
@@ -12,6 +10,7 @@ from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotF
 from agent_libos.models import Capability, CapabilityRight, EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.substrate import FilesystemProvider, LocalFilesystemProvider, ResolvedPath
 
 
 @dataclass(frozen=True)
@@ -68,32 +67,39 @@ class FilesystemAdapter:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
-        root: str | Path,
+        root: str | os.PathLike[str] | None = None,
         namespace: str = "workspace",
         human: Any | None = None,
+        provider: FilesystemProvider | None = None,
     ):
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
-        self.root = Path(root).resolve()
-        self.namespace = namespace
+        if provider is None:
+            if root is None:
+                raise ValueError("FilesystemAdapter requires either root or provider")
+            provider = LocalFilesystemProvider(root, namespace=namespace)
+        self.provider = provider
+        self.root = provider.root_display
+        self.namespace = provider.namespace
         self.human = human
 
     def read_text(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         encoding: str = "utf-8",
         max_bytes: int = 65536,
     ) -> FileReadResult:
         target, relative = self._resolve(path)
         resource = self.resource_for(relative)
         self.capabilities.require(pid, resource, CapabilityRight.READ)
-        if not target.exists():
+        target_state = self.provider.state(target)
+        if not target_state.exists:
             raise NotFound(f"file does not exist: {relative}")
-        if not target.is_file():
+        if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
-        raw = target.read_bytes()
+        raw = self.provider.read_bytes(target)
         truncated = len(raw) > max_bytes
         selected = raw[:max_bytes]
         content = selected.decode(encoding)
@@ -114,7 +120,7 @@ class FilesystemAdapter:
     def write_text(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         text: str,
         encoding: str = "utf-8",
         overwrite: bool = True,
@@ -130,13 +136,13 @@ class FilesystemAdapter:
             encoding=encoding,
             overwrite=overwrite,
         )
-        created = not target.exists()
-        if target.exists() and not target.is_file():
+        target_state = self.provider.state(target)
+        created = not target_state.exists
+        if target_state.exists and target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
-        if target.exists() and not overwrite:
+        if target_state.exists and not overwrite:
             raise FileExistsError(f"file already exists: {relative}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding=encoding, newline="\n")
+        self.provider.write_text(target, text, encoding=encoding, newline="\n")
         bytes_written = len(text.encode(encoding))
         self.events.emit(
             EventType.EXTERNAL_WRITE,
@@ -162,19 +168,20 @@ class FilesystemAdapter:
     def read_directory(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         limit: int = 1024,
     ) -> DirectoryReadResult:
         target, relative = self._resolve(path)
         resource = self.directory_resource_for(relative)
         self.capabilities.require(pid, resource, CapabilityRight.READ)
-        if not target.exists():
+        target_state = self.provider.state(target)
+        if not target_state.exists:
             raise NotFound(f"directory does not exist: {relative}")
-        if not target.is_dir():
+        if target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
-        children = sorted(target.iterdir(), key=lambda item: item.name)
+        children = list(self.provider.list_directory(target))
         selected = children[:limit]
-        entries = [self._directory_entry(child) for child in selected]
+        entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
         truncated = len(children) > len(selected)
         self.events.emit(
             EventType.EXTERNAL_READ,
@@ -199,7 +206,7 @@ class FilesystemAdapter:
     def write_directory(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         parents: bool = True,
         exist_ok: bool = True,
     ) -> DirectoryWriteResult:
@@ -215,10 +222,11 @@ class FilesystemAdapter:
             question=f"Allow this process to create or update directory {relative}?",
             extra_context={"parents": parents, "exist_ok": exist_ok},
         )
-        created = not target.exists()
-        if target.exists() and not target.is_dir():
+        target_state = self.provider.state(target)
+        created = not target_state.exists
+        if target_state.exists and target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
-        target.mkdir(parents=parents, exist_ok=exist_ok)
+        self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -243,7 +251,7 @@ class FilesystemAdapter:
     def delete_file(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         missing_ok: bool = False,
     ) -> DeleteResult:
         target, relative = self._resolve(path)
@@ -257,13 +265,14 @@ class FilesystemAdapter:
             recursive=False,
             missing_ok=missing_ok,
         )
-        if not target.exists():
+        target_state = self.provider.state(target)
+        if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"file does not exist: {relative}")
             return DeleteResult(path=relative, kind="missing", deleted=False)
-        if not target.is_file():
+        if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
-        target.unlink()
+        self.provider.delete_file(target)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -288,12 +297,12 @@ class FilesystemAdapter:
     def delete_directory(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         recursive: bool = False,
         missing_ok: bool = False,
     ) -> DeleteResult:
         target, relative = self._resolve(path)
-        if target == self.root:
+        if target.is_root:
             raise CapabilityDenied("cannot delete filesystem adapter root")
         resource = self.directory_resource_for(relative)
         consumed_once = self._require_delete(
@@ -305,16 +314,14 @@ class FilesystemAdapter:
             recursive=recursive,
             missing_ok=missing_ok,
         )
-        if not target.exists():
+        target_state = self.provider.state(target)
+        if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"directory does not exist: {relative}")
             return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
-        if not target.is_dir():
+        if target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
-        if recursive:
-            shutil.rmtree(target)
-        else:
-            target.rmdir()
+        self.provider.delete_directory(target, recursive=recursive)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -357,7 +364,7 @@ class FilesystemAdapter:
     def grant_path(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         rights: Iterable[str | CapabilityRight],
         issued_by: str = "filesystem",
     ) -> Capability:
@@ -371,7 +378,7 @@ class FilesystemAdapter:
     def grant_directory(
         self,
         pid: str,
-        path: str | Path,
+        path: str | os.PathLike[str],
         rights: Iterable[str | CapabilityRight],
         issued_by: str = "filesystem",
     ) -> Capability:
@@ -386,12 +393,12 @@ class FilesystemAdapter:
         self,
         pid: str,
         *,
-        read_files: Iterable[str | Path] = (),
-        write_files: Iterable[str | Path] = (),
-        delete_files: Iterable[str | Path] = (),
-        read_dirs: Iterable[str | Path] = (),
-        write_dirs: Iterable[str | Path] = (),
-        delete_dirs: Iterable[str | Path] = (),
+        read_files: Iterable[str | os.PathLike[str]] = (),
+        write_files: Iterable[str | os.PathLike[str]] = (),
+        delete_files: Iterable[str | os.PathLike[str]] = (),
+        read_dirs: Iterable[str | os.PathLike[str]] = (),
+        write_dirs: Iterable[str | os.PathLike[str]] = (),
+        delete_dirs: Iterable[str | os.PathLike[str]] = (),
         issued_by: str = "filesystem",
     ) -> list[Capability]:
         grants: list[Capability] = []
@@ -412,38 +419,38 @@ class FilesystemAdapter:
     def workspace_resource(self) -> str:
         return f"filesystem:{self.namespace}:*"
 
-    def resource_for(self, path: str | Path) -> str:
-        relative = Path(path).as_posix()
+    def resource_for(self, path: str | os.PathLike[str]) -> str:
+        relative = self._logical_path(path)
         if relative in {"", "."}:
             return f"filesystem:{self.namespace}:"
         return f"filesystem:{self.namespace}:{relative}"
 
-    def resource_for_path(self, path: str | Path) -> str:
+    def resource_for_path(self, path: str | os.PathLike[str]) -> str:
         _target, relative = self._resolve(path)
         return self.resource_for(relative)
 
-    def directory_resource_for(self, path: str | Path) -> str:
-        relative = Path(path).as_posix().rstrip("/")
+    def directory_resource_for(self, path: str | os.PathLike[str]) -> str:
+        relative = self._logical_path(path).rstrip("/")
         if relative in {"", "."}:
             return self.workspace_resource()
         return f"filesystem:{self.namespace}:{relative}/*"
 
-    def directory_resource_for_path(self, path: str | Path) -> str:
+    def directory_resource_for_path(self, path: str | os.PathLike[str]) -> str:
         _target, relative = self._resolve(path)
         return self.directory_resource_for(relative)
 
-    def _resolve(self, path: str | Path) -> tuple[Path, str]:
-        target = (self.root / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
-        if self.root not in target.parents and target != self.root:
-            raise CapabilityDenied(f"path escapes filesystem adapter root: {path}")
-        relative = target.relative_to(self.root).as_posix()
-        return target, relative
+    def _resolve(self, path: str | os.PathLike[str]) -> tuple[ResolvedPath, str]:
+        target = self.provider.resolve(path)
+        return target, target.relative
+
+    def _logical_path(self, path: str | os.PathLike[str]) -> str:
+        return os.fspath(path).replace("\\", "/")
 
     def _require_write(
         self,
         pid: str,
         resource: str,
-        target: Path,
+        target: ResolvedPath,
         relative: str,
         text: str,
         encoding: str,
@@ -468,7 +475,7 @@ class FilesystemAdapter:
         self,
         pid: str,
         resource: str,
-        target: Path,
+        target: ResolvedPath,
         relative: str,
         operation: str,
         primitive: str,
@@ -523,7 +530,7 @@ class FilesystemAdapter:
         self,
         pid: str,
         resource: str,
-        target: Path,
+        target: ResolvedPath,
         relative: str,
         operation: str,
         recursive: bool,
@@ -573,7 +580,7 @@ class FilesystemAdapter:
         self,
         pid: str,
         resource: str,
-        target: Path,
+        target: ResolvedPath,
         relative: str,
         primitive: str,
         operation: str,
@@ -587,9 +594,9 @@ class FilesystemAdapter:
             "primitive": primitive,
             "operation": operation,
             "pid": pid,
-            "workspace_root": str(self.root),
+            "workspace_root": self.root,
             "path": relative,
-            "absolute_path": str(target),
+            "absolute_path": target.display,
             "resource": resource,
             "right": right,
             "grant_scope": "one_time",
@@ -616,25 +623,14 @@ class FilesystemAdapter:
         # separate approval instructions in the human terminal prompt.
         return repr(preview), len(text) > limit
 
-    def _target_state(self, target: Path) -> dict[str, Any]:
-        if not target.exists():
+    def _target_state(self, target: ResolvedPath) -> dict[str, Any]:
+        state = self.provider.state(target)
+        if not state.exists:
             return {"exists": False, "kind": "missing"}
-        stat = target.stat()
-        kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
-        return {
+        result = {
             "exists": True,
-            "kind": kind,
-            "size_bytes": stat.st_size if target.is_file() else None,
-            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            "kind": state.kind,
+            "size_bytes": state.size_bytes,
+            "modified_at": state.modified_at,
         }
-
-    def _directory_entry(self, target: Path) -> DirectoryEntry:
-        stat = target.stat()
-        kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
-        return DirectoryEntry(
-            name=target.name,
-            path=target.relative_to(self.root).as_posix(),
-            kind=kind,
-            size_bytes=stat.st_size if target.is_file() else None,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-        )
+        return result

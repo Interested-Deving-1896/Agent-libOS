@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_libos.exceptions import ValidationError
 from agent_libos.models import EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.substrate import ClockProvider, LocalClockProvider
 
 
 @dataclass(frozen=True)
@@ -32,14 +31,21 @@ class ClockPrimitive:
         "Asia/Shanghai": timezone(timedelta(hours=8), name="Asia/Shanghai"),
     }
 
-    def __init__(self, audit: AuditManager, events: EventBus, max_sleep_seconds: float = 60.0):
+    def __init__(
+        self,
+        audit: AuditManager,
+        events: EventBus,
+        max_sleep_seconds: float = 60.0,
+        provider: ClockProvider | None = None,
+    ):
         self.audit = audit
         self.events = events
         self.max_sleep_seconds = max_sleep_seconds
+        self.provider = provider or LocalClockProvider()
 
     def now(self, pid: str, tz: str = "UTC") -> ClockNowResult:
         selected_tz = self._timezone(tz)
-        current = datetime.now(selected_tz)
+        current = self.provider.now(selected_tz)
         result = ClockNowResult(
             iso8601=current.isoformat(),
             unix_seconds=current.timestamp(),
@@ -61,18 +67,16 @@ class ClockPrimitive:
 
     def sleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
-        started = time.monotonic()
-        time.sleep(duration)
-        elapsed = time.monotonic() - started
+        started = self.provider.monotonic()
+        self.provider.sleep(duration)
+        elapsed = self.provider.monotonic() - started
         return self._record_sleep(pid, duration, elapsed)
 
     async def asleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
-        started = time.monotonic()
-        # Use asyncio sleep so one sleeping AgentProcess does not block other
-        # runnable process tasks in the scheduler.
-        await asyncio.sleep(duration)
-        elapsed = time.monotonic() - started
+        started = self.provider.monotonic()
+        await self.provider.asleep(duration)
+        elapsed = self.provider.monotonic() - started
         return self._record_sleep(pid, duration, elapsed)
 
     def _validate_sleep_duration(self, seconds: float) -> float:

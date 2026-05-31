@@ -21,6 +21,7 @@ from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.skills.linker import SkillLinker
 from agent_libos.skills.registry import RuntimeSkillRegistry
 from agent_libos.storage import SQLiteStore
+from agent_libos.substrate import LocalResourceProviderSubstrate, ResourceProviderSubstrate
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.builtin import (
     AskHumanTool,
@@ -51,21 +52,27 @@ from agent_libos.tools.builtin import (
 class Runtime:
     """Composition root for the MVP libOS runtime."""
 
-    def __init__(self, store: SQLiteStore, llm_client: LLMClient | None = None):
-        self.workspace_root = Path.cwd().resolve()
+    def __init__(
+        self,
+        store: SQLiteStore,
+        llm_client: LLMClient | None = None,
+        substrate: ResourceProviderSubstrate | None = None,
+    ):
+        self.substrate = substrate or LocalResourceProviderSubstrate(Path.cwd().resolve())
+        self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
         self.store = store
         self.audit = AuditManager(store)
         self.events = EventBus(store)
         self.capability = CapabilityManager(store, self.audit, self.events)
         self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events)
         self.human = HumanObjectManager(store, self.capability, self.audit, self.events)
-        self.clock = ClockPrimitive(self.audit, self.events)
+        self.clock = ClockPrimitive(self.audit, self.events, provider=self.substrate.clock)
         self.filesystem = FilesystemAdapter(
             self.capability,
             self.audit,
             self.events,
-            root=self.workspace_root,
             human=self.human,
+            provider=self.substrate.filesystem,
         )
         self.tools = ToolBroker(
             store,
@@ -88,10 +95,10 @@ class Runtime:
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
 
     @classmethod
-    def open(cls, target: str | Path = "local") -> "Runtime":
+    def open(cls, target: str | Path = "local", substrate: ResourceProviderSubstrate | None = None) -> "Runtime":
         if str(target) == "local":
-            return cls(SQLiteStore(":memory:"))
-        return cls(SQLiteStore(str(target)))
+            return cls(SQLiteStore(":memory:"), substrate=substrate)
+        return cls(SQLiteStore(str(target)), substrate=substrate)
 
     def close(self) -> None:
         self.store.close()
