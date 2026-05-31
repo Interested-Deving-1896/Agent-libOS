@@ -5,7 +5,14 @@ from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.permission import RequestPermissionTool
-from agent_libos.tools.builtin.process import ProcessExitTool
+from agent_libos.tools.builtin.process import (
+    ForkChildProcessTool,
+    ListChildProcessesTool,
+    MergeChildMemoryTool,
+    ProcessExitTool,
+    SignalChildProcessTool,
+    WaitChildProcessTool,
+)
 
 __all__ = [
     "CreateMemoryObjectTool",
@@ -14,11 +21,16 @@ __all__ = [
     "GetCurrentTimeTool",
     "AskHumanTool",
     "HumanOutputTool",
+    "ForkChildProcessTool",
+    "ListChildProcessesTool",
+    "MergeChildMemoryTool",
     "ParsePytestLogTool",
     "ProcessExitTool",
     "ReadTextFileTool",
     "RequestPermissionTool",
+    "SignalChildProcessTool",
     "SleepTool",
+    "WaitChildProcessTool",
     "WriteObjectToFileTool",
     "WriteTextFileTool",
 ]

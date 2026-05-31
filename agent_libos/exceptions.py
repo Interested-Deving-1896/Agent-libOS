@@ -23,6 +23,12 @@ class HumanResponseRequired(HumanApprovalRequired):
     pass
 
 
+class ProcessWaitRequired(LibOSError):
+    def __init__(self, child_pid: str, message: str):
+        super().__init__(message)
+        self.child_pid = child_pid
+
+
 class PolicyDenied(LibOSError):
     pass
 

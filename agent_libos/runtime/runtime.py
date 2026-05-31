@@ -27,13 +27,18 @@ from agent_libos.tools.builtin import (
     CreateMemoryObjectTool,
     CreateObjectFromFileTool,
     EchoTool,
+    ForkChildProcessTool,
     GetCurrentTimeTool,
     HumanOutputTool,
+    ListChildProcessesTool,
+    MergeChildMemoryTool,
     ParsePytestLogTool,
     ProcessExitTool,
     ReadTextFileTool,
     RequestPermissionTool,
+    SignalChildProcessTool,
     SleepTool,
+    WaitChildProcessTool,
     WriteObjectToFileTool,
     WriteTextFileTool,
 )
@@ -179,6 +184,7 @@ class Runtime:
         return self.images[image_id]
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
+        process = self.store.get_process(pid)
         image = self.images.get(image_id) or self.images["base-agent:v0"]
         # Tool visibility is fixed from the AgentImage at process creation time.
         # External-resource authority is still enforced later by the primitives.
@@ -192,6 +198,14 @@ class Runtime:
                 target=f"process:{pid}",
                 decision={"tools": sorted(tool_names), "error": str(exc)},
             )
+        if process is not None and process.parent_pid is not None:
+            self.audit.record(
+                actor="runtime",
+                action="image.default_capability_skipped_for_child",
+                target=f"process:{pid}",
+                decision={"image": image_id, "parent_pid": process.parent_pid},
+            )
+            return
         for spec in image.required_capabilities:
             try:
                 self.capability.grant(
@@ -219,10 +233,15 @@ class Runtime:
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
+        self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(ListChildProcessesTool(), registered_by="runtime")
+        self.tools.register_tool(MergeChildMemoryTool(), registered_by="runtime")
         self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
         self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
+        self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
+        self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")

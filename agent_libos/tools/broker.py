@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.exceptions import HumanApprovalRequired, NotFound, ProcessWaitRequired, ValidationError
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -332,6 +332,19 @@ class ToolBroker:
                     "tool": handle.name,
                     "policy_decision": "require_human_approval",
                     "request_id": exc.request_id,
+                },
+            )
+            raise
+        except ProcessWaitRequired as exc:
+            self.audit.record(
+                actor=pid,
+                action="tool.call_waiting_process",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "wait_for_child",
+                    "child_pid": exc.child_pid,
                 },
             )
             raise

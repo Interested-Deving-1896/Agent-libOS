@@ -12,7 +12,9 @@ This project is still in active development.
 
 - Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`, `resume`, `exit`.
 - Async process supervisor: `Runtime.arun_until_idle()` automatically keeps runnable processes moving.
+- Child process tools can fork workers, wait/join, list direct children, signal direct children, and merge child memory.
 - Human queue integration is part of the runtime supervisor by default. If a primitive blocks on human approval, the process enters `WAITING_HUMAN`; the runtime processes human terminal messages, wakes the process, and resumes the pending action.
+- Child waits are also resumable: `wait_child_process` puts the parent in `WAITING_EVENT`, child exit wakes the parent, and the original wait action resumes without asking the model for a new action.
 - Single-step APIs remain available for tests and debugging: `run_next_process_once()` / `arun_next_process_once()` do not drain the human queue.
 - Agent images configure process-visible tool tables at process creation time.
 - Event bus and audit trace cover process, object memory, capabilities, tools, human requests, checkpoints, and external primitive access.
@@ -34,7 +36,12 @@ Built-in tools currently include:
 
 - `create_memory_object`
 - `create_object_from_file`
+- `fork_child_process`
 - `write_object_to_file`
+- `wait_child_process`
+- `list_child_processes`
+- `signal_child_process`
+- `merge_child_memory`
 - `get_current_time`
 - `sleep`
 - `read_text_file`

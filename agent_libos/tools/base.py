@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound
+from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.models import ToolSpec
 
 InputT = TypeVar("InputT", bound=BaseModel)
@@ -215,6 +215,8 @@ class BaseAgentTool(ABC, Generic[InputT]):
             )
         except HumanApprovalRequired:
             raise
+        except ProcessWaitRequired:
+            raise
         except CapabilityDenied as exc:
             return ToolResult.failure(
                 code=ToolErrorCode.PERMISSION_DENIED,
@@ -223,6 +225,13 @@ class BaseAgentTool(ABC, Generic[InputT]):
                 metadata=self._base_metadata(ctx, started_at),
             )
         except NotFound as exc:
+            return ToolResult.failure(
+                code=ToolErrorCode.EXECUTION_ERROR,
+                message=str(exc),
+                details={"error_type": type(exc).__name__},
+                metadata=self._base_metadata(ctx, started_at),
+            )
+        except ProcessError as exc:
             return ToolResult.failure(
                 code=ToolErrorCode.EXECUTION_ERROR,
                 message=str(exc),

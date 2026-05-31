@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import NotFound, ProcessError
+from agent_libos.exceptions import NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
@@ -15,6 +15,8 @@ from agent_libos.models import (
     ForkMode,
     MemoryView,
     MemoryViewSpec,
+    MergePolicy,
+    MergeResult,
     ObjectHandle,
     ObjectMetadata,
     ObjectType,
@@ -31,6 +33,8 @@ from agent_libos.storage import SQLiteStore
 
 class ProcessManager:
     """Process lifecycle primitive."""
+
+    TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
     def __init__(
         self,
@@ -113,8 +117,9 @@ class ProcessManager:
     ) -> str:
         parent_proc = self._get(parent)
         fork_mode = ForkMode(mode)
-        if parent_proc.status in {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}:
+        if parent_proc.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot fork terminated process: {parent}")
+        self._require_child_budget(parent_proc)
         now = utc_now()
         child_pid = new_id("pid")
         child = AgentProcess(
@@ -214,17 +219,15 @@ class ProcessManager:
 
     def wait(self, pid: str, child: str, timeout: float | None = None) -> ProcessResult:
         parent = self._get(pid)
-        child_proc = self._get(child)
-        if child_proc.parent_pid != parent.pid:
-            raise ProcessError(f"{child} is not a child of {pid}")
-        if child_proc.status not in {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}:
+        child_proc = self._require_child(parent.pid, child)
+        if child_proc.status not in self.TERMINAL_STATUSES:
             parent.status = ProcessStatus.WAITING_EVENT
             parent.status_message = f"waiting for {child}"
             parent.updated_at = utc_now()
             self.store.update_process(parent)
             if timeout == 0:
                 raise TimeoutError(f"child still running: {child}")
-            raise TimeoutError(f"child still running: {child}")
+            raise ProcessWaitRequired(child_pid=child, message=f"{pid} is waiting for child process {child}")
         result_handle = None
         if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
             oid = child_proc.status_message.split(":", 1)[1]
@@ -234,6 +237,7 @@ class ProcessManager:
                 {"read", "materialize", "link", "diff"},
                 issued_by=f"process.wait:{child}",
             )
+            self._add_handle_to_process_view(parent, result_handle)
         if parent.status == ProcessStatus.WAITING_EVENT:
             parent.status = ProcessStatus.RUNNABLE
             parent.status_message = None
@@ -248,28 +252,106 @@ class ProcessManager:
         )
         return ProcessResult(pid=child, status=child_proc.status, result=result_handle, message=child_proc.status_message)
 
+    def list_children(self, pid: str, include_terminal: bool = True) -> builtins.list[AgentProcess]:
+        self._get(pid)
+        children = [process for process in self.store.list_processes() if process.parent_pid == pid]
+        if not include_terminal:
+            children = [process for process in children if process.status not in self.TERMINAL_STATUSES]
+        children.sort(key=lambda process: process.created_at)
+        self.audit.record(
+            actor=pid,
+            action="process.list_children",
+            target=f"process:{pid}",
+            decision={"count": len(children), "include_terminal": include_terminal},
+        )
+        return children
+
+    def signal_child(
+        self,
+        pid: str,
+        child: str,
+        signal: ProcessSignal | str,
+        reason: str | None = None,
+    ) -> AgentProcess:
+        child_proc = self._require_child(pid, child)
+        sig = ProcessSignal(signal)
+        self._apply_signal(
+            child_proc,
+            sig,
+            payload={"reason": reason} if reason else {},
+            actor=pid,
+            action="process.signal_child",
+        )
+        updated = self._get(child)
+        if updated.status in self.TERMINAL_STATUSES:
+            self._wake_parent_waiting_on_child(updated)
+        return updated
+
+    def merge_child_memory(
+        self,
+        pid: str,
+        child: str,
+        policy: MergePolicy | None = None,
+    ) -> MergeResult:
+        child_proc = self._require_child(pid, child)
+        if child_proc.status not in self.TERMINAL_STATUSES:
+            raise ProcessError(f"cannot merge running child process: {child}")
+        if child_proc.memory_view is None:
+            return MergeResult(merged_oids=[], skipped_oids=[])
+        result = self.memory.merge_view(pid, child_proc.memory_view, policy=policy)
+        parent = self._get(pid)
+        for oid in result.merged_oids:
+            handle = self.capabilities.handle_for_object(
+                pid,
+                oid,
+                {"read", "materialize", "link", "diff"},
+                issued_by=f"process.merge_child_memory:{child}",
+            )
+            self._add_handle_to_process_view(parent, handle)
+        self.audit.record(
+            actor=pid,
+            action="process.merge_child_memory",
+            target=f"process:{child}",
+            output_refs=result.merged_oids,
+            decision={"merged": len(result.merged_oids), "skipped": result.skipped_oids},
+        )
+        return result
+
     def signal(self, target: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> None:
         proc = self._get(target)
         sig = ProcessSignal(signal)
+        self._apply_signal(proc, sig, payload=payload or {}, actor="runtime", action="process.signal")
+        updated = self._get(target)
+        if updated.status in self.TERMINAL_STATUSES:
+            self._wake_parent_waiting_on_child(updated)
+
+    def _apply_signal(
+        self,
+        proc: AgentProcess,
+        sig: ProcessSignal,
+        payload: dict[str, Any],
+        actor: str,
+        action: str,
+    ) -> None:
         if sig == ProcessSignal.PAUSE:
             proc.status = ProcessStatus.PAUSED
         elif sig == ProcessSignal.RESUME:
             proc.status = ProcessStatus.RUNNABLE
         elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
             proc.status = ProcessStatus.KILLED
-        proc.status_message = (payload or {}).get("reason")
+        proc.status_message = payload.get("reason")
         proc.updated_at = utc_now()
         self.store.update_process(proc)
         self.events.emit(
             EventType.PROCESS_SIGNAL,
-            source="runtime",
-            target=target,
+            source=actor,
+            target=proc.pid,
             payload={"signal": sig.value, "payload": payload or {}},
         )
         self.audit.record(
-            actor="runtime",
-            action="process.signal",
-            target=f"process:{target}",
+            actor=actor,
+            action=action,
+            target=f"process:{proc.pid}",
             decision={"signal": sig.value, "payload": payload or {}},
         )
 
@@ -304,6 +386,7 @@ class ProcessManager:
         # Reclaim volatile Object Memory owned by this process after its final
         # state has been recorded.
         self.memory.release_process_owned(pid, preserve_oids={result.oid} if result is not None else set())
+        self._wake_parent_waiting_on_child(process)
 
     def get(self, pid: str) -> AgentProcess:
         return self._get(pid)
@@ -354,3 +437,47 @@ class ProcessManager:
     def _run_after_spawn_hooks(self, pid: str, image_id: str) -> None:
         for hook in self._after_spawn_hooks:
             hook(pid, image_id)
+
+    def _require_child(self, parent: str, child: str) -> AgentProcess:
+        self._get(parent)
+        child_proc = self._get(child)
+        if child_proc.parent_pid != parent:
+            raise ProcessError(f"{child} is not a child of {parent}")
+        return child_proc
+
+    def _require_child_budget(self, parent: AgentProcess) -> None:
+        child_count = len([process for process in self.store.list_processes() if process.parent_pid == parent.pid])
+        if child_count >= parent.resource_budget.max_child_processes:
+            raise ProcessError(
+                f"process {parent.pid} exhausted child process budget: "
+                f"{child_count}/{parent.resource_budget.max_child_processes}"
+            )
+
+    def _add_handle_to_process_view(self, process: AgentProcess, handle: ObjectHandle) -> None:
+        if process.memory_view is None:
+            process.memory_view = self.memory.create_view(process.pid, [handle], mode=ViewMode.READ_ONLY)
+        elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
+            process.memory_view.roots.append(handle)
+        process.updated_at = utc_now()
+        self.store.update_process(process)
+
+    def _wake_parent_waiting_on_child(self, child: AgentProcess) -> None:
+        if child.parent_pid is None:
+            return
+        parent = self.store.get_process(child.parent_pid)
+        if parent is None:
+            return
+        if parent.status != ProcessStatus.WAITING_EVENT:
+            return
+        if parent.status_message != f"waiting for {child.pid}":
+            return
+        parent.status = ProcessStatus.RUNNABLE
+        parent.status_message = None
+        parent.updated_at = utc_now()
+        self.store.update_process(parent)
+        self.audit.record(
+            actor="process",
+            action="process.wait_wake",
+            target=f"process:{parent.pid}",
+            decision={"child": child.pid, "child_status": child.status.value},
+        )

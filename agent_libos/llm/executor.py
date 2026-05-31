@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, TYPE_CHECKING
 
-from agent_libos.exceptions import HumanApprovalRequired
+from agent_libos.exceptions import HumanApprovalRequired, ProcessWaitRequired
 from agent_libos.ids import utc_now
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
@@ -31,6 +31,7 @@ class LLMProcessExecutor:
         # not received a tool result yet. The action is retried after the human
         # queue records a decision, without asking the model for a new action.
         self._pending_human_actions: dict[str, dict[str, Any]] = {}
+        self._pending_wait_actions: dict[str, dict[str, Any]] = {}
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -45,6 +46,8 @@ class LLMProcessExecutor:
             return {"ok": False, "skipped": True, "status": process.status.value}
         if pid in self._pending_human_actions:
             return await self._resume_pending_human_action(pid)
+        if pid in self._pending_wait_actions:
+            return await self._resume_pending_wait_action(pid)
         image = self.runtime.images.get(process.image_id) or self.runtime.images["base-agent:v0"]
         if process.memory_view is None:
             process.memory_view = self.runtime.memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
@@ -95,6 +98,15 @@ class LLMProcessExecutor:
                     content_preview=completion.content[:500],
                     tool_call_count=len(completion.tool_calls),
                 )
+            except ProcessWaitRequired as exc:
+                return self._wait_for_child_action(
+                    pid=pid,
+                    action=action,
+                    child_pid=exc.child_pid,
+                    message=str(exc),
+                    content_preview=completion.content[:500],
+                    tool_call_count=len(completion.tool_calls),
+                )
             return self._completed_action_result(
                 pid=pid,
                 action=action,
@@ -110,6 +122,14 @@ class LLMProcessExecutor:
                 decision={"request_id": exc.request_id, "message": str(exc)},
             )
             return {"ok": False, "waiting_human": True, "request_id": exc.request_id}
+        except ProcessWaitRequired as exc:
+            self.runtime.audit.record(
+                actor=pid,
+                action="llm.action_waiting_child",
+                target=f"process:{exc.child_pid}",
+                decision={"child_pid": exc.child_pid, "message": str(exc)},
+            )
+            return {"ok": False, "waiting_event": True, "child_pid": exc.child_pid}
         except Exception as exc:
             self.runtime.process.exit(pid, failed=True, message=f"LLM quantum failed: {exc}")
             self.runtime.audit.record(
@@ -174,6 +194,34 @@ class LLMProcessExecutor:
         )
         return {"ok": False, "waiting_human": True, "request_id": request_id}
 
+    def _wait_for_child_action(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        child_pid: str,
+        message: str,
+        content_preview: str,
+        tool_call_count: int,
+    ) -> dict[str, Any]:
+        self._pending_wait_actions[pid] = {
+            "child_pid": child_pid,
+            "action": dict(action),
+            "content_preview": content_preview,
+            "tool_call_count": tool_call_count,
+        }
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.action_waiting_child",
+            target=f"process:{child_pid}",
+            decision={
+                "child_pid": child_pid,
+                "action": action,
+                "message": message,
+                "tool_call_count": tool_call_count,
+            },
+        )
+        return {"ok": False, "waiting_event": True, "child_pid": child_pid}
+
     async def _resume_pending_human_action(self, pid: str) -> dict[str, Any]:
         pending = self._pending_human_actions[pid]
         request_id = str(pending["request_id"])
@@ -218,6 +266,44 @@ class LLMProcessExecutor:
             content_preview=str(pending.get("content_preview", "")),
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_human=True,
+        )
+
+    async def _resume_pending_wait_action(self, pid: str) -> dict[str, Any]:
+        pending = self._pending_wait_actions[pid]
+        child_pid = str(pending["child_pid"])
+        child = self.runtime.process.get(child_pid)
+        if child.status not in {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}:
+            return {"ok": False, "waiting_event": True, "child_pid": child_pid}
+
+        action = dict(pending["action"])
+        self._pending_wait_actions.pop(pid, None)
+        try:
+            result = await self.adispatch(pid, action)
+        except ProcessWaitRequired as exc:
+            return self._wait_for_child_action(
+                pid=pid,
+                action=action,
+                child_pid=exc.child_pid,
+                message=str(exc),
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+            )
+        except HumanApprovalRequired as exc:
+            return self._wait_for_human_action(
+                pid=pid,
+                action=action,
+                request_id=exc.request_id,
+                message=str(exc),
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+            )
+        return self._completed_action_result(
+            pid=pid,
+            action=action,
+            result=result,
+            content_preview=str(pending.get("content_preview", "")),
+            tool_call_count=int(pending.get("tool_call_count", 0)),
+            resumed_after_human=False,
         )
 
     def _emit_pending_action_rejected(self, pid: str, action: dict[str, Any], request_id: str, error: str) -> None:
