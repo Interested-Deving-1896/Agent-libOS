@@ -47,6 +47,7 @@ async def amain(args: argparse.Namespace) -> None:
                 human_auto_answer=args.human_auto_answer,
             )
         process = runtime.process.get(pid)
+        audit_counts = _audit_counts_for_process(runtime.audit.trace(), pid)
         summary = {
             "workspace": str(workspace),
             "database": "local" if args.ephemeral_db else str(_resolve_db_path(args, workspace)),
@@ -57,7 +58,7 @@ async def amain(args: argparse.Namespace) -> None:
             "ran": not args.no_run,
             "process_status": process.status.value,
             "results": to_jsonable(results),
-            "audit_records": len(runtime.audit.trace()),
+            **audit_counts,
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
         if args.strict and process.status in {ProcessStatus.FAILED, ProcessStatus.KILLED}:
@@ -188,6 +189,15 @@ def _optional_bool(value: str | None) -> bool | None:
     if value is None:
         return None
     return value == "yes"
+
+
+def _audit_counts_for_process(audit_records: list[Any], pid: str) -> dict[str, int]:
+    process_records = [record for record in audit_records if record.actor == pid]
+    return {
+        "audit_records": len(process_records),
+        "audit_records_total": len(audit_records),
+        "llm_repair_attempts": sum(1 for record in process_records if record.action == "llm.action_repair_requested"),
+    }
 
 
 def _capability_summary(capability: Capability) -> dict[str, Any]:

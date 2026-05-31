@@ -22,7 +22,7 @@ class LLMContextMemoryTests(unittest.TestCase):
             runtime.run_next_process_once()
 
             name = context_object_name(pid)
-            obj = runtime.store.get_object_by_name(name)
+            obj = runtime.store.get_object_by_name(name, namespace=runtime.memory.resolve_namespace(pid))
             self.assertIsNotNone(obj)
             assert obj is not None
             self.assertFalse(obj.immutable)
@@ -39,7 +39,7 @@ class LLMContextMemoryTests(unittest.TestCase):
                 {"name": name, "entry": {"kind": "agent_note", "text": "keep this in context"}},
             )
 
-            updated = runtime.store.get_object_by_name(name)
+            updated = runtime.store.get_object_by_name(name, namespace=runtime.memory.resolve_namespace(pid))
             self.assertTrue(read.ok, read.error)
             self.assertTrue(appended.ok, appended.error)
             self.assertEqual(updated.payload["entries"][-1]["kind"], "agent_note")
@@ -64,7 +64,10 @@ class LLMContextMemoryTests(unittest.TestCase):
             self.assertIn("Cache strategy: append_only_stable_prefix", first)
             self.assertIn("LLM context object", first)
             self.assertTrue(second.startswith(first))
-            context = runtime.store.get_object_by_name(context_object_name(pid))
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
             kinds = [entry["kind"] for entry in context.payload["entries"]]
             self.assertIn("memory_delta", kinds)
             self.assertGreater(len(second), len(first))
@@ -88,6 +91,31 @@ class LLMContextMemoryTests(unittest.TestCase):
             self.assertIn("process_exit", tool_names)
             self.assertNotIn("read_text_file", tool_names)
             self.assertNotIn("read_text_file", runtime.llm.client.user_prompts[0])
+        finally:
+            runtime.close()
+
+    def test_llm_retries_malformed_empty_tool_name_once(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.llm.client = RecordingActionClient(
+                [
+                    {"action": "", "path": "."},
+                    {"action": "process_exit", "payload": {"done": True}},
+                ]
+            )
+            pid = runtime.process.spawn(image="base-agent:v0", goal="recover malformed action")
+
+            result = runtime.run_next_process_once()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["action"]["action"], "process_exit")
+            self.assertEqual(len(runtime.llm.client.user_prompts), 2)
+            self.assertIn("could not be dispatched", runtime.llm.client.user_prompts[1])
+            repairs = [record for record in runtime.audit.trace() if record.action == "llm.action_repair_requested"]
+            self.assertEqual(len(repairs), 1)
+            assert repairs[0].decision is not None
+            self.assertEqual(repairs[0].decision["tool_calls_preview"][0]["name"], "")
+            self.assertIn('"path"', repairs[0].decision["tool_calls_preview"][0]["arguments_preview"])
         finally:
             runtime.close()
 

@@ -12,6 +12,7 @@ from agent_libos.models import (
     MemoryView,
     ObjectHandle,
     ObjectMetadata,
+    ObjectNamespace,
     ObjectQuery,
     ObjectRight,
     ObjectType,
@@ -44,6 +45,7 @@ __all__ = [
     "MemoryView",
     "ObjectHandle",
     "ObjectMetadata",
+    "ObjectNamespace",
     "ObjectQuery",
     "ObjectRight",
     "ObjectType",
@@ -62,4 +64,3 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
-

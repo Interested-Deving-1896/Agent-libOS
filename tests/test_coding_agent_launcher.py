@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_libos import Runtime
@@ -120,6 +121,19 @@ class CodingAgentLauncherTests(unittest.TestCase):
 
             with self.assertRaises(SystemExit):
                 run_coding_agent._load_env(args)
+
+    def test_audit_counts_are_scoped_to_launched_process(self) -> None:
+        records = [
+            SimpleNamespace(actor="pid_current", action="llm.request"),
+            SimpleNamespace(actor="pid_other", action="llm.action_repair_requested"),
+            SimpleNamespace(actor="pid_current", action="llm.action_repair_requested"),
+        ]
+
+        counts = run_coding_agent._audit_counts_for_process(records, "pid_current")
+
+        self.assertEqual(counts["audit_records"], 2)
+        self.assertEqual(counts["audit_records_total"], 3)
+        self.assertEqual(counts["llm_repair_attempts"], 1)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.builtin import (
     AskHumanTool,
     AppendMemoryObjectTool,
+    CreateMemoryNamespaceTool,
     CreateMemoryObjectTool,
     CreateObjectFromFileTool,
     DeleteDirectoryTool,
@@ -35,6 +36,7 @@ from agent_libos.tools.builtin import (
     GetCurrentTimeTool,
     HumanOutputTool,
     ListChildProcessesTool,
+    ListMemoryNamespaceTool,
     MergeChildMemoryTool,
     ParsePytestLogTool,
     ProcessExitTool,
@@ -245,12 +247,14 @@ class Runtime:
         self.tools.register_tool(SleepTool(), registered_by="runtime")
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
         self.tools.register_tool(AppendMemoryObjectTool(), registered_by="runtime")
+        self.tools.register_tool(CreateMemoryNamespaceTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
         self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
         self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(ListChildProcessesTool(), registered_by="runtime")
+        self.tools.register_tool(ListMemoryNamespaceTool(), registered_by="runtime")
         self.tools.register_tool(MergeChildMemoryTool(), registered_by="runtime")
         self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
         self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")

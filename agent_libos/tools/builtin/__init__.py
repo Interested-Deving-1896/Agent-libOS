@@ -9,7 +9,13 @@ from agent_libos.tools.builtin.filesystem import (
     WriteTextFileTool,
 )
 from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
-from agent_libos.tools.builtin.memory import AppendMemoryObjectTool, CreateMemoryObjectTool, ReadMemoryObjectTool
+from agent_libos.tools.builtin.memory import (
+    AppendMemoryObjectTool,
+    CreateMemoryNamespaceTool,
+    CreateMemoryObjectTool,
+    ListMemoryNamespaceTool,
+    ReadMemoryObjectTool,
+)
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.permission import RequestPermissionTool
 from agent_libos.tools.builtin.process import (
@@ -23,6 +29,7 @@ from agent_libos.tools.builtin.process import (
 
 __all__ = [
     "CreateMemoryObjectTool",
+    "CreateMemoryNamespaceTool",
     "CreateObjectFromFileTool",
     "AppendMemoryObjectTool",
     "DeleteDirectoryTool",
@@ -38,6 +45,7 @@ __all__ = [
     "ProcessExitTool",
     "ReadDirectoryTool",
     "ReadMemoryObjectTool",
+    "ListMemoryNamespaceTool",
     "ReadTextFileTool",
     "RequestPermissionTool",
     "SignalChildProcessTool",

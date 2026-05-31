@@ -80,6 +80,7 @@ class ProcessManager:
             updated_at=now,
         )
         self.store.insert_process(process)
+        self.memory.ensure_process_namespace(pid)
         goal_handle = self._ensure_goal(pid, goal)
         # A process starts with a mutable view rooted at its goal. Later tool
         # results are appended to this view by the LLM executor.
@@ -147,6 +148,7 @@ class ProcessManager:
             updated_at=now,
         )
         self.store.insert_process(child)
+        self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
         goal_handle = self._ensure_goal(child_pid, goal)
         source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
         if isinstance(memory_view, MemoryView):

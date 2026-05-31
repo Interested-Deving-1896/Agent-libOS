@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
+from agent_libos.ids import utc_now
 from agent_libos.models import (
     AgentObject,
     AgentProcess,
@@ -21,6 +22,7 @@ from agent_libos.models import (
     ObjectHandle,
     ObjectLink,
     ObjectMetadata,
+    ObjectNamespace,
     ObjectType,
     ProcessStatus,
     Provenance,
@@ -43,6 +45,7 @@ class SQLiteStore:
     """
 
     SNAPSHOT_TABLES = [
+        "object_namespaces",
         "objects",
         "object_links",
         "processes",
@@ -52,6 +55,7 @@ class SQLiteStore:
         "tools",
         "tool_candidates",
     ]
+    SYSTEM_NAMESPACE = "system"
 
     def __init__(self, path: str | Path = ":memory:"):
         self.path = str(path)
@@ -75,7 +79,8 @@ class SQLiteStore:
                 """
                 CREATE TABLE IF NOT EXISTS objects (
                   oid TEXT PRIMARY KEY,
-                  name TEXT NOT NULL UNIQUE,
+                  namespace TEXT NOT NULL DEFAULT 'system',
+                  name TEXT NOT NULL,
                   type TEXT NOT NULL,
                   schema_version TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
@@ -83,6 +88,15 @@ class SQLiteStore:
                   provenance_json TEXT NOT NULL,
                   version INTEGER NOT NULL,
                   immutable INTEGER NOT NULL,
+                  created_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS object_namespaces (
+                  namespace TEXT PRIMARY KEY,
+                  parent_namespace TEXT,
+                  metadata_json TEXT NOT NULL,
                   created_by TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
@@ -200,7 +214,7 @@ class SQLiteStore:
                 );
                 """
             )
-            self._ensure_object_name_schema()
+            self._ensure_object_namespace_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -218,12 +232,13 @@ class SQLiteStore:
         self._execute(
             """
             INSERT INTO objects (
-                oid, name, type, schema_version, payload_json, metadata_json,
+                oid, namespace, name, type, schema_version, payload_json, metadata_json,
                 provenance_json, version, immutable, created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obj.oid,
+                obj.namespace,
                 obj.name,
                 obj.type.value,
                 obj.schema_version,
@@ -243,12 +258,13 @@ class SQLiteStore:
         self._execute(
             """
             UPDATE objects
-               SET name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
+               SET namespace = ?, name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
                    provenance_json = ?, version = ?, immutable = ?, created_by = ?,
                    created_at = ?, updated_at = ?
              WHERE oid = ?
             """,
             (
+                obj.namespace,
                 obj.name,
                 obj.type.value,
                 obj.schema_version,
@@ -272,20 +288,24 @@ class SQLiteStore:
             return None
         return self._row_to_object(rows[0])
 
-    def get_object_by_name(self, name: str) -> AgentObject | None:
-        rows = self._query("SELECT * FROM objects WHERE name = ?", (name,))
+    def get_object_by_name(self, name: str, namespace: str) -> AgentObject | None:
+        rows = self._query("SELECT * FROM objects WHERE namespace = ? AND name = ?", (namespace, name))
         if not rows or rows[0]["oid"] not in self._object_payloads:
             return None
         return self._row_to_object(rows[0])
 
-    def object_name_exists(self, name: str, except_oid: str | None = None) -> bool:
-        rows = self._query("SELECT oid FROM objects WHERE name = ?", (name,))
+    def object_name_exists(self, name: str, namespace: str, except_oid: str | None = None) -> bool:
+        rows = self._query("SELECT oid FROM objects WHERE namespace = ? AND name = ?", (namespace, name))
         return any(row["oid"] != except_oid for row in rows)
 
-    def list_objects(self) -> list[AgentObject]:
+    def list_objects(self, namespace: str | None = None) -> list[AgentObject]:
+        if namespace is None:
+            rows = self._query("SELECT * FROM objects")
+        else:
+            rows = self._query("SELECT * FROM objects WHERE namespace = ?", (namespace,))
         return [
             self._row_to_object(row)
-            for row in self._query("SELECT * FROM objects")
+            for row in rows
             if row["oid"] in self._object_payloads
         ]
 
@@ -297,6 +317,41 @@ class SQLiteStore:
         self._object_payloads.pop(oid, None)
         self._execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
         self._execute("DELETE FROM objects WHERE oid = ?", (oid,))
+
+    def insert_namespace(self, namespace: ObjectNamespace) -> None:
+        self._execute(
+            """
+            INSERT INTO object_namespaces (
+                namespace, parent_namespace, metadata_json, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                namespace.namespace,
+                namespace.parent_namespace,
+                dumps(namespace.metadata),
+                namespace.created_by,
+                namespace.created_at,
+                namespace.updated_at,
+            ),
+        )
+
+    def get_namespace(self, namespace: str) -> ObjectNamespace | None:
+        rows = self._query("SELECT * FROM object_namespaces WHERE namespace = ?", (namespace,))
+        return self._row_to_namespace(rows[0]) if rows else None
+
+    def namespace_exists(self, namespace: str) -> bool:
+        rows = self._query("SELECT 1 FROM object_namespaces WHERE namespace = ?", (namespace,))
+        return bool(rows)
+
+    def list_namespaces(self, parent_namespace: str | None = None) -> list[ObjectNamespace]:
+        if parent_namespace is None:
+            rows = self._query("SELECT * FROM object_namespaces ORDER BY namespace")
+        else:
+            rows = self._query(
+                "SELECT * FROM object_namespaces WHERE parent_namespace = ? ORDER BY namespace",
+                (parent_namespace,),
+            )
+        return [self._row_to_namespace(row) for row in rows]
 
     def insert_link(self, link: ObjectLink) -> None:
         self._execute(
@@ -637,14 +692,108 @@ class SQLiteStore:
                         f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
                         tuple(row[column] for column in columns),
                     )
+            self._ensure_object_namespace_schema()
             self.conn.commit()
 
-    def _ensure_object_name_schema(self) -> None:
+    def _ensure_object_namespace_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS object_namespaces (
+              namespace TEXT PRIMARY KEY,
+              parent_namespace TEXT,
+              metadata_json TEXT NOT NULL,
+              created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(objects)")}
-        if "name" not in columns:
+        if "namespace" not in columns or self._has_name_only_unique_index():
+            self._rebuild_objects_table_with_namespace(columns)
+        elif "name" not in columns:
             self.conn.execute("ALTER TABLE objects ADD COLUMN name TEXT")
             self.conn.execute("UPDATE objects SET name = oid WHERE name IS NULL OR name = ''")
-        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_name ON objects(name)")
+        self.conn.execute("DROP INDEX IF EXISTS idx_objects_name")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_namespace_name ON objects(namespace, name)")
+        now = utc_now()
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO object_namespaces (
+                namespace, parent_namespace, metadata_json, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (self.SYSTEM_NAMESPACE, None, dumps({"kind": "root"}), "runtime", now, now),
+        )
+        namespaces = {
+            str(row["namespace"] or self.SYSTEM_NAMESPACE)
+            for row in self.conn.execute("SELECT DISTINCT namespace FROM objects")
+        }
+        for namespace in sorted(namespaces):
+            for current in self._namespace_chain(namespace):
+                if current == self.SYSTEM_NAMESPACE:
+                    continue
+                parent = current.rsplit("/", 1)[0] if "/" in current else None
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO object_namespaces (
+                        namespace, parent_namespace, metadata_json, created_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (current, parent, dumps({"kind": "migration"}), "storage.migration", now, now),
+                )
+
+    def _rebuild_objects_table_with_namespace(self, columns: set[str]) -> None:
+        self.conn.execute("DROP INDEX IF EXISTS idx_objects_name")
+        self.conn.execute("ALTER TABLE objects RENAME TO objects_old")
+        self.conn.execute(
+            """
+            CREATE TABLE objects (
+              oid TEXT PRIMARY KEY,
+              namespace TEXT NOT NULL DEFAULT 'system',
+              name TEXT NOT NULL,
+              type TEXT NOT NULL,
+              schema_version TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              provenance_json TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              immutable INTEGER NOT NULL,
+              created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        namespace_expr = "namespace" if "namespace" in columns else f"'{self.SYSTEM_NAMESPACE}'"
+        name_expr = "name" if "name" in columns else "oid"
+        self.conn.execute(
+            f"""
+            INSERT INTO objects (
+                oid, namespace, name, type, schema_version, payload_json, metadata_json,
+                provenance_json, version, immutable, created_by, created_at, updated_at
+            )
+            SELECT
+                oid, COALESCE({namespace_expr}, '{self.SYSTEM_NAMESPACE}'), COALESCE({name_expr}, oid), type,
+                schema_version, payload_json, metadata_json, provenance_json, version,
+                immutable, created_by, created_at, updated_at
+            FROM objects_old
+            """
+        )
+        self.conn.execute("DROP TABLE objects_old")
+
+    def _has_name_only_unique_index(self) -> bool:
+        for index in self.conn.execute("PRAGMA index_list(objects)"):
+            if not bool(index["unique"]):
+                continue
+            columns = [row["name"] for row in self.conn.execute(f"PRAGMA index_info({index['name']})")]
+            if columns == ["name"]:
+                return True
+        return False
+
+    def _namespace_chain(self, namespace: str) -> list[str]:
+        parts = namespace.split("/")
+        return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
 
     def _normalize_restore_rows(self, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if table != "objects":
@@ -653,6 +802,7 @@ class SQLiteStore:
         for row in rows:
             item = dict(row)
             item.setdefault("name", item.get("oid"))
+            item.setdefault("namespace", self.SYSTEM_NAMESPACE)
             item["payload_json"] = dumps(self._memory_payload_marker(present=False))
             normalized.append(item)
         return normalized
@@ -687,6 +837,7 @@ class SQLiteStore:
         provenance = Provenance(**loads(row["provenance_json"], {}))
         return AgentObject(
             oid=row["oid"],
+            namespace=row["namespace"],
             name=row["name"],
             type=ObjectType(row["type"]),
             schema_version=row["schema_version"],
@@ -695,6 +846,16 @@ class SQLiteStore:
             provenance=provenance,
             version=row["version"],
             immutable=bool(row["immutable"]),
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _row_to_namespace(self, row: sqlite3.Row) -> ObjectNamespace:
+        return ObjectNamespace(
+            namespace=row["namespace"],
+            parent_namespace=row["parent_namespace"],
+            metadata=loads(row["metadata_json"], {}),
             created_by=row["created_by"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

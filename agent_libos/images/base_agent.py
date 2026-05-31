@@ -65,6 +65,10 @@ Tool-use guidance:
   plans. Read only what you need next.
 - create_memory_object: store plans, evidence, hypotheses, review findings,
   test summaries, and final decision records.
+- create_memory_namespace / list_memory_namespace: create and inspect scoped
+  Object Memory directories when multiple agents or phases need same local
+  names without collisions. Unqualified Object Memory names resolve inside your
+  own process namespace, not a global namespace.
 - read_memory_object / append_memory_object: inspect or append to named mutable
   memory objects, especially your `llm_context:<pid>` context object. Prefer
   append-style writes so earlier prompt prefixes remain cacheable.
@@ -121,6 +125,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         default_tools=[
             "append_memory_object",
             "ask_human",
+            "create_memory_namespace",
             "create_memory_object",
             "fork_child_process",
             "get_current_time",
@@ -128,6 +133,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
             "list_child_processes",
             "merge_child_memory",
             "process_exit",
+            "list_memory_namespace",
             "read_memory_object",
             "request_permission",
             "signal_child_process",
@@ -145,6 +151,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         default_tools=[
             "append_memory_object",
             "ask_human",
+            "create_memory_namespace",
             "create_memory_object",
             "create_object_from_file",
             "delete_directory",
@@ -153,6 +160,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
             "get_current_time",
             "human_output",
             "list_child_processes",
+            "list_memory_namespace",
             "merge_child_memory",
             "parse_pytest_log",
             "process_exit",
@@ -196,6 +204,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         default_tools=[
             "append_memory_object",
             "ask_human",
+            "create_memory_namespace",
             "create_object_from_file",
             "delete_directory",
             "delete_file",
@@ -203,6 +212,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
             "get_current_time",
             "human_output",
             "list_child_processes",
+            "list_memory_namespace",
             "merge_child_memory",
             "read_directory",
             "read_memory_object",

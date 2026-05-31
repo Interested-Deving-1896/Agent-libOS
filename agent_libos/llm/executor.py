@@ -100,8 +100,11 @@ class LLMProcessExecutor:
             decision={"messages": len(messages), "policy": image.context_policy},
         )
         try:
-            completion = await self._complete_action(messages, self.runtime.tools.openai_tool_schemas(pid))
-            action = self._completion_to_action(completion.content, completion.tool_calls)
+            completion, action = await self._complete_valid_action(
+                pid,
+                messages,
+                self.runtime.tools.openai_tool_schemas(pid),
+            )
             try:
                 result = await self.adispatch(pid, action)
             except HumanApprovalRequired as exc:
@@ -349,12 +352,92 @@ class LLMProcessExecutor:
         )
 
     def _completion_to_action(self, content: str, tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
-        if tool_calls:
-            return tool_call_to_action(tool_calls[-1])
+        errors: list[str] = []
+        for tool_call in reversed(tool_calls):
+            try:
+                return tool_call_to_action(tool_call)
+            except Exception as exc:
+                errors.append(str(exc))
         try:
             return parse_json_action(content)
         except Exception as exc:
-            raise ValueError(f"no valid tool call or fallback JSON action found: {exc}; content preview: {content[:500]!r}") from exc
+            detail = f"; invalid tool calls: {errors}" if errors else ""
+            raise ValueError(
+                f"no valid tool call or fallback JSON action found: {exc}{detail}; "
+                f"content preview: {content[:500]!r}"
+            ) from exc
+
+    async def _complete_valid_action(
+        self,
+        pid: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_attempts: int = 2,
+    ) -> tuple[Any, dict[str, Any]]:
+        attempt_messages = messages
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            completion = await self._complete_action(attempt_messages, tools)
+            try:
+                action = self._completion_to_action(completion.content, completion.tool_calls)
+                self._validate_dispatchable_action(pid, action)
+                return completion, action
+            except ValueError as exc:
+                last_error = exc
+                self.runtime.audit.record(
+                    actor=pid,
+                    action="llm.action_repair_requested",
+                    target=f"process:{pid}",
+                    decision={
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                        "tool_call_count": len(completion.tool_calls),
+                        "tool_calls_preview": self._tool_call_previews(completion.tool_calls),
+                        "content_preview": completion.content[:500],
+                    },
+                )
+                if attempt + 1 >= max_attempts:
+                    break
+                attempt_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous model response could not be dispatched: "
+                            f"{exc}. Choose exactly one available OpenAI tool call by its function name. "
+                            f"Available tool names: {sorted(self.runtime.process.get(pid).tool_table)}"
+                        ),
+                    },
+                ]
+        assert last_error is not None
+        raise last_error
+
+    def _validate_dispatchable_action(self, pid: str, action: dict[str, Any]) -> None:
+        name = str(action.get("action") or "").strip()
+        if not name:
+            raise ValueError("selected action has an empty tool name")
+        process = self.runtime.process.get(pid)
+        if name not in process.tool_table:
+            raise ValueError(f"selected action is not in this process tool table: {name}")
+
+    def _tool_call_previews(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        previews: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            raw_args = tool_call.get("arguments")
+            if isinstance(raw_args, str):
+                arguments_preview = raw_args[:500]
+            else:
+                arguments_preview = repr(raw_args)[:500]
+            previews.append(
+                {
+                    "id": tool_call.get("id"),
+                    "call_id": tool_call.get("call_id"),
+                    "name": tool_call.get("name"),
+                    "arguments_type": type(raw_args).__name__,
+                    "arguments_preview": arguments_preview,
+                }
+            )
+        return previews
 
     async def _complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
         if hasattr(self.client, "acomplete_action"):

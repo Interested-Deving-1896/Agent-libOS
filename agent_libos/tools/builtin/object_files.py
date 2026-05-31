@@ -9,7 +9,8 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 
 
 class CreateObjectFromFileArgs(BaseModel):
-    name: str = Field(description="Globally unique Object Memory name to create.")
+    name: str = Field(description="Namespace-local Object Memory name to create.")
+    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     path: str = Field(description="Workspace-relative file path to import.")
     encoding: str = Field(default="utf-8", description="Text encoding.")
     max_bytes: int = Field(default=1_048_576, ge=1, le=10_485_760, description="Maximum bytes to import.")
@@ -19,6 +20,7 @@ class CreateObjectFromFileArgs(BaseModel):
 
 class CreateObjectFromFileOutput(BaseModel):
     oid: str
+    namespace: str
     name: str
     type: str
     source_path: str
@@ -27,7 +29,8 @@ class CreateObjectFromFileOutput(BaseModel):
 
 
 class WriteObjectToFileArgs(BaseModel):
-    name: str = Field(description="Object Memory name to resolve and write.")
+    name: str = Field(description="Namespace-local Object Memory name to resolve and write.")
+    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     path: str = Field(description="Workspace-relative output file path.")
     encoding: str = Field(default="utf-8", description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
@@ -35,6 +38,7 @@ class WriteObjectToFileArgs(BaseModel):
 
 class WriteObjectToFileOutput(BaseModel):
     oid: str
+    namespace: str
     name: str
     path: str
     bytes_written: int
@@ -103,10 +107,12 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
             ),
             immutable=True,
             name=args.name,
+            namespace=args.namespace,
         )
         obj = runtime.memory.get_object(ctx.pid, handle)
         return CreateObjectFromFileOutput(
             oid=handle.oid,
+            namespace=obj.namespace,
             name=obj.name,
             type=args.object_type,
             source_path=result.path,
@@ -136,7 +142,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        obj = runtime.memory.get_object_by_name(ctx.pid, args.name)
+        obj = runtime.memory.get_object_by_name(ctx.pid, args.name, namespace=args.namespace)
         text = self._extract_text(obj.payload)
         # The object payload is handed directly to the filesystem primitive; the
         # process-visible result below still omits the concrete content.
@@ -156,6 +162,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
             ) from exc
         return WriteObjectToFileOutput(
             oid=obj.oid,
+            namespace=obj.namespace,
             name=obj.name,
             path=result.path,
             bytes_written=result.bytes_written,

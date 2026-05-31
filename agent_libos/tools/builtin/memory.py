@@ -9,7 +9,8 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 
 
 class CreateMemoryObjectArgs(BaseModel):
-    name: str | None = Field(default=None, description="Optional globally unique object name.")
+    name: str | None = Field(default=None, description="Optional namespace-local object name.")
+    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     type: str = Field(description="Agent libOS object type, for example summary, plan, observation, or artifact.")
     payload: Any = Field(description="Structured payload to store.")
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -18,17 +19,20 @@ class CreateMemoryObjectArgs(BaseModel):
 
 class CreateMemoryObjectOutput(BaseModel):
     oid: str
+    namespace: str
     name: str
     type: str
 
 
 class ReadMemoryObjectArgs(BaseModel):
-    name: str = Field(description="Globally unique Object Memory name to read.")
+    name: str = Field(description="Namespace-local Object Memory name to read.")
+    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     max_payload_chars: int = Field(default=12000, ge=1, le=200000, description="Maximum rendered payload chars.")
 
 
 class ReadMemoryObjectOutput(BaseModel):
     oid: str
+    namespace: str
     name: str
     type: str
     version: int
@@ -37,7 +41,8 @@ class ReadMemoryObjectOutput(BaseModel):
 
 
 class AppendMemoryObjectArgs(BaseModel):
-    name: str = Field(description="Globally unique mutable Object Memory name to append to.")
+    name: str = Field(description="Namespace-local mutable Object Memory name to append to.")
+    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     entry: Any = Field(description="Structured entry to append.")
     list_field: str = Field(
         default="entries",
@@ -47,11 +52,50 @@ class AppendMemoryObjectArgs(BaseModel):
 
 class AppendMemoryObjectOutput(BaseModel):
     oid: str
+    namespace: str
     name: str
     version: int
     appended: bool
     list_field: str | None = None
     length: int
+
+
+class CreateMemoryNamespaceArgs(BaseModel):
+    namespace: str = Field(description="Namespace path to create, for example project/research or child-results.")
+    parent_namespace: str | None = Field(
+        default=None,
+        description="Parent namespace. Defaults to the path parent; top-level namespaces have no parent.",
+    )
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateMemoryNamespaceOutput(BaseModel):
+    namespace: str
+    parent_namespace: str | None
+    created: bool
+
+
+class ListMemoryNamespaceArgs(BaseModel):
+    namespace: str | None = Field(default=None, description="Namespace to list. Defaults to this process namespace.")
+
+
+class MemoryNamespaceObjectEntry(BaseModel):
+    oid: str
+    namespace: str
+    name: str
+    type: str
+    version: int
+
+
+class MemoryNamespaceEntry(BaseModel):
+    namespace: str
+    parent_namespace: str | None
+
+
+class ListMemoryNamespaceOutput(BaseModel):
+    namespace: str
+    objects: list[MemoryNamespaceObjectEntry]
+    namespaces: list[MemoryNamespaceEntry]
 
 
 class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
@@ -85,6 +129,7 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             metadata=metadata,
             immutable=args.immutable,
             name=args.name,
+            namespace=args.namespace,
         )
         obj = runtime.memory.get_object(ctx.pid, handle)
         process = runtime.process.get(ctx.pid)
@@ -93,7 +138,74 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
         elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
             process.memory_view.roots.append(handle)
         runtime.store.update_process(process)
-        return CreateMemoryObjectOutput(oid=handle.oid, name=obj.name, type=args.type)
+        return CreateMemoryObjectOutput(oid=handle.oid, namespace=obj.namespace, name=obj.name, type=args.type)
+
+
+class CreateMemoryNamespaceTool(SyncAgentTool[CreateMemoryNamespaceArgs]):
+    name = "create_memory_namespace"
+    description = (
+        "Create an Object Memory namespace. Namespaces provide directory-like name scopes; "
+        "object capabilities still control object reads and writes."
+    )
+    args_schema = CreateMemoryNamespaceArgs
+    output_schema = CreateMemoryNamespaceOutput
+    version = "1.0.0"
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    tags = ["memory", "object", "namespace"]
+
+    def run(self, args: CreateMemoryNamespaceArgs, ctx: ToolContext) -> CreateMemoryNamespaceOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        namespace = runtime.memory.create_namespace(
+            pid=ctx.pid,
+            namespace=args.namespace,
+            parent_namespace=args.parent_namespace,
+            metadata=args.metadata,
+        )
+        return CreateMemoryNamespaceOutput(
+            namespace=namespace.namespace,
+            parent_namespace=namespace.parent_namespace,
+            created=True,
+        )
+
+
+class ListMemoryNamespaceTool(SyncAgentTool[ListMemoryNamespaceArgs]):
+    name = "list_memory_namespace"
+    description = (
+        "List process-visible objects and child namespaces within an Object Memory namespace. "
+        "The list contains only objects the process can read."
+    )
+    args_schema = ListMemoryNamespaceArgs
+    output_schema = ListMemoryNamespaceOutput
+    version = "1.0.0"
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=5.0)
+    tags = ["memory", "object", "namespace", "read"]
+
+    def run(self, args: ListMemoryNamespaceArgs, ctx: ToolContext) -> ListMemoryNamespaceOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        listing = runtime.memory.list_namespace(ctx.pid, args.namespace)
+        objects = [
+            MemoryNamespaceObjectEntry(
+                oid=obj.oid,
+                namespace=obj.namespace,
+                name=obj.name,
+                type=obj.type.value,
+                version=obj.version,
+            )
+            for obj in listing["objects"]
+        ]
+        namespaces = [
+            MemoryNamespaceEntry(namespace=namespace.namespace, parent_namespace=namespace.parent_namespace)
+            for namespace in listing["namespaces"]
+        ]
+        return ListMemoryNamespaceOutput(
+            namespace=listing["namespace"],
+            objects=objects,
+            namespaces=namespaces,
+        )
 
 
 class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
@@ -112,7 +224,7 @@ class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        obj = runtime.memory.get_object_by_name(ctx.pid, args.name)
+        obj = runtime.memory.get_object_by_name(ctx.pid, args.name, namespace=args.namespace)
         payload = obj.payload
         rendered = repr(payload)
         truncated = len(rendered) > args.max_payload_chars
@@ -120,6 +232,7 @@ class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
             payload = rendered[: args.max_payload_chars]
         return ReadMemoryObjectOutput(
             oid=obj.oid,
+            namespace=obj.namespace,
             name=obj.name,
             type=obj.type.value,
             version=obj.version,
@@ -149,6 +262,7 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
             args.name,
             rights=["read", "write"],
             issued_by="append_memory_object_tool",
+            namespace=args.namespace,
         )
         obj = runtime.memory.get_object(ctx.pid, handle)
         payload = obj.payload
@@ -177,6 +291,7 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
         updated = runtime.memory.get_object(ctx.pid, handle)
         return AppendMemoryObjectOutput(
             oid=updated.oid,
+            namespace=updated.namespace,
             name=updated.name,
             version=updated.version,
             appended=True,

@@ -77,7 +77,8 @@ class LLMContextMemory:
 
     def ensure(self, pid: str, image: AgentImage, process: AgentProcess, tools: list[dict[str, Any]]) -> ObjectHandle:
         name = context_object_name(pid)
-        existing = self.runtime.store.get_object_by_name(name)
+        namespace = self.runtime.memory.resolve_namespace(pid)
+        existing = self.runtime.store.get_object_by_name(name, namespace=namespace)
         rights = {
             ObjectRight.READ.value,
             ObjectRight.WRITE.value,
@@ -281,7 +282,10 @@ class LLMContextMemory:
         return obj.payload
 
     def _context_oid(self, pid: str) -> str | None:
-        obj = self.runtime.store.get_object_by_name(context_object_name(pid))
+        obj = self.runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=self.runtime.memory.resolve_namespace(pid),
+        )
         return obj.oid if obj is not None else None
 
     def _add_handle_to_view(self, pid: str, handle: ObjectHandle) -> None:
