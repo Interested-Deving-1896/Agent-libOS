@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import NotFound, ProcessError, ProcessWaitRequired
+from agent_libos.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
@@ -112,6 +112,7 @@ class ProcessManager:
         goal: dict[str, Any] | str | ObjectHandle,
         memory_view: MemoryView | MemoryViewSpec | None = None,
         capabilities: builtins.list[dict[str, Any]] | None = None,
+        inherit_capabilities: builtins.list[dict[str, Any]] | None = None,
         image: str | None = None,
         mode: ForkMode | str = ForkMode.RESTRICTED,
     ) -> str:
@@ -120,6 +121,8 @@ class ProcessManager:
         if parent_proc.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot fork terminated process: {parent}")
         self._require_child_budget(parent_proc)
+        inherit_specs = inherit_capabilities or []
+        self._validate_inherit_capability_specs(parent, inherit_specs)
         now = utc_now()
         child_pid = new_id("pid")
         child = AgentProcess(
@@ -161,6 +164,12 @@ class ProcessManager:
         child.updated_at = utc_now()
         self.store.update_process(child)
         self._grant_specs(child_pid, capabilities or [], issued_by=f"process.fork:{parent}")
+        self._inherit_capability_specs(
+            parent_pid=parent,
+            child_pid=child_pid,
+            specs=inherit_specs,
+            issued_by=f"process.fork:{parent}",
+        )
         self.events.emit(
             EventType.PROCESS_FORKED,
             source=parent,
@@ -424,6 +433,34 @@ class ProcessManager:
                 delegable=spec.get("delegable", False),
                 revocable=spec.get("revocable", True),
             )
+
+    def _inherit_capability_specs(
+        self,
+        parent_pid: str,
+        child_pid: str,
+        specs: Iterable[dict[str, Any]],
+        issued_by: str,
+    ) -> None:
+        for spec in specs:
+            self.capabilities.inherit(
+                parent=parent_pid,
+                child=child_pid,
+                resource=spec["resource"],
+                rights=spec.get("rights", [CapabilityRight.READ.value]),
+                issued_by=issued_by,
+                constraints=spec.get("constraints") if isinstance(spec.get("constraints"), dict) else None,
+            )
+
+    def _validate_inherit_capability_specs(self, parent_pid: str, specs: Iterable[dict[str, Any]]) -> None:
+        for spec in specs:
+            resource = spec["resource"]
+            rights = spec.get("rights", [CapabilityRight.READ.value])
+            for right in rights:
+                policy = self.capabilities.permission_policy(parent_pid, resource, right)
+                if policy != CapabilityManager.ALWAYS_ALLOW:
+                    raise CapabilityDenied(
+                        f"{parent_pid} cannot inherit {right} on {resource}; parent policy is {policy}"
+                    )
 
     def _fork_mode_to_view_mode(self, mode: ForkMode) -> ViewMode:
         if mode == ForkMode.COPY:

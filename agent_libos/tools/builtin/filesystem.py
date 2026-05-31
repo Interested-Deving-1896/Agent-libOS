@@ -31,6 +31,55 @@ class ReadTextFileOutput(BaseModel):
     truncated: bool
 
 
+class DirectoryEntryOutput(BaseModel):
+    name: str
+    path: str
+    kind: str
+    size_bytes: int | None
+    modified_at: str
+
+
+class ReadDirectoryArgs(BaseModel):
+    path: str = Field(description="Relative directory path under the runtime workspace root.")
+    limit: int = Field(default=1024, ge=1, le=10000, description="Maximum number of entries to return.")
+
+
+class ReadDirectoryOutput(BaseModel):
+    path: str
+    entries: list[DirectoryEntryOutput]
+    count: int
+    truncated: bool
+
+
+class WriteDirectoryArgs(BaseModel):
+    path: str = Field(description="Relative directory path under the runtime workspace root.")
+    parents: bool = Field(default=True, description="Whether to create missing parent directories.")
+    exist_ok: bool = Field(default=True, description="Whether an existing directory is accepted.")
+
+
+class WriteDirectoryOutput(BaseModel):
+    path: str
+    created: bool
+
+
+class DeleteFileArgs(BaseModel):
+    path: str = Field(description="Relative file path under the runtime workspace root.")
+    missing_ok: bool = Field(default=False, description="Whether a missing file should be treated as success.")
+
+
+class DeleteDirectoryArgs(BaseModel):
+    path: str = Field(description="Relative directory path under the runtime workspace root.")
+    recursive: bool = Field(default=False, description="Whether to delete a non-empty directory recursively.")
+    missing_ok: bool = Field(default=False, description="Whether a missing directory should be treated as success.")
+
+
+class DeletePathOutput(BaseModel):
+    path: str
+    kind: str
+    deleted: bool
+    recursive: bool = False
+
+
 class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     name = "read_text_file"
     description = (
@@ -71,6 +120,41 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
             path=result.path,
             content=result.content,
             bytes_read=result.bytes_read,
+            truncated=result.truncated,
+        )
+
+
+class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
+    name = "read_directory"
+    description = (
+        "List entries in a directory under the runtime workspace root. "
+        "The filesystem primitive enforces directory read capability, path containment, audit, and events."
+    )
+    args_schema = ReadDirectoryArgs
+    output_schema = ReadDirectoryOutput
+    version = "1.0.0"
+    policy = ToolPolicy(
+        side_effects=False,
+        idempotent=True,
+        requires_confirmation=False,
+        permissions={"filesystem.read"},
+        timeout_s=5.0,
+    )
+    tags = ["filesystem", "workspace", "read", "directory"]
+
+    def run(self, args: ReadDirectoryArgs, ctx: ToolContext) -> ReadDirectoryOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        result = runtime.filesystem.read_directory(
+            pid=ctx.pid,
+            path=args.path,
+            limit=args.limit,
+        )
+        return ReadDirectoryOutput(
+            path=result.path,
+            entries=[DirectoryEntryOutput(**entry.__dict__) for entry in result.entries],
+            count=result.count,
             truncated=result.truncated,
         )
 
@@ -116,4 +200,120 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
             path=result.path,
             bytes_written=result.bytes_written,
             created=result.created,
+        )
+
+
+class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
+    name = "write_directory"
+    description = (
+        "Create or ensure a directory under the runtime workspace root. "
+        "The filesystem primitive enforces directory write capability, path containment, audit, and events."
+    )
+    args_schema = WriteDirectoryArgs
+    output_schema = WriteDirectoryOutput
+    version = "1.0.0"
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        requires_confirmation=True,
+        permissions={"filesystem.write"},
+        timeout_s=5.0,
+    )
+    tags = ["filesystem", "workspace", "side_effect", "directory"]
+
+    def run(self, args: WriteDirectoryArgs, ctx: ToolContext) -> WriteDirectoryOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        try:
+            result = runtime.filesystem.write_directory(
+                pid=ctx.pid,
+                path=args.path,
+                parents=args.parents,
+                exist_ok=args.exist_ok,
+            )
+        except FileExistsError as exc:
+            raise ToolExecutionError(
+                "Directory already exists and exist_ok is false.",
+                code=ToolErrorCode.EXECUTION_ERROR,
+                details={"path": args.path},
+            ) from exc
+        return WriteDirectoryOutput(path=result.path, created=result.created)
+
+
+class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
+    name = "delete_file"
+    description = (
+        "Delete a file under the runtime workspace root. "
+        "The filesystem primitive enforces delete capability, path containment, audit, and events."
+    )
+    args_schema = DeleteFileArgs
+    output_schema = DeletePathOutput
+    version = "1.0.0"
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        requires_confirmation=True,
+        permissions={"filesystem.delete"},
+        timeout_s=5.0,
+    )
+    tags = ["filesystem", "workspace", "side_effect", "delete"]
+
+    def run(self, args: DeleteFileArgs, ctx: ToolContext) -> DeletePathOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        result = runtime.filesystem.delete_file(
+            pid=ctx.pid,
+            path=args.path,
+            missing_ok=args.missing_ok,
+        )
+        return DeletePathOutput(
+            path=result.path,
+            kind=result.kind,
+            deleted=result.deleted,
+            recursive=result.recursive,
+        )
+
+
+class DeleteDirectoryTool(SyncAgentTool[DeleteDirectoryArgs]):
+    name = "delete_directory"
+    description = (
+        "Delete a directory under the runtime workspace root. "
+        "The filesystem primitive enforces delete capability, path containment, audit, and events."
+    )
+    args_schema = DeleteDirectoryArgs
+    output_schema = DeletePathOutput
+    version = "1.0.0"
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        requires_confirmation=True,
+        permissions={"filesystem.delete"},
+        timeout_s=5.0,
+    )
+    tags = ["filesystem", "workspace", "side_effect", "delete", "directory"]
+
+    def run(self, args: DeleteDirectoryArgs, ctx: ToolContext) -> DeletePathOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        try:
+            result = runtime.filesystem.delete_directory(
+                pid=ctx.pid,
+                path=args.path,
+                recursive=args.recursive,
+                missing_ok=args.missing_ok,
+            )
+        except OSError as exc:
+            raise ToolExecutionError(
+                "Directory could not be deleted.",
+                code=ToolErrorCode.EXECUTION_ERROR,
+                details={"path": args.path, "error": str(exc)},
+            ) from exc
+        return DeletePathOutput(
+            path=result.path,
+            kind=result.kind,
+            deleted=result.deleted,
+            recursive=result.recursive,
         )

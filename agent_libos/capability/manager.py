@@ -160,6 +160,43 @@ class CapabilityManager:
             constraints=constraints,
         )
 
+    def inherit(
+        self,
+        parent: str,
+        child: str,
+        resource: str,
+        rights: Iterable[str | CapabilityRight],
+        issued_by: str,
+        constraints: dict | None = None,
+    ) -> Capability:
+        normalized = {str(right) for right in rights}
+        if not normalized:
+            raise ValueError("inherited capability must include at least one right")
+        for right in normalized:
+            policy = self.permission_policy(parent, resource, right)
+            if policy != self.ALWAYS_ALLOW:
+                raise CapabilityDenied(
+                    f"{parent} cannot inherit {right} on {resource} to {child}; parent policy is {policy}"
+                )
+        inherited_constraints = dict(constraints or {})
+        inherited_constraints[self.POLICY_KEY] = self.ALWAYS_ALLOW
+        inherited_constraints["inherited_from"] = parent
+        cap = self.grant(
+            subject=child,
+            resource=resource,
+            rights=normalized,
+            issued_by=issued_by,
+            constraints=inherited_constraints,
+        )
+        self.audit.record(
+            actor=issued_by,
+            action="capability.inherit",
+            target=f"{parent}->{child}:{resource}",
+            capability_refs=[cap.cap_id],
+            decision={"rights": sorted(normalized)},
+        )
+        return cap
+
     def consume_allow_once(self, subject: str, resource: str, right: str | CapabilityRight, used_by: str) -> None:
         # One-shot grants are consumed by the primitive after the operation
         # succeeds, so a failed attempt does not burn the user's approval.
@@ -235,6 +272,8 @@ class CapabilityManager:
         if granted == "*" or granted == requested:
             return True
         if granted.endswith(":*"):
+            return requested.startswith(granted[:-1])
+        if granted.endswith("/*"):
             return requested.startswith(granted[:-1])
         return False
 

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent_libos.models import (
     AgentProcess,
+    CapabilityRight,
     ForkMode,
     MemoryViewSpec,
     MergePolicy,
@@ -59,6 +60,26 @@ class ForkChildProcessArgs(BaseModel):
         default=None,
         description="Optional explicit Object ids to expose to the child instead of all parent roots.",
     )
+    inherit_read_files: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative files whose read capability should be inherited by the child.",
+    )
+    inherit_write_files: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative files whose write capability should be inherited by the child.",
+    )
+    inherit_read_dirs: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative directories whose read capability should be inherited by the child.",
+    )
+    inherit_write_dirs: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative directories whose write capability should be inherited by the child.",
+    )
+    inherit_capabilities: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Explicit capability specs to inherit, each with resource and rights.",
+    )
 
 
 class ForkChildProcessOutput(BaseModel):
@@ -68,6 +89,7 @@ class ForkChildProcessOutput(BaseModel):
     mode: str
     status: str
     goal_oid: str | None
+    inherited_capabilities: list[dict[str, Any]]
 
 
 class WaitChildProcessArgs(BaseModel):
@@ -197,10 +219,12 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             mode=_view_mode_for_fork(fork_mode),
             include_parent_roots=args.include_parent_roots,
         )
+        inherit_specs = self._inheritance_specs(runtime, args)
         child_pid = runtime.process.fork(
             parent=ctx.pid,
             goal=args.goal,
             memory_view=view_spec,
+            inherit_capabilities=inherit_specs,
             image=image,
             mode=fork_mode,
         )
@@ -212,6 +236,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             mode=fork_mode.value,
             status=child.status.value,
             goal_oid=child.goal_oid,
+            inherited_capabilities=inherit_specs,
         )
 
     def _selected_roots(self, runtime: Any, pid: str, root_oids: list[str] | None) -> list[ObjectHandle] | None:
@@ -234,6 +259,22 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
                 )
             )
         return roots
+
+    def _inheritance_specs(self, runtime: Any, args: ForkChildProcessArgs) -> list[dict[str, Any]]:
+        specs = [_normalize_capability_spec(spec) for spec in args.inherit_capabilities]
+        for path in args.inherit_read_files:
+            specs.append({"resource": runtime.filesystem.resource_for_path(path), "rights": [CapabilityRight.READ.value]})
+        for path in args.inherit_write_files:
+            specs.append({"resource": runtime.filesystem.resource_for_path(path), "rights": [CapabilityRight.WRITE.value]})
+        for path in args.inherit_read_dirs:
+            specs.append(
+                {"resource": runtime.filesystem.directory_resource_for_path(path), "rights": [CapabilityRight.READ.value]}
+            )
+        for path in args.inherit_write_dirs:
+            specs.append(
+                {"resource": runtime.filesystem.directory_resource_for_path(path), "rights": [CapabilityRight.WRITE.value]}
+            )
+        return _coalesce_capability_specs(specs)
 
 
 class WaitChildProcessTool(SyncAgentTool[WaitChildProcessArgs]):
@@ -369,3 +410,36 @@ def _child_info(child: AgentProcess) -> ChildProcessInfo:
         result_oid=result_oid,
         status_message=child.status_message,
     )
+
+
+def _normalize_capability_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    resource = spec.get("resource")
+    if not isinstance(resource, str) or not resource:
+        raise ToolExecutionError(
+            "Inherited capability spec requires a non-empty resource.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+            details={"spec": spec},
+        )
+    rights = spec.get("rights", [CapabilityRight.READ.value])
+    if not isinstance(rights, list) or not rights:
+        raise ToolExecutionError(
+            "Inherited capability spec requires a non-empty rights list.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+            details={"spec": spec},
+        )
+    normalized: dict[str, Any] = {"resource": resource, "rights": [str(right) for right in rights]}
+    constraints = spec.get("constraints")
+    if isinstance(constraints, dict):
+        normalized["constraints"] = constraints
+    return normalized
+
+
+def _coalesce_capability_specs(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_resource: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        resource = str(spec["resource"])
+        current = by_resource.setdefault(resource, {"resource": resource, "rights": []})
+        current["rights"] = sorted(set(current["rights"]) | {str(right) for right in spec.get("rights", [])})
+        if isinstance(spec.get("constraints"), dict):
+            current["constraints"] = dict(spec["constraints"])
+    return list(by_resource.values())

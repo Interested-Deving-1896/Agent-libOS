@@ -26,6 +26,8 @@ from agent_libos.tools.builtin import (
     AskHumanTool,
     CreateMemoryObjectTool,
     CreateObjectFromFileTool,
+    DeleteDirectoryTool,
+    DeleteFileTool,
     EchoTool,
     ForkChildProcessTool,
     GetCurrentTimeTool,
@@ -34,11 +36,13 @@ from agent_libos.tools.builtin import (
     MergeChildMemoryTool,
     ParsePytestLogTool,
     ProcessExitTool,
+    ReadDirectoryTool,
     ReadTextFileTool,
     RequestPermissionTool,
     SignalChildProcessTool,
     SleepTool,
     WaitChildProcessTool,
+    WriteDirectoryTool,
     WriteObjectToFileTool,
     WriteTextFileTool,
 )
@@ -233,14 +237,18 @@ class Runtime:
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
+        self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
+        self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
         self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(ListChildProcessesTool(), registered_by="runtime")
         self.tools.register_tool(MergeChildMemoryTool(), registered_by="runtime")
         self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
         self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
+        self.tools.register_tool(ReadDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
         self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
+        self.tools.register_tool(WriteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
