@@ -12,6 +12,8 @@ from agent_libos.storage import SQLiteStore
 
 
 class CapabilityManager:
+    """Capability directory and permission-policy helper."""
+
     POLICY_KEY = "permission_policy"
     ALWAYS_ALLOW = "always_allow"
     ALWAYS_DENY = "always_deny"
@@ -90,6 +92,8 @@ class CapabilityManager:
         return revoked
 
     def check(self, subject: str, resource: str, right: str | CapabilityRight) -> bool:
+        # ASK_EACH_TIME is intentionally not treated as allowed here; only the
+        # primitive with enough operation context may turn it into a human prompt.
         return self.permission_policy(subject, resource, right) in {self.ALWAYS_ALLOW, self.ALLOW_ONCE}
 
     def require(self, subject: str, resource: str, right: str | CapabilityRight) -> None:
@@ -157,6 +161,8 @@ class CapabilityManager:
         )
 
     def consume_allow_once(self, subject: str, resource: str, right: str | CapabilityRight, used_by: str) -> None:
+        # One-shot grants are consumed by the primitive after the operation
+        # succeeds, so a failed attempt does not burn the user's approval.
         for cap in self._matching_capabilities(subject, resource, right):
             if cap.constraints.get(self.POLICY_KEY) == self.ALLOW_ONCE:
                 self.revoke(cap.cap_id, revoked_by=used_by, reason="one-time permission consumed")
@@ -246,5 +252,7 @@ class CapabilityManager:
             if "*" not in cap.rights and requested_right not in cap.rights:
                 continue
             matches.append(cap)
+        # Prefer the most specific resource grant when overlapping wildcard and
+        # path-level capabilities both exist.
         matches.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
         return matches

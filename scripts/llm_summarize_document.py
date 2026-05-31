@@ -63,6 +63,8 @@ async def amain(args: argparse.Namespace) -> None:
     try:
         document_path = _workspace_relative_document(args.document, runtime.workspace_root)
         output_path = _workspace_relative_output(args.output, runtime.workspace_root)
+        # The process begins with read authority from the coding image but no
+        # write authority; it must request a policy before write_text_file works.
         pid = runtime.process.spawn(
             image="coding-agent:v0",
             goal=_build_goal(

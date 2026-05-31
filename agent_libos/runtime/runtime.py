@@ -40,6 +40,8 @@ from agent_libos.tools.builtin import (
 
 
 class Runtime:
+    """Composition root for the MVP libOS runtime."""
+
     def __init__(self, store: SQLiteStore, llm_client: LLMClient | None = None):
         self.workspace_root = Path.cwd().resolve()
         self.store = store
@@ -138,6 +140,9 @@ class Runtime:
         results: list[Any] = []
         remaining = max_quanta
         while remaining > 0:
+            # Run all currently runnable processes first. Human queue work below
+            # may wake a process, so this loop intentionally alternates between
+            # process execution and terminal queue draining.
             batch = await self.scheduler.arun_until_idle(self.arun_process_once, max_quanta=remaining)
             results.extend(batch)
             remaining -= len(batch)
@@ -175,6 +180,8 @@ class Runtime:
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
         image = self.images.get(image_id) or self.images["base-agent:v0"]
+        # Tool visibility is fixed from the AgentImage at process creation time.
+        # External-resource authority is still enforced later by the primitives.
         tool_names = {"process_exit", "create_memory_object", *image.default_tools}
         try:
             self.tools.configure_process_tools(pid, sorted(tool_names), assigned_by=f"image:{image_id}")

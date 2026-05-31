@@ -15,6 +15,8 @@ Quantum = Callable[[str], Any | Awaitable[Any]]
 
 
 class AsyncProcessScheduler:
+    """Cooperative async scheduler for AgentProcess quanta."""
+
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
     def __init__(self, store: SQLiteStore, audit: AuditManager, poll_interval_s: float = 0.01):
@@ -48,6 +50,7 @@ class AsyncProcessScheduler:
         quanta_lock = asyncio.Lock()
 
         async def reserve_quantum() -> bool:
+            # The quantum budget is global across process tasks, not per process.
             nonlocal quanta_used
             async with quanta_lock:
                 if quanta_used >= max_quanta:
@@ -70,10 +73,14 @@ class AsyncProcessScheduler:
                 latest = self.store.get_process(pid)
                 if latest is None or latest.status != ProcessStatus.RUNNABLE:
                     break
+                # Yield so a sleeping or long-running async tool in another
+                # process can advance without this pid monopolizing the loop.
                 await asyncio.sleep(0)
             return process_results
 
         while True:
+            # Start one task per runnable pid. Each task keeps advancing its own
+            # process until it blocks, exits, fails, or the shared budget is used.
             for pid in self.runnable_pids():
                 if quanta_used >= max_quanta:
                     break
@@ -123,6 +130,8 @@ class AsyncProcessScheduler:
             return result
         finally:
             latest = self.store.get_process(pid)
+            # A primitive may deliberately set WAITING_HUMAN, EXITED, or another
+            # status during the quantum. Only restore RUNNABLE for plain returns.
             if latest is not None and latest.status == ProcessStatus.RUNNING:
                 latest.status = ProcessStatus.RUNNABLE
                 latest.updated_at = utc_now()

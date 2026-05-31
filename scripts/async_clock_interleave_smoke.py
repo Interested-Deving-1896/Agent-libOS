@@ -122,6 +122,8 @@ class InterleavingClockClient:
         actions: list[dict[str, Any]] = []
         if initial_delay_s > 0:
             actions.append({"action": "sleep", "seconds": initial_delay_s})
+        # Each loop needs three quanta: read clock, output the observed time,
+        # then sleep. The async scheduler should interleave the two pid tasks.
         for iteration in range(1, iterations + 1):
             actions.append({"action": "get_current_time", "timezone": timezone})
             actions.append({"action": "human_output", "label": label, "iteration": iteration, "from_last_time": True})

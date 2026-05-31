@@ -22,6 +22,8 @@ from agent_libos.storage import SQLiteStore
 
 
 class HumanObjectManager:
+    """HumanObject primitive: terminal queue, approvals, questions, and output."""
+
     def __init__(
         self,
         store: SQLiteStore,
@@ -57,6 +59,8 @@ class HumanObjectManager:
         )
         self.store.insert_human_request(human_request)
         if blocking:
+            # Blocking human requests suspend scheduling for this process until
+            # a terminal queue decision moves it back to RUNNABLE.
             process = self.store.get_process(pid)
             if process is not None:
                 process.status = ProcessStatus.WAITING_HUMAN
@@ -239,6 +243,8 @@ class HumanObjectManager:
         pending = self.pending(human=human)
         if not pending:
             return None
+        # The terminal is the human's message queue. Process requests strictly
+        # in creation order so approvals and answers remain predictable.
         request = pending[0]
         request_type = request.payload.get("type")
         if request_type == "output":
@@ -430,6 +436,9 @@ class HumanObjectManager:
                 )
         process = self.store.get_process(request.pid)
         if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
+            # Permission denials still wake the process so it can observe the
+            # failed operation and explain what happened. Generic rejected human
+            # approvals remain a pause/interruption signal.
             process.status = (
                 ProcessStatus.RUNNABLE
                 if status == HumanRequestStatus.APPROVED or permission_related
@@ -509,6 +518,8 @@ class HumanObjectManager:
         context = request.payload.get("context")
         if not isinstance(context, dict):
             return question
+        # External-operation prompts show structured facts, not tool prose, so
+        # the human can judge the primitive-level side effect safely.
         capability = request.payload.get("requested_once_capability")
         lines = ["Operation details:"]
         for label, key in [

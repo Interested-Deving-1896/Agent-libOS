@@ -100,6 +100,8 @@ class HumanChatActionClient:
         if self._exit_after_output:
             return self._completion("process_exit", {"payload": {"turns": self.turns, "reason": "chat_finished"}}, )
         if not self._waiting_for_answer:
+            # The script uses ask_human/human_output as the terminal transport.
+            # This local client only decides which libOS tool action comes next.
             if self.turns >= self.max_turns:
                 return self._completion("process_exit",
                     {"payload": {"turns": self.turns, "reason": "max_turns_reached"}}, )
@@ -174,6 +176,8 @@ def _last_tool_result(messages: list[dict[str, str]], tool_name: str) -> dict[st
 
 
 def _last_human_answer(messages: list[dict[str, str]]) -> str:
+    # Prefer recent events over Object Memory payload order; the latter can
+    # include older tool results after context sorting.
     for event in reversed(_recent_events(messages)):
         if event.get("type") != "human_response":
             continue

@@ -81,6 +81,8 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
                 code=ToolErrorCode.EXECUTION_ERROR,
                 details={"path": result.path, "bytes_read": result.bytes_read, "max_bytes": args.max_bytes},
             )
+        # The content moves into Object Memory, but the tool result exposes only
+        # metadata so a process can copy files without seeing the bytes.
         payload = {
             "kind": "workspace_text_file",
             "source_path": result.path,
@@ -136,6 +138,8 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         obj = runtime.memory.get_object_by_name(ctx.pid, args.name)
         text = self._extract_text(obj.payload)
+        # The object payload is handed directly to the filesystem primitive; the
+        # process-visible result below still omits the concrete content.
         try:
             result = runtime.filesystem.write_text(
                 pid=ctx.pid,

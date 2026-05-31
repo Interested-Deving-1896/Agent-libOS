@@ -133,6 +133,8 @@ class GuardedActionClient:
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1
         serialized_messages = json.dumps(messages, ensure_ascii=False)
+        # This assertion is the point of the smoke test: copying through named
+        # Object Memory must not materialize file bytes into the prompt.
         if self.forbidden_text and self.forbidden_text in serialized_messages:
             raise AssertionError("source file content was materialized into the process prompt")
         if not self.actions:

@@ -60,6 +60,9 @@ class SQLiteStore:
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # Object payloads are runtime memory, not durable database state. SQLite
+        # stores only metadata plus a marker saying whether a payload was present
+        # in this process.
         self._object_payloads: dict[str, Any] = {}
         self.initialize()
 
@@ -263,6 +266,8 @@ class SQLiteStore:
 
     def get_object(self, oid: str) -> AgentObject | None:
         rows = self._query("SELECT * FROM objects WHERE oid = ?", (oid,))
+        # A row without an in-memory payload is a directory remnant from a prior
+        # runtime instance or checkpoint restore, not a materializable Object.
         if not rows or oid not in self._object_payloads:
             return None
         return self._row_to_object(rows[0])

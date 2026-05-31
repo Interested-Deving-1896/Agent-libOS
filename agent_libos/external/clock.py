@@ -26,6 +26,8 @@ class SleepResult:
 
 
 class ClockPrimitive:
+    """Clock primitive used by scheduler-facing tools."""
+
     FIXED_TIMEZONE_FALLBACKS = {
         "Asia/Shanghai": timezone(timedelta(hours=8), name="Asia/Shanghai"),
     }
@@ -67,6 +69,8 @@ class ClockPrimitive:
     async def asleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
         started = time.monotonic()
+        # Use asyncio sleep so one sleeping AgentProcess does not block other
+        # runnable process tasks in the scheduler.
         await asyncio.sleep(duration)
         elapsed = time.monotonic() - started
         return self._record_sleep(pid, duration, elapsed)

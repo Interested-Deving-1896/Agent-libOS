@@ -22,9 +22,14 @@ if TYPE_CHECKING:
 
 
 class LLMProcessExecutor:
+    """Runs one model-selected tool action per process quantum."""
+
     def __init__(self, runtime: "Runtime", client: LLMClient | None = None):
         self.runtime = runtime
         self.client = client or LLMClient.from_env()
+        # Pending actions are held outside Object Memory because the process has
+        # not received a tool result yet. The action is retried after the human
+        # queue records a decision, without asking the model for a new action.
         self._pending_human_actions: dict[str, dict[str, Any]] = {}
 
     def run_once(self, pid: str) -> dict[str, Any]:
@@ -179,6 +184,8 @@ class LLMProcessExecutor:
         action = dict(pending["action"])
         self._pending_human_actions.pop(pid, None)
         if request.status == HumanRequestStatus.APPROVED:
+            # Re-dispatch the exact same action. This preserves the original
+            # model decision and prevents hidden progress before approval.
             try:
                 result = await self.adispatch(pid, action)
             except HumanApprovalRequired as exc:
@@ -200,6 +207,8 @@ class LLMProcessExecutor:
             )
 
         error = f"human rejected approval request {request_id}"
+        # A rejected per-use approval is surfaced as a failed action result, not
+        # as a runtime crash, so the process can explain or choose another path.
         self._emit_pending_action_rejected(pid, action, request_id, error)
         result = {"ok": False, "tool_id": None, "result_oid": None, "payload": None, "error": error}
         return self._completed_action_result(

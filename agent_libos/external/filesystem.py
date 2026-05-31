@@ -29,6 +29,8 @@ class FileWriteResult:
 
 
 class FilesystemAdapter:
+    """Workspace-contained filesystem primitive."""
+
     def __init__(
         self,
         capabilities: CapabilityManager,
@@ -189,6 +191,8 @@ class FilesystemAdapter:
         if policy == CapabilityManager.ASK_EACH_TIME:
             if self.human is None:
                 raise CapabilityDenied(f"{pid} requires human approval for write on {resource}")
+            # This primitive has the concrete path, overwrite state, byte count,
+            # and preview needed for a safe per-use human decision.
             request_id = self.human.query(
                 pid=pid,
                 human="owner",
@@ -259,6 +263,8 @@ class FilesystemAdapter:
 
     def _preview_text(self, text: str, limit: int = 256) -> tuple[str, bool]:
         preview = text[:limit]
+        # repr() prevents newlines or prompt-like text from masquerading as
+        # separate approval instructions in the human terminal prompt.
         return repr(preview), len(text) > limit
 
     def _target_state(self, target: Path) -> dict[str, Any]:

@@ -101,6 +101,8 @@ class AskFileViewerClient:
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1
         if self.step == 0:
+            # Drive the process through real human/file primitives while keeping
+            # this script deterministic and testable without a model call.
             self.step = 1
             return self._completion(
                 "ask_human",

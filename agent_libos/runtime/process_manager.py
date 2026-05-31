@@ -30,6 +30,8 @@ from agent_libos.storage import SQLiteStore
 
 
 class ProcessManager:
+    """Process lifecycle primitive."""
+
     def __init__(
         self,
         store: SQLiteStore,
@@ -75,6 +77,8 @@ class ProcessManager:
         )
         self.store.insert_process(process)
         goal_handle = self._ensure_goal(pid, goal)
+        # A process starts with a mutable view rooted at its goal. Later tool
+        # results are appended to this view by the LLM executor.
         view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
         process.goal_oid = goal_handle.oid
         process.memory_view = view
@@ -142,6 +146,8 @@ class ProcessManager:
             spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
         else:
             spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
+        # Forking attenuates memory handles by default. The child can see only
+        # roots selected by the parent and only the rights granted into its view.
         child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
         child_view.roots.append(goal_handle)
         child.goal_oid = goal_handle.oid
@@ -295,6 +301,8 @@ class ProcessManager:
             output_refs=[result.oid] if result else [],
             decision={"status": process.status.value, "message": message},
         )
+        # Reclaim volatile Object Memory owned by this process after its final
+        # state has been recorded.
         self.memory.release_process_owned(pid, preserve_oids={result.oid} if result is not None else set())
 
     def get(self, pid: str) -> AgentProcess:

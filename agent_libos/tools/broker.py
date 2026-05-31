@@ -29,6 +29,8 @@ from agent_libos.tools.sandbox import PythonSubprocessSandbox, SandboxBackend
 
 
 class ToolBroker:
+    """Registry and dispatch boundary for model-facing tools."""
+
     def __init__(
         self,
         store: SQLiteStore,
@@ -244,6 +246,8 @@ class ToolBroker:
         handle = self.resolve(tool, pid=pid)
         resource = f"tool:{handle.tool_id}"
         if not self._process_has_tool(pid, handle):
+            # The process tool table is the only execute gate in this MVP. Host
+            # resources are still checked by the primitive each tool calls into.
             call_id = new_id("tcall")
             error = f"tool is not in process tool table: {handle.name}"
             self.events.emit(
@@ -317,6 +321,8 @@ class ToolBroker:
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
         except HumanApprovalRequired as exc:
+            # Do not convert this into a ToolCallResult: the LLM quantum has not
+            # completed and must be resumed after the human decision.
             self.audit.record(
                 actor=pid,
                 action="tool.call_waiting_human",

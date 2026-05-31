@@ -32,6 +32,8 @@ from agent_libos.storage import SQLiteStore
 
 
 class ObjectMemoryManager:
+    """Typed Object Memory with capability-checked handles and global names."""
+
     def __init__(
         self,
         store: SQLiteStore,
@@ -58,6 +60,8 @@ class ObjectMemoryManager:
         obj_type = ObjectType(object_type)
         oid = new_id("obj")
         object_name = self._normalize_name(name or self._default_name(obj_type, oid))
+        # Names are stable directory entries, not authority. Reads by name still
+        # resolve to an oid and then pass through capability checks.
         self._require_unique_name(object_name)
         meta = metadata or ObjectMetadata(token_estimate=estimate_tokens(payload))
         if meta.token_estimate is None:
@@ -122,6 +126,7 @@ class ObjectMemoryManager:
         obj = self.store.get_object_by_name(self._normalize_name(name))
         if obj is None:
             raise NotFound(f"object not found: {name}")
+        # Name lookup never bypasses the object capability model.
         self.capabilities.require(pid, f"object:{obj.oid}", ObjectRight.READ)
         self.audit.record(
             actor=pid,
@@ -143,6 +148,7 @@ class ObjectMemoryManager:
         if obj is None:
             raise NotFound(f"object not found: {name}")
         requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
+        # A name can be resolved only into rights the process already has.
         for right in requested:
             self.capabilities.require(pid, f"object:{obj.oid}", right)
         handle = self.capabilities.handle_for_object(pid, obj.oid, requested, issued_by=issued_by)
@@ -380,6 +386,8 @@ class ObjectMemoryManager:
         return snapshot_id
 
     def release_process_owned(self, pid: str, preserve_oids: set[str] | None = None) -> list[str]:
+        # Process-owned Object payloads behave like volatile memory: they are
+        # reclaimed on exit unless explicitly promoted as the process result.
         preserve = set(preserve_oids or set())
         released: list[str] = []
         for oid in self.store.list_object_oids_created_by(pid):

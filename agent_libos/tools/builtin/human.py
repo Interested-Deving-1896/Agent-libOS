@@ -98,6 +98,8 @@ class AskHumanTool(SyncAgentTool[AskHumanArgs]):
         with self._lock:
             request_id = self._pending_by_key.get(key)
         if request_id is None:
+            # The first call queues the question and raises; the resumed call
+            # with the same arguments returns the already-recorded answer.
             request_id = runtime.human.ask(
                 pid=ctx.pid,
                 human=args.human,
