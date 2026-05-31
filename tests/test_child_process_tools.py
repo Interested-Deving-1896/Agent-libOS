@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import ast
 import json
-import re
 import unittest
 from typing import Any
 
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus, ResourceBudget
+from scripts.llm_context_probe import last_tool_result, static_prefix
 
 
 class ChildProcessToolTests(unittest.TestCase):
@@ -168,43 +167,24 @@ class ParentChildClient:
 
 
 def _pid_from_messages(messages: list[dict[str, str]]) -> str:
-    text = "\n".join(message.get("content", "") for message in messages)
-    match = re.search(r"^- pid: (?P<pid>\S+)", text, flags=re.MULTILINE)
-    if not match:
+    pid = static_prefix(messages).get("pid")
+    if not isinstance(pid, str) or not pid:
         raise AssertionError("prompt did not include process pid")
-    return match.group("pid")
+    return pid
 
 
 def _parent_pid_from_messages(messages: list[dict[str, str]]) -> str | None:
-    text = "\n".join(message.get("content", "") for message in messages)
-    match = re.search(r"^- parent_pid: (?P<parent>\S+)", text, flags=re.MULTILINE)
-    if not match:
-        raise AssertionError("prompt did not include parent pid")
-    value = match.group("parent")
-    return None if value == "None" else value
+    value = static_prefix(messages).get("parent_pid")
+    if value is None or isinstance(value, str):
+        return value
+    raise AssertionError("prompt parent pid had an unexpected shape")
 
 
 def _last_tool_result(messages: list[dict[str, str]], tool_name: str) -> dict[str, Any]:
-    for payload in reversed(_materialized_payloads(messages)):
-        if payload.get("tool_name") != tool_name:
-            continue
-        result = payload.get("result")
-        if isinstance(result, dict):
-            return result
+    result = last_tool_result(messages, tool_name)
+    if result is not None:
+        return result
     raise AssertionError(f"no visible result for {tool_name}")
-
-
-def _materialized_payloads(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
-    text = "\n".join(message.get("content", "") for message in messages)
-    payloads: list[dict[str, Any]] = []
-    for match in re.finditer(r"^payload: (?P<payload>.+)$", text, flags=re.MULTILINE):
-        try:
-            payload = ast.literal_eval(match.group("payload"))
-        except (SyntaxError, ValueError):
-            continue
-        if isinstance(payload, dict):
-            payloads.append(payload)
-    return payloads
 
 
 def _action_name(result: object) -> str | None:

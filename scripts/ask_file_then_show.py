@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
 import json
-import re
 from typing import Any
 
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessStatus
 from agent_libos.serde import to_jsonable
+from scripts.llm_context_probe import last_tool_result, recent_events
 
 
 def main() -> None:
@@ -161,49 +160,21 @@ class AskFileViewerClient:
         *,
         required: bool = True,
     ) -> dict[str, Any] | None:
-        for payload in reversed(_materialized_payloads(messages)):
-            if payload.get("tool_name") != tool_name:
-                continue
-            result = payload.get("result")
-            if isinstance(result, dict):
-                return result
+        result = last_tool_result(messages, tool_name)
+        if result is not None:
+            return result
         if required:
             raise AssertionError(f"no visible result for {tool_name}")
         return None
 
     def _last_tool_error(self, messages: list[dict[str, str]]) -> str | None:
-        for event in reversed(_recent_events(messages)):
+        for event in reversed(recent_events(messages)):
             if event.get("type") != "tool_failed":
                 continue
             payload = event.get("payload")
             if isinstance(payload, dict) and isinstance(payload.get("error"), str):
                 return payload["error"]
         return None
-
-
-def _materialized_payloads(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
-    text = "\n".join(message.get("content", "") for message in messages)
-    payloads: list[dict[str, Any]] = []
-    for match in re.finditer(r"^payload: (?P<payload>.+)$", text, flags=re.MULTILINE):
-        try:
-            payload = ast.literal_eval(match.group("payload"))
-        except (SyntaxError, ValueError):
-            continue
-        if isinstance(payload, dict):
-            payloads.append(payload)
-    return payloads
-
-
-def _recent_events(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
-    text = "\n".join(message.get("content", "") for message in messages)
-    match = re.search(r"Recent events:\n(?P<events>.*?)\n\nMaterialized context:", text, flags=re.DOTALL)
-    if not match:
-        return []
-    try:
-        events = ast.literal_eval(match.group("events"))
-    except (SyntaxError, ValueError):
-        return []
-    return events if isinstance(events, list) else []
 
 
 def _action_name(result: object) -> str | None:

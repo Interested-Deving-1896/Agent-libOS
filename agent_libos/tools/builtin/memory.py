@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agent_libos.models import ObjectMetadata, ObjectType, ViewMode
+from agent_libos.models import ObjectMetadata, ObjectPatch, ObjectType, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 
@@ -20,6 +20,38 @@ class CreateMemoryObjectOutput(BaseModel):
     oid: str
     name: str
     type: str
+
+
+class ReadMemoryObjectArgs(BaseModel):
+    name: str = Field(description="Globally unique Object Memory name to read.")
+    max_payload_chars: int = Field(default=12000, ge=1, le=200000, description="Maximum rendered payload chars.")
+
+
+class ReadMemoryObjectOutput(BaseModel):
+    oid: str
+    name: str
+    type: str
+    version: int
+    payload: Any
+    truncated: bool
+
+
+class AppendMemoryObjectArgs(BaseModel):
+    name: str = Field(description="Globally unique mutable Object Memory name to append to.")
+    entry: Any = Field(description="Structured entry to append.")
+    list_field: str = Field(
+        default="entries",
+        description="Payload list field to append into when the object payload is a JSON object.",
+    )
+
+
+class AppendMemoryObjectOutput(BaseModel):
+    oid: str
+    name: str
+    version: int
+    appended: bool
+    list_field: str | None = None
+    length: int
 
 
 class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
@@ -62,3 +94,92 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             process.memory_view.roots.append(handle)
         runtime.store.update_process(process)
         return CreateMemoryObjectOutput(oid=handle.oid, name=obj.name, type=args.type)
+
+
+class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
+    name = "read_memory_object"
+    description = (
+        "Read a named Object Memory object. Name lookup does not grant authority; "
+        "the memory primitive still enforces object read capability."
+    )
+    args_schema = ReadMemoryObjectArgs
+    output_schema = ReadMemoryObjectOutput
+    version = "1.0.0"
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=5.0)
+    tags = ["memory", "object", "read"]
+
+    def run(self, args: ReadMemoryObjectArgs, ctx: ToolContext) -> ReadMemoryObjectOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        obj = runtime.memory.get_object_by_name(ctx.pid, args.name)
+        payload = obj.payload
+        rendered = repr(payload)
+        truncated = len(rendered) > args.max_payload_chars
+        if truncated:
+            payload = rendered[: args.max_payload_chars]
+        return ReadMemoryObjectOutput(
+            oid=obj.oid,
+            name=obj.name,
+            type=obj.type.value,
+            version=obj.version,
+            payload=payload,
+            truncated=truncated,
+        )
+
+
+class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
+    name = "append_memory_object"
+    description = (
+        "Append a structured entry to a mutable named Object Memory object. "
+        "This is the preferred write pattern for LLM context objects because it preserves prompt-cache-friendly prefixes."
+    )
+    args_schema = AppendMemoryObjectArgs
+    output_schema = AppendMemoryObjectOutput
+    version = "1.0.0"
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    tags = ["memory", "object", "write", "append"]
+
+    def run(self, args: AppendMemoryObjectArgs, ctx: ToolContext) -> AppendMemoryObjectOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        handle = runtime.memory.handle_for_name(
+            ctx.pid,
+            args.name,
+            rights=["read", "write"],
+            issued_by="append_memory_object_tool",
+        )
+        obj = runtime.memory.get_object(ctx.pid, handle)
+        payload = obj.payload
+        if isinstance(payload, dict):
+            values = payload.setdefault(args.list_field, [])
+            if not isinstance(values, list):
+                raise ToolExecutionError(
+                    "Target payload field is not a list.",
+                    code=ToolErrorCode.VALIDATION_ERROR,
+                    details={"name": args.name, "list_field": args.list_field},
+                )
+            values.append(args.entry)
+            length = len(values)
+            list_field: str | None = args.list_field
+        elif isinstance(payload, list):
+            payload.append(args.entry)
+            length = len(payload)
+            list_field = None
+        else:
+            raise ToolExecutionError(
+                "Target object payload is not appendable.",
+                code=ToolErrorCode.VALIDATION_ERROR,
+                details={"name": args.name, "payload_type": type(payload).__name__},
+            )
+        runtime.memory.update_object(ctx.pid, handle, ObjectPatch(payload=payload))
+        updated = runtime.memory.get_object(ctx.pid, handle)
+        return AppendMemoryObjectOutput(
+            oid=updated.oid,
+            name=updated.name,
+            version=updated.version,
+            appended=True,
+            list_field=list_field,
+            length=length,
+        )

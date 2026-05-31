@@ -70,6 +70,15 @@ def build_user_prompt(
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
 ) -> str:
+    if context.policy_used == "llm_context_object":
+        return "\n\n".join(
+            [
+                "The append-only LLM context object below is the source of truth for this process quantum.",
+                "OpenAI tool schemas are supplied out-of-band; fallback JSON must still use an exact available tool name.",
+                "Choose the next single runtime action after reading the latest appended entries.",
+                context.text,
+            ]
+        )
     return "\n\n".join(
         [
             _process_section(process),

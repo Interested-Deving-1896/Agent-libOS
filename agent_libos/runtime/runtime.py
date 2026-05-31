@@ -25,6 +25,7 @@ from agent_libos.substrate import LocalResourceProviderSubstrate, ResourceProvid
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.builtin import (
     AskHumanTool,
+    AppendMemoryObjectTool,
     CreateMemoryObjectTool,
     CreateObjectFromFileTool,
     DeleteDirectoryTool,
@@ -38,6 +39,7 @@ from agent_libos.tools.builtin import (
     ParsePytestLogTool,
     ProcessExitTool,
     ReadDirectoryTool,
+    ReadMemoryObjectTool,
     ReadTextFileTool,
     RequestPermissionTool,
     SignalChildProcessTool,
@@ -242,6 +244,7 @@ class Runtime:
         self.tools.register_tool(GetCurrentTimeTool(), registered_by="runtime")
         self.tools.register_tool(SleepTool(), registered_by="runtime")
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
+        self.tools.register_tool(AppendMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
         self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
@@ -252,6 +255,7 @@ class Runtime:
         self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
         self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
         self.tools.register_tool(ReadDirectoryTool(), registered_by="runtime")
+        self.tools.register_tool(ReadMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
         self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")

@@ -12,6 +12,7 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessStatus
+from scripts.llm_context_probe import last_tool_result, static_prefix
 
 
 @dataclass
@@ -156,22 +157,16 @@ class InterleavingClockClient:
         )
 
     def _pid_from_messages(self, messages: list[dict[str, str]]) -> str:
-        text = "\n".join(message.get("content", "") for message in messages)
-        match = re.search(r"^- pid: (?P<pid>\S+)", text, flags=re.MULTILINE)
-        if not match:
+        pid = static_prefix(messages).get("pid")
+        if not isinstance(pid, str) or not pid:
             raise AssertionError("prompt did not include process pid")
-        return match.group("pid")
+        return pid
 
     def _last_tool_time(self, messages: list[dict[str, str]]) -> str:
-        text = "\n".join(message.get("content", "") for message in messages)
-        matches = re.findall(
-            r"tool_name[\"']:\s*[\"']get_current_time[\"'].*?iso8601[\"']:\s*[\"']([^\"']+)[\"']",
-            text,
-            flags=re.DOTALL,
-        )
-        if not matches:
+        result = last_tool_result(messages, "get_current_time")
+        if result is None or not isinstance(result.get("iso8601"), str):
             raise AssertionError("prompt did not include a get_current_time tool result")
-        return matches[-1]
+        return result["iso8601"]
 
 
 def main() -> None:

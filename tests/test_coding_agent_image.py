@@ -40,6 +40,8 @@ class CodingAgentImageTests(unittest.TestCase):
                 "delete_file",
                 "delete_directory",
                 "create_memory_object",
+                "read_memory_object",
+                "append_memory_object",
                 "create_object_from_file",
                 "write_object_to_file",
                 "fork_child_process",

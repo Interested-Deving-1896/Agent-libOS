@@ -55,6 +55,9 @@ Tool-use guidance:
   plans. Read only what you need next.
 - create_memory_object: store plans, evidence, hypotheses, review findings,
   test summaries, and final decision records.
+- read_memory_object / append_memory_object: inspect or append to named mutable
+  memory objects, especially your `llm_context:<pid>` context object. Prefer
+  append-style writes so earlier prompt prefixes remain cacheable.
 - create_object_from_file / write_object_to_file: move file content through
   Object Memory without exposing the concrete bytes in the process-visible
   result. Use this for copy/transform workflows and large reference files.
@@ -106,6 +109,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         version="v0",
         system_prompt=BASE_AGENT_PROMPT,
         default_tools=[
+            "append_memory_object",
             "ask_human",
             "create_memory_object",
             "fork_child_process",
@@ -114,6 +118,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
             "list_child_processes",
             "merge_child_memory",
             "process_exit",
+            "read_memory_object",
             "request_permission",
             "signal_child_process",
             "sleep",
@@ -128,6 +133,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         version="v0",
         system_prompt=CODING_AGENT_PROMPT,
         default_tools=[
+            "append_memory_object",
             "ask_human",
             "create_memory_object",
             "create_object_from_file",
@@ -141,6 +147,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
             "parse_pytest_log",
             "process_exit",
             "read_directory",
+            "read_memory_object",
             "read_text_file",
             "request_permission",
             "signal_child_process",
@@ -176,6 +183,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
         version="v0",
         system_prompt=REVIEW_AGENT_PROMPT,
         default_tools=[
+            "append_memory_object",
             "ask_human",
             "create_object_from_file",
             "delete_directory",
@@ -186,6 +194,7 @@ DEFAULT_IMAGES: dict[str, AgentImage] = {
             "list_child_processes",
             "merge_child_memory",
             "read_directory",
+            "read_memory_object",
             "read_text_file",
             "request_permission",
             "signal_child_process",

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.exceptions import HumanApprovalRequired, ProcessWaitRequired
 from agent_libos.ids import utc_now
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
+from agent_libos.llm.context_memory import LLMContextMemory
 from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import (
@@ -32,6 +34,7 @@ class LLMProcessExecutor:
         # queue records a decision, without asking the model for a new action.
         self._pending_human_actions: dict[str, dict[str, Any]] = {}
         self._pending_wait_actions: dict[str, dict[str, Any]] = {}
+        self.context_memory = LLMContextMemory(runtime)
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -54,11 +57,24 @@ class LLMProcessExecutor:
             process.updated_at = utc_now()
             self.runtime.store.update_process(process)
 
-        context = self.runtime.memory.materialize_context(
+        source_view = self.context_memory.view_without_context(pid, process.memory_view)
+        source_context = self.runtime.memory.materialize_context(
             pid,
-            process.memory_view,
+            source_view,
             policy=image.context_policy,
             budget_tokens=process.resource_budget.max_materialized_tokens,
+        )
+        events = self.runtime.events.list(target=pid)
+        capabilities = self.runtime.capability.capabilities_for(pid)
+        tools = self.runtime.tools.list()
+        context = self.context_memory.prepare(
+            pid=pid,
+            image=image,
+            process=process,
+            source_context=source_context,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
         )
         messages = [
             {"role": "system", "content": build_system_prompt(image)},
@@ -67,9 +83,9 @@ class LLMProcessExecutor:
                 "content": build_user_prompt(
                     process=process,
                     context=context,
-                    events=self.runtime.events.list(target=pid),
-                    capabilities=self.runtime.capability.capabilities_for(pid),
-                    tools=self.runtime.tools.list(),
+                    events=events,
+                    capabilities=capabilities,
+                    tools=tools,
                 ),
             },
         ]
@@ -81,11 +97,7 @@ class LLMProcessExecutor:
             decision={"messages": len(messages), "policy": image.context_policy},
         )
         try:
-            completion = await asyncio.to_thread(
-                self.client.complete_action,
-                messages,
-                self.runtime.tools.openai_tool_schemas(pid),
-            )
+            completion = await self._complete_action(messages, self.runtime.tools.openai_tool_schemas(pid))
             action = self._completion_to_action(completion.content, completion.tool_calls)
             try:
                 result = await self.adispatch(pid, action)
@@ -340,6 +352,14 @@ class LLMProcessExecutor:
             return parse_json_action(content)
         except Exception as exc:
             raise ValueError(f"no valid tool call or fallback JSON action found: {exc}; content preview: {content[:500]!r}") from exc
+
+    async def _complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        if hasattr(self.client, "acomplete_action"):
+            result = self.client.acomplete_action(messages, tools)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        return await asyncio.to_thread(self.client.complete_action, messages, tools)
 
     def dispatch(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
         name = str(action["action"])

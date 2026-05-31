@@ -36,6 +36,8 @@ LLM-facing tools are stable wrappers over libOS primitives. They are similar to 
 Built-in tools currently include:
 
 - `create_memory_object`
+- `read_memory_object`
+- `append_memory_object`
 - `create_object_from_file`
 - `fork_child_process`
 - `write_object_to_file`
@@ -89,6 +91,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 - The runtime executes the selected legal tool call for each quantum.
 - Free-form model text is allowed, but only tool calls or fallback JSON actions have side effects.
 - Model calls run off the event loop, and tool dispatch has async support.
+- Each process LLM context is stored as a mutable Object Memory object named `llm_context:<pid>`. The runtime appends new process facts, events, capability snapshots, and object summaries to the end of this object so repeated prompt prefixes remain stable for prompt caching.
 
 ### Built-In Coding Image
 
@@ -143,6 +146,8 @@ OPENAI_CODING_AGENT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 OPENAI_LANGUAGE_MODEL=qwen3.7-max
 OPENAI_API_KEY=...
 ```
+
+The LLM client uses the OpenAI Python SDK. By default it uses the Responses API for OpenAI-hosted models and falls back to Chat Completions for custom OpenAI-compatible `base_url` providers. Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode. Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`, `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific `OPENAI_ENABLE_THINKING`.
 
 Spawn and run a process:
 
