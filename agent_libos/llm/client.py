@@ -50,7 +50,7 @@ class LLMClient:
         if api_mode not in _API_MODES:
             raise LLMError(f"OPENAI_API_MODE must be one of {sorted(_API_MODES)}, got {api_mode!r}")
         return cls(
-            base_url=os.getenv("OPENAI_CODING_AGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+            base_url=os.getenv("OPENAI_BASE_URL"),
             model=os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"),
             api_key=os.getenv("OPENAI_API_KEY"),
             timeout=_float_env("OPENAI_TIMEOUT", default=60.0),

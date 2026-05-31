@@ -102,7 +102,7 @@ class FilesystemAdapter:
         raw = self.provider.read_bytes(target)
         truncated = len(raw) > max_bytes
         selected = raw[:max_bytes]
-        content = selected.decode(encoding)
+        content = self._decode_text_prefix(selected, encoding, truncated=truncated)
         self.events.emit(
             EventType.EXTERNAL_READ,
             source=pid,
@@ -127,6 +127,12 @@ class FilesystemAdapter:
     ) -> FileWriteResult:
         target, relative = self._resolve(path)
         resource = self.resource_for(relative)
+        self._reject_definite_permission_denial(pid, resource, CapabilityRight.WRITE)
+        target_state = self.provider.state(target)
+        if target_state.exists and target_state.kind != "file":
+            raise CapabilityDenied(f"path is not a file: {relative}")
+        if target_state.exists and not overwrite:
+            raise FileExistsError(f"file already exists: {relative}")
         consumed_once = self._require_write(
             pid=pid,
             resource=resource,
@@ -136,33 +142,35 @@ class FilesystemAdapter:
             encoding=encoding,
             overwrite=overwrite,
         )
-        target_state = self.provider.state(target)
-        created = not target_state.exists
-        if target_state.exists and target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
-        if target_state.exists and not overwrite:
-            raise FileExistsError(f"file already exists: {relative}")
-        self.provider.write_text(target, text, encoding=encoding, newline="\n")
-        bytes_written = len(text.encode(encoding))
-        self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=resource,
-            payload={"adapter": "filesystem", "path": relative, "bytes_written": bytes_written, "created": created},
-        )
-        self.audit.record(
-            actor=pid,
-            action="external.filesystem.write_text",
-            target=resource,
-            decision={"path": relative, "bytes_written": bytes_written, "created": created},
-        )
-        if consumed_once:
-            self.capabilities.consume_allow_once(
-                subject=pid,
-                resource=resource,
-                right=CapabilityRight.WRITE,
-                used_by="filesystem",
-        )
+        try:
+            target_state = self.provider.state(target)
+            created = not target_state.exists
+            if target_state.exists and target_state.kind != "file":
+                raise CapabilityDenied(f"path is not a file: {relative}")
+            if target_state.exists and not overwrite:
+                raise FileExistsError(f"file already exists: {relative}")
+            self.provider.write_text(target, text, encoding=encoding, newline="\n")
+            bytes_written = len(text.encode(encoding))
+            self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=pid,
+                target=resource,
+                payload={"adapter": "filesystem", "path": relative, "bytes_written": bytes_written, "created": created},
+            )
+            self.audit.record(
+                actor=pid,
+                action="external.filesystem.write_text",
+                target=resource,
+                decision={"path": relative, "bytes_written": bytes_written, "created": created},
+            )
+        finally:
+            if consumed_once:
+                self.capabilities.consume_allow_once(
+                    subject=pid,
+                    resource=resource,
+                    right=CapabilityRight.WRITE,
+                    used_by="filesystem",
+                )
         return FileWriteResult(path=relative, bytes_written=bytes_written, created=created)
 
     def read_directory(
@@ -212,6 +220,12 @@ class FilesystemAdapter:
     ) -> DirectoryWriteResult:
         target, relative = self._resolve(path)
         resource = self.directory_resource_for(relative)
+        self._reject_definite_permission_denial(pid, resource, CapabilityRight.WRITE)
+        target_state = self.provider.state(target)
+        if target_state.exists and target_state.kind != "directory":
+            raise CapabilityDenied(f"path is not a directory: {relative}")
+        if target_state.exists and not exist_ok:
+            raise FileExistsError(f"directory already exists: {relative}")
         consumed_once = self._require_write_operation(
             pid=pid,
             resource=resource,
@@ -222,30 +236,34 @@ class FilesystemAdapter:
             question=f"Allow this process to create or update directory {relative}?",
             extra_context={"parents": parents, "exist_ok": exist_ok},
         )
-        target_state = self.provider.state(target)
-        created = not target_state.exists
-        if target_state.exists and target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
-        self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
-        self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=resource,
-            payload={"adapter": "filesystem", "operation": "write_directory", "path": relative, "created": created},
-        )
-        self.audit.record(
-            actor=pid,
-            action="external.filesystem.write_directory",
-            target=resource,
-            decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
-        )
-        if consumed_once:
-            self.capabilities.consume_allow_once(
-                subject=pid,
-                resource=resource,
-                right=CapabilityRight.WRITE,
-                used_by="filesystem",
+        try:
+            target_state = self.provider.state(target)
+            created = not target_state.exists
+            if target_state.exists and target_state.kind != "directory":
+                raise CapabilityDenied(f"path is not a directory: {relative}")
+            if target_state.exists and not exist_ok:
+                raise FileExistsError(f"directory already exists: {relative}")
+            self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
+            self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=pid,
+                target=resource,
+                payload={"adapter": "filesystem", "operation": "write_directory", "path": relative, "created": created},
             )
+            self.audit.record(
+                actor=pid,
+                action="external.filesystem.write_directory",
+                target=resource,
+                decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
+            )
+        finally:
+            if consumed_once:
+                self.capabilities.consume_allow_once(
+                    subject=pid,
+                    resource=resource,
+                    right=CapabilityRight.WRITE,
+                    used_by="filesystem",
+                )
         return DirectoryWriteResult(path=relative, created=created)
 
     def delete_file(
@@ -256,6 +274,12 @@ class FilesystemAdapter:
     ) -> DeleteResult:
         target, relative = self._resolve(path)
         resource = self.resource_for(relative)
+        self._reject_definite_permission_denial(pid, resource, CapabilityRight.DELETE)
+        target_state = self.provider.state(target)
+        if not target_state.exists and not missing_ok:
+            raise NotFound(f"file does not exist: {relative}")
+        if target_state.exists and target_state.kind != "file":
+            raise CapabilityDenied(f"path is not a file: {relative}")
         consumed_once = self._require_delete(
             pid=pid,
             resource=resource,
@@ -265,34 +289,36 @@ class FilesystemAdapter:
             recursive=False,
             missing_ok=missing_ok,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            if not missing_ok:
-                raise NotFound(f"file does not exist: {relative}")
-            return DeleteResult(path=relative, kind="missing", deleted=False)
-        if target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
-        self.provider.delete_file(target)
-        self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=resource,
-            payload={"adapter": "filesystem", "operation": "delete_file", "path": relative},
-        )
-        self.audit.record(
-            actor=pid,
-            action="external.filesystem.delete_file",
-            target=resource,
-            decision={"path": relative, "deleted": True},
-        )
-        if consumed_once:
-            self.capabilities.consume_allow_once(
-                subject=pid,
-                resource=resource,
-                right=CapabilityRight.DELETE,
-                used_by="filesystem",
+        try:
+            target_state = self.provider.state(target)
+            if not target_state.exists:
+                if not missing_ok:
+                    raise NotFound(f"file does not exist: {relative}")
+                return DeleteResult(path=relative, kind="missing", deleted=False)
+            if target_state.kind != "file":
+                raise CapabilityDenied(f"path is not a file: {relative}")
+            self.provider.delete_file(target)
+            self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=pid,
+                target=resource,
+                payload={"adapter": "filesystem", "operation": "delete_file", "path": relative},
             )
-        return DeleteResult(path=relative, kind="file", deleted=True)
+            self.audit.record(
+                actor=pid,
+                action="external.filesystem.delete_file",
+                target=resource,
+                decision={"path": relative, "deleted": True},
+            )
+            return DeleteResult(path=relative, kind="file", deleted=True)
+        finally:
+            if consumed_once:
+                self.capabilities.consume_allow_once(
+                    subject=pid,
+                    resource=resource,
+                    right=CapabilityRight.DELETE,
+                    used_by="filesystem",
+                )
 
     def delete_directory(
         self,
@@ -305,6 +331,12 @@ class FilesystemAdapter:
         if target.is_root:
             raise CapabilityDenied("cannot delete filesystem adapter root")
         resource = self.directory_resource_for(relative)
+        self._reject_definite_permission_denial(pid, resource, CapabilityRight.DELETE)
+        target_state = self.provider.state(target)
+        if not target_state.exists and not missing_ok:
+            raise NotFound(f"directory does not exist: {relative}")
+        if target_state.exists and target_state.kind != "directory":
+            raise CapabilityDenied(f"path is not a directory: {relative}")
         consumed_once = self._require_delete(
             pid=pid,
             resource=resource,
@@ -314,39 +346,41 @@ class FilesystemAdapter:
             recursive=recursive,
             missing_ok=missing_ok,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            if not missing_ok:
-                raise NotFound(f"directory does not exist: {relative}")
-            return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
-        if target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
-        self.provider.delete_directory(target, recursive=recursive)
-        self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=resource,
-            payload={
-                "adapter": "filesystem",
-                "operation": "delete_directory",
-                "path": relative,
-                "recursive": recursive,
-            },
-        )
-        self.audit.record(
-            actor=pid,
-            action="external.filesystem.delete_directory",
-            target=resource,
-            decision={"path": relative, "deleted": True, "recursive": recursive},
-        )
-        if consumed_once:
-            self.capabilities.consume_allow_once(
-                subject=pid,
-                resource=resource,
-                right=CapabilityRight.DELETE,
-                used_by="filesystem",
+        try:
+            target_state = self.provider.state(target)
+            if not target_state.exists:
+                if not missing_ok:
+                    raise NotFound(f"directory does not exist: {relative}")
+                return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
+            if target_state.kind != "directory":
+                raise CapabilityDenied(f"path is not a directory: {relative}")
+            self.provider.delete_directory(target, recursive=recursive)
+            self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=pid,
+                target=resource,
+                payload={
+                    "adapter": "filesystem",
+                    "operation": "delete_directory",
+                    "path": relative,
+                    "recursive": recursive,
+                },
             )
-        return DeleteResult(path=relative, kind="directory", deleted=True, recursive=recursive)
+            self.audit.record(
+                actor=pid,
+                action="external.filesystem.delete_directory",
+                target=resource,
+                decision={"path": relative, "deleted": True, "recursive": recursive},
+            )
+            return DeleteResult(path=relative, kind="directory", deleted=True, recursive=recursive)
+        finally:
+            if consumed_once:
+                self.capabilities.consume_allow_once(
+                    subject=pid,
+                    resource=resource,
+                    right=CapabilityRight.DELETE,
+                    used_by="filesystem",
+                )
 
     def grant_workspace(
         self,
@@ -470,6 +504,18 @@ class FilesystemAdapter:
                 **self._content_context(text, encoding),
             },
         )
+
+    def _reject_definite_permission_denial(
+        self,
+        pid: str,
+        resource: str,
+        right: CapabilityRight,
+    ) -> None:
+        # Do not stat the target before a definite deny/miss; existence and
+        # kind are filesystem facts that require some matching policy first.
+        policy = self.capabilities.permission_policy(pid, resource, right)
+        if policy in {CapabilityManager.MISSING, CapabilityManager.ALWAYS_DENY}:
+            self.capabilities.require(pid, resource, right)
 
     def _require_write_operation(
         self,
@@ -622,6 +668,14 @@ class FilesystemAdapter:
         # repr() prevents newlines or prompt-like text from masquerading as
         # separate approval instructions in the human terminal prompt.
         return repr(preview), len(text) > limit
+
+    def _decode_text_prefix(self, data: bytes, encoding: str, *, truncated: bool) -> str:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError as exc:
+            if truncated and exc.end == len(data):
+                return data[: exc.start].decode(encoding)
+            raise
 
     def _target_state(self, target: ResolvedPath) -> dict[str, Any]:
         state = self.provider.state(target)

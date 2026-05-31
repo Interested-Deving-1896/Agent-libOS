@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -62,15 +63,19 @@ class ToolBroker:
         scope: str = "static",
         ephemeral: bool = False,
     ) -> ToolHandle:
-        tool_id = new_id("tool")
         spec = tool.spec()
         if spec.name in self._tool_ids_by_name:
             raise ValueError(f"tool already registered: {spec.name}")
+        tool_id = new_id("tool") if ephemeral else _stable_static_tool_id(spec.name)
         handle = ToolHandle(tool_id=tool_id, name=spec.name, capability_id=None, scope=scope)
         self._tools[tool_id] = tool
         self._tool_ids_by_name[spec.name] = tool_id
         self._handles[tool_id] = handle
-        self.store.insert_tool(handle, spec, registered_by=registered_by, created_at=utc_now(), ephemeral=ephemeral)
+        existing = next((row for row in self.store.list_tools() if row["tool_id"] == tool_id), None)
+        if existing is not None and existing["name"] != spec.name:
+            raise ValueError(f"tool id collision: {tool_id}")
+        if existing is None:
+            self.store.insert_tool(handle, spec, registered_by=registered_by, created_at=utc_now(), ephemeral=ephemeral)
         self.audit.record(
             actor=registered_by,
             action="tool.register",
@@ -208,6 +213,12 @@ class ToolBroker:
         scope: str = "ephemeral_process",
     ) -> ToolHandle:
         candidate = self._get_candidate(candidate_id)
+        if candidate.status == ToolCandidateStatus.REGISTERED:
+            raise ValidationError(f"tool candidate is already registered: {candidate_id}")
+        if candidate.spec.name in self._tool_ids_by_name or any(
+            row["name"] == candidate.spec.name for row in self.store.list_tools()
+        ):
+            raise ValidationError(f"tool name already exists: {candidate.spec.name}")
         if candidate.status != ToolCandidateStatus.VALIDATED:
             validation = self.validate(candidate_id)
             if not validation.ok:
@@ -417,6 +428,10 @@ class ToolBroker:
     def list(self) -> builtins.list[dict[str, Any]]:
         return self.store.list_tools()
 
+    def visible_tools(self, pid: str) -> builtins.list[dict[str, Any]]:
+        visible_ids = self._visible_tool_ids(pid)
+        return [row for row in self.store.list_tools() if row["tool_id"] in visible_ids]
+
     def openai_tool_schemas(self, pid: str | None = None) -> builtins.list[dict[str, Any]]:
         tool_ids = self._visible_tool_ids(pid) if pid is not None else set(self._tools)
         schemas: builtins.list[dict[str, Any]] = []
@@ -474,3 +489,8 @@ class ToolBroker:
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return set(process.tool_table.values())
+
+
+def _stable_static_tool_id(name: str) -> str:
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    return f"tool_static_{digest}"

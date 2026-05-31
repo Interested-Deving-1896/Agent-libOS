@@ -153,6 +153,37 @@ class ObjectMemoryNameTests(unittest.TestCase):
         self.assertNotIn(secret, serialized)
         self.assertIn("runtime_memory", serialized)
 
+    def test_stale_persistent_name_still_blocks_duplicate_creation(self) -> None:
+        self.runtime.close()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/runtime.sqlite"
+            runtime = Runtime.open(db_path)
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="reserve name")
+                runtime.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.ARTIFACT,
+                    payload={"runtime_only": True},
+                    name="reserved.name",
+                )
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db_path)
+            try:
+                pid = reopened.process.spawn(image="base-agent:v0", goal="duplicate stale name")
+                with self.assertRaises(ValidationError):
+                    reopened.memory.create_object(
+                        pid=pid,
+                        object_type=ObjectType.ARTIFACT,
+                        payload={"new": True},
+                        name="reserved.name",
+                    )
+            finally:
+                reopened.close()
+
+        self.runtime = Runtime.open("local")
+
     def test_process_exit_releases_owned_memory_except_result_object(self) -> None:
         pid = self.runtime.process.spawn(image="base-agent:v0", goal="release memory")
         scratch = self.runtime.memory.create_object(

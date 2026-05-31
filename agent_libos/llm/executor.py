@@ -66,7 +66,10 @@ class LLMProcessExecutor:
         )
         events = self.runtime.events.list(target=pid)
         capabilities = self.runtime.capability.capabilities_for(pid)
-        tools = self.runtime.tools.list()
+        # The prompt-visible tool list must match the process tool table. The
+        # broker still owns the real execute check, but showing extra tools
+        # teaches the model to choose actions the process cannot call.
+        tools = self.runtime.tools.visible_tools(pid)
         context = self.context_memory.prepare(
             pid=pid,
             image=image,

@@ -71,14 +71,36 @@ class LLMContextMemoryTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_llm_prompt_lists_only_process_visible_tools(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.llm.client = RecordingActionClient(
+                [{"action": "process_exit", "payload": {"done": True}}]
+            )
+            pid = runtime.process.spawn(image="base-agent:v0", goal="exit")
+
+            runtime.run_next_process_once()
+
+            tool_names = {
+                tool["function"]["name"]
+                for tool in runtime.llm.client.tool_batches[0]
+            }
+            self.assertIn("process_exit", tool_names)
+            self.assertNotIn("read_text_file", tool_names)
+            self.assertNotIn("read_text_file", runtime.llm.client.user_prompts[0])
+        finally:
+            runtime.close()
+
 
 class RecordingActionClient:
     def __init__(self, actions: list[dict[str, Any]]):
         self.actions = list(actions)
         self.user_prompts: list[str] = []
+        self.tool_batches: list[list[dict[str, Any]]] = []
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         self.user_prompts.append(str(messages[-1]["content"]))
+        self.tool_batches.append(tools)
         action = self.actions.pop(0)
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}

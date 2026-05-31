@@ -278,6 +278,10 @@ class SQLiteStore:
             return None
         return self._row_to_object(rows[0])
 
+    def object_name_exists(self, name: str, except_oid: str | None = None) -> bool:
+        rows = self._query("SELECT oid FROM objects WHERE name = ?", (name,))
+        return any(row["oid"] != except_oid for row in rows)
+
     def list_objects(self) -> list[AgentObject]:
         return [
             self._row_to_object(row)

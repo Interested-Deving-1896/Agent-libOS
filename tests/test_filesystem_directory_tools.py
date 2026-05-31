@@ -91,6 +91,17 @@ class FilesystemDirectoryToolTests(unittest.TestCase):
         self.assertTrue(retried.ok, retried.error)
         self.assertFalse((self.runtime.workspace_root / path).exists())
 
+    def test_truncated_utf8_read_does_not_split_codepoint(self) -> None:
+        path = self._write_fixture(f"agent_outputs/utf8_{uuid4().hex}.txt", "éx")
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="read utf8")
+        self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by="test")
+
+        result = self.runtime.filesystem.read_text(pid, path, max_bytes=1)
+
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.bytes_read, 1)
+        self.assertEqual(result.content, "")
+
     def _write_fixture(self, path: str, content: str) -> str:
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)

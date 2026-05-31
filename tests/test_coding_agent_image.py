@@ -13,7 +13,8 @@ class CodingAgentImageTests(unittest.TestCase):
 
         required_phrases = [
             "practical coding agent",
-            "Default operating loop",
+            "Scale the size",
+            "Adaptive operating loop",
             "read_directory",
             "create_memory_object",
             "fork_child_process",
@@ -23,6 +24,7 @@ class CodingAgentImageTests(unittest.TestCase):
             "process_exit",
             "Never claim that tests",
             "least-privilege permission",
+            "Do not over-decompose",
         ]
         for phrase in required_phrases:
             self.assertIn(phrase, prompt)

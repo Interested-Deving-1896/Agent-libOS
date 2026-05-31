@@ -95,7 +95,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 
 ### Built-In Coding Image
 
-`coding-agent:v0` is the practical repository-engineering image. It starts with read-only workspace authority and human-output authority, but no default write/delete authority. Its prompt tells the agent to orient with directory/file reads, preserve plans and evidence in Object Memory, fork narrow child workers for independent analysis, request least-privilege permissions for edits, use file/Object bridge tools for large content movement, parse pytest logs when available, and exit with a structured summary of changes, evidence, verification, residual risks, and follow-up.
+`coding-agent:v0` is the practical repository-engineering image. It starts with read-only workspace authority and human-output authority, but no default write/delete authority. Its prompt tells the agent to scale the size of a change to the goal, preserve plans and evidence in Object Memory, fork child workers only when parallel analysis materially helps, use pregranted write/delete authority when present, request least-privilege permissions when authority is missing, use file/Object bridge tools for large content movement, parse pytest logs when available, and exit with a structured summary of changes, evidence, verification, residual risks, and follow-up.
 
 ### Security Properties Covered By Tests
 
@@ -142,7 +142,7 @@ uv run agent-libos --db .agent_libos.sqlite tools
 Create a local `.env` file for real-model execution:
 
 ```bash
-OPENAI_CODING_AGENT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 OPENAI_LANGUAGE_MODEL=qwen3.7-max
 OPENAI_API_KEY=...
 ```
@@ -182,6 +182,16 @@ Run the real-model write-file smoke test:
 ```bash
 uv run python scripts/llm_write_goal_smoke.py
 ```
+
+Launch a real coding agent against any workspace with preconfigured permissions:
+
+```bash
+uv run python scripts/run_coding_agent.py --workspace /path/to/repo --goal "Implement the requested change"
+```
+
+The launcher defaults to the `edit` permission preset: read+write over the workspace, but no delete authority. Use `--permission-preset read-only` for inspection-only runs, `--permission-preset full` for read+write+delete, or combine `read-only` with exact allow-list grants such as `--write-file src/main.py` and `--delete-dir build`.
+
+By default the launcher loads LLM settings from this Agent-libOS checkout's `.env` before switching to the target workspace. Use `--env-file /path/to/.env` to override that.
 
 Copy a workspace text file through named Object Memory without materializing the file content into the process prompt:
 

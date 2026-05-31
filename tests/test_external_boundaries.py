@@ -46,6 +46,31 @@ class ExternalBoundaryTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "allowed")
         self.assertIn("external.filesystem.write_text", self._audit_actions())
 
+    def test_write_precondition_does_not_leak_existing_file_without_capability(self) -> None:
+        path = self._write_workspace_fixture("existing")
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="probe existing file")
+
+        denied = self.runtime.tools.call(
+            pid,
+            "write_text_file",
+            {"path": path, "content": "new", "overwrite": False},
+        )
+
+        self.assertFalse(denied.ok)
+        self.assertIn("lacks write", denied.error or "")
+        self.assertNotIn("already exists", denied.error or "")
+        self.assertEqual((self.runtime.workspace_root / path).read_text(encoding="utf-8"), "existing")
+
+    def test_delete_precondition_does_not_leak_missing_file_without_capability(self) -> None:
+        path = f"agent_outputs/missing_delete_{uuid4().hex}.txt"
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="probe missing file")
+
+        denied = self.runtime.tools.call(pid, "delete_file", {"path": path})
+
+        self.assertFalse(denied.ok)
+        self.assertIn("lacks delete", denied.error or "")
+        self.assertNotIn("does not exist", denied.error or "")
+
     def test_human_output_tool_cannot_bypass_human_capability(self) -> None:
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="speak to the human")
 

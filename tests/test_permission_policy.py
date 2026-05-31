@@ -176,6 +176,59 @@ class PermissionPolicyTests(unittest.TestCase):
         self.assertEqual(context["target"]["kind"], "file")
         self.assertEqual(context["target"]["size_bytes"], len("old content".encode("utf-8")))
 
+    def test_write_preconditions_fail_before_per_use_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="do not prompt impossible write")
+        path = self._path()
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("existing", encoding="utf-8")
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(
+            subject=pid,
+            resource=resource,
+            rights=[CapabilityRight.WRITE],
+            policy=CapabilityManager.ASK_EACH_TIME,
+            issued_by="test",
+        )
+
+        result = self.runtime.tools.call(
+            pid,
+            "write_text_file",
+            {"path": path, "content": "new", "overwrite": False},
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(self.runtime.human.pending(), [])
+        self.assertEqual(target.read_text(encoding="utf-8"), "existing")
+
+    def test_missing_delete_consumes_one_time_grant(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="delete missing once")
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(
+            subject=pid,
+            resource=resource,
+            rights=[CapabilityRight.DELETE],
+            policy=CapabilityManager.ASK_EACH_TIME,
+            issued_by="test",
+        )
+
+        with self.assertRaises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, "delete_file", {"path": path, "missing_ok": True})
+        self.runtime.human.drain_terminal_queue(auto_approve=True)
+        retry = self.runtime.tools.call(pid, "delete_file", {"path": path, "missing_ok": True})
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("now present", encoding="utf-8")
+
+        self.assertTrue(retry.ok, retry.error)
+        self.assertEqual(
+            self.runtime.capability.permission_policy(pid, resource, CapabilityRight.DELETE),
+            CapabilityManager.ASK_EACH_TIME,
+        )
+        with self.assertRaises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, "delete_file", {"path": path, "missing_ok": False})
+
     def test_llm_pending_per_use_approval_does_not_return_action_until_decision(self) -> None:
         path = self._path()
         client = FakeActionClient(

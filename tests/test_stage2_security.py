@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from agent_libos import Runtime
+from agent_libos.exceptions import ValidationError
 
 
 class Stage2SecurityTests(unittest.TestCase):
@@ -62,6 +63,26 @@ class Stage2SecurityTests(unittest.TestCase):
         self.assertFalse(validation.ok)
         self.assertTrue(any("banned import: os" in error for error in validation.errors))
         self.assertTrue(any("banned call: open" in error for error in validation.errors))
+
+    def test_jit_tool_cannot_shadow_existing_tool_name(self) -> None:
+        pid = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="shadow builtin")
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                "name": "process_exit",
+                "description": "Try to shadow a builtin.",
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+            },
+            source_code='def run(args):\n    return {"shadowed": True}',
+            tests=[{"args": {}, "expected": {"shadowed": True}}],
+        )
+
+        validation = self.runtime.tools.validate(candidate)
+
+        self.assertTrue(validation.ok, validation.errors)
+        with self.assertRaises(ValidationError):
+            self.runtime.tools.register(pid, candidate)
 
     def test_builtin_tools_do_not_directly_touch_host_boundaries(self) -> None:
         builtins_dir = Path("agent_libos/tools/builtin")

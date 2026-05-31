@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from agent_libos import Runtime  # noqa: E402
+from agent_libos.capability.manager import CapabilityManager  # noqa: E402
+from agent_libos.llm.client import load_dotenv  # noqa: E402
+from agent_libos.models import Capability, CapabilityRight, ProcessStatus  # noqa: E402
+from agent_libos.serde import to_jsonable  # noqa: E402
+from agent_libos.substrate import LocalResourceProviderSubstrate  # noqa: E402
+
+
+PERMISSION_PRESETS = ("read-only", "edit", "full")
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    asyncio.run(amain(args))
+
+
+async def amain(args: argparse.Namespace) -> None:
+    _load_env(args)
+    workspace = _resolve_workspace(args.workspace)
+    original_cwd = Path.cwd()
+    os.chdir(workspace)
+    runtime = _open_runtime(args, workspace)
+    try:
+        goal = _load_goal(args)
+        pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
+        grants = configure_coding_agent_permissions(runtime, pid, args)
+        results: list[Any] = []
+        if not args.no_run:
+            results = await runtime.arun_until_idle(
+                max_quanta=args.max_quanta,
+                human_auto_policy=args.human_auto_policy,
+                human_auto_approve=_optional_bool(args.human_auto_approve),
+                human_auto_answer=args.human_auto_answer,
+            )
+        process = runtime.process.get(pid)
+        summary = {
+            "workspace": str(workspace),
+            "database": "local" if args.ephemeral_db else str(_resolve_db_path(args, workspace)),
+            "pid": pid,
+            "image": "coding-agent:v0",
+            "permission_preset": args.permission_preset,
+            "pregranted_capabilities": [_capability_summary(cap) for cap in grants],
+            "ran": not args.no_run,
+            "process_status": process.status.value,
+            "results": to_jsonable(results),
+            "audit_records": len(runtime.audit.trace()),
+        }
+        print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        if args.strict and process.status in {ProcessStatus.FAILED, ProcessStatus.KILLED}:
+            raise SystemExit(2)
+    finally:
+        runtime.close()
+        os.chdir(original_cwd)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Launch coding-agent:v0 against any workspace with preconfigured filesystem permissions."
+    )
+    parser.add_argument("--goal", help="Goal for the coding agent.")
+    parser.add_argument("--goal-file", help="Read the goal from a UTF-8 text file.")
+    parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace root exposed to the agent. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="SQLite runtime DB path. Relative paths are resolved under the workspace. Defaults to .agent_libos.sqlite.",
+    )
+    parser.add_argument(
+        "--env-file",
+        help="LLM .env file to load before switching to the workspace. Defaults to this Agent-libOS checkout's .env.",
+    )
+    parser.add_argument("--ephemeral-db", action="store_true", help="Use an in-memory runtime DB.")
+    parser.add_argument(
+        "--permission-preset",
+        choices=PERMISSION_PRESETS,
+        default="edit",
+        help="read-only grants read only; edit grants read+write workspace; full grants read+write+delete workspace.",
+    )
+    parser.add_argument("--read-file", action="append", default=[], help="Extra workspace-relative file read grant.")
+    parser.add_argument("--write-file", action="append", default=[], help="Extra workspace-relative file write grant.")
+    parser.add_argument("--delete-file", action="append", default=[], help="Extra workspace-relative file delete grant.")
+    parser.add_argument("--read-dir", action="append", default=[], help="Extra workspace-relative directory read grant.")
+    parser.add_argument("--write-dir", action="append", default=[], help="Extra workspace-relative directory write grant.")
+    parser.add_argument("--delete-dir", action="append", default=[], help="Extra workspace-relative directory delete grant.")
+    parser.add_argument("--max-quanta", type=int, default=40, help="Maximum LLM/tool execution quanta.")
+    parser.add_argument("--no-run", action="store_true", help="Spawn and pregrant only; do not run the scheduler.")
+    parser.add_argument(
+        "--human-auto-policy",
+        choices=[CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALWAYS_DENY, CapabilityManager.ASK_EACH_TIME],
+        help="Automatically answer request_permission prompts while running.",
+    )
+    parser.add_argument(
+        "--human-auto-approve",
+        choices=["yes", "no"],
+        help="Automatically approve or reject boolean/per-use human approval prompts while running.",
+    )
+    parser.add_argument("--human-auto-answer", help="Automatically answer ask_human questions while running.")
+    parser.add_argument("--strict", action="store_true", help="Exit non-zero if the process fails or is killed.")
+    return parser
+
+
+def configure_coding_agent_permissions(
+    runtime: Runtime,
+    pid: str,
+    args: argparse.Namespace,
+) -> list[Capability]:
+    grants: list[Capability] = []
+    grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.READ], issued_by="coding-agent-launcher"))
+    if args.permission_preset in {"edit", "full"}:
+        grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="coding-agent-launcher"))
+    if args.permission_preset == "full":
+        grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.DELETE], issued_by="coding-agent-launcher"))
+
+    grants.extend(
+        runtime.filesystem.grant_path_list(
+            pid,
+            read_files=args.read_file,
+            write_files=args.write_file,
+            delete_files=args.delete_file,
+            read_dirs=args.read_dir,
+            write_dirs=args.write_dir,
+            delete_dirs=args.delete_dir,
+            issued_by="coding-agent-launcher",
+        )
+    )
+    return grants
+
+
+def _load_env(args: argparse.Namespace) -> None:
+    env_path = Path(args.env_file).expanduser() if args.env_file else PROJECT_ROOT / ".env"
+    env_path = env_path.resolve()
+    if args.env_file and not env_path.exists():
+        raise SystemExit(f"env file does not exist: {env_path}")
+    if env_path.exists():
+        load_dotenv(env_path)
+
+
+def _open_runtime(args: argparse.Namespace, workspace: Path) -> Runtime:
+    substrate = LocalResourceProviderSubstrate(workspace)
+    if args.ephemeral_db:
+        return Runtime.open("local", substrate=substrate)
+    return Runtime.open(_resolve_db_path(args, workspace), substrate=substrate)
+
+
+def _resolve_workspace(value: str) -> Path:
+    workspace = Path(value).expanduser().resolve()
+    if not workspace.exists():
+        raise SystemExit(f"workspace does not exist: {workspace}")
+    if not workspace.is_dir():
+        raise SystemExit(f"workspace is not a directory: {workspace}")
+    return workspace
+
+
+def _resolve_db_path(args: argparse.Namespace, workspace: Path) -> Path:
+    if args.db is None:
+        return workspace / ".agent_libos.sqlite"
+    db_path = Path(args.db).expanduser()
+    return db_path.resolve() if db_path.is_absolute() else (workspace / db_path).resolve()
+
+
+def _load_goal(args: argparse.Namespace) -> str:
+    if bool(args.goal) == bool(args.goal_file):
+        raise SystemExit("provide exactly one of --goal or --goal-file")
+    if args.goal_file:
+        return Path(args.goal_file).expanduser().read_text(encoding="utf-8").strip()
+    return str(args.goal).strip()
+
+
+def _optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    return value == "yes"
+
+
+def _capability_summary(capability: Capability) -> dict[str, Any]:
+    return {
+        "cap_id": capability.cap_id,
+        "resource": capability.resource,
+        "rights": sorted(capability.rights),
+        "policy": capability.constraints.get(CapabilityManager.POLICY_KEY, CapabilityManager.ALWAYS_ALLOW),
+    }
+
+
+if __name__ == "__main__":
+    main()

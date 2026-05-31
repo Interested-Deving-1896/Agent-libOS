@@ -495,6 +495,5 @@ class ObjectMemoryManager:
         return normalized
 
     def _require_unique_name(self, name: str, except_oid: str | None = None) -> None:
-        existing = self.store.get_object_by_name(name)
-        if existing is not None and existing.oid != except_oid:
+        if self.store.object_name_exists(name, except_oid=except_oid):
             raise ValidationError(f"object name already exists: {name}")
