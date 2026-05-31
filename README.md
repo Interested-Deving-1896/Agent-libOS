@@ -13,6 +13,7 @@ This project is still in active development.
 - Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`, `resume`, `exit`.
 - Async process supervisor: `Runtime.arun_until_idle()` automatically keeps runnable processes moving.
 - Child process tools can fork workers, wait/join, list direct children, signal direct children, and merge child memory.
+- Each process gets its own default Object Memory namespace at spawn/fork time. Bare Object Memory names resolve inside that process namespace.
 - Human queue integration is part of the runtime supervisor by default. If a primitive blocks on human approval, the process enters `WAITING_HUMAN`; the runtime processes human terminal messages, wakes the process, and resumes the pending action.
 - Child waits are also resumable: `wait_child_process` puts the parent in `WAITING_EVENT`, child exit wakes the parent, and the original wait action resumes without asking the model for a new action.
 - Single-step APIs remain available for tests and debugging: `run_next_process_once()` / `arun_next_process_once()` do not drain the human queue.
@@ -23,8 +24,12 @@ This project is still in active development.
 
 ### Object Memory
 
-- Typed Object Memory with handles, links, views, materialized context, snapshots, and merge scaffolding.
-- Every Object has a globally unique `name`; authorized processes can resolve by name, but a name is not itself a capability.
+- Typed Object Memory with handles, namespace-local names, namespace directories, links, views, materialized context, snapshots, and merge scaffolding.
+- The default namespace is process-private: process `proc_abc` resolves bare names inside `process:proc_abc`, similar to how an OS process sees its own virtual address space by default.
+- Names are unique only inside a namespace. The same local name can exist independently in two process namespaces or in an explicit shared namespace.
+- Explicit namespaces are directory-like scopes created with `create_memory_namespace` and inspected with `list_memory_namespace`.
+- Namespace capabilities gate listing and name resolution. Object capabilities still gate reading, writing, linking, materializing, deleting, and granting object access.
+- A name is not itself a capability: resolving `namespace/name` requires namespace read authority and object read authority.
 - Object payloads live in runtime memory, not SQLite. SQLite stores directory metadata and a runtime-memory marker only.
 - Process-owned memory is released on process exit unless retained as the process result.
 - File/Object bridge tools can move file content into and out of Object Memory without returning the concrete content to the process-visible tool result.
@@ -35,35 +40,38 @@ LLM-facing tools are stable wrappers over libOS primitives. They are similar to 
 
 Built-in tools currently include:
 
-- `create_memory_object`
-- `read_memory_object`
 - `append_memory_object`
-- `create_object_from_file`
-- `fork_child_process`
-- `write_object_to_file`
-- `wait_child_process`
-- `list_child_processes`
-- `signal_child_process`
-- `merge_child_memory`
-- `get_current_time`
-- `sleep`
-- `read_text_file`
-- `write_text_file`
-- `read_directory`
-- `write_directory`
-- `delete_file`
-- `delete_directory`
-- `request_permission`
 - `ask_human`
+- `create_memory_namespace`
+- `create_memory_object`
+- `create_object_from_file`
+- `delete_directory`
+- `delete_file`
+- `fork_child_process`
+- `get_current_time`
 - `human_output`
+- `list_child_processes`
+- `list_memory_namespace`
+- `merge_child_memory`
 - `parse_pytest_log`
 - `process_exit`
+- `read_directory`
+- `read_memory_object`
+- `read_text_file`
+- `request_permission`
+- `signal_child_process`
+- `sleep`
+- `wait_child_process`
+- `write_directory`
+- `write_object_to_file`
+- `write_text_file`
 - `echo`
 
 Important boundary rules:
 
 - A process can call only tools in its process tool table.
 - Tool call visibility is not an external-resource grant.
+- Bare Object Memory names resolve in the caller's process namespace; shared memory requires an explicit namespace plus namespace/object capabilities.
 - Filesystem read/write/delete checks happen in the filesystem primitive.
 - Human output and human approval checks happen in the HumanObject primitive.
 - `ask_human` creates a blocking HumanObject question and returns the answer only after the human queue responds.
@@ -86,10 +94,11 @@ Permission requests are ordinary process actions mediated by the human queue:
 
 ### LLM Execution
 
-- OpenAI-compatible chat completions client using `.env` configuration.
+- OpenAI-compatible LLM client using `.env` configuration.
 - OpenAI tool-call schemas generated from the current process tool table.
 - The runtime executes the selected legal tool call for each quantum.
 - Free-form model text is allowed, but only tool calls or fallback JSON actions have side effects.
+- Malformed tool calls with missing function names are rejected; when possible the executor gives the model one repair attempt with the exact visible tool names.
 - Model calls run off the event loop, and tool dispatch has async support.
 - Each process LLM context is stored as a mutable Object Memory object named `llm_context:<pid>`. The runtime appends new process facts, events, capability snapshots, and object summaries to the end of this object so repeated prompt prefixes remain stable for prompt caching.
 
@@ -100,6 +109,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 ### Security Properties Covered By Tests
 
 - Object handles are capability-protected; OIDs or object names alone do not grant access.
+- Object Memory namespaces are capability-protected; namespace read/write and object read/write are separate checks.
 - Tool tables and external-resource capabilities are independent.
 - Tools cannot bypass filesystem or human primitive checks.
 - Path containment, revoked capabilities, fork attenuation, tool-table denial, JIT scope, and dangerous JIT imports are covered by tests.
@@ -187,6 +197,12 @@ Launch a real coding agent against any workspace with preconfigured permissions:
 
 ```bash
 uv run python scripts/run_coding_agent.py --workspace /path/to/repo --goal "Implement the requested change"
+```
+
+On Windows PowerShell, the same launcher works with Windows-style paths:
+
+```powershell
+uv run python scripts\run_coding_agent.py --workspace ..\some-repo --goal "Summarize the current project"
 ```
 
 The launcher defaults to the `edit` permission preset: read+write over the workspace, but no delete authority. Use `--permission-preset read-only` for inspection-only runs, `--permission-preset full` for read+write+delete, or combine `read-only` with exact allow-list grants such as `--write-file src/main.py` and `--delete-dir build`.
@@ -294,6 +310,40 @@ Single-step APIs also remain available:
 result = await runtime.arun_next_process_once()
 ```
 
+## Object Memory Namespace Model
+
+Object Memory names are local to a namespace. Runtime code that omits `namespace` uses the caller process namespace:
+
+```python
+pid = runtime.process.spawn(image="base-agent:v0", goal="collect notes")
+handle = runtime.memory.create_object(
+    pid=pid,
+    object_type="summary",
+    name="notes",
+    payload={"entries": []},
+    immutable=False,
+)
+obj = runtime.memory.get_object_by_name(pid, "notes")
+assert obj.namespace == runtime.memory.process_namespace(pid)
+```
+
+For shared or phase-specific memory, create an explicit namespace and pass it on object operations:
+
+```python
+runtime.memory.create_namespace(pid, "project")
+runtime.memory.create_namespace(pid, "project/research")
+runtime.memory.create_object(
+    pid=pid,
+    object_type="observation",
+    namespace="project/research",
+    name="notes",
+    payload={"source": "README.md"},
+)
+listing = runtime.memory.list_namespace(pid, "project/research")
+```
+
+The namespace grants directory-style authority such as list, lookup, and create. It does not replace object capabilities; reading `project/research/notes` still requires object read capability.
+
 ## How To Write Agent libOS Tools
 
 Tools should not directly access host resources. Use this pattern:
@@ -318,6 +368,7 @@ agent_libos/
   images/          Built-in AgentImage definitions
   llm/             Prompt, context, OpenAI-compatible client, executor, action parser
   memory/          Typed Object Memory and MemoryView implementation
+  models/          Dataclass and enum models split by runtime domain
   runtime/         Runtime composition, async scheduler, process manager, events, checkpoints, audit
   skills/          Skill schema, registry, verifier, linker scaffolding
   skills_tools/    Tool/action registry and bundle scaffolding
@@ -332,7 +383,7 @@ tests/             Safety-boundary and regression tests
 
 Near-term priorities:
 
-- LLM executor conformance tests for provider edge cases and tool-call formats.
+- More LLM executor conformance tests for provider edge cases and unusual tool-call formats.
 - Tool result compaction and long-context paging.
 - Stronger checkpoint/rollback tests.
 - Audit querying by pid, capability, tool, external resource, and time range.
