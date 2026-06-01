@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, MemoryViewID, NamespaceID, OID, PID, SnapshotID, StrEnum
+
+_MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
 
 
 class ObjectType(StrEnum):
@@ -76,8 +79,8 @@ class ObjectMetadata:
     token_estimate: int | None = None
     embedding_refs: list[str] = field(default_factory=list)
     indexes: list[str] = field(default_factory=list)
-    sensitivity: str = "normal"
-    retention_policy: str = "default"
+    sensitivity: str = _MEMORY_DEFAULTS.metadata_sensitivity
+    retention_policy: str = _MEMORY_DEFAULTS.metadata_retention_policy
 
 
 @dataclass
@@ -134,7 +137,7 @@ class ObjectQuery:
     type: ObjectType | str | None = None
     tags: list[str] = field(default_factory=list)
     text: str | None = None
-    limit: int = 50
+    limit: int = _MEMORY_DEFAULTS.query_limit
     name: str | None = None
     namespace: NamespaceID | None = None
 

@@ -7,10 +7,13 @@ from uuid import uuid4
 
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import HumanRequestStatus, ProcessStatus, ResourceBudget
 
 
-MAX_READ_BYTES = 1_048_576
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
+MAX_READ_BYTES = _SCRIPT_DEFAULTS.document_summary_max_read_bytes
 
 
 def main() -> None:
@@ -27,15 +30,29 @@ def main() -> None:
         default="README.md",
         help="Document path under the current workspace. Absolute paths must stay inside the workspace.",
     )
-    parser.add_argument("--db", default="local", help="Runtime SQLite database path, or 'local' for in-memory.")
+    parser.add_argument(
+        "--db",
+        default=_RUNTIME_DEFAULTS.local_store_target,
+        help=f"Runtime SQLite database path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory.",
+    )
     parser.add_argument(
         "--output",
         default=None,
         help="Summary output path under the current workspace. Defaults to agent_outputs/document_summary_<id>.txt.",
     )
     parser.add_argument("--language", default="Chinese", help="Language for the one-sentence summary.")
-    parser.add_argument("--max-bytes", type=int, default=65_536, help="Maximum document bytes the Agent should read.")
-    parser.add_argument("--max-quanta", type=int, default=10, help="Maximum Agent execution quanta to run.")
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=_SCRIPT_DEFAULTS.document_summary_max_bytes,
+        help="Maximum document bytes the Agent should read.",
+    )
+    parser.add_argument(
+        "--max-quanta",
+        type=int,
+        default=_SCRIPT_DEFAULTS.document_summary_max_quanta,
+        help="Maximum Agent execution quanta to run.",
+    )
     parser.add_argument(
         "--auto-approve",
         action="store_true",
@@ -66,7 +83,7 @@ async def amain(args: argparse.Namespace) -> None:
         # The process begins with read authority from the coding image but no
         # write authority; it must request a policy before write_text_file works.
         pid = runtime.process.spawn(
-            image="coding-agent:v0",
+            image=_RUNTIME_DEFAULTS.coding_image_id,
             goal=_build_goal(
                 document_path=document_path,
                 output_path=output_path,
@@ -126,7 +143,7 @@ def _workspace_relative_output(raw_path: str | None, workspace: Path) -> str:
 
 
 def _build_goal(*, document_path: str, output_path: str, language: str, max_bytes: int) -> str:
-    output_resource = f"filesystem:workspace:{output_path}"
+    output_resource = f"filesystem:{_RUNTIME_DEFAULTS.workspace_namespace}:{output_path}"
     return "\n".join(
         [
             "Read a workspace document, write a summary file, and tell the human the output filename.",
@@ -145,7 +162,13 @@ def _build_goal(*, document_path: str, output_path: str, language: str, max_byte
 
 
 def _context_budget(max_bytes: int) -> int:
-    return min(120_000, max(8_000, max_bytes + 12_000))
+    return min(
+        _SCRIPT_DEFAULTS.document_context_max_tokens,
+        max(
+            _SCRIPT_DEFAULTS.document_context_min_tokens,
+            max_bytes + _SCRIPT_DEFAULTS.document_context_slack_tokens,
+        ),
+    )
 
 
 def _had_permission_rejection(runtime: Runtime, pid: str) -> bool:

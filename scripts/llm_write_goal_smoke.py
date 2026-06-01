@@ -6,32 +6,37 @@ import json
 from uuid import uuid4
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.serde import to_jsonable
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a real LLM smoke test for write_text_file.")
     parser.add_argument("--path", default=f"agent_outputs/llm_goal_{uuid4().hex[:8]}.txt")
     parser.add_argument("--content", default="Agent libOS LLM write-file smoke test passed.\n")
-    parser.add_argument("--max-quanta", type=int, default=5)
+    parser.add_argument("--max-quanta", type=int, default=_SCRIPT_DEFAULTS.llm_write_smoke_max_quanta)
     args = parser.parse_args()
     asyncio.run(amain(args))
 
 
 async def amain(args: argparse.Namespace) -> None:
-    runtime = Runtime.open("local")
+    runtime = Runtime.open(_RUNTIME_DEFAULTS.local_store_target)
     try:
         goal = (
             f"Use the write_text_file tool to create workspace file {args.path!r} "
             f"with exactly this content: {args.content!r}. After the file is written, exit."
         )
-        pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
+        pid = runtime.process.spawn(image=_RUNTIME_DEFAULTS.coding_image_id, goal=goal)
         runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="smoke-test")
         results = await runtime.arun_until_idle(max_quanta=args.max_quanta)
         target = runtime.workspace_root / args.path
         file_exists = target.exists()
-        actual_content = target.read_text(encoding="utf-8") if file_exists else None
+        actual_content = target.read_text(encoding=_TOOL_DEFAULTS.default_text_encoding) if file_exists else None
         process = runtime.process.get(pid)
         summary = {
             "pid": pid,

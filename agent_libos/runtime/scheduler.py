@@ -5,6 +5,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.ids import utc_now
 from agent_libos.models import ProcessStatus
 from agent_libos.runtime.audit_manager import AuditManager
@@ -12,6 +13,7 @@ from agent_libos.storage import SQLiteStore
 
 
 Quantum = Callable[[str], Any | Awaitable[Any]]
+_SCHEDULER_DEFAULTS = DEFAULT_CONFIG.scheduler
 
 
 class AsyncProcessScheduler:
@@ -19,7 +21,7 @@ class AsyncProcessScheduler:
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
-    def __init__(self, store: SQLiteStore, audit: AuditManager, poll_interval_s: float = 0.01):
+    def __init__(self, store: SQLiteStore, audit: AuditManager, poll_interval_s: float = _SCHEDULER_DEFAULTS.poll_interval_s):
         self.store = store
         self.audit = audit
         self.poll_interval_s = poll_interval_s
@@ -43,7 +45,7 @@ class AsyncProcessScheduler:
     def run_once(self, quantum: Quantum) -> Any:
         return _run_sync(self.arun_once(quantum))
 
-    async def arun_until_idle(self, quantum: Quantum, max_quanta: int = 25) -> list[Any]:
+    async def arun_until_idle(self, quantum: Quantum, max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         results: list[Any] = []
         tasks: dict[str, asyncio.Task[list[Any]]] = {}
         quanta_used = 0
@@ -112,7 +114,7 @@ class AsyncProcessScheduler:
 
         return results
 
-    def run_until_idle(self, quantum: Quantum, max_quanta: int = 25) -> list[Any]:
+    def run_until_idle(self, quantum: Quantum, max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         return _run_sync(self.arun_until_idle(quantum, max_quanta=max_quanta))
 
     async def _run_quantum(self, pid: str, quantum: Quantum) -> Any:

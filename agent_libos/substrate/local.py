@@ -8,6 +8,7 @@ from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import CapabilityDenied
 from agent_libos.substrate.base import (
     CommandResult,
@@ -16,11 +17,14 @@ from agent_libos.substrate.base import (
     ResolvedPath,
 )
 
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+
 
 class LocalFilesystemProvider:
     """Local-workspace implementation of the filesystem substrate."""
 
-    def __init__(self, root: str | Path, namespace: str = "workspace"):
+    def __init__(self, root: str | Path, namespace: str = _RUNTIME_DEFAULTS.workspace_namespace):
         self.root = Path(root).resolve()
         self.namespace = namespace
         self.root_display = str(self.root)
@@ -110,7 +114,7 @@ class LocalShellProvider:
     def __init__(self, cwd: str | Path):
         self.cwd = Path(cwd)
 
-    def run(self, argv: list[str], *, timeout: float = 30.0) -> CommandResult:
+    def run(self, argv: list[str], *, timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult:
         proc = subprocess.run(argv, cwd=self.cwd, text=True, capture_output=True, timeout=timeout)
         return CommandResult(
             argv=list(argv),
@@ -123,7 +127,7 @@ class LocalShellProvider:
 class LocalResourceProviderSubstrate:
     """Default Resource Provider Substrate backed by the host OS."""
 
-    def __init__(self, workspace_root: str | Path, namespace: str = "workspace"):
+    def __init__(self, workspace_root: str | Path, namespace: str = _RUNTIME_DEFAULTS.workspace_namespace):
         self.workspace_root = Path(workspace_root).resolve()
         self.workspace_display = str(self.workspace_root)
         self.filesystem = LocalFilesystemProvider(self.workspace_root, namespace=namespace)

@@ -6,13 +6,17 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import HumanResponseRequired
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class HumanOutputArgs(BaseModel):
     message: str = Field(description="Message to present to the human operator.")
-    channel: str = Field(default="terminal", description="Output channel. MVP supports terminal.")
+    channel: str = Field(default=_RUNTIME_DEFAULTS.terminal_channel, description="Output channel. MVP supports terminal.")
 
 
 class HumanOutputResult(BaseModel):
@@ -27,7 +31,7 @@ class AskHumanArgs(BaseModel):
         default_factory=dict,
         description="Optional structured context shown with the question.",
     )
-    human: str = Field(default="owner", description="Human recipient name.")
+    human: str = Field(default=_RUNTIME_DEFAULTS.default_human, description="Human recipient name.")
 
 
 class AskHumanResult(BaseModel):
@@ -45,13 +49,12 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     )
     args_schema = HumanOutputArgs
     output_schema = HumanOutputResult
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         requires_confirmation=False,
         permissions={"human.output"},
-        timeout_s=2.0,
+        timeout_s=_TOOL_DEFAULTS.interactive_timeout_s,
     )
     tags = ["human", "terminal", "output"]
 
@@ -62,7 +65,7 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
         result = runtime.human.output(
             pid=ctx.pid,
             message=args.message,
-            human="owner",
+            human=_RUNTIME_DEFAULTS.default_human,
             channel=args.channel,
         )
         return HumanOutputResult(**result)
@@ -76,13 +79,12 @@ class AskHumanTool(SyncAgentTool[AskHumanArgs]):
     )
     args_schema = AskHumanArgs
     output_schema = AskHumanResult
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         requires_confirmation=False,
         permissions={"human.ask"},
-        timeout_s=2.0,
+        timeout_s=_TOOL_DEFAULTS.interactive_timeout_s,
     )
     tags = ["human", "terminal", "question"]
 

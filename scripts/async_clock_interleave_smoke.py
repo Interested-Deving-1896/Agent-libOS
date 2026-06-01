@@ -10,9 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessStatus
 from scripts.llm_context_probe import last_tool_result, static_prefix
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 
 
 @dataclass
@@ -23,11 +27,11 @@ class ProcessPlan:
 
 async def run_interleaved_clock_demo(
     *,
-    db: str = "local",
-    iterations: int = 3,
-    interval_s: float = 0.2,
+    db: str = _RUNTIME_DEFAULTS.local_store_target,
+    iterations: int = _SCRIPT_DEFAULTS.clock_demo_iterations,
+    interval_s: float = _SCRIPT_DEFAULTS.clock_demo_interval_s,
     offset_s: float | None = None,
-    timezone: str = "Asia/Shanghai",
+    timezone: str = _SCRIPT_DEFAULTS.clock_demo_timezone,
     echo: bool = True,
 ) -> dict[str, Any]:
     runtime = Runtime.open(db)
@@ -52,11 +56,11 @@ async def run_interleaved_clock_demo(
     try:
         offset = interval_s / 2 if offset_s is None else offset_s
         pid_a = runtime.process.spawn(
-            image="base-agent:v0",
+            image=_RUNTIME_DEFAULTS.default_image_id,
             goal=f"Process A: output the current time {iterations} times, sleeping between outputs.",
         )
         pid_b = runtime.process.spawn(
-            image="base-agent:v0",
+            image=_RUNTIME_DEFAULTS.default_image_id,
             goal=f"Process B: sleep {offset:.3f}s first, then output the current time {iterations} times.",
         )
         client.configure(
@@ -148,7 +152,7 @@ class InterleavingClockClient:
             label = action.pop("label")
             iteration = action.pop("iteration")
             action["message"] = f"[{label}] iteration={iteration} time={iso8601}"
-            action["channel"] = "terminal"
+            action["channel"] = _RUNTIME_DEFAULTS.terminal_channel
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
         return LLMCompletion(
@@ -171,11 +175,15 @@ class InterleavingClockClient:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run two async-scheduled processes that alternate current-time output.")
-    parser.add_argument("--db", default="local", help="Runtime SQLite database path, or 'local' for in-memory.")
-    parser.add_argument("--iterations", type=int, default=3)
-    parser.add_argument("--interval", type=float, default=0.2)
+    parser.add_argument(
+        "--db",
+        default=_RUNTIME_DEFAULTS.local_store_target,
+        help=f"Runtime SQLite database path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory.",
+    )
+    parser.add_argument("--iterations", type=int, default=_SCRIPT_DEFAULTS.clock_demo_iterations)
+    parser.add_argument("--interval", type=float, default=_SCRIPT_DEFAULTS.clock_demo_interval_s)
     parser.add_argument("--offset", type=float, default=None)
-    parser.add_argument("--timezone", default="Asia/Shanghai")
+    parser.add_argument("--timezone", default=_SCRIPT_DEFAULTS.clock_demo_timezone)
     parser.add_argument("--quiet", action="store_true", help="Only print the final JSON report.")
     args = parser.parse_args()
     report = asyncio.run(

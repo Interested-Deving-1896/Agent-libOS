@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.substrate import CommandResult, LocalShellProvider, ShellProvider
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class ShellAdapter:
@@ -20,7 +23,7 @@ class ShellAdapter:
         self.audit = audit
         self.provider = provider or LocalShellProvider(cwd or ".")
 
-    def run(self, pid: str, argv: list[str], timeout: float = 30.0) -> CommandResult:
+    def run(self, pid: str, argv: list[str], timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult:
         if not argv:
             raise ValueError("argv cannot be empty")
         self.capabilities.require(pid, f"shell:{argv[0]}", CapabilityRight.EXECUTE)

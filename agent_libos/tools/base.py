@@ -10,10 +10,13 @@ from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.models import ToolSpec
 
 InputT = TypeVar("InputT", bound=BaseModel)
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class ToolErrorCode(str, Enum):
@@ -32,7 +35,7 @@ class ToolPolicy(BaseModel):
     idempotent: bool = True
     requires_confirmation: bool = False
     permissions: set[str] = Field(default_factory=set)
-    timeout_s: float | None = 30.0
+    timeout_s: float | None = _TOOL_DEFAULTS.default_timeout_s
     max_retries: int = 0
 
 
@@ -121,7 +124,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
     args_schema: ClassVar[type[InputT]]
 
     output_schema: ClassVar[type[BaseModel] | None] = None
-    version: ClassVar[str] = "1.0.0"
+    version: ClassVar[str] = _TOOL_DEFAULTS.version
     policy: ClassVar[ToolPolicy] = ToolPolicy()
     tags: ClassVar[list[str]] = []
     metadata: ClassVar[dict[str, Any]] = {}

@@ -14,13 +14,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent_libos import Runtime  # noqa: E402
 from agent_libos.capability.manager import CapabilityManager  # noqa: E402
+from agent_libos.config import DEFAULT_CONFIG  # noqa: E402
 from agent_libos.llm.client import load_dotenv  # noqa: E402
 from agent_libos.models import Capability, CapabilityRight, ProcessStatus  # noqa: E402
 from agent_libos.serde import to_jsonable  # noqa: E402
 from agent_libos.substrate import LocalResourceProviderSubstrate  # noqa: E402
 
 
-PERMISSION_PRESETS = ("read-only", "edit", "full")
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_LAUNCHER_DEFAULTS = DEFAULT_CONFIG.launcher
+PERMISSION_PRESETS = _LAUNCHER_DEFAULTS.permission_presets
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -36,7 +39,7 @@ async def amain(args: argparse.Namespace) -> None:
     runtime = _open_runtime(args, workspace)
     try:
         goal = _load_goal(args)
-        pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
+        pid = runtime.process.spawn(image=_RUNTIME_DEFAULTS.coding_image_id, goal=goal)
         grants = configure_coding_agent_permissions(runtime, pid, args)
         results: list[Any] = []
         if not args.no_run:
@@ -50,9 +53,9 @@ async def amain(args: argparse.Namespace) -> None:
         audit_counts = _audit_counts_for_process(runtime.audit.trace(), pid)
         summary = {
             "workspace": str(workspace),
-            "database": "local" if args.ephemeral_db else str(_resolve_db_path(args, workspace)),
+            "database": _RUNTIME_DEFAULTS.local_store_target if args.ephemeral_db else str(_resolve_db_path(args, workspace)),
             "pid": pid,
-            "image": "coding-agent:v0",
+            "image": _RUNTIME_DEFAULTS.coding_image_id,
             "permission_preset": args.permission_preset,
             "pregranted_capabilities": [_capability_summary(cap) for cap in grants],
             "ran": not args.no_run,
@@ -70,7 +73,7 @@ async def amain(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Launch coding-agent:v0 against any workspace with preconfigured filesystem permissions."
+        description=f"Launch {_RUNTIME_DEFAULTS.coding_image_id} against any workspace with preconfigured filesystem permissions."
     )
     parser.add_argument("--goal", help="Goal for the coding agent.")
     parser.add_argument("--goal-file", help="Read the goal from a UTF-8 text file.")
@@ -92,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--permission-preset",
         choices=PERMISSION_PRESETS,
-        default="edit",
+        default=_LAUNCHER_DEFAULTS.default_permission_preset,
         help="read-only grants read only; edit grants read+write workspace; full grants read+write+delete workspace.",
     )
     parser.add_argument("--read-file", action="append", default=[], help="Extra workspace-relative file read grant.")
@@ -101,7 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--read-dir", action="append", default=[], help="Extra workspace-relative directory read grant.")
     parser.add_argument("--write-dir", action="append", default=[], help="Extra workspace-relative directory write grant.")
     parser.add_argument("--delete-dir", action="append", default=[], help="Extra workspace-relative directory delete grant.")
-    parser.add_argument("--max-quanta", type=int, default=40, help="Maximum LLM/tool execution quanta.")
+    parser.add_argument(
+        "--max-quanta",
+        type=int,
+        default=_RUNTIME_DEFAULTS.launcher_max_quanta,
+        help="Maximum LLM/tool execution quanta.",
+    )
     parser.add_argument("--no-run", action="store_true", help="Spawn and pregrant only; do not run the scheduler.")
     parser.add_argument(
         "--human-auto-policy",
@@ -125,9 +133,9 @@ def configure_coding_agent_permissions(
 ) -> list[Capability]:
     grants: list[Capability] = []
     grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.READ], issued_by="coding-agent-launcher"))
-    if args.permission_preset in {"edit", "full"}:
+    if args.permission_preset in {_LAUNCHER_DEFAULTS.edit_preset, _LAUNCHER_DEFAULTS.full_preset}:
         grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="coding-agent-launcher"))
-    if args.permission_preset == "full":
+    if args.permission_preset == _LAUNCHER_DEFAULTS.full_preset:
         grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.DELETE], issued_by="coding-agent-launcher"))
 
     grants.extend(
@@ -157,7 +165,7 @@ def _load_env(args: argparse.Namespace) -> None:
 def _open_runtime(args: argparse.Namespace, workspace: Path) -> Runtime:
     substrate = LocalResourceProviderSubstrate(workspace)
     if args.ephemeral_db:
-        return Runtime.open("local", substrate=substrate)
+        return Runtime.open(_RUNTIME_DEFAULTS.local_store_target, substrate=substrate)
     return Runtime.open(_resolve_db_path(args, workspace), substrate=substrate)
 
 
@@ -172,7 +180,7 @@ def _resolve_workspace(value: str) -> Path:
 
 def _resolve_db_path(args: argparse.Namespace, workspace: Path) -> Path:
     if args.db is None:
-        return workspace / ".agent_libos.sqlite"
+        return workspace / _RUNTIME_DEFAULTS.runtime_db_filename
     db_path = Path(args.db).expanduser()
     return db_path.resolve() if db_path.is_absolute() else (workspace / db_path).resolve()
 

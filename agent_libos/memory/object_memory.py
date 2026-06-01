@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
@@ -41,7 +42,9 @@ class ObjectMemoryManager:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
+        config: AgentLibOSConfig | None = None,
     ):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.capabilities = capabilities
         self.audit = audit
@@ -76,7 +79,7 @@ class ObjectMemoryManager:
             namespace=object_namespace,
             name=object_name,
             type=obj_type,
-            schema_version="1",
+            schema_version=self.config.memory.object_schema_version,
             payload=payload,
             metadata=meta,
             provenance=provenance or Provenance(created_from_action="memory.create_object"),
@@ -121,7 +124,7 @@ class ObjectMemoryManager:
         return handle
 
     def process_namespace(self, pid: str) -> str:
-        return f"process:{pid}"
+        return f"{self.config.memory.process_namespace_prefix}:{pid}"
 
     def resolve_namespace(self, pid: str, namespace: str | None = None) -> str:
         if namespace is None:
@@ -564,9 +567,11 @@ class ObjectMemoryManager:
         self,
         pid: str,
         view: MemoryView,
-        policy: str = "plan_first",
-        budget_tokens: int = 8000,
+        policy: str | None = None,
+        budget_tokens: int | None = None,
     ) -> MaterializedContext:
+        selected_policy = policy or self.config.memory.context_policy
+        selected_budget = budget_tokens if budget_tokens is not None else self.config.memory.materialize_budget_tokens
         objects: list[AgentObject] = []
         omitted: list[str] = []
         for handle in view.roots:
@@ -578,13 +583,13 @@ class ObjectMemoryManager:
             except CapabilityDenied:
                 omitted.append(handle.oid)
 
-        objects = self._sort_for_policy(objects, policy)
+        objects = self._sort_for_policy(objects, selected_policy)
         chunks: list[str] = []
         refs: list[str] = []
         total = 0
         for obj in objects:
             tokens = obj.metadata.token_estimate or estimate_tokens(obj.payload)
-            if total + tokens > budget_tokens:
+            if total + tokens > selected_budget:
                 omitted.append(obj.oid)
                 continue
             chunks.append(self._render_object(obj))
@@ -595,7 +600,7 @@ class ObjectMemoryManager:
             object_refs=refs,
             token_count=total,
             omitted_objects=omitted,
-            policy_used=policy,
+            policy_used=selected_policy,
         )
         self.audit.record(
             actor=pid,
@@ -603,7 +608,7 @@ class ObjectMemoryManager:
             target=f"view:{view.view_id}",
             input_refs=[handle.oid for handle in view.roots],
             output_refs=refs,
-            decision={"tokens": total, "omitted": omitted, "policy": policy},
+            decision={"tokens": total, "omitted": omitted, "policy": selected_policy},
         )
         return context
 

@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
@@ -19,6 +20,8 @@ from agent_libos.models import (
     ViewMode,
 )
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class ProcessExitArgs(BaseModel):
@@ -153,8 +156,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
     )
     args_schema = ProcessExitArgs
     output_schema = ProcessExitOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["process", "lifecycle"]
 
     def run(self, args: ProcessExitArgs, ctx: ToolContext) -> ProcessExitOutput:
@@ -189,8 +191,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
     )
     args_schema = ForkChildProcessArgs
     output_schema = ForkChildProcessOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["process", "child", "fork"]
 
     def run(self, args: ForkChildProcessArgs, ctx: ToolContext) -> ForkChildProcessOutput:
@@ -285,8 +286,7 @@ class WaitChildProcessTool(SyncAgentTool[WaitChildProcessArgs]):
     )
     args_schema = WaitChildProcessArgs
     output_schema = WaitChildProcessOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["process", "child", "wait"]
 
     def run(self, args: WaitChildProcessArgs, ctx: ToolContext) -> WaitChildProcessOutput:
@@ -321,8 +321,7 @@ class ListChildProcessesTool(SyncAgentTool[ListChildProcessesArgs]):
     description = "List direct child AgentProcesses owned by the current process."
     args_schema = ListChildProcessesArgs
     output_schema = ListChildProcessesOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["process", "child", "inspect"]
 
     def run(self, args: ListChildProcessesArgs, ctx: ToolContext) -> ListChildProcessesOutput:
@@ -339,8 +338,7 @@ class SignalChildProcessTool(SyncAgentTool[SignalChildProcessArgs]):
     description = "Pause, resume, cancel, or terminate a direct child AgentProcess."
     args_schema = SignalChildProcessArgs
     output_schema = SignalChildProcessOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["process", "child", "signal"]
 
     def run(self, args: SignalChildProcessArgs, ctx: ToolContext) -> SignalChildProcessOutput:
@@ -370,8 +368,7 @@ class MergeChildMemoryTool(SyncAgentTool[MergeChildMemoryArgs]):
     description = "Merge result-visible Object Memory from an exited direct child into the parent process view."
     args_schema = MergeChildMemoryArgs
     output_schema = MergeChildMemoryOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["process", "child", "memory"]
 
     def run(self, args: MergeChildMemoryArgs, ctx: ToolContext) -> MergeChildMemoryOutput:

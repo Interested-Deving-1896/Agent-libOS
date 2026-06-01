@@ -4,16 +4,24 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import ObjectMetadata, ObjectType
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class CreateObjectFromFileArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to create.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     path: str = Field(description="Workspace-relative file path to import.")
-    encoding: str = Field(default="utf-8", description="Text encoding.")
-    max_bytes: int = Field(default=1_048_576, ge=1, le=10_485_760, description="Maximum bytes to import.")
+    encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
+    max_bytes: int = Field(
+        default=_TOOL_DEFAULTS.object_file_max_bytes,
+        ge=1,
+        le=_TOOL_DEFAULTS.object_file_hard_limit_bytes,
+        description="Maximum bytes to import.",
+    )
     allow_truncated: bool = Field(default=False, description="Whether to create the object if the file is truncated.")
     object_type: str = Field(default=ObjectType.ARTIFACT.value, description="ObjectType for the created object.")
 
@@ -32,7 +40,7 @@ class WriteObjectToFileArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to resolve and write.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     path: str = Field(description="Workspace-relative output file path.")
-    encoding: str = Field(default="utf-8", description="Text encoding.")
+    encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
 
 
@@ -53,12 +61,11 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
     )
     args_schema = CreateObjectFromFileArgs
     output_schema = CreateObjectFromFileOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         permissions={"filesystem.read", "object.write"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["memory", "filesystem", "object"]
 
@@ -129,12 +136,11 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
     )
     args_schema = WriteObjectToFileArgs
     output_schema = WriteObjectToFileOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         permissions={"filesystem.write", "object.read"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["memory", "filesystem", "object", "side_effect"]
 

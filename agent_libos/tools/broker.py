@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.exceptions import HumanApprovalRequired, NotFound, ProcessWaitRequired, ValidationError
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.ids import new_id, utc_now
@@ -28,6 +29,8 @@ from agent_libos.storage import SQLiteStore
 from agent_libos.tools.base import BaseAgentTool, ToolContext
 from agent_libos.tools.sandbox import PythonSubprocessSandbox, SandboxBackend
 
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+
 
 class ToolBroker:
     """Registry and dispatch boundary for model-facing tools."""
@@ -42,14 +45,16 @@ class ToolBroker:
         events: EventBus,
         sandbox: SandboxBackend | None = None,
         workspace_root: str | Path | None = None,
+        config: AgentLibOSConfig | None = None,
     ):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.memory = memory
         self.capabilities = capabilities
         self.human = human
         self.audit = audit
         self.events = events
-        self.sandbox = sandbox or PythonSubprocessSandbox()
+        self.sandbox = sandbox or PythonSubprocessSandbox(default_timeout_s=self.config.tools.sandbox_timeout_s)
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self._tools: dict[str, BaseAgentTool] = {}
         self._tool_ids_by_name: dict[str, str] = {}
@@ -66,7 +71,10 @@ class ToolBroker:
         spec = tool.spec()
         if spec.name in self._tool_ids_by_name:
             raise ValueError(f"tool already registered: {spec.name}")
-        tool_id = new_id("tool") if ephemeral else _stable_static_tool_id(spec.name)
+        tool_id = new_id("tool") if ephemeral else _stable_static_tool_id(
+            spec.name,
+            digest_chars=self.config.tools.static_tool_id_digest_chars,
+        )
         handle = ToolHandle(tool_id=tool_id, name=spec.name, capability_id=None, scope=scope)
         self._tools[tool_id] = tool
         self._tool_ids_by_name[spec.name] = tool_id
@@ -491,6 +499,6 @@ class ToolBroker:
         return set(process.tool_table.values())
 
 
-def _stable_static_tool_id(name: str) -> str:
-    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+def _stable_static_tool_id(name: str, digest_chars: int = _TOOL_DEFAULTS.static_tool_id_digest_chars) -> str:
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:digest_chars]
     return f"tool_static_{digest}"

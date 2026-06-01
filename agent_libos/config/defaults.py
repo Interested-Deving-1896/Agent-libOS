@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class RuntimeDefaults:
+    local_store_target: str = "local"
+    runtime_db_filename: str = ".agent_libos.sqlite"
+    workspace_namespace: str = "workspace"
+    default_image_id: str = "base-agent:v0"
+    coding_image_id: str = "coding-agent:v0"
+    default_human: str = "owner"
+    terminal_channel: str = "terminal"
+    run_until_idle_max_quanta: int = 25
+    launcher_max_quanta: int = 40
+
+    @property
+    def default_human_resource(self) -> str:
+        return f"human:{self.default_human}"
+
+    @property
+    def default_human_actor(self) -> str:
+        return f"human:{self.default_human}"
+
+
+@dataclass(frozen=True)
+class SchedulerDefaults:
+    max_quanta: int = 25
+    poll_interval_s: float = 0.01
+
+
+@dataclass(frozen=True)
+class ProcessDefaults:
+    max_tool_calls: int = 256
+    max_child_processes: int = 16
+    max_runtime_seconds: int | None = None
+    max_materialized_tokens: int = 65_536
+    default_goal_text: str = "Run agent process"
+    fork_budget_divisor: int = 2
+    fork_min_tool_calls: int = 1
+    fork_min_child_processes: int = 0
+
+
+@dataclass(frozen=True)
+class LLMDefaults:
+    temperature: float = 0.2
+    max_tokens: int = 65_536
+    timeout_s: float = 60.0
+    max_retries: int = 2
+    api_mode: Literal["auto", "responses", "chat"] = "auto"
+    store: bool = False
+    compatibility_retry_attempts: int = 8
+    action_repair_attempts: int = 2
+    content_preview_chars: int = 500
+    tool_arguments_preview_chars: int = 500
+    json_instruction: str = "You must respond with a valid JSON object."
+    fallback_status_codes: tuple[int, ...] = (404, 405)
+
+
+@dataclass(frozen=True)
+class ToolDefaults:
+    version: str = "1.0.0"
+    default_timeout_s: float = 30.0
+    standard_timeout_s: float = 5.0
+    interactive_timeout_s: float = 2.0
+    default_text_encoding: str = "utf-8"
+    filesystem_read_max_bytes: int = 65_536
+    filesystem_read_hard_limit_bytes: int = 1_048_576
+    directory_entry_limit: int = 1_024
+    directory_entry_hard_limit: int = 10_000
+    memory_payload_chars: int = 12_000
+    memory_payload_hard_limit_chars: int = 200_000
+    object_file_max_bytes: int = 1_048_576
+    object_file_hard_limit_bytes: int = 10_485_760
+    shell_timeout_s: float = 30.0
+    sandbox_timeout_s: float = 5.0
+    static_tool_id_digest_chars: int = 16
+    approval_preview_chars: int = 256
+    clock_timezone: str = "UTC"
+    max_sleep_seconds: float = 60.0
+    sleep_timeout_grace_s: float = 5.0
+
+    @property
+    def sleep_tool_timeout_s(self) -> float:
+        return self.max_sleep_seconds + self.sleep_timeout_grace_s
+
+
+@dataclass(frozen=True)
+class ObjectMemoryDefaults:
+    object_schema_version: str = "1"
+    materialize_budget_tokens: int = 8_000
+    query_limit: int = 50
+    context_policy: str = "plan_first"
+    metadata_sensitivity: str = "normal"
+    metadata_retention_policy: str = "default"
+    process_namespace_prefix: str = "process"
+
+
+@dataclass(frozen=True)
+class LLMContextDefaults:
+    policy: str = "llm_context_object"
+    schema_version: int = 1
+    object_name_prefix: str = "llm_context"
+    recent_event_limit: int = 20
+
+
+@dataclass(frozen=True)
+class LauncherDefaults:
+    permission_presets: tuple[str, ...] = ("read-only", "edit", "full")
+    default_permission_preset: str = "edit"
+    read_only_preset: str = "read-only"
+    edit_preset: str = "edit"
+    full_preset: str = "full"
+
+
+@dataclass(frozen=True)
+class ScriptDefaults:
+    ask_file_max_bytes: int = 65_536
+    ask_file_max_quanta: int = 6
+    document_summary_max_bytes: int = 65_536
+    document_summary_max_read_bytes: int = 1_048_576
+    document_summary_max_quanta: int = 10
+    document_context_min_tokens: int = 8_000
+    document_context_slack_tokens: int = 12_000
+    document_context_max_tokens: int = 120_000
+    object_copy_max_quanta: int = 5
+    llm_write_smoke_max_quanta: int = 5
+    clock_demo_iterations: int = 3
+    clock_demo_interval_s: float = 0.2
+    clock_demo_timezone: str = "Asia/Shanghai"
+    chat_max_turns: int = 20
+    chat_context_tokens: int = 64_000
+    chat_quanta_per_turn: int = 5
+    chat_quanta_overhead: int = 8
+
+
+@dataclass(frozen=True)
+class AgentLibOSConfig:
+    runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
+    scheduler: SchedulerDefaults = field(default_factory=SchedulerDefaults)
+    process: ProcessDefaults = field(default_factory=ProcessDefaults)
+    llm: LLMDefaults = field(default_factory=LLMDefaults)
+    tools: ToolDefaults = field(default_factory=ToolDefaults)
+    memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
+    llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
+    launcher: LauncherDefaults = field(default_factory=LauncherDefaults)
+    scripts: ScriptDefaults = field(default_factory=ScriptDefaults)
+
+
+DEFAULT_CONFIG = AgentLibOSConfig()

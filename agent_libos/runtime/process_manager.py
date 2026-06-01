@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -30,6 +31,8 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
 
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+
 
 class ProcessManager:
     """Process lifecycle primitive."""
@@ -43,7 +46,9 @@ class ProcessManager:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
+        config: AgentLibOSConfig | None = None,
     ):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.memory = memory
         self.capabilities = capabilities
@@ -56,7 +61,7 @@ class ProcessManager:
 
     def spawn(
         self,
-        image: str = "base-agent:v0",
+        image: str = _RUNTIME_DEFAULTS.default_image_id,
         goal: dict[str, Any] | str | ObjectHandle | None = None,
         capabilities: builtins.list[dict[str, Any]] | None = None,
         resource_budget: ResourceBudget | None = None,
@@ -75,7 +80,7 @@ class ProcessManager:
             tool_table={},
             event_cursor=None,
             checkpoint_head=None,
-            resource_budget=resource_budget or ResourceBudget(),
+            resource_budget=resource_budget or self._default_resource_budget(),
             created_at=now,
             updated_at=now,
         )
@@ -139,8 +144,14 @@ class ProcessManager:
             event_cursor=None,
             checkpoint_head=None,
             resource_budget=ResourceBudget(
-                max_tool_calls=max(1, parent_proc.resource_budget.max_tool_calls // 2),
-                max_child_processes=max(0, parent_proc.resource_budget.max_child_processes // 2),
+                max_tool_calls=max(
+                    self.config.process.fork_min_tool_calls,
+                    parent_proc.resource_budget.max_tool_calls // self.config.process.fork_budget_divisor,
+                ),
+                max_child_processes=max(
+                    self.config.process.fork_min_child_processes,
+                    parent_proc.resource_budget.max_child_processes // self.config.process.fork_budget_divisor,
+                ),
                 max_runtime_seconds=parent_proc.resource_budget.max_runtime_seconds,
                 max_materialized_tokens=parent_proc.resource_budget.max_materialized_tokens,
             ),
@@ -411,10 +422,20 @@ class ProcessManager:
             raise NotFound(f"process not found: {pid}")
         return process
 
+    def _default_resource_budget(self) -> ResourceBudget:
+        defaults = self.config.process
+        return ResourceBudget(
+            max_tool_calls=defaults.max_tool_calls,
+            max_child_processes=defaults.max_child_processes,
+            max_runtime_seconds=defaults.max_runtime_seconds,
+            max_materialized_tokens=defaults.max_materialized_tokens,
+        )
+
     def _ensure_goal(self, pid: str, goal: dict[str, Any] | str | ObjectHandle | None) -> ObjectHandle:
         if isinstance(goal, ObjectHandle):
             return goal
-        payload = {"text": goal or "Run agent process"} if isinstance(goal, str) or goal is None else goal
+        default_goal = self.config.process.default_goal_text
+        payload = {"text": goal or default_goal} if isinstance(goal, str) or goal is None else goal
         return self.memory.create_object(
             pid=pid,
             object_type=ObjectType.GOAL,

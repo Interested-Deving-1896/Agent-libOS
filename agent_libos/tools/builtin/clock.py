@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import BaseAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class GetCurrentTimeArgs(BaseModel):
-    timezone: str = Field(default="UTC", description="IANA timezone name, for example UTC or Asia/Shanghai.")
+    timezone: str = Field(
+        default=_TOOL_DEFAULTS.clock_timezone,
+        description="IANA timezone name, for example UTC or Asia/Shanghai.",
+    )
 
 
 class GetCurrentTimeOutput(BaseModel):
@@ -16,7 +22,11 @@ class GetCurrentTimeOutput(BaseModel):
 
 
 class SleepArgs(BaseModel):
-    seconds: float = Field(ge=0, le=60, description="Seconds to sleep. Maximum is 60 seconds.")
+    seconds: float = Field(
+        ge=0,
+        le=_TOOL_DEFAULTS.max_sleep_seconds,
+        description=f"Seconds to sleep. Maximum is {_TOOL_DEFAULTS.max_sleep_seconds:g} seconds.",
+    )
 
 
 class SleepOutput(BaseModel):
@@ -29,8 +39,7 @@ class GetCurrentTimeTool(BaseAgentTool[GetCurrentTimeArgs]):
     description = "Return the current wall-clock time from the libOS clock primitive."
     args_schema = GetCurrentTimeArgs
     output_schema = GetCurrentTimeOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["clock", "time"]
 
     async def execute(self, args: GetCurrentTimeArgs, ctx: ToolContext) -> GetCurrentTimeOutput:
@@ -50,8 +59,7 @@ class SleepTool(BaseAgentTool[SleepArgs]):
     description = "Sleep for a bounded duration using the libOS clock primitive."
     args_schema = SleepArgs
     output_schema = SleepOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=65.0)
+    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.sleep_tool_timeout_s)
     tags = ["clock", "time", "scheduler"]
 
     async def execute(self, args: SleepArgs, ctx: ToolContext) -> SleepOutput:

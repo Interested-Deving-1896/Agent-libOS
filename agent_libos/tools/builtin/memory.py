@@ -4,8 +4,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import ObjectMetadata, ObjectPatch, ObjectType, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class CreateMemoryObjectArgs(BaseModel):
@@ -27,7 +31,12 @@ class CreateMemoryObjectOutput(BaseModel):
 class ReadMemoryObjectArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to read.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
-    max_payload_chars: int = Field(default=12000, ge=1, le=200000, description="Maximum rendered payload chars.")
+    max_payload_chars: int = Field(
+        default=_TOOL_DEFAULTS.memory_payload_chars,
+        ge=1,
+        le=_TOOL_DEFAULTS.memory_payload_hard_limit_chars,
+        description="Maximum rendered payload chars.",
+    )
 
 
 class ReadMemoryObjectOutput(BaseModel):
@@ -106,8 +115,7 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
     )
     args_schema = CreateMemoryObjectArgs
     output_schema = CreateMemoryObjectOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["memory", "object"]
 
     def run(self, args: CreateMemoryObjectArgs, ctx: ToolContext) -> CreateMemoryObjectOutput:
@@ -119,8 +127,8 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             summary=args.metadata.get("summary"),
             tags=args.metadata.get("tags", []),
             mime_type=args.metadata.get("mime_type"),
-            sensitivity=args.metadata.get("sensitivity", "normal"),
-            retention_policy=args.metadata.get("retention_policy", "default"),
+            sensitivity=args.metadata.get("sensitivity", _MEMORY_DEFAULTS.metadata_sensitivity),
+            retention_policy=args.metadata.get("retention_policy", _MEMORY_DEFAULTS.metadata_retention_policy),
         )
         handle = runtime.memory.create_object(
             pid=ctx.pid,
@@ -149,8 +157,7 @@ class CreateMemoryNamespaceTool(SyncAgentTool[CreateMemoryNamespaceArgs]):
     )
     args_schema = CreateMemoryNamespaceArgs
     output_schema = CreateMemoryNamespaceOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["memory", "object", "namespace"]
 
     def run(self, args: CreateMemoryNamespaceArgs, ctx: ToolContext) -> CreateMemoryNamespaceOutput:
@@ -178,8 +185,7 @@ class ListMemoryNamespaceTool(SyncAgentTool[ListMemoryNamespaceArgs]):
     )
     args_schema = ListMemoryNamespaceArgs
     output_schema = ListMemoryNamespaceOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["memory", "object", "namespace", "read"]
 
     def run(self, args: ListMemoryNamespaceArgs, ctx: ToolContext) -> ListMemoryNamespaceOutput:
@@ -216,8 +222,7 @@ class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
     )
     args_schema = ReadMemoryObjectArgs
     output_schema = ReadMemoryObjectOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["memory", "object", "read"]
 
     def run(self, args: ReadMemoryObjectArgs, ctx: ToolContext) -> ReadMemoryObjectOutput:
@@ -249,8 +254,7 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
     )
     args_schema = AppendMemoryObjectArgs
     output_schema = AppendMemoryObjectOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["memory", "object", "write", "append"]
 
     def run(self, args: AppendMemoryObjectArgs, ctx: ToolContext) -> AppendMemoryObjectOutput:

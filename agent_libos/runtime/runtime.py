@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.external import ClockPrimitive, FilesystemAdapter
 from agent_libos.human.manager import HumanObjectManager
-from agent_libos.images import DEFAULT_IMAGES
+from agent_libos.images import build_default_images
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -52,6 +53,8 @@ from agent_libos.tools.builtin import (
     WriteTextFileTool,
 )
 
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+
 
 class Runtime:
     """Composition root for the MVP libOS runtime."""
@@ -61,16 +64,26 @@ class Runtime:
         store: SQLiteStore,
         llm_client: LLMClient | None = None,
         substrate: ResourceProviderSubstrate | None = None,
+        config: AgentLibOSConfig | None = None,
     ):
-        self.substrate = substrate or LocalResourceProviderSubstrate(Path.cwd().resolve())
+        self.config = config or DEFAULT_CONFIG
+        self.substrate = substrate or LocalResourceProviderSubstrate(
+            Path.cwd().resolve(),
+            namespace=self.config.runtime.workspace_namespace,
+        )
         self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
         self.store = store
         self.audit = AuditManager(store)
         self.events = EventBus(store)
-        self.capability = CapabilityManager(store, self.audit, self.events)
-        self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events)
-        self.human = HumanObjectManager(store, self.capability, self.audit, self.events)
-        self.clock = ClockPrimitive(self.audit, self.events, provider=self.substrate.clock)
+        self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
+        self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events, config=self.config)
+        self.human = HumanObjectManager(store, self.capability, self.audit, self.events, config=self.config)
+        self.clock = ClockPrimitive(
+            self.audit,
+            self.events,
+            max_sleep_seconds=self.config.tools.max_sleep_seconds,
+            provider=self.substrate.clock,
+        )
         self.filesystem = FilesystemAdapter(
             self.capability,
             self.audit,
@@ -86,23 +99,30 @@ class Runtime:
             self.audit,
             self.events,
             workspace_root=self.workspace_root,
+            config=self.config,
         )
         self.tools.runtime = self
-        self.process = ProcessManager(store, self.memory, self.capability, self.audit, self.events)
-        self.scheduler = SimpleScheduler(store, self.audit)
+        self.process = ProcessManager(store, self.memory, self.capability, self.audit, self.events, config=self.config)
+        self.scheduler = SimpleScheduler(store, self.audit, poll_interval_s=self.config.scheduler.poll_interval_s)
         self.checkpoint = CheckpointManager(store, self.audit, self.events)
         self.skill_registry = RuntimeSkillRegistry()
         self.skills = SkillLinker(store, self.skill_registry, self.audit)
-        self.images: dict[str, AgentImage] = dict(DEFAULT_IMAGES)
-        self.llm = LLMProcessExecutor(self, llm_client)
+        self.images: dict[str, AgentImage] = build_default_images(self.config)
+        self.llm = LLMProcessExecutor(self, llm_client, config=self.config)
         self._register_builtin_tools()
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
 
     @classmethod
-    def open(cls, target: str | Path = "local", substrate: ResourceProviderSubstrate | None = None) -> "Runtime":
-        if str(target) == "local":
-            return cls(SQLiteStore(":memory:"), substrate=substrate)
-        return cls(SQLiteStore(str(target)), substrate=substrate)
+    def open(
+        cls,
+        target: str | Path = _RUNTIME_DEFAULTS.local_store_target,
+        substrate: ResourceProviderSubstrate | None = None,
+        config: AgentLibOSConfig | None = None,
+    ) -> "Runtime":
+        selected_config = config or DEFAULT_CONFIG
+        if str(target) == selected_config.runtime.local_store_target:
+            return cls(SQLiteStore(":memory:"), substrate=substrate, config=selected_config)
+        return cls(SQLiteStore(str(target)), substrate=substrate, config=selected_config)
 
     def close(self) -> None:
         self.store.close()
@@ -121,10 +141,10 @@ class Runtime:
 
     def run_until_idle(
         self,
-        max_quanta: int = 25,
+        max_quanta: int | None = None,
         *,
         process_human_queue: bool = True,
-        human: str = "owner",
+        human: str | None = None,
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
@@ -148,17 +168,18 @@ class Runtime:
 
     async def arun_until_idle(
         self,
-        max_quanta: int = 4096,
+        max_quanta: int | None = None,
         *,
         process_human_queue: bool = True,
-        human: str = "owner",
+        human: str | None = None,
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
         human_input_fn: Callable[[str], str] | None = None,
     ) -> list[Any]:
         results: list[Any] = []
-        remaining = max_quanta
+        remaining = max_quanta if max_quanta is not None else self.config.runtime.run_until_idle_max_quanta
+        selected_human = human or self.config.runtime.default_human
         while remaining > 0:
             # Run all currently runnable processes first. Human queue work below
             # may wake a process, so this loop intentionally alternates between
@@ -169,7 +190,7 @@ class Runtime:
             if not process_human_queue:
                 break
             processed = await self.human.adrain_terminal_queue(
-                human=human,
+                human=selected_human,
                 auto_approve=human_auto_approve,
                 auto_policy=human_auto_policy,
                 auto_answer=human_auto_answer,
@@ -180,7 +201,7 @@ class Runtime:
             self.audit.record(
                 actor="runtime",
                 action="runtime.human_queue_drained",
-                target=f"human:{human}",
+                target=f"human:{selected_human}",
                 decision={"request_ids": [request.request_id for request in processed]},
             )
             await asyncio.sleep(0)
@@ -200,7 +221,7 @@ class Runtime:
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
         process = self.store.get_process(pid)
-        image = self.images.get(image_id) or self.images["base-agent:v0"]
+        image = self.images.get(image_id) or self.images[self.config.runtime.default_image_id]
         # Tool visibility is fixed from the AgentImage at process creation time.
         # External-resource authority is still enforced later by the primitives.
         tool_names = {"process_exit", "create_memory_object", *image.default_tools}

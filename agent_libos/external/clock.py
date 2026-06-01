@@ -4,11 +4,14 @@ from dataclasses import dataclass
 from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import ValidationError
 from agent_libos.models import EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.substrate import ClockProvider, LocalClockProvider
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 @dataclass(frozen=True)
@@ -35,7 +38,7 @@ class ClockPrimitive:
         self,
         audit: AuditManager,
         events: EventBus,
-        max_sleep_seconds: float = 60.0,
+        max_sleep_seconds: float = _TOOL_DEFAULTS.max_sleep_seconds,
         provider: ClockProvider | None = None,
     ):
         self.audit = audit
@@ -43,7 +46,7 @@ class ClockPrimitive:
         self.max_sleep_seconds = max_sleep_seconds
         self.provider = provider or LocalClockProvider()
 
-    def now(self, pid: str, tz: str = "UTC") -> ClockNowResult:
+    def now(self, pid: str, tz: str = _TOOL_DEFAULTS.clock_timezone) -> ClockNowResult:
         selected_tz = self._timezone(tz)
         current = self.provider.now(selected_tz)
         result = ClockNowResult(

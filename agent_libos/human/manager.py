@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import CapabilityRight
 from agent_libos.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
 from agent_libos.ids import new_id, utc_now
@@ -31,7 +32,9 @@ class HumanObjectManager:
         audit: AuditManager,
         events: EventBus,
         output_sink: Callable[[str], None] | None = None,
+        config: AgentLibOSConfig | None = None,
     ):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.capabilities = capabilities
         self.audit = audit
@@ -110,15 +113,16 @@ class HumanObjectManager:
         self,
         pid: str,
         question: str,
-        human: str = "owner",
+        human: str | None = None,
         context: dict[str, Any] | None = None,
         blocking: bool = True,
     ) -> str:
-        resource = f"human:{human}"
+        selected_human = human or self.config.runtime.default_human
+        resource = f"human:{selected_human}"
         self.capabilities.require(pid, resource, CapabilityRight.WRITE)
         return self.query(
             pid=pid,
-            human=human,
+            human=selected_human,
             request={
                 "type": "question",
                 "question": question,
@@ -147,17 +151,27 @@ class HumanObjectManager:
         self,
         request_id: str,
         decision: dict[str, Any] | None = None,
-        responder: str = "human:owner",
+        responder: str | None = None,
     ) -> HumanRequest:
-        return self._decide(request_id, HumanRequestStatus.APPROVED, decision or {"approved": True}, responder)
+        return self._decide(
+            request_id,
+            HumanRequestStatus.APPROVED,
+            decision or {"approved": True},
+            responder or self.config.runtime.default_human_actor,
+        )
 
     def reject(
         self,
         request_id: str,
         decision: dict[str, Any] | None = None,
-        responder: str = "human:owner",
+        responder: str | None = None,
     ) -> HumanRequest:
-        return self._decide(request_id, HumanRequestStatus.REJECTED, decision or {"approved": False}, responder)
+        return self._decide(
+            request_id,
+            HumanRequestStatus.REJECTED,
+            decision or {"approved": False},
+            responder or self.config.runtime.default_human_actor,
+        )
 
     def interrupt(self, pid: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> str:
         sig = ProcessSignal(signal)
@@ -191,16 +205,19 @@ class HumanObjectManager:
         self,
         pid: str,
         message: str,
-        human: str = "owner",
-        channel: str = "terminal",
+        human: str | None = None,
+        channel: str | None = None,
     ) -> dict[str, Any]:
-        selected_channel = "terminal" if channel != "terminal" else channel
-        resource = f"human:{human}"
+        selected_human = human or self.config.runtime.default_human
+        selected_channel = channel or self.config.runtime.terminal_channel
+        if selected_channel != self.config.runtime.terminal_channel:
+            selected_channel = self.config.runtime.terminal_channel
+        resource = f"human:{selected_human}"
         self.capabilities.require(pid, resource, CapabilityRight.WRITE)
         request = HumanRequest(
             request_id=new_id("hreq"),
             pid=pid,
-            human=human,
+            human=selected_human,
             payload={"type": "output", "message": message, "channel": selected_channel},
             status=HumanRequestStatus.PENDING,
             decision=None,
@@ -234,13 +251,14 @@ class HumanObjectManager:
 
     def process_next_terminal(
         self,
-        human: str = "owner",
+        human: str | None = None,
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
         input_fn: Callable[[str], str] | None = None,
     ) -> HumanRequest | None:
-        pending = self.pending(human=human)
+        selected_human = human or self.config.runtime.default_human
+        pending = self.pending(human=selected_human)
         if not pending:
             return None
         # The terminal is the human's message queue. Process requests strictly
@@ -283,7 +301,7 @@ class HumanObjectManager:
 
     async def aprocess_next_terminal(
         self,
-        human: str = "owner",
+        human: str | None = None,
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
@@ -300,7 +318,7 @@ class HumanObjectManager:
 
     def drain_terminal_queue(
         self,
-        human: str = "owner",
+        human: str | None = None,
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
@@ -321,7 +339,7 @@ class HumanObjectManager:
 
     async def adrain_terminal_queue(
         self,
-        human: str = "owner",
+        human: str | None = None,
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
@@ -593,7 +611,7 @@ class HumanObjectManager:
 
     def _deliver_output_request(self, request: HumanRequest) -> HumanRequest:
         message = str(request.payload.get("message", ""))
-        channel = str(request.payload.get("channel", "terminal"))
+        channel = str(request.payload.get("channel", self.config.runtime.terminal_channel))
         self.output_sink(message)
         request.status = HumanRequestStatus.DELIVERED
         request.decision = {"delivered": True}

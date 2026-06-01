@@ -4,6 +4,7 @@ import asyncio
 import inspect
 from typing import Any, TYPE_CHECKING
 
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.exceptions import HumanApprovalRequired, ProcessWaitRequired
 from agent_libos.ids import utc_now
 from agent_libos.llm.action_parser import parse_json_action
@@ -26,8 +27,9 @@ if TYPE_CHECKING:
 class LLMProcessExecutor:
     """Runs one model-selected tool action per process quantum."""
 
-    def __init__(self, runtime: "Runtime", client: LLMClient | None = None):
+    def __init__(self, runtime: "Runtime", client: LLMClient | None = None, config: AgentLibOSConfig | None = None):
         self.runtime = runtime
+        self.config = config or DEFAULT_CONFIG
         self.client = client or LLMClient.from_env()
         # Pending actions are held outside Object Memory because the process has
         # not received a tool result yet. The action is retried after the human
@@ -51,7 +53,7 @@ class LLMProcessExecutor:
             return await self._resume_pending_human_action(pid)
         if pid in self._pending_wait_actions:
             return await self._resume_pending_wait_action(pid)
-        image = self.runtime.images.get(process.image_id) or self.runtime.images["base-agent:v0"]
+        image = self.runtime.images.get(process.image_id) or self.runtime.images[self.config.runtime.default_image_id]
         if process.memory_view is None:
             process.memory_view = self.runtime.memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
             process.updated_at = utc_now()
@@ -113,7 +115,7 @@ class LLMProcessExecutor:
                     action=action,
                     request_id=exc.request_id,
                     message=str(exc),
-                    content_preview=completion.content[:500],
+                    content_preview=completion.content[: self.config.llm.content_preview_chars],
                     tool_call_count=len(completion.tool_calls),
                 )
             except ProcessWaitRequired as exc:
@@ -122,14 +124,14 @@ class LLMProcessExecutor:
                     action=action,
                     child_pid=exc.child_pid,
                     message=str(exc),
-                    content_preview=completion.content[:500],
+                    content_preview=completion.content[: self.config.llm.content_preview_chars],
                     tool_call_count=len(completion.tool_calls),
                 )
             return self._completed_action_result(
                 pid=pid,
                 action=action,
                 result=result,
-                content_preview=completion.content[:500],
+                content_preview=completion.content[: self.config.llm.content_preview_chars],
                 tool_call_count=len(completion.tool_calls),
             )
         except HumanApprovalRequired as exc:
@@ -364,7 +366,7 @@ class LLMProcessExecutor:
             detail = f"; invalid tool calls: {errors}" if errors else ""
             raise ValueError(
                 f"no valid tool call or fallback JSON action found: {exc}{detail}; "
-                f"content preview: {content[:500]!r}"
+                f"content preview: {content[: self.config.llm.content_preview_chars]!r}"
             ) from exc
 
     async def _complete_valid_action(
@@ -372,11 +374,12 @@ class LLMProcessExecutor:
         pid: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        max_attempts: int = 2,
+        max_attempts: int | None = None,
     ) -> tuple[Any, dict[str, Any]]:
         attempt_messages = messages
         last_error: Exception | None = None
-        for attempt in range(max_attempts):
+        selected_max_attempts = max_attempts or self.config.llm.action_repair_attempts
+        for attempt in range(selected_max_attempts):
             completion = await self._complete_action(attempt_messages, tools)
             try:
                 action = self._completion_to_action(completion.content, completion.tool_calls)
@@ -393,10 +396,10 @@ class LLMProcessExecutor:
                         "error": str(exc),
                         "tool_call_count": len(completion.tool_calls),
                         "tool_calls_preview": self._tool_call_previews(completion.tool_calls),
-                        "content_preview": completion.content[:500],
+                        "content_preview": completion.content[: self.config.llm.content_preview_chars],
                     },
                 )
-                if attempt + 1 >= max_attempts:
+                if attempt + 1 >= selected_max_attempts:
                     break
                 attempt_messages = [
                     *messages,
@@ -425,9 +428,9 @@ class LLMProcessExecutor:
         for tool_call in tool_calls:
             raw_args = tool_call.get("arguments")
             if isinstance(raw_args, str):
-                arguments_preview = raw_args[:500]
+                arguments_preview = raw_args[: self.config.llm.tool_arguments_preview_chars]
             else:
-                arguments_preview = repr(raw_args)[:500]
+                arguments_preview = repr(raw_args)[: self.config.llm.tool_arguments_preview_chars]
             previews.append(
                 {
                     "id": tool_call.get("id"),

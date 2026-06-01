@@ -6,11 +6,15 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound
 from agent_libos.models import Capability, CapabilityRight, EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.substrate import FilesystemProvider, LocalFilesystemProvider, ResolvedPath
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,7 @@ class FilesystemAdapter:
         audit: AuditManager,
         events: EventBus,
         root: str | os.PathLike[str] | None = None,
-        namespace: str = "workspace",
+        namespace: str = _RUNTIME_DEFAULTS.workspace_namespace,
         human: Any | None = None,
         provider: FilesystemProvider | None = None,
     ):
@@ -88,8 +92,8 @@ class FilesystemAdapter:
         self,
         pid: str,
         path: str | os.PathLike[str],
-        encoding: str = "utf-8",
-        max_bytes: int = 65536,
+        encoding: str = _TOOL_DEFAULTS.default_text_encoding,
+        max_bytes: int = _TOOL_DEFAULTS.filesystem_read_max_bytes,
     ) -> FileReadResult:
         target, relative = self._resolve(path)
         resource = self.resource_for(relative)
@@ -122,7 +126,7 @@ class FilesystemAdapter:
         pid: str,
         path: str | os.PathLike[str],
         text: str,
-        encoding: str = "utf-8",
+        encoding: str = _TOOL_DEFAULTS.default_text_encoding,
         overwrite: bool = True,
     ) -> FileWriteResult:
         target, relative = self._resolve(path)
@@ -177,7 +181,7 @@ class FilesystemAdapter:
         self,
         pid: str,
         path: str | os.PathLike[str],
-        limit: int = 1024,
+        limit: int = _TOOL_DEFAULTS.directory_entry_limit,
     ) -> DirectoryReadResult:
         target, relative = self._resolve(path)
         resource = self.directory_resource_for(relative)
@@ -542,7 +546,7 @@ class FilesystemAdapter:
             # and preview needed for a safe per-use human decision.
             request_id = self.human.query(
                 pid=pid,
-                human="owner",
+                human=_RUNTIME_DEFAULTS.default_human,
                 request={
                     "type": "external_operation_approval",
                     "question": question,
@@ -594,7 +598,7 @@ class FilesystemAdapter:
                 raise CapabilityDenied(f"{pid} requires human approval for delete on {resource}")
             request_id = self.human.query(
                 pid=pid,
-                human="owner",
+                human=_RUNTIME_DEFAULTS.default_human,
                 request={
                     "type": "external_operation_approval",
                     "question": f"Allow this process to delete {relative}?",
@@ -663,7 +667,7 @@ class FilesystemAdapter:
             "content_preview_truncated": preview_truncated,
         }
 
-    def _preview_text(self, text: str, limit: int = 256) -> tuple[str, bool]:
+    def _preview_text(self, text: str, limit: int = _TOOL_DEFAULTS.approval_preview_chars) -> tuple[str, bool]:
         preview = text[:limit]
         # repr() prevents newlines or prompt-like text from masquerading as
         # separate approval instructions in the human terminal prompt.

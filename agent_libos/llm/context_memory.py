@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.ids import estimate_tokens, utc_now
 from agent_libos.models import (
     AgentImage,
@@ -21,8 +22,9 @@ from agent_libos.models import (
     ViewMode,
 )
 
-LLM_CONTEXT_POLICY = "llm_context_object"
-LLM_CONTEXT_SCHEMA_VERSION = 1
+_LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
+LLM_CONTEXT_POLICY = _LLM_CONTEXT_DEFAULTS.policy
+LLM_CONTEXT_SCHEMA_VERSION = _LLM_CONTEXT_DEFAULTS.schema_version
 
 
 class LLMContextMemory:
@@ -216,7 +218,9 @@ class LLMContextMemory:
             changed = True
 
         captured_events = set(captured.get("event_ids", []))
-        new_events = [event for event in events[-20:] if event.event_id not in captured_events]
+        new_events = [
+            event for event in events[-_LLM_CONTEXT_DEFAULTS.recent_event_limit :] if event.event_id not in captured_events
+        ]
         if new_events:
             entries.append(
                 {
@@ -304,7 +308,7 @@ class LLMContextMemory:
 
 
 def context_object_name(pid: str) -> str:
-    return f"llm_context:{pid}"
+    return f"{_LLM_CONTEXT_DEFAULTS.object_name_prefix}:{pid}"
 
 
 def _tool_name(tool: dict[str, Any]) -> str | None:

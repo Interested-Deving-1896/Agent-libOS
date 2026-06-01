@@ -8,8 +8,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 DEFAULT_SOURCE_TEXT = "Object Memory copy smoke source.\nCONTENT_STAYS_OUT_OF_PROCESS_CONTEXT\n"
@@ -19,12 +24,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Copy a workspace text file through named Object Memory without materializing its content to the process."
     )
-    parser.add_argument("--db", default="local", help="Runtime SQLite database path, or 'local' for in-memory.")
+    parser.add_argument(
+        "--db",
+        default=_RUNTIME_DEFAULTS.local_store_target,
+        help=f"Runtime SQLite database path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory.",
+    )
     parser.add_argument("--source", default="agent_outputs/object_memory_copy_source.txt")
     parser.add_argument("--target", default="agent_outputs/object_memory_copy_target.txt")
     parser.add_argument("--object-name", default=None)
-    parser.add_argument("--encoding", default="utf-8")
-    parser.add_argument("--max-quanta", type=int, default=5)
+    parser.add_argument("--encoding", default=_TOOL_DEFAULTS.default_text_encoding)
+    parser.add_argument("--max-quanta", type=int, default=_SCRIPT_DEFAULTS.object_copy_max_quanta)
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
     asyncio.run(amain(args))

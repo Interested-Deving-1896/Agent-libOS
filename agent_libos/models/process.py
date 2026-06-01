@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, CheckpointID, EventID, OID, PID, StrEnum
 from agent_libos.models.memory import MemoryView, ObjectHandle
+
+_PROCESS_DEFAULTS = DEFAULT_CONFIG.process
 
 
 class ProcessStatus(StrEnum):
@@ -38,10 +41,10 @@ class ProcessSignal(StrEnum):
 
 @dataclass
 class ResourceBudget:
-    max_tool_calls: int = 256
-    max_child_processes: int = 16
-    max_runtime_seconds: int | None = None
-    max_materialized_tokens: int = 65536
+    max_tool_calls: int = _PROCESS_DEFAULTS.max_tool_calls
+    max_child_processes: int = _PROCESS_DEFAULTS.max_child_processes
+    max_runtime_seconds: int | None = _PROCESS_DEFAULTS.max_runtime_seconds
+    max_materialized_tokens: int = _PROCESS_DEFAULTS.max_materialized_tokens
 
 
 @dataclass(frozen=True)

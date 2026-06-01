@@ -6,9 +6,11 @@ import json
 from collections import Counter
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ForkMode, MemoryViewSpec, ObjectMetadata, ObjectType, ToolCallResult, ViewMode
 from agent_libos.runtime.runtime import Runtime
 
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 
 DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
 DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
@@ -16,7 +18,11 @@ DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="agent-libos")
-    parser.add_argument("--db", default="local", help="SQLite DB path, or 'local' for in-memory")
+    parser.add_argument(
+        "--db",
+        default=_RUNTIME_DEFAULTS.local_store_target,
+        help=f"SQLite DB path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Initialize a runtime database")
     sub.add_parser("demo", help="Run the coding-agent MVP demo")
@@ -24,12 +30,12 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("processes", help="Print process table")
     sub.add_parser("tools", help="Print registered tools")
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
-    spawn_parser.add_argument("--image", default="base-agent:v0")
+    spawn_parser.add_argument("--image", default=_RUNTIME_DEFAULTS.default_image_id)
     spawn_parser.add_argument("--goal", required=True)
     llm_once_parser = sub.add_parser("llm-once", help="Run one LLM quantum for a process")
     llm_once_parser.add_argument("pid")
     run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
-    run_parser.add_argument("--max-quanta", type=int, default=25)
+    run_parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
     sub.add_parser("human", help="Process pending human messages in terminal order")
     grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
     grant_tool_parser.add_argument("pid")
@@ -66,7 +72,7 @@ def main(argv: list[str] | None = None) -> None:
 def run_demo(runtime: Runtime) -> dict[str, Any]:
     tool_sequence: list[dict[str, Any]] = []
     root = runtime.process.spawn(
-        image="coding-agent:v0",
+        image=_RUNTIME_DEFAULTS.coding_image_id,
         goal={"text": "Fix failing tests in this repository"},
     )
     log = """
@@ -144,7 +150,7 @@ def run(args):
     filesystem_resource = runtime.filesystem.resource_for(DEMO_PATCH_PREVIEW_PATH)
     approval_request = runtime.human.query(
         pid=root,
-        human="owner",
+        human=_RUNTIME_DEFAULTS.default_human,
         request={
             "type": "approval",
             "question": f"Grant workspace write capability for {DEMO_PATCH_PREVIEW_PATH}?",
@@ -193,7 +199,7 @@ def run(args):
         "authorization": {
             "filesystem_write_approval_request": approval_request,
             "filesystem_write_resource": filesystem_resource,
-            "filesystem_write_granted_by": "human:owner",
+            "filesystem_write_granted_by": _RUNTIME_DEFAULTS.default_human_actor,
             "filesystem_write_denied_before_grant": {
                 "ok": denied_without_filesystem.ok,
                 "error": denied_without_filesystem.error,

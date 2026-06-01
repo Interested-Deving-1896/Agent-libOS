@@ -10,18 +10,26 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import SandboxError
 from agent_libos.models import ValidationResult
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class SandboxBackend:
     def static_check(self, source_code: str) -> ValidationResult:
         raise NotImplementedError
 
-    def run_source(self, source_code: str, args: dict[str, Any], timeout: float = 5.0) -> Any:
+    def run_source(self, source_code: str, args: dict[str, Any], timeout: float = _TOOL_DEFAULTS.sandbox_timeout_s) -> Any:
         raise NotImplementedError
 
-    def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float = 5.0) -> ValidationResult:
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float = _TOOL_DEFAULTS.sandbox_timeout_s,
+    ) -> ValidationResult:
         raise NotImplementedError
 
 
@@ -48,6 +56,9 @@ class PythonSubprocessSandbox(SandboxBackend):
     }
     banned_calls = {"__import__", "compile", "eval", "exec", "input", "open"}
 
+    def __init__(self, default_timeout_s: float = _TOOL_DEFAULTS.sandbox_timeout_s):
+        self.default_timeout_s = default_timeout_s
+
     def static_check(self, source_code: str) -> ValidationResult:
         errors: list[str] = []
         warnings: list[str] = []
@@ -73,10 +84,11 @@ class PythonSubprocessSandbox(SandboxBackend):
                     errors.append(f"banned call: {node.func.id}")
         return ValidationResult(ok=not errors, errors=errors, warnings=warnings)
 
-    def run_source(self, source_code: str, args: dict[str, Any], timeout: float = 5.0) -> Any:
+    def run_source(self, source_code: str, args: dict[str, Any], timeout: float | None = None) -> Any:
         validation = self.static_check(source_code)
         if not validation.ok:
             raise SandboxError("; ".join(validation.errors))
+        selected_timeout = self.default_timeout_s if timeout is None else timeout
         with tempfile.TemporaryDirectory(prefix="agent_libos_tool_") as tmp:
             tmp_path = Path(tmp)
             (tmp_path / "candidate_tool.py").write_text(source_code, encoding="utf-8")
@@ -94,7 +106,7 @@ class PythonSubprocessSandbox(SandboxBackend):
                 input=json.dumps(args, ensure_ascii=True),
                 text=True,
                 capture_output=True,
-                timeout=timeout,
+                timeout=selected_timeout,
                 env=env,
             )
             if proc.returncode != 0:
@@ -107,7 +119,12 @@ class PythonSubprocessSandbox(SandboxBackend):
                 raise SandboxError(payload.get("error", "tool failed"))
             return payload.get("result")
 
-    def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float = 5.0) -> ValidationResult:
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+    ) -> ValidationResult:
         validation = self.static_check(source_code)
         if not validation.ok:
             return validation
@@ -141,4 +158,3 @@ class PythonSubprocessSandbox(SandboxBackend):
                 raise
             """
         ).strip()
-

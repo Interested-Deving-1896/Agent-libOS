@@ -6,19 +6,37 @@ import json
 from typing import Any
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessStatus
 from agent_libos.serde import to_jsonable
 from scripts.llm_context_probe import last_tool_result, recent_events
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ask the human which workspace file to view, then show that file's content through HumanObject output."
     )
-    parser.add_argument("--db", default="local", help="Runtime SQLite database path, or 'local' for in-memory.")
-    parser.add_argument("--max-bytes", type=int, default=65_536, help="Maximum bytes to read from the selected file.")
-    parser.add_argument("--max-quanta", type=int, default=6, help="Maximum Agent execution quanta to run.")
+    parser.add_argument(
+        "--db",
+        default=_RUNTIME_DEFAULTS.local_store_target,
+        help=f"Runtime SQLite database path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory.",
+    )
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=_SCRIPT_DEFAULTS.ask_file_max_bytes,
+        help="Maximum bytes to read from the selected file.",
+    )
+    parser.add_argument(
+        "--max-quanta",
+        type=int,
+        default=_SCRIPT_DEFAULTS.ask_file_max_quanta,
+        help="Maximum Agent execution quanta to run.",
+    )
     parser.add_argument(
         "--auto-answer",
         default=None,
@@ -38,9 +56,9 @@ def main() -> None:
 
 async def run_file_viewer(
     *,
-    db: str = "local",
-    max_bytes: int = 65_536,
-    max_quanta: int = 6,
+    db: str = _RUNTIME_DEFAULTS.local_store_target,
+    max_bytes: int = _SCRIPT_DEFAULTS.ask_file_max_bytes,
+    max_quanta: int = _SCRIPT_DEFAULTS.ask_file_max_quanta,
     auto_answer: str | None = None,
     echo: bool = True,
 ) -> dict[str, Any]:
@@ -59,7 +77,7 @@ async def run_file_viewer(
     runtime.human.output_sink = output_sink
     try:
         pid = runtime.process.spawn(
-            image="coding-agent:v0",
+            image=_RUNTIME_DEFAULTS.coding_image_id,
             goal=(
                 "Ask the human which workspace file they want to view. Read that file and show its content "
                 "to the human. If reading fails, show the failure reason to the human. Then exit."

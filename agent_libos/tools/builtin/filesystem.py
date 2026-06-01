@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class WriteTextFileArgs(BaseModel):
     path: str = Field(description="Relative file path under the runtime workspace root.")
     content: str = Field(description="Exact UTF-8 text content to write.")
-    encoding: str = Field(default="utf-8", description="Text encoding.")
+    encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
 
 
@@ -20,8 +23,13 @@ class WriteTextFileOutput(BaseModel):
 
 class ReadTextFileArgs(BaseModel):
     path: str = Field(description="Relative file path under the runtime workspace root.")
-    encoding: str = Field(default="utf-8", description="Text encoding.")
-    max_bytes: int = Field(default=65536, ge=1, le=1048576, description="Maximum bytes to read.")
+    encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
+    max_bytes: int = Field(
+        default=_TOOL_DEFAULTS.filesystem_read_max_bytes,
+        ge=1,
+        le=_TOOL_DEFAULTS.filesystem_read_hard_limit_bytes,
+        description="Maximum bytes to read.",
+    )
 
 
 class ReadTextFileOutput(BaseModel):
@@ -41,7 +49,12 @@ class DirectoryEntryOutput(BaseModel):
 
 class ReadDirectoryArgs(BaseModel):
     path: str = Field(description="Relative directory path under the runtime workspace root.")
-    limit: int = Field(default=1024, ge=1, le=10000, description="Maximum number of entries to return.")
+    limit: int = Field(
+        default=_TOOL_DEFAULTS.directory_entry_limit,
+        ge=1,
+        le=_TOOL_DEFAULTS.directory_entry_hard_limit,
+        description="Maximum number of entries to return.",
+    )
 
 
 class ReadDirectoryOutput(BaseModel):
@@ -89,13 +102,12 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     )
     args_schema = ReadTextFileArgs
     output_schema = ReadTextFileOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=False,
         idempotent=True,
         requires_confirmation=False,
         permissions={"filesystem.read"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "read"]
 
@@ -132,13 +144,12 @@ class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
     )
     args_schema = ReadDirectoryArgs
     output_schema = ReadDirectoryOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=False,
         idempotent=True,
         requires_confirmation=False,
         permissions={"filesystem.read"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "read", "directory"]
 
@@ -168,13 +179,12 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
     )
     args_schema = WriteTextFileArgs
     output_schema = WriteTextFileOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         requires_confirmation=True,
         permissions={"filesystem.write"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect"]
 
@@ -211,13 +221,12 @@ class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
     )
     args_schema = WriteDirectoryArgs
     output_schema = WriteDirectoryOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         requires_confirmation=True,
         permissions={"filesystem.write"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect", "directory"]
 
@@ -249,13 +258,12 @@ class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
     )
     args_schema = DeleteFileArgs
     output_schema = DeletePathOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         requires_confirmation=True,
         permissions={"filesystem.delete"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect", "delete"]
 
@@ -284,13 +292,12 @@ class DeleteDirectoryTool(SyncAgentTool[DeleteDirectoryArgs]):
     )
     args_schema = DeleteDirectoryArgs
     output_schema = DeletePathOutput
-    version = "1.0.0"
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         requires_confirmation=True,
         permissions={"filesystem.delete"},
-        timeout_s=5.0,
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect", "delete", "directory"]
 

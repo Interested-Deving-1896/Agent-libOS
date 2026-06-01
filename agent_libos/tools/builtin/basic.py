@@ -5,7 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class EchoArgs(BaseModel):
@@ -16,8 +19,7 @@ class EchoTool(SyncAgentTool[EchoArgs]):
     name = "echo"
     description = "Return the provided arguments unchanged. Useful for tool plumbing tests."
     args_schema = EchoArgs
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=2.0)
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.interactive_timeout_s)
     tags = ["debug", "deterministic"]
 
     def run(self, args: EchoArgs, ctx: ToolContext) -> dict[str, Any]:
@@ -40,8 +42,7 @@ class ParsePytestLogTool(SyncAgentTool[ParsePytestLogArgs]):
     description = "Parse pytest output into a small structured failure summary."
     args_schema = ParsePytestLogArgs
     output_schema = ParsePytestLogOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=2.0)
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.interactive_timeout_s)
     tags = ["coding", "pytest", "parser"]
 
     def run(self, args: ParsePytestLogArgs, ctx: ToolContext) -> ParsePytestLogOutput:
@@ -62,4 +63,3 @@ class ParsePytestLogTool(SyncAgentTool[ParsePytestLogArgs]):
             assertions=assertions,
             failure_count=len(failed) or len(assertions) or len(errors),
         )
-

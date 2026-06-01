@@ -159,6 +159,8 @@ OPENAI_API_KEY=...
 
 The LLM client uses the OpenAI Python SDK. By default it uses the Responses API for OpenAI-hosted models and falls back to Chat Completions for custom OpenAI-compatible `base_url` providers. Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode. Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`, `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific `OPENAI_ENABLE_THINKING`.
 
+Runtime defaults that are not provider secrets live in `agent_libos.config.DEFAULT_CONFIG`. This includes scheduler quanta, process budgets, default image ids, workspace namespace, tool timeouts, filesystem/object-memory size limits, sandbox and shell timeouts, launcher presets, and example-script defaults. Components accept an `AgentLibOSConfig` where runtime-level injection is useful; fixed protocol identifiers and model-facing tool semantics stay in their own modules.
+
 Spawn and run a process:
 
 ```bash
@@ -363,6 +365,7 @@ Do not put direct filesystem, terminal, network, shell, browser, database, or cr
 agent_libos/
   api/             CLI entry points and demo orchestration
   capability/      Capability grant, revoke, check, and object handles
+  config/          Typed runtime, LLM, tool, memory, launcher, and script defaults
   external/        External-object primitives such as filesystem and clock
   human/           HumanObject query, approval, interrupt, and output primitives
   images/          Built-in AgentImage definitions

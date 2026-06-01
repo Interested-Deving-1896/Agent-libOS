@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from typing import Any, Protocol
 
+from agent_libos.config import DEFAULT_CONFIG
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+
 
 @dataclass(frozen=True)
 class ResolvedPath:
@@ -70,7 +74,7 @@ class ClockProvider(Protocol):
 
 
 class ShellProvider(Protocol):
-    def run(self, argv: list[str], *, timeout: float = 30.0) -> CommandResult: ...
+    def run(self, argv: list[str], *, timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult: ...
 
 
 class ResourceProviderSubstrate(Protocol):

@@ -7,10 +7,14 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.models import AgentImage, ProcessStatus, ResourceBudget
 from agent_libos.serde import to_jsonable
 from scripts.llm_context_probe import last_tool_result, recent_events
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 
 CHAT_IMAGE_ID = "chat-image:v0"
 CHAT_IMAGE_NAME = "ChatImage"
@@ -28,8 +32,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=("Run a traditional human/LLM chat loop through Agent libOS HumanObject tools: "
                      "ask_human for user input and human_output for assistant replies."))
-    parser.add_argument("--db", default="local", help="Runtime SQLite database path, or 'local' for in-memory.")
-    parser.add_argument("--max-turns", type=int, default=20, help="Maximum user turns before the chat process exits.")
+    parser.add_argument(
+        "--db",
+        default=_RUNTIME_DEFAULTS.local_store_target,
+        help=f"Runtime SQLite database path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory.",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=_SCRIPT_DEFAULTS.chat_max_turns,
+        help="Maximum user turns before the chat process exits.",
+    )
     parser.add_argument("--max-quanta", type=int, default=None, help="Maximum Agent execution quanta.")
     parser.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT, help="System prompt for the chat model.")
     parser.add_argument("--exit-word", action="append", default=None,
@@ -46,7 +59,7 @@ def main() -> None:
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
 
 
-async def run_chat(*, db: str = "local", responder: ChatResponder | None = None, max_turns: int = 20,
+async def run_chat(*, db: str = _RUNTIME_DEFAULTS.local_store_target, responder: ChatResponder | None = None, max_turns: int = _SCRIPT_DEFAULTS.chat_max_turns,
         max_quanta: int | None = None, exit_words: Sequence[str] = DEFAULT_EXIT_WORDS,
         auto_messages: Sequence[str] | None = None, echo: bool = True, ) -> dict[str, Any]:
     if max_turns < 1:
@@ -70,8 +83,9 @@ async def run_chat(*, db: str = "local", responder: ChatResponder | None = None,
             "You are an AI assistant interacting via a terminal interface. To ensure a smooth and efficient conversation, please adhere to the following rules:"
             "1. Do not repeat the same text, greetings, or explanations in one turn. Keep responses concise and strictly relevant to the new context.",
             "2. Every turn MUST conclude with a tool call to either `ask_human` (to receive the next user message) or `process_exit` (when the user wants to exit or the task is done). Never end a turn without calling one of these tools."),
-            resource_budget=ResourceBudget(max_materialized_tokens=64_000), )
-        results = await runtime.arun_until_idle(max_quanta=max_quanta or (max_turns * 5 + 8), human_input_fn=input_fn, )
+            resource_budget=ResourceBudget(max_materialized_tokens=_SCRIPT_DEFAULTS.chat_context_tokens), )
+        default_max_quanta = max_turns * _SCRIPT_DEFAULTS.chat_quanta_per_turn + _SCRIPT_DEFAULTS.chat_quanta_overhead
+        results = await runtime.arun_until_idle(max_quanta=max_quanta or default_max_quanta, human_input_fn=input_fn, )
         process = runtime.process.get(pid)
         report = {"pid": pid, "turns": client.turns, "process_status": process.status.value,
             "actions": [_action_name(result) for result in results], "outputs": outputs, "history": client.history,
@@ -149,7 +163,7 @@ def chat_image() -> AgentImage:
     return AgentImage(image_id=CHAT_IMAGE_ID, name=CHAT_IMAGE_NAME, version="v0",
         system_prompt="Traditional human/LLM chat image with only human I/O and process exit tools.",
         default_tools=["ask_human", "human_output", "process_exit"], context_policy="recency_first",
-        required_capabilities=[{"resource": "human:owner", "rights": ["write"]}], )
+        required_capabilities=[{"resource": _RUNTIME_DEFAULTS.default_human_resource, "rights": ["write"]}], )
 
 
 def _auto_input_fn(messages: Sequence[str], *, echo: bool):

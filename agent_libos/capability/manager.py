@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Iterable
 
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.exceptions import CapabilityDenied, NotFound
 from agent_libos.ids import new_id, utc_now
 from agent_libos.models import Capability, CapabilityRight, EventType, ObjectHandle
@@ -22,7 +23,8 @@ class CapabilityManager:
     MISSING = "missing"
     POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
 
-    def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus):
+    def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.audit = audit
         self.events = events
@@ -120,7 +122,7 @@ class CapabilityManager:
         resource: str,
         rights: Iterable[str | CapabilityRight],
         policy: str,
-        issued_by: str = "human:owner",
+        issued_by: str | None = None,
         constraints: dict | None = None,
     ) -> Capability:
         if policy not in self.POLICY_VALUES:
@@ -131,11 +133,12 @@ class CapabilityManager:
             subject=subject,
             resource=resource,
             rights=rights,
-            issued_by=issued_by,
+            issued_by=issued_by or self.config.runtime.default_human_actor,
             constraints=merged_constraints,
         )
+        actor = issued_by or self.config.runtime.default_human_actor
         self.audit.record(
-            actor=issued_by,
+            actor=actor,
             action="capability.permission_policy",
             target=f"{subject}:{resource}",
             capability_refs=[cap.cap_id],
@@ -148,7 +151,7 @@ class CapabilityManager:
         subject: str,
         resource: str,
         rights: Iterable[str | CapabilityRight],
-        issued_by: str = "human:owner",
+        issued_by: str | None = None,
         constraints: dict | None = None,
     ) -> Capability:
         return self.set_permission_policy(
@@ -156,7 +159,7 @@ class CapabilityManager:
             resource=resource,
             rights=rights,
             policy=self.ALLOW_ONCE,
-            issued_by=issued_by,
+            issued_by=issued_by or self.config.runtime.default_human_actor,
             constraints=constraints,
         )
 

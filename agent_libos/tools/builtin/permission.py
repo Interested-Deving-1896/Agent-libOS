@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class RequestPermissionArgs(BaseModel):
     resource: str = Field(description="Capability resource to request, such as filesystem:workspace:path.txt.")
     rights: list[str] = Field(description="Capability rights to request, such as ['write'].")
     reason: str = Field(description="Brief reason shown to the human.")
-    human: str = Field(default="owner", description="Human recipient name.")
+    human: str = Field(default=_RUNTIME_DEFAULTS.default_human, description="Human recipient name.")
 
 
 class RequestPermissionOutput(BaseModel):
@@ -27,8 +31,7 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
     )
     args_schema = RequestPermissionArgs
     output_schema = RequestPermissionOutput
-    version = "1.0.0"
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=5.0)
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["permission", "human", "capability"]
 
     def run(self, args: RequestPermissionArgs, ctx: ToolContext) -> RequestPermissionOutput:

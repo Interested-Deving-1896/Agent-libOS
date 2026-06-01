@@ -7,11 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.exceptions import LibOSError
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _API_MODES = {"auto", "responses", "chat"}
+_LLM_DEFAULTS = DEFAULT_CONFIG.llm
 
 
 class LLMError(LibOSError):
@@ -34,10 +36,10 @@ class LLMClient:
     base_url: str | None = None
     model: str | None = None
     api_key: str | None = None
-    timeout: float = 60.0
-    max_retries: int = 2
-    api_mode: Literal["auto", "responses", "chat"] = "auto"
-    store: bool = False
+    timeout: float = _LLM_DEFAULTS.timeout_s
+    max_retries: int = _LLM_DEFAULTS.max_retries
+    api_mode: Literal["auto", "responses", "chat"] = _LLM_DEFAULTS.api_mode
+    store: bool = _LLM_DEFAULTS.store
     reasoning_effort: str | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
     _client: Any | None = field(default=None, init=False, repr=False)
@@ -53,10 +55,10 @@ class LLMClient:
             base_url=os.getenv("OPENAI_BASE_URL"),
             model=os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"),
             api_key=os.getenv("OPENAI_API_KEY"),
-            timeout=_float_env("OPENAI_TIMEOUT", default=60.0),
-            max_retries=_int_env("OPENAI_MAX_RETRIES", default=2),
+            timeout=_float_env("OPENAI_TIMEOUT", default=_LLM_DEFAULTS.timeout_s),
+            max_retries=_int_env("OPENAI_MAX_RETRIES", default=_LLM_DEFAULTS.max_retries),
             api_mode=api_mode,  # type: ignore[arg-type]
-            store=_bool_env("OPENAI_STORE", default=False),
+            store=_bool_env("OPENAI_STORE", default=_LLM_DEFAULTS.store),
             reasoning_effort=_optional_env("OPENAI_REASONING_EFFORT"),
             verbosity=_verbosity_env("OPENAI_VERBOSITY"),
         )
@@ -64,8 +66,8 @@ class LLMClient:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        temperature: float = 0.2,
-        max_tokens: int = 1200,
+        temperature: float = _LLM_DEFAULTS.temperature,
+        max_tokens: int = _LLM_DEFAULTS.max_tokens,
         json_mode: bool = True,
     ) -> str:
         return _run_sync(
@@ -80,8 +82,8 @@ class LLMClient:
     async def acomplete(
         self,
         messages: list[dict[str, Any]],
-        temperature: float = 0.2,
-        max_tokens: int = 1200,
+        temperature: float = _LLM_DEFAULTS.temperature,
+        max_tokens: int = _LLM_DEFAULTS.max_tokens,
         json_mode: bool = True,
     ) -> str:
         selected_messages = self._messages_with_json_instruction(messages) if json_mode else messages
@@ -99,8 +101,8 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        temperature: float = 0.2,
-        max_tokens: int = 1200,
+        temperature: float = _LLM_DEFAULTS.temperature,
+        max_tokens: int = _LLM_DEFAULTS.max_tokens,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_action(
@@ -115,8 +117,8 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        temperature: float = 0.2,
-        max_tokens: int = 1200,
+        temperature: float = _LLM_DEFAULTS.temperature,
+        max_tokens: int = _LLM_DEFAULTS.max_tokens,
     ) -> LLMCompletion:
         if self._use_responses_api():
             try:
@@ -313,7 +315,7 @@ class LLMClient:
     async def _call_with_compatibility(self, create: Any, payload: dict[str, Any], api: str) -> Any:
         request = dict(payload)
         last_error: Exception | None = None
-        for _attempt in range(8):
+        for _attempt in range(_LLM_DEFAULTS.compatibility_retry_attempts):
             try:
                 return await create(**request)
             except Exception as exc:
@@ -491,7 +493,7 @@ class LLMClient:
         if _messages_contain_json_instruction(messages):
             return messages
         new_messages = [dict(message) for message in messages]
-        json_instruction = "You must respond with a valid JSON object."
+        json_instruction = _LLM_DEFAULTS.json_instruction
         for msg in new_messages:
             if msg.get("role") in {"system", "developer"}:
                 msg["content"] = str(msg.get("content", "")) + f" {json_instruction}"
@@ -553,7 +555,7 @@ def _is_openai_sdk_error(exc: Exception) -> bool:
 def _should_fallback_to_chat(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
     message = str(exc).lower()
-    if status_code in {404, 405}:
+    if status_code in _LLM_DEFAULTS.fallback_status_codes:
         return True
     return any(
         fragment in message
