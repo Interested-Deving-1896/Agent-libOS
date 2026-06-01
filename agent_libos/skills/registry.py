@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import builtins
 
-from agent_libos.exceptions import NotFound
+from agent_libos.models.exceptions import NotFound
 from agent_libos.skills.schema import SkillSpec
 
 

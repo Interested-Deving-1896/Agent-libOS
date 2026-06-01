@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.exceptions import LibOSError
+from agent_libos.models.exceptions import LibOSError
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}

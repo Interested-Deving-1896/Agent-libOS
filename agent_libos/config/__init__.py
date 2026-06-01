@@ -8,6 +8,9 @@ from agent_libos.config.defaults import (
     ProcessDefaults,
     RuntimeDefaults,
     SchedulerDefaults,
+    ShellCommandRule,
+    ShellDefaults,
+    ShellPolicyLevel,
     ScriptDefaults,
     ToolDefaults,
 )
@@ -22,6 +25,9 @@ __all__ = [
     "ProcessDefaults",
     "RuntimeDefaults",
     "SchedulerDefaults",
+    "ShellCommandRule",
+    "ShellDefaults",
+    "ShellPolicyLevel",
     "ScriptDefaults",
     "ToolDefaults",
 ]

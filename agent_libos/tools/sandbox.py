@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.exceptions import SandboxError
+from agent_libos.models.exceptions import SandboxError
 from agent_libos.models import ValidationResult
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools

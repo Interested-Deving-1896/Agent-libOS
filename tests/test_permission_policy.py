@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.exceptions import HumanApprovalRequired
+from agent_libos.models.exceptions import HumanApprovalRequired
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
 

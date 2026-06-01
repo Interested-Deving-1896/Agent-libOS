@@ -8,8 +8,8 @@ from typing import Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import CapabilityRight
-from agent_libos.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
-from agent_libos.ids import new_id, utc_now
+from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
     EventType,
     HumanRequest,
@@ -558,6 +558,13 @@ class HumanObjectManager:
             ("will overwrite", "will_overwrite"),
             ("content bytes", "content_bytes"),
             ("content sha256", "content_sha256"),
+            ("argv", "argv"),
+            ("command", "command"),
+            ("timeout seconds", "timeout_s"),
+            ("policy level", "policy_level"),
+            ("policy reason", "policy_reason"),
+            ("matched rule", "matched_rule"),
+            ("high risk", "high_risk"),
         ]:
             if key in context:
                 lines.append(f"- {label}: {context[key]}")

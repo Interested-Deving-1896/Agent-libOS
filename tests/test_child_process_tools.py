@@ -15,6 +15,9 @@ class ChildProcessToolTests(unittest.TestCase):
     def test_fork_wait_tool_blocks_parent_until_child_exits_and_exposes_result(self) -> None:
         runtime = Runtime.open("local")
         try:
+            # This test needs the parent to reach wait_child_process before
+            # the newly forked child gets a scheduler task.
+            runtime.scheduler.poll_interval_s = 1.0
             client = ParentChildClient()
             runtime.llm.client = client
             parent = runtime.process.spawn(image="base-agent:v0", goal="fork child and wait")
@@ -129,6 +132,12 @@ class ParentChildClient:
         self.child_pid: str | None = None
         self.parent_step = 0
         self.calls = 0
+
+    async def acomplete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        # Keep this test focused on child wait/resume semantics. The generic
+        # sync-client path runs in a worker thread, which can let the scheduler
+        # start the child before the parent has issued wait_child_process.
+        return self.complete_action(messages, tools)
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1

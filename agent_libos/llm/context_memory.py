@@ -5,7 +5,7 @@ from dataclasses import replace
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.ids import estimate_tokens, utc_now
+from agent_libos.utils.ids import estimate_tokens, utc_now
 from agent_libos.models import (
     AgentImage,
     AgentObject,

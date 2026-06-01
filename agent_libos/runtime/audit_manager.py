@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_libos.ids import new_id, utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import AuditRecord
 from agent_libos.storage import SQLiteStore
 

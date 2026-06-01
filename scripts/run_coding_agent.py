@@ -17,13 +17,21 @@ from agent_libos.capability.manager import CapabilityManager  # noqa: E402
 from agent_libos.config import DEFAULT_CONFIG  # noqa: E402
 from agent_libos.llm.client import load_dotenv  # noqa: E402
 from agent_libos.models import Capability, CapabilityRight, ProcessStatus  # noqa: E402
-from agent_libos.serde import to_jsonable  # noqa: E402
+from agent_libos.utils.serde import to_jsonable  # noqa: E402
 from agent_libos.substrate import LocalResourceProviderSubstrate  # noqa: E402
 
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _LAUNCHER_DEFAULTS = DEFAULT_CONFIG.launcher
+_SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 PERMISSION_PRESETS = _LAUNCHER_DEFAULTS.permission_presets
+SHELL_POLICY_CHOICES = (
+    "none",
+    _SHELL_DEFAULTS.always_deny_level,
+    _SHELL_DEFAULTS.allowlist_auto_else_ask_level,
+    _SHELL_DEFAULTS.blocklist_ask_else_auto_level,
+    _SHELL_DEFAULTS.always_allow_level,
+)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -105,6 +113,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-dir", action="append", default=[], help="Extra workspace-relative directory write grant.")
     parser.add_argument("--delete-dir", action="append", default=[], help="Extra workspace-relative directory delete grant.")
     parser.add_argument(
+        "--shell-policy",
+        choices=SHELL_POLICY_CHOICES,
+        default=_SHELL_DEFAULTS.default_policy_level,
+        help=(
+            "Shell execution policy. Default auto-allows configured whitelist commands and asks for the rest. "
+            "always_allow is high risk."
+        ),
+    )
+    parser.add_argument(
         "--max-quanta",
         type=int,
         default=_RUNTIME_DEFAULTS.launcher_max_quanta,
@@ -137,6 +154,8 @@ def configure_coding_agent_permissions(
         grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by="coding-agent-launcher"))
     if args.permission_preset == _LAUNCHER_DEFAULTS.full_preset:
         grants.append(runtime.filesystem.grant_workspace(pid, [CapabilityRight.DELETE], issued_by="coding-agent-launcher"))
+    if args.shell_policy != "none":
+        grants.append(runtime.shell.grant_policy(pid, args.shell_policy, issued_by="coding-agent-launcher"))
 
     grants.extend(
         runtime.filesystem.grant_path_list(
@@ -214,6 +233,7 @@ def _capability_summary(capability: Capability) -> dict[str, Any]:
         "resource": capability.resource,
         "rights": sorted(capability.rights),
         "policy": capability.constraints.get(CapabilityManager.POLICY_KEY, CapabilityManager.ALWAYS_ALLOW),
+        "shell_policy": capability.constraints.get(_SHELL_DEFAULTS.policy_capability_key),
     }
 
 

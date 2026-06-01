@@ -8,9 +8,9 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.exceptions import HumanApprovalRequired, NotFound, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessWaitRequired, ValidationError
 from agent_libos.human.manager import HumanObjectManager
-from agent_libos.ids import new_id, utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     EventType,

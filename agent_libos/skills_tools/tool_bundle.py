@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 from dataclasses import dataclass, field
 
-from agent_libos.exceptions import NotFound
+from agent_libos.models.exceptions import NotFound
 
 
 @dataclass(frozen=True)

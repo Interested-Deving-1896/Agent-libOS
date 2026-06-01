@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.exceptions import HumanResponseRequired
+from agent_libos.models.exceptions import HumanResponseRequired
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime

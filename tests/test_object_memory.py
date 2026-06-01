@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from agent_libos import Runtime
-from agent_libos.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.models import CapabilityRight, ObjectPatch, ObjectQuery, ObjectType
 
 

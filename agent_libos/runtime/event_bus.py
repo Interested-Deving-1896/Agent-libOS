@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 from typing import Any
 
-from agent_libos.ids import new_id, utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import Event, EventPriority, EventType
 from agent_libos.storage import SQLiteStore
 

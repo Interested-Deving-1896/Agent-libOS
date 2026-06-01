@@ -26,6 +26,7 @@ from agent_libos.tools.builtin.process import (
     SignalChildProcessTool,
     WaitChildProcessTool,
 )
+from agent_libos.tools.builtin.shell import RunShellCommandTool
 
 __all__ = [
     "CreateMemoryObjectTool",
@@ -48,6 +49,7 @@ __all__ = [
     "ListMemoryNamespaceTool",
     "ReadTextFileTool",
     "RequestPermissionTool",
+    "RunShellCommandTool",
     "SignalChildProcessTool",
     "SleepTool",
     "WaitChildProcessTool",

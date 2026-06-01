@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_libos.models import AgentImage, AgentProcess, Capability, Event, MaterializedContext
-from agent_libos.serde import loads
+from agent_libos.utils.serde import loads
 
 
 ACTION_PROTOCOL = """

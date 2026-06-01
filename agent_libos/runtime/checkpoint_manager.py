@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent_libos.ids import new_id, utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import Checkpoint, EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus

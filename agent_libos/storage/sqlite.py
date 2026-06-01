@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-from agent_libos.ids import utc_now
+from agent_libos.utils.ids import utc_now
 from agent_libos.models import (
     AgentObject,
     AgentProcess,
@@ -34,7 +34,7 @@ from agent_libos.models import (
     ToolSpec,
     ViewMode,
 )
-from agent_libos.serde import dumps, loads
+from agent_libos.utils.serde import dumps, loads
 
 
 class SQLiteStore:

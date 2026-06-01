@@ -8,7 +8,7 @@ from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ProcessStatus
-from agent_libos.serde import to_jsonable
+from agent_libos.utils.serde import to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts

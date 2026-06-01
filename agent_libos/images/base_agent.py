@@ -95,6 +95,10 @@ Tool-use guidance:
   the task or clearly safe generated cleanup.
 - get_current_time / sleep: reserve for temporal coordination, timestamps, and
   bounded waits.
+- run_shell_command: use only for verification or repository inspection that
+  truly needs a host command. Pass argv arrays, not shell strings; shell policy
+  may auto-allow listed commands, ask for unlisted/blacklisted commands, or
+  deny all shell access.
 - parse_pytest_log: convert pytest output into structured failure evidence.
 - process_exit: end as soon as the task is handled or honestly blocked.
 
@@ -140,6 +144,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "list_memory_namespace",
                 "read_memory_object",
                 "request_permission",
+                "run_shell_command",
                 "signal_child_process",
                 "sleep",
                 "wait_child_process",
@@ -172,6 +177,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "read_memory_object",
                 "read_text_file",
                 "request_permission",
+                "run_shell_command",
                 "signal_child_process",
                 "sleep",
                 "wait_child_process",
@@ -222,6 +228,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "read_memory_object",
                 "read_text_file",
                 "request_permission",
+                "run_shell_command",
                 "signal_child_process",
                 "sleep",
                 "wait_child_process",

@@ -3,6 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+ShellPolicyLevel = Literal[
+    "always_deny",
+    "allowlist_auto_else_ask",
+    "blocklist_ask_else_auto",
+    "always_allow",
+]
+
+
+@dataclass(frozen=True)
+class ShellCommandRule:
+    argv: tuple[str, ...]
+    match: Literal["exact", "prefix"] = "exact"
+    description: str = ""
+
 
 @dataclass(frozen=True)
 class RuntimeDefaults:
@@ -88,6 +102,80 @@ class ToolDefaults:
 
 
 @dataclass(frozen=True)
+class ShellDefaults:
+    policy_capability_key: str = "shell_policy_level"
+    policy_resource: str = "shell:*"
+    default_policy_level: ShellPolicyLevel = "allowlist_auto_else_ask"
+    always_deny_level: ShellPolicyLevel = "always_deny"
+    allowlist_auto_else_ask_level: ShellPolicyLevel = "allowlist_auto_else_ask"
+    blocklist_ask_else_auto_level: ShellPolicyLevel = "blocklist_ask_else_auto"
+    always_allow_level: ShellPolicyLevel = "always_allow"
+    high_risk_level: ShellPolicyLevel = "always_allow"
+    max_stdout_chars: int = 32_000
+    max_stderr_chars: int = 32_000
+    whitelist: tuple[ShellCommandRule, ...] = (
+        ShellCommandRule(("git", "status")),
+        ShellCommandRule(("git", "status", "--short")),
+        ShellCommandRule(("git", "branch", "--show-current")),
+        ShellCommandRule(("git", "rev-parse", "--show-toplevel")),
+        ShellCommandRule(("git", "diff", "--stat")),
+        ShellCommandRule(("python", "--version")),
+        ShellCommandRule(("python3", "--version")),
+        ShellCommandRule(("uv", "--version")),
+    )
+    blacklist: tuple[ShellCommandRule, ...] = (
+        ShellCommandRule(("cmd",), match="prefix"),
+        ShellCommandRule(("powershell",), match="prefix"),
+        ShellCommandRule(("pwsh",), match="prefix"),
+        ShellCommandRule(("sh",), match="prefix"),
+        ShellCommandRule(("bash",), match="prefix"),
+        ShellCommandRule(("zsh",), match="prefix"),
+        ShellCommandRule(("fish",), match="prefix"),
+        ShellCommandRule(("python",), match="prefix"),
+        ShellCommandRule(("python3",), match="prefix"),
+        ShellCommandRule(("py",), match="prefix"),
+        ShellCommandRule(("node",), match="prefix"),
+        ShellCommandRule(("npm",), match="prefix"),
+        ShellCommandRule(("npx",), match="prefix"),
+        ShellCommandRule(("yarn",), match="prefix"),
+        ShellCommandRule(("pnpm",), match="prefix"),
+        ShellCommandRule(("uv",), match="prefix"),
+        ShellCommandRule(("pip",), match="prefix"),
+        ShellCommandRule(("pip3",), match="prefix"),
+        ShellCommandRule(("ruby",), match="prefix"),
+        ShellCommandRule(("perl",), match="prefix"),
+        ShellCommandRule(("php",), match="prefix"),
+        ShellCommandRule(("java",), match="prefix"),
+        ShellCommandRule(("cargo",), match="prefix"),
+        ShellCommandRule(("docker",), match="prefix"),
+        ShellCommandRule(("kubectl",), match="prefix"),
+        ShellCommandRule(("ssh",), match="prefix"),
+        ShellCommandRule(("scp",), match="prefix"),
+        ShellCommandRule(("sftp",), match="prefix"),
+        ShellCommandRule(("curl",), match="prefix"),
+        ShellCommandRule(("wget",), match="prefix"),
+        ShellCommandRule(("nc",), match="prefix"),
+        ShellCommandRule(("ncat",), match="prefix"),
+        ShellCommandRule(("netcat",), match="prefix"),
+        ShellCommandRule(("rm",), match="prefix"),
+        ShellCommandRule(("del",), match="prefix"),
+        ShellCommandRule(("rmdir",), match="prefix"),
+        ShellCommandRule(("remove-item",), match="prefix"),
+        ShellCommandRule(("move-item",), match="prefix"),
+        ShellCommandRule(("copy-item",), match="prefix"),
+        ShellCommandRule(("chmod",), match="prefix"),
+        ShellCommandRule(("chown",), match="prefix"),
+        ShellCommandRule(("icacls",), match="prefix"),
+        ShellCommandRule(("reg",), match="prefix"),
+        ShellCommandRule(("regedit",), match="prefix"),
+        ShellCommandRule(("taskkill",), match="prefix"),
+        ShellCommandRule(("sudo",), match="prefix"),
+        ShellCommandRule(("su",), match="prefix"),
+        ShellCommandRule(("runas",), match="prefix"),
+    )
+
+
+@dataclass(frozen=True)
 class ObjectMemoryDefaults:
     object_schema_version: str = "1"
     materialize_budget_tokens: int = 8_000
@@ -143,6 +231,7 @@ class AgentLibOSConfig:
     process: ProcessDefaults = field(default_factory=ProcessDefaults)
     llm: LLMDefaults = field(default_factory=LLMDefaults)
     tools: ToolDefaults = field(default_factory=ToolDefaults)
+    shell: ShellDefaults = field(default_factory=ShellDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)

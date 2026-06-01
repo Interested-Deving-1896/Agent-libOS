@@ -59,6 +59,7 @@ Built-in tools currently include:
 - `read_memory_object`
 - `read_text_file`
 - `request_permission`
+- `run_shell_command`
 - `signal_child_process`
 - `sleep`
 - `wait_child_process`
@@ -74,6 +75,7 @@ Important boundary rules:
 - Bare Object Memory names resolve in the caller's process namespace; shared memory requires an explicit namespace plus namespace/object capabilities.
 - Filesystem read/write/delete checks happen in the filesystem primitive.
 - Human output and human approval checks happen in the HumanObject primitive.
+- Shell execution checks happen in the shell primitive. The model-facing tool accepts argv arrays only; it never accepts shell command strings for implicit parsing.
 - `ask_human` creates a blocking HumanObject question and returns the answer only after the human queue responds.
 - Clock `sleep` is async, so one sleeping process does not block other runnable processes.
 
@@ -86,6 +88,8 @@ Permission requests are ordinary process actions mediated by the human queue:
 - With `ask_each_time`, the relevant primitive creates a per-use human approval request when the operation is attempted.
 - Per-use approval grants a one-shot capability that is consumed after one successful primitive call.
 - Filesystem capabilities can target exact files such as `filesystem:workspace:README.md`, directory subtrees such as `filesystem:workspace:agent_outputs/*`, or the whole workspace.
+- Shell capabilities are process-scoped policies over `shell:*`. The built-in policy levels are `always_deny`, `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, and `always_allow`; `always_allow` is intentionally marked high-risk.
+- Shell allow/block lists match tokenized argv, not substrings, globs, or shell-expanded strings. Allow-list rules are exact by default, bare executable names do not match path-qualified executables, and block-list checks also scan nested executable-looking argv tokens such as `bash` or `powershell`.
 - Runtime helpers can grant file/directory allow lists separately for read, write, and delete operations.
 - Child processes inherit no external-resource capability by default; `fork_child_process` can explicitly inherit selected file, directory, or resource capabilities that the parent already holds.
 - Ordinary human questions use the same queue: a process waiting on `ask_human` stays in `WAITING_HUMAN` until the terminal queue supplies an answer.
@@ -209,6 +213,8 @@ uv run python scripts\run_coding_agent.py --workspace ..\some-repo --goal "Summa
 
 The launcher defaults to the `edit` permission preset: read+write over the workspace, but no delete authority. Use `--permission-preset read-only` for inspection-only runs, `--permission-preset full` for read+write+delete, or combine `read-only` with exact allow-list grants such as `--write-file src/main.py` and `--delete-dir build`.
 
+The launcher also grants a shell policy by default: `--shell-policy allowlist_auto_else_ask`. Use `--shell-policy none` to grant no shell execution policy, `always_deny` to hard-disable shell calls, `blocklist_ask_else_auto` to auto-allow commands except configured risky entries, or `always_allow` only for high-risk fully trusted runs.
+
 By default the launcher loads LLM settings from this Agent-libOS checkout's `.env` before switching to the target workspace. Use `--env-file /path/to/.env` to override that.
 
 Copy a workspace text file through named Object Memory without materializing the file content into the process prompt:
@@ -284,7 +290,7 @@ The key design boundary is between model-facing tools and libOS primitives. For 
 
 Putting a tool in a process table does not grant access to files, humans, shell, network, secrets, or other host resources.
 
-External primitives are not themselves the host implementation. They own libOS semantics: capability checks, human approval, event emission, and audit records. Concrete host calls live behind `agent_libos.substrate` providers such as `LocalFilesystemProvider`, `LocalClockProvider`, and `LocalShellProvider`.
+External primitives are not themselves the host implementation. They own libOS semantics: capability checks, human approval, event emission, and audit records. Concrete host calls live behind `agent_libos.substrate` providers such as `LocalFilesystemProvider`, `LocalClockProvider`, and `LocalShellProvider`. Shell calls are intentionally argv-only at this boundary, so quoting, pipes, redirects, and command chaining must be requested explicitly through an interpreter executable, where policy matching can see the interpreter token.
 
 ## Runtime Execution Model
 
@@ -366,7 +372,7 @@ agent_libos/
   api/             CLI entry points and demo orchestration
   capability/      Capability grant, revoke, check, and object handles
   config/          Typed runtime, LLM, tool, memory, launcher, and script defaults
-  external/        External-object primitives such as filesystem and clock
+  external/        External-object primitives such as filesystem, clock, and shell
   human/           HumanObject query, approval, interrupt, and output primitives
   images/          Built-in AgentImage definitions
   llm/             Prompt, context, OpenAI-compatible client, executor, action parser

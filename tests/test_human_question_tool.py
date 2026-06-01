@@ -5,7 +5,7 @@ import json
 import unittest
 
 from agent_libos import Runtime
-from agent_libos.exceptions import HumanResponseRequired
+from agent_libos.models.exceptions import HumanResponseRequired
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
 

@@ -5,7 +5,7 @@ from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.exceptions import ValidationError
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus

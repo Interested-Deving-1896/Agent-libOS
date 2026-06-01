@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.ids import utc_now
+from agent_libos.utils.ids import utc_now
 from agent_libos.models import ProcessStatus
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.storage import SQLiteStore

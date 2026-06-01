@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent_libos.exceptions import NotFound
+from agent_libos.models.exceptions import NotFound
 from agent_libos.skills_tools.action_schema import ActionSchema
 
 

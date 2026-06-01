@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_libos.exceptions import HumanApprovalRequired
+from agent_libos.models.exceptions import HumanApprovalRequired
 from agent_libos.runtime.runtime import Runtime
 
 

@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Generic, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessError, ProcessWaitRequired
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.models import ToolSpec
 
 InputT = TypeVar("InputT", bound=BaseModel)

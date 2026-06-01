@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from agent_libos import Runtime
-from agent_libos.exceptions import ValidationError
+from agent_libos.models.exceptions import ValidationError
 
 
 class Stage2SecurityTests(unittest.TestCase):

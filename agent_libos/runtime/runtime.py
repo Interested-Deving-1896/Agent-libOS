@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.external import ClockPrimitive, FilesystemAdapter
+from agent_libos.external import ClockPrimitive, FilesystemAdapter, ShellAdapter
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.images import build_default_images
 from agent_libos.llm.client import LLMClient
@@ -48,6 +48,7 @@ from agent_libos.tools.builtin import (
     SignalChildProcessTool,
     SleepTool,
     WaitChildProcessTool,
+    RunShellCommandTool,
     WriteDirectoryTool,
     WriteObjectToFileTool,
     WriteTextFileTool,
@@ -90,6 +91,14 @@ class Runtime:
             self.events,
             human=self.human,
             provider=self.substrate.filesystem,
+        )
+        self.shell = ShellAdapter(
+            self.capability,
+            self.audit,
+            self.events,
+            human=self.human,
+            provider=self.substrate.shell,
+            config=self.config,
         )
         self.tools = ToolBroker(
             store,
@@ -289,3 +298,4 @@ class Runtime:
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
         self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")

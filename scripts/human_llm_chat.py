@@ -10,7 +10,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.models import AgentImage, ProcessStatus, ResourceBudget
-from agent_libos.serde import to_jsonable
+from agent_libos.utils.serde import to_jsonable
 from scripts.llm_context_probe import last_tool_result, recent_events
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime

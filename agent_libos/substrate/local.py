@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.exceptions import CapabilityDenied
+from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.substrate.base import (
     CommandResult,
     DirectoryEntrySnapshot,

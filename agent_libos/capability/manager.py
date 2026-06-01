@@ -4,8 +4,8 @@ from dataclasses import replace
 from typing import Iterable
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.exceptions import CapabilityDenied, NotFound
-from agent_libos.ids import new_id, utc_now
+from agent_libos.models.exceptions import CapabilityDenied, NotFound
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import Capability, CapabilityRight, EventType, ObjectHandle
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
