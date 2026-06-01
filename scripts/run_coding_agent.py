@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -42,11 +41,9 @@ def main(argv: list[str] | None = None) -> None:
 async def amain(args: argparse.Namespace) -> None:
     _load_env(args)
     workspace = _resolve_workspace(args.workspace)
-    original_cwd = Path.cwd()
-    os.chdir(workspace)
     runtime = _open_runtime(args, workspace)
     try:
-        goal = _load_goal(args)
+        goal = _load_goal(args, workspace)
         pid = runtime.process.spawn(image=_RUNTIME_DEFAULTS.coding_image_id, goal=goal)
         grants = configure_coding_agent_permissions(runtime, pid, args)
         results: list[Any] = []
@@ -76,7 +73,6 @@ async def amain(args: argparse.Namespace) -> None:
             raise SystemExit(2)
     finally:
         runtime.close()
-        os.chdir(original_cwd)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--env-file",
-        help="LLM .env file to load before switching to the workspace. Defaults to this Agent-libOS checkout's .env.",
+        help="LLM .env file to load before mounting the workspace. Defaults to this Agent-libOS checkout's .env.",
     )
     parser.add_argument("--ephemeral-db", action="store_true", help="Use an in-memory runtime DB.")
     parser.add_argument(
@@ -204,11 +200,14 @@ def _resolve_db_path(args: argparse.Namespace, workspace: Path) -> Path:
     return db_path.resolve() if db_path.is_absolute() else (workspace / db_path).resolve()
 
 
-def _load_goal(args: argparse.Namespace) -> str:
+def _load_goal(args: argparse.Namespace, workspace: Path | None = None) -> str:
     if bool(args.goal) == bool(args.goal_file):
         raise SystemExit("provide exactly one of --goal or --goal-file")
     if args.goal_file:
-        return Path(args.goal_file).expanduser().read_text(encoding="utf-8").strip()
+        path = Path(args.goal_file).expanduser()
+        if not path.is_absolute() and workspace is not None:
+            path = workspace / path
+        return path.read_text(encoding="utf-8").strip()
     return str(args.goal).strip()
 
 

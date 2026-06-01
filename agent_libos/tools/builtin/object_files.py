@@ -73,12 +73,14 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         try:
             result = runtime.filesystem.read_text(
                 pid=ctx.pid,
                 path=args.path,
                 encoding=args.encoding,
                 max_bytes=args.max_bytes,
+                cwd=cwd,
             )
         except UnicodeDecodeError as exc:
             raise ToolExecutionError(
@@ -159,6 +161,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
                 text=text,
                 encoding=args.encoding,
                 overwrite=args.overwrite,
+                cwd=runtime.process.working_directory(ctx.pid),
             )
         except FileExistsError as exc:
             raise ToolExecutionError(

@@ -12,8 +12,9 @@ This project is still in active development.
 
 - Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`, `resume`, `exit`.
 - Async process supervisor: `Runtime.arun_until_idle()` automatically keeps runnable processes moving.
-- Child process tools can fork workers, wait/join, list direct children, signal direct children, and merge child memory.
+- Child process tools can fork workers, spawn fresh children, wait/join, list direct children, signal direct children, and merge child memory.
 - Each process gets its own default Object Memory namespace at spawn/fork time. Bare Object Memory names resolve inside that process namespace.
+- Each process has its own workspace-relative working directory. Relative filesystem paths and shell subprocess cwd resolve from that process cwd; the runtime host process does not `chdir` into launched workspaces.
 - Human queue integration is part of the runtime supervisor by default. If a primitive blocks on human approval, the process enters `WAITING_HUMAN`; the runtime processes human terminal messages, wakes the process, and resumes the pending action.
 - Child waits are also resumable: `wait_child_process` puts the parent in `WAITING_EVENT`, child exit wakes the parent, and the original wait action resumes without asking the model for a new action.
 - Single-step APIs remain available for tests and debugging: `run_next_process_once()` / `arun_next_process_once()` do not drain the human queue.
@@ -47,9 +48,12 @@ Built-in tools currently include:
 - `create_object_from_file`
 - `delete_directory`
 - `delete_file`
+- `exec_process`
 - `fork_child_process`
 - `get_current_time`
+- `get_working_directory`
 - `human_output`
+- `load_image_from_yaml`
 - `list_child_processes`
 - `list_memory_namespace`
 - `merge_child_memory`
@@ -60,8 +64,10 @@ Built-in tools currently include:
 - `read_text_file`
 - `request_permission`
 - `run_shell_command`
+- `set_working_directory`
 - `signal_child_process`
 - `sleep`
+- `spawn_child_process`
 - `wait_child_process`
 - `write_directory`
 - `write_object_to_file`
@@ -73,9 +79,11 @@ Important boundary rules:
 - A process can call only tools in its process tool table.
 - Tool call visibility is not an external-resource grant.
 - Bare Object Memory names resolve in the caller's process namespace; shared memory requires an explicit namespace plus namespace/object capabilities.
+- Relative filesystem paths and shell commands resolve from the caller's process working directory, which is independent for each `AgentProcess`.
 - Filesystem read/write/delete checks happen in the filesystem primitive.
 - Human output and human approval checks happen in the HumanObject primitive.
 - Shell execution checks happen in the shell primitive. The model-facing tool accepts argv arrays only; it never accepts shell command strings for implicit parsing.
+- Image registration checks happen in the image registry primitive. `load_image_from_yaml` only reads a workspace YAML file and passes the parsed manifest to that primitive.
 - `ask_human` creates a blocking HumanObject question and returns the answer only after the human queue responds.
 - Clock `sleep` is async, so one sleeping process does not block other runnable processes.
 
@@ -91,7 +99,10 @@ Permission requests are ordinary process actions mediated by the human queue:
 - Shell capabilities are process-scoped policies over `shell:*`. The built-in policy levels are `always_deny`, `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, and `always_allow`; `always_allow` is intentionally marked high-risk.
 - Shell allow/block lists match tokenized argv, not substrings, globs, or shell-expanded strings. Allow-list rules are exact by default, bare executable names do not match path-qualified executables, and block-list checks also scan nested executable-looking argv tokens such as `bash` or `powershell`.
 - Runtime helpers can grant file/directory allow lists separately for read, write, and delete operations.
-- Child processes inherit no external-resource capability by default; `fork_child_process` can explicitly inherit selected file, directory, or resource capabilities that the parent already holds.
+- Child processes inherit no external-resource capability by default; `fork_child_process` and `spawn_child_process` can explicitly inherit selected file, directory, or resource capabilities that the parent already holds.
+- `fork_child_process` attenuates a selected parent MemoryView into the child. `spawn_child_process` creates a fresh direct child with a new process namespace and a goal-only MemoryView.
+- `exec_process` replaces the current process image and tool table without changing pid. It never grants the target image's required capabilities automatically; capabilities are preserved only when explicitly requested, otherwise external capabilities are shrunk.
+- Image registration requires `write` on `image:<image_id>` or a wildcard such as `image:*`. The YAML loader also requires filesystem read authority for the manifest path.
 - Ordinary human questions use the same queue: a process waiting on `ask_human` stays in `WAITING_HUMAN` until the terminal queue supplies an answer.
 - Rejection does not crash the runtime; the process resumes and can report why it could not complete.
 - Approval context includes path, resource, overwrite risk, byte count, SHA-256, target state, and a `repr()`-escaped content preview.
@@ -108,7 +119,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 
 ### Built-In Coding Image
 
-`coding-agent:v0` is the practical repository-engineering image. It starts with read-only workspace authority and human-output authority, but no default write/delete authority. Its prompt tells the agent to scale the size of a change to the goal, preserve plans and evidence in Object Memory, fork child workers only when parallel analysis materially helps, use pregranted write/delete authority when present, request least-privilege permissions when authority is missing, use file/Object bridge tools for large content movement, parse pytest logs when available, and exit with a structured summary of changes, evidence, verification, residual risks, and follow-up.
+`coding-agent:v0` is the practical repository-engineering image. It starts with read-only workspace authority and human-output authority, but no default write/delete authority. Its prompt tells the agent to scale the size of a change to the goal, preserve plans and evidence in Object Memory, fork child workers only when parallel analysis materially helps, spawn fresh children when parent context should not be copied, use pregranted write/delete authority when present, request least-privilege permissions when authority is missing, use file/Object bridge tools for large content movement, parse pytest logs when available, and exit with a structured summary of changes, evidence, verification, residual risks, and follow-up.
 
 ### Security Properties Covered By Tests
 
@@ -116,7 +127,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 - Object Memory namespaces are capability-protected; namespace read/write and object read/write are separate checks.
 - Tool tables and external-resource capabilities are independent.
 - Tools cannot bypass filesystem or human primitive checks.
-- Path containment, revoked capabilities, fork attenuation, tool-table denial, JIT scope, and dangerous JIT imports are covered by tests.
+- Path containment, revoked capabilities, fork attenuation, spawn-child isolation, exec non-escalation, image registration authority, tool-table denial, JIT scope, and dangerous JIT imports are covered by tests.
 - Built-in LLM-facing tools are checked so they do not directly touch host filesystem, terminal, network, shell, database, or secrets.
 
 ## Quick Start
@@ -178,6 +189,23 @@ uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite human
 ```
 
+An AgentImage YAML manifest accepted by `load_image_from_yaml` can use either a top-level image mapping or direct image fields:
+
+```yaml
+image:
+  image_id: yaml-agent:v0
+  name: yaml-agent
+  system_prompt: |
+    Use the smallest safe tool sequence.
+  default_tools:
+    - read_memory_object
+    - human_output
+  context_policy: evidence_first
+  safety_profile: review
+  metadata:
+    role: example
+```
+
 ## Example Scripts
 
 Summarize a workspace document through an Agent process:
@@ -215,7 +243,7 @@ The launcher defaults to the `edit` permission preset: read+write over the works
 
 The launcher also grants a shell policy by default: `--shell-policy allowlist_auto_else_ask`. Use `--shell-policy none` to grant no shell execution policy, `always_deny` to hard-disable shell calls, `blocklist_ask_else_auto` to auto-allow commands except configured risky entries, or `always_allow` only for high-risk fully trusted runs.
 
-By default the launcher loads LLM settings from this Agent-libOS checkout's `.env` before switching to the target workspace. Use `--env-file /path/to/.env` to override that.
+By default the launcher loads LLM settings from this Agent-libOS checkout's `.env` before mounting the target workspace into the Resource Provider Substrate. It does not change the launcher process cwd. Use `--env-file /path/to/.env` to override that.
 
 Copy a workspace text file through named Object Memory without materializing the file content into the process prompt:
 

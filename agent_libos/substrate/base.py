@@ -74,7 +74,13 @@ class ClockProvider(Protocol):
 
 
 class ShellProvider(Protocol):
-    def run(self, argv: list[str], *, timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult: ...
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
+        cwd: str | None = None,
+    ) -> CommandResult: ...
 
 
 class ResourceProviderSubstrate(Protocol):

@@ -57,22 +57,31 @@ class ShellAdapter:
         self.human = human
         self.provider = provider or LocalShellProvider(cwd or ".")
 
-    def run(self, pid: str, argv: list[str], timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult:
+    def run(
+        self,
+        pid: str,
+        argv: list[str],
+        timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> CommandResult:
         checked = self._validate_argv(argv)
         resource = self.resource_for(checked)
         decision = self._authorize(pid, checked, resource, timeout=timeout)
         if decision.ask_human:
-            self._request_human_approval(pid, checked, resource, decision, timeout=timeout)
+            self._request_human_approval(pid, checked, resource, decision, timeout=timeout, cwd=cwd)
         if not decision.allowed:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
         try:
-            proc = self.provider.run(checked, timeout=timeout)
+            if cwd is None:
+                proc = self.provider.run(checked, timeout=timeout)
+            else:
+                proc = self.provider.run(checked, timeout=timeout, cwd=os.fspath(cwd))
         except subprocess.TimeoutExpired as exc:
             self.audit.record(
                 actor=pid,
                 action="external.shell.timeout",
                 target=resource,
-                decision={"argv": checked, "timeout_s": timeout},
+                decision={"argv": checked, "timeout_s": timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
             )
             raise TimeoutError(f"shell command timed out after {timeout}s: {checked}") from exc
         finally:
@@ -83,7 +92,7 @@ class ShellAdapter:
                     right=CapabilityRight.EXECUTE,
                     used_by="shell",
                 )
-        self._emit_run_event(pid, resource, checked, proc, decision)
+        self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd)
         self.audit.record(
             actor=pid,
             action="external.shell.run",
@@ -95,12 +104,19 @@ class ShellAdapter:
                 "policy_reason": decision.reason,
                 "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
                 "high_risk": decision.high_risk,
+                "cwd": os.fspath(cwd) if cwd is not None else None,
             },
         )
         return proc
 
-    async def arun(self, pid: str, argv: list[str], timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult:
-        return await asyncio.to_thread(self.run, pid, argv, timeout)
+    async def arun(
+        self,
+        pid: str,
+        argv: list[str],
+        timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> CommandResult:
+        return await asyncio.to_thread(self.run, pid, argv, timeout=timeout, cwd=cwd)
 
     def grant_policy(
         self,
@@ -207,6 +223,7 @@ class ShellAdapter:
         decision: ShellPolicyDecision,
         *,
         timeout: float,
+        cwd: str | os.PathLike[str] | None,
     ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for shell execute on {resource}")
@@ -227,6 +244,7 @@ class ShellAdapter:
                     "operation": "run",
                     "pid": pid,
                     "workspace_root": str(getattr(self.provider, "cwd", "")),
+                    "working_directory": os.fspath(cwd) if cwd is not None else ".",
                     "argv": list(argv),
                     "command": argv[0],
                     "resource": resource,
@@ -253,6 +271,8 @@ class ShellAdapter:
         argv: list[str],
         proc: CommandResult,
         decision: ShellPolicyDecision,
+        *,
+        cwd: str | os.PathLike[str] | None,
     ) -> None:
         if self.events is None:
             return
@@ -267,6 +287,7 @@ class ShellAdapter:
                 "returncode": proc.returncode,
                 "policy_level": decision.policy_level,
                 "high_risk": decision.high_risk,
+                "cwd": os.fspath(cwd) if cwd is not None else None,
             },
         )
 

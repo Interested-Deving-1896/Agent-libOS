@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import NotFound
 from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
@@ -48,6 +49,47 @@ class ProcessExitOutput(BaseModel):
     result_oid: str | None = None
 
 
+class GetWorkingDirectoryArgs(BaseModel):
+    pass
+
+
+class GetWorkingDirectoryOutput(BaseModel):
+    working_directory: str
+
+
+class SetWorkingDirectoryArgs(BaseModel):
+    path: str = Field(description="Workspace-relative directory, resolved from the current process working directory.")
+
+
+class SetWorkingDirectoryOutput(BaseModel):
+    working_directory: str
+
+
+class ExecProcessArgs(BaseModel):
+    image: str = Field(description="Target AgentImage id for the current process.")
+    args: dict[str, Any] = Field(default_factory=dict, description="Structured exec arguments recorded in audit.")
+    goal: str | dict[str, Any] | None = Field(
+        default=None,
+        description="Optional replacement goal for the new image.",
+    )
+    preserve_memory: bool = Field(default=True, description="Keep the current MemoryView unless a replacement is requested.")
+    preserve_capabilities: bool = Field(
+        default=False,
+        description="Keep existing capabilities. Exec never grants capabilities required by the target image.",
+    )
+
+
+class ExecProcessOutput(BaseModel):
+    pid: str
+    old_image: str
+    new_image: str
+    status: str
+    goal_oid: str | None
+    preserve_memory: bool
+    preserve_capabilities: bool
+    active_tools: list[str]
+
+
 class ForkChildProcessArgs(BaseModel):
     goal: str | dict[str, Any] = Field(description="Goal for the child AgentProcess.")
     mode: str = Field(default=ForkMode.WORKER.value, description="Fork mode: copy, restricted, speculative, or worker.")
@@ -83,6 +125,10 @@ class ForkChildProcessArgs(BaseModel):
         default_factory=list,
         description="Explicit capability specs to inherit, each with resource and rights.",
     )
+    working_directory: str | None = Field(
+        default=None,
+        description="Optional child working directory. Defaults to the parent's current working directory.",
+    )
 
 
 class ForkChildProcessOutput(BaseModel):
@@ -93,6 +139,47 @@ class ForkChildProcessOutput(BaseModel):
     status: str
     goal_oid: str | None
     inherited_capabilities: list[dict[str, Any]]
+    working_directory: str
+
+
+class SpawnChildProcessArgs(BaseModel):
+    goal: str | dict[str, Any] = Field(description="Goal for the fresh child AgentProcess.")
+    image: str | None = Field(default=None, description="Optional child image id. Defaults to the parent image.")
+    inherit_read_files: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative files whose read capability should be inherited by the child.",
+    )
+    inherit_write_files: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative files whose write capability should be inherited by the child.",
+    )
+    inherit_read_dirs: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative directories whose read capability should be inherited by the child.",
+    )
+    inherit_write_dirs: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative directories whose write capability should be inherited by the child.",
+    )
+    inherit_capabilities: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Explicit capability specs to inherit, each with resource and rights.",
+    )
+    working_directory: str | None = Field(
+        default=None,
+        description="Optional child working directory. Defaults to the parent's current working directory.",
+    )
+
+
+class SpawnChildProcessOutput(BaseModel):
+    child_pid: str
+    parent_pid: str
+    image: str
+    status: str
+    goal_oid: str | None
+    inherited_capabilities: list[dict[str, Any]]
+    fresh_memory_view: bool
+    working_directory: str
 
 
 class WaitChildProcessArgs(BaseModel):
@@ -112,6 +199,7 @@ class ChildProcessInfo(BaseModel):
     pid: str
     image: str
     status: str
+    working_directory: str
     goal_oid: str | None
     result_oid: str | None = None
     status_message: str | None = None
@@ -183,6 +271,82 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         return ProcessExitOutput(status="exited", result_oid=result_oid)
 
 
+class GetWorkingDirectoryTool(SyncAgentTool[GetWorkingDirectoryArgs]):
+    name = "get_working_directory"
+    description = "Return this AgentProcess working directory, relative to the runtime workspace root."
+    args_schema = GetWorkingDirectoryArgs
+    output_schema = GetWorkingDirectoryOutput
+    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    tags = ["process", "working_directory"]
+
+    def run(self, args: GetWorkingDirectoryArgs, ctx: ToolContext) -> GetWorkingDirectoryOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        return GetWorkingDirectoryOutput(working_directory=runtime.process.working_directory(ctx.pid))
+
+
+class SetWorkingDirectoryTool(SyncAgentTool[SetWorkingDirectoryArgs]):
+    name = "set_working_directory"
+    description = (
+        "Set this AgentProcess working directory. Relative filesystem and shell tool paths resolve from it."
+    )
+    args_schema = SetWorkingDirectoryArgs
+    output_schema = SetWorkingDirectoryOutput
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    tags = ["process", "working_directory"]
+
+    def run(self, args: SetWorkingDirectoryArgs, ctx: ToolContext) -> SetWorkingDirectoryOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        process = runtime.set_process_working_directory(ctx.pid, args.path)
+        return SetWorkingDirectoryOutput(working_directory=process.working_directory)
+
+
+class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
+    name = "exec_process"
+    description = (
+        "Replace the current AgentProcess image and tool table without changing pid. "
+        "Exec is not a permission escalation path: target image required capabilities are not granted automatically."
+    )
+    args_schema = ExecProcessArgs
+    output_schema = ExecProcessOutput
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    tags = ["process", "lifecycle", "exec"]
+
+    def run(self, args: ExecProcessArgs, ctx: ToolContext) -> ExecProcessOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        old_image = runtime.process.get(ctx.pid).image_id
+        try:
+            process = runtime.exec_process(
+                ctx.pid,
+                args.image,
+                args=args.args,
+                goal=args.goal,
+                preserve_memory=args.preserve_memory,
+                preserve_capabilities=args.preserve_capabilities,
+            )
+        except NotFound as exc:
+            raise ToolExecutionError(
+                "Target image does not exist.",
+                code=ToolErrorCode.VALIDATION_ERROR,
+                details={"image": args.image},
+            ) from exc
+        return ExecProcessOutput(
+            pid=process.pid,
+            old_image=old_image,
+            new_image=process.image_id,
+            status=process.status.value,
+            goal_oid=process.goal_oid,
+            preserve_memory=args.preserve_memory,
+            preserve_capabilities=args.preserve_capabilities,
+            active_tools=sorted(process.tool_table),
+        )
+
+
 class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
     name = "fork_child_process"
     description = (
@@ -220,7 +384,12 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             mode=_view_mode_for_fork(fork_mode),
             include_parent_roots=args.include_parent_roots,
         )
-        inherit_specs = self._inheritance_specs(runtime, args)
+        inherit_specs = self._inheritance_specs(runtime, args, cwd=parent.working_directory)
+        child_cwd = (
+            runtime.resolve_process_working_directory(ctx.pid, args.working_directory)
+            if args.working_directory is not None
+            else parent.working_directory
+        )
         child_pid = runtime.process.fork(
             parent=ctx.pid,
             goal=args.goal,
@@ -228,6 +397,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             inherit_capabilities=inherit_specs,
             image=image,
             mode=fork_mode,
+            working_directory=child_cwd,
         )
         child = runtime.process.get(child_pid)
         return ForkChildProcessOutput(
@@ -238,6 +408,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             status=child.status.value,
             goal_oid=child.goal_oid,
             inherited_capabilities=inherit_specs,
+            working_directory=child.working_directory,
         )
 
     def _selected_roots(self, runtime: Any, pid: str, root_oids: list[str] | None) -> list[ObjectHandle] | None:
@@ -261,19 +432,83 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             )
         return roots
 
-    def _inheritance_specs(self, runtime: Any, args: ForkChildProcessArgs) -> list[dict[str, Any]]:
+    def _inheritance_specs(
+        self,
+        runtime: Any,
+        args: ForkChildProcessArgs,
+        *,
+        cwd: str,
+    ) -> list[dict[str, Any]]:
         specs = [_normalize_capability_spec(spec) for spec in args.inherit_capabilities]
         for path in args.inherit_read_files:
-            specs.append({"resource": runtime.filesystem.resource_for_path(path), "rights": [CapabilityRight.READ.value]})
+            specs.append({"resource": runtime.filesystem.resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.READ.value]})
         for path in args.inherit_write_files:
-            specs.append({"resource": runtime.filesystem.resource_for_path(path), "rights": [CapabilityRight.WRITE.value]})
+            specs.append({"resource": runtime.filesystem.resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.WRITE.value]})
         for path in args.inherit_read_dirs:
             specs.append(
-                {"resource": runtime.filesystem.directory_resource_for_path(path), "rights": [CapabilityRight.READ.value]}
+                {"resource": runtime.filesystem.directory_resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.READ.value]}
             )
         for path in args.inherit_write_dirs:
             specs.append(
-                {"resource": runtime.filesystem.directory_resource_for_path(path), "rights": [CapabilityRight.WRITE.value]}
+                {"resource": runtime.filesystem.directory_resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.WRITE.value]}
+            )
+        return _coalesce_capability_specs(specs)
+
+
+class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
+    name = "spawn_child_process"
+    description = (
+        "Create a fresh direct child AgentProcess with a new process namespace and goal-only MemoryView. "
+        "Unlike fork_child_process, this does not copy parent memory roots."
+    )
+    args_schema = SpawnChildProcessArgs
+    output_schema = SpawnChildProcessOutput
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    tags = ["process", "child", "spawn"]
+
+    def run(self, args: SpawnChildProcessArgs, ctx: ToolContext) -> SpawnChildProcessOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        inherit_specs = self._inheritance_specs(runtime, args, cwd=runtime.process.working_directory(ctx.pid))
+        child_pid = runtime.spawn_child_process(
+            parent=ctx.pid,
+            goal=args.goal,
+            image=args.image,
+            inherit_capabilities=inherit_specs,
+            working_directory=args.working_directory,
+        )
+        child = runtime.process.get(child_pid)
+        return SpawnChildProcessOutput(
+            child_pid=child.pid,
+            parent_pid=ctx.pid,
+            image=child.image_id,
+            status=child.status.value,
+            goal_oid=child.goal_oid,
+            inherited_capabilities=inherit_specs,
+            fresh_memory_view=True,
+            working_directory=child.working_directory,
+        )
+
+    def _inheritance_specs(
+        self,
+        runtime: Any,
+        args: SpawnChildProcessArgs,
+        *,
+        cwd: str,
+    ) -> list[dict[str, Any]]:
+        specs = [_normalize_capability_spec(spec) for spec in args.inherit_capabilities]
+        for path in args.inherit_read_files:
+            specs.append({"resource": runtime.filesystem.resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.READ.value]})
+        for path in args.inherit_write_files:
+            specs.append({"resource": runtime.filesystem.resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.WRITE.value]})
+        for path in args.inherit_read_dirs:
+            specs.append(
+                {"resource": runtime.filesystem.directory_resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.READ.value]}
+            )
+        for path in args.inherit_write_dirs:
+            specs.append(
+                {"resource": runtime.filesystem.directory_resource_for_path(path, cwd=cwd), "rights": [CapabilityRight.WRITE.value]}
             )
         return _coalesce_capability_specs(specs)
 
@@ -403,6 +638,7 @@ def _child_info(child: AgentProcess) -> ChildProcessInfo:
         pid=child.pid,
         image=child.image_id,
         status=child.status.value,
+        working_directory=child.working_directory,
         goal_oid=child.goal_oid,
         result_oid=result_oid,
         status_message=child.status_message,

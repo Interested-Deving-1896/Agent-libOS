@@ -62,6 +62,7 @@ class ChildProcessToolTests(unittest.TestCase):
             listed = runtime.tools.call(parent, "list_child_processes", {})
             self.assertTrue(listed.ok, listed.error)
             self.assertEqual([entry["pid"] for entry in listed.payload["children"]], [child])
+            self.assertEqual(listed.payload["children"][0]["working_directory"], ".")
 
             paused = runtime.tools.call(parent, "signal_child_process", {"child_pid": child, "signal": "pause"})
             self.assertTrue(paused.ok, paused.error)
@@ -78,6 +79,85 @@ class ChildProcessToolTests(unittest.TestCase):
             denied_fork = runtime.tools.call(parent, "fork_child_process", {"goal": "second child"})
             self.assertFalse(denied_fork.ok)
             self.assertIn("exhausted child process budget", denied_fork.error or "")
+        finally:
+            runtime.close()
+
+    def test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="review-agent:v0", goal="parent")
+            parent_note = runtime.memory.create_object(
+                pid=parent,
+                object_type="observation",
+                name="parent.note",
+                payload={"visible_to_parent": True},
+            )
+
+            spawned = runtime.tools.call(
+                parent,
+                "spawn_child_process",
+                {"goal": "fresh child", "image": "coding-agent:v0"},
+            )
+
+            self.assertTrue(spawned.ok, spawned.error)
+            child = runtime.process.get(spawned.payload["child_pid"])
+            self.assertEqual(child.parent_pid, parent)
+            self.assertEqual(child.image_id, "coding-agent:v0")
+            self.assertIn("read_text_file", child.tool_table)
+            self.assertNotIn(parent_note.oid, [handle.oid for handle in child.memory_view.roots])
+            self.assertEqual([handle.oid for handle in child.memory_view.roots], [child.goal_oid])
+            read_resource = runtime.filesystem.resource_for_path("README.md")
+            self.assertFalse(runtime.capability.check(child.pid, read_resource, CapabilityRight.READ))
+        finally:
+            runtime.close()
+
+    def test_spawn_child_process_inherits_only_explicit_capabilities(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="review-agent:v0", goal="parent")
+            runtime.filesystem.grant_path(parent, "README.md", [CapabilityRight.READ], issued_by="test")
+
+            spawned = runtime.tools.call(
+                parent,
+                "spawn_child_process",
+                {"goal": "read one file", "inherit_read_files": ["README.md"]},
+            )
+
+            self.assertTrue(spawned.ok, spawned.error)
+            child = runtime.process.get(spawned.payload["child_pid"])
+            allowed = runtime.filesystem.resource_for_path("README.md")
+            other = runtime.filesystem.resource_for_path("pyproject.toml")
+            self.assertTrue(runtime.capability.check(child.pid, allowed, CapabilityRight.READ))
+            self.assertFalse(runtime.capability.check(child.pid, other, CapabilityRight.READ))
+        finally:
+            runtime.close()
+
+    def test_exec_process_swaps_image_without_granting_target_image_capabilities(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="become coding agent")
+            runtime.filesystem.grant_workspace(pid, [CapabilityRight.READ], issued_by="test")
+
+            executed = runtime.tools.call(
+                pid,
+                "exec_process",
+                {
+                    "image": "coding-agent:v0",
+                    "goal": "inspect without automatic capability lift",
+                    "preserve_capabilities": False,
+                    "preserve_memory": False,
+                },
+            )
+
+            self.assertTrue(executed.ok, executed.error)
+            process = runtime.process.get(pid)
+            self.assertEqual(process.image_id, "coding-agent:v0")
+            self.assertIn("read_text_file", process.tool_table)
+            self.assertIn("spawn_child_process", process.tool_table)
+            read_resource = runtime.filesystem.resource_for_path("README.md")
+            self.assertFalse(runtime.capability.check(pid, read_resource, CapabilityRight.READ))
+            self.assertEqual([handle.oid for handle in process.memory_view.roots], [process.goal_oid])
+            self.assertIn("process.exec", [record.action for record in runtime.audit.trace()])
         finally:
             runtime.close()
 

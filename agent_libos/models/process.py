@@ -80,6 +80,7 @@ class AgentProcess:
     resource_budget: ResourceBudget
     created_at: str
     updated_at: str
+    working_directory: str = "."
     status_message: str | None = None
 
 

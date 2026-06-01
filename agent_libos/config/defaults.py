@@ -52,6 +52,7 @@ class ProcessDefaults:
     max_runtime_seconds: int | None = None
     max_materialized_tokens: int = 65_536
     default_goal_text: str = "Run agent process"
+    default_working_directory: str = "."
     fork_budget_divisor: int = 2
     fork_min_tool_calls: int = 1
     fork_min_child_processes: int = 0
@@ -176,6 +177,18 @@ class ShellDefaults:
 
 
 @dataclass(frozen=True)
+class ImageDefaults:
+    registry_resource: str = "image:*"
+    id_max_chars: int = 128
+    name_max_chars: int = 128
+    version_max_chars: int = 64
+    max_default_tools: int = 128
+    max_required_capabilities: int = 64
+    yaml_max_bytes: int = 262_144
+    yaml_hard_limit_bytes: int = 1_048_576
+
+
+@dataclass(frozen=True)
 class ObjectMemoryDefaults:
     object_schema_version: str = "1"
     materialize_budget_tokens: int = 8_000
@@ -232,6 +245,7 @@ class AgentLibOSConfig:
     llm: LLMDefaults = field(default_factory=LLMDefaults)
     tools: ToolDefaults = field(default_factory=ToolDefaults)
     shell: ShellDefaults = field(default_factory=ShellDefaults)
+    image: ImageDefaults = field(default_factory=ImageDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)

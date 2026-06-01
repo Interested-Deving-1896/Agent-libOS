@@ -558,6 +558,7 @@ class HumanObjectManager:
             ("will overwrite", "will_overwrite"),
             ("content bytes", "content_bytes"),
             ("content sha256", "content_sha256"),
+            ("working directory", "working_directory"),
             ("argv", "argv"),
             ("command", "command"),
             ("timeout seconds", "timeout_s"),

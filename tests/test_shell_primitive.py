@@ -151,7 +151,7 @@ class FakeShellProvider:
     def __init__(self):
         self.calls: list[tuple[list[str], float]] = []
 
-    def run(self, argv: list[str], *, timeout: float = 30.0) -> CommandResult:
+    def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
         self.calls.append((list(argv), timeout))
         return CommandResult(argv=list(argv), returncode=0, stdout="ok\n", stderr="")
 

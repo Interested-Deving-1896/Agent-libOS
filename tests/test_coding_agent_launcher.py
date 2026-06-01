@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,7 +96,7 @@ class CodingAgentLauncherTests(unittest.TestCase):
             finally:
                 runtime.close()
 
-    def test_launcher_loads_project_env_before_workspace_switch(self) -> None:
+    def test_launcher_loads_project_env_before_workspace_mount(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp)
             env_file = project_root / ".env"
@@ -111,6 +112,18 @@ class CodingAgentLauncherTests(unittest.TestCase):
                 run_coding_agent._load_env(args)
 
         load.assert_called_once_with(env_file)
+
+    def test_launcher_does_not_change_host_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            before = Path.cwd()
+            args = run_coding_agent.build_parser().parse_args(
+                ["--goal", "inspect", "--workspace", tmp, "--ephemeral-db", "--no-run"]
+            )
+
+            with patch.object(run_coding_agent, "load_dotenv"):
+                asyncio.run(run_coding_agent.amain(args))
+
+            self.assertEqual(Path.cwd(), before)
 
     def test_explicit_missing_env_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

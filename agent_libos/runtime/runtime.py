@@ -14,9 +14,11 @@ from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import AgentImage
+from agent_libos.models.exceptions import NotFound
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.skills.linker import SkillLinker
@@ -33,9 +35,12 @@ from agent_libos.tools.builtin import (
     DeleteDirectoryTool,
     DeleteFileTool,
     EchoTool,
+    ExecProcessTool,
     ForkChildProcessTool,
     GetCurrentTimeTool,
+    GetWorkingDirectoryTool,
     HumanOutputTool,
+    LoadImageFromYamlTool,
     ListChildProcessesTool,
     ListMemoryNamespaceTool,
     MergeChildMemoryTool,
@@ -47,6 +52,8 @@ from agent_libos.tools.builtin import (
     RequestPermissionTool,
     SignalChildProcessTool,
     SleepTool,
+    SpawnChildProcessTool,
+    SetWorkingDirectoryTool,
     WaitChildProcessTool,
     RunShellCommandTool,
     WriteDirectoryTool,
@@ -117,6 +124,14 @@ class Runtime:
         self.skill_registry = RuntimeSkillRegistry()
         self.skills = SkillLinker(store, self.skill_registry, self.audit)
         self.images: dict[str, AgentImage] = build_default_images(self.config)
+        self.image_registry = ImageRegistryPrimitive(
+            self.images,
+            self.capability,
+            self.audit,
+            self.events,
+            self.tools.resolve,
+            config=self.config,
+        )
         self.llm = LLMProcessExecutor(self, llm_client, config=self.config)
         self._register_builtin_tools()
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
@@ -216,32 +231,89 @@ class Runtime:
             await asyncio.sleep(0)
         return results
 
-    def register_image(self, image: AgentImage) -> None:
-        self.images[image.image_id] = image
-        self.audit.record(
-            actor="runtime",
-            action="image.register",
-            target=f"image:{image.image_id}",
-            decision={"name": image.name, "version": image.version},
-        )
+    def register_image(self, image: AgentImage | dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> None:
+        self.image_registry.register(image, actor=actor, replace=replace)
 
     def get_image(self, image_id: str) -> AgentImage:
         return self.images[image_id]
+
+    def exec_process(
+        self,
+        pid: str,
+        image: str,
+        *,
+        args: dict[str, Any] | None = None,
+        goal: dict[str, Any] | str | None = None,
+        preserve_memory: bool = True,
+        preserve_capabilities: bool = False,
+    ) -> Any:
+        self._require_image(image)
+        self.process.exec(
+            pid,
+            image,
+            args=args,
+            goal=goal,
+            preserve_memory=preserve_memory,
+            preserve_capabilities=preserve_capabilities,
+        )
+        # Exec swaps the process image and tool table, but deliberately does not
+        # apply image required_capabilities. Exec may preserve existing
+        # capabilities or shrink them; it never grants new external authority.
+        self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
+        return self.process.get(pid)
+
+    def spawn_child_process(
+        self,
+        parent: str,
+        goal: dict[str, Any] | str,
+        *,
+        image: str | None = None,
+        inherit_capabilities: list[dict[str, Any]] | None = None,
+        working_directory: str | None = None,
+    ) -> str:
+        parent_process = self.process.get(parent)
+        selected_image = image or parent_process.image_id
+        self._require_image(selected_image)
+        selected_cwd = (
+            self.resolve_process_working_directory(parent, working_directory)
+            if working_directory is not None
+            else parent_process.working_directory
+        )
+        return self.process.spawn_child(
+            parent=parent,
+            goal=goal,
+            image=selected_image,
+            inherit_capabilities=inherit_capabilities,
+            working_directory=selected_cwd,
+        )
+
+    def set_process_working_directory(self, pid: str, path: str) -> Any:
+        relative = self.resolve_process_working_directory(pid, path)
+        return self.process.set_working_directory(pid, relative)
+
+    def resolve_process_working_directory(self, pid: str, path: str) -> str:
+        current_cwd = self.process.working_directory(pid)
+        target, relative = self.filesystem.resolve_path(path, cwd=current_cwd)
+        state = self.filesystem.provider.state(target)
+        if not state.exists:
+            raise NotFound(f"working directory does not exist: {relative}")
+        if state.kind != "directory":
+            raise NotFound(f"working directory is not a directory: {relative}")
+        return relative or "."
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
         process = self.store.get_process(pid)
         image = self.images.get(image_id) or self.images[self.config.runtime.default_image_id]
         # Tool visibility is fixed from the AgentImage at process creation time.
         # External-resource authority is still enforced later by the primitives.
-        tool_names = {"process_exit", "create_memory_object", *image.default_tools}
         try:
-            self.tools.configure_process_tools(pid, sorted(tool_names), assigned_by=f"image:{image_id}")
+            self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
         except Exception as exc:
             self.audit.record(
                 actor="runtime",
                 action="image.default_tool_configure_failed",
                 target=f"process:{pid}",
-                decision={"tools": sorted(tool_names), "error": str(exc)},
+                decision={"image": image_id, "error": str(exc)},
             )
         if process is not None and process.parent_pid is not None:
             self.audit.record(
@@ -271,8 +343,20 @@ class Runtime:
                     decision={"capability": spec, "error": str(exc)},
                 )
 
+    def _require_image(self, image_id: str) -> AgentImage:
+        image = self.images.get(image_id)
+        if image is None:
+            raise NotFound(f"agent image not found: {image_id}")
+        return image
+
+    def _configure_process_tools_for_image(self, pid: str, image_id: str, assigned_by: str) -> dict[str, str]:
+        image = self._require_image(image_id)
+        tool_names = {"process_exit", "create_memory_object", *image.default_tools}
+        return self.tools.configure_process_tools(pid, sorted(tool_names), assigned_by=assigned_by)
+
     def _register_builtin_tools(self) -> None:
         self.tools.register_tool(EchoTool(), registered_by="runtime")
+        self.tools.register_tool(ExecProcessTool(), registered_by="runtime")
         self.tools.register_tool(GetCurrentTimeTool(), registered_by="runtime")
         self.tools.register_tool(SleepTool(), registered_by="runtime")
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
@@ -283,6 +367,8 @@ class Runtime:
         self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
         self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(GetWorkingDirectoryTool(), registered_by="runtime")
+        self.tools.register_tool(LoadImageFromYamlTool(), registered_by="runtime")
         self.tools.register_tool(ListChildProcessesTool(), registered_by="runtime")
         self.tools.register_tool(ListMemoryNamespaceTool(), registered_by="runtime")
         self.tools.register_tool(MergeChildMemoryTool(), registered_by="runtime")
@@ -292,6 +378,8 @@ class Runtime:
         self.tools.register_tool(ReadMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
         self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(SetWorkingDirectoryTool(), registered_by="runtime")
+        self.tools.register_tool(SpawnChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
         self.tools.register_tool(WriteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")

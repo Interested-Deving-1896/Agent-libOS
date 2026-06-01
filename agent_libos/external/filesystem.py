@@ -94,8 +94,9 @@ class FilesystemAdapter:
         path: str | os.PathLike[str],
         encoding: str = _TOOL_DEFAULTS.default_text_encoding,
         max_bytes: int = _TOOL_DEFAULTS.filesystem_read_max_bytes,
+        cwd: str | os.PathLike[str] | None = None,
     ) -> FileReadResult:
-        target, relative = self._resolve(path)
+        target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
         self.capabilities.require(pid, resource, CapabilityRight.READ)
         target_state = self.provider.state(target)
@@ -128,8 +129,9 @@ class FilesystemAdapter:
         text: str,
         encoding: str = _TOOL_DEFAULTS.default_text_encoding,
         overwrite: bool = True,
+        cwd: str | os.PathLike[str] | None = None,
     ) -> FileWriteResult:
-        target, relative = self._resolve(path)
+        target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
         self._reject_definite_permission_denial(pid, resource, CapabilityRight.WRITE)
         target_state = self.provider.state(target)
@@ -182,8 +184,9 @@ class FilesystemAdapter:
         pid: str,
         path: str | os.PathLike[str],
         limit: int = _TOOL_DEFAULTS.directory_entry_limit,
+        cwd: str | os.PathLike[str] | None = None,
     ) -> DirectoryReadResult:
-        target, relative = self._resolve(path)
+        target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
         self.capabilities.require(pid, resource, CapabilityRight.READ)
         target_state = self.provider.state(target)
@@ -221,8 +224,9 @@ class FilesystemAdapter:
         path: str | os.PathLike[str],
         parents: bool = True,
         exist_ok: bool = True,
+        cwd: str | os.PathLike[str] | None = None,
     ) -> DirectoryWriteResult:
-        target, relative = self._resolve(path)
+        target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
         self._reject_definite_permission_denial(pid, resource, CapabilityRight.WRITE)
         target_state = self.provider.state(target)
@@ -275,8 +279,9 @@ class FilesystemAdapter:
         pid: str,
         path: str | os.PathLike[str],
         missing_ok: bool = False,
+        cwd: str | os.PathLike[str] | None = None,
     ) -> DeleteResult:
-        target, relative = self._resolve(path)
+        target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
         self._reject_definite_permission_denial(pid, resource, CapabilityRight.DELETE)
         target_state = self.provider.state(target)
@@ -330,8 +335,9 @@ class FilesystemAdapter:
         path: str | os.PathLike[str],
         recursive: bool = False,
         missing_ok: bool = False,
+        cwd: str | os.PathLike[str] | None = None,
     ) -> DeleteResult:
-        target, relative = self._resolve(path)
+        target, relative = self._resolve(path, cwd=cwd)
         if target.is_root:
             raise CapabilityDenied("cannot delete filesystem adapter root")
         resource = self.directory_resource_for(relative)
@@ -405,10 +411,11 @@ class FilesystemAdapter:
         path: str | os.PathLike[str],
         rights: Iterable[str | CapabilityRight],
         issued_by: str = "filesystem",
+        cwd: str | os.PathLike[str] | None = None,
     ) -> Capability:
         return self.capabilities.grant(
             subject=pid,
-            resource=self.resource_for_path(path),
+            resource=self.resource_for_path(path, cwd=cwd),
             rights=rights,
             issued_by=issued_by,
         )
@@ -419,10 +426,11 @@ class FilesystemAdapter:
         path: str | os.PathLike[str],
         rights: Iterable[str | CapabilityRight],
         issued_by: str = "filesystem",
+        cwd: str | os.PathLike[str] | None = None,
     ) -> Capability:
         return self.capabilities.grant(
             subject=pid,
-            resource=self.directory_resource_for_path(path),
+            resource=self.directory_resource_for_path(path, cwd=cwd),
             rights=rights,
             issued_by=issued_by,
         )
@@ -438,20 +446,21 @@ class FilesystemAdapter:
         write_dirs: Iterable[str | os.PathLike[str]] = (),
         delete_dirs: Iterable[str | os.PathLike[str]] = (),
         issued_by: str = "filesystem",
+        cwd: str | os.PathLike[str] | None = None,
     ) -> list[Capability]:
         grants: list[Capability] = []
         for path in read_files:
-            grants.append(self.grant_path(pid, path, [CapabilityRight.READ], issued_by=issued_by))
+            grants.append(self.grant_path(pid, path, [CapabilityRight.READ], issued_by=issued_by, cwd=cwd))
         for path in write_files:
-            grants.append(self.grant_path(pid, path, [CapabilityRight.WRITE], issued_by=issued_by))
+            grants.append(self.grant_path(pid, path, [CapabilityRight.WRITE], issued_by=issued_by, cwd=cwd))
         for path in delete_files:
-            grants.append(self.grant_path(pid, path, [CapabilityRight.DELETE], issued_by=issued_by))
+            grants.append(self.grant_path(pid, path, [CapabilityRight.DELETE], issued_by=issued_by, cwd=cwd))
         for path in read_dirs:
-            grants.append(self.grant_directory(pid, path, [CapabilityRight.READ], issued_by=issued_by))
+            grants.append(self.grant_directory(pid, path, [CapabilityRight.READ], issued_by=issued_by, cwd=cwd))
         for path in write_dirs:
-            grants.append(self.grant_directory(pid, path, [CapabilityRight.WRITE], issued_by=issued_by))
+            grants.append(self.grant_directory(pid, path, [CapabilityRight.WRITE], issued_by=issued_by, cwd=cwd))
         for path in delete_dirs:
-            grants.append(self.grant_directory(pid, path, [CapabilityRight.DELETE], issued_by=issued_by))
+            grants.append(self.grant_directory(pid, path, [CapabilityRight.DELETE], issued_by=issued_by, cwd=cwd))
         return grants
 
     def workspace_resource(self) -> str:
@@ -463,8 +472,8 @@ class FilesystemAdapter:
             return f"filesystem:{self.namespace}:"
         return f"filesystem:{self.namespace}:{relative}"
 
-    def resource_for_path(self, path: str | os.PathLike[str]) -> str:
-        _target, relative = self._resolve(path)
+    def resource_for_path(self, path: str | os.PathLike[str], cwd: str | os.PathLike[str] | None = None) -> str:
+        _target, relative = self._resolve(path, cwd=cwd)
         return self.resource_for(relative)
 
     def directory_resource_for(self, path: str | os.PathLike[str]) -> str:
@@ -473,16 +482,44 @@ class FilesystemAdapter:
             return self.workspace_resource()
         return f"filesystem:{self.namespace}:{relative}/*"
 
-    def directory_resource_for_path(self, path: str | os.PathLike[str]) -> str:
-        _target, relative = self._resolve(path)
+    def directory_resource_for_path(
+        self,
+        path: str | os.PathLike[str],
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> str:
+        _target, relative = self._resolve(path, cwd=cwd)
         return self.directory_resource_for(relative)
 
-    def _resolve(self, path: str | os.PathLike[str]) -> tuple[ResolvedPath, str]:
-        target = self.provider.resolve(path)
+    def resolve_path(
+        self,
+        path: str | os.PathLike[str],
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> tuple[ResolvedPath, str]:
+        return self._resolve(path, cwd=cwd)
+
+    def _resolve(
+        self,
+        path: str | os.PathLike[str],
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> tuple[ResolvedPath, str]:
+        target = self.provider.resolve(self._path_with_cwd(path, cwd))
         return target, target.relative
 
     def _logical_path(self, path: str | os.PathLike[str]) -> str:
         return os.fspath(path).replace("\\", "/")
+
+    def _path_with_cwd(
+        self,
+        path: str | os.PathLike[str],
+        cwd: str | os.PathLike[str] | None,
+    ) -> str:
+        raw = os.fspath(path)
+        if os.path.isabs(raw) or cwd is None or os.fspath(cwd) in {"", "."}:
+            return raw
+        cwd_path = self._logical_path(cwd).strip("/")
+        if cwd_path in {"", "."}:
+            return raw
+        return f"{cwd_path}/{raw}"
 
     def _require_write(
         self,

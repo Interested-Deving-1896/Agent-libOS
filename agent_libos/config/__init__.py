@@ -1,6 +1,7 @@
 from agent_libos.config.defaults import (
     DEFAULT_CONFIG,
     AgentLibOSConfig,
+    ImageDefaults,
     LLMContextDefaults,
     LLMDefaults,
     LauncherDefaults,
@@ -18,6 +19,7 @@ from agent_libos.config.defaults import (
 __all__ = [
     "DEFAULT_CONFIG",
     "AgentLibOSConfig",
+    "ImageDefaults",
     "LLMContextDefaults",
     "LLMDefaults",
     "LauncherDefaults",

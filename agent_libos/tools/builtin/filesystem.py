@@ -115,12 +115,14 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         try:
             result = runtime.filesystem.read_text(
                 pid=ctx.pid,
                 path=args.path,
                 encoding=args.encoding,
                 max_bytes=args.max_bytes,
+                cwd=cwd,
             )
         except UnicodeDecodeError as exc:
             raise ToolExecutionError(
@@ -157,10 +159,12 @@ class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         result = runtime.filesystem.read_directory(
             pid=ctx.pid,
             path=args.path,
             limit=args.limit,
+            cwd=cwd,
         )
         return ReadDirectoryOutput(
             path=result.path,
@@ -192,6 +196,7 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         try:
             result = runtime.filesystem.write_text(
                 pid=ctx.pid,
@@ -199,6 +204,7 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
                 text=args.content,
                 encoding=args.encoding,
                 overwrite=args.overwrite,
+                cwd=cwd,
             )
         except FileExistsError as exc:
             raise ToolExecutionError(
@@ -234,12 +240,14 @@ class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         try:
             result = runtime.filesystem.write_directory(
                 pid=ctx.pid,
                 path=args.path,
                 parents=args.parents,
                 exist_ok=args.exist_ok,
+                cwd=cwd,
             )
         except FileExistsError as exc:
             raise ToolExecutionError(
@@ -271,10 +279,12 @@ class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         result = runtime.filesystem.delete_file(
             pid=ctx.pid,
             path=args.path,
             missing_ok=args.missing_ok,
+            cwd=cwd,
         )
         return DeletePathOutput(
             path=result.path,
@@ -305,12 +315,14 @@ class DeleteDirectoryTool(SyncAgentTool[DeleteDirectoryArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         try:
             result = runtime.filesystem.delete_directory(
                 pid=ctx.pid,
                 path=args.path,
                 recursive=args.recursive,
                 missing_ok=args.missing_ok,
+                cwd=cwd,
             )
         except OSError as exc:
             raise ToolExecutionError(

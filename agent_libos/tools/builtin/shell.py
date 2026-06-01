@@ -63,8 +63,9 @@ class RunShellCommandTool(BaseAgentTool[RunShellCommandArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        cwd = runtime.process.working_directory(ctx.pid)
         try:
-            result = await runtime.shell.arun(ctx.pid, args.argv, timeout=args.timeout_s)
+            result = await runtime.shell.arun(ctx.pid, args.argv, timeout=args.timeout_s, cwd=cwd)
         except TimeoutError as exc:
             raise ToolExecutionError(
                 "Shell command timed out.",

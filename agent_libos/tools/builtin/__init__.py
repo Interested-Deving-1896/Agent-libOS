@@ -9,6 +9,7 @@ from agent_libos.tools.builtin.filesystem import (
     WriteTextFileTool,
 )
 from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
+from agent_libos.tools.builtin.images import LoadImageFromYamlTool
 from agent_libos.tools.builtin.memory import (
     AppendMemoryObjectTool,
     CreateMemoryNamespaceTool,
@@ -19,11 +20,15 @@ from agent_libos.tools.builtin.memory import (
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.permission import RequestPermissionTool
 from agent_libos.tools.builtin.process import (
+    ExecProcessTool,
     ForkChildProcessTool,
+    GetWorkingDirectoryTool,
     ListChildProcessesTool,
     MergeChildMemoryTool,
     ProcessExitTool,
     SignalChildProcessTool,
+    SpawnChildProcessTool,
+    SetWorkingDirectoryTool,
     WaitChildProcessTool,
 )
 from agent_libos.tools.builtin.shell import RunShellCommandTool
@@ -36,9 +41,12 @@ __all__ = [
     "DeleteDirectoryTool",
     "DeleteFileTool",
     "EchoTool",
+    "ExecProcessTool",
+    "GetWorkingDirectoryTool",
     "GetCurrentTimeTool",
     "AskHumanTool",
     "HumanOutputTool",
+    "LoadImageFromYamlTool",
     "ForkChildProcessTool",
     "ListChildProcessesTool",
     "MergeChildMemoryTool",
@@ -51,7 +59,9 @@ __all__ = [
     "RequestPermissionTool",
     "RunShellCommandTool",
     "SignalChildProcessTool",
+    "SetWorkingDirectoryTool",
     "SleepTool",
+    "SpawnChildProcessTool",
     "WaitChildProcessTool",
     "WriteDirectoryTool",
     "WriteObjectToFileTool",

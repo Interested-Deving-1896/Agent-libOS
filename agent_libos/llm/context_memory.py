@@ -159,6 +159,7 @@ class LLMContextMemory:
                 "safety_profile": image.safety_profile,
                 "context_policy": image.context_policy,
                 "parent_pid": process.parent_pid,
+                "initial_working_directory": process.working_directory,
                 "goal_oid": process.goal_oid,
                 "tool_names": sorted(_tool_name(tool) for tool in tools if _tool_name(tool)),
             },
@@ -169,6 +170,7 @@ class LLMContextMemory:
                     "pid": pid,
                     "parent_pid": process.parent_pid,
                     "goal_oid": process.goal_oid,
+                    "working_directory": process.working_directory,
                 }
             ],
             "captured": {
@@ -199,6 +201,7 @@ class LLMContextMemory:
             "status_message": process.status_message,
             "checkpoint_head": process.checkpoint_head,
             "image_id": image.image_id,
+            "working_directory": process.working_directory,
         }
         if captured.get("process_signature") != process_signature:
             entries.append({"kind": "process_snapshot", "at": utc_now(), **process_signature})

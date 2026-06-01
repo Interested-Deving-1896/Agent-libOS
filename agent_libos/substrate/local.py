@@ -112,16 +112,32 @@ class LocalShellProvider:
     """Subprocess-backed shell provider scoped to a configured working directory."""
 
     def __init__(self, cwd: str | Path):
-        self.cwd = Path(cwd)
+        self.cwd = Path(cwd).resolve()
 
-    def run(self, argv: list[str], *, timeout: float = _TOOL_DEFAULTS.shell_timeout_s) -> CommandResult:
-        proc = subprocess.run(argv, cwd=self.cwd, text=True, capture_output=True, timeout=timeout)
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
+        cwd: str | None = None,
+    ) -> CommandResult:
+        selected_cwd = self._resolve_cwd(cwd)
+        proc = subprocess.run(argv, cwd=selected_cwd, text=True, capture_output=True, timeout=timeout)
         return CommandResult(
             argv=list(argv),
             returncode=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
+
+    def _resolve_cwd(self, cwd: str | None) -> Path:
+        if cwd is None or cwd in {"", "."}:
+            return self.cwd
+        raw = Path(cwd)
+        target = raw.resolve() if raw.is_absolute() else (self.cwd / raw).resolve()
+        if self.cwd not in target.parents and target != self.cwd:
+            raise CapabilityDenied(f"shell working directory escapes workspace root: {cwd}")
+        return target
 
 
 class LocalResourceProviderSubstrate:

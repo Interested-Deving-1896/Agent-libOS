@@ -9,6 +9,7 @@ from agent_libos.models.base import EventID, StrEnum
 class EventType(StrEnum):
     PROCESS_CREATED = "process_created"
     PROCESS_FORKED = "process_forked"
+    PROCESS_EXEC = "process_exec"
     PROCESS_EXITED = "process_exited"
     PROCESS_SIGNAL = "process_signal"
     OBJECT_CREATED = "object_created"
@@ -16,6 +17,7 @@ class EventType(StrEnum):
     OBJECT_LINKED = "object_linked"
     HUMAN_QUERY = "human_query"
     HUMAN_RESPONSE = "human_response"
+    IMAGE_REGISTERED = "image_registered"
     TOOL_CALLED = "tool_called"
     TOOL_COMPLETED = "tool_completed"
     TOOL_FAILED = "tool_failed"

@@ -98,6 +98,7 @@ def _process_section(process: AgentProcess) -> str:
         f"- parent_pid: {process.parent_pid}\n"
         f"- image_id: {process.image_id}\n"
         f"- status: {process.status.value}\n"
+        f"- working_directory: {process.working_directory}\n"
         f"- goal_oid: {process.goal_oid}\n"
         f"- loaded_skills: {process.loaded_skills}\n"
         f"- tool_table: {process.tool_table}\n"

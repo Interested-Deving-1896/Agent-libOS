@@ -43,8 +43,10 @@ Adaptive operating loop:
    the process-visible tool result.
 3. Decompose. For independent analysis, fork_child_process with a precise goal,
    a narrow MemoryView, and only the file/directory capabilities it needs. Use
-   list_child_processes, wait_child_process, and merge_child_memory to collect
-   results. Signal children only to pause, resume, or stop stale work.
+   spawn_child_process when the child should start fresh instead of seeing a
+   forked parent MemoryView. Use list_child_processes, wait_child_process, and
+   merge_child_memory to collect results. Signal children only to pause,
+   resume, or stop stale work.
 4. Edit. Use write_text_file and write_directory for deliberate changes. If
    permission is already granted, act directly. If authority is missing, request
    the least-privilege permission for exact files or directories. Use
@@ -86,15 +88,26 @@ Tool-use guidance:
 - fork_child_process: delegate independent review, log analysis, impact search,
   or alternative patch planning. Children inherit no external-resource authority
   unless you explicitly pass a narrow subset.
+- spawn_child_process: create a fresh child with only its own goal in Object
+  Memory; use this when parent context would be distracting or over-privileged.
 - wait_child_process / merge_child_memory: join child work before relying on it.
 - signal_child_process: stop or pause direct children that are obsolete,
   over-budget, or waiting on the wrong thing.
+- exec_process: switch your current process to a different image/tool table
+  without changing pid. Exec does not automatically grant the target image's
+  required capabilities.
+- load_image_from_yaml: register a new AgentImage from a workspace YAML file.
+  The file still needs filesystem read authority, and registration needs image
+  write authority such as `image:*`.
 - write_text_file / write_directory: perform the actual repository change after
   inspection and, when needed, permission approval.
 - delete_file / delete_directory: remove only paths whose deletion is part of
   the task or clearly safe generated cleanup.
 - get_current_time / sleep: reserve for temporal coordination, timestamps, and
   bounded waits.
+- get_working_directory / set_working_directory: inspect or change this
+  process cwd. Relative filesystem paths and shell commands resolve from this
+  cwd independently for each AgentProcess.
 - run_shell_command: use only for verification or repository inspection that
   truly needs a host command. Pass argv arrays, not shell strings; shell policy
   may auto-allow listed commands, ask for unlisted/blacklisted commands, or
@@ -135,9 +148,12 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "ask_human",
                 "create_memory_namespace",
                 "create_memory_object",
+                "exec_process",
                 "fork_child_process",
                 "get_current_time",
+                "get_working_directory",
                 "human_output",
+                "load_image_from_yaml",
                 "list_child_processes",
                 "merge_child_memory",
                 "process_exit",
@@ -145,8 +161,10 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "read_memory_object",
                 "request_permission",
                 "run_shell_command",
+                "set_working_directory",
                 "signal_child_process",
                 "sleep",
+                "spawn_child_process",
                 "wait_child_process",
             ],
             context_policy=memory_defaults.context_policy,
@@ -165,9 +183,12 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "create_object_from_file",
                 "delete_directory",
                 "delete_file",
+                "exec_process",
                 "fork_child_process",
                 "get_current_time",
+                "get_working_directory",
                 "human_output",
+                "load_image_from_yaml",
                 "list_child_processes",
                 "list_memory_namespace",
                 "merge_child_memory",
@@ -178,8 +199,10 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "read_text_file",
                 "request_permission",
                 "run_shell_command",
+                "set_working_directory",
                 "signal_child_process",
                 "sleep",
+                "spawn_child_process",
                 "wait_child_process",
                 "write_directory",
                 "write_object_to_file",
@@ -218,9 +241,12 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "create_object_from_file",
                 "delete_directory",
                 "delete_file",
+                "exec_process",
                 "fork_child_process",
                 "get_current_time",
+                "get_working_directory",
                 "human_output",
+                "load_image_from_yaml",
                 "list_child_processes",
                 "list_memory_namespace",
                 "merge_child_memory",
@@ -229,8 +255,10 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "read_text_file",
                 "request_permission",
                 "run_shell_command",
+                "set_working_directory",
                 "signal_child_process",
                 "sleep",
+                "spawn_child_process",
                 "wait_child_process",
                 "write_directory",
                 "write_object_to_file",
