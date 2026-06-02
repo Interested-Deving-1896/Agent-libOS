@@ -59,15 +59,18 @@ Built-in tools currently include:
 - `merge_child_memory`
 - `parse_pytest_log`
 - `process_exit`
+- `propose_jit_tool`
 - `read_directory`
 - `read_memory_object`
 - `read_text_file`
+- `register_jit_tool`
 - `request_permission`
 - `run_shell_command`
 - `set_working_directory`
 - `signal_child_process`
 - `sleep`
 - `spawn_child_process`
+- `validate_jit_tool`
 - `wait_child_process`
 - `write_directory`
 - `write_object_to_file`
@@ -86,6 +89,11 @@ Important boundary rules:
 - Image registration checks happen in the image registry primitive. `load_image_from_yaml` only reads a workspace YAML file and passes the parsed manifest to that primitive.
 - `ask_human` creates a blocking HumanObject question and returns the answer only after the human queue responds.
 - Clock `sleep` is async, so one sleeping process does not block other runnable processes.
+- Agent-authored JIT tools are Deno/TypeScript modules. They export `run(args, libos)` and can reach libOS only through `await libos.syscall(name, args)`.
+- JIT syscalls do not consult the caller's LLM-facing tool table. They are authorized by pid, primitive-level capabilities, permission policy, human approval, and audit.
+- The Deno subprocess is launched with `--no-prompt` and no read/write/net/env/run/ffi host permissions. Static imports are limited to configured `jsr:` packages, with a small `@std/*` allowlist by default.
+- Human approval is part of a syscall. TypeScript sees either the final syscall payload or a final syscall error; it never sees a pending/retry protocol state.
+- `process.exit` and `process.exec` are ordinary syscalls from the TypeScript side. The runtime applies the resulting lifecycle change only after the JIT tool returns its normal tool result.
 
 ### Permissions And Human Queue
 
@@ -127,7 +135,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 - Object Memory namespaces are capability-protected; namespace read/write and object read/write are separate checks.
 - Tool tables and external-resource capabilities are independent.
 - Tools cannot bypass filesystem or human primitive checks.
-- Path containment, revoked capabilities, fork attenuation, spawn-child isolation, exec non-escalation, image registration authority, tool-table denial, JIT scope, and dangerous JIT imports are covered by tests.
+- Path containment, revoked capabilities, fork attenuation, spawn-child isolation, exec non-escalation, image registration authority, tool-table denial, Deno/TypeScript JIT scope, syscall capability checks, human approval inside syscalls, deferred process lifecycle, and unsafe import/API rejection are covered by tests.
 - Built-in LLM-facing tools are checked so they do not directly touch host filesystem, terminal, network, shell, database, or secrets.
 
 ## Quick Start
@@ -137,6 +145,8 @@ Install dependencies:
 ```bash
 uv sync
 ```
+
+Deno is optional for the Python test suite. Install `deno` or set `agent_libos.config.DEFAULT_CONFIG.tools.deno_executable` if you want to validate or run real Deno/TypeScript JIT tools.
 
 Run tests:
 
@@ -150,7 +160,7 @@ Run the deterministic local demo:
 uv run agent-libos demo
 ```
 
-The demo does not call a real model. It covers process spawn/fork, Object Memory, a JIT parser, checkpointing, capability denial before grant, human approval, filesystem write, final report object creation, and audit trace generation.
+The demo does not call a real model. It covers process spawn/fork, Object Memory, a Deno/TypeScript JIT parser when Deno is available, checkpointing, capability denial before grant, human approval, filesystem write, final report object creation, and audit trace generation. If Deno is not installed, the demo reports the JIT validation error and continues through the rest of the contract.
 
 Use a persistent local runtime database:
 
@@ -174,7 +184,7 @@ OPENAI_API_KEY=...
 
 The LLM client uses the OpenAI Python SDK. By default it uses the Responses API for OpenAI-hosted models and falls back to Chat Completions for custom OpenAI-compatible `base_url` providers. Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode. Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`, `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific `OPENAI_ENABLE_THINKING`.
 
-Runtime defaults that are not provider secrets live in `agent_libos.config.DEFAULT_CONFIG`. This includes scheduler quanta, process budgets, default image ids, workspace namespace, tool timeouts, filesystem/object-memory size limits, sandbox and shell timeouts, launcher presets, and example-script defaults. Components accept an `AgentLibOSConfig` where runtime-level injection is useful; fixed protocol identifiers and model-facing tool semantics stay in their own modules.
+Runtime defaults that are not provider secrets live in `agent_libos.config.DEFAULT_CONFIG`. This includes scheduler quanta, process budgets, default image ids, workspace namespace, tool timeouts, filesystem/object-memory size limits, Deno JIT sandbox limits, JSR import allowlists, shell policy lists, launcher presets, and example-script defaults. Components accept an `AgentLibOSConfig` where runtime-level injection is useful; fixed protocol identifiers and model-facing tool semantics stay in their own modules.
 
 Spawn and run a process:
 
@@ -188,6 +198,16 @@ uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 ```bash
 uv run agent-libos --db .agent_libos.sqlite human
 ```
+
+The CLI also exposes process built-ins for manual lifecycle control:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite cd <pid> src
+uv run agent-libos --db .agent_libos.sqlite exec image.yaml "Review README.md" --pid <pid> --run
+uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
+```
+
+For `exec`, the first positional argument is the target image. It can be an already registered image id such as `coding-agent:v0`, or a `.yaml` / `.yml` AgentImage manifest path such as `image.yaml`. The second positional argument is the replacement goal. `--run` runs the scheduler immediately after exec; omit it or pass `--no-run` to only swap the process image and tool table.
 
 An AgentImage YAML manifest accepted by `load_image_from_yaml` can use either a top-level image mapping or direct image fields:
 
@@ -393,6 +413,19 @@ Tools should not directly access host resources. Use this pattern:
 
 Do not put direct filesystem, terminal, network, shell, browser, database, or credential access inside a model-facing tool unless that code is itself the libOS primitive or a sandbox backend.
 
+Agent-authored JIT tools use TypeScript, not Python. A process proposes source with `propose_jit_tool`, validates it with `validate_jit_tool`, and registers it with `register_jit_tool`. Registration adds the new tool only to the registering process tool table.
+
+The TypeScript source shape is:
+
+```ts
+export async function run(args, libos) {
+  const file = await libos.syscall("filesystem.read_text", { path: args.path });
+  return { bytes: file.content.length };
+}
+```
+
+The `libos` object intentionally exposes only `syscall(name, args)`. It does not expose Python objects, `Runtime`, or `runtime.tools`. Syscall dispatch enters `LibOSSyscallSession`, which calls primitives such as filesystem, Object Memory, human, clock, process, shell, and image registry under the caller pid.
+
 ## Module Map
 
 ```text
@@ -406,7 +439,7 @@ agent_libos/
   llm/             Prompt, context, OpenAI-compatible client, executor, action parser
   memory/          Typed Object Memory and MemoryView implementation
   models/          Dataclass and enum models split by runtime domain
-  runtime/         Runtime composition, async scheduler, process manager, events, checkpoints, audit
+  runtime/         Runtime composition, syscall broker, async scheduler, process manager, events, checkpoints, audit
   skills/          Skill schema, registry, verifier, linker scaffolding
   skills_tools/    Tool/action registry and bundle scaffolding
   substrate/        Resource provider interfaces and the default local host-backed implementation
@@ -425,7 +458,7 @@ Near-term priorities:
 - Stronger checkpoint/rollback tests.
 - Audit querying by pid, capability, tool, external resource, and time range.
 - More complete terminal human queue UX.
-- Production-grade sandbox profiles for JIT and high-risk tools.
+- More hardened Deno JIT sandbox profiles and policy presets for high-risk tools.
 
 Longer-term directions:
 

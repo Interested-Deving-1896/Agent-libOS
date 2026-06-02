@@ -10,11 +10,11 @@ from agent_libos.tools.base import (
     ToolResult,
 )
 from agent_libos.tools.broker import ToolBroker
-from agent_libos.tools.sandbox import PythonSubprocessSandbox, SandboxBackend
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 
 __all__ = [
     "BaseAgentTool",
-    "PythonSubprocessSandbox",
+    "DenoTypescriptSandbox",
     "SandboxBackend",
     "SyncAgentTool",
     "ToolArtifact",

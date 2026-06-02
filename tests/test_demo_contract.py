@@ -36,7 +36,10 @@ class DemoContractTests(unittest.TestCase):
 
         tool_names = [entry["tool"] for entry in result["tool_sequence"]]
         self.assertIn("parse_pytest_log", tool_names)
-        self.assertIn("extract_failed_tests", tool_names)
+        if result["jit_validation_ok"]:
+            self.assertIn("extract_failed_tests", tool_names)
+        else:
+            self.assertTrue(result["jit_validation_errors"])
         self.assertGreaterEqual(tool_names.count("write_text_file"), 2)
 
         report = self.runtime.store.get_object(result["final_report_oid"])

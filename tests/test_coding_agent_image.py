@@ -68,6 +68,9 @@ class CodingAgentImageTests(unittest.TestCase):
                 "get_current_time",
                 "sleep",
                 "parse_pytest_log",
+                "propose_jit_tool",
+                "validate_jit_tool",
+                "register_jit_tool",
             }.issubset(tools)
         )
 

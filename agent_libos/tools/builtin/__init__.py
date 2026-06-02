@@ -10,6 +10,7 @@ from agent_libos.tools.builtin.filesystem import (
 )
 from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
 from agent_libos.tools.builtin.images import LoadImageFromYamlTool
+from agent_libos.tools.builtin.jit import ProposeJitTool, RegisterJitTool, ValidateJitTool
 from agent_libos.tools.builtin.memory import (
     AppendMemoryObjectTool,
     CreateMemoryNamespaceTool,
@@ -52,16 +53,19 @@ __all__ = [
     "MergeChildMemoryTool",
     "ParsePytestLogTool",
     "ProcessExitTool",
+    "ProposeJitTool",
     "ReadDirectoryTool",
     "ReadMemoryObjectTool",
     "ListMemoryNamespaceTool",
     "ReadTextFileTool",
     "RequestPermissionTool",
+    "RegisterJitTool",
     "RunShellCommandTool",
     "SignalChildProcessTool",
     "SetWorkingDirectoryTool",
     "SleepTool",
     "SpawnChildProcessTool",
+    "ValidateJitTool",
     "WaitChildProcessTool",
     "WriteDirectoryTool",
     "WriteObjectToFileTool",

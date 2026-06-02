@@ -4,10 +4,11 @@ import argparse
 import asyncio
 import json
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import CapabilityRight, ForkMode, MemoryViewSpec, ObjectMetadata, ObjectType, ToolCallResult, ViewMode
+from agent_libos.models import CapabilityRight, ForkMode, MemoryViewSpec, ObjectHandle, ObjectMetadata, ObjectType, ToolCallResult, ViewMode
 from agent_libos.runtime.runtime import Runtime
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -32,6 +33,36 @@ def main(argv: list[str] | None = None) -> None:
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image", default=_RUNTIME_DEFAULTS.default_image_id)
     spawn_parser.add_argument("--goal", required=True)
+    cd_parser = sub.add_parser("cd", help="Set an AgentProcess working directory")
+    cd_parser.add_argument("pid")
+    cd_parser.add_argument("path")
+    exec_parser = sub.add_parser("exec", help="Exec an AgentProcess into another image")
+    exec_parser.add_argument("image", help="Target AgentImage id, or a .yaml/.yml AgentImage manifest to load first.")
+    exec_parser.add_argument("goal", help="Replacement process goal.")
+    exec_parser.add_argument("--pid", required=True, help="Process id to exec.")
+    exec_parser.add_argument("--replace-image", action="store_true", help="Allow a YAML image manifest to replace an existing image id.")
+    exec_parser.add_argument("--args-json", default="{}", help="JSON object recorded as structured exec args.")
+    exec_parser.add_argument(
+        "--preserve-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep the current MemoryView across exec. Use --no-preserve-memory to replace it with the new goal only.",
+    )
+    exec_parser.add_argument(
+        "--preserve-capabilities",
+        action="store_true",
+        help="Keep existing external capabilities. Exec never grants target image required_capabilities automatically.",
+    )
+    run_group = exec_parser.add_mutually_exclusive_group()
+    run_group.add_argument("--run", dest="run", action="store_true", default=False, help="Run the scheduler after exec.")
+    run_group.add_argument("--no-run", dest="run", action="store_false", help="Only apply exec; do not run the scheduler.")
+    exec_parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    exit_parser = sub.add_parser("exit", help="Exit an AgentProcess")
+    exit_parser.add_argument("pid")
+    exit_parser.add_argument("--message", help="Optional process status message.")
+    exit_parser.add_argument("--payload", help="Optional JSON final-result payload. Non-JSON text is wrapped as content.")
+    exit_parser.add_argument("--result-oid", help="Existing object id to use as process result.")
+    exit_parser.add_argument("--failed", action="store_true", help="Mark the process as failed instead of exited.")
     llm_once_parser = sub.add_parser("llm-once", help="Run one LLM quantum for a process")
     llm_once_parser.add_argument("pid")
     run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
@@ -57,6 +88,12 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "spawn":
             pid = runtime.process.spawn(image=args.image, goal=args.goal)
             _print_json({"pid": pid, "image": args.image, "goal": args.goal})
+        elif args.command == "cd":
+            _print_json(_run_cd_command(runtime, args))
+        elif args.command == "exec":
+            _print_json(asyncio.run(_run_exec_command(runtime, args)))
+        elif args.command == "exit":
+            _print_json(_run_exit_command(runtime, args))
         elif args.command == "llm-once":
             _print_json(asyncio.run(runtime.arun_process_once(args.pid)))
         elif args.command == "run":
@@ -67,6 +104,140 @@ def main(argv: list[str] | None = None) -> None:
             _print_json([request.__dict__ for request in runtime.human.drain_terminal_queue()])
     finally:
         runtime.close()
+
+
+def _run_cd_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    before = runtime.process.working_directory(args.pid)
+    process = runtime.set_process_working_directory(args.pid, args.path)
+    return {
+        "pid": process.pid,
+        "previous_working_directory": before,
+        "working_directory": process.working_directory,
+    }
+
+
+async def _run_exec_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    loaded_image = (
+        _load_cli_image_from_yaml(runtime, args.image, replace=args.replace_image)
+        if _is_yaml_image_arg(args.image)
+        else None
+    )
+    target_image = loaded_image["image_id"] if loaded_image is not None else args.image
+    exec_args = _parse_json_mapping(args.args_json, "--args-json")
+    old_image = runtime.process.get(args.pid).image_id
+    process = runtime.exec_process(
+        args.pid,
+        target_image,
+        args=exec_args,
+        goal=args.goal,
+        preserve_memory=args.preserve_memory,
+        preserve_capabilities=args.preserve_capabilities,
+    )
+    results: list[Any] = []
+    if args.run:
+        results = await runtime.arun_until_idle(max_quanta=args.max_quanta)
+        process = runtime.process.get(args.pid)
+    return {
+        "pid": args.pid,
+        "goal": args.goal,
+        "image_arg": args.image,
+        "loaded_image": loaded_image,
+        "exec": {
+            "old_image": old_image,
+            "new_image": process.image_id,
+            "preserve_memory": args.preserve_memory,
+            "preserve_capabilities": args.preserve_capabilities,
+            "args": exec_args,
+        },
+        "process": _process_cli_summary(process),
+        "ran": args.run,
+        "results": results,
+    }
+
+
+def _run_exit_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    if args.payload is not None and args.result_oid is not None:
+        raise SystemExit("exit accepts at most one of --payload or --result-oid")
+    result_handle: ObjectHandle | None = None
+    if args.result_oid is not None:
+        result_handle = runtime.capability.handle_for_object(
+            args.pid,
+            args.result_oid,
+            {"read", "materialize", "link", "diff"},
+            issued_by="cli.exit",
+        )
+    elif args.payload is not None:
+        result_handle = runtime.memory.create_object(
+            pid=args.pid,
+            object_type=ObjectType.SUMMARY,
+            payload=_parse_json_value(args.payload),
+            metadata=ObjectMetadata(title="CLI process final result", tags=["final", "cli"]),
+        )
+    runtime.process.exit(args.pid, result=result_handle, failed=args.failed, message=args.message)
+    process = runtime.process.get(args.pid)
+    return {
+        "pid": process.pid,
+        "status": process.status.value,
+        "message": args.message,
+        "result_oid": result_handle.oid if result_handle is not None else None,
+    }
+
+
+def _load_cli_image_from_yaml(runtime: Runtime, value: str, *, replace: bool) -> dict[str, Any]:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if not path.exists():
+        raise SystemExit(f"image YAML does not exist: {path}")
+    if not path.is_file():
+        raise SystemExit(f"image YAML is not a file: {path}")
+    result = runtime.image_registry.register_from_yaml_text(
+        path.read_text(encoding="utf-8"),
+        actor="cli",
+        replace=replace,
+        require_capability=False,
+        source=str(path),
+    )
+    return {
+        "image_id": result.image.image_id,
+        "name": result.image.name,
+        "version": result.image.version,
+        "replaced": result.replaced,
+        "source": result.source,
+    }
+
+
+def _is_yaml_image_arg(value: str) -> bool:
+    return Path(value).suffix.lower() in {".yaml", ".yml"}
+
+
+def _parse_json_mapping(value: str, label: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{label} must be valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise SystemExit(f"{label} must be a JSON object")
+    return decoded
+
+
+def _parse_json_value(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return {"content": value}
+
+
+def _process_cli_summary(process: Any) -> dict[str, Any]:
+    return {
+        "pid": process.pid,
+        "image": process.image_id,
+        "status": process.status.value,
+        "goal_oid": process.goal_oid,
+        "working_directory": process.working_directory,
+        "active_tools": sorted(process.tool_table),
+    }
 
 
 def run_demo(runtime: Runtime) -> dict[str, Any]:
@@ -110,14 +281,17 @@ def run_demo(runtime: Runtime) -> dict[str, Any]:
             runtime.store.update_process(root_proc)
 
     jit_source = """
-def run(args):
-    log = args.get("log", "")
-    names = []
-    for line in log.splitlines():
-        line = line.strip()
-        if line.startswith("FAILED "):
-            names.append(line.split()[1])
-    return {"tests": names, "count": len(names)}
+export function run(args, libos) {
+  const log = String(args.log ?? "");
+  const names = [];
+  for (const rawLine of log.split("\\n")) {
+    const line = rawLine.trim();
+    if (line.startsWith("FAILED ")) {
+      names.push(line.split(/\\s+/)[1]);
+    }
+  }
+  return { tests: names, count: names.length };
+}
 """.strip()
     candidate = runtime.tools.propose(
         root,
@@ -192,7 +366,12 @@ def run(args):
                 "oid": worker_result.result.oid if worker_result.result else None,
                 "payload": parsed.payload,
             },
-            {"kind": "jit_extract_result", "payload": jit_result.payload if jit_result else None},
+            {
+                "kind": "jit_extract_result",
+                "payload": jit_result.payload if jit_result else None,
+                "validation_ok": validation.ok,
+                "validation_errors": validation.errors,
+            },
             {"kind": "filesystem_denial", "payload": denied_without_filesystem.payload, "error": denied_without_filesystem.error},
         ],
         "tool_sequence": tool_sequence,
@@ -244,6 +423,7 @@ def run(args):
         "worker_result_oid": worker_result.result.oid if worker_result.result else None,
         "jit_candidate": candidate,
         "jit_validation_ok": validation.ok,
+        "jit_validation_errors": validation.errors,
         "jit_result": jit_result.payload if jit_result else None,
         "approval_request": approval_request,
         "filesystem_write_denial": _tool_call_summary("write_text_file", root, denied_without_filesystem),

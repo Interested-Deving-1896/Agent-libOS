@@ -25,9 +25,10 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.storage import SQLiteStore
 from agent_libos.tools.base import BaseAgentTool, ToolContext
-from agent_libos.tools.sandbox import PythonSubprocessSandbox, SandboxBackend
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -54,7 +55,14 @@ class ToolBroker:
         self.human = human
         self.audit = audit
         self.events = events
-        self.sandbox = sandbox or PythonSubprocessSandbox(default_timeout_s=self.config.tools.sandbox_timeout_s)
+        self.sandbox = sandbox or DenoTypescriptSandbox(
+            deno_executable=self.config.tools.deno_executable,
+            default_timeout_s=self.config.tools.deno_timeout_s,
+            max_rpc_calls=self.config.tools.deno_max_rpc_calls,
+            max_stdout_bytes=self.config.tools.deno_max_stdout_bytes,
+            max_stderr_bytes=self.config.tools.deno_max_stderr_bytes,
+            jsr_allowlist=self.config.tools.deno_jsr_allowlist,
+        )
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self._tools: dict[str, BaseAgentTool] = {}
         self._tool_ids_by_name: dict[str, str] = {}
@@ -125,7 +133,7 @@ class ToolBroker:
         handle = self.resolve(tool, pid=pid)
         if not self._process_has_tool(pid, handle):
             raise ValidationError(
-                "tool execute capabilities are not used in the current MVP; configure process tools at creation time"
+                "tool execute capabilities are not a resource authority; configure process tools at creation time"
             )
         self.audit.record(
             actor=issued_by,
@@ -166,6 +174,7 @@ class ToolBroker:
             object_type=ObjectType.TOOL_CANDIDATE,
             payload={
                 "candidate_id": candidate.candidate_id,
+                "language": self.sandbox.language,
                 "spec": {
                     "name": tool_spec.name,
                     "description": tool_spec.description,
@@ -194,13 +203,15 @@ class ToolBroker:
         errors = list(result.errors)
         warnings = list(result.warnings)
         if candidate.requested_capabilities:
-            errors.append("MVP JIT tools cannot request external capabilities")
+            errors.append("Deno/TypeScript JIT tools cannot request external capabilities")
         validation = ValidationResult(ok=not errors and result.ok, errors=errors, warnings=warnings, logs=result.logs)
+        metadata = self.sandbox.metadata_for_source(candidate.source_code)
         candidate.validation = {
             "ok": validation.ok,
             "errors": validation.errors,
             "warnings": validation.warnings,
             "logs": validation.logs,
+            **metadata,
         }
         candidate.status = ToolCandidateStatus.VALIDATED if validation.ok else ToolCandidateStatus.REJECTED
         candidate.updated_at = utc_now()
@@ -265,8 +276,8 @@ class ToolBroker:
         handle = self.resolve(tool, pid=pid)
         resource = f"tool:{handle.tool_id}"
         if not self._process_has_tool(pid, handle):
-            # The process tool table is the only execute gate in this MVP. Host
-            # resources are still checked by the primitive each tool calls into.
+            # The process tool table gates only LLM-facing tool visibility.
+            # Host resources are checked by the primitive each tool calls into.
             call_id = new_id("tcall")
             error = f"tool is not in process tool table: {handle.name}"
             self.events.emit(
@@ -296,6 +307,7 @@ class ToolBroker:
             payload={"call_id": call_id, "args": args},
         )
         try:
+            jit_session: LibOSSyscallSession | None = None
             if handle.tool_id in self._tools:
                 tool_result = await self._tools[handle.tool_id].ainvoke(args, self._context(pid, handle, call_id))
                 if not tool_result.ok:
@@ -335,7 +347,16 @@ class ToolBroker:
                     "metadata": tool_result.metadata,
                 }
             elif handle.tool_id in self._jit_sources:
-                payload = await asyncio.to_thread(self.sandbox.run_source, self._jit_sources[handle.tool_id], args)
+                runtime = getattr(self, "runtime", None)
+                if runtime is None:
+                    raise RuntimeError("Runtime is unavailable for Deno JIT syscall execution.")
+                jit_session = LibOSSyscallSession(runtime, pid, config=self.config)
+                payload = await self.sandbox.arun_source(
+                    self._jit_sources[handle.tool_id],
+                    args,
+                    pid=pid,
+                    syscall_handler=jit_session.handle,
+                )
                 result_payload = {"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload}
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
@@ -402,6 +423,8 @@ class ToolBroker:
             output_refs=[result_handle.oid],
             decision={"ok": True, "tool": handle.name, "policy_decision": "allow"},
         )
+        if jit_session is not None:
+            await jit_session.apply_deferred_lifecycle(result_handle)
         return ToolCallResult(
             call_id=call_id,
             tool_id=handle.tool_id,

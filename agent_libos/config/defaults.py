@@ -91,6 +91,18 @@ class ToolDefaults:
     object_file_hard_limit_bytes: int = 10_485_760
     shell_timeout_s: float = 30.0
     sandbox_timeout_s: float = 5.0
+    deno_executable: str = "deno"
+    deno_timeout_s: float = 5.0
+    deno_max_rpc_calls: int = 64
+    deno_max_stdout_bytes: int = 1_000_000
+    deno_max_stderr_bytes: int = 100_000
+    deno_jsr_allowlist: tuple[str, ...] = (
+        "@std/assert",
+        "@std/collections",
+        "@std/encoding",
+        "@std/path",
+        "@std/yaml",
+    )
     static_tool_id_digest_chars: int = 16
     approval_preview_chars: int = 256
     clock_timezone: str = "UTC"

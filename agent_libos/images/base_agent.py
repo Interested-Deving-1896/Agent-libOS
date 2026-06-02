@@ -99,6 +99,11 @@ Tool-use guidance:
 - load_image_from_yaml: register a new AgentImage from a workspace YAML file.
   The file still needs filesystem read authority, and registration needs image
   write authority such as `image:*`.
+- propose_jit_tool / validate_jit_tool / register_jit_tool: create a
+  Deno/TypeScript JIT tool when a reusable computation or libOS syscall
+  sequence is clearer than repeated model tool calls. JIT source must export
+  run(args, libos) and use libos.syscall(...) for filesystem, memory, process,
+  human, shell, image, and clock primitives.
 - write_text_file / write_directory: perform the actual repository change after
   inspection and, when needed, permission approval.
 - delete_file / delete_directory: remove only paths whose deletion is part of
@@ -194,15 +199,18 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "merge_child_memory",
                 "parse_pytest_log",
                 "process_exit",
+                "propose_jit_tool",
                 "read_directory",
                 "read_memory_object",
                 "read_text_file",
+                "register_jit_tool",
                 "request_permission",
                 "run_shell_command",
                 "set_working_directory",
                 "signal_child_process",
                 "sleep",
                 "spawn_child_process",
+                "validate_jit_tool",
                 "wait_child_process",
                 "write_directory",
                 "write_object_to_file",
@@ -225,7 +233,19 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
             image_id="toolmaker-agent:v0",
             name="toolmaker-agent",
             version="v0",
-            system_prompt="Ephemeral tool generation and validation image.",
+            system_prompt=(
+                "Ephemeral Deno/TypeScript tool generation and validation image. "
+                "Generated tools export run(args, libos) and access libOS only through libos.syscall()."
+            ),
+            default_tools=[
+                "create_memory_object",
+                "human_output",
+                "process_exit",
+                "propose_jit_tool",
+                "read_memory_object",
+                "register_jit_tool",
+                "validate_jit_tool",
+            ],
             context_policy="minimal",
             safety_profile="toolmaker",
         ),

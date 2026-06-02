@@ -46,14 +46,17 @@ from agent_libos.tools.builtin import (
     MergeChildMemoryTool,
     ParsePytestLogTool,
     ProcessExitTool,
+    ProposeJitTool,
     ReadDirectoryTool,
     ReadMemoryObjectTool,
     ReadTextFileTool,
     RequestPermissionTool,
+    RegisterJitTool,
     SignalChildProcessTool,
     SleepTool,
     SpawnChildProcessTool,
     SetWorkingDirectoryTool,
+    ValidateJitTool,
     WaitChildProcessTool,
     RunShellCommandTool,
     WriteDirectoryTool,
@@ -133,6 +136,10 @@ class Runtime:
             config=self.config,
         )
         self.llm = LLMProcessExecutor(self, llm_client, config=self.config)
+        self._current_human_auto_approve: bool | None = None
+        self._current_human_auto_policy: str | None = None
+        self._current_human_auto_answer: str | None = None
+        self._current_human_input_fn: Callable[[str], str] | None = None
         self._register_builtin_tools()
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
 
@@ -204,31 +211,49 @@ class Runtime:
         results: list[Any] = []
         remaining = max_quanta if max_quanta is not None else self.config.runtime.run_until_idle_max_quanta
         selected_human = human or self.config.runtime.default_human
-        while remaining > 0:
-            # Run all currently runnable processes first. Human queue work below
-            # may wake a process, so this loop intentionally alternates between
-            # process execution and terminal queue draining.
-            batch = await self.scheduler.arun_until_idle(self.arun_process_once, max_quanta=remaining)
-            results.extend(batch)
-            remaining -= len(batch)
-            if not process_human_queue:
-                break
-            processed = await self.human.adrain_terminal_queue(
-                human=selected_human,
-                auto_approve=human_auto_approve,
-                auto_policy=human_auto_policy,
-                auto_answer=human_auto_answer,
-                input_fn=human_input_fn,
-            )
-            if not processed:
-                break
-            self.audit.record(
-                actor="runtime",
-                action="runtime.human_queue_drained",
-                target=f"human:{selected_human}",
-                decision={"request_ids": [request.request_id for request in processed]},
-            )
-            await asyncio.sleep(0)
+        previous_human_context = (
+            self._current_human_auto_approve,
+            self._current_human_auto_policy,
+            self._current_human_auto_answer,
+            self._current_human_input_fn,
+        )
+        self._current_human_auto_approve = human_auto_approve
+        self._current_human_auto_policy = human_auto_policy
+        self._current_human_auto_answer = human_auto_answer
+        self._current_human_input_fn = human_input_fn
+        try:
+            while remaining > 0:
+                # Run all currently runnable processes first. Human queue work below
+                # may wake a process, so this loop intentionally alternates between
+                # process execution and terminal queue draining.
+                batch = await self.scheduler.arun_until_idle(self.arun_process_once, max_quanta=remaining)
+                results.extend(batch)
+                remaining -= len(batch)
+                if not process_human_queue:
+                    break
+                processed = await self.human.adrain_terminal_queue(
+                    human=selected_human,
+                    auto_approve=human_auto_approve,
+                    auto_policy=human_auto_policy,
+                    auto_answer=human_auto_answer,
+                    input_fn=human_input_fn,
+                )
+                if not processed:
+                    break
+                self.audit.record(
+                    actor="runtime",
+                    action="runtime.human_queue_drained",
+                    target=f"human:{selected_human}",
+                    decision={"request_ids": [request.request_id for request in processed]},
+                )
+                await asyncio.sleep(0)
+        finally:
+            (
+                self._current_human_auto_approve,
+                self._current_human_auto_policy,
+                self._current_human_auto_answer,
+                self._current_human_input_fn,
+            ) = previous_human_context
         return results
 
     def register_image(self, image: AgentImage | dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> None:
@@ -373,13 +398,16 @@ class Runtime:
         self.tools.register_tool(ListMemoryNamespaceTool(), registered_by="runtime")
         self.tools.register_tool(MergeChildMemoryTool(), registered_by="runtime")
         self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
+        self.tools.register_tool(ProposeJitTool(), registered_by="runtime")
         self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
         self.tools.register_tool(ReadDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(ReadMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
+        self.tools.register_tool(RegisterJitTool(), registered_by="runtime")
         self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(SetWorkingDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(SpawnChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(ValidateJitTool(), registered_by="runtime")
         self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
         self.tools.register_tool(WriteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
