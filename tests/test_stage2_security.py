@@ -273,6 +273,22 @@ class Stage2SecurityTests(unittest.TestCase):
         self.assertEqual(result, {"doubled": 42})
         self.assertTrue("read" in str(raised.exception).lower() or "permission" in str(raised.exception).lower())
 
+    @unittest.skipUnless(shutil.which("deno"), "deno not installed")
+    def test_real_deno_result_frame_completes_even_with_live_handles(self) -> None:
+        sandbox = DenoTypescriptSandbox(deno_executable="deno", default_timeout_s=1.0)
+
+        result = sandbox.run_source(
+            """
+            export function run(args, libos) {
+              setInterval(() => {}, 1000);
+              return { ok: true };
+            }
+            """,
+            {},
+        )
+
+        self.assertEqual(result, {"ok": True})
+
     def test_deno_missing_is_clear_validation_error(self) -> None:
         sandbox = DenoTypescriptSandbox(deno_executable="agent-libos-deno-definitely-missing")
         validation = sandbox.run_tests("export function run(args, libos) { return {}; }", [])

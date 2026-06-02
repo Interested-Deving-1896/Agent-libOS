@@ -5,8 +5,13 @@ from uuid import uuid4
 
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.models.exceptions import HumanApprovalRequired
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
 from agent_libos.models import CapabilityRight, HumanRequestStatus
+
+_TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+DEFAULT_FILESYSTEM_READ_HARD_LIMIT = _TOOL_DEFAULTS.filesystem_read_hard_limit_bytes
+DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT = _TOOL_DEFAULTS.directory_entry_hard_limit
 
 
 class FilesystemDirectoryToolTests(unittest.TestCase):
@@ -101,6 +106,31 @@ class FilesystemDirectoryToolTests(unittest.TestCase):
         self.assertTrue(result.truncated)
         self.assertEqual(result.bytes_read, 1)
         self.assertEqual(result.content, "")
+
+    def test_filesystem_primitive_enforces_read_limits_without_tool_schema(self) -> None:
+        path = self._write_fixture(f"agent_outputs/read_limit_{uuid4().hex}.txt", "content")
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="read limit")
+        self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by="test")
+
+        with self.assertRaises(ValidationError):
+            self.runtime.filesystem.read_text(pid, path, max_bytes=0)
+        with self.assertRaises(ValidationError):
+            self.runtime.filesystem.read_text(
+                pid,
+                path,
+                max_bytes=DEFAULT_FILESYSTEM_READ_HARD_LIMIT + 1,
+            )
+
+    def test_directory_primitive_enforces_limit_without_tool_schema(self) -> None:
+        base = f"agent_outputs/list_limit_{uuid4().hex}"
+        self._write_fixture(f"{base}/item.txt", "content")
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="directory limit")
+        self.runtime.filesystem.grant_directory(pid, base, [CapabilityRight.READ], issued_by="test")
+
+        with self.assertRaises(ValidationError):
+            self.runtime.filesystem.read_directory(pid, base, limit=0)
+        with self.assertRaises(ValidationError):
+            self.runtime.filesystem.read_directory(pid, base, limit=DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT + 1)
 
     def _write_fixture(self, path: str, content: str) -> str:
         target = self.runtime.workspace_root / path

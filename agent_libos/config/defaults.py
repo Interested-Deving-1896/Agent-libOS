@@ -124,8 +124,11 @@ class ShellDefaults:
     blocklist_ask_else_auto_level: ShellPolicyLevel = "blocklist_ask_else_auto"
     always_allow_level: ShellPolicyLevel = "always_allow"
     high_risk_level: ShellPolicyLevel = "always_allow"
+    timeout_hard_limit_s: float = 300.0
     max_stdout_chars: int = 32_000
     max_stderr_chars: int = 32_000
+    stdout_hard_limit_chars: int = 200_000
+    stderr_hard_limit_chars: int = 200_000
     whitelist: tuple[ShellCommandRule, ...] = (
         ShellCommandRule(("git", "status")),
         ShellCommandRule(("git", "status", "--short")),

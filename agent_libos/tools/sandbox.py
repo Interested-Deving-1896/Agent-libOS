@@ -248,7 +248,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         while True:
             line = await proc.stdout.readline()
             if not line:
-                stderr = await self._finish_stderr(stderr_task)
+                stderr, _stderr_truncated = await self._finish_stderr(stderr_task)
                 code = await proc.wait()
                 raise SandboxError(stderr.strip() or f"Deno JIT tool exited before result: {code}")
             stdout_bytes += len(line)
@@ -275,15 +275,18 @@ class DenoTypescriptSandbox(SandboxBackend):
                 await self._handle_syscall_frame(proc, frame, syscall_handler)
                 continue
             if frame_type == "result":
-                code = await proc.wait()
-                stderr = await self._finish_stderr(stderr_task)
-                if len(stderr.encode("utf-8")) > self.max_stderr_bytes:
+                # The result frame is the protocol boundary for a successful
+                # tool call. Any remaining Deno event-loop handles belong to
+                # this transient tool process and must not delay lifecycle
+                # syscalls or scheduler progress.
+                value = frame.get("value")
+                await self._kill_process(proc)
+                stderr, stderr_truncated = await self._finish_stderr(stderr_task)
+                if stderr_truncated:
                     raise SandboxError("Deno JIT stderr exceeded max bytes")
-                if code != 0:
-                    raise SandboxError(stderr.strip() or f"Deno JIT exited {code}")
-                return frame.get("value")
+                return value
             if frame_type == "error":
-                stderr = await self._finish_stderr(stderr_task)
+                stderr, _stderr_truncated = await self._finish_stderr(stderr_task)
                 message = str(frame.get("message") or stderr or "Deno JIT tool failed")
                 raise SandboxError(message)
             raise SandboxError(f"unknown Deno JIT protocol frame: {frame_type!r}")
@@ -331,12 +334,12 @@ class DenoTypescriptSandbox(SandboxBackend):
         proc.stdin.write((json.dumps(frame, ensure_ascii=True, default=str) + "\n").encode("utf-8"))
         await proc.stdin.drain()
 
-    async def _finish_stderr(self, stderr_task: asyncio.Task[bytes]) -> str:
+    async def _finish_stderr(self, stderr_task: asyncio.Task[bytes]) -> tuple[str, bool]:
         try:
             data = await stderr_task
         except Exception:
-            return ""
-        return data[: self.max_stderr_bytes].decode("utf-8", errors="replace")
+            return "", False
+        return data[: self.max_stderr_bytes].decode("utf-8", errors="replace"), len(data) > self.max_stderr_bytes
 
     async def _kill_process(self, proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:

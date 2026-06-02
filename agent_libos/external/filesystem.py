@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.models import Capability, CapabilityRight, EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -96,6 +96,11 @@ class FilesystemAdapter:
         max_bytes: int = _TOOL_DEFAULTS.filesystem_read_max_bytes,
         cwd: str | os.PathLike[str] | None = None,
     ) -> FileReadResult:
+        max_bytes = self._bounded_positive_int(
+            max_bytes,
+            label="max_bytes",
+            hard_limit=_TOOL_DEFAULTS.filesystem_read_hard_limit_bytes,
+        )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
         self.capabilities.require(pid, resource, CapabilityRight.READ)
@@ -186,6 +191,11 @@ class FilesystemAdapter:
         limit: int = _TOOL_DEFAULTS.directory_entry_limit,
         cwd: str | os.PathLike[str] | None = None,
     ) -> DirectoryReadResult:
+        limit = self._bounded_positive_int(
+            limit,
+            label="limit",
+            hard_limit=_TOOL_DEFAULTS.directory_entry_hard_limit,
+        )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
         self.capabilities.require(pid, resource, CapabilityRight.READ)
@@ -729,3 +739,14 @@ class FilesystemAdapter:
             "modified_at": state.modified_at,
         }
         return result
+
+    def _bounded_positive_int(self, value: int, *, label: str, hard_limit: int) -> int:
+        try:
+            selected = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"{label} must be an integer") from exc
+        if selected < 1:
+            raise ValidationError(f"{label} must be >= 1")
+        if selected > hard_limit:
+            raise ValidationError(f"{label} exceeds hard limit {hard_limit}")
+        return selected

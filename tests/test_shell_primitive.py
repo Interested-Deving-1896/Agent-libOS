@@ -7,7 +7,7 @@ from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
 from agent_libos.models import CapabilityRight, HumanRequestStatus
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalResourceProviderSubstrate
 
 
@@ -100,12 +100,72 @@ class ShellPrimitiveTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_shell_primitive_truncates_output_before_tool_layer(self) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                max_stdout_chars=3,
+                max_stderr_chars=2,
+                whitelist=(ShellCommandRule(("tool",)),),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        provider.stdout = "abcdef"
+        provider.stderr = "wxyz"
+        try:
+            pid = runtime.process.spawn(image="review-agent:v0", goal="bounded shell")
+            runtime.shell.grant_policy(pid, config.shell.allowlist_auto_else_ask_level, issued_by="test")
+
+            result = runtime.shell.run(pid, ["tool"])
+            tool_result = runtime.tools.call(
+                pid,
+                "run_shell_command",
+                {"argv": ["tool"], "max_stdout_chars": 10, "max_stderr_chars": 10},
+            )
+
+            self.assertEqual(result.stdout, "abc")
+            self.assertEqual(result.stderr, "wx")
+            self.assertTrue(result.stdout_truncated)
+            self.assertTrue(result.stderr_truncated)
+            self.assertEqual(tool_result.payload["stdout"], "abc")
+            self.assertTrue(tool_result.payload["stdout_truncated"])
+            self.assertEqual(tool_result.payload["stderr"], "wx")
+            self.assertTrue(tool_result.payload["stderr_truncated"])
+        finally:
+            runtime.close()
+
+    def test_shell_primitive_enforces_timeout_limit_without_tool_schema(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image="review-agent:v0", goal="bounded timeout")
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by="test")
+
+            with self.assertRaises(ValidationError):
+                runtime.shell.run(pid, ["git", "status", "--short"], timeout=0)
+            with self.assertRaises(ValidationError):
+                runtime.shell.run(
+                    pid,
+                    ["git", "status", "--short"],
+                    timeout=runtime.config.shell.timeout_hard_limit_s + 1,
+                )
+        finally:
+            runtime.close()
+
     def _runtime_with_fake_shell(self) -> tuple[Runtime, "FakeShellProvider"]:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         provider = FakeShellProvider()
         substrate = RecordingShellSubstrate(temp_dir.name, provider)
         runtime = Runtime.open("local", substrate=substrate)
+        runtime.human.output_sink = lambda _message: None
+        return runtime, provider
+
+    def _runtime_with_config(self, config: AgentLibOSConfig) -> tuple[Runtime, "FakeShellProvider"]:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        provider = FakeShellProvider()
+        substrate = RecordingShellSubstrate(temp_dir.name, provider)
+        runtime = Runtime.open("local", substrate=substrate, config=config)
         runtime.human.output_sink = lambda _message: None
         return runtime, provider
 
@@ -150,10 +210,12 @@ class RecordingShellSubstrate(LocalResourceProviderSubstrate):
 class FakeShellProvider:
     def __init__(self):
         self.calls: list[tuple[list[str], float]] = []
+        self.stdout = "ok\n"
+        self.stderr = ""
 
     def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
         self.calls.append((list(argv), timeout))
-        return CommandResult(argv=list(argv), returncode=0, stdout="ok\n", stderr="")
+        return CommandResult(argv=list(argv), returncode=0, stdout=self.stdout, stderr=self.stderr)
 
 
 if __name__ == "__main__":

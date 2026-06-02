@@ -65,25 +65,27 @@ class ShellAdapter:
         cwd: str | os.PathLike[str] | None = None,
     ) -> CommandResult:
         checked = self._validate_argv(argv)
+        selected_timeout = self._validate_timeout(timeout)
         resource = self.resource_for(checked)
-        decision = self._authorize(pid, checked, resource, timeout=timeout)
+        decision = self._authorize(pid, checked, resource, timeout=selected_timeout)
         if decision.ask_human:
-            self._request_human_approval(pid, checked, resource, decision, timeout=timeout, cwd=cwd)
+            self._request_human_approval(pid, checked, resource, decision, timeout=selected_timeout, cwd=cwd)
         if not decision.allowed:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
         try:
             if cwd is None:
-                proc = self.provider.run(checked, timeout=timeout)
+                proc = self.provider.run(checked, timeout=selected_timeout)
             else:
-                proc = self.provider.run(checked, timeout=timeout, cwd=os.fspath(cwd))
+                proc = self.provider.run(checked, timeout=selected_timeout, cwd=os.fspath(cwd))
+            proc = self._bounded_result(proc)
         except subprocess.TimeoutExpired as exc:
             self.audit.record(
                 actor=pid,
                 action="external.shell.timeout",
                 target=resource,
-                decision={"argv": checked, "timeout_s": timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
+                decision={"argv": checked, "timeout_s": selected_timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
             )
-            raise TimeoutError(f"shell command timed out after {timeout}s: {checked}") from exc
+            raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
         finally:
             if decision.consume_once:
                 self.capabilities.consume_allow_once(
@@ -105,6 +107,8 @@ class ShellAdapter:
                 "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
                 "high_risk": decision.high_risk,
                 "cwd": os.fspath(cwd) if cwd is not None else None,
+                "stdout_truncated": proc.stdout_truncated,
+                "stderr_truncated": proc.stderr_truncated,
             },
         )
         return proc
@@ -397,6 +401,34 @@ class ShellAdapter:
                 raise ValidationError("shell argv[0] must be non-empty")
             checked.append(value)
         return checked
+
+    def _validate_timeout(self, timeout: float) -> float:
+        try:
+            selected = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("shell timeout must be a number") from exc
+        if selected <= 0:
+            raise ValidationError("shell timeout must be > 0")
+        if selected > self.config.shell.timeout_hard_limit_s:
+            raise ValidationError(f"shell timeout exceeds hard limit {self.config.shell.timeout_hard_limit_s}s")
+        return selected
+
+    def _bounded_result(self, proc: CommandResult) -> CommandResult:
+        stdout, stdout_truncated = self._truncate_output(proc.stdout, self.config.shell.max_stdout_chars)
+        stderr, stderr_truncated = self._truncate_output(proc.stderr, self.config.shell.max_stderr_chars)
+        return CommandResult(
+            argv=proc.argv,
+            returncode=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_truncated=proc.stdout_truncated or stdout_truncated,
+            stderr_truncated=proc.stderr_truncated or stderr_truncated,
+        )
+
+    def _truncate_output(self, value: str, limit: int) -> tuple[str, bool]:
+        if len(value) <= limit:
+            return value, False
+        return value[:limit], True
 
     def _command_identity(self, argv0: str) -> str:
         return self._normalize_executable(argv0)

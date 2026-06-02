@@ -17,19 +17,19 @@ class RunShellCommandArgs(BaseModel):
     timeout_s: float = Field(
         default=_TOOL_DEFAULTS.shell_timeout_s,
         gt=0,
-        le=300,
+        le=_SHELL_DEFAULTS.timeout_hard_limit_s,
         description="Command timeout in seconds.",
     )
     max_stdout_chars: int = Field(
         default=_SHELL_DEFAULTS.max_stdout_chars,
         ge=0,
-        le=200_000,
+        le=_SHELL_DEFAULTS.stdout_hard_limit_chars,
         description="Maximum stdout characters returned in the tool result.",
     )
     max_stderr_chars: int = Field(
         default=_SHELL_DEFAULTS.max_stderr_chars,
         ge=0,
-        le=200_000,
+        le=_SHELL_DEFAULTS.stderr_hard_limit_chars,
         description="Maximum stderr characters returned in the tool result.",
     )
 
@@ -80,8 +80,8 @@ class RunShellCommandTool(BaseAgentTool[RunShellCommandArgs]):
             returncode=result.returncode,
             stdout=stdout,
             stderr=stderr,
-            stdout_truncated=stdout_truncated,
-            stderr_truncated=stderr_truncated,
+            stdout_truncated=result.stdout_truncated or stdout_truncated,
+            stderr_truncated=result.stderr_truncated or stderr_truncated,
         )
 
 
