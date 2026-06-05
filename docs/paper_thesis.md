@@ -27,14 +27,16 @@ measurably safer under adversarial workloads.
 
 1. Runtime model. PAR models an agent as an `AgentProcess` with process-local
    Object Memory namespaces, process-local working directories, message queues,
-   child process lifecycle, and capability-controlled primitives. Human I/O is a
-   device-like runtime primitive rather than prompt text.
+   child process lifecycle, dynamic Skill/tool visibility, and
+   capability-controlled primitives. Human I/O is a device-like runtime
+   primitive rather than prompt text.
 
 2. Implementation. The current prototype implements the model in Python with a
    Resource Provider Substrate, SQLite persistence, audit records, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
-   shell/image/filesystem/process/human/memory primitives, and Deno/TypeScript
-   JIT tools that can reach libOS only through syscall RPC.
+   shell/image/filesystem/process/human/memory/skill primitives, declarative
+   Skill manifests, and Deno/TypeScript JIT tools that can reach libOS only
+   through syscall RPC.
 
 3. Benchmark suite. The planned evaluation uses adversarial coding-agent and
    runtime-safety tasks with declared allowed and forbidden side effects. The
@@ -59,6 +61,9 @@ measurably safer under adversarial workloads.
 - PAR does not rely on MCP, GitHub, OpenAI Agents SDK, or LangGraph as a
   trusted security boundary. Those systems are workload inspiration or possible
   adapters; PAR's boundary is inside the libOS primitive layer.
+- PAR does not treat Skills as a permission system. Skills organize prompt
+  instructions and process-visible actions; resource authority still comes only
+  from process capabilities, primitive checks, policy, approval, and audit.
 
 ## Current Submission Story
 

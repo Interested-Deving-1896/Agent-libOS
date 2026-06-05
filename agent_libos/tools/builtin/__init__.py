@@ -42,6 +42,13 @@ from agent_libos.tools.builtin.process import (
     WaitChildProcessTool,
 )
 from agent_libos.tools.builtin.shell import RunShellCommandTool
+from agent_libos.tools.builtin.skills import (
+    DiscoverSkillsTool,
+    InspectSkillTool,
+    LoadSkillFromYamlTool,
+    LoadSkillTool,
+    UnloadSkillTool,
+)
 
 __all__ = [
     "CreateMemoryObjectTool",
@@ -51,6 +58,7 @@ __all__ = [
     "AppendMemoryObjectTool",
     "DeleteDirectoryTool",
     "DeleteFileTool",
+    "DiscoverSkillsTool",
     "EchoTool",
     "ExecProcessTool",
     "DiffCheckpointTool",
@@ -59,7 +67,10 @@ __all__ = [
     "AskHumanTool",
     "HumanOutputTool",
     "InspectCheckpointTool",
+    "InspectSkillTool",
     "LoadImageFromYamlTool",
+    "LoadSkillFromYamlTool",
+    "LoadSkillTool",
     "ForkChildProcessTool",
     "ForkCheckpointTool",
     "ListChildProcessesTool",
@@ -83,6 +94,7 @@ __all__ = [
     "SetWorkingDirectoryTool",
     "SleepTool",
     "SpawnChildProcessTool",
+    "UnloadSkillTool",
     "ValidateJitTool",
     "WaitChildProcessTool",
     "WriteDirectoryTool",

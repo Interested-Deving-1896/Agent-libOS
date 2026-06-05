@@ -78,6 +78,7 @@ class LLMProcessExecutor:
         # broker still owns the real execute check, but showing extra tools
         # teaches the model to choose actions the process cannot call.
         tools = self.runtime.tools.visible_tools(pid)
+        skills = self.runtime.skills.prompt_context(pid)
         context = self.context_memory.prepare(
             pid=pid,
             image=image,
@@ -97,6 +98,7 @@ class LLMProcessExecutor:
                     events=events,
                     capabilities=capabilities,
                     tools=tools,
+                    skills=skills,
                 ),
             },
         ]

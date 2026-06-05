@@ -58,6 +58,7 @@ Built-in tools currently include:
 - `delete_directory`
 - `delete_file`
 - `diff_checkpoint`
+- `discover_skills`
 - `exec_process`
 - `fork_checkpoint`
 - `fork_child_process`
@@ -65,7 +66,10 @@ Built-in tools currently include:
 - `get_working_directory`
 - `human_output`
 - `inspect_checkpoint`
+- `inspect_skill`
 - `load_image_from_yaml`
+- `load_skill`
+- `load_skill_from_yaml`
 - `list_child_processes`
 - `list_checkpoints`
 - `list_memory_namespace`
@@ -87,6 +91,7 @@ Built-in tools currently include:
 - `signal_child_process`
 - `sleep`
 - `spawn_child_process`
+- `unload_skill`
 - `validate_jit_tool`
 - `wait_child_process`
 - `write_directory`
@@ -112,10 +117,89 @@ Important boundary rules:
 - Human approval is part of a syscall. TypeScript sees either the final syscall payload or a final syscall error; it never sees a pending/retry protocol state.
 - `process.exit` and `process.exec` are ordinary syscalls from the TypeScript side. The runtime applies the resulting lifecycle change only after the JIT tool returns its normal tool result.
 
+### Skills
+
+Skills are dynamic, capability-controlled model-facing packages. A Skill can
+provide prompt instructions, action summaries, existing tool references, and
+optional Deno/TypeScript JIT tool candidates. Loading a Skill changes only the
+current process tool table and prompt materialization. It never grants
+filesystem, shell, human, Object Memory, process, image, checkpoint, or other
+resource capabilities.
+
+Skill manifests use schema version `1` and may be YAML or JSON, either as direct
+fields or under a top-level `skill:` mapping:
+
+```yaml
+skill:
+  schema_version: 1
+  skill_id: review-helper:v0
+  name: Review Helper
+  version: v0
+  description: Focused code-review workflow helpers.
+  instructions: |
+    Prefer small, evidence-backed findings with file and line references.
+  tools:
+    - read_text_file
+    - read_directory
+  actions:
+    - name: summarize_findings
+      use_cases:
+        - Summarize review findings in severity order.
+      input_schema:
+        type: object
+        properties:
+          findings:
+            type: array
+      output_schema:
+        type: object
+  jit_tools: []
+  required_capabilities:
+    - resource: filesystem:workspace:*
+      rights:
+        - read
+  metadata:
+    owner: local
+```
+
+`required_capabilities` is advisory metadata for humans and prompts. The runtime
+does not grant those capabilities during registration or load. If a loaded Skill
+exposes `read_text_file`, that tool still fails at the filesystem primitive
+without filesystem read authority.
+
+Skill sources are split into workspace and global sources:
+
+- Workspace Skills are read through the filesystem primitive, so the process
+  must have read authority for the manifest path. If the process lacks
+  `skill:<skill_id>` write/execute authority, loading can go through the normal
+  human approval path and one-shot grant.
+- Global Skills are read only from configured global Skill directories. The
+  exact manifest bytes must match a SHA-256 allowlist entry or a row in the
+  `skill_trust` table before registration or load.
+
+JIT tools bundled in a Skill use the same Deno sandbox, import allowlist,
+ToolBroker registration path, and syscall broker as manually proposed JIT tools.
+They are visible only to the loading process and cannot shadow static tool names.
+
+CLI examples:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review.yaml
+uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review.yaml --source-type global
+uv run agent-libos --db .agent_libos.sqlite skills discover
+uv run agent-libos --db .agent_libos.sqlite skills load <pid> review-helper:v0 --actor-pid <pid>
+uv run agent-libos --db .agent_libos.sqlite skills unload <pid> review-helper:v0 --actor-pid <pid>
+```
+
+Processes can also use the LLM-facing `discover_skills`, `inspect_skill`,
+`load_skill`, `load_skill_from_yaml`, and `unload_skill` tools when those tools
+are visible. Deno JIT tools can call `skill.discover`, `skill.inspect`,
+`skill.register`, `skill.load`, `skill.unload`, and `skill.load_yaml` syscalls;
+syscalls go to the Skill primitive and do not consult the LLM-facing tool table.
+
 ### Checkpoints
 
 - Checkpoints are capability-controlled durable snapshots of reconstructable runtime state for one process subtree.
-- A checkpoint captures process state, Object Memory metadata and payloads, process namespaces, object links, subtree capabilities, tool/JIT metadata, mailbox delivery state, and image definitions needed by that subtree.
+- A checkpoint captures process state, Object Memory metadata and payloads, process namespaces, object links, subtree capabilities, tool/JIT/Skill metadata, mailbox delivery state, and image definitions needed by that subtree.
 - Restore is scoped to the checkpoint owner subtree. It does not delete audit records, events, LLM call records, checkpoint records, or human interaction history.
 - External filesystem, shell, image, network, and provider effects are not rolled back. Restore reports them in `external_effects_since_checkpoint` for audit/explain or future compensation.
 - Default images expose low-risk `create_checkpoint`, `list_checkpoints`, `inspect_checkpoint`, and `diff_checkpoint`; `restore_checkpoint` and `fork_checkpoint` are registered but require explicit tool visibility plus checkpoint authority.
@@ -137,6 +221,7 @@ Permission requests are ordinary process actions mediated by the human queue:
 - `fork_child_process` attenuates a selected parent MemoryView into the child. `spawn_child_process` creates a fresh direct child with a new process namespace and a goal-only MemoryView.
 - `exec_process` replaces the current process image and tool table without changing pid. It never grants the target image's required capabilities automatically; capabilities are preserved only when explicitly requested, otherwise external capabilities are shrunk.
 - Image registration requires `write` on `image:<image_id>` or a wildcard such as `image:*`. The YAML loader also requires filesystem read authority for the manifest path.
+- Skill registration/loading requires Skill authority and source authority, but Skill manifests do not grant their declared `required_capabilities`.
 - Ordinary human questions use the same queue: a process waiting on `ask_human` stays in `WAITING_HUMAN` until the terminal queue supplies an answer.
 - Rejection does not crash the runtime; the process resumes and can report why it could not complete.
 - Approval context includes path, resource, overwrite risk, byte count, SHA-256, target state, and a `repr()`-escaped content preview.
@@ -366,7 +451,8 @@ Agent Personality / Application
      - LLM-facing actions
      - tool schemas
      - macro actions
-     - skill metadata
+     - dynamic Skill manifests and prompt instructions
+     - process-visible JIT tool candidates
   -> Agent libOS Runtime
      - AsyncProcessScheduler
      - ProcessManager
@@ -394,6 +480,12 @@ Agent Personality / Application
 The key design boundary is between model-facing tools and libOS primitives. For example, `write_text_file` can be visible in a process tool table, but `FilesystemAdapter.write_text()` still enforces workspace containment, resource capability or permission policy, human approval if needed, events, and audit logging.
 
 Putting a tool in a process table does not grant access to files, humans, shell, network, secrets, or other host resources.
+
+Loading a Skill follows the same rule. A Skill can add existing tools or
+validated JIT tools to one process table and can add bounded instructions to the
+next prompt, but resource authority remains entirely in primitive capabilities
+and policy. Global Skill trust and workspace Skill filesystem reads are checked
+before the Skill registry is modified.
 
 Primitives are not themselves the host implementation. They own libOS semantics: capability checks, human approval, event emission, and audit records. Concrete host calls live behind `agent_libos.substrate` providers such as `LocalFilesystemProvider`, `LocalClockProvider`, `LocalShellProvider`, and `LocalHumanProvider`. Shell calls are intentionally argv-only at this boundary, so quoting, pipes, redirects, and command chaining must be requested explicitly through an interpreter executable, where policy matching can see the interpreter token. HumanObject similarly owns request queues, approvals, wakeups, and audit records, while the substrate `HumanProvider` owns terminal or UI read/write.
 
@@ -486,6 +578,12 @@ export async function run(args, libos) {
 
 The `libos` object intentionally exposes only `syscall(name, args)`. It does not expose Python objects, `Runtime`, or `runtime.tools`. Syscall dispatch enters `LibOSSyscallSession`, which calls primitives such as filesystem, Object Memory, human, clock, process, shell, and image registry under the caller pid.
 
+Skills may bundle the same JIT candidate shape inside `jit_tools`. Skill loading
+validates all existing-tool references and JIT candidates before changing the
+process table. Unloading a Skill removes the tool visibility and prompt
+instructions contributed by that Skill, but it does not revoke capabilities,
+delete audit history, or undo external side effects.
+
 ## Module Map
 
 ```text
@@ -500,8 +598,7 @@ agent_libos/
   models/          Dataclass and enum models split by runtime domain
   primitives/      LibOS primitive managers for filesystem, clock, shell, git, and browser placeholders
   runtime/         Runtime composition, syscall broker, async scheduler, process manager, events, checkpoints, audit
-  skills/          Skill schema, registry, verifier, linker scaffolding
-  skills_tools/    Tool/action registry and bundle scaffolding
+  skills/          Skill schema, strict manifest loader, trust registry, and runtime SkillManager primitive
   substrate/        Resource provider interfaces for filesystem, clock, shell, human I/O, and local host-backed implementations
   storage/         SQLite persistence
   tools/           Tool base classes, ToolBroker, sandbox, and built-in tools
@@ -519,10 +616,11 @@ Near-term priorities:
 - Audit querying by pid, capability, tool, external resource, and time range.
 - More complete terminal human queue UX.
 - More hardened Deno JIT sandbox profiles and policy presets for high-risk tools.
+- Richer Skill policy, provenance display, and public-key signature verification.
 
 Longer-term directions:
 
-- Persistent signed skill/tool registry.
+- Distributed signed Skill/tool registries.
 - Distributed process scheduling.
 - Rich human role and authority model.
 - ExternalRef objects and snapshots for external resources.

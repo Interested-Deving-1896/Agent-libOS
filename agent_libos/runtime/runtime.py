@@ -21,8 +21,7 @@ from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.scheduler import SimpleScheduler
-from agent_libos.skills.linker import SkillLinker
-from agent_libos.skills.registry import RuntimeSkillRegistry
+from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate, ResourceProviderSubstrate
 from agent_libos.tools.broker import ToolBroker
@@ -35,6 +34,7 @@ from agent_libos.tools.builtin import (
     CreateObjectFromFileTool,
     DeleteDirectoryTool,
     DeleteFileTool,
+    DiscoverSkillsTool,
     DiffCheckpointTool,
     EchoTool,
     ExecProcessTool,
@@ -44,7 +44,10 @@ from agent_libos.tools.builtin import (
     GetWorkingDirectoryTool,
     HumanOutputTool,
     InspectCheckpointTool,
+    InspectSkillTool,
     LoadImageFromYamlTool,
+    LoadSkillFromYamlTool,
+    LoadSkillTool,
     ListChildProcessesTool,
     ListCheckpointsTool,
     ListMemoryNamespaceTool,
@@ -66,12 +69,14 @@ from agent_libos.tools.builtin import (
     SleepTool,
     SpawnChildProcessTool,
     SetWorkingDirectoryTool,
+    UnloadSkillTool,
     ValidateJitTool,
     WaitChildProcessTool,
     WriteDirectoryTool,
     WriteObjectToFileTool,
     WriteTextFileTool,
 )
+from agent_libos.utils.ids import utc_now
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 
@@ -143,8 +148,15 @@ class Runtime:
         self.scheduler = SimpleScheduler(store, self.audit, poll_interval_s=self.config.scheduler.poll_interval_s)
         self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
         self.checkpoint.bind_runtime(self)
-        self.skill_registry = RuntimeSkillRegistry()
-        self.skills = SkillLinker(store, self.skill_registry, self.audit)
+        self.skills = SkillManager(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            human=self.human,
+            config=self.config,
+        )
+        self.skills.bind_runtime(self)
         self.images: dict[str, AgentImage] = build_default_images(self.config)
         self.image_registry = ImageRegistryPrimitive(
             self.images,
@@ -273,6 +285,48 @@ class Runtime:
     def get_image(self, image_id: str) -> AgentImage:
         return self.images[image_id]
 
+    def register_skill(self, skill: dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> dict[str, Any]:
+        return self.skills.register_skill(skill, actor=actor, replace=replace, require_capability=False)
+
+    def register_skill_from_yaml_text(
+        self,
+        text: str,
+        *,
+        actor: str = "runtime",
+        replace: bool = False,
+        source_type: str = "inline",
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        return self.skills.register_skill_from_yaml_text(
+            text,
+            actor=actor,
+            replace=replace,
+            require_capability=False,
+            source_type=source_type,
+            source=source,
+        )
+
+    def discover_skills(self, text: str | None = None) -> list[dict[str, Any]]:
+        return self.skills.discover_skills(text, require_capability=False)
+
+    def inspect_skill(self, skill_id: str) -> dict[str, Any]:
+        return self.skills.inspect_skill(skill_id, require_capability=False)
+
+    def load_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
+        return self.skills.load_skill(pid, skill_id, actor=pid, require_capability=False)
+
+    def unload_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
+        return self.skills.unload_skill(pid, skill_id, actor=pid, require_capability=False)
+
+    def trust_skill_source(self, *, source_type: str, source: str, manifest_sha256: str, actor: str = "runtime") -> dict[str, Any]:
+        return self.skills.trust_skill_source(
+            actor=actor,
+            source_type=source_type,
+            source=source,
+            manifest_sha256=manifest_sha256,
+            require_capability=False,
+        )
+
     def exec_process(
         self,
         pid: str,
@@ -296,6 +350,7 @@ class Runtime:
         # apply image required_capabilities. Exec may preserve existing
         # capabilities or shrink them; it never grants new external authority.
         self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
+        self._configure_process_skills_for_image(pid, image, assigned_by=f"process.exec:{image}")
         return self.process.get(pid)
 
     def spawn_child_process(
@@ -351,6 +406,15 @@ class Runtime:
                 target=f"process:{pid}",
                 decision={"image": image_id, "error": str(exc)},
             )
+        try:
+            self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
+        except Exception as exc:
+            self.audit.record(
+                actor="runtime",
+                action="image.default_skill_configure_failed",
+                target=f"process:{pid}",
+                decision={"image": image_id, "error": str(exc)},
+            )
         if process is not None:
             self.checkpoint.grant_process_defaults(pid, issued_by=f"image:{image_id}")
         if process is not None and process.parent_pid is not None:
@@ -392,6 +456,37 @@ class Runtime:
         tool_names = {"process_exit", "create_memory_object", *image.default_tools}
         return self.tools.configure_process_tools(pid, sorted(tool_names), assigned_by=assigned_by)
 
+    def _configure_process_skills_for_image(self, pid: str, image_id: str, assigned_by: str) -> None:
+        process = self.store.get_process(pid)
+        if process is None:
+            return
+        self._apply_loaded_skill_tool_table(pid)
+        image = self._require_image(image_id)
+        for skill_id in image.default_skills:
+            process = self.store.get_process(pid)
+            if process is not None and skill_id in process.loaded_skills:
+                continue
+            self.skills.load_skill(pid, skill_id, actor=assigned_by, require_capability=False)
+
+    def _apply_loaded_skill_tool_table(self, pid: str) -> None:
+        process = self.store.get_process(pid)
+        if process is None or not process.loaded_skills:
+            return
+        updated = dict(process.tool_table)
+        for loaded in process.loaded_skills.values():
+            if not isinstance(loaded, dict):
+                continue
+            for mapping_key in ["tool_ids", "jit_tool_ids"]:
+                mapping = loaded.get(mapping_key)
+                if not isinstance(mapping, dict):
+                    continue
+                for name, tool_id in mapping.items():
+                    if isinstance(name, str) and isinstance(tool_id, str):
+                        updated[name] = tool_id
+        process.tool_table = updated
+        process.updated_at = utc_now()
+        self.store.update_process(process)
+
     def _register_builtin_tools(self) -> None:
         self.tools.register_tool(EchoTool(), registered_by="runtime")
         self.tools.register_tool(ExecProcessTool(), registered_by="runtime")
@@ -406,6 +501,7 @@ class Runtime:
         self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
         self.tools.register_tool(DiffCheckpointTool(), registered_by="runtime")
+        self.tools.register_tool(DiscoverSkillsTool(), registered_by="runtime")
         self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(ForkCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(GetWorkingDirectoryTool(), registered_by="runtime")
@@ -432,8 +528,12 @@ class Runtime:
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
         self.tools.register_tool(InspectCheckpointTool(), registered_by="runtime")
+        self.tools.register_tool(InspectSkillTool(), registered_by="runtime")
         self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(ListCheckpointsTool(), registered_by="runtime")
+        self.tools.register_tool(LoadSkillFromYamlTool(), registered_by="runtime")
+        self.tools.register_tool(LoadSkillTool(), registered_by="runtime")
         self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")
         self.tools.register_tool(RestoreCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(SendProcessMessageTool(), registered_by="runtime")
+        self.tools.register_tool(UnloadSkillTool(), registered_by="runtime")

@@ -176,11 +176,15 @@ class ImageRegistryPrimitive:
         self._validate_string_length(image.version, "version", self.config.image.version_max_chars)
         if len(image.default_tools) > self.config.image.max_default_tools:
             raise ValidationError(f"default_tools exceeds max_default_tools={self.config.image.max_default_tools}")
+        if len(image.default_skills) > self.config.skills.max_tools:
+            raise ValidationError(f"default_skills exceeds max_tools={self.config.skills.max_tools}")
         if len(image.required_capabilities) > self.config.image.max_required_capabilities:
             raise ValidationError(
                 "required_capabilities exceeds "
                 f"max_required_capabilities={self.config.image.max_required_capabilities}"
             )
+        for skill_id in image.default_skills:
+            self._validate_identifier(skill_id, "default_skills[]", self.config.skills.id_max_chars)
         for tool_name in image.default_tools:
             self._validate_identifier(tool_name, "default_tools[]", self.config.image.id_max_chars)
             try:

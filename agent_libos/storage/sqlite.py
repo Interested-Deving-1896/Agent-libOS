@@ -38,6 +38,7 @@ from agent_libos.models import (
     ToolSpec,
     ViewMode,
 )
+from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillSpec
 from agent_libos.utils.serde import dumps, loads
 
 
@@ -58,6 +59,8 @@ class SQLiteStore:
         "human_requests",
         "llm_calls",
         "process_messages",
+        "skills",
+        "skill_trust",
         "tools",
         "tool_candidates",
     ]
@@ -255,6 +258,34 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_process_messages_correlation
                   ON process_messages(recipient_pid, correlation_id, status, created_at);
 
+                CREATE TABLE IF NOT EXISTS skills (
+                  skill_id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  version TEXT NOT NULL,
+                  spec_json TEXT NOT NULL,
+                  source_type TEXT NOT NULL,
+                  source TEXT,
+                  manifest_sha256 TEXT NOT NULL,
+                  signed INTEGER NOT NULL,
+                  registered_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_skills_name
+                  ON skills(name);
+
+                CREATE TABLE IF NOT EXISTS skill_trust (
+                  trust_id TEXT PRIMARY KEY,
+                  source_type TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  manifest_sha256 TEXT NOT NULL,
+                  trusted_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL,
+                  UNIQUE(source_type, source, manifest_sha256)
+                );
+
                 CREATE TABLE IF NOT EXISTS tools (
                   tool_id TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
@@ -284,6 +315,7 @@ class SQLiteStore:
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_checkpoint_schema()
+            self._ensure_skill_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -899,6 +931,115 @@ class SQLiteStore:
         rows = self._query("SELECT * FROM tool_candidates WHERE candidate_id = ?", (candidate_id,))
         return self._row_to_tool_candidate(rows[0]) if rows else None
 
+    def upsert_skill(
+        self,
+        skill: SkillSpec,
+        *,
+        source_type: str,
+        source: str | None,
+        manifest_sha256: str,
+        registered_by: str,
+        created_at: str,
+    ) -> None:
+        self._execute(
+            """
+            INSERT INTO skills (
+                skill_id, name, version, spec_json, source_type, source,
+                manifest_sha256, signed, registered_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(skill_id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                spec_json = excluded.spec_json,
+                source_type = excluded.source_type,
+                source = excluded.source,
+                manifest_sha256 = excluded.manifest_sha256,
+                signed = excluded.signed,
+                registered_by = excluded.registered_by,
+                updated_at = excluded.updated_at
+            """,
+            (
+                skill.skill_id,
+                skill.name,
+                skill.version,
+                dumps(skill),
+                source_type,
+                source,
+                manifest_sha256,
+                int(skill.signed),
+                registered_by,
+                created_at,
+                created_at,
+            ),
+        )
+
+    def get_skill(self, skill_id: str) -> tuple[SkillSpec, dict[str, Any]] | None:
+        rows = self._query("SELECT * FROM skills WHERE skill_id = ?", (skill_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        return self._dict_to_skill_spec(loads(row["spec_json"], {})), self._skill_row_metadata(row)
+
+    def list_skills(self, text: str | None = None, limit: int | None = None) -> list[tuple[SkillSpec, dict[str, Any]]]:
+        params: list[Any] = []
+        sql = "SELECT * FROM skills"
+        if text:
+            needle = f"%{text.lower()}%"
+            sql += " WHERE lower(skill_id) LIKE ? OR lower(name) LIKE ? OR lower(spec_json) LIKE ?"
+            params.extend([needle, needle, needle])
+        sql += " ORDER BY name, skill_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [
+            (self._dict_to_skill_spec(loads(row["spec_json"], {})), self._skill_row_metadata(row))
+            for row in self._query(sql, params)
+        ]
+
+    def insert_skill_trust(
+        self,
+        *,
+        trust_id: str,
+        source_type: str,
+        source: str,
+        manifest_sha256: str,
+        trusted_by: str,
+        created_at: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO skill_trust (
+                trust_id, source_type, source, manifest_sha256, trusted_by, created_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trust_id,
+                source_type,
+                source,
+                manifest_sha256,
+                trusted_by,
+                created_at,
+                dumps(metadata or {}),
+            ),
+        )
+
+    def delete_skill_trust(self, *, source_type: str, source: str, manifest_sha256: str) -> None:
+        self._execute(
+            "DELETE FROM skill_trust WHERE source_type = ? AND source = ? AND manifest_sha256 = ?",
+            (source_type, source, manifest_sha256),
+        )
+
+    def is_skill_trusted(self, *, source_type: str, source: str, manifest_sha256: str) -> bool:
+        rows = self._query(
+            "SELECT 1 FROM skill_trust WHERE source_type = ? AND source = ? AND manifest_sha256 = ?",
+            (source_type, source, manifest_sha256),
+        )
+        return bool(rows)
+
+    def list_skill_trust(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._query("SELECT * FROM skill_trust ORDER BY created_at, source")]
+
     def insert_checkpoint(self, checkpoint: Checkpoint, snapshot: dict[str, Any]) -> None:
         self._execute(
             """
@@ -966,6 +1107,7 @@ class SQLiteStore:
             self._ensure_process_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
+            self._ensure_skill_schema()
             self.conn.commit()
 
     def _ensure_process_schema(self) -> None:
@@ -1033,6 +1175,39 @@ class SQLiteStore:
             self.conn.execute("ALTER TABLE checkpoints ADD COLUMN snapshot_version INTEGER NOT NULL DEFAULT 1")
         if "metadata_json" not in columns:
             self.conn.execute("ALTER TABLE checkpoints ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+
+    def _ensure_skill_schema(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS skills (
+              skill_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              version TEXT NOT NULL,
+              spec_json TEXT NOT NULL,
+              source_type TEXT NOT NULL,
+              source TEXT,
+              manifest_sha256 TEXT NOT NULL,
+              signed INTEGER NOT NULL,
+              registered_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_skills_name
+              ON skills(name);
+
+            CREATE TABLE IF NOT EXISTS skill_trust (
+              trust_id TEXT PRIMARY KEY,
+              source_type TEXT NOT NULL,
+              source TEXT NOT NULL,
+              manifest_sha256 TEXT NOT NULL,
+              trusted_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              UNIQUE(source_type, source, manifest_sha256)
+            );
+            """
+        )
 
     def _ensure_object_namespace_schema(self) -> None:
         self.conn.execute(
@@ -1365,6 +1540,33 @@ class SQLiteStore:
             validation=loads(row["validation_json"]) if row["validation_json"] else None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def _skill_row_metadata(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "source_type": row["source_type"],
+            "source": row["source"],
+            "manifest_sha256": row["manifest_sha256"],
+            "signed": bool(row["signed"]),
+            "registered_by": row["registered_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _dict_to_skill_spec(self, data: dict[str, Any]) -> SkillSpec:
+        return SkillSpec(
+            schema_version=int(data.get("schema_version", 1)),
+            skill_id=data["skill_id"],
+            name=data["name"],
+            version=data.get("version", "v0"),
+            description=data.get("description", ""),
+            instructions=data.get("instructions", ""),
+            tools=list(data.get("tools", [])),
+            actions=[ActionSchema(**item) for item in data.get("actions", [])],
+            jit_tools=[JitToolSpec(**item) for item in data.get("jit_tools", [])],
+            required_capabilities=list(data.get("required_capabilities", [])),
+            metadata=dict(data.get("metadata", {})),
+            signature=data.get("signature"),
         )
 
     def _dict_to_tool_spec(self, data: dict[str, Any]) -> ToolSpec:

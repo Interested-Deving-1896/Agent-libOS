@@ -1,5 +1,3 @@
-from agent_libos.skills.linker import SkillLinker
-from agent_libos.skills.schema import SkillSpec
+from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillSpec
 
-__all__ = ["SkillLinker", "SkillSpec"]
-
+__all__ = ["ActionSchema", "JitToolSpec", "LoadedSkill", "SkillSpec"]

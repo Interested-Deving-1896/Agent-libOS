@@ -233,6 +233,29 @@ class CheckpointDefaults:
 
 
 @dataclass(frozen=True)
+class SkillDefaults:
+    schema_version: int = 1
+    registry_resource: str = "skill:*"
+    trust_resource: str = "skill_trust:*"
+    global_dirs: tuple[str, ...] = ("~/.agent-libos/skills",)
+    workspace_dirs: tuple[str, ...] = ("skills", ".agent_libos/skills")
+    trusted_global_sha256: tuple[str, ...] = ()
+    global_requires_trust: bool = True
+    manifest_max_bytes: int = 262_144
+    manifest_hard_limit_bytes: int = 1_048_576
+    max_prompt_instruction_chars: int = 8_000
+    max_jit_source_chars: int = 64_000
+    discover_limit: int = 100
+    id_max_chars: int = 128
+    name_max_chars: int = 128
+    version_max_chars: int = 64
+    max_tools: int = 128
+    max_actions: int = 128
+    max_jit_tools: int = 32
+    max_required_capabilities: int = 64
+
+
+@dataclass(frozen=True)
 class LauncherDefaults:
     permission_presets: tuple[str, ...] = ("read-only", "edit", "full")
     default_permission_preset: str = "edit"
@@ -274,6 +297,7 @@ class AgentLibOSConfig:
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     checkpoint: CheckpointDefaults = field(default_factory=CheckpointDefaults)
+    skills: SkillDefaults = field(default_factory=SkillDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)
     scripts: ScriptDefaults = field(default_factory=ScriptDefaults)
 

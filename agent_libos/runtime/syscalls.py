@@ -313,6 +313,42 @@ class LibOSSyscallSession:
                 str(args["event_id"]),
                 actor=self.pid,
             )
+        if name == "skill.discover":
+            return {
+                "skills": self.runtime.skills.discover_skills(
+                    text=str(args["text"]) if args.get("text") is not None else None,
+                    actor=self.pid,
+                    limit=int(args["limit"]) if args.get("limit") is not None else None,
+                )
+            }
+        if name == "skill.inspect":
+            return self.runtime.skills.inspect_skill(str(args["skill_id"]), actor=self.pid)
+        if name == "skill.register":
+            if args.get("yaml") is not None:
+                return self.runtime.skills.register_skill_from_yaml_text(
+                    str(args["yaml"]),
+                    actor=self.pid,
+                    replace=bool(args.get("replace", False)),
+                    source_type=str(args.get("source_type") or "inline"),
+                    source=str(args["source"]) if args.get("source") is not None else None,
+                )
+            return self.runtime.skills.register_skill(
+                dict(args["skill"]),
+                actor=self.pid,
+                replace=bool(args.get("replace", False)),
+                source_type=str(args.get("source_type") or "inline"),
+                source=str(args["source"]) if args.get("source") is not None else None,
+            )
+        if name == "skill.load":
+            return self.runtime.skills.load_skill(self.pid, str(args["skill_id"]), actor=self.pid)
+        if name == "skill.unload":
+            return self.runtime.skills.unload_skill(self.pid, str(args["skill_id"]), actor=self.pid)
+        if name == "skill.load_yaml":
+            return self.runtime.skills.load_skill_from_workspace_yaml(
+                self.pid,
+                str(args["path"]),
+                replace=bool(args.get("replace", False)),
+            )
         if name in {"shell.run", "shell.run_command"}:
             cwd = self.runtime.process.working_directory(self.pid)
             return self.runtime.shell.arun(

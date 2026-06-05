@@ -203,7 +203,7 @@ class CheckpointManager:
             self._require_checkpoint_or_process_read(actor, checkpoint)
         current = self._build_current_state_for_diff(snapshot)
         tables: dict[str, Any] = {}
-        for table in ["processes", "objects", "capabilities", "process_messages", "tool_candidates"]:
+        for table in ["processes", "objects", "capabilities", "process_messages", "tool_candidates", "skills"]:
             before = self._index_rows(table, snapshot["rows"].get(table, []))
             after = self._index_rows(table, current.get(table, []))
             added = sorted(set(after) - set(before))
@@ -382,6 +382,8 @@ class CheckpointManager:
             "object_links": self._link_rows_for_objects(object_oids),
             "capabilities": self._capability_rows_for_subjects(subtree_pids),
             "process_messages": self._message_rows_for_recipients(subtree_pids),
+            "skills": self._skill_rows_for_processes(process_rows),
+            "skill_trust": self._skill_trust_rows_for_processes(process_rows),
             "tools": self._tool_rows_for_processes(process_rows),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", subtree_pids),
         }
@@ -433,6 +435,10 @@ class CheckpointManager:
                 self._insert_row(cur, "capabilities", row)
             for row in rows.get("tool_candidates", []):
                 self._insert_row(cur, "tool_candidates", row)
+            for row in rows.get("skills", []):
+                self._upsert_row(cur, "skills", row, "skill_id")
+            for row in rows.get("skill_trust", []):
+                self._upsert_row(cur, "skill_trust", row, "trust_id")
             for row in rows.get("tools", []):
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
@@ -514,6 +520,10 @@ class CheckpointManager:
             for table in ["object_links", "capabilities", "process_messages", "tool_candidates"]:
                 for row in rows.get(table, []):
                     self._insert_row(cur, table, row)
+            for row in rows.get("skills", []):
+                self._upsert_row(cur, "skills", row, "skill_id")
+            for row in rows.get("skill_trust", []):
+                self._upsert_row(cur, "skill_trust", row, "trust_id")
             for row in rows.get("tools", []):
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
@@ -645,6 +655,34 @@ class CheckpointManager:
             for tool_id in loads(row.get("tool_table_json"), {}).values():
                 tool_ids.add(str(tool_id))
         return self._rows_by_ids("tools", "tool_id", sorted(tool_ids))
+
+    def _skill_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        skill_ids = self._loaded_skill_ids(process_rows)
+        return self._rows_by_ids("skills", "skill_id", sorted(skill_ids))
+
+    def _skill_trust_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        skill_rows = self._skill_rows_for_processes(process_rows)
+        pairs = {(row["source_type"], row["source"], row["manifest_sha256"]) for row in skill_rows if row.get("source")}
+        if not pairs:
+            return []
+        rows: list[dict[str, Any]] = []
+        for source_type, source, manifest_sha256 in sorted(pairs):
+            rows.extend(
+                self.store.select_table_rows(
+                    "skill_trust",
+                    "source_type = ? AND source = ? AND manifest_sha256 = ?",
+                    [source_type, source, manifest_sha256],
+                    order_by="created_at",
+                )
+            )
+        return rows
+
+    def _loaded_skill_ids(self, process_rows: list[dict[str, Any]]) -> set[str]:
+        skill_ids: set[str] = set()
+        for row in process_rows:
+            for skill_id in loads(row.get("loaded_skills_json"), {}).keys():
+                skill_ids.add(str(skill_id))
+        return skill_ids
 
     def _image_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, Any]:
         runtime = self.runtime
@@ -783,6 +821,7 @@ class CheckpointManager:
             "capabilities": self._capability_rows_for_subjects(pids),
             "process_messages": self._message_rows_for_recipients(pids),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", pids),
+            "skills": self._skill_rows_for_processes(process_rows),
         }
 
     def _index_rows(self, table: str, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -792,6 +831,7 @@ class CheckpointManager:
             "capabilities": "cap_id",
             "process_messages": "message_id",
             "tool_candidates": "candidate_id",
+            "skills": "skill_id",
         }
         key = key_by_table[table]
         return {str(row[key]): row for row in rows}

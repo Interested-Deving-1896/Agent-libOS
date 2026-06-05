@@ -73,7 +73,7 @@ class AgentProcess:
     goal_oid: OID | None
     memory_view: MemoryView | None
     capabilities: list[CapabilityID]
-    loaded_skills: dict[str, str]
+    loaded_skills: dict[str, Any]
     tool_table: dict[str, str]
     event_cursor: EventID | None
     checkpoint_head: CheckpointID | None

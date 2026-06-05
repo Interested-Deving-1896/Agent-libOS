@@ -14,6 +14,7 @@ from agent_libos.config.defaults import (
     ShellDefaults,
     ShellPolicyLevel,
     ScriptDefaults,
+    SkillDefaults,
     ToolDefaults,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "ShellDefaults",
     "ShellPolicyLevel",
     "ScriptDefaults",
+    "SkillDefaults",
     "ToolDefaults",
 ]

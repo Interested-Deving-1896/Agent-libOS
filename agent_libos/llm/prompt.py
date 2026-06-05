@@ -69,6 +69,7 @@ def build_user_prompt(
     events: list[Event],
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
+    skills: list[dict[str, Any]] | None = None,
 ) -> str:
     if context.policy_used == "llm_context_object":
         return "\n\n".join(
@@ -76,12 +77,14 @@ def build_user_prompt(
                 "The append-only LLM context object below is the source of truth for this process quantum.",
                 "OpenAI tool schemas are supplied out-of-band; fallback JSON must still use an exact available tool name.",
                 "Choose the next single runtime action after reading the latest appended entries.",
+                _skill_section(skills or []),
                 context.text,
             ]
         )
     return "\n\n".join(
         [
             _process_section(process),
+            _skill_section(skills or []),
             _capability_section(capabilities),
             _tool_section(tools),
             _event_section(events),
@@ -119,6 +122,24 @@ def _capability_section(capabilities: list[Capability]) -> str:
         if not cap.revoked
     ]
     return f"Capabilities:\n{visible}"
+
+
+def _skill_section(skills: list[dict[str, Any]]) -> str:
+    visible = [
+        {
+            "skill_id": skill.get("skill_id"),
+            "name": skill.get("name"),
+            "version": skill.get("version"),
+            "description": skill.get("description", ""),
+            "instructions": skill.get("instructions", ""),
+            "tools": skill.get("tools", []),
+            "actions": skill.get("actions", []),
+            "jit_tools": skill.get("jit_tools", []),
+            "required_capabilities": skill.get("required_capabilities", []),
+        }
+        for skill in skills
+    ]
+    return f"Loaded skills:\n{visible}"
 
 
 def _tool_section(tools: list[dict[str, Any]]) -> str:
