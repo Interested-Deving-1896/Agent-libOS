@@ -14,6 +14,7 @@ class ProcessMessageKind(StrEnum):
 class ProcessMessageStatus(StrEnum):
     UNREAD = "unread"
     ACKED = "acked"
+    SUPERSEDED_BY_RESTORE = "superseded_by_restore"
 
 
 @dataclass

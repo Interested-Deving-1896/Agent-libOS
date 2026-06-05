@@ -182,7 +182,10 @@ class SQLiteStore:
                   pid TEXT NOT NULL,
                   reason TEXT NOT NULL,
                   snapshot_json TEXT NOT NULL,
-                  created_at TEXT NOT NULL
+                  created_at TEXT NOT NULL,
+                  created_by TEXT,
+                  snapshot_version INTEGER NOT NULL DEFAULT 1,
+                  metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS human_requests (
@@ -280,6 +283,7 @@ class SQLiteStore:
             self._ensure_process_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
+            self._ensure_checkpoint_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -486,6 +490,42 @@ class SQLiteStore:
 
     def list_processes(self) -> list[AgentProcess]:
         return [self._row_to_process(row) for row in self._query("SELECT * FROM processes")]
+
+    def select_table_rows(
+        self,
+        table: str,
+        where_sql: str = "",
+        params: Iterable[Any] = (),
+        *,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = f"SELECT * FROM {table}"
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+        if order_by:
+            sql += f" ORDER BY {order_by}"
+        return [self._row_to_dict(row) for row in self._query(sql, params)]
+
+    def insert_table_row(self, table: str, row: dict[str, Any]) -> None:
+        columns = list(row)
+        placeholders = ", ".join("?" for _ in columns)
+        col_sql = ", ".join(columns)
+        self._execute(
+            f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
+            tuple(row[column] for column in columns),
+        )
+
+    def delete_table_rows(self, table: str, where_sql: str, params: Iterable[Any] = ()) -> None:
+        self._execute(f"DELETE FROM {table} WHERE {where_sql}", params)
+
+    def object_payload(self, oid: str) -> Any:
+        return self._object_payloads[oid]
+
+    def set_object_payload(self, oid: str, payload: Any) -> None:
+        self._object_payloads[oid] = payload
+
+    def forget_object_payload(self, oid: str) -> None:
+        self._object_payloads.pop(oid, None)
 
     def insert_event(self, event: Event) -> None:
         self._execute(
@@ -861,13 +901,21 @@ class SQLiteStore:
 
     def insert_checkpoint(self, checkpoint: Checkpoint, snapshot: dict[str, Any]) -> None:
         self._execute(
-            "INSERT INTO checkpoints VALUES (?, ?, ?, ?, ?)",
+            """
+            INSERT INTO checkpoints (
+                checkpoint_id, pid, reason, snapshot_json, created_at,
+                created_by, snapshot_version, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 checkpoint.checkpoint_id,
                 checkpoint.pid,
                 checkpoint.reason,
                 dumps(snapshot),
                 checkpoint.created_at,
+                checkpoint.created_by,
+                checkpoint.snapshot_version,
+                dumps(checkpoint.metadata or {}),
             ),
         )
 
@@ -876,13 +924,20 @@ class SQLiteStore:
         if not rows:
             return None
         row = rows[0]
-        checkpoint = Checkpoint(
-            checkpoint_id=row["checkpoint_id"],
-            pid=row["pid"],
-            reason=row["reason"],
-            created_at=row["created_at"],
-        )
+        checkpoint = self._row_to_checkpoint(row)
         return checkpoint, loads(row["snapshot_json"], {})
+
+    def list_checkpoints(self, pid: str | None = None, limit: int | None = None) -> list[Checkpoint]:
+        params: list[Any] = []
+        sql = "SELECT * FROM checkpoints"
+        if pid is not None:
+            sql += " WHERE pid = ?"
+            params.append(pid)
+        sql += " ORDER BY created_at DESC, checkpoint_id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [self._row_to_checkpoint(row) for row in self._query(sql, params)]
 
     def snapshot_tables(self) -> dict[str, list[dict[str, Any]]]:
         snapshot: dict[str, list[dict[str, Any]]] = {}
@@ -969,6 +1024,15 @@ class SQLiteStore:
               ON process_messages(recipient_pid, correlation_id, status, created_at)
             """
         )
+
+    def _ensure_checkpoint_schema(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(checkpoints)")}
+        if "created_by" not in columns:
+            self.conn.execute("ALTER TABLE checkpoints ADD COLUMN created_by TEXT")
+        if "snapshot_version" not in columns:
+            self.conn.execute("ALTER TABLE checkpoints ADD COLUMN snapshot_version INTEGER NOT NULL DEFAULT 1")
+        if "metadata_json" not in columns:
+            self.conn.execute("ALTER TABLE checkpoints ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
 
     def _ensure_object_namespace_schema(self) -> None:
         self.conn.execute(
@@ -1220,6 +1284,18 @@ class SQLiteStore:
             decision=loads(row["decision_json"]) if row["decision_json"] else None,
             correlation_id=row["correlation_id"],
             parent_record_id=row["parent_record_id"],
+        )
+
+    def _row_to_checkpoint(self, row: sqlite3.Row) -> Checkpoint:
+        keys = set(row.keys())
+        return Checkpoint(
+            checkpoint_id=row["checkpoint_id"],
+            pid=row["pid"],
+            reason=row["reason"],
+            created_at=row["created_at"],
+            created_by=row["created_by"] if "created_by" in keys else None,
+            snapshot_version=int(row["snapshot_version"]) if "snapshot_version" in keys else 1,
+            metadata=loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
         )
 
     def _row_to_human_request(self, row: sqlite3.Row) -> HumanRequest:

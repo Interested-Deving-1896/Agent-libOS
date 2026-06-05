@@ -28,7 +28,7 @@ Submission-facing M0 docs:
 - Single-step APIs remain available for tests and debugging: `run_next_process_once()` / `arun_next_process_once()` do not drain the human queue.
 - Agent images configure process-visible tool tables at process creation time.
 - Event bus and audit trace cover process, process messages, object memory, capabilities, tools, human requests, checkpoints, and primitive access.
-- SQLite stores process/object metadata, process messages, full LLM call records, events, audit records, capabilities, human requests, tools, candidates, and checkpoints.
+- SQLite stores process/object metadata, process messages, full LLM call records, events, audit records, capabilities, human requests, tools, candidates, and scoped checkpoints.
 - LibOS primitives use an injectable Resource Provider Substrate. The default substrate is local host OS backed, but filesystem, clock/sleep, shell, and human terminal I/O providers can be replaced without changing tool schemas or capability checks.
 
 ### Object Memory
@@ -39,7 +39,7 @@ Submission-facing M0 docs:
 - Explicit namespaces are directory-like scopes created with `create_memory_namespace` and inspected with `list_memory_namespace`.
 - Namespace capabilities gate listing and name resolution. Object capabilities still gate reading, writing, linking, materializing, deleting, and granting object access.
 - A name is not itself a capability: resolving `namespace/name` requires namespace read authority and object read authority.
-- Object payloads live in runtime memory, not SQLite. SQLite stores directory metadata and a runtime-memory marker only.
+- Object payloads live in runtime memory, not ordinary SQLite object rows. SQLite stores directory metadata and a runtime-memory marker only; checkpoint payloads are the explicit durable snapshot exception.
 - Process-owned memory is released on process exit unless retained as the process result.
 - File/Object bridge tools can move file content into and out of Object Memory without returning the concrete content to the process-visible tool result.
 
@@ -51,18 +51,23 @@ Built-in tools currently include:
 
 - `append_memory_object`
 - `ask_human`
+- `create_checkpoint`
 - `create_memory_namespace`
 - `create_memory_object`
 - `create_object_from_file`
 - `delete_directory`
 - `delete_file`
+- `diff_checkpoint`
 - `exec_process`
+- `fork_checkpoint`
 - `fork_child_process`
 - `get_current_time`
 - `get_working_directory`
 - `human_output`
+- `inspect_checkpoint`
 - `load_image_from_yaml`
 - `list_child_processes`
+- `list_checkpoints`
 - `list_memory_namespace`
 - `merge_child_memory`
 - `parse_pytest_log`
@@ -75,6 +80,7 @@ Built-in tools currently include:
 - `read_text_file`
 - `register_jit_tool`
 - `request_permission`
+- `restore_checkpoint`
 - `run_shell_command`
 - `send_process_message`
 - `set_working_directory`
@@ -105,6 +111,15 @@ Important boundary rules:
 - The Deno subprocess is launched with `--no-prompt` and no read/write/net/env/run/ffi host permissions. Static imports are limited to configured `jsr:` packages, with a small `@std/*` allowlist by default.
 - Human approval is part of a syscall. TypeScript sees either the final syscall payload or a final syscall error; it never sees a pending/retry protocol state.
 - `process.exit` and `process.exec` are ordinary syscalls from the TypeScript side. The runtime applies the resulting lifecycle change only after the JIT tool returns its normal tool result.
+
+### Checkpoints
+
+- Checkpoints are capability-controlled durable snapshots of reconstructable runtime state for one process subtree.
+- A checkpoint captures process state, Object Memory metadata and payloads, process namespaces, object links, subtree capabilities, tool/JIT metadata, mailbox delivery state, and image definitions needed by that subtree.
+- Restore is scoped to the checkpoint owner subtree. It does not delete audit records, events, LLM call records, checkpoint records, or human interaction history.
+- External filesystem, shell, image, network, and provider effects are not rolled back. Restore reports them in `external_effects_since_checkpoint` for audit/explain or future compensation.
+- Default images expose low-risk `create_checkpoint`, `list_checkpoints`, `inspect_checkpoint`, and `diff_checkpoint`; `restore_checkpoint` and `fork_checkpoint` are registered but require explicit tool visibility plus checkpoint authority.
+- CLI admin commands are available with `agent-libos checkpoint create|list|inspect|diff|restore|fork|replay`. Passing `--actor-pid` makes the CLI enforce that process's checkpoint capabilities.
 
 ### Permissions And Human Queue
 
@@ -500,7 +515,7 @@ Near-term priorities:
 
 - More LLM executor conformance tests for provider edge cases and unusual tool-call formats.
 - Tool result compaction and long-context paging.
-- Stronger checkpoint/rollback tests.
+- Audit explain over checkpoint restore/fork decisions and external effects since checkpoint.
 - Audit querying by pid, capability, tool, external resource, and time range.
 - More complete terminal human queue UX.
 - More hardened Deno JIT sandbox profiles and policy presets for high-risk tools.

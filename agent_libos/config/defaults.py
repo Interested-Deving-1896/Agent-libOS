@@ -223,6 +223,16 @@ class LLMContextDefaults:
 
 
 @dataclass(frozen=True)
+class CheckpointDefaults:
+    snapshot_version: int = 1
+    list_limit: int = 100
+    payload_capture_limit_bytes: int = 1_048_576
+    snapshot_hard_limit_bytes: int = 16_777_216
+    diff_preview_items: int = 25
+    auto_high_risk_checkpoint: bool = False
+
+
+@dataclass(frozen=True)
 class LauncherDefaults:
     permission_presets: tuple[str, ...] = ("read-only", "edit", "full")
     default_permission_preset: str = "edit"
@@ -263,6 +273,7 @@ class AgentLibOSConfig:
     image: ImageDefaults = field(default_factory=ImageDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
+    checkpoint: CheckpointDefaults = field(default_factory=CheckpointDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)
     scripts: ScriptDefaults = field(default_factory=ScriptDefaults)
 

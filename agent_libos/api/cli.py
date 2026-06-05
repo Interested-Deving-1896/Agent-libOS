@@ -94,6 +94,8 @@ def main(argv: list[str] | None = None) -> None:
     _add_message_parser_args(message_parser)
     interrupt_parser = sub.add_parser("interrupt", help="Send a human interrupt process message")
     _add_message_parser_args(interrupt_parser, include_kind=False)
+    checkpoint_parser = sub.add_parser("checkpoint", help="Create, inspect, diff, restore, fork, or replay checkpoints")
+    _add_checkpoint_parser_args(checkpoint_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
     grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
     grant_tool_parser.add_argument("pid")
@@ -134,6 +136,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(asyncio.run(_run_message_command(runtime, args)))
         elif args.command == "interrupt":
             _print_json(asyncio.run(_run_message_command(runtime, args, fixed_kind=ProcessMessageKind.INTERRUPT)))
+        elif args.command == "checkpoint":
+            _print_json(_run_checkpoint_command(runtime, args))
         elif args.command == "grant-tool":
             raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
         elif args.command == "human":
@@ -373,6 +377,84 @@ def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: b
     parser.add_argument("--payload-json", default="{}", help="Structured JSON object to include in the message payload.")
     parser.add_argument("--run", action="store_true", help="Run the scheduler after posting the message.")
     parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+
+
+def _add_checkpoint_parser_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--actor-pid",
+        help="If set, execute as this process and enforce checkpoint capabilities. Omit for admin CLI mode.",
+    )
+    sub = parser.add_subparsers(dest="checkpoint_command", required=True)
+    create = sub.add_parser("create", help="Create a checkpoint for a process subtree")
+    create.add_argument("pid")
+    create.add_argument("reason")
+    create.add_argument("--metadata-json", default="{}", help="Optional checkpoint metadata JSON object.")
+    list_parser = sub.add_parser("list", help="List checkpoints")
+    list_parser.add_argument("--pid", help="Filter by process id.")
+    list_parser.add_argument("--limit", type=int)
+    inspect = sub.add_parser("inspect", help="Inspect checkpoint metadata")
+    inspect.add_argument("checkpoint_id")
+    diff = sub.add_parser("diff", help="Diff current reconstructable state against a checkpoint")
+    diff.add_argument("checkpoint_id")
+    restore = sub.add_parser("restore", help="Restore checkpoint process subtree")
+    restore.add_argument("checkpoint_id")
+    fork = sub.add_parser("fork", help="Fork a new process subtree from a checkpoint")
+    fork.add_argument("checkpoint_id")
+    fork.add_argument("--parent-pid", help="Optional parent pid for the fork root.")
+    replay = sub.add_parser("replay", help="Return diagnostic event timeline from a checkpoint to an event")
+    replay.add_argument("checkpoint_id")
+    replay.add_argument("event_id")
+
+
+def _run_checkpoint_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+    actor = args.actor_pid or "cli"
+    require_capability = args.actor_pid is not None
+    command = args.checkpoint_command
+    if command == "create":
+        checkpoint_id = runtime.checkpoint.create(
+            args.pid,
+            args.reason,
+            actor=actor,
+            require_capability=require_capability,
+            metadata=_parse_json_mapping(args.metadata_json, "--metadata-json"),
+        )
+        return {"checkpoint_id": checkpoint_id, "pid": args.pid, "reason": args.reason, "actor": actor}
+    if command == "list":
+        return runtime.checkpoint.list(
+            args.pid,
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+            limit=args.limit,
+        )
+    if command == "inspect":
+        return runtime.checkpoint.inspect(
+            args.checkpoint_id,
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+        )
+    if command == "diff":
+        return runtime.checkpoint.diff(
+            args.checkpoint_id,
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+        )
+    if command == "restore":
+        return runtime.checkpoint.restore(actor, args.checkpoint_id, require_capability=require_capability)
+    if command == "fork":
+        return runtime.checkpoint.fork_from_checkpoint(
+            actor,
+            args.checkpoint_id,
+            parent_pid=args.parent_pid,
+            require_capability=require_capability,
+        )
+    if command == "replay":
+        return runtime.checkpoint.replay_to_event(
+            args.checkpoint_id,
+            args.event_id,
+            actor=actor if require_capability else "cli",
+            require_capability=require_capability,
+        )
+    raise SystemExit(f"unknown checkpoint command: {command}")
 
 
 def _message_cli_summary(message: ProcessMessage) -> dict[str, Any]:

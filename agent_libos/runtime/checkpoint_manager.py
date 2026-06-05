@@ -1,63 +1,973 @@
 from __future__ import annotations
 
-from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.models import Checkpoint, EventType
+from copy import deepcopy
+from typing import Any, Iterable
+
+from agent_libos.capability.manager import CapabilityManager
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.models import (
+    AgentImage,
+    CapabilityRight,
+    Checkpoint,
+    EventType,
+    HumanRequestStatus,
+    ProcessMessageStatus,
+    ProcessStatus,
+    ToolHandle,
+)
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
+from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.serde import dumps, loads, to_jsonable
 
 
 class CheckpointManager:
-    def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus):
+    """Durable checkpoints for reconstructable AgentProcess runtime state.
+
+    Checkpoints deliberately do not roll back audit records, LLM calls, events,
+    or external provider side effects. Restore edits only the scoped process
+    subtree state that can be reconstructed from the checkpoint payload.
+    """
+
+    PROCESS_RESOURCE_PREFIX = "checkpoint:process:"
+    CHECKPOINT_RESOURCE_PREFIX = "checkpoint:"
+    HISTORY_TABLES = {"audit_records", "events", "llm_calls", "checkpoints"}
+    TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+
+    def __init__(
+        self,
+        store: SQLiteStore,
+        audit: AuditManager,
+        events: EventBus,
+        capabilities: CapabilityManager | None = None,
+        *,
+        config: AgentLibOSConfig | None = None,
+    ):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.audit = audit
         self.events = events
+        self.capabilities = capabilities
+        self.runtime: Any | None = None
 
-    def checkpoint(self, pid: str, reason: str) -> str:
-        checkpoint = Checkpoint(
-            checkpoint_id=new_id("ckpt"),
+    def bind_runtime(self, runtime: Any) -> None:
+        self.runtime = runtime
+
+    def process_resource(self, pid: str) -> str:
+        return f"{self.PROCESS_RESOURCE_PREFIX}{pid}"
+
+    def checkpoint_resource(self, checkpoint_id: str) -> str:
+        return f"{self.CHECKPOINT_RESOURCE_PREFIX}{checkpoint_id}"
+
+    def grant_process_defaults(self, pid: str, *, issued_by: str = "checkpoint.process") -> None:
+        if self.capabilities is None:
+            return
+        self.capabilities.grant(
+            subject=pid,
+            resource=self.process_resource(pid),
+            rights=[CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by=issued_by,
+        )
+
+    def create(
+        self,
+        pid: str,
+        reason: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        selected_actor = actor or pid
+        if require_capability:
+            self._require_process_right(selected_actor, pid, CapabilityRight.WRITE)
+        checkpoint_id = new_id("ckpt")
+        created_at = utc_now()
+        snapshot = self._build_snapshot(
+            checkpoint_id=checkpoint_id,
             pid=pid,
             reason=reason,
-            created_at=utc_now(),
+            created_at=created_at,
+            created_by=selected_actor,
         )
-        snapshot = self.store.snapshot_tables()
+        checkpoint = Checkpoint(
+            checkpoint_id=checkpoint_id,
+            pid=pid,
+            reason=reason,
+            created_at=created_at,
+            created_by=selected_actor,
+            snapshot_version=self.config.checkpoint.snapshot_version,
+            metadata={
+                **(metadata or {}),
+                "subtree_pids": snapshot["subtree_pids"],
+                "object_count": len(snapshot["object_payloads"]),
+                "snapshot_bytes": len(dumps(snapshot).encode("utf-8")),
+            },
+        )
+        snapshot_bytes = len(dumps(snapshot).encode("utf-8"))
+        if snapshot_bytes > self.config.checkpoint.snapshot_hard_limit_bytes:
+            raise ValidationError(
+                "checkpoint snapshot exceeded "
+                f"snapshot_hard_limit_bytes={self.config.checkpoint.snapshot_hard_limit_bytes}"
+            )
         self.store.insert_checkpoint(checkpoint, snapshot)
         process = self.store.get_process(pid)
         if process is not None:
-            process.checkpoint_head = checkpoint.checkpoint_id
+            process.checkpoint_head = checkpoint_id
             process.updated_at = utc_now()
             self.store.update_process(process)
+        if self.capabilities is not None:
+            self.capabilities.grant(
+                subject=pid,
+                resource=self.checkpoint_resource(checkpoint_id),
+                rights=[CapabilityRight.READ],
+                issued_by="checkpoint.create",
+            )
         self.events.emit(
             EventType.CHECKPOINT_CREATED,
-            source=pid,
+            source=selected_actor,
             target=pid,
-            payload={"checkpoint_id": checkpoint.checkpoint_id, "reason": reason},
+            payload={"checkpoint_id": checkpoint_id, "reason": reason, "subtree_pids": snapshot["subtree_pids"]},
         )
         self.audit.record(
-            actor=pid,
+            actor=selected_actor,
             action="checkpoint.create",
-            target=f"checkpoint:{checkpoint.checkpoint_id}",
-            decision={"reason": reason},
+            target=self.checkpoint_resource(checkpoint_id),
+            decision={
+                "reason": reason,
+                "pid": pid,
+                "subtree_pids": snapshot["subtree_pids"],
+                "snapshot_bytes": snapshot_bytes,
+            },
         )
-        return checkpoint.checkpoint_id
+        return checkpoint_id
 
-    def rollback(self, pid: str, checkpoint_id: str) -> dict[str, str]:
-        found = self.store.get_checkpoint_snapshot(checkpoint_id)
-        if found is None:
-            raise KeyError(f"checkpoint not found: {checkpoint_id}")
-        checkpoint, snapshot = found
-        self.store.restore_tables(snapshot)
+    def checkpoint(self, pid: str, reason: str) -> str:
+        return self.create(pid, reason, actor=pid, require_capability=False)
+
+    def list(
+        self,
+        pid: str | None = None,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if require_capability and actor is not None:
+            if pid is None:
+                self._require_checkpoint_right(actor, "*", CapabilityRight.READ)
+            else:
+                self._require_process_right(actor, pid, CapabilityRight.READ)
+        selected_limit = self.config.checkpoint.list_limit if limit is None else limit
+        return [self._checkpoint_summary(item) for item in self.store.list_checkpoints(pid=pid, limit=selected_limit)]
+
+    def inspect(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> dict[str, Any]:
+        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        if require_capability and actor is not None:
+            self._require_checkpoint_or_process_read(actor, checkpoint)
+        return {
+            "checkpoint": self._checkpoint_summary(checkpoint),
+            "snapshot_version": snapshot.get("version"),
+            "subtree_pids": list(snapshot.get("subtree_pids", [])),
+            "counts": self._snapshot_counts(snapshot),
+            "processes": [
+                {
+                    "pid": row["pid"],
+                    "parent_pid": row.get("parent_pid"),
+                    "image_id": row["image_id"],
+                    "status": row["status"],
+                    "working_directory": row.get("working_directory", "."),
+                    "goal_oid": row.get("goal_oid"),
+                }
+                for row in snapshot["rows"].get("processes", [])
+            ],
+        }
+
+    def diff(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> dict[str, Any]:
+        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        if require_capability and actor is not None:
+            self._require_checkpoint_or_process_read(actor, checkpoint)
+        current = self._build_current_state_for_diff(snapshot)
+        tables: dict[str, Any] = {}
+        for table in ["processes", "objects", "capabilities", "process_messages", "tool_candidates"]:
+            before = self._index_rows(table, snapshot["rows"].get(table, []))
+            after = self._index_rows(table, current.get(table, []))
+            added = sorted(set(after) - set(before))
+            removed = sorted(set(before) - set(after))
+            changed = sorted(key for key in set(before) & set(after) if before[key] != after[key])
+            tables[table] = {
+                "added": added[: self.config.checkpoint.diff_preview_items],
+                "removed": removed[: self.config.checkpoint.diff_preview_items],
+                "changed": changed[: self.config.checkpoint.diff_preview_items],
+                "added_count": len(added),
+                "removed_count": len(removed),
+                "changed_count": len(changed),
+            }
+        return {
+            "checkpoint_id": checkpoint_id,
+            "pid": checkpoint.pid,
+            "tables": tables,
+            "external_effects_since_checkpoint": self._external_effects_since(checkpoint),
+        }
+
+    def restore(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        *,
+        require_capability: bool = True,
+    ) -> dict[str, Any]:
+        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        if require_capability:
+            self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
+        current_pids = self._subtree_pids(checkpoint.pid)
+        snapshot_pids = list(snapshot.get("subtree_pids", []))
+        external_effects = self._external_effects_since(checkpoint)
+        cancelled_human_requests = self._cancel_pending_human_requests(current_pids, checkpoint)
+        superseded_messages = self._supersede_post_checkpoint_messages(current_pids, checkpoint)
+        self._restore_scoped_rows(snapshot, current_pids)
+        self._restore_images(snapshot)
+        self._restore_jit_sources(snapshot)
         self.events.emit(
             EventType.ROLLBACK,
-            source=pid,
+            source=actor,
             target=checkpoint.pid,
-            payload={"checkpoint_id": checkpoint_id},
+            payload={
+                "checkpoint_id": checkpoint_id,
+                "restored_pids": snapshot_pids,
+                "external_effects_since_checkpoint": len(external_effects),
+            },
         )
         self.audit.record(
-            actor=pid,
-            action="checkpoint.rollback",
-            target=f"checkpoint:{checkpoint_id}",
-            decision={"restored_for": checkpoint.pid},
+            actor=actor,
+            action="checkpoint.restore",
+            target=self.checkpoint_resource(checkpoint_id),
+            decision={
+                "restored_for": checkpoint.pid,
+                "restored_pids": snapshot_pids,
+                "previous_pids": current_pids,
+                "cancelled_human_requests": cancelled_human_requests,
+                "superseded_messages": superseded_messages,
+                "external_effects_since_checkpoint": external_effects,
+            },
         )
-        return {"checkpoint_id": checkpoint_id, "pid": checkpoint.pid, "status": "rolled_back"}
+        return {
+            "checkpoint_id": checkpoint_id,
+            "pid": checkpoint.pid,
+            "status": "restored",
+            "restored_pids": snapshot_pids,
+            "previous_pids": current_pids,
+            "cancelled_human_requests": cancelled_human_requests,
+            "superseded_messages": superseded_messages,
+            "external_effects_since_checkpoint": external_effects,
+        }
 
+    def rollback(self, pid: str, checkpoint_id: str) -> dict[str, Any]:
+        return self.restore(pid, checkpoint_id, require_capability=False)
+
+    def fork_from_checkpoint(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        *,
+        parent_pid: str | None = None,
+        require_capability: bool = True,
+    ) -> dict[str, Any]:
+        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        if require_capability:
+            self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.EXECUTE)
+        remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid)
+        self._insert_fork_rows(remapped)
+        self._restore_images(snapshot)
+        self._restore_jit_sources(snapshot)
+        root_pid = remapped["pid_map"][checkpoint.pid]
+        self.events.emit(
+            EventType.PROCESS_FORKED,
+            source=actor,
+            target=root_pid,
+            payload={"checkpoint_id": checkpoint_id, "source_pid": checkpoint.pid, "fork_root_pid": root_pid},
+        )
+        self.audit.record(
+            actor=actor,
+            action="checkpoint.fork",
+            target=self.checkpoint_resource(checkpoint_id),
+            decision={"source_pid": checkpoint.pid, "fork_root_pid": root_pid, "pid_map": remapped["pid_map"]},
+        )
+        return {
+            "checkpoint_id": checkpoint_id,
+            "source_pid": checkpoint.pid,
+            "fork_root_pid": root_pid,
+            "pid_map": remapped["pid_map"],
+            "object_map": remapped["object_map"],
+        }
+
+    def replay_to_event(
+        self,
+        checkpoint_id: str,
+        event_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> dict[str, Any]:
+        checkpoint, _snapshot = self._load_checkpoint(checkpoint_id)
+        if require_capability and actor is not None:
+            self._require_checkpoint_or_process_read(actor, checkpoint)
+        events = self.store.list_events()
+        selected = []
+        reached = False
+        for event in events:
+            if event.created_at < checkpoint.created_at:
+                continue
+            selected.append(
+                {
+                    "event_id": event.event_id,
+                    "type": event.type.value,
+                    "source": event.source,
+                    "target": event.target,
+                    "created_at": event.created_at,
+                    "payload": event.payload,
+                }
+            )
+            if event.event_id == event_id:
+                reached = True
+                break
+        if not reached:
+            raise NotFound(f"event not found after checkpoint: {event_id}")
+        self.audit.record(
+            actor=actor or "runtime",
+            action="checkpoint.replay_to_event",
+            target=self.checkpoint_resource(checkpoint_id),
+            decision={"event_id": event_id, "events": len(selected), "diagnostic_only": True},
+        )
+        return {
+            "checkpoint_id": checkpoint_id,
+            "event_id": event_id,
+            "diagnostic_only": True,
+            "events": selected,
+        }
+
+    def _build_snapshot(
+        self,
+        *,
+        checkpoint_id: str,
+        pid: str,
+        reason: str,
+        created_at: str,
+        created_by: str,
+    ) -> dict[str, Any]:
+        subtree_pids = self._subtree_pids(pid)
+        if not subtree_pids:
+            raise NotFound(f"process not found: {pid}")
+        process_rows = [self._safe_point_process_row(row, checkpoint_id) for row in self._rows_by_ids("processes", "pid", subtree_pids)]
+        object_oids = self._scoped_object_oids(process_rows, subtree_pids)
+        namespace_names = self._scoped_namespaces(object_oids, subtree_pids)
+        rows = {
+            "processes": process_rows,
+            "object_namespaces": self._rows_by_ids("object_namespaces", "namespace", namespace_names),
+            "objects": self._rows_by_ids("objects", "oid", object_oids),
+            "object_links": self._link_rows_for_objects(object_oids),
+            "capabilities": self._capability_rows_for_subjects(subtree_pids),
+            "process_messages": self._message_rows_for_recipients(subtree_pids),
+            "tools": self._tool_rows_for_processes(process_rows),
+            "tool_candidates": self._rows_by_ids("tool_candidates", "pid", subtree_pids),
+        }
+        object_payloads = self._object_payload_snapshot(object_oids)
+        return {
+            "version": self.config.checkpoint.snapshot_version,
+            "checkpoint_id": checkpoint_id,
+            "pid": pid,
+            "reason": reason,
+            "created_at": created_at,
+            "created_by": created_by,
+            "subtree_pids": subtree_pids,
+            "object_oids": object_oids,
+            "namespaces": namespace_names,
+            "rows": rows,
+            "object_payloads": object_payloads,
+            "images": self._image_snapshot(process_rows),
+            "jit_sources": self._jit_source_snapshot(process_rows),
+        }
+
+    def _restore_scoped_rows(self, snapshot: dict[str, Any], current_pids: list[str]) -> None:
+        rows = snapshot["rows"]
+        object_oids = set(snapshot.get("object_oids", [])) | set(self._current_scoped_object_oids(current_pids))
+        namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
+        with self.store._lock:
+            cur = self.store.conn.cursor()
+            self._delete_object_links(cur, object_oids)
+            self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
+            for oid in object_oids:
+                self.store.forget_object_payload(oid)
+            self._delete_rows_by_ids(cur, "object_namespaces", "namespace", namespace_names)
+            self._delete_non_checkpoint_capabilities(cur, current_pids)
+            self._delete_rows_by_ids(cur, "tool_candidates", "pid", current_pids)
+            self._delete_rows_by_ids(cur, "processes", "pid", current_pids)
+            for row in rows.get("object_namespaces", []):
+                self._insert_row(cur, "object_namespaces", row)
+            for row in rows.get("objects", []):
+                item = dict(row)
+                item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
+                self._insert_row(cur, "objects", item)
+                oid = str(item["oid"])
+                if oid in snapshot["object_payloads"]:
+                    self.store.set_object_payload(oid, deepcopy(snapshot["object_payloads"][oid]))
+            for row in rows.get("object_links", []):
+                self._insert_row(cur, "object_links", row)
+            for row in rows.get("capabilities", []):
+                if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
+                    continue
+                self._insert_row(cur, "capabilities", row)
+            for row in rows.get("tool_candidates", []):
+                self._insert_row(cur, "tool_candidates", row)
+            for row in rows.get("tools", []):
+                exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
+                if exists is None:
+                    self._insert_row(cur, "tools", row)
+            for row in rows.get("process_messages", []):
+                self._upsert_row(cur, "process_messages", row, "message_id")
+            for row in rows.get("processes", []):
+                self._insert_row(cur, "processes", row)
+            self.store.conn.commit()
+
+    def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None) -> dict[str, Any]:
+        original_pids = list(snapshot["subtree_pids"])
+        pid_map = {pid: new_id("pid") for pid in original_pids}
+        object_map = {oid: new_id("obj") for oid in snapshot.get("object_oids", [])}
+        namespace_map = {
+            namespace: self._remap_namespace(namespace, pid_map)
+            for namespace in snapshot.get("namespaces", [])
+        }
+        capability_map = {row["cap_id"]: new_id("cap") for row in snapshot["rows"].get("capabilities", [])}
+        rows = deepcopy(snapshot["rows"])
+        rows["processes"] = [
+            self._remap_process_row(row, pid_map, object_map, capability_map, parent_pid)
+            for row in rows.get("processes", [])
+        ]
+        rows["object_namespaces"] = [
+            self._remap_namespace_row(row, pid_map, namespace_map)
+            for row in rows.get("object_namespaces", [])
+        ]
+        rows["objects"] = [
+            self._remap_object_row(row, pid_map, object_map, namespace_map)
+            for row in rows.get("objects", [])
+        ]
+        rows["object_links"] = [
+            self._remap_link_row(row, object_map)
+            for row in rows.get("object_links", [])
+            if row["src_oid"] in object_map and row["dst_oid"] in object_map
+        ]
+        rows["capabilities"] = [
+            self._remap_capability_row(row, pid_map, object_map, namespace_map, capability_map)
+            for row in rows.get("capabilities", [])
+            if row["subject"] in pid_map and not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)
+        ]
+        rows["process_messages"] = [
+            self._remap_message_row(row, pid_map)
+            for row in rows.get("process_messages", [])
+            if row["recipient_pid"] in pid_map
+        ]
+        rows["tool_candidates"] = [
+            self._remap_tool_candidate_row(row, pid_map)
+            for row in rows.get("tool_candidates", [])
+            if row["pid"] in pid_map
+        ]
+        payloads = {
+            object_map[oid]: deepcopy(payload)
+            for oid, payload in snapshot.get("object_payloads", {}).items()
+            if oid in object_map
+        }
+        return {
+            "rows": rows,
+            "object_payloads": payloads,
+            "pid_map": pid_map,
+            "object_map": object_map,
+            "namespace_map": namespace_map,
+            "capability_map": capability_map,
+        }
+
+    def _insert_fork_rows(self, remapped: dict[str, Any]) -> None:
+        rows = remapped["rows"]
+        with self.store._lock:
+            cur = self.store.conn.cursor()
+            for row in rows.get("object_namespaces", []):
+                if cur.execute("SELECT 1 FROM object_namespaces WHERE namespace = ?", (row["namespace"],)).fetchone() is None:
+                    self._insert_row(cur, "object_namespaces", row)
+            for row in rows.get("objects", []):
+                item = dict(row)
+                item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
+                self._insert_row(cur, "objects", item)
+                self.store.set_object_payload(item["oid"], deepcopy(remapped["object_payloads"][item["oid"]]))
+            for table in ["object_links", "capabilities", "process_messages", "tool_candidates"]:
+                for row in rows.get(table, []):
+                    self._insert_row(cur, table, row)
+            for row in rows.get("tools", []):
+                exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
+                if exists is None:
+                    self._insert_row(cur, "tools", row)
+            for row in rows.get("processes", []):
+                self._insert_row(cur, "processes", row)
+            self.store.conn.commit()
+
+    def _load_checkpoint(self, checkpoint_id: str) -> tuple[Checkpoint, dict[str, Any]]:
+        found = self.store.get_checkpoint_snapshot(checkpoint_id)
+        if found is None:
+            raise NotFound(f"checkpoint not found: {checkpoint_id}")
+        return found
+
+    def _checkpoint_summary(self, checkpoint: Checkpoint) -> dict[str, Any]:
+        return {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "pid": checkpoint.pid,
+            "reason": checkpoint.reason,
+            "created_at": checkpoint.created_at,
+            "created_by": checkpoint.created_by,
+            "snapshot_version": checkpoint.snapshot_version,
+            "metadata": checkpoint.metadata or {},
+        }
+
+    def _require_process_right(self, actor: str, pid: str, right: CapabilityRight) -> None:
+        if self.capabilities is None:
+            return
+        self.capabilities.require(actor, self.process_resource(pid), right)
+
+    def _require_checkpoint_right(self, actor: str, checkpoint_id: str, right: CapabilityRight) -> None:
+        if self.capabilities is None:
+            return
+        resource = "checkpoint:*" if checkpoint_id == "*" else self.checkpoint_resource(checkpoint_id)
+        self.capabilities.require(actor, resource, right)
+
+    def _require_checkpoint_or_process_read(self, actor: str, checkpoint: Checkpoint) -> None:
+        if self.capabilities is None:
+            return
+        if self.capabilities.check(actor, self.checkpoint_resource(checkpoint.checkpoint_id), CapabilityRight.READ):
+            return
+        if self.capabilities.check(actor, self.process_resource(checkpoint.pid), CapabilityRight.READ):
+            return
+        raise CapabilityDenied(f"{actor} lacks read on checkpoint {checkpoint.checkpoint_id}")
+
+    def _subtree_pids(self, root_pid: str) -> list[str]:
+        processes = {process.pid: process for process in self.store.list_processes()}
+        if root_pid not in processes:
+            return []
+        selected: list[str] = []
+        queue = [root_pid]
+        while queue:
+            pid = queue.pop(0)
+            if pid in selected:
+                continue
+            selected.append(pid)
+            children = sorted(item.pid for item in processes.values() if item.parent_pid == pid)
+            queue.extend(children)
+        return selected
+
+    def _safe_point_process_row(self, row: dict[str, Any], checkpoint_id: str) -> dict[str, Any]:
+        item = dict(row)
+        if item.get("status") == ProcessStatus.RUNNING.value:
+            item["status"] = ProcessStatus.RUNNABLE.value
+        item["checkpoint_head"] = checkpoint_id
+        return item
+
+    def _scoped_object_oids(self, process_rows: list[dict[str, Any]], pids: list[str]) -> list[str]:
+        oids: set[str] = set()
+        for row in process_rows:
+            if row.get("goal_oid"):
+                oids.add(str(row["goal_oid"]))
+            view = loads(row.get("memory_view_json"), {}) if row.get("memory_view_json") else {}
+            for root in view.get("roots", []):
+                if isinstance(root, dict) and root.get("oid"):
+                    oids.add(str(root["oid"]))
+        for row in self.store.select_table_rows("objects"):
+            if row["created_by"] in pids:
+                oids.add(row["oid"])
+        return sorted(oid for oid in oids if oid in self.store._object_payloads)
+
+    def _current_scoped_object_oids(self, pids: list[str]) -> list[str]:
+        process_rows = self._rows_by_ids("processes", "pid", pids)
+        return self._scoped_object_oids(process_rows, pids)
+
+    def _scoped_namespaces(self, object_oids: list[str], pids: list[str]) -> list[str]:
+        namespaces = {
+            row["namespace"]
+            for row in self._rows_by_ids("objects", "oid", object_oids)
+        }
+        process_namespaces = {f"{self.config.memory.process_namespace_prefix}:{pid}" for pid in pids}
+        namespaces |= process_namespaces
+        for row in self.store.select_table_rows("object_namespaces"):
+            if row["created_by"] in pids or row["namespace"] in namespaces:
+                namespaces.add(row["namespace"])
+        return sorted(namespaces)
+
+    def _current_scoped_namespaces(self, pids: list[str]) -> list[str]:
+        return self._scoped_namespaces(self._current_scoped_object_oids(pids), pids)
+
+    def _rows_by_ids(self, table: str, column: str, values: Iterable[str]) -> list[dict[str, Any]]:
+        selected = list(dict.fromkeys(values))
+        if not selected:
+            return []
+        placeholders = ", ".join("?" for _ in selected)
+        return self.store.select_table_rows(table, f"{column} IN ({placeholders})", selected, order_by=column)
+
+    def _link_rows_for_objects(self, object_oids: list[str]) -> list[dict[str, Any]]:
+        if not object_oids:
+            return []
+        placeholders = ", ".join("?" for _ in object_oids)
+        return self.store.select_table_rows(
+            "object_links",
+            f"src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
+            [*object_oids, *object_oids],
+            order_by="id",
+        )
+
+    def _capability_rows_for_subjects(self, pids: list[str]) -> list[dict[str, Any]]:
+        rows = self._rows_by_ids("capabilities", "subject", pids)
+        return [row for row in rows if not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)]
+
+    def _message_rows_for_recipients(self, pids: list[str]) -> list[dict[str, Any]]:
+        return self._rows_by_ids("process_messages", "recipient_pid", pids)
+
+    def _tool_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        tool_ids: set[str] = set()
+        for row in process_rows:
+            for tool_id in loads(row.get("tool_table_json"), {}).values():
+                tool_ids.add(str(tool_id))
+        return self._rows_by_ids("tools", "tool_id", sorted(tool_ids))
+
+    def _image_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        runtime = self.runtime
+        if runtime is None:
+            return {}
+        image_ids = {row["image_id"] for row in process_rows}
+        return {
+            image_id: to_jsonable(runtime.images[image_id])
+            for image_id in sorted(image_ids)
+            if image_id in runtime.images
+        }
+
+    def _restore_images(self, snapshot: dict[str, Any]) -> None:
+        runtime = self.runtime
+        if runtime is None:
+            return
+        for image_id, data in snapshot.get("images", {}).items():
+            runtime.images[image_id] = AgentImage(**data)
+
+    def _object_payload_snapshot(self, object_oids: list[str]) -> dict[str, Any]:
+        payloads: dict[str, Any] = {}
+        limit = self.config.checkpoint.payload_capture_limit_bytes
+        for oid in object_oids:
+            if oid not in self.store._object_payloads:
+                continue
+            payload = deepcopy(self.store.object_payload(oid))
+            payload_bytes = len(dumps(payload).encode("utf-8"))
+            if payload_bytes > limit:
+                raise ValidationError(
+                    f"object payload {oid} exceeds checkpoint payload_capture_limit_bytes={limit}"
+                )
+            payloads[oid] = payload
+        return payloads
+
+    def _jit_source_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, str]:
+        runtime = self.runtime
+        tools = getattr(runtime, "tools", None)
+        if tools is None:
+            return {}
+        sources = getattr(tools, "_jit_sources", {})
+        tool_ids: set[str] = set()
+        for row in process_rows:
+            for tool_id in loads(row.get("tool_table_json"), {}).values():
+                tool_ids.add(str(tool_id))
+        return {tool_id: sources[tool_id] for tool_id in sorted(tool_ids) if tool_id in sources}
+
+    def _restore_jit_sources(self, snapshot: dict[str, Any]) -> None:
+        runtime = self.runtime
+        tools = getattr(runtime, "tools", None)
+        if tools is None:
+            return
+        sources = getattr(tools, "_jit_sources", None)
+        handles = getattr(tools, "_handles", None)
+        names = getattr(tools, "_tool_ids_by_name", None)
+        if sources is None or handles is None:
+            return
+        tool_rows = {row["tool_id"]: row for row in snapshot.get("rows", {}).get("tools", [])}
+        for tool_id, source in snapshot.get("jit_sources", {}).items():
+            sources[tool_id] = source
+            row = tool_rows.get(tool_id)
+            if row is None:
+                continue
+            handle = ToolHandle(
+                tool_id=tool_id,
+                name=row["name"],
+                capability_id=None,
+                scope=row["scope"],
+            )
+            handles[tool_id] = handle
+            if names is not None:
+                names.setdefault(handle.name, tool_id)
+
+    def _external_effects_since(self, checkpoint: Checkpoint) -> list[dict[str, Any]]:
+        effects: list[dict[str, Any]] = []
+        for record in self.store.list_audit():
+            if record.timestamp <= checkpoint.created_at:
+                continue
+            if record.action in {
+                "primitive.filesystem.write_text",
+                "primitive.filesystem.write_directory",
+                "primitive.filesystem.delete_file",
+                "primitive.filesystem.delete_directory",
+                "primitive.shell.run",
+            }:
+                effects.append(
+                    {
+                        "record_id": record.record_id,
+                        "timestamp": record.timestamp,
+                        "actor": record.actor,
+                        "action": record.action,
+                        "target": record.target,
+                        "decision": record.decision,
+                    }
+                )
+        return effects
+
+    def _cancel_pending_human_requests(self, pids: list[str], checkpoint: Checkpoint) -> list[str]:
+        cancelled: list[str] = []
+        for request in self.store.list_human_requests():
+            if request.pid not in pids or request.created_at <= checkpoint.created_at:
+                continue
+            if request.status != HumanRequestStatus.PENDING:
+                continue
+            request.status = HumanRequestStatus.CANCELLED
+            request.decision = {"cancelled_by": f"checkpoint:{checkpoint.checkpoint_id}"}
+            request.updated_at = utc_now()
+            self.store.update_human_request(request)
+            cancelled.append(request.request_id)
+        return cancelled
+
+    def _supersede_post_checkpoint_messages(self, pids: list[str], checkpoint: Checkpoint) -> list[str]:
+        superseded: list[str] = []
+        for message in self.store.list_process_messages():
+            if message.recipient_pid not in pids or message.created_at <= checkpoint.created_at:
+                continue
+            if message.status != ProcessMessageStatus.UNREAD:
+                continue
+            message.status = ProcessMessageStatus.SUPERSEDED_BY_RESTORE
+            message.payload = {
+                **message.payload,
+                "superseded_by_restore": checkpoint.checkpoint_id,
+                "superseded_at": utc_now(),
+            }
+            message.updated_at = utc_now()
+            self.store.update_process_message(message)
+            superseded.append(message.message_id)
+        return superseded
+
+    def _build_current_state_for_diff(self, snapshot: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+        pids = self._subtree_pids(snapshot["pid"])
+        process_rows = self._rows_by_ids("processes", "pid", pids)
+        object_oids = self._current_scoped_object_oids(pids)
+        return {
+            "processes": process_rows,
+            "objects": self._rows_by_ids("objects", "oid", object_oids),
+            "capabilities": self._capability_rows_for_subjects(pids),
+            "process_messages": self._message_rows_for_recipients(pids),
+            "tool_candidates": self._rows_by_ids("tool_candidates", "pid", pids),
+        }
+
+    def _index_rows(self, table: str, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        key_by_table = {
+            "processes": "pid",
+            "objects": "oid",
+            "capabilities": "cap_id",
+            "process_messages": "message_id",
+            "tool_candidates": "candidate_id",
+        }
+        key = key_by_table[table]
+        return {str(row[key]): row for row in rows}
+
+    def _snapshot_counts(self, snapshot: dict[str, Any]) -> dict[str, int]:
+        return {table: len(rows) for table, rows in snapshot.get("rows", {}).items()}
+
+    def _delete_object_links(self, cur: Any, object_oids: set[str]) -> None:
+        if not object_oids:
+            return
+        placeholders = ", ".join("?" for _ in object_oids)
+        cur.execute(
+            f"DELETE FROM object_links WHERE src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
+            [*object_oids, *object_oids],
+        )
+
+    def _delete_rows_by_ids(self, cur: Any, table: str, column: str, values: Iterable[str]) -> None:
+        selected = list(dict.fromkeys(values))
+        if not selected:
+            return
+        placeholders = ", ".join("?" for _ in selected)
+        cur.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", selected)
+
+    def _delete_non_checkpoint_capabilities(self, cur: Any, pids: list[str]) -> None:
+        if not pids:
+            return
+        placeholders = ", ".join("?" for _ in pids)
+        cur.execute(
+            f"DELETE FROM capabilities WHERE subject IN ({placeholders}) AND resource NOT LIKE 'checkpoint:%'",
+            pids,
+        )
+
+    def _insert_row(self, cur: Any, table: str, row: dict[str, Any]) -> None:
+        columns = list(row)
+        placeholders = ", ".join("?" for _ in columns)
+        cur.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(row[column] for column in columns),
+        )
+
+    def _upsert_row(self, cur: Any, table: str, row: dict[str, Any], key: str) -> None:
+        columns = list(row)
+        assignments = ", ".join(f"{column} = excluded.{column}" for column in columns if column != key)
+        placeholders = ", ".join("?" for _ in columns)
+        cur.execute(
+            f"""
+            INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})
+            ON CONFLICT({key}) DO UPDATE SET {assignments}
+            """,
+            tuple(row[column] for column in columns),
+        )
+
+    def _remap_namespace(self, namespace: str, pid_map: dict[str, str]) -> str:
+        prefix = f"{self.config.memory.process_namespace_prefix}:"
+        if namespace.startswith(prefix):
+            old_pid = namespace[len(prefix) :]
+            if old_pid in pid_map:
+                return f"{prefix}{pid_map[old_pid]}"
+        if self.store.namespace_exists(namespace):
+            return f"checkpoint_fork/{new_id('ns')}/{namespace}"
+        return namespace
+
+    def _remap_process_row(
+        self,
+        row: dict[str, Any],
+        pid_map: dict[str, str],
+        object_map: dict[str, str],
+        capability_map: dict[str, str],
+        parent_pid: str | None,
+    ) -> dict[str, Any]:
+        item = dict(row)
+        old_pid = item["pid"]
+        item["pid"] = pid_map[old_pid]
+        old_parent = item.get("parent_pid")
+        item["parent_pid"] = pid_map.get(old_parent) if old_parent else parent_pid
+        if item.get("goal_oid") in object_map:
+            item["goal_oid"] = object_map[item["goal_oid"]]
+        item["checkpoint_head"] = None
+        item["status"] = ProcessStatus.RUNNABLE.value if item["status"] == ProcessStatus.RUNNING.value else item["status"]
+        item["capabilities_json"] = dumps([capability_map.get(cap, cap) for cap in loads(item["capabilities_json"], [])])
+        view = loads(item.get("memory_view_json"), {}) if item.get("memory_view_json") else None
+        if view:
+            view["view_id"] = new_id("view")
+            view["owner_pid"] = item["pid"]
+            view["created_from"] = None
+            for root in view.get("roots", []):
+                if root.get("oid") in object_map:
+                    root["oid"] = object_map[root["oid"]]
+                if root.get("capability_id") in capability_map:
+                    root["capability_id"] = capability_map[root["capability_id"]]
+            item["memory_view_json"] = dumps(view)
+        now = utc_now()
+        item["created_at"] = now
+        item["updated_at"] = now
+        return item
+
+    def _remap_namespace_row(
+        self,
+        row: dict[str, Any],
+        pid_map: dict[str, str],
+        namespace_map: dict[str, str],
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
+        if item.get("parent_namespace") in namespace_map:
+            item["parent_namespace"] = namespace_map[item["parent_namespace"]]
+        if item.get("created_by") in pid_map:
+            item["created_by"] = pid_map[item["created_by"]]
+        item["updated_at"] = utc_now()
+        return item
+
+    def _remap_object_row(
+        self,
+        row: dict[str, Any],
+        pid_map: dict[str, str],
+        object_map: dict[str, str],
+        namespace_map: dict[str, str],
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["oid"] = object_map[item["oid"]]
+        item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
+        if item.get("created_by") in pid_map:
+            item["created_by"] = pid_map[item["created_by"]]
+        provenance = loads(item["provenance_json"], {})
+        provenance["parent_oids"] = [object_map.get(oid, oid) for oid in provenance.get("parent_oids", [])]
+        item["provenance_json"] = dumps(provenance)
+        item["created_at"] = utc_now()
+        item["updated_at"] = utc_now()
+        return item
+
+    def _remap_link_row(self, row: dict[str, Any], object_map: dict[str, str]) -> dict[str, Any]:
+        item = dict(row)
+        item["id"] = new_id("link")
+        item["src_oid"] = object_map[item["src_oid"]]
+        item["dst_oid"] = object_map[item["dst_oid"]]
+        item["created_at"] = utc_now()
+        return item
+
+    def _remap_capability_row(
+        self,
+        row: dict[str, Any],
+        pid_map: dict[str, str],
+        object_map: dict[str, str],
+        namespace_map: dict[str, str],
+        capability_map: dict[str, str],
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["cap_id"] = capability_map[item["cap_id"]]
+        item["subject"] = pid_map[item["subject"]]
+        resource = str(item["resource"])
+        if resource.startswith("object:"):
+            oid = resource.split(":", 1)[1]
+            item["resource"] = f"object:{object_map.get(oid, oid)}"
+        elif resource.startswith("object_namespace:"):
+            namespace = resource.split(":", 1)[1]
+            item["resource"] = f"object_namespace:{namespace_map.get(namespace, namespace)}"
+        item["issued_by"] = f"checkpoint.fork:{item['issued_by']}"
+        item["issued_at"] = utc_now()
+        return item
+
+    def _remap_message_row(self, row: dict[str, Any], pid_map: dict[str, str]) -> dict[str, Any]:
+        item = dict(row)
+        item["message_id"] = new_id("pmsg")
+        item["recipient_pid"] = pid_map[item["recipient_pid"]]
+        if item["sender"] in pid_map:
+            item["sender"] = pid_map[item["sender"]]
+        item["payload_json"] = dumps({**loads(item["payload_json"], {}), "forked_from_message_id": row["message_id"]})
+        item["created_at"] = utc_now()
+        item["updated_at"] = utc_now()
+        item["acked_at"] = None
+        return item
+
+    def _remap_tool_candidate_row(self, row: dict[str, Any], pid_map: dict[str, str]) -> dict[str, Any]:
+        item = dict(row)
+        item["candidate_id"] = new_id("tcand")
+        item["pid"] = pid_map[item["pid"]]
+        item["created_at"] = utc_now()
+        item["updated_at"] = utc_now()
+        return item

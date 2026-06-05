@@ -279,6 +279,40 @@ class LibOSSyscallSession:
         if name == "process.exit":
             self._deferred_exit = dict(args)
             return {"deferred": True, "operation": "process.exit"}
+        if name == "checkpoint.create":
+            checkpoint_id = self.runtime.checkpoint.create(
+                self.pid,
+                str(args.get("reason", "checkpoint syscall")),
+                actor=self.pid,
+                metadata=dict(args.get("metadata") or {}),
+            )
+            return {"checkpoint_id": checkpoint_id, "pid": self.pid}
+        if name == "checkpoint.list":
+            return {
+                "checkpoints": self.runtime.checkpoint.list(
+                    str(args.get("pid") or self.pid),
+                    actor=self.pid,
+                    limit=int(args["limit"]) if args.get("limit") is not None else None,
+                )
+            }
+        if name == "checkpoint.inspect":
+            return self.runtime.checkpoint.inspect(str(args["checkpoint_id"]), actor=self.pid)
+        if name == "checkpoint.diff":
+            return self.runtime.checkpoint.diff(str(args["checkpoint_id"]), actor=self.pid)
+        if name == "checkpoint.restore":
+            return self.runtime.checkpoint.restore(self.pid, str(args["checkpoint_id"]))
+        if name in {"checkpoint.fork", "checkpoint.fork_from_checkpoint"}:
+            return self.runtime.checkpoint.fork_from_checkpoint(
+                self.pid,
+                str(args["checkpoint_id"]),
+                parent_pid=str(args["parent_pid"]) if args.get("parent_pid") is not None else None,
+            )
+        if name in {"checkpoint.replay", "checkpoint.replay_to_event"}:
+            return self.runtime.checkpoint.replay_to_event(
+                str(args["checkpoint_id"]),
+                str(args["event_id"]),
+                actor=self.pid,
+            )
         if name in {"shell.run", "shell.run_command"}:
             cwd = self.runtime.process.working_directory(self.pid)
             return self.runtime.shell.arun(

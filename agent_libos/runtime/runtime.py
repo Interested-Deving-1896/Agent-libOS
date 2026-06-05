@@ -31,17 +31,22 @@ from agent_libos.tools.builtin import (
     AppendMemoryObjectTool,
     CreateMemoryNamespaceTool,
     CreateMemoryObjectTool,
+    CreateCheckpointTool,
     CreateObjectFromFileTool,
     DeleteDirectoryTool,
     DeleteFileTool,
+    DiffCheckpointTool,
     EchoTool,
     ExecProcessTool,
+    ForkCheckpointTool,
     ForkChildProcessTool,
     GetCurrentTimeTool,
     GetWorkingDirectoryTool,
     HumanOutputTool,
+    InspectCheckpointTool,
     LoadImageFromYamlTool,
     ListChildProcessesTool,
+    ListCheckpointsTool,
     ListMemoryNamespaceTool,
     MergeChildMemoryTool,
     ParsePytestLogTool,
@@ -54,6 +59,7 @@ from agent_libos.tools.builtin import (
     ReadTextFileTool,
     RequestPermissionTool,
     RegisterJitTool,
+    RestoreCheckpointTool,
     RunShellCommandTool,
     SendProcessMessageTool,
     SignalChildProcessTool,
@@ -135,7 +141,8 @@ class Runtime:
         self.tools.runtime = self
         self.process = ProcessManager(store, self.memory, self.capability, self.audit, self.events, config=self.config)
         self.scheduler = SimpleScheduler(store, self.audit, poll_interval_s=self.config.scheduler.poll_interval_s)
-        self.checkpoint = CheckpointManager(store, self.audit, self.events)
+        self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
+        self.checkpoint.bind_runtime(self)
         self.skill_registry = RuntimeSkillRegistry()
         self.skills = SkillLinker(store, self.skill_registry, self.audit)
         self.images: dict[str, AgentImage] = build_default_images(self.config)
@@ -344,6 +351,8 @@ class Runtime:
                 target=f"process:{pid}",
                 decision={"image": image_id, "error": str(exc)},
             )
+        if process is not None:
+            self.checkpoint.grant_process_defaults(pid, issued_by=f"image:{image_id}")
         if process is not None and process.parent_pid is not None:
             self.audit.record(
                 actor="runtime",
@@ -390,12 +399,15 @@ class Runtime:
         self.tools.register_tool(SleepTool(), registered_by="runtime")
         self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
         self.tools.register_tool(AppendMemoryObjectTool(), registered_by="runtime")
+        self.tools.register_tool(CreateCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryNamespaceTool(), registered_by="runtime")
         self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
         self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
         self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
+        self.tools.register_tool(DiffCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(ForkCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(GetWorkingDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(LoadImageFromYamlTool(), registered_by="runtime")
         self.tools.register_tool(ListChildProcessesTool(), registered_by="runtime")
@@ -419,6 +431,9 @@ class Runtime:
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
+        self.tools.register_tool(InspectCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(ListCheckpointsTool(), registered_by="runtime")
         self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")
+        self.tools.register_tool(RestoreCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(SendProcessMessageTool(), registered_by="runtime")

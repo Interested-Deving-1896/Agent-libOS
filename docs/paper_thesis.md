@@ -31,9 +31,10 @@ measurably safer under adversarial workloads.
    device-like runtime primitive rather than prompt text.
 
 2. Implementation. The current prototype implements the model in Python with a
-   Resource Provider Substrate, SQLite persistence, audit records, persistent LLM
-   call accounting, shell/image/filesystem/process/human/memory primitives, and
-   Deno/TypeScript JIT tools that can reach libOS only through syscall RPC.
+   Resource Provider Substrate, SQLite persistence, audit records, scoped
+   checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
+   shell/image/filesystem/process/human/memory primitives, and Deno/TypeScript
+   JIT tools that can reach libOS only through syscall RPC.
 
 3. Benchmark suite. The planned evaluation uses adversarial coding-agent and
    runtime-safety tasks with declared allowed and forbidden side effects. The
