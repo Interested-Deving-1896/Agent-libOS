@@ -8,8 +8,14 @@ version = "0.1.0"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Agent libOS contributors" }]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "openai>=2.38.0",
     "pydantic>=2.13.4",
@@ -20,4 +26,3 @@ agent-libos = "agent_libos.api.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_libos"]
-

@@ -12,3 +12,6 @@ build/
 agent_outputs/
 .idea
 .vscode
+plan.md
+.benchmark_runs/
+!benchmarks/runtime_safety/fixtures/basic_repo/.env

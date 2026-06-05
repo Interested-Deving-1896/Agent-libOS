@@ -1,4 +1,10 @@
-# Agent libOS 设计文档 *（本文档部分内容可能已经过时）*
+# Agent libOS Historical Design Archive
+
+> Status: historical design archive. This document records design intent and
+> future directions, but it is not the source of truth for the current
+> implementation. Use [README.md](README.md) for the current behavior and
+> [docs/invariants.md](docs/invariants.md) for the invariant-to-test map.
+> Sections below may intentionally describe planned or superseded interfaces.
 
 ## 0. 文档目的
 

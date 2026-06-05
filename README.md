@@ -2,9 +2,16 @@
 
 An experimental Agent-native libOS runtime written in Python.
 
-Agent libOS models an agent as a long-running, schedulable, interruptible, capability-controlled `AgentProcess`, not as a single chat request or workflow thread. The codebase is an MVP implementation of the ideas in [agent_libos_design_doc.md](agent_libos_design_doc.md).
+Agent libOS models an agent as a long-running, schedulable, interruptible, capability-controlled `AgentProcess`, not as a single chat request or workflow thread. The README is the current implementation guide. [agent_libos_design_doc.md](agent_libos_design_doc.md) is a historical design archive and may describe planned or superseded interfaces.
 
 This project is still in active development.
+
+Submission-facing M0 docs:
+
+- [docs/invariants.md](docs/invariants.md) maps runtime invariants to regression coverage and known gaps.
+- [docs/artifact_anonymity.md](docs/artifact_anonymity.md) tracks license, double-blind, and artifact hygiene checks.
+- [docs/paper_thesis.md](docs/paper_thesis.md) freezes the current one-page paper story.
+- [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md) defines the M1 benchmark task schema v0.
 
 ## Current MVP
 
@@ -157,6 +164,15 @@ Run tests:
 ```bash
 uv run python -m unittest discover -s tests -v
 ```
+
+Run the deterministic M1 runtime-safety benchmark subset:
+
+```bash
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/m1-smoke
+uv run python experiments/collect_metrics.py .benchmark_runs/m1-smoke
+```
+
+The benchmark harness defaults to mock/planned actions. A real-model smoke run is available only when LLM environment variables are configured, and must be scoped explicitly with `--llm real --limit 1` or a single `--task`.
 
 Run the deterministic local demo:
 
