@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos import Runtime
-from agent_libos.external.shell import ShellAdapter
+from agent_libos.primitives.shell import ShellAdapter
 from agent_libos.models import CapabilityRight
 from agent_libos.substrate import (
     CommandResult,
     LocalClockProvider,
     LocalFilesystemProvider,
+    LocalHumanProvider,
     LocalResourceProviderSubstrate,
     LocalShellProvider,
     ResolvedPath,
@@ -73,6 +74,26 @@ class ResourceProviderSubstrateTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_runtime_human_primitive_uses_injected_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            human = RecordingHumanProvider(answers=["blue"])
+            substrate = LocalResourceProviderSubstrate(temp_dir)
+            substrate.human = human
+            runtime = Runtime.open("local", substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="use fake human")
+                output = runtime.tools.call(pid, "human_output", {"message": "hello"})
+                question_id = runtime.human.ask(pid, "Favorite color?", blocking=True)
+                processed = runtime.human.drain_terminal_queue()
+
+                self.assertTrue(output.ok, output.error)
+                self.assertEqual(human.outputs[0], "hello")
+                self.assertEqual(human.prompts, ["Favorite color? "])
+                self.assertEqual(processed[0].request_id, question_id)
+                self.assertEqual(processed[0].decision["answer"], "blue")
+            finally:
+                runtime.close()
+
 
 class RecordingSubstrate:
     def __init__(self, root: str):
@@ -81,6 +102,7 @@ class RecordingSubstrate:
         self.filesystem = RecordingFilesystemProvider(root)
         self.clock = LocalClockProvider()
         self.shell = LocalShellProvider(root)
+        self.human = LocalHumanProvider()
 
 
 class RecordingFilesystemProvider:
@@ -131,6 +153,20 @@ class FakeShellProvider:
     def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
         self.calls.append((list(argv), timeout))
         return CommandResult(argv=list(argv), returncode=0, stdout="ok\n", stderr="")
+
+
+class RecordingHumanProvider:
+    def __init__(self, answers: list[str] | None = None):
+        self.outputs: list[str] = []
+        self.prompts: list[str] = []
+        self.answers = list(answers or [])
+
+    def write(self, message: str) -> None:
+        self.outputs.append(message)
+
+    def read(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.answers.pop(0) if self.answers else ""
 
 
 if __name__ == "__main__":

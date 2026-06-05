@@ -668,6 +668,13 @@ class ObjectMemoryManager:
         normalized = name.strip()
         if not normalized:
             raise ValidationError("object name must be non-empty")
+        # Names are a single directory entry inside a namespace. Keeping path
+        # separators out makes qualified_name_parts(namespace, name) a stable
+        # display and audit identifier instead of an ambiguous pseudo-path.
+        if "/" in normalized or "\\" in normalized:
+            raise ValidationError("object name must not contain namespace separators")
+        if normalized in {".", ".."}:
+            raise ValidationError(f"invalid object name: {name}")
         return normalized
 
     def _parent_namespace(self, namespace: str) -> str | None:

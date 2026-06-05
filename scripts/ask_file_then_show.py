@@ -74,7 +74,7 @@ async def run_file_viewer(
         if echo:
             print(message, flush=True)
 
-    runtime.human.output_sink = output_sink
+    runtime.substrate.human.output_sink = output_sink
     try:
         pid = runtime.process.spawn(
             image=_RUNTIME_DEFAULTS.coding_image_id,

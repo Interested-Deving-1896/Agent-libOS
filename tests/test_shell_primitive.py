@@ -8,7 +8,13 @@ from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
 from agent_libos.models import CapabilityRight, HumanRequestStatus
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
-from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalResourceProviderSubstrate
+from agent_libos.substrate import (
+    CommandResult,
+    LocalClockProvider,
+    LocalFilesystemProvider,
+    LocalHumanProvider,
+    LocalResourceProviderSubstrate,
+)
 
 
 class ShellPrimitiveTests(unittest.TestCase):
@@ -22,7 +28,7 @@ class ShellPrimitiveTests(unittest.TestCase):
 
             self.assertEqual(result.stdout, "ok\n")
             self.assertEqual(provider.calls, [(["git", "status", "--short"], 2.0)])
-            self.assertIn("external.shell.run", self._audit_actions(runtime))
+            self.assertIn("primitive.shell.run", self._audit_actions(runtime))
         finally:
             runtime.close()
 
@@ -157,7 +163,7 @@ class ShellPrimitiveTests(unittest.TestCase):
         provider = FakeShellProvider()
         substrate = RecordingShellSubstrate(temp_dir.name, provider)
         runtime = Runtime.open("local", substrate=substrate)
-        runtime.human.output_sink = lambda _message: None
+        runtime.substrate.human.output_sink = lambda _message: None
         return runtime, provider
 
     def _runtime_with_config(self, config: AgentLibOSConfig) -> tuple[Runtime, "FakeShellProvider"]:
@@ -166,7 +172,7 @@ class ShellPrimitiveTests(unittest.TestCase):
         provider = FakeShellProvider()
         substrate = RecordingShellSubstrate(temp_dir.name, provider)
         runtime = Runtime.open("local", substrate=substrate, config=config)
-        runtime.human.output_sink = lambda _message: None
+        runtime.substrate.human.output_sink = lambda _message: None
         return runtime, provider
 
     def _audit_actions(self, runtime: Runtime) -> list[str]:
@@ -194,7 +200,7 @@ class ShellMatcherTests(unittest.TestCase):
         provider = FakeShellProvider()
         substrate = RecordingShellSubstrate(temp_dir.name, provider)
         runtime = Runtime.open("local", substrate=substrate, config=config)
-        runtime.human.output_sink = lambda _message: None
+        runtime.substrate.human.output_sink = lambda _message: None
         return runtime, provider
 
 
@@ -205,6 +211,7 @@ class RecordingShellSubstrate(LocalResourceProviderSubstrate):
         self.filesystem = LocalFilesystemProvider(root)
         self.clock = LocalClockProvider()
         self.shell = shell
+        self.human = LocalHumanProvider()
 
 
 class FakeShellProvider:

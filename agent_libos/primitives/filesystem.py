@@ -121,7 +121,7 @@ class FilesystemAdapter:
         )
         self.audit.record(
             actor=pid,
-            action="external.filesystem.read_text",
+            action="primitive.filesystem.read_text",
             target=resource,
             decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
         )
@@ -170,7 +170,7 @@ class FilesystemAdapter:
             )
             self.audit.record(
                 actor=pid,
-                action="external.filesystem.write_text",
+                action="primitive.filesystem.write_text",
                 target=resource,
                 decision={"path": relative, "bytes_written": bytes_written, "created": created},
             )
@@ -222,7 +222,7 @@ class FilesystemAdapter:
         )
         self.audit.record(
             actor=pid,
-            action="external.filesystem.read_directory",
+            action="primitive.filesystem.read_directory",
             target=resource,
             decision={"path": relative, "count": len(entries), "truncated": truncated},
         )
@@ -270,7 +270,7 @@ class FilesystemAdapter:
             )
             self.audit.record(
                 actor=pid,
-                action="external.filesystem.write_directory",
+                action="primitive.filesystem.write_directory",
                 target=resource,
                 decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
             )
@@ -325,7 +325,7 @@ class FilesystemAdapter:
             )
             self.audit.record(
                 actor=pid,
-                action="external.filesystem.delete_file",
+                action="primitive.filesystem.delete_file",
                 target=resource,
                 decision={"path": relative, "deleted": True},
             )
@@ -388,7 +388,7 @@ class FilesystemAdapter:
             )
             self.audit.record(
                 actor=pid,
-                action="external.filesystem.delete_directory",
+                action="primitive.filesystem.delete_directory",
                 target=resource,
                 decision={"path": relative, "deleted": True, "recursive": recursive},
             )

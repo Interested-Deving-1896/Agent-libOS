@@ -80,7 +80,7 @@ class DenoTypescriptSandbox(SandboxBackend):
 
     Candidate tools run as Deno userland programs without host permissions.
     Their only libOS access path is the NDJSON syscall protocol handled by the
-    Python runtime over stdin/stdout.
+    libOS runtime broker over stdin/stdout.
     """
 
     _IMPORT_RE = re.compile(
@@ -190,13 +190,15 @@ class DenoTypescriptSandbox(SandboxBackend):
         errors: list[str] = []
         logs: list[str] = [f"language=typescript", f"deno={version}"]
         for index, test in enumerate(tests, start=1):
+            syscall_handler, assert_syscalls_consumed = self._test_syscall_handler(test, index)
             try:
                 result = self.run_source(
                     source_code,
                     test.get("args", {}),
-                    syscall_handler=self._test_syscall_handler(test, index),
+                    syscall_handler=syscall_handler,
                     timeout=timeout,
                 )
+                assert_syscalls_consumed()
             except Exception as exc:
                 errors.append(f"test {index} failed to run: {exc}")
                 continue
@@ -350,7 +352,7 @@ class DenoTypescriptSandbox(SandboxBackend):
             return
         await proc.wait()
 
-    def _test_syscall_handler(self, test: dict[str, Any], index: int) -> SyscallHandler:
+    def _test_syscall_handler(self, test: dict[str, Any], index: int) -> tuple[SyscallHandler, Callable[[], None]]:
         expected = list(test.get("syscalls", []))
 
         async def handler(name: str, args: dict[str, Any]) -> Any:
@@ -366,7 +368,12 @@ class DenoTypescriptSandbox(SandboxBackend):
                 raise SandboxError(str(spec.get("error", "mock syscall failed")))
             return spec.get("result", spec.get("payload"))
 
-        return handler
+        def assert_consumed() -> None:
+            if expected:
+                missing = [str(spec.get("name", "<unnamed>")) for spec in expected]
+                raise SandboxError(f"test {index} expected syscall(s) not performed: {missing}")
+
+        return handler, assert_consumed
 
     def _extract_imports(self, source_code: str) -> list[str]:
         imports = [match.group(1) for match in self._IMPORT_RE.finditer(source_code)]

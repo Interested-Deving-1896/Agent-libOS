@@ -85,8 +85,15 @@ class ShellProvider(Protocol):
     ) -> CommandResult: ...
 
 
+class HumanProvider(Protocol):
+    def write(self, message: str) -> None: ...
+
+    def read(self, prompt: str) -> str: ...
+
+
 class ResourceProviderSubstrate(Protocol):
     filesystem: FilesystemProvider
     clock: ClockProvider
     shell: ShellProvider
+    human: HumanProvider
     workspace_display: str

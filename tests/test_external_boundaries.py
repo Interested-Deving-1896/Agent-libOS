@@ -11,7 +11,7 @@ class ExternalBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = Runtime.open("local")
         self.human_output: list[str] = []
-        self.runtime.human.output_sink = self.human_output.append
+        self.runtime.substrate.human.output_sink = self.human_output.append
 
     def tearDown(self) -> None:
         self.runtime.close()
@@ -23,13 +23,13 @@ class ExternalBoundaryTests(unittest.TestCase):
         denied = self.runtime.tools.call(pid, "read_text_file", {"path": path})
         self.assertFalse(denied.ok)
         self.assertIn("lacks read", denied.error or "")
-        self.assertNotIn("external.filesystem.read_text", self._audit_actions())
+        self.assertNotIn("primitive.filesystem.read_text", self._audit_actions())
 
         self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by="test")
         allowed = self.runtime.tools.call(pid, "read_text_file", {"path": path})
         self.assertTrue(allowed.ok)
         self.assertEqual(allowed.payload["content"], "hello from workspace")
-        self.assertIn("external.filesystem.read_text", self._audit_actions())
+        self.assertIn("primitive.filesystem.read_text", self._audit_actions())
 
     def test_write_file_tool_cannot_bypass_filesystem_capability(self) -> None:
         path = f"agent_outputs/boundary_write_{uuid4().hex}.txt"
@@ -44,7 +44,7 @@ class ExternalBoundaryTests(unittest.TestCase):
         allowed = self.runtime.tools.call(pid, "write_text_file", {"path": path, "content": "allowed"})
         self.assertTrue(allowed.ok)
         self.assertEqual(target.read_text(encoding="utf-8"), "allowed")
-        self.assertIn("external.filesystem.write_text", self._audit_actions())
+        self.assertIn("primitive.filesystem.write_text", self._audit_actions())
 
     def test_write_precondition_does_not_leak_existing_file_without_capability(self) -> None:
         path = self._write_workspace_fixture("existing")
@@ -102,7 +102,7 @@ class ExternalBoundaryTests(unittest.TestCase):
 
         self.assertFalse(denied.ok)
         self.assertIn("escapes filesystem adapter root", denied.error or "")
-        self.assertNotIn("external.filesystem.write_text", self._audit_actions())
+        self.assertNotIn("primitive.filesystem.write_text", self._audit_actions())
 
     def test_revoked_filesystem_capability_denies_write(self) -> None:
         path = f"agent_outputs/revoked_write_{uuid4().hex}.txt"
@@ -114,7 +114,7 @@ class ExternalBoundaryTests(unittest.TestCase):
 
         self.assertFalse(denied.ok)
         self.assertFalse((self.runtime.workspace_root / path).exists())
-        self.assertNotIn("external.filesystem.write_text", self._audit_actions())
+        self.assertNotIn("primitive.filesystem.write_text", self._audit_actions())
 
     def test_fork_does_not_inherit_parent_filesystem_write_capability(self) -> None:
         path = f"agent_outputs/fork_write_{uuid4().hex}.txt"

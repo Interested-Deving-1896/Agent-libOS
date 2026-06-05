@@ -90,7 +90,7 @@ class ValidateJitTool(SyncAgentTool[ValidateJitToolArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        validation = runtime.tools.validate(args.candidate_id)
+        validation = runtime.tools.validate(args.candidate_id, pid=ctx.pid)
         return ValidateJitToolOutput(
             ok=validation.ok,
             errors=validation.errors,

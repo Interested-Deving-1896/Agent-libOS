@@ -8,10 +8,18 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any, ClassVar, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessError, ProcessWaitRequired
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    NotFound,
+    ProcessError,
+    ProcessMessageWaitRequired,
+    ProcessWaitRequired,
+    ValidationError as LibOSValidationError,
+)
 from agent_libos.models import ToolSpec
 
 InputT = TypeVar("InputT", bound=BaseModel)
@@ -177,7 +185,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
         started_at = time.perf_counter()
         try:
             args = self.parse_args(raw_args)
-        except ValidationError as exc:
+        except PydanticValidationError as exc:
             return ToolResult.failure(
                 code=ToolErrorCode.VALIDATION_ERROR,
                 message=f"Invalid arguments for tool `{self.name}`.",
@@ -220,6 +228,8 @@ class BaseAgentTool(ABC, Generic[InputT]):
             raise
         except ProcessWaitRequired:
             raise
+        except ProcessMessageWaitRequired:
+            raise
         except CapabilityDenied as exc:
             return ToolResult.failure(
                 code=ToolErrorCode.PERMISSION_DENIED,
@@ -237,6 +247,13 @@ class BaseAgentTool(ABC, Generic[InputT]):
         except ProcessError as exc:
             return ToolResult.failure(
                 code=ToolErrorCode.EXECUTION_ERROR,
+                message=str(exc),
+                details={"error_type": type(exc).__name__},
+                metadata=self._base_metadata(ctx, started_at),
+            )
+        except LibOSValidationError as exc:
+            return ToolResult.failure(
+                code=ToolErrorCode.VALIDATION_ERROR,
                 message=str(exc),
                 details={"error_type": type(exc).__name__},
                 metadata=self._base_metadata(ctx, started_at),

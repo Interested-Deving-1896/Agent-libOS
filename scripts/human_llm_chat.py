@@ -9,7 +9,8 @@ from typing import Any, Protocol
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
-from agent_libos.models import AgentImage, ProcessStatus, ResourceBudget
+from agent_libos.models import AgentImage, LLMCallRecord, ProcessStatus, ResourceBudget
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import to_jsonable
 from scripts.llm_context_probe import last_tool_result, recent_events
 
@@ -77,15 +78,18 @@ async def run_chat(*, db: str = _RUNTIME_DEFAULTS.local_store_target, responder:
             print(message, flush=True)
 
     input_fn = _auto_input_fn(auto_messages, echo=echo) if auto_messages is not None else None
-    runtime.human.output_sink = output_sink
+    runtime.substrate.human.output_sink = output_sink
+    if input_fn is not None:
+        runtime.substrate.human.input_reader = input_fn
     try:
         pid = runtime.process.spawn(image=CHAT_IMAGE_ID, goal=(
             "You are an AI assistant interacting via a terminal interface. To ensure a smooth and efficient conversation, please adhere to the following rules:"
             "1. Do not repeat the same text, greetings, or explanations in one turn. Keep responses concise and strictly relevant to the new context.",
             "2. Every turn MUST conclude with a tool call to either `ask_human` (to receive the next user message) or `process_exit` (when the user wants to exit or the task is done). Never end a turn without calling one of these tools."),
             resource_budget=ResourceBudget(max_materialized_tokens=_SCRIPT_DEFAULTS.chat_context_tokens), )
+        client.bind_runtime(runtime, pid)
         default_max_quanta = max_turns * _SCRIPT_DEFAULTS.chat_quanta_per_turn + _SCRIPT_DEFAULTS.chat_quanta_overhead
-        results = await runtime.arun_until_idle(max_quanta=max_quanta or default_max_quanta, human_input_fn=input_fn, )
+        results = await runtime.arun_until_idle(max_quanta=max_quanta or default_max_quanta)
         process = runtime.process.get(pid)
         report = {"pid": pid, "turns": client.turns, "process_status": process.status.value,
             "actions": [_action_name(result) for result in results], "outputs": outputs, "history": client.history,
@@ -107,6 +111,11 @@ class HumanChatActionClient:
         self.history: list[dict[str, str]] = []
         self._waiting_for_answer = False
         self._exit_after_output = False
+
+    def bind_runtime(self, runtime: Runtime, pid: str) -> None:
+        binder = getattr(self.responder, "bind_runtime", None)
+        if callable(binder):
+            binder(runtime, pid)
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1
@@ -146,12 +155,66 @@ class ModelResponder:
     def __init__(self, *, system_prompt: str):
         self.system_prompt = system_prompt
         self.client = LLMClient.from_env()
+        self._runtime: Runtime | None = None
+        self._pid: str | None = None
+
+    def bind_runtime(self, runtime: Runtime, pid: str) -> None:
+        self._runtime = runtime
+        self._pid = pid
 
     def reply(self, history: list[dict[str, str]], user_message: str) -> str:
         messages = [{"role": "system", "content": self.system_prompt}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
-        return self.client.complete(messages, json_mode=False)
+        call_id = new_id("llmcall")
+        created_at = utc_now()
+        try:
+            completion = self.client.complete_with_metadata(messages, json_mode=False)
+        except Exception as exc:
+            self._record_llm_call(call_id=call_id, messages=messages, created_at=created_at, error=str(exc))
+            raise
+        self._record_llm_call(call_id=call_id, messages=messages, created_at=created_at, completion=completion)
+        return completion.content
+
+    def _record_llm_call(
+        self,
+        *,
+        call_id: str,
+        messages: list[dict[str, str]],
+        created_at: str,
+        completion: LLMCompletion | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self._runtime is None:
+            return
+        self._runtime.store.insert_llm_call(
+            LLMCallRecord(
+                call_id=call_id,
+                pid=self._pid,
+                image_id=CHAT_IMAGE_ID,
+                purpose="script_human_chat_reply",
+                status="error" if error else "ok",
+                api=completion.api if completion else None,
+                model=completion.model if completion else self.client.model,
+                request_id=completion.request_id if completion else None,
+                response_id=completion.response_id if completion else None,
+                messages=messages,
+                tools=[],
+                request_options={
+                    "json_mode": False,
+                    "client_class": type(self.client).__name__,
+                    "real_llm_client": True,
+                },
+                response_content=completion.content if completion else "",
+                tool_calls=completion.tool_calls if completion else [],
+                reasoning=completion.reasoning if completion else None,
+                usage=completion.usage if completion else {},
+                raw_response=completion.raw if completion else None,
+                error=error,
+                created_at=created_at,
+                completed_at=utc_now(),
+            )
+        )
 
 
 class EchoResponder:

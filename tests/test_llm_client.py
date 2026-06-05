@@ -13,8 +13,10 @@ class LLMClientTests(unittest.TestCase):
         response = SimpleNamespace(
             id="resp_123",
             model="gpt-test",
+            usage=SimpleNamespace(input_tokens=11, output_tokens=3, total_tokens=14),
             output_text="",
             output=[
+                SimpleNamespace(type="reasoning", summary=[{"text": "choose write_text_file"}]),
                 SimpleNamespace(
                     type="function_call",
                     id="fc_1",
@@ -59,6 +61,8 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(completion.response_id, "resp_123")
         self.assertEqual(completion.tool_calls[0]["call_id"], "call_1")
         self.assertEqual(completion.tool_calls[0]["name"], "write_text_file")
+        self.assertEqual(completion.usage["total_tokens"], 14)
+        self.assertEqual(completion.reasoning[0]["summary"][0]["text"], "choose write_text_file")
 
     def test_responses_text_request_uses_json_mode_when_requested(self) -> None:
         response = SimpleNamespace(id="resp_json", model="gpt-test", output_text='{"ok":true}', output=[])
@@ -77,11 +81,13 @@ class LLMClientTests(unittest.TestCase):
         chat_completion = SimpleNamespace(
             id="chatcmpl_123",
             model="compat-model",
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=2, total_tokens=9),
             choices=[
                 SimpleNamespace(
                     finish_reason="tool_calls",
                     message=SimpleNamespace(
                         content="",
+                        reasoning_content="select process_exit",
                         tool_calls=[
                             SimpleNamespace(
                                 id="tool_1",
@@ -121,6 +127,8 @@ class LLMClientTests(unittest.TestCase):
         self.assertFalse(fake.responses.payloads)
         self.assertEqual(completion.api, "chat")
         self.assertEqual(completion.tool_calls[0]["name"], "process_exit")
+        self.assertEqual(completion.usage["total_tokens"], 9)
+        self.assertEqual(completion.reasoning, "select process_exit")
 
     def test_custom_chat_empty_response_retries_with_thinking_disabled(self) -> None:
         empty = SimpleNamespace(

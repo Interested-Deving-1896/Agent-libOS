@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.external import ClockPrimitive, FilesystemAdapter, ShellAdapter
+from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, ShellAdapter
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.images import build_default_images
 from agent_libos.llm.client import LLMClient
@@ -19,6 +18,7 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.image_registry import ImageRegistryPrimitive
+from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.skills.linker import SkillLinker
@@ -49,16 +49,19 @@ from agent_libos.tools.builtin import (
     ProposeJitTool,
     ReadDirectoryTool,
     ReadMemoryObjectTool,
+    ReadProcessMessagesTool,
+    ReceiveProcessMessagesTool,
     ReadTextFileTool,
     RequestPermissionTool,
     RegisterJitTool,
+    RunShellCommandTool,
+    SendProcessMessageTool,
     SignalChildProcessTool,
     SleepTool,
     SpawnChildProcessTool,
     SetWorkingDirectoryTool,
     ValidateJitTool,
     WaitChildProcessTool,
-    RunShellCommandTool,
     WriteDirectoryTool,
     WriteObjectToFileTool,
     WriteTextFileTool,
@@ -88,7 +91,16 @@ class Runtime:
         self.events = EventBus(store)
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
         self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events, config=self.config)
-        self.human = HumanObjectManager(store, self.capability, self.audit, self.events, config=self.config)
+        self.human = HumanObjectManager(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            provider=self.substrate.human,
+            config=self.config,
+        )
+        self.messages = ProcessMessageManager(store, self.audit, self.events)
+        self.human.bind_messages(self.messages)
         self.clock = ClockPrimitive(
             self.audit,
             self.events,
@@ -139,7 +151,6 @@ class Runtime:
         self._current_human_auto_approve: bool | None = None
         self._current_human_auto_policy: str | None = None
         self._current_human_auto_answer: str | None = None
-        self._current_human_input_fn: Callable[[str], str] | None = None
         self._register_builtin_tools()
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
 
@@ -179,7 +190,6 @@ class Runtime:
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
-        human_input_fn: Callable[[str], str] | None = None,
     ) -> list[Any]:
         try:
             asyncio.get_running_loop()
@@ -192,7 +202,6 @@ class Runtime:
                     human_auto_approve=human_auto_approve,
                     human_auto_policy=human_auto_policy,
                     human_auto_answer=human_auto_answer,
-                    human_input_fn=human_input_fn,
                 )
             )
         raise RuntimeError("Cannot call run_until_idle() inside a running event loop. Use await arun_until_idle(...).")
@@ -206,7 +215,6 @@ class Runtime:
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
-        human_input_fn: Callable[[str], str] | None = None,
     ) -> list[Any]:
         results: list[Any] = []
         remaining = max_quanta if max_quanta is not None else self.config.runtime.run_until_idle_max_quanta
@@ -215,12 +223,10 @@ class Runtime:
             self._current_human_auto_approve,
             self._current_human_auto_policy,
             self._current_human_auto_answer,
-            self._current_human_input_fn,
         )
         self._current_human_auto_approve = human_auto_approve
         self._current_human_auto_policy = human_auto_policy
         self._current_human_auto_answer = human_auto_answer
-        self._current_human_input_fn = human_input_fn
         try:
             while remaining > 0:
                 # Run all currently runnable processes first. Human queue work below
@@ -236,7 +242,6 @@ class Runtime:
                     auto_approve=human_auto_approve,
                     auto_policy=human_auto_policy,
                     auto_answer=human_auto_answer,
-                    input_fn=human_input_fn,
                 )
                 if not processed:
                     break
@@ -252,7 +257,6 @@ class Runtime:
                 self._current_human_auto_approve,
                 self._current_human_auto_policy,
                 self._current_human_auto_answer,
-                self._current_human_input_fn,
             ) = previous_human_context
         return results
 
@@ -402,6 +406,8 @@ class Runtime:
         self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
         self.tools.register_tool(ReadDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(ReadMemoryObjectTool(), registered_by="runtime")
+        self.tools.register_tool(ReadProcessMessagesTool(), registered_by="runtime")
+        self.tools.register_tool(ReceiveProcessMessagesTool(), registered_by="runtime")
         self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
         self.tools.register_tool(RegisterJitTool(), registered_by="runtime")
         self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
@@ -415,3 +421,4 @@ class Runtime:
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
         self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")
+        self.tools.register_tool(SendProcessMessageTool(), registered_by="runtime")

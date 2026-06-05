@@ -11,6 +11,7 @@ from agent_libos.models.base import (
     NamespaceID,
     OID,
     PID,
+    ProcessMessageID,
     SnapshotID,
     StrEnum,
     ToolID,
@@ -19,6 +20,7 @@ from agent_libos.models.capability import Capability, CapabilityRight
 from agent_libos.models.checkpoint import Checkpoint
 from agent_libos.models.events import Event, EventPriority, EventType
 from agent_libos.models.human import HumanRequest, HumanRequestStatus
+from agent_libos.models.llm import LLMCallRecord
 from agent_libos.models.memory import (
     AgentObject,
     MaterializedContext,
@@ -39,6 +41,7 @@ from agent_libos.models.memory import (
     RelationType,
     ViewMode,
 )
+from agent_libos.models.messages import ProcessMessage, ProcessMessageKind, ProcessMessageStatus
 from agent_libos.models.policy import PolicyDecision
 from agent_libos.models.process import (
     AgentImage,
@@ -77,6 +80,7 @@ __all__ = [
     "HumanRequest",
     "HumanRequestID",
     "HumanRequestStatus",
+    "LLMCallRecord",
     "MaterializedContext",
     "MemoryView",
     "MemoryViewID",
@@ -96,6 +100,10 @@ __all__ = [
     "ObjectType",
     "PID",
     "PolicyDecision",
+    "ProcessMessage",
+    "ProcessMessageID",
+    "ProcessMessageKind",
+    "ProcessMessageStatus",
     "ProcessResult",
     "ProcessSignal",
     "ProcessStatus",

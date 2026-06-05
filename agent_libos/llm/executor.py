@@ -5,8 +5,8 @@ import inspect
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import HumanApprovalRequired, ProcessWaitRequired
-from agent_libos.utils.ids import utc_now
+from agent_libos.models.exceptions import HumanApprovalRequired, ProcessMessageWaitRequired, ProcessWaitRequired
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.context_memory import LLMContextMemory
@@ -15,7 +15,9 @@ from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import (
     EventType,
     HumanRequestStatus,
+    LLMCallRecord,
     ObjectHandle,
+    ProcessMessageKind,
     ProcessStatus,
     ViewMode,
 )
@@ -36,6 +38,7 @@ class LLMProcessExecutor:
         # queue records a decision, without asking the model for a new action.
         self._pending_human_actions: dict[str, dict[str, Any]] = {}
         self._pending_wait_actions: dict[str, dict[str, Any]] = {}
+        self._pending_message_actions: dict[str, dict[str, Any]] = {}
         self.context_memory = LLMContextMemory(runtime)
 
     def run_once(self, pid: str) -> dict[str, Any]:
@@ -53,12 +56,15 @@ class LLMProcessExecutor:
             return await self._resume_pending_human_action(pid)
         if pid in self._pending_wait_actions:
             return await self._resume_pending_wait_action(pid)
+        if pid in self._pending_message_actions:
+            return await self._resume_pending_message_action(pid)
         image = self.runtime.images.get(process.image_id) or self.runtime.images[self.config.runtime.default_image_id]
         if process.memory_view is None:
             process.memory_view = self.runtime.memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
             process.updated_at = utc_now()
             self.runtime.store.update_process(process)
 
+        self._notify_interrupt_messages(pid)
         source_view = self.context_memory.view_without_context(pid, process.memory_view)
         source_context = self.runtime.memory.materialize_context(
             pid,
@@ -127,6 +133,15 @@ class LLMProcessExecutor:
                     content_preview=completion.content[: self.config.llm.content_preview_chars],
                     tool_call_count=len(completion.tool_calls),
                 )
+            except ProcessMessageWaitRequired as exc:
+                return self._wait_for_message_action(
+                    pid=pid,
+                    action=action,
+                    filters=exc.filters,
+                    message=str(exc),
+                    content_preview=completion.content[: self.config.llm.content_preview_chars],
+                    tool_call_count=len(completion.tool_calls),
+                )
             return self._completed_action_result(
                 pid=pid,
                 action=action,
@@ -150,6 +165,14 @@ class LLMProcessExecutor:
                 decision={"child_pid": exc.child_pid, "message": str(exc)},
             )
             return {"ok": False, "waiting_event": True, "child_pid": exc.child_pid}
+        except ProcessMessageWaitRequired as exc:
+            self.runtime.audit.record(
+                actor=pid,
+                action="llm.action_waiting_message",
+                target=f"process:{pid}",
+                decision={"recipient_pid": exc.recipient_pid, "filters": exc.filters, "message": str(exc)},
+            )
+            return {"ok": False, "waiting_message": True, "filters": exc.filters}
         except Exception as exc:
             self.runtime.process.exit(pid, failed=True, message=f"LLM quantum failed: {exc}")
             self.runtime.audit.record(
@@ -168,6 +191,7 @@ class LLMProcessExecutor:
         content_preview: str,
         tool_call_count: int,
         resumed_after_human: bool = False,
+        resumed_after_message: bool = False,
     ) -> dict[str, Any]:
         self.runtime.audit.record(
             actor=pid,
@@ -179,11 +203,14 @@ class LLMProcessExecutor:
                 "content_preview": content_preview,
                 "tool_call_count": tool_call_count,
                 "resumed_after_human": resumed_after_human,
+                "resumed_after_message": resumed_after_message,
             },
         )
         payload = {"ok": True, "action": action, "result": result}
         if resumed_after_human:
             payload["resumed_after_human"] = True
+        if resumed_after_message:
+            payload["resumed_after_message"] = True
         return payload
 
     def _wait_for_human_action(
@@ -242,6 +269,34 @@ class LLMProcessExecutor:
         )
         return {"ok": False, "waiting_event": True, "child_pid": child_pid}
 
+    def _wait_for_message_action(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        filters: dict[str, Any],
+        message: str,
+        content_preview: str,
+        tool_call_count: int,
+    ) -> dict[str, Any]:
+        self._pending_message_actions[pid] = {
+            "filters": dict(filters),
+            "action": dict(action),
+            "content_preview": content_preview,
+            "tool_call_count": tool_call_count,
+        }
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.action_waiting_message",
+            target=f"process:{pid}",
+            decision={
+                "filters": filters,
+                "action": action,
+                "message": message,
+                "tool_call_count": tool_call_count,
+            },
+        )
+        return {"ok": False, "waiting_message": True, "filters": filters}
+
     async def _resume_pending_human_action(self, pid: str) -> dict[str, Any]:
         pending = self._pending_human_actions[pid]
         request_id = str(pending["request_id"])
@@ -261,6 +316,15 @@ class LLMProcessExecutor:
                     pid=pid,
                     action=action,
                     request_id=exc.request_id,
+                    message=str(exc),
+                    content_preview=str(pending.get("content_preview", "")),
+                    tool_call_count=int(pending.get("tool_call_count", 0)),
+                )
+            except ProcessMessageWaitRequired as exc:
+                return self._wait_for_message_action(
+                    pid=pid,
+                    action=action,
+                    filters=exc.filters,
                     message=str(exc),
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
@@ -317,6 +381,15 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
             )
+        except ProcessMessageWaitRequired as exc:
+            return self._wait_for_message_action(
+                pid=pid,
+                action=action,
+                filters=exc.filters,
+                message=str(exc),
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+            )
         return self._completed_action_result(
             pid=pid,
             action=action,
@@ -325,6 +398,61 @@ class LLMProcessExecutor:
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_human=False,
         )
+
+    async def _resume_pending_message_action(self, pid: str) -> dict[str, Any]:
+        pending = self._pending_message_actions[pid]
+        filters = dict(pending.get("filters") or {})
+        messages = self.runtime.messages.unread(
+            pid,
+            kind=filters.get("kind"),
+            sender=filters.get("sender"),
+            channel=filters.get("channel"),
+            correlation_id=filters.get("correlation_id"),
+            reply_to=filters.get("reply_to"),
+            message_ids=filters.get("message_ids"),
+        )
+        if not messages:
+            return {"ok": False, "waiting_message": True, "filters": filters}
+        action = dict(pending["action"])
+        self._pending_message_actions.pop(pid, None)
+        try:
+            result = await self.adispatch(pid, action)
+        except ProcessMessageWaitRequired as exc:
+            return self._wait_for_message_action(
+                pid=pid,
+                action=action,
+                filters=exc.filters,
+                message=str(exc),
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+            )
+        except ProcessWaitRequired as exc:
+            return self._wait_for_child_action(
+                pid=pid,
+                action=action,
+                child_pid=exc.child_pid,
+                message=str(exc),
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+            )
+        except HumanApprovalRequired as exc:
+            return self._wait_for_human_action(
+                pid=pid,
+                action=action,
+                request_id=exc.request_id,
+                message=str(exc),
+                content_preview=str(pending.get("content_preview", "")),
+                tool_call_count=int(pending.get("tool_call_count", 0)),
+            )
+        completed = self._completed_action_result(
+            pid=pid,
+            action=action,
+            result=result,
+            content_preview=str(pending.get("content_preview", "")),
+            tool_call_count=int(pending.get("tool_call_count", 0)),
+            resumed_after_message=True,
+        )
+        return completed
 
     def _emit_pending_action_rejected(self, pid: str, action: dict[str, Any], request_id: str, error: str) -> None:
         tool_name = str(action.get("action"))
@@ -380,7 +508,13 @@ class LLMProcessExecutor:
         last_error: Exception | None = None
         selected_max_attempts = max_attempts or self.config.llm.action_repair_attempts
         for attempt in range(selected_max_attempts):
-            completion = await self._complete_action(attempt_messages, tools)
+            completion = await self._complete_action_recorded(
+                pid=pid,
+                messages=attempt_messages,
+                tools=tools,
+                attempt=attempt + 1,
+                max_attempts=selected_max_attempts,
+            )
             try:
                 action = self._completion_to_action(completion.content, completion.tool_calls)
                 self._validate_dispatchable_action(pid, action)
@@ -442,6 +576,69 @@ class LLMProcessExecutor:
             )
         return previews
 
+    async def _complete_action_recorded(
+        self,
+        *,
+        pid: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        attempt: int,
+        max_attempts: int,
+    ) -> Any:
+        call_id = new_id("llmcall")
+        process = self.runtime.process.get(pid)
+        created_at = utc_now()
+        request_options = {
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "purpose": "action_selection",
+            "client_class": type(self.client).__name__,
+            "real_llm_client": isinstance(self.client, LLMClient),
+        }
+        try:
+            completion = await self._complete_action(messages, tools)
+        except Exception as exc:
+            self.runtime.store.insert_llm_call(
+                LLMCallRecord(
+                    call_id=call_id,
+                    pid=pid,
+                    image_id=process.image_id if process is not None else None,
+                    purpose="action_selection",
+                    status="error",
+                    messages=messages,
+                    tools=tools,
+                    request_options=request_options,
+                    error=str(exc),
+                    created_at=created_at,
+                    completed_at=utc_now(),
+                )
+            )
+            raise
+        self.runtime.store.insert_llm_call(
+            LLMCallRecord(
+                call_id=call_id,
+                pid=pid,
+                image_id=process.image_id if process is not None else None,
+                purpose="action_selection",
+                status="ok",
+                api=getattr(completion, "api", None),
+                model=getattr(completion, "model", None),
+                request_id=getattr(completion, "request_id", None),
+                response_id=getattr(completion, "response_id", None),
+                messages=messages,
+                tools=tools,
+                request_options=request_options,
+                response_content=str(getattr(completion, "content", "")),
+                tool_calls=list(getattr(completion, "tool_calls", []) or []),
+                reasoning=getattr(completion, "reasoning", None),
+                usage=dict(getattr(completion, "usage", {}) or {}),
+                raw_response=getattr(completion, "raw", None),
+                created_at=created_at,
+                completed_at=utc_now(),
+            )
+        )
+        return completion
+
     async def _complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
         if hasattr(self.client, "acomplete_action"):
             result = self.client.acomplete_action(messages, tools)
@@ -453,30 +650,75 @@ class LLMProcessExecutor:
     def dispatch(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
+        if notice := self._pre_tool_interrupt_notice(pid, name):
+            return notice
         result = self.runtime.tools.call(pid, name, args)
         if result.result_handle is not None:
             self._add_to_view(pid, result.result_handle)
+        post_tool_notice = self._notify_normal_messages(pid)
         return {
             "ok": result.ok,
             "tool_id": result.tool_id,
             "result_oid": result.result_handle.oid if result.result_handle else None,
             "payload": result.payload,
             "error": result.error,
+            "message_notice": post_tool_notice,
         }
 
     async def adispatch(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
+        if notice := self._pre_tool_interrupt_notice(pid, name):
+            return notice
         result = await self.runtime.tools.acall(pid, name, args)
         if result.result_handle is not None:
             self._add_to_view(pid, result.result_handle)
+        post_tool_notice = self._notify_normal_messages(pid)
         return {
             "ok": result.ok,
             "tool_id": result.tool_id,
             "result_oid": result.result_handle.oid if result.result_handle else None,
             "payload": result.payload,
             "error": result.error,
+            "message_notice": post_tool_notice,
         }
+
+    def _notify_interrupt_messages(self, pid: str) -> dict[str, Any] | None:
+        return self.runtime.messages.notice(
+            pid,
+            kind=ProcessMessageKind.INTERRUPT,
+            phase="before_llm_tool_selection",
+            source="llm.executor",
+        )
+
+    def _pre_tool_interrupt_notice(self, pid: str, tool_name: str) -> dict[str, Any] | None:
+        if tool_name in {"read_process_messages", "receive_process_messages"}:
+            return None
+        notice = self.runtime.messages.notice(
+            pid,
+            kind=ProcessMessageKind.INTERRUPT,
+            phase="before_tool_call",
+            source="llm.executor",
+        )
+        if notice is None:
+            return None
+        return {
+            "ok": False,
+            "tool_id": None,
+            "result_oid": None,
+            "payload": {"message_notice": notice},
+            "error": "unread interrupt process messages are waiting; call read_process_messages or receive_process_messages first",
+            "interrupted_by_message": True,
+            "message_notice": notice,
+        }
+
+    def _notify_normal_messages(self, pid: str) -> dict[str, Any] | None:
+        return self.runtime.messages.notice(
+            pid,
+            kind=ProcessMessageKind.NORMAL,
+            phase="after_tool_call",
+            source="llm.executor",
+        )
 
     def _handles_for_oids(self, pid: str, oids: list[str]) -> list[ObjectHandle]:
         return [self._handle_for_oid(pid, oid) for oid in oids]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.models import CapabilityRight, ProcessStatus, ValidationResult
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 
@@ -76,6 +78,22 @@ class FakeDenoSandbox(SandboxBackend):
         return {"language": "typescript", "deno_version": "fake-deno", "imports": []}
 
 
+class NoSyscallDenoSandbox(DenoTypescriptSandbox):
+    def deno_version(self) -> str:
+        return "fake-deno"
+
+    def run_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        *,
+        pid: str | None = None,
+        syscall_handler: SyscallHandler | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return {"ok": True}
+
+
 class Stage2SecurityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = Runtime.open("local")
@@ -113,6 +131,52 @@ class Stage2SecurityTests(unittest.TestCase):
         self.assertEqual(owner_call.payload, {"count": 4})
         self.assertFalse(other_call.ok)
         self.assertIn("not in process tool table", other_call.error or "")
+
+    def test_jit_candidate_tools_are_owned_by_proposing_process(self) -> None:
+        owner = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="make private tool")
+        other = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="try private candidate")
+        candidate = self.runtime.tools.propose(
+            owner,
+            {
+                "name": "owned_count_chars",
+                "description": "Count characters in text.",
+                "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                "output_schema": {"type": "object"},
+            },
+            source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }',
+            tests=[{"args": {"text": "abc"}, "expected": {"count": 3}}],
+        )
+
+        denied_validation = self.runtime.tools.call(other, "validate_jit_tool", {"candidate_id": candidate})
+        denied_registration = self.runtime.tools.call(other, "register_jit_tool", {"candidate_id": candidate})
+        allowed_validation = self.runtime.tools.call(owner, "validate_jit_tool", {"candidate_id": candidate})
+        allowed_registration = self.runtime.tools.call(owner, "register_jit_tool", {"candidate_id": candidate})
+
+        self.assertFalse(denied_validation.ok)
+        self.assertIn("belongs to process", denied_validation.error or "")
+        self.assertFalse(denied_registration.ok)
+        self.assertIn("belongs to process", denied_registration.error or "")
+        self.assertNotIn("owned_count_chars", self.runtime.process.get(other).tool_table)
+        self.assertTrue(allowed_validation.ok, allowed_validation.error)
+        self.assertTrue(allowed_registration.ok, allowed_registration.error)
+        self.assertIn("owned_count_chars", self.runtime.process.get(owner).tool_table)
+
+    def test_jit_tool_names_are_process_local(self) -> None:
+        first = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="local tool one")
+        second = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="local tool two")
+
+        first_candidate = self._register_count_tool(first, "local_count_chars")
+        second_candidate = self._register_count_tool(second, "local_count_chars")
+        first_call = self.runtime.tools.call(first, "local_count_chars", {"text": "aa"})
+        second_call = self.runtime.tools.call(second, "local_count_chars", {"text": "bbbbb"})
+
+        self.assertNotEqual(first_candidate.tool_id, second_candidate.tool_id)
+        self.assertTrue(first_call.ok, first_call.error)
+        self.assertTrue(second_call.ok, second_call.error)
+        self.assertEqual(first_call.payload, {"count": 2})
+        self.assertEqual(second_call.payload, {"count": 5})
+        self.assertIn("local_count_chars", self._schema_names(first))
+        self.assertIn("local_count_chars", self._schema_names(second))
 
     def test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -155,6 +219,13 @@ class Stage2SecurityTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("lacks read", result.error or "")
+
+    def test_shell_syscall_rejects_non_list_argv_before_policy(self) -> None:
+        pid = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="bad shell argv")
+        session = LibOSSyscallSession(self.runtime, pid)
+
+        with self.assertRaises(ValidationError):
+            asyncio.run(session.handle("shell.run", {"argv": "git status"}))
 
     def test_deno_jit_human_approval_is_internal_to_syscall(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -254,6 +325,23 @@ class Stage2SecurityTests(unittest.TestCase):
         self.assertTrue(any("import is not allowed: file:///tmp/tool.ts" in error for error in denied.errors))
         self.assertTrue(any("JSR package is not in allowlist: @bad/pkg" in error for error in denied.errors))
 
+    def test_deno_candidate_tests_fail_when_expected_syscall_is_not_performed(self) -> None:
+        sandbox = NoSyscallDenoSandbox(deno_executable="deno")
+
+        validation = sandbox.run_tests(
+            "export function run(args, libos) { return { ok: true }; }",
+            [
+                {
+                    "args": {},
+                    "syscalls": [{"name": "filesystem.read_text", "args": {"path": "README.md"}}],
+                    "expected": {"ok": True},
+                }
+            ],
+        )
+
+        self.assertFalse(validation.ok)
+        self.assertTrue(any("expected syscall(s) not performed" in error for error in validation.errors))
+
     @unittest.skipUnless(shutil.which("deno"), "deno not installed")
     def test_real_deno_tool_runs_and_has_no_host_read_permission(self) -> None:
         sandbox = DenoTypescriptSandbox(deno_executable="deno", default_timeout_s=10.0)
@@ -326,6 +414,21 @@ class Stage2SecurityTests(unittest.TestCase):
 
     def _schema_names(self, pid: str) -> set[str]:
         return {schema["function"]["name"] for schema in self.runtime.tools.openai_tool_schemas(pid)}
+
+    def _register_count_tool(self, pid: str, name: str) -> Any:
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                "name": name,
+                "description": "Count characters in text.",
+                "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                "output_schema": {"type": "object"},
+            },
+            source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }',
+            tests=[{"args": {"text": "abc"}, "expected": {"count": 3}}],
+        )
+        self.assertTrue(self.runtime.tools.validate(candidate).ok)
+        return self.runtime.tools.register(pid, candidate)
 
 
 if __name__ == "__main__":

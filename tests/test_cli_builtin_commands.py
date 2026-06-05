@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
-from agent_libos.models import ProcessStatus
+from agent_libos.models import ProcessMessageKind, ProcessStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 
@@ -100,6 +100,46 @@ image:
                 self.assertEqual(process.image_id, "cli-yaml-agent:v0")
                 self.assertNotEqual(process.goal_oid, old_goal_oid)
                 self.assertIn("human_output", process.tool_table)
+            finally:
+                runtime.close()
+
+    def test_cli_message_and_interrupt_post_human_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / "runtime.sqlite"
+            with _temporary_cwd(root):
+                spawn = _run_cli_json(["--db", str(db), "spawn", "--image", "base-agent:v0", "--goal", "listen"])
+                normal = _run_cli_json(
+                    [
+                        "--db",
+                        str(db),
+                        "message",
+                        spawn["pid"],
+                        "please inspect the latest result",
+                        "--subject",
+                        "status",
+                    ]
+                )
+                interrupt = _run_cli_json(
+                    [
+                        "--db",
+                        str(db),
+                        "interrupt",
+                        spawn["pid"],
+                        "stop and read this first",
+                    ]
+                )
+
+            runtime = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
+            try:
+                unread = runtime.messages.unread(spawn["pid"])
+
+                self.assertEqual(normal["message"]["kind"], ProcessMessageKind.NORMAL.value)
+                self.assertEqual(interrupt["message"]["kind"], ProcessMessageKind.INTERRUPT.value)
+                self.assertEqual([message.message_id for message in unread], [normal["message"]["message_id"], interrupt["message"]["message_id"]])
+                self.assertEqual(unread[0].sender, "human:owner")
+                self.assertEqual(unread[0].subject, "status")
+                self.assertEqual(unread[1].subject, "Human interrupt")
             finally:
                 runtime.close()
 

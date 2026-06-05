@@ -29,6 +29,13 @@ class ProcessWaitRequired(LibOSError):
         self.child_pid = child_pid
 
 
+class ProcessMessageWaitRequired(LibOSError):
+    def __init__(self, recipient_pid: str, filters: dict, message: str):
+        super().__init__(message)
+        self.recipient_pid = recipient_pid
+        self.filters = dict(filters)
+
+
 class PolicyDenied(LibOSError):
     pass
 

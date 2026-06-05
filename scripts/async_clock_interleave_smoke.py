@@ -52,7 +52,7 @@ async def run_interleaved_clock_demo(
         if echo:
             print(message, flush=True)
 
-    runtime.human.output_sink = output_sink
+    runtime.substrate.human.output_sink = output_sink
     try:
         offset = interval_s / 2 if offset_s is None else offset_s
         pid_a = runtime.process.spawn(

@@ -8,7 +8,7 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ValidationError
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -197,8 +197,10 @@ class ToolBroker:
         )
         return candidate.candidate_id
 
-    def validate(self, candidate_id: str) -> ValidationResult:
+    def validate(self, candidate_id: str, *, pid: str | None = None) -> ValidationResult:
         candidate = self._get_candidate(candidate_id)
+        if pid is not None:
+            self._require_candidate_owner(candidate, pid)
         result = self.sandbox.run_tests(candidate.source_code, candidate.tests)
         errors = list(result.errors)
         warnings = list(result.warnings)
@@ -232,14 +234,18 @@ class ToolBroker:
         scope: str = "ephemeral_process",
     ) -> ToolHandle:
         candidate = self._get_candidate(candidate_id)
+        self._require_candidate_owner(candidate, pid)
         if candidate.status == ToolCandidateStatus.REGISTERED:
             raise ValidationError(f"tool candidate is already registered: {candidate_id}")
-        if candidate.spec.name in self._tool_ids_by_name or any(
-            row["name"] == candidate.spec.name for row in self.store.list_tools()
-        ):
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        if candidate.spec.name in process.tool_table:
+            raise ValidationError(f"process already has a tool named: {candidate.spec.name}")
+        if self._name_collides_with_static_tool(candidate.spec.name):
             raise ValidationError(f"tool name already exists: {candidate.spec.name}")
         if candidate.status != ToolCandidateStatus.VALIDATED:
-            validation = self.validate(candidate_id)
+            validation = self.validate(candidate_id, pid=pid)
             if not validation.ok:
                 raise ValidationError("; ".join(validation.errors))
             candidate = self._get_candidate(candidate_id)
@@ -247,16 +253,18 @@ class ToolBroker:
         handle = ToolHandle(tool_id=tool_id, name=candidate.spec.name, capability_id=None, scope=scope)
         self._jit_sources[tool_id] = candidate.source_code
         self._handles[tool_id] = handle
-        self._tool_ids_by_name[candidate.spec.name] = tool_id
+        # JIT tool names are process-local through AgentProcess.tool_table.
+        # Keep the global name index stable for static tools and for legacy
+        # resolve(name) calls; resolve(name, pid=...) is the authority for
+        # process-scoped JIT tools and handles duplicate local names.
+        self._tool_ids_by_name.setdefault(candidate.spec.name, tool_id)
         self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
         candidate.status = ToolCandidateStatus.REGISTERED
         candidate.updated_at = utc_now()
         self.store.update_tool_candidate(candidate)
-        process = self.store.get_process(pid)
-        if process is not None:
-            process.tool_table[candidate.spec.name] = tool_id
-            process.updated_at = utc_now()
-            self.store.update_process(process)
+        process.tool_table[candidate.spec.name] = tool_id
+        process.updated_at = utc_now()
+        self.store.update_process(process)
         self.audit.record(
             actor=approver,
             action="tool.register",
@@ -388,6 +396,20 @@ class ToolBroker:
                 },
             )
             raise
+        except ProcessMessageWaitRequired as exc:
+            self.audit.record(
+                actor=pid,
+                action="tool.call_waiting_message",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "wait_for_process_message",
+                    "recipient_pid": exc.recipient_pid,
+                    "filters": exc.filters,
+                },
+            )
+            raise
         except Exception as exc:
             self.events.emit(
                 EventType.TOOL_FAILED,
@@ -508,6 +530,18 @@ class ToolBroker:
         if candidate is None:
             raise NotFound(f"tool candidate not found: {candidate_id}")
         return candidate
+
+    def _require_candidate_owner(self, candidate: ToolCandidate, pid: str) -> None:
+        if candidate.pid != pid:
+            raise ValidationError(
+                f"tool candidate {candidate.candidate_id} belongs to process {candidate.pid}, not {pid}"
+            )
+
+    def _name_collides_with_static_tool(self, name: str) -> bool:
+        mapped = self._tool_ids_by_name.get(name)
+        if mapped in self._tools:
+            return True
+        return any(row["name"] == name and not bool(row["ephemeral"]) for row in self.store.list_tools())
 
     def _process_has_tool(self, pid: str, handle: ToolHandle) -> bool:
         process = self.store.get_process(pid)

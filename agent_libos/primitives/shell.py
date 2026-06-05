@@ -81,7 +81,7 @@ class ShellAdapter:
         except subprocess.TimeoutExpired as exc:
             self.audit.record(
                 actor=pid,
-                action="external.shell.timeout",
+                action="primitive.shell.timeout",
                 target=resource,
                 decision={"argv": checked, "timeout_s": selected_timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
             )
@@ -97,7 +97,7 @@ class ShellAdapter:
         self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd)
         self.audit.record(
             actor=pid,
-            action="external.shell.run",
+            action="primitive.shell.run",
             target=resource,
             decision={
                 "argv": checked,

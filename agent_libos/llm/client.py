@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import LibOSError
+from agent_libos.utils.serde import to_jsonable
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -29,6 +30,8 @@ class LLMCompletion:
     response_id: str | None = None
     request_id: str | None = None
     model: str | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
+    reasoning: Any | None = None
 
 
 @dataclass
@@ -70,8 +73,22 @@ class LLMClient:
         max_tokens: int = _LLM_DEFAULTS.max_tokens,
         json_mode: bool = True,
     ) -> str:
+        return self.complete_with_metadata(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+        ).content
+
+    def complete_with_metadata(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float = _LLM_DEFAULTS.temperature,
+        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        json_mode: bool = True,
+    ) -> LLMCompletion:
         return _run_sync(
-            self.acomplete(
+            self.acomplete_with_metadata(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -86,6 +103,22 @@ class LLMClient:
         max_tokens: int = _LLM_DEFAULTS.max_tokens,
         json_mode: bool = True,
     ) -> str:
+        return (
+            await self.acomplete_with_metadata(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+            )
+        ).content
+
+    async def acomplete_with_metadata(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float = _LLM_DEFAULTS.temperature,
+        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        json_mode: bool = True,
+    ) -> LLMCompletion:
         selected_messages = self._messages_with_json_instruction(messages) if json_mode else messages
         completion = await self._complete_without_tools(
             messages=selected_messages,
@@ -95,7 +128,7 @@ class LLMClient:
         )
         if not completion.content:
             raise LLMError("LLM returned empty content")
-        return completion.content
+        return completion
 
     def complete_action(
         self,
@@ -394,6 +427,8 @@ class LLMClient:
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
             model=str(getattr(response, "model", "")) or None,
+            usage=_usage_from_response(response),
+            reasoning=_reasoning_from_response(response),
         )
 
     def _completion_from_chat(self, completion: Any) -> LLMCompletion:
@@ -423,6 +458,8 @@ class LLMClient:
             response_id=getattr(completion, "id", None),
             request_id=getattr(completion, "_request_id", None),
             model=str(getattr(completion, "model", "")) or None,
+            usage=_usage_from_response(completion),
+            reasoning=_reasoning_from_chat_message(message),
         )
 
     def _use_responses_api(self) -> bool:
@@ -604,6 +641,43 @@ def _first_choice_attr(completion: Any, attr: str) -> Any:
         return getattr(completion.choices[0], attr, None)
     except (AttributeError, IndexError):
         return None
+
+
+def _usage_from_response(response: Any) -> dict[str, Any]:
+    usage = _get_attr_or_key(response, "usage")
+    if usage is None:
+        return {}
+    jsonable = to_jsonable(usage)
+    return jsonable if isinstance(jsonable, dict) else {"raw": jsonable}
+
+
+def _reasoning_from_response(response: Any) -> Any | None:
+    direct = _get_attr_or_key(response, "reasoning")
+    if direct is not None:
+        return to_jsonable(direct)
+    reasoning_items: list[Any] = []
+    for item in _get_attr_or_key(response, "output") or []:
+        if _get_attr_or_key(item, "type") == "reasoning":
+            reasoning_items.append(to_jsonable(item))
+    return reasoning_items or None
+
+
+def _reasoning_from_chat_message(message: Any) -> Any | None:
+    for key in ("reasoning", "reasoning_content", "thinking", "thinking_content"):
+        value = _get_attr_or_key(message, key)
+        if _has_value(value):
+            return to_jsonable(value)
+    additional = _get_attr_or_key(message, "additional_kwargs")
+    if isinstance(additional, dict):
+        for key in ("reasoning", "reasoning_content", "thinking", "thinking_content"):
+            value = additional.get(key)
+            if _has_value(value):
+                return to_jsonable(value)
+    return None
+
+
+def _has_value(value: Any) -> bool:
+    return value is not None and value != ""
 
 
 def _bool_env_value(value: str) -> bool:

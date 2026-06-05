@@ -18,6 +18,7 @@ from agent_libos.tools.builtin.memory import (
     ListMemoryNamespaceTool,
     ReadMemoryObjectTool,
 )
+from agent_libos.tools.builtin.messages import ReadProcessMessagesTool, ReceiveProcessMessagesTool, SendProcessMessageTool
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.permission import RequestPermissionTool
 from agent_libos.tools.builtin.process import (
@@ -60,7 +61,10 @@ __all__ = [
     "ReadTextFileTool",
     "RequestPermissionTool",
     "RegisterJitTool",
+    "ReadProcessMessagesTool",
+    "ReceiveProcessMessagesTool",
     "RunShellCommandTool",
+    "SendProcessMessageTool",
     "SignalChildProcessTool",
     "SetWorkingDirectoryTool",
     "SleepTool",

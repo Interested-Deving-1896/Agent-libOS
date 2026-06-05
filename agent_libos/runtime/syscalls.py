@@ -16,11 +16,19 @@ from agent_libos.models import (
     ObjectPatch,
     ObjectRight,
     ObjectType,
+    ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
     ViewMode,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    NotFound,
+    ProcessMessageWaitRequired,
+    ProcessWaitRequired,
+    ValidationError,
+)
 from agent_libos.utils.serde import to_jsonable
 
 if TYPE_CHECKING:
@@ -95,6 +103,8 @@ class LibOSSyscallSession:
                 await self._resolve_human_request(exc.request_id)
             except ProcessWaitRequired as exc:
                 await self._wait_for_child_terminal(exc.child_pid)
+            except ProcessMessageWaitRequired as exc:
+                await self._wait_for_process_message(exc.recipient_pid, exc.filters)
 
     async def _resolve_human_request(self, request_id: str) -> None:
         while True:
@@ -108,7 +118,6 @@ class LibOSSyscallSession:
                 auto_approve=getattr(self.runtime, "_current_human_auto_approve", None),
                 auto_policy=getattr(self.runtime, "_current_human_auto_policy", None),
                 auto_answer=getattr(self.runtime, "_current_human_auto_answer", None),
-                input_fn=getattr(self.runtime, "_current_human_input_fn", None),
             )
             if processed is None:
                 await asyncio.sleep(self.runtime.scheduler.poll_interval_s)
@@ -117,6 +126,21 @@ class LibOSSyscallSession:
         while True:
             child = self.runtime.process.get(child_pid)
             if child.status in self.TERMINAL_STATUSES:
+                return
+            await asyncio.sleep(self.runtime.scheduler.poll_interval_s)
+
+    async def _wait_for_process_message(self, pid: str, filters: dict[str, Any]) -> None:
+        while True:
+            messages = self.runtime.messages.unread(
+                pid,
+                kind=filters.get("kind"),
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+            )
+            if messages:
                 return
             await asyncio.sleep(self.runtime.scheduler.poll_interval_s)
 
@@ -232,6 +256,23 @@ class LibOSSyscallSession:
                 policy=MergePolicy(include_child_created=bool(args.get("include_child_created", True))),
             )
             return result
+        if name == "process.send_message":
+            message = self.runtime.messages.send_from_process(
+                self.pid,
+                str(args["recipient_pid"]),
+                kind=ProcessMessageKind(str(args.get("kind", ProcessMessageKind.NORMAL.value))),
+                channel=str(args.get("channel", "default")),
+                correlation_id=str(args["correlation_id"]) if args.get("correlation_id") is not None else None,
+                reply_to=str(args["reply_to"]) if args.get("reply_to") is not None else None,
+                subject=str(args.get("subject", "")),
+                body=str(args.get("body", "")),
+                payload=dict(args.get("payload") or {}),
+            )
+            return self._process_message_result(message)
+        if name == "process.read_messages":
+            return self._process_read_messages(args, default_block=False)
+        if name == "process.receive_messages":
+            return self._process_read_messages(args, default_block=True)
         if name == "process.exec":
             self._deferred_exec = dict(args)
             return {"deferred": True, "operation": "process.exec", "image": args.get("image")}
@@ -242,7 +283,7 @@ class LibOSSyscallSession:
             cwd = self.runtime.process.working_directory(self.pid)
             return self.runtime.shell.arun(
                 self.pid,
-                list(args.get("argv") or []),
+                self._string_list_arg(args, "argv"),
                 timeout=float(args.get("timeout_s", self.config.tools.shell_timeout_s)),
                 cwd=cwd,
             )
@@ -457,6 +498,50 @@ class LibOSSyscallSession:
             "message": result.message,
         }
 
+    def _process_read_messages(self, args: dict[str, Any], *, default_block: bool) -> dict[str, Any]:
+        kind = ProcessMessageKind(str(args["kind"])) if args.get("kind") is not None else None
+        messages = self.runtime.messages.receive(
+            self.pid,
+            block=bool(args.get("block", default_block)),
+            include_acked=bool(args.get("include_acked", False)),
+            kind=kind,
+            sender=str(args["sender"]) if args.get("sender") is not None else None,
+            channel=str(args["channel"]) if args.get("channel") is not None else None,
+            correlation_id=str(args["correlation_id"]) if args.get("correlation_id") is not None else None,
+            reply_to=str(args["reply_to"]) if args.get("reply_to") is not None else None,
+            message_ids=[str(item) for item in args["message_ids"]] if args.get("message_ids") is not None else None,
+            limit=int(args["limit"]) if args.get("limit") is not None else None,
+        )
+        acked = []
+        if bool(args.get("ack", True)):
+            unread_ids = [message.message_id for message in messages if message.status.value == "unread"]
+            if unread_ids:
+                acked = self.runtime.messages.ack(self.pid, unread_ids)
+                acked_by_id = {message.message_id: message for message in acked}
+                messages = [acked_by_id.get(message.message_id, message) for message in messages]
+        return {
+            "ready": bool(messages),
+            "messages": [self._process_message_result(message) for message in messages],
+            "acked_message_ids": [message.message_id for message in acked],
+        }
+
+    def _process_message_result(self, message: Any) -> dict[str, Any]:
+        return {
+            "message_id": message.message_id,
+            "sender": message.sender,
+            "recipient_pid": message.recipient_pid,
+            "kind": message.kind.value,
+            "channel": message.channel,
+            "correlation_id": message.correlation_id,
+            "reply_to": message.reply_to,
+            "subject": message.subject,
+            "body": message.body,
+            "payload": message.payload,
+            "status": message.status.value,
+            "created_at": message.created_at,
+            "acked_at": message.acked_at,
+        }
+
     def _image_load_yaml(self, args: dict[str, Any]) -> Any:
         file_result = self._filesystem_read_text(
             {
@@ -487,6 +572,14 @@ class LibOSSyscallSession:
             "default_tools": list(image.default_tools),
             "required_capabilities_count": len(image.required_capabilities),
         }
+
+    def _string_list_arg(self, args: dict[str, Any], key: str) -> list[str]:
+        value = args.get(key, [])
+        if not isinstance(value, list):
+            raise ValidationError(f"{key} must be a list of strings")
+        if not all(isinstance(item, str) for item in value):
+            raise ValidationError(f"{key} must contain only strings")
+        return list(value)
 
     def _result_handle_for_exit(self, args: dict[str, Any], tool_result: ObjectHandle | None) -> ObjectHandle | None:
         if args.get("result_oid"):

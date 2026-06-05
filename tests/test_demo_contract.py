@@ -58,7 +58,7 @@ class DemoContractTests(unittest.TestCase):
             "checkpoint.create",
             "human.query",
             "human.response",
-            "external.filesystem.write_text",
+            "primitive.filesystem.write_text",
             "tool.call",
             "process.exit",
         ]:

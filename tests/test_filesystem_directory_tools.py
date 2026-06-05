@@ -18,7 +18,7 @@ class FilesystemDirectoryToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = Runtime.open("local")
         self.human_output: list[str] = []
-        self.runtime.human.output_sink = self.human_output.append
+        self.runtime.substrate.human.output_sink = self.human_output.append
 
     def tearDown(self) -> None:
         self.runtime.close()

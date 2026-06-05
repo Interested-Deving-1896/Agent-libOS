@@ -30,6 +30,16 @@ class ToolProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tool_call_to_action({"name": "", "arguments": '{"path": "."}'})
 
+    def test_falsey_non_object_arguments_are_rejected(self) -> None:
+        for arguments in ([], 0, False):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    tool_call_to_action({"name": "read_directory", "arguments": arguments})
+
+    def test_none_or_empty_arguments_default_to_empty_object(self) -> None:
+        self.assertEqual(tool_call_to_action({"name": "get_current_time", "arguments": None}), {"action": "get_current_time"})
+        self.assertEqual(tool_call_to_action({"name": "get_current_time", "arguments": ""}), {"action": "get_current_time"})
+
 
 if __name__ == "__main__":
     unittest.main()

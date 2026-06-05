@@ -23,7 +23,7 @@ class ClockToolTests(unittest.TestCase):
         self.assertEqual(result.payload["timezone"], "UTC")
         parsed = datetime.fromisoformat(result.payload["iso8601"])
         self.assertIsNotNone(parsed.tzinfo)
-        self.assertIn("external.clock.now", self._audit_actions())
+        self.assertIn("primitive.clock.now", self._audit_actions())
         self.assertTrue(
             any(event.target == "clock:now" and event.payload.get("operation") == "now" for event in self.runtime.events.list())
         )
@@ -48,7 +48,7 @@ class ClockToolTests(unittest.TestCase):
         self.assertEqual(result.payload["requested_seconds"], 0.02)
         self.assertGreaterEqual(result.payload["elapsed_seconds"], 0.0)
         self.assertGreaterEqual(elapsed, 0.015)
-        self.assertIn("external.clock.sleep", self._audit_actions())
+        self.assertIn("primitive.clock.sleep", self._audit_actions())
         self.assertTrue(
             any(
                 event.target == "clock:sleep" and event.payload.get("operation") == "sleep"
@@ -63,7 +63,7 @@ class ClockToolTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("Invalid arguments", result.error or "")
-        self.assertNotIn("external.clock.sleep", self._audit_actions())
+        self.assertNotIn("primitive.clock.sleep", self._audit_actions())
 
     def test_clock_tools_are_in_process_tool_table(self) -> None:
         pid = self.runtime.process.spawn(image="base-agent:v0", goal="time tools")

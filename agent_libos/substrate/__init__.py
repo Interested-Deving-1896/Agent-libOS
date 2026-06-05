@@ -3,6 +3,7 @@ from agent_libos.substrate.base import (
     CommandResult,
     DirectoryEntrySnapshot,
     FilesystemProvider,
+    HumanProvider,
     PathState,
     ResolvedPath,
     ResourceProviderSubstrate,
@@ -11,6 +12,7 @@ from agent_libos.substrate.base import (
 from agent_libos.substrate.local import (
     LocalClockProvider,
     LocalFilesystemProvider,
+    LocalHumanProvider,
     LocalResourceProviderSubstrate,
     LocalShellProvider,
 )
@@ -20,8 +22,10 @@ __all__ = [
     "CommandResult",
     "DirectoryEntrySnapshot",
     "FilesystemProvider",
+    "HumanProvider",
     "LocalClockProvider",
     "LocalFilesystemProvider",
+    "LocalHumanProvider",
     "LocalResourceProviderSubstrate",
     "LocalShellProvider",
     "PathState",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_libos.external.shell import ShellAdapter
+from agent_libos.primitives.shell import ShellAdapter
 
 
 class GitAdapter:
@@ -17,4 +17,3 @@ class GitAdapter:
         if path is not None:
             argv.append(str(path))
         return self.shell.run(pid, argv).stdout
-

@@ -75,6 +75,12 @@ Tool-use guidance:
 - read_memory_object / append_memory_object: inspect or append to named mutable
   memory objects, especially your `llm_context:<pid>` context object. Prefer
   append-style writes so earlier prompt prefixes remain cacheable.
+- read_process_messages / send_process_message: inspect your process message
+  queue and coordinate with your parent or direct children. Use
+  receive_process_messages for blocking or selective IPC by channel,
+  correlation_id, sender, reply_to, or exact message id. Interrupt messages
+  should be read before continuing unrelated work; normal messages can be read
+  after the current tool result.
 - create_object_from_file / write_object_to_file: move file content through
   Object Memory without exposing the concrete bytes in the process-visible
   result. Use this for copy/transform workflows and large reference files.
@@ -164,8 +170,11 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "process_exit",
                 "list_memory_namespace",
                 "read_memory_object",
+                "read_process_messages",
+                "receive_process_messages",
                 "request_permission",
                 "run_shell_command",
+                "send_process_message",
                 "set_working_directory",
                 "signal_child_process",
                 "sleep",
@@ -202,10 +211,13 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "propose_jit_tool",
                 "read_directory",
                 "read_memory_object",
+                "read_process_messages",
+                "receive_process_messages",
                 "read_text_file",
                 "register_jit_tool",
                 "request_permission",
                 "run_shell_command",
+                "send_process_message",
                 "set_working_directory",
                 "signal_child_process",
                 "sleep",
@@ -243,6 +255,8 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "process_exit",
                 "propose_jit_tool",
                 "read_memory_object",
+                "read_process_messages",
+                "receive_process_messages",
                 "register_jit_tool",
                 "validate_jit_tool",
             ],
@@ -272,9 +286,12 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "merge_child_memory",
                 "read_directory",
                 "read_memory_object",
+                "read_process_messages",
+                "receive_process_messages",
                 "read_text_file",
                 "request_permission",
                 "run_shell_command",
+                "send_process_message",
                 "set_working_directory",
                 "signal_child_process",
                 "sleep",

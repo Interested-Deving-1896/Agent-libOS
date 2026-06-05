@@ -3,18 +3,34 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import CapabilityRight, ForkMode, MemoryViewSpec, ObjectHandle, ObjectMetadata, ObjectType, ToolCallResult, ViewMode
+from agent_libos.models import (
+    CapabilityRight,
+    ForkMode,
+    MemoryViewSpec,
+    ObjectHandle,
+    ObjectMetadata,
+    ObjectType,
+    ProcessMessage,
+    ProcessMessageKind,
+    ProcessStatus,
+    ToolCallResult,
+    ViewMode,
+)
 from agent_libos.runtime.runtime import Runtime
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 
 DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
 DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
+_TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -28,6 +44,9 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("init", help="Initialize a runtime database")
     sub.add_parser("demo", help="Run the coding-agent MVP demo")
     sub.add_parser("audit", help="Print audit trace")
+    llm_calls_parser = sub.add_parser("llm-calls", help="Print persisted LLM call records")
+    llm_calls_parser.add_argument("--pid", help="Filter by process id.")
+    llm_calls_parser.add_argument("--limit", type=int, help="Maximum number of records to print.")
     sub.add_parser("processes", help="Print process table")
     sub.add_parser("tools", help="Print registered tools")
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
@@ -67,6 +86,14 @@ def main(argv: list[str] | None = None) -> None:
     llm_once_parser.add_argument("pid")
     run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
     run_parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    run_parser.add_argument("--interactive", action="store_true", help="Read human input while running and post it as process messages.")
+    run_parser.add_argument("--pid", help="Default target process for interactive human messages.")
+    run_parser.add_argument("--human", default=_RUNTIME_DEFAULTS.default_human, help="Human actor name for interactive messages.")
+    run_parser.add_argument("--message-channel", default="human", help="Process-message channel for interactive human input.")
+    message_parser = sub.add_parser("message", help="Send a human process message")
+    _add_message_parser_args(message_parser)
+    interrupt_parser = sub.add_parser("interrupt", help="Send a human interrupt process message")
+    _add_message_parser_args(interrupt_parser, include_kind=False)
     sub.add_parser("human", help="Process pending human messages in terminal order")
     grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
     grant_tool_parser.add_argument("pid")
@@ -81,6 +108,8 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
         elif args.command == "audit":
             _print_json([record.__dict__ for record in runtime.audit.trace()])
+        elif args.command == "llm-calls":
+            _print_json([record.__dict__ for record in runtime.store.list_llm_calls(pid=args.pid, limit=args.limit)])
         elif args.command == "processes":
             _print_json([process.__dict__ for process in runtime.process.list()])
         elif args.command == "tools":
@@ -97,7 +126,14 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "llm-once":
             _print_json(asyncio.run(runtime.arun_process_once(args.pid)))
         elif args.command == "run":
-            _print_json(asyncio.run(runtime.arun_until_idle(max_quanta=args.max_quanta)))
+            if args.interactive:
+                _print_json(asyncio.run(_run_interactive_command(runtime, args)))
+            else:
+                _print_json(asyncio.run(runtime.arun_until_idle(max_quanta=args.max_quanta)))
+        elif args.command == "message":
+            _print_json(asyncio.run(_run_message_command(runtime, args)))
+        elif args.command == "interrupt":
+            _print_json(asyncio.run(_run_message_command(runtime, args, fixed_kind=ProcessMessageKind.INTERRUPT)))
         elif args.command == "grant-tool":
             raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
         elif args.command == "human":
@@ -183,6 +219,100 @@ def _run_exit_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, A
     }
 
 
+async def _run_message_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    fixed_kind: ProcessMessageKind | None = None,
+) -> dict[str, Any]:
+    kind = fixed_kind or (ProcessMessageKind.INTERRUPT if getattr(args, "interrupt", False) else ProcessMessageKind(args.kind))
+    payload = _parse_json_mapping(args.payload_json, "--payload-json")
+    payload.setdefault("source", "cli.message")
+    message = runtime.human.send_process_message(
+        args.pid,
+        args.body,
+        kind=kind,
+        human=args.human,
+        channel=args.channel,
+        correlation_id=args.correlation_id,
+        reply_to=args.reply_to,
+        subject=args.subject,
+        payload=payload,
+    )
+    results: list[Any] = []
+    if args.run:
+        results = await runtime.arun_until_idle(max_quanta=args.max_quanta, human=args.human)
+    return {
+        "message": _message_cli_summary(message),
+        "ran": args.run,
+        "results": results,
+    }
+
+
+async def _run_interactive_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    target_pid = args.pid or _single_active_process_pid(runtime)
+    if target_pid is None:
+        raise SystemExit("run --interactive needs --pid when there is not exactly one active process")
+    _redirect_human_output_to_stderr(runtime)
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    stop = threading.Event()
+    _start_interactive_input_thread(asyncio.get_running_loop(), queue, stop)
+    _print_interactive_help(target_pid)
+
+    results: list[Any] = []
+    posted: list[dict[str, Any]] = []
+    state = {"pid": target_pid, "shown_request_id": ""}
+    remaining = int(args.max_quanta)
+    selected_human = args.human or _RUNTIME_DEFAULTS.default_human
+    try:
+        while remaining > 0:
+            command = _drain_interactive_queue(runtime, queue, state, selected_human, args.message_channel, posted)
+            if command in {"exit", "eof"}:
+                break
+
+            batch = await runtime.scheduler.arun_until_idle(runtime.arun_process_once, max_quanta=remaining)
+            results.extend(batch)
+            remaining -= len(batch)
+
+            processed = _process_interactive_terminal_outputs(runtime, selected_human)
+            if processed:
+                runtime.audit.record(
+                    actor="runtime",
+                    action="runtime.human_queue_drained",
+                    target=f"human:{selected_human}",
+                    decision={"request_ids": [request.request_id for request in processed]},
+                )
+
+            command = _drain_interactive_queue(runtime, queue, state, selected_human, args.message_channel, posted)
+            if command in {"exit", "eof"}:
+                break
+
+            target = runtime.process.get(state["pid"])
+            if target.status in _TERMINAL_PROCESS_STATUSES:
+                break
+            _show_pending_interactive_human_request(runtime, selected_human, state)
+            if batch or processed:
+                await asyncio.sleep(0)
+                continue
+            try:
+                line = await asyncio.wait_for(queue.get(), timeout=runtime.scheduler.poll_interval_s)
+            except asyncio.TimeoutError:
+                continue
+            command = _handle_interactive_line(runtime, line, state, selected_human, args.message_channel, posted)
+            if command in {"exit", "eof"}:
+                break
+    finally:
+        stop.set()
+    return {
+        "interactive": True,
+        "target_pid": state["pid"],
+        "posted_messages": posted,
+        "results": results,
+        "remaining_quanta": remaining,
+        "process": _process_cli_summary(runtime.process.get(state["pid"])),
+    }
+
+
 def _load_cli_image_from_yaml(runtime: Runtime, value: str, *, replace: bool) -> dict[str, Any]:
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -227,6 +357,300 @@ def _parse_json_value(value: str) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return {"content": value}
+
+
+def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: bool = True) -> None:
+    parser.add_argument("pid", help="Target process id.")
+    parser.add_argument("body", help="Message body. Quote it to include spaces.")
+    if include_kind:
+        parser.add_argument("--kind", choices=[kind.value for kind in ProcessMessageKind], default=ProcessMessageKind.NORMAL.value)
+        parser.add_argument("--interrupt", action="store_true", help="Shortcut for --kind interrupt.")
+    parser.add_argument("--human", default=_RUNTIME_DEFAULTS.default_human, help="Human actor name.")
+    parser.add_argument("--channel", default="human", help="Process-message channel.")
+    parser.add_argument("--subject", help="Short message subject.")
+    parser.add_argument("--correlation-id", help="Optional conversation/request correlation id.")
+    parser.add_argument("--reply-to", help="Optional message id this message replies to.")
+    parser.add_argument("--payload-json", default="{}", help="Structured JSON object to include in the message payload.")
+    parser.add_argument("--run", action="store_true", help="Run the scheduler after posting the message.")
+    parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+
+
+def _message_cli_summary(message: ProcessMessage) -> dict[str, Any]:
+    return {
+        "message_id": message.message_id,
+        "sender": message.sender,
+        "recipient_pid": message.recipient_pid,
+        "kind": message.kind.value,
+        "channel": message.channel,
+        "correlation_id": message.correlation_id,
+        "reply_to": message.reply_to,
+        "subject": message.subject,
+        "body": message.body,
+        "payload": message.payload,
+        "status": message.status.value,
+        "created_at": message.created_at,
+    }
+
+
+def _single_active_process_pid(runtime: Runtime) -> str | None:
+    active = [process.pid for process in runtime.process.list() if process.status not in _TERMINAL_PROCESS_STATUSES]
+    return active[0] if len(active) == 1 else None
+
+
+def _redirect_human_output_to_stderr(runtime: Runtime) -> None:
+    provider = runtime.substrate.human
+    if hasattr(provider, "output_sink"):
+        provider.output_sink = lambda message: print(message, file=sys.stderr, flush=True)
+
+
+def _start_interactive_input_thread(
+    loop: asyncio.AbstractEventLoop,
+    queue: asyncio.Queue[str | None],
+    stop: threading.Event,
+) -> None:
+    def worker() -> None:
+        while not stop.is_set():
+            print("agent-libos> ", end="", file=sys.stderr, flush=True)
+            line = sys.stdin.readline()
+            if line == "":
+                _enqueue_interactive_line(loop, queue, None)
+                return
+            _enqueue_interactive_line(loop, queue, line.rstrip("\r\n"))
+
+    threading.Thread(target=worker, name="agent-libos-cli-input", daemon=True).start()
+
+
+def _enqueue_interactive_line(
+    loop: asyncio.AbstractEventLoop,
+    queue: asyncio.Queue[str | None],
+    line: str | None,
+) -> None:
+    try:
+        loop.call_soon_threadsafe(queue.put_nowait, line)
+    except RuntimeError:
+        pass
+
+
+def _print_interactive_help(target_pid: str) -> None:
+    print(
+        (
+            f"Interactive human input target: {target_pid}\n"
+            "Plain text sends a normal message. Commands: /interrupt <text>, /message <text>, "
+            "/pid <pid>, /help, /exit"
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _drain_interactive_queue(
+    runtime: Runtime,
+    queue: asyncio.Queue[str | None],
+    state: dict[str, str],
+    human: str,
+    channel: str,
+    posted: list[dict[str, Any]],
+) -> str | None:
+    command: str | None = None
+    while True:
+        try:
+            line = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return command
+        command = _handle_interactive_line(runtime, line, state, human, channel, posted)
+        if command in {"exit", "eof"}:
+            return command
+
+
+def _handle_interactive_line(
+    runtime: Runtime,
+    line: str | None,
+    state: dict[str, str],
+    human: str,
+    channel: str,
+    posted: list[dict[str, Any]],
+) -> str | None:
+    if line is None:
+        return "eof"
+    if _handle_interactive_human_response(runtime, line, human):
+        return None
+    parsed = _parse_interactive_line(line)
+    command = parsed.get("command")
+    if command is None:
+        return None
+    if command == "exit":
+        return "exit"
+    if command == "help":
+        _print_interactive_help(state["pid"])
+        return None
+    if command == "pid":
+        pid = str(parsed["pid"])
+        runtime.process.get(pid)
+        state["pid"] = pid
+        print(f"Target process: {pid}", file=sys.stderr, flush=True)
+        return None
+    if command == "message":
+        kind = ProcessMessageKind(str(parsed["kind"]))
+        message = runtime.human.send_process_message(
+            state["pid"],
+            str(parsed["body"]),
+            kind=kind,
+            human=human,
+            channel=channel,
+            payload={"source": "cli.interactive"},
+        )
+        summary = _message_cli_summary(message)
+        posted.append(summary)
+        print(f"Sent {message.kind.value} message {message.message_id} -> {message.recipient_pid}", file=sys.stderr, flush=True)
+        return None
+    return None
+
+
+def _parse_interactive_line(line: str) -> dict[str, Any]:
+    stripped = line.strip()
+    if not stripped:
+        return {}
+    if not stripped.startswith("/"):
+        return {"command": "message", "kind": ProcessMessageKind.NORMAL.value, "body": stripped}
+    command, _, rest = stripped[1:].partition(" ")
+    command = command.lower()
+    body = rest.strip()
+    if command in {"exit", "quit", "q"}:
+        return {"command": "exit"}
+    if command in {"help", "h", "?"}:
+        return {"command": "help"}
+    if command in {"pid", "target"}:
+        if not body:
+            raise SystemExit("/pid requires a process id")
+        return {"command": "pid", "pid": body}
+    if command in {"interrupt", "i"}:
+        return {
+            "command": "message",
+            "kind": ProcessMessageKind.INTERRUPT.value,
+            "body": body or "Human requested attention.",
+        }
+    if command in {"message", "m"}:
+        return {"command": "message", "kind": ProcessMessageKind.NORMAL.value, "body": body}
+    print(f"Unknown interactive command: /{command}. Type /help for commands.", file=sys.stderr, flush=True)
+    return {}
+
+
+def _process_interactive_terminal_outputs(runtime: Runtime, human: str) -> list[Any]:
+    processed: list[Any] = []
+    while True:
+        pending = runtime.human.pending(human=human)
+        if not pending or pending[0].payload.get("type") != "output":
+            return processed
+        processed.append(runtime.human.process_next_terminal(human=human))
+
+
+def _show_pending_interactive_human_request(runtime: Runtime, human: str, state: dict[str, str]) -> None:
+    request = _first_interactive_input_request(runtime, human)
+    if request is None:
+        state["shown_request_id"] = ""
+        return
+    if state.get("shown_request_id") == request.request_id:
+        return
+    state["shown_request_id"] = request.request_id
+    question = str(request.payload.get("question") or request.payload)
+    request_type = str(request.payload.get("type") or "approval")
+    if request_type == "permission_request":
+        suffix = "Reply a=always allow, d=always deny, e=ask each time."
+    elif request_type == "question":
+        suffix = "Reply with the answer text."
+    else:
+        suffix = "Reply y/yes to approve, n/no to reject."
+    print(f"\nHuman request {request.request_id}: {question}\n{suffix}", file=sys.stderr, flush=True)
+
+
+def _handle_interactive_human_response(runtime: Runtime, line: str, human: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("/message", "/m", "/interrupt", "/i", "/pid", "/target", "/help", "/exit", "/quit")):
+        return False
+    request = _first_interactive_input_request(runtime, human)
+    if request is None:
+        return False
+    response = _interactive_response_text(stripped)
+    if response is None:
+        return False
+    request_type = request.payload.get("type")
+    if request_type == "question":
+        runtime.human.approve(
+            request.request_id,
+            {"approved": True, "answer": response, "source": "interactive_cli"},
+            responder=f"human:{human}",
+        )
+        print(f"Answered human request {request.request_id}", file=sys.stderr, flush=True)
+        return True
+    if request_type == "permission_request":
+        policy = _interactive_permission_policy(response)
+        decision = {"policy": policy, "source": "interactive_cli"}
+        if policy == CapabilityManager.ALWAYS_DENY:
+            runtime.human.reject(request.request_id, {"approved": False, **decision}, responder=f"human:{human}")
+        else:
+            runtime.human.approve(request.request_id, {"approved": True, **decision}, responder=f"human:{human}")
+        print(f"Resolved permission request {request.request_id} with policy={policy}", file=sys.stderr, flush=True)
+        return True
+    approved = response.lower() in {"y", "yes", "approve", "approved", "a", "allow"}
+    if approved:
+        runtime.human.approve(
+            request.request_id,
+            {"approved": True, "source": "interactive_cli"},
+            responder=f"human:{human}",
+        )
+    else:
+        runtime.human.reject(
+            request.request_id,
+            {"approved": False, "source": "interactive_cli"},
+            responder=f"human:{human}",
+        )
+    print(f"{'Approved' if approved else 'Rejected'} human request {request.request_id}", file=sys.stderr, flush=True)
+    return True
+
+
+def _interactive_response_text(stripped: str) -> str | None:
+    if not stripped.startswith("/"):
+        return stripped
+    command, _, rest = stripped[1:].partition(" ")
+    command = command.lower()
+    if command in {"answer", "reply"}:
+        return rest
+    if command in {"approve", "yes", "y"}:
+        return "yes"
+    if command in {"reject", "deny", "no", "n"}:
+        return "no"
+    if command in {"allow", "always-allow", "always_allow"}:
+        return "always_allow"
+    if command in {"ask", "ask-each-time", "ask_each_time"}:
+        return "ask_each_time"
+    return None
+
+
+def _interactive_permission_policy(answer: str) -> str:
+    normalized = answer.strip().lower()
+    return {
+        "a": CapabilityManager.ALWAYS_ALLOW,
+        "allow": CapabilityManager.ALWAYS_ALLOW,
+        "always_allow": CapabilityManager.ALWAYS_ALLOW,
+        "yes": CapabilityManager.ALWAYS_ALLOW,
+        "y": CapabilityManager.ALWAYS_ALLOW,
+        "e": CapabilityManager.ASK_EACH_TIME,
+        "ask": CapabilityManager.ASK_EACH_TIME,
+        "each": CapabilityManager.ASK_EACH_TIME,
+        "ask_each_time": CapabilityManager.ASK_EACH_TIME,
+        "d": CapabilityManager.ALWAYS_DENY,
+        "deny": CapabilityManager.ALWAYS_DENY,
+        "always_deny": CapabilityManager.ALWAYS_DENY,
+        "no": CapabilityManager.ALWAYS_DENY,
+        "n": CapabilityManager.ALWAYS_DENY,
+    }.get(normalized, CapabilityManager.ALWAYS_DENY)
+
+
+def _first_interactive_input_request(runtime: Runtime, human: str) -> Any | None:
+    for request in runtime.human.pending(human=human):
+        if request.payload.get("type") != "output":
+            return request
+    return None
 
 
 def _process_cli_summary(process: Any) -> dict[str, Any]:
@@ -390,7 +814,7 @@ export function run(args, libos) {
                 "action": "write_text",
                 "path": DEMO_PATCH_PREVIEW_PATH,
                 "bytes_written": approved_call.payload.get("bytes_written") if isinstance(approved_call.payload, dict) else None,
-                "audit_action": "external.filesystem.write_text",
+                "audit_action": "primitive.filesystem.write_text",
             }
         ],
         "checkpoint": checkpoint,

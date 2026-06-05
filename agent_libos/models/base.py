@@ -10,6 +10,7 @@ AuditID = str
 CheckpointID = str
 ToolID = str
 HumanRequestID = str
+ProcessMessageID = str
 MemoryViewID = str
 SnapshotID = str
 NamespaceID = str

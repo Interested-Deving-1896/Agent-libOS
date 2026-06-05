@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,25 @@ class LocalShellProvider:
         return target
 
 
+class LocalHumanProvider:
+    """Terminal-backed human I/O provider for the local substrate."""
+
+    def __init__(
+        self,
+        *,
+        output_sink: Callable[[str], None] | None = None,
+        input_reader: Callable[[str], str] | None = None,
+    ) -> None:
+        self.output_sink = output_sink or (lambda message: print(message, flush=True))
+        self.input_reader = input_reader or input
+
+    def write(self, message: str) -> None:
+        self.output_sink(message)
+
+    def read(self, prompt: str) -> str:
+        return self.input_reader(prompt)
+
+
 class LocalResourceProviderSubstrate:
     """Default Resource Provider Substrate backed by the host OS."""
 
@@ -149,3 +169,4 @@ class LocalResourceProviderSubstrate:
         self.filesystem = LocalFilesystemProvider(self.workspace_root, namespace=namespace)
         self.clock = LocalClockProvider()
         self.shell = LocalShellProvider(self.workspace_root)
+        self.human = LocalHumanProvider()

@@ -62,7 +62,7 @@ class ClockPrimitive:
         )
         self.audit.record(
             actor=pid,
-            action="external.clock.now",
+            action="primitive.clock.now",
             target="clock:now",
             decision={"timezone": tz, "iso8601": result.iso8601},
         )
@@ -105,7 +105,7 @@ class ClockPrimitive:
         )
         self.audit.record(
             actor=pid,
-            action="external.clock.sleep",
+            action="primitive.clock.sleep",
             target="clock:sleep",
             decision={"requested_seconds": duration, "elapsed_seconds": elapsed},
         )

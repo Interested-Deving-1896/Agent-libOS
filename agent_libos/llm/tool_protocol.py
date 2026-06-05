@@ -6,7 +6,12 @@ from typing import Any
 
 def tool_call_to_action(tool_call: dict[str, Any]) -> dict[str, Any]:
     name = str(tool_call.get("name") or "").strip()
-    raw_args = tool_call.get("arguments") or "{}"
+    raw_args = tool_call.get("arguments")
+    # Empty arguments are common for no-arg tool calls, but other false-y
+    # values such as [] or 0 are malformed protocol frames and should surface
+    # as repairable LLM output errors.
+    if raw_args is None or raw_args == "":
+        raw_args = "{}"
     if isinstance(raw_args, str):
         args = json.loads(raw_args or "{}")
     elif isinstance(raw_args, dict):

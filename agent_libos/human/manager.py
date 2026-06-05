@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import CapabilityRight
+from agent_libos.models import CapabilityRight, ProcessMessage, ProcessMessageKind
 from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
@@ -20,6 +19,10 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
+from agent_libos.substrate import HumanProvider
+
+if TYPE_CHECKING:
+    from agent_libos.runtime.message_manager import ProcessMessageManager
 
 
 class HumanObjectManager:
@@ -31,7 +34,7 @@ class HumanObjectManager:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
-        output_sink: Callable[[str], None] | None = None,
+        provider: HumanProvider,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
@@ -39,7 +42,11 @@ class HumanObjectManager:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
-        self.output_sink = output_sink or (lambda message: print(message, flush=True))
+        self.provider = provider
+        self._messages: ProcessMessageManager | None = None
+
+    def bind_messages(self, messages: "ProcessMessageManager") -> None:
+        self._messages = messages
 
     def query(
         self,
@@ -201,6 +208,52 @@ class HumanObjectManager:
         )
         return event.event_id
 
+    def send_process_message(
+        self,
+        recipient_pid: str,
+        body: str,
+        *,
+        kind: ProcessMessageKind | str = ProcessMessageKind.NORMAL,
+        human: str | None = None,
+        channel: str = "human",
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        subject: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> ProcessMessage:
+        if self._messages is None:
+            raise RuntimeError("HumanObjectManager is not bound to a ProcessMessageManager")
+        selected_human = human or self.config.runtime.default_human
+        selected_kind = ProcessMessageKind(kind)
+        message_payload = dict(payload or {})
+        message_payload.setdefault("source", "human_input")
+        message_payload.setdefault("human", selected_human)
+        message = self._messages.post(
+            sender=f"human:{selected_human}",
+            recipient_pid=recipient_pid,
+            kind=selected_kind,
+            channel=channel,
+            correlation_id=correlation_id,
+            reply_to=reply_to,
+            subject=subject if subject is not None else self._default_message_subject(selected_kind),
+            body=body,
+            payload=message_payload,
+        )
+        self.audit.record(
+            actor=f"human:{selected_human}",
+            action="human.message",
+            target=f"process:{recipient_pid}",
+            decision={
+                "message_id": message.message_id,
+                "kind": message.kind.value,
+                "channel": message.channel,
+                "correlation_id": message.correlation_id,
+                "reply_to": message.reply_to,
+                "subject": message.subject,
+            },
+        )
+        return message
+
     def output(
         self,
         pid: str,
@@ -255,7 +308,6 @@ class HumanObjectManager:
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
-        input_fn: Callable[[str], str] | None = None,
     ) -> HumanRequest | None:
         selected_human = human or self.config.runtime.default_human
         pending = self.pending(human=selected_human)
@@ -272,7 +324,6 @@ class HumanObjectManager:
             answer = self._select_text_answer(
                 question=question,
                 auto_answer=auto_answer,
-                input_fn=input_fn,
             )
             return self.approve(
                 request.request_id,
@@ -283,7 +334,6 @@ class HumanObjectManager:
                 question=question,
                 auto_policy=auto_policy,
                 auto_approve=auto_approve,
-                input_fn=input_fn,
             )
             decision = {"policy": policy, "source": "terminal_queue"}
             if policy == CapabilityManager.ALWAYS_DENY:
@@ -293,7 +343,6 @@ class HumanObjectManager:
         approved = self._select_boolean_approval(
             question=question,
             auto_approve=auto_approve,
-            input_fn=input_fn,
         )
         if approved:
             return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
@@ -305,7 +354,6 @@ class HumanObjectManager:
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
-        input_fn: Callable[[str], str] | None = None,
     ) -> HumanRequest | None:
         return await asyncio.to_thread(
             self.process_next_terminal,
@@ -313,7 +361,6 @@ class HumanObjectManager:
             auto_approve=auto_approve,
             auto_policy=auto_policy,
             auto_answer=auto_answer,
-            input_fn=input_fn,
         )
 
     def drain_terminal_queue(
@@ -322,7 +369,6 @@ class HumanObjectManager:
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
-        input_fn: Callable[[str], str] | None = None,
     ) -> builtins.list[HumanRequest]:
         processed: builtins.list[HumanRequest] = []
         while True:
@@ -331,7 +377,6 @@ class HumanObjectManager:
                 auto_approve=auto_approve,
                 auto_policy=auto_policy,
                 auto_answer=auto_answer,
-                input_fn=input_fn,
             )
             if request is None:
                 return processed
@@ -343,7 +388,6 @@ class HumanObjectManager:
         auto_approve: bool | None = None,
         auto_policy: str | None = None,
         auto_answer: str | None = None,
-        input_fn: Callable[[str], str] | None = None,
     ) -> builtins.list[HumanRequest]:
         processed: builtins.list[HumanRequest] = []
         while True:
@@ -352,7 +396,6 @@ class HumanObjectManager:
                 auto_approve=auto_approve,
                 auto_policy=auto_policy,
                 auto_answer=auto_answer,
-                input_fn=input_fn,
             )
             if request is None:
                 return processed
@@ -484,7 +527,6 @@ class HumanObjectManager:
         question: str,
         auto_policy: str | None,
         auto_approve: bool | None,
-        input_fn: Callable[[str], str] | None,
     ) -> str:
         choices = {
             CapabilityManager.ALWAYS_ALLOW,
@@ -494,14 +536,13 @@ class HumanObjectManager:
         if auto_policy is not None:
             if auto_policy not in choices:
                 raise ValueError(f"unknown permission policy: {auto_policy}")
-            self.output_sink(f"{question} [policy={auto_policy}]")
+            self.provider.write(f"{question} [policy={auto_policy}]")
             return auto_policy
         if auto_approve is not None:
             policy = CapabilityManager.ALWAYS_ALLOW if auto_approve else CapabilityManager.ALWAYS_DENY
-            self.output_sink(f"{question} [policy={policy}]")
+            self.provider.write(f"{question} [policy={policy}]")
             return policy
-        reader = input_fn or input
-        answer = reader(
+        answer = self.provider.read(
             f"{question} [a=always allow, d=always deny, e=ask each time; default=d]: "
         ).strip().lower()
         return {
@@ -596,31 +637,27 @@ class HumanObjectManager:
         self,
         question: str,
         auto_approve: bool | None,
-        input_fn: Callable[[str], str] | None,
     ) -> bool:
         if auto_approve is None:
-            reader = input_fn or input
-            answer = reader(f"{question} [y/N]: ").strip().lower()
+            answer = self.provider.read(f"{question} [y/N]: ").strip().lower()
             return answer in {"y", "yes"}
-        self.output_sink(f"{question} [{'approved' if auto_approve else 'rejected'}]")
+        self.provider.write(f"{question} [{'approved' if auto_approve else 'rejected'}]")
         return auto_approve
 
     def _select_text_answer(
         self,
         question: str,
         auto_answer: str | None,
-        input_fn: Callable[[str], str] | None,
     ) -> str:
         if auto_answer is not None:
-            self.output_sink(f"{question} [answer={auto_answer!r}]")
+            self.provider.write(f"{question} [answer={auto_answer!r}]")
             return auto_answer
-        reader = input_fn or input
-        return reader(f"{question} ")
+        return self.provider.read(f"{question} ")
 
     def _deliver_output_request(self, request: HumanRequest) -> HumanRequest:
         message = str(request.payload.get("message", ""))
         channel = str(request.payload.get("channel", self.config.runtime.terminal_channel))
-        self.output_sink(message)
+        self.provider.write(message)
         request.status = HumanRequestStatus.DELIVERED
         request.decision = {"delivered": True}
         request.updated_at = utc_now()
@@ -639,3 +676,8 @@ class HumanObjectManager:
             decision={"request_id": request.request_id, "channel": channel, "chars": len(message), "queued": True},
         )
         return request
+
+    def _default_message_subject(self, kind: ProcessMessageKind) -> str:
+        if kind == ProcessMessageKind.INTERRUPT:
+            return "Human interrupt"
+        return "Human message"

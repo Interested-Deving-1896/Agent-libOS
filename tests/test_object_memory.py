@@ -53,6 +53,19 @@ class ObjectMemoryNameTests(unittest.TestCase):
                 name="duplicate.name",
             )
 
+    def test_object_name_cannot_contain_namespace_separators(self) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="invalid local names")
+
+        for name in ("project/note", "project\\note", ".", ".."):
+            with self.subTest(name=name):
+                with self.assertRaises(ValidationError):
+                    self.runtime.memory.create_object(
+                        pid=pid,
+                        object_type=ObjectType.OBSERVATION,
+                        payload={"name": name},
+                        name=name,
+                    )
+
     def test_same_local_name_is_allowed_in_process_and_explicit_namespaces(self) -> None:
         pid = self.runtime.process.spawn(image="base-agent:v0", goal="namespace names")
         self.runtime.memory.create_namespace(pid, "project")

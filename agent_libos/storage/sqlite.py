@@ -17,6 +17,7 @@ from agent_libos.models import (
     EventType,
     HumanRequest,
     HumanRequestStatus,
+    LLMCallRecord,
     MemoryView,
     ObjectFilter,
     ObjectHandle,
@@ -25,6 +26,9 @@ from agent_libos.models import (
     ObjectNamespace,
     ObjectType,
     ProcessStatus,
+    ProcessMessage,
+    ProcessMessageKind,
+    ProcessMessageStatus,
     Provenance,
     RelationType,
     ResourceBudget,
@@ -52,6 +56,8 @@ class SQLiteStore:
         "events",
         "capabilities",
         "human_requests",
+        "llm_calls",
+        "process_messages",
         "tools",
         "tool_candidates",
     ]
@@ -191,6 +197,61 @@ class SQLiteStore:
                   updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS llm_calls (
+                  call_id TEXT PRIMARY KEY,
+                  pid TEXT,
+                  image_id TEXT,
+                  purpose TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  api TEXT,
+                  model TEXT,
+                  request_id TEXT,
+                  response_id TEXT,
+                  messages_json TEXT NOT NULL,
+                  tools_json TEXT NOT NULL,
+                  request_options_json TEXT NOT NULL,
+                  response_content TEXT NOT NULL,
+                  tool_calls_json TEXT NOT NULL,
+                  reasoning_json TEXT,
+                  usage_json TEXT NOT NULL,
+                  raw_response_json TEXT,
+                  error TEXT,
+                  created_at TEXT NOT NULL,
+                  completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_llm_calls_pid_created
+                  ON llm_calls(pid, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_llm_calls_request_id
+                  ON llm_calls(request_id);
+
+                CREATE INDEX IF NOT EXISTS idx_llm_calls_response_id
+                  ON llm_calls(response_id);
+
+                CREATE TABLE IF NOT EXISTS process_messages (
+                  message_id TEXT PRIMARY KEY,
+                  sender TEXT NOT NULL,
+                  recipient_pid TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  channel TEXT NOT NULL DEFAULT 'default',
+                  correlation_id TEXT,
+                  reply_to TEXT,
+                  subject TEXT NOT NULL,
+                  body TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  acked_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_status_kind
+                  ON process_messages(recipient_pid, status, kind, channel, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_process_messages_correlation
+                  ON process_messages(recipient_pid, correlation_id, status, created_at);
+
                 CREATE TABLE IF NOT EXISTS tools (
                   tool_id TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
@@ -217,6 +278,8 @@ class SQLiteStore:
             )
             self._ensure_object_namespace_schema()
             self._ensure_process_schema()
+            self._ensure_llm_call_schema()
+            self._ensure_process_message_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -580,6 +643,155 @@ class SQLiteStore:
             )
         return [self._row_to_human_request(row) for row in rows]
 
+    def insert_llm_call(self, record: LLMCallRecord) -> None:
+        self._execute(
+            """
+            INSERT INTO llm_calls (
+                call_id, pid, image_id, purpose, status, api, model, request_id, response_id,
+                messages_json, tools_json, request_options_json, response_content, tool_calls_json,
+                reasoning_json, usage_json, raw_response_json, error, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.call_id,
+                record.pid,
+                record.image_id,
+                record.purpose,
+                record.status,
+                record.api,
+                record.model,
+                record.request_id,
+                record.response_id,
+                dumps(record.messages),
+                dumps(record.tools),
+                dumps(record.request_options),
+                record.response_content,
+                dumps(record.tool_calls),
+                dumps(record.reasoning) if record.reasoning is not None else None,
+                dumps(record.usage),
+                dumps(record.raw_response) if record.raw_response is not None else None,
+                record.error,
+                record.created_at,
+                record.completed_at,
+            ),
+        )
+
+    def list_llm_calls(self, pid: str | None = None, limit: int | None = None) -> list[LLMCallRecord]:
+        params: list[Any] = []
+        sql = "SELECT * FROM llm_calls"
+        if pid is not None:
+            sql += " WHERE pid = ?"
+            params.append(pid)
+        sql += " ORDER BY created_at, call_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [self._row_to_llm_call(row) for row in self._query(sql, params)]
+
+    def insert_process_message(self, message: ProcessMessage) -> None:
+        self._execute(
+            """
+            INSERT INTO process_messages (
+                message_id, sender, recipient_pid, kind, channel, correlation_id, reply_to,
+                subject, body, payload_json, status, created_at, updated_at, acked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message.message_id,
+                message.sender,
+                message.recipient_pid,
+                message.kind.value,
+                message.channel,
+                message.correlation_id,
+                message.reply_to,
+                message.subject,
+                message.body,
+                dumps(message.payload),
+                message.status.value,
+                message.created_at,
+                message.updated_at,
+                message.acked_at,
+            ),
+        )
+
+    def update_process_message(self, message: ProcessMessage) -> None:
+        self._execute(
+            """
+            UPDATE process_messages
+               SET sender = ?, recipient_pid = ?, kind = ?, subject = ?, body = ?,
+                   channel = ?, correlation_id = ?, reply_to = ?, payload_json = ?,
+                   status = ?, created_at = ?, updated_at = ?, acked_at = ?
+             WHERE message_id = ?
+            """,
+            (
+                message.sender,
+                message.recipient_pid,
+                message.kind.value,
+                message.subject,
+                message.body,
+                message.channel,
+                message.correlation_id,
+                message.reply_to,
+                dumps(message.payload),
+                message.status.value,
+                message.created_at,
+                message.updated_at,
+                message.acked_at,
+                message.message_id,
+            ),
+        )
+
+    def get_process_message(self, message_id: str) -> ProcessMessage | None:
+        rows = self._query("SELECT * FROM process_messages WHERE message_id = ?", (message_id,))
+        return self._row_to_process_message(rows[0]) if rows else None
+
+    def list_process_messages(
+        self,
+        recipient_pid: str | None = None,
+        *,
+        status: ProcessMessageStatus | str | None = None,
+        kind: ProcessMessageKind | str | None = None,
+        sender: str | None = None,
+        channel: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        message_ids: list[str] | None = None,
+    ) -> list[ProcessMessage]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if message_ids is not None and not message_ids:
+            return []
+        if recipient_pid is not None:
+            clauses.append("recipient_pid = ?")
+            params.append(recipient_pid)
+        if status is not None:
+            selected_status = ProcessMessageStatus(status)
+            clauses.append("status = ?")
+            params.append(selected_status.value)
+        if kind is not None:
+            selected_kind = ProcessMessageKind(kind)
+            clauses.append("kind = ?")
+            params.append(selected_kind.value)
+        if sender is not None:
+            clauses.append("sender = ?")
+            params.append(sender)
+        if channel is not None:
+            clauses.append("channel = ?")
+            params.append(channel)
+        if correlation_id is not None:
+            clauses.append("correlation_id = ?")
+            params.append(correlation_id)
+        if reply_to is not None:
+            clauses.append("reply_to = ?")
+            params.append(reply_to)
+        if message_ids is not None:
+            placeholders = ", ".join("?" for _ in message_ids)
+            clauses.append(f"message_id IN ({placeholders})")
+            params.extend(message_ids)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._query(f"SELECT * FROM process_messages{where} ORDER BY created_at, message_id", params)
+        return [self._row_to_process_message(row) for row in rows]
+
     def insert_tool(self, handle: ToolHandle, spec: ToolSpec, registered_by: str, created_at: str, ephemeral: bool) -> None:
         self._execute(
             "INSERT INTO tools VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -697,12 +909,66 @@ class SQLiteStore:
                     )
             self._ensure_object_namespace_schema()
             self._ensure_process_schema()
+            self._ensure_llm_call_schema()
+            self._ensure_process_message_schema()
             self.conn.commit()
 
     def _ensure_process_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(processes)")}
         if "working_directory" not in columns:
             self.conn.execute("ALTER TABLE processes ADD COLUMN working_directory TEXT NOT NULL DEFAULT '.'")
+
+    def _ensure_llm_call_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_calls (
+              call_id TEXT PRIMARY KEY,
+              pid TEXT,
+              image_id TEXT,
+              purpose TEXT NOT NULL,
+              status TEXT NOT NULL,
+              api TEXT,
+              model TEXT,
+              request_id TEXT,
+              response_id TEXT,
+              messages_json TEXT NOT NULL,
+              tools_json TEXT NOT NULL,
+              request_options_json TEXT NOT NULL,
+              response_content TEXT NOT NULL,
+              tool_calls_json TEXT NOT NULL,
+              reasoning_json TEXT,
+              usage_json TEXT NOT NULL,
+              raw_response_json TEXT,
+              error TEXT,
+              created_at TEXT NOT NULL,
+              completed_at TEXT
+            )
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_pid_created ON llm_calls(pid, created_at)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_request_id ON llm_calls(request_id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_response_id ON llm_calls(response_id)")
+
+    def _ensure_process_message_schema(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(process_messages)")}
+        if "channel" not in columns:
+            self.conn.execute("ALTER TABLE process_messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'default'")
+        if "correlation_id" not in columns:
+            self.conn.execute("ALTER TABLE process_messages ADD COLUMN correlation_id TEXT")
+        if "reply_to" not in columns:
+            self.conn.execute("ALTER TABLE process_messages ADD COLUMN reply_to TEXT")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_status_kind
+              ON process_messages(recipient_pid, status, kind, channel, created_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_process_messages_correlation
+              ON process_messages(recipient_pid, correlation_id, status, created_at)
+            """
+        )
 
     def _ensure_object_namespace_schema(self) -> None:
         self.conn.execute(
@@ -808,6 +1074,15 @@ class SQLiteStore:
         if table != "objects":
             if table == "processes":
                 return [dict(row, working_directory=row.get("working_directory") or ".") for row in rows]
+            if table == "process_messages":
+                normalized_messages: list[dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    item.setdefault("channel", "default")
+                    item.setdefault("correlation_id", None)
+                    item.setdefault("reply_to", None)
+                    normalized_messages.append(item)
+                return normalized_messages
             return rows
         normalized: list[dict[str, Any]] = []
         for row in rows:
@@ -958,6 +1233,48 @@ class SQLiteStore:
             blocking=bool(row["blocking"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def _row_to_llm_call(self, row: sqlite3.Row) -> LLMCallRecord:
+        return LLMCallRecord(
+            call_id=row["call_id"],
+            pid=row["pid"],
+            image_id=row["image_id"],
+            purpose=row["purpose"],
+            status=row["status"],
+            api=row["api"],
+            model=row["model"],
+            request_id=row["request_id"],
+            response_id=row["response_id"],
+            messages=loads(row["messages_json"], []),
+            tools=loads(row["tools_json"], []),
+            request_options=loads(row["request_options_json"], {}),
+            response_content=row["response_content"],
+            tool_calls=loads(row["tool_calls_json"], []),
+            reasoning=loads(row["reasoning_json"]) if row["reasoning_json"] else None,
+            usage=loads(row["usage_json"], {}),
+            raw_response=loads(row["raw_response_json"]) if row["raw_response_json"] else None,
+            error=row["error"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def _row_to_process_message(self, row: sqlite3.Row) -> ProcessMessage:
+        return ProcessMessage(
+            message_id=row["message_id"],
+            sender=row["sender"],
+            recipient_pid=row["recipient_pid"],
+            kind=ProcessMessageKind(row["kind"]),
+            channel=row["channel"] if "channel" in row.keys() else "default",
+            correlation_id=row["correlation_id"] if "correlation_id" in row.keys() else None,
+            reply_to=row["reply_to"] if "reply_to" in row.keys() else None,
+            subject=row["subject"],
+            body=row["body"],
+            payload=loads(row["payload_json"], {}),
+            status=ProcessMessageStatus(row["status"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            acked_at=row["acked_at"],
         )
 
     def _row_to_tool_candidate(self, row: sqlite3.Row) -> ToolCandidate:

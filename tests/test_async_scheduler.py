@@ -31,7 +31,7 @@ class AsyncSchedulerTests(unittest.TestCase):
     def test_async_runtime_drains_human_queue_and_resumes_pending_permission_action(self) -> None:
         runtime = Runtime.open("local")
         try:
-            runtime.human.output_sink = lambda _message: None
+            runtime.substrate.human.output_sink = lambda _message: None
             path = f"agent_outputs/async_permission_{uuid4().hex}.txt"
             resource = runtime.filesystem.resource_for(path)
             runtime.llm.client = PlannedActionClient(

@@ -14,7 +14,7 @@ class HumanQuestionToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = Runtime.open("local")
         self.human_output: list[str] = []
-        self.runtime.human.output_sink = self.human_output.append
+        self.runtime.substrate.human.output_sink = self.human_output.append
 
     def tearDown(self) -> None:
         self.runtime.close()
@@ -32,9 +32,8 @@ class HumanQuestionToolTests(unittest.TestCase):
             )
 
         pending = self.runtime.human.pending()[0]
-        processed = self.runtime.human.drain_terminal_queue(
-            input_fn=lambda prompt: prompts.append(prompt) or "blue",
-        )
+        self.runtime.substrate.human.input_reader = lambda prompt: prompts.append(prompt) or "blue"
+        processed = self.runtime.human.drain_terminal_queue()
         result = self.runtime.tools.call(
             pid,
             "ask_human",

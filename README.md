@@ -15,13 +15,14 @@ This project is still in active development.
 - Child process tools can fork workers, spawn fresh children, wait/join, list direct children, signal direct children, and merge child memory.
 - Each process gets its own default Object Memory namespace at spawn/fork time. Bare Object Memory names resolve inside that process namespace.
 - Each process has its own workspace-relative working directory. Relative filesystem paths and shell subprocess cwd resolve from that process cwd; the runtime host process does not `chdir` into launched workspaces.
+- Each process has a durable message queue for IPC. Messages carry `kind`, `channel`, `correlation_id`, `reply_to`, subject/body, and structured payload; receivers can read, acknowledge, or block on selective filters.
 - Human queue integration is part of the runtime supervisor by default. If a primitive blocks on human approval, the process enters `WAITING_HUMAN`; the runtime processes human terminal messages, wakes the process, and resumes the pending action.
 - Child waits are also resumable: `wait_child_process` puts the parent in `WAITING_EVENT`, child exit wakes the parent, and the original wait action resumes without asking the model for a new action.
 - Single-step APIs remain available for tests and debugging: `run_next_process_once()` / `arun_next_process_once()` do not drain the human queue.
 - Agent images configure process-visible tool tables at process creation time.
-- Event bus and audit trace cover process, object memory, capabilities, tools, human requests, checkpoints, and external primitive access.
-- SQLite stores process/object metadata, events, audit records, capabilities, human requests, tools, candidates, and checkpoints.
-- External primitives use an injectable Resource Provider Substrate. The default substrate is local host OS backed, but filesystem, clock/sleep, and shell providers can be replaced without changing tool schemas or capability checks.
+- Event bus and audit trace cover process, process messages, object memory, capabilities, tools, human requests, checkpoints, and primitive access.
+- SQLite stores process/object metadata, process messages, full LLM call records, events, audit records, capabilities, human requests, tools, candidates, and checkpoints.
+- LibOS primitives use an injectable Resource Provider Substrate. The default substrate is local host OS backed, but filesystem, clock/sleep, shell, and human terminal I/O providers can be replaced without changing tool schemas or capability checks.
 
 ### Object Memory
 
@@ -62,10 +63,13 @@ Built-in tools currently include:
 - `propose_jit_tool`
 - `read_directory`
 - `read_memory_object`
+- `read_process_messages`
+- `receive_process_messages`
 - `read_text_file`
 - `register_jit_tool`
 - `request_permission`
 - `run_shell_command`
+- `send_process_message`
 - `set_working_directory`
 - `signal_child_process`
 - `sleep`
@@ -84,7 +88,7 @@ Important boundary rules:
 - Bare Object Memory names resolve in the caller's process namespace; shared memory requires an explicit namespace plus namespace/object capabilities.
 - Relative filesystem paths and shell commands resolve from the caller's process working directory, which is independent for each `AgentProcess`.
 - Filesystem read/write/delete checks happen in the filesystem primitive.
-- Human output and human approval checks happen in the HumanObject primitive.
+- Human output, human questions, and human approval checks happen in the HumanObject primitive; concrete terminal reads/writes happen only through the substrate `HumanProvider`.
 - Shell execution checks happen in the shell primitive. The model-facing tool accepts argv arrays only; it never accepts shell command strings for implicit parsing.
 - Image registration checks happen in the image registry primitive. `load_image_from_yaml` only reads a workspace YAML file and passes the parsed manifest to that primitive.
 - `ask_human` creates a blocking HumanObject question and returns the answer only after the human queue responds.
@@ -197,6 +201,26 @@ uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite human
+```
+
+Every LLM action-selection call is persisted in SQLite as an `llm_calls` row. The record includes the exact prompt messages, visible tool schemas, output content, tool calls, provider ids, model/api, token usage when the provider returns it, reasoning fields when exposed by the provider, raw response JSON, and errors. Inspect them with:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
+```
+
+Humans can also inject process messages at any time. This works while another `agent-libos run` is using the same SQLite runtime database:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite message <pid> "Please inspect the latest result"
+uv run agent-libos --db .agent_libos.sqlite interrupt <pid> "Stop current work and read this first"
+uv run agent-libos --db .agent_libos.sqlite message <pid> "Use this as job input" --channel human --correlation-id job-42 --run
+```
+
+For a Codex CLI-style loop in one terminal, use interactive run. Plain text sends a normal message unless a human question or approval is pending, in which case it answers that request; use `/message <text>` to force a normal process message. `/interrupt <text>` sends an interrupt; `/pid <pid>` switches the target; `/exit` exits the interactive loop.
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite run --interactive --pid <pid> --max-quanta 20
 ```
 
 The CLI also exposes process built-ins for manual lifecycle control:
@@ -318,7 +342,7 @@ Agent Personality / Application
      - ObjectMemoryManager
      - ToolBroker
      - HumanObjectManager
-     - ExternalObjectAdapters
+     - Primitive managers
      - CapabilityManager
      - EventBus
      - CheckpointManager
@@ -327,10 +351,12 @@ Agent Personality / Application
      - filesystem provider
      - clock/sleep provider
      - shell provider
+     - human provider
   -> Host Runtime / Provider Backend
      - local workspace filesystem
      - host clock
      - subprocess backend
+     - terminal or UI human I/O backend
      - future remote, container, WASM, or service-backed providers
 ```
 
@@ -338,7 +364,7 @@ The key design boundary is between model-facing tools and libOS primitives. For 
 
 Putting a tool in a process table does not grant access to files, humans, shell, network, secrets, or other host resources.
 
-External primitives are not themselves the host implementation. They own libOS semantics: capability checks, human approval, event emission, and audit records. Concrete host calls live behind `agent_libos.substrate` providers such as `LocalFilesystemProvider`, `LocalClockProvider`, and `LocalShellProvider`. Shell calls are intentionally argv-only at this boundary, so quoting, pipes, redirects, and command chaining must be requested explicitly through an interpreter executable, where policy matching can see the interpreter token.
+Primitives are not themselves the host implementation. They own libOS semantics: capability checks, human approval, event emission, and audit records. Concrete host calls live behind `agent_libos.substrate` providers such as `LocalFilesystemProvider`, `LocalClockProvider`, `LocalShellProvider`, and `LocalHumanProvider`. Shell calls are intentionally argv-only at this boundary, so quoting, pipes, redirects, and command chaining must be requested explicitly through an interpreter executable, where policy matching can see the interpreter token. HumanObject similarly owns request queues, approvals, wakeups, and audit records, while the substrate `HumanProvider` owns terminal or UI read/write.
 
 ## Runtime Execution Model
 
@@ -348,11 +374,14 @@ High-level execution:
 results = await runtime.arun_until_idle(max_quanta=10)
 ```
 
-By default this does three things:
+By default this does four things:
 
 1. Runs all runnable processes asynchronously.
 2. Processes pending human terminal messages when processes are waiting on human input.
-3. Wakes resumed processes and continues until no runnable or human-resumable work remains, or the quantum budget is exhausted.
+3. Delivers process-message notices at the appropriate tool boundary.
+4. Wakes resumed processes and continues until no runnable or human-resumable work remains, or the quantum budget is exhausted.
+
+Process messages are explicit queue entries, not raw prompt text. A process can send messages to itself, its parent, or direct children with `send_process_message`. The receiver uses `read_process_messages` for non-blocking inspection or `receive_process_messages` to wait in `WAITING_EVENT` until a matching unread message arrives. Both read paths can filter by kind, sender, channel, correlation id, reply target, or exact message ids, and returned unread messages are acknowledged by default. Interrupt messages are checked before tool execution and preempt non-message tools until read; normal messages are noticed after a tool call and do not block the current tool.
 
 For debugging a pending approval state, opt out explicitly:
 
@@ -433,16 +462,16 @@ agent_libos/
   api/             CLI entry points and demo orchestration
   capability/      Capability grant, revoke, check, and object handles
   config/          Typed runtime, LLM, tool, memory, launcher, and script defaults
-  external/        External-object primitives such as filesystem, clock, and shell
   human/           HumanObject query, approval, interrupt, and output primitives
   images/          Built-in AgentImage definitions
   llm/             Prompt, context, OpenAI-compatible client, executor, action parser
   memory/          Typed Object Memory and MemoryView implementation
   models/          Dataclass and enum models split by runtime domain
+  primitives/      LibOS primitive managers for filesystem, clock, shell, git, and browser placeholders
   runtime/         Runtime composition, syscall broker, async scheduler, process manager, events, checkpoints, audit
   skills/          Skill schema, registry, verifier, linker scaffolding
   skills_tools/    Tool/action registry and bundle scaffolding
-  substrate/        Resource provider interfaces and the default local host-backed implementation
+  substrate/        Resource provider interfaces for filesystem, clock, shell, human I/O, and local host-backed implementations
   storage/         SQLite persistence
   tools/           Tool base classes, ToolBroker, sandbox, and built-in tools
 scripts/           Real-model smoke and demo scripts
