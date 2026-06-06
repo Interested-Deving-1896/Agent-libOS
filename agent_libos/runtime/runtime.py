@@ -82,7 +82,13 @@ _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 
 
 class Runtime:
-    """Composition root for the MVP libOS runtime."""
+    """Composition root for Agent libOS.
+
+    Runtime wires storage, capability checks, primitives, providers, process
+    scheduling, ToolBroker, Skills, checkpoints, audit, and LLM execution. Host
+    effects should enter through primitives and provider interfaces, not through
+    model-facing tools.
+    """
 
     def __init__(
         self,

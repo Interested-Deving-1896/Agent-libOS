@@ -38,10 +38,12 @@ measurably safer under adversarial workloads.
    Skill manifests, and Deno/TypeScript JIT tools that can reach libOS only
    through syscall RPC.
 
-3. Benchmark suite. The planned evaluation uses adversarial coding-agent and
-   runtime-safety tasks with declared allowed and forbidden side effects. The
-   benchmark is designed to test whether the runtime blocks unauthorized effects
-   while preserving task success and keeping approval burden measurable.
+3. Benchmark suite. The current prototype includes an M1 deterministic
+   runtime-safety harness with adversarial tasks, wrapper baselines, ablations,
+   declared allowed/forbidden side effects, a side-effect oracle, and stable
+   metrics output. It is designed to test whether the runtime blocks
+   unauthorized effects while preserving task success and keeping approval
+   burden measurable.
 
 4. Evaluation. The paper should compare PAR against direct tool wrappers,
    confirmation-prompt wrappers, and host-isolation-only baselines. Metrics
@@ -69,6 +71,8 @@ measurably safer under adversarial workloads.
 
 The strongest submission story is a systems story: primitive-level authority
 boundaries make long-running LLM agents safer and more explainable at acceptable
-cost. M0 freezes the story and repository hygiene. M1 through M4 should focus on
-benchmark tasks, baselines, audit explain, context materialization, and
-quantitative results rather than broad ecosystem compatibility.
+cost. M0 freezes the story and repository hygiene. M1 establishes the initial
+benchmark harness and deterministic workloads. The next milestones should focus
+on richer audit explain, context materialization, MCP/Git provider workloads,
+durable replay evaluation, and quantitative results rather than broad ecosystem
+compatibility.

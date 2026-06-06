@@ -73,6 +73,6 @@ and paper claims aligned.
 ## Known Test Gaps
 
 - Audit explain is not implemented yet; current tests check audit record emission and selected audit counts, not query/explanation completeness.
-- Benchmark side-effect oracles are not implemented yet; current tests are regression tests, not paper evaluation workloads.
+- The M1 runtime-safety benchmark harness, 20 deterministic tasks, side-effect oracle, baselines, ablations, and metrics collection are implemented. It is still an early deterministic workload, not a complete paper evaluation suite.
 - Context materialization metadata is not yet complete enough to compute included/omitted/summarized/truncated object statistics for every LLM call.
 - Real MCP, Git worktree, and mock PR providers are planned but not implemented.

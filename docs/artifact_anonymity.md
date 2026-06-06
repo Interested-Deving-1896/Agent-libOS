@@ -45,7 +45,7 @@ These commands are the M0 baseline checks for the code artifact:
 
 ```bash
 uv sync --frozen
-uv run python -m compileall agent_libos tests scripts
+uv run python -m compileall agent_libos tests scripts experiments benchmarks
 uv run python -m unittest discover -s tests -v
 ```
 
@@ -61,10 +61,15 @@ real Deno installation should skip with a clear message when `deno` is missing.
 
 ## Documentation Consistency
 
-- README is the current implementation guide.
+- README is the current project entrypoint and documentation index.
 - `agent_libos_design_doc.md` is a historical design archive.
 - `docs/invariants.md` is the invariant-to-test map.
-- `benchmarks/runtime_safety/schema.md` defines benchmark task shape for M1.
+- `docs/architecture.md`, `docs/runtime_model.md`, `docs/capabilities.md`,
+  `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
+  `docs/checkpoints.md`, `docs/cli.md`, `docs/development.md`, and
+  `docs/benchmark.md` are the current implementation guides.
+- `benchmarks/runtime_safety/schema.md` defines benchmark task shape for the M1
+  runtime-safety harness.
 - Documentation must not describe Python JIT, direct external framework
   adapters, real GitHub/MCP providers, or unsupported rollback semantics as
   current behavior.
@@ -77,5 +82,6 @@ M0 is complete when:
 - the CI workflow runs compile and unit tests on supported Python versions,
 - every core invariant has test coverage or an explicit gap,
 - benchmark task schema v0 exists,
+- benchmark harness documentation exists,
 - a one-page paper thesis exists,
 - this anonymity checklist exists and is linked from README.

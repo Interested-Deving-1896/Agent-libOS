@@ -1,0 +1,163 @@
+# Development Guide
+
+This guide covers local setup, regression checks, optional real LLM paths, and
+documentation rules for Agent libOS contributors.
+
+## Setup
+
+Install dependencies:
+
+```bash
+uv sync
+```
+
+Use frozen dependency resolution for artifact and CI-style checks:
+
+```bash
+uv sync --frozen
+```
+
+Deno is optional for the default Python test suite. Install `deno` or configure
+`agent_libos.config.DEFAULT_CONFIG.tools.deno_executable` to validate and run
+real Deno/TypeScript JIT tools.
+
+## Standard Checks
+
+Run:
+
+```bash
+uv run python -m compileall agent_libos tests scripts experiments benchmarks
+uv run python -m unittest discover -s tests -v
+git diff --check
+```
+
+Useful smoke commands:
+
+```bash
+uv run agent-libos --help
+uv run agent-libos checkpoint --help
+uv run agent-libos skills --help
+uv run python experiments/run_benchmark.py --help
+uv run python experiments/collect_metrics.py --help
+```
+
+Benchmark smoke:
+
+```bash
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/docs-smoke
+uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
+```
+
+`.benchmark_runs/` is ignored and should not be committed.
+
+## Real LLM Smoke
+
+Real LLM paths are opt-in because tokens are valuable.
+
+Configure `.env`:
+
+```bash
+OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
+OPENAI_LANGUAGE_MODEL=your-model
+OPENAI_API_KEY=...
+```
+
+Useful optional variables:
+
+- `OPENAI_API_MODE=responses|chat|auto`
+- `OPENAI_TIMEOUT`
+- `OPENAI_MAX_RETRIES`
+- `OPENAI_STORE`
+- `OPENAI_REASONING_EFFORT`
+- `OPENAI_VERBOSITY`
+- provider-specific `OPENAI_ENABLE_THINKING`
+
+Run a script smoke:
+
+```bash
+uv run python scripts/llm_write_goal_smoke.py
+```
+
+Run a benchmark smoke only with an explicit one-task limit:
+
+```bash
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --llm real --limit 1 --output .benchmark_runs/real-smoke
+```
+
+Every runtime LLM action-selection call must persist an `llm_calls` row with
+prompt, visible tools, output, tool calls, usage, reasoning metadata when
+available, raw response, and errors.
+
+## Configuration Defaults
+
+Non-secret runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`.
+
+Current default groups include:
+
+- runtime database and default ids,
+- scheduler quanta and poll interval,
+- process budgets and default cwd,
+- LLM timeouts and provider compatibility knobs,
+- tool limits and text encodings,
+- filesystem and Object Memory size limits,
+- Deno sandbox limits and JSR import allowlist,
+- shell policy allow/block lists,
+- image registry limits,
+- Object Memory and LLM context defaults,
+- checkpoint snapshot limits,
+- Skill source, trust, and manifest limits,
+- launcher presets,
+- script defaults.
+
+Do not scatter magic numbers in implementation code when a value affects
+runtime behavior, policy, persistence, or test reproducibility. Add a typed
+config default instead.
+
+## Documentation Rules
+
+README is the entrypoint. Detailed implementation documentation belongs in
+`docs/`.
+
+When behavior changes, update the relevant doc and `docs/invariants.md` in the
+same change. Do not describe future work as current behavior.
+
+Current behavior must not claim:
+
+- Python JIT compatibility,
+- direct external framework adapters as trusted boundaries,
+- real MCP/GitHub/provider integrations that are not implemented,
+- checkpoint rollback of external side effects,
+- Skill loading as a capability grant.
+
+`agent_libos_design_doc.md` remains a historical archive and can be stale.
+
+## Adding Runtime Code
+
+Preserve the boundary:
+
+- model-facing tools call primitives;
+- primitives perform capability checks, policy, approval, events, and audit;
+- providers perform host effects only after primitive authorization;
+- JIT tools access libOS only through syscalls;
+- Skills change visibility and prompt materialization only;
+- checkpoint restore is scoped and append-only outside reconstructable state.
+
+Prefer existing managers and primitives over new side channels. If a new host
+effect is needed, add or extend a primitive and provider interface rather than
+calling the host directly from a tool.
+
+## Dependencies
+
+Add runtime dependencies with:
+
+```bash
+uv add <package>
+```
+
+Add development dependencies with:
+
+```bash
+uv add --dev <package>
+```
+
+Commit both `pyproject.toml` and `uv.lock` after dependency changes.

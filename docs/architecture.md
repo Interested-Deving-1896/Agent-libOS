@@ -1,0 +1,156 @@
+# Architecture
+
+Agent libOS is structured around one boundary: model-visible actions are not
+resource authority. A process may see a tool schema, but protected effects are
+authorized only when a primitive runs under that process id.
+
+## Layer Model
+
+```text
+Agent personality / application
+  -> Skills and tools layer
+     - model-facing actions
+     - prompt instructions
+     - tool schemas
+     - Deno/TypeScript JIT candidates
+  -> Agent libOS runtime
+     - scheduler
+     - process manager
+     - Object Memory manager
+     - ToolBroker
+     - Skill manager
+     - HumanObject manager
+     - primitive managers
+     - capability manager
+     - event bus
+     - checkpoint manager
+     - audit manager
+  -> Resource Provider Substrate
+     - filesystem provider
+     - clock provider
+     - shell provider
+     - human provider
+  -> host backend
+     - local workspace filesystem
+     - host clock
+     - subprocess backend
+     - terminal or UI human I/O
+     - future remote, container, WASM, or service providers
+```
+
+The Skills and tools layer exists for LLM ergonomics. It presents stable action
+names, schemas, summaries, and workflow instructions. It does not own external
+authority.
+
+The runtime owns agent-level semantics: process identity, capability checks,
+approval, event emission, audit, process wakeups, checkpointing, and durable
+metadata.
+
+The Resource Provider Substrate owns concrete host calls. A provider is a
+backend, not a security bypass. Replacing the filesystem or shell provider must
+not change tool schemas or skip primitive authorization.
+
+## Composition Root
+
+`agent_libos.runtime.runtime.Runtime` wires the runtime together:
+
+- `SQLiteStore` persists metadata and append-only records.
+- `CapabilityManager` grants, checks, revokes, and consumes one-shot authority.
+- `ObjectMemoryManager` provides typed memory and namespace resolution.
+- `HumanObjectManager` owns questions, approvals, terminal queue processing,
+  and human output.
+- `FilesystemAdapter`, `ShellAdapter`, and `ClockPrimitive` expose protected
+  primitive operations over provider backends.
+- `ToolBroker` registers static tools and process-local JIT tools.
+- `SkillManager` registers trusted Skill specs and loads them into process tool
+  tables.
+- `ProcessManager` owns lifecycle, working directories, child relationships,
+  and image transitions.
+- `SimpleScheduler` runs runnable processes and wakes waiting work.
+- `CheckpointManager` snapshots and restores reconstructable process-subtree
+  state.
+- `LLMProcessExecutor` materializes prompt context, calls the LLM client, and
+  dispatches selected tool calls.
+
+The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
+workspace unless another substrate is injected.
+
+## Tool Boundary
+
+LLM-facing tools are stable wrappers over primitives. For example,
+`write_text_file` can be visible in a process tool table, but the actual write
+still enters the filesystem primitive, which checks:
+
+- workspace containment,
+- process working directory resolution,
+- filesystem capability or permission policy,
+- human approval if policy requires it,
+- overwrite and content preview metadata,
+- event emission,
+- audit recording.
+
+Putting a tool in a process table never grants access to files, shell,
+terminal/human I/O, Object Memory, image registration, checkpoints, or other
+resources.
+
+## Primitive Boundary
+
+Primitives are the runtime boundary. They are responsible for:
+
+- authorizing the caller pid against capabilities and policy,
+- blocking on human approval when needed,
+- validating inputs before side effects,
+- constraining provider paths, argv, sizes, and timeouts,
+- emitting events,
+- writing audit records,
+- preserving process wake/resume semantics.
+
+JIT syscalls enter the same primitive boundary through
+`LibOSSyscallSession`. They do not consult the caller's LLM-facing tool table.
+
+## Persistence And Audit
+
+SQLite stores durable runtime metadata and append-only records:
+
+- processes, working directories, loaded Skills, and tool tables,
+- Object Memory metadata and namespace directories,
+- capabilities and object handles,
+- process messages and human requests,
+- tools and JIT candidates,
+- Skill registry and trust rows,
+- image registry metadata,
+- checkpoints and checkpoint payload snapshots,
+- events and audit records,
+- LLM call records with prompt, visible tools, output, tool calls, usage,
+  reasoning metadata, raw response, and errors.
+
+Object payloads are not ordinary durable object rows. They live in runtime
+memory. Checkpoint payloads are the explicit durable snapshot exception.
+
+Audit and events are append-only. Checkpoint restore must not delete them.
+
+## Module Map
+
+```text
+agent_libos/
+  api/             CLI entry points and demo orchestration
+  capability/      capability grant, revoke, check, and object handles
+  config/          typed runtime, LLM, tool, memory, launcher, and script defaults
+  human/           HumanObject query, approval, interrupt, and output primitives
+  images/          built-in AgentImage definitions
+  llm/             prompt, context, OpenAI-compatible client, executor, action parser
+  memory/          typed Object Memory and MemoryView implementation
+  models/          dataclass and enum models split by runtime domain
+  primitives/      libOS primitives for filesystem, clock, shell, git, and placeholders
+  runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
+  skills/          Skill schema, strict loader, trust registry, and SkillManager
+  substrate/       provider interfaces and local host-backed implementations
+  storage/         SQLite persistence
+  tools/           tool base classes, ToolBroker, sandbox, and built-in tools
+benchmarks/        deterministic runtime-safety benchmark harness and fixtures
+docs/              current implementation documentation
+experiments/       benchmark entrypoints
+scripts/           real-model smoke and demo scripts
+skills/            workspace Skill manifests
+tests/             safety-boundary and regression tests
+```

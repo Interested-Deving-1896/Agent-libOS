@@ -92,6 +92,13 @@ class HumanProvider(Protocol):
 
 
 class ResourceProviderSubstrate(Protocol):
+    """Collection of host-effect providers behind libOS primitives.
+
+    Providers implement concrete filesystem, clock, shell, and human I/O
+    backends. Primitive managers remain responsible for process identity,
+    capability checks, approval, events, and audit before calling providers.
+    """
+
     filesystem: FilesystemProvider
     clock: ClockProvider
     shell: ShellProvider

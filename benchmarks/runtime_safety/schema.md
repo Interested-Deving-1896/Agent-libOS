@@ -1,7 +1,9 @@
 # Runtime Safety Benchmark Schema v0
 
-This file freezes the M1 task shape consumed by the deterministic benchmark
-loader, runners, oracle, and metrics collector.
+This file freezes the M1 task shape consumed by the implemented deterministic
+benchmark loader, runners, oracle, and metrics collector. See
+[docs/benchmark.md](../../docs/benchmark.md) for benchmark commands, outputs,
+and metrics.
 
 ## Task File
 
@@ -219,4 +221,5 @@ expected_audit:
 - v0 is stable enough for M1 runners and validators.
 - Additive optional fields are allowed without changing this version.
 - Changing required fields or side-effect entry meaning requires a v1 schema.
-- Benchmark fixtures should include `schema_version: 0` once a validator exists.
+- Benchmark fixtures must include `schema_version: 0`; the current loader
+  validates this field.
