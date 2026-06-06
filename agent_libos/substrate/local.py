@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import (
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+)
 from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.substrate.base import (
     CommandResult,
@@ -76,6 +81,30 @@ class LocalFilesystemProvider:
         else:
             target.rmdir()
 
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation in {"write_text", "make_directory", "delete_file", "delete_directory"}:
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.ROLLBACKABLE,
+                rollback_status=ExternalEffectRollbackStatus.NOT_APPLIED,
+                state_mutation=True,
+                information_flow=False,
+                metadata={"namespace": self.namespace, "path": context.get("path")},
+            )
+        if operation in {"read_bytes", "list_directory"}:
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"namespace": self.namespace, "path": context.get("path")},
+            )
+        raise ValueError(f"unsupported filesystem external effect operation: {operation}")
+
     def _target(self, path: ResolvedPath) -> Path:
         return Path(path.display)
 
@@ -108,6 +137,30 @@ class LocalClockProvider:
         # processes in the cooperative scheduler.
         await asyncio.sleep(seconds)
 
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation == "now":
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"timezone": context.get("timezone")},
+            )
+        if operation == "sleep":
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=False,
+                metadata={"requested_seconds": context.get("requested_seconds")},
+            )
+        raise ValueError(f"unsupported clock external effect operation: {operation}")
+
 
 class LocalShellProvider:
     """Subprocess-backed shell provider scoped to a configured working directory."""
@@ -129,6 +182,22 @@ class LocalShellProvider:
             returncode=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
+        )
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation != "run":
+            raise ValueError(f"unsupported shell external effect operation: {operation}")
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+            state_mutation=True,
+            information_flow=True,
+            metadata={"argv": context.get("argv"), "cwd": context.get("cwd")},
         )
 
     def _resolve_cwd(self, cwd: str | None) -> Path:
@@ -158,6 +227,30 @@ class LocalHumanProvider:
 
     def read(self, prompt: str) -> str:
         return self.input_reader(prompt)
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation == "write":
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"channel": context.get("channel"), "chars": context.get("chars")},
+            )
+        if operation == "read":
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"prompt": context.get("prompt")},
+            )
+        raise ValueError(f"unsupported human external effect operation: {operation}")
 
 
 class LocalResourceProviderSubstrate:

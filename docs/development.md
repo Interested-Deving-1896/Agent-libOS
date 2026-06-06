@@ -126,7 +126,7 @@ Current behavior must not claim:
 - Python JIT compatibility,
 - direct external framework adapters as trusted boundaries,
 - real MCP/GitHub/provider integrations that are not implemented,
-- checkpoint rollback of external side effects,
+- provider-level compensation for rollbackable external side effects,
 - Skill loading as a capability grant.
 
 `agent_libos_design_doc.md` remains a historical archive and can be stale.
@@ -136,11 +136,12 @@ Current behavior must not claim:
 Preserve the boundary:
 
 - model-facing tools call primitives;
-- primitives perform capability checks, policy, approval, events, and audit;
+- primitives perform Capability v2 authorization, policy, approval, events, and audit;
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
 - Skills change visibility and prompt materialization only;
-- checkpoint restore is scoped and append-only outside reconstructable state.
+- checkpoint restore is scoped and append-only outside reconstructable state;
+  provider-classified external effects are report-only in v1.
 
 Prefer existing managers and primitives over new side channels. If a new host
 effect is needed, add or extend a primitive and provider interface rather than

@@ -9,10 +9,15 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellPolicyLevel
-from agent_libos.models import Capability, CapabilityRight, EventType
+from agent_libos.models import Capability, CapabilityEffect, CapabilityRight, EventType
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.external_effects import (
+    classify_external_effect,
+    record_external_effect,
+    require_external_effect_classifier,
+)
 from agent_libos.substrate import CommandResult, LocalShellProvider, ShellProvider
 from agent_libos.utils.ids import utc_now
 
@@ -72,6 +77,15 @@ class ShellAdapter:
             self._request_human_approval(pid, checked, resource, decision, timeout=selected_timeout, cwd=cwd)
         if not decision.allowed:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
+        effect_context = {
+            "argv": list(checked),
+            "resource": resource,
+            "timeout_s": selected_timeout,
+            "cwd": os.fspath(cwd) if cwd is not None else None,
+            "policy_level": decision.policy_level,
+            "high_risk": decision.high_risk,
+        }
+        require_external_effect_classifier(self.provider, "run")
         try:
             if cwd is None:
                 proc = self.provider.run(checked, timeout=selected_timeout)
@@ -94,8 +108,8 @@ class ShellAdapter:
                     right=CapabilityRight.EXECUTE,
                     used_by="shell",
                 )
-        self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd)
-        self.audit.record(
+        event = self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd)
+        audit_record = self.audit.record(
             actor=pid,
             action="primitive.shell.run",
             target=resource,
@@ -110,6 +124,23 @@ class ShellAdapter:
                 "stdout_truncated": proc.stdout_truncated,
                 "stderr_truncated": proc.stderr_truncated,
             },
+        )
+        classification = classify_external_effect(
+            self.provider,
+            "run",
+            effect_context,
+            {"returncode": proc.returncode, "stdout_truncated": proc.stdout_truncated, "stderr_truncated": proc.stderr_truncated},
+        )
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="shell",
+            operation="run",
+            target=resource,
+            classification=classification,
+            audit_record=audit_record,
+            event=event,
+            metadata={"context": effect_context, "returncode": proc.returncode},
         )
         return proc
 
@@ -148,6 +179,8 @@ class ShellAdapter:
     def _authorize(self, pid: str, argv: list[str], resource: str, *, timeout: float) -> ShellPolicyDecision:
         policy_caps = self._matching_shell_policy_caps(pid, resource)
         if any(
+            cap.effect == CapabilityEffect.DENY
+            or
             cap.constraints.get(self.config.shell.policy_capability_key) == self.config.shell.always_deny_level
             for cap in policy_caps
         ):
@@ -277,10 +310,10 @@ class ShellAdapter:
         decision: ShellPolicyDecision,
         *,
         cwd: str | os.PathLike[str] | None,
-    ) -> None:
+    ) -> Any:
         if self.events is None:
-            return
-        self.events.emit(
+            return None
+        return self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
             target=resource,
@@ -313,7 +346,15 @@ class ShellAdapter:
         if not caps:
             return CapabilityManager.MISSING, False
         caps.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
+        deny = next((cap for cap in caps if cap.effect == CapabilityEffect.DENY), None)
+        if deny is not None:
+            return CapabilityManager.ALWAYS_DENY, False
+        ask = next((cap for cap in caps if cap.effect == CapabilityEffect.ASK), None)
+        if ask is not None:
+            return CapabilityManager.ASK_EACH_TIME, False
         cap = caps[0]
+        if cap.uses_remaining is not None:
+            return CapabilityManager.ALLOW_ONCE, True
         policy = str(cap.constraints.get(CapabilityManager.POLICY_KEY) or CapabilityManager.ALWAYS_ALLOW)
         return policy, policy == CapabilityManager.ALLOW_ONCE
 
@@ -321,11 +362,11 @@ class ShellAdapter:
         now = utc_now()
         result: list[Capability] = []
         for cap in self.capabilities.capabilities_for(pid):
-            if cap.revoked:
+            if not cap.active:
                 continue
             if cap.expires_at is not None and cap.expires_at <= now:
                 continue
-            if CapabilityRight.EXECUTE.value not in cap.rights and "*" not in cap.rights:
+            if CapabilityRight.EXECUTE.value not in cap.rights:
                 continue
             if not self._resource_matches(cap.resource, resource):
                 continue
@@ -446,8 +487,8 @@ class ShellAdapter:
         return "/" in value or "\\" in value or PurePath(value).is_absolute()
 
     def _resource_matches(self, granted: str, requested: str) -> bool:
-        if granted == "*" or granted == requested:
+        if granted == requested:
             return True
-        if granted.endswith(":*"):
+        if granted == "shell:*":
             return requested.startswith(granted[:-1])
         return False

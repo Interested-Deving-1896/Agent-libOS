@@ -35,8 +35,18 @@ Restore never deletes:
 Restore itself appends new audit and event records.
 
 External filesystem, shell, image, network, and provider effects are not rolled
-back. Restore reports relevant effects in `external_effects_since_checkpoint`
-so later audit explain or compensation logic can reason about them.
+back. Providers classify their own effects as:
+
+- `irreversible`,
+- `rollbackable`,
+- `no_rollback_required`.
+
+Restore reports provider-recorded effects in
+`external_effects_since_checkpoint`, summarizes them in
+`external_effect_summary`, and returns `restore_external_policy:
+"report_only"`. In v1, `rollbackable` means the provider says a future
+compensation layer could reason about the effect; restore still does not apply
+external compensation.
 
 ## Capability Model
 
@@ -108,6 +118,10 @@ by default.
 
 The current tool call's result object can still be appended after restore so
 the process receives a coherent action result.
+
+If irreversible provider effects exist after the checkpoint, restore still
+continues by default. The irreversible effects stay in append-only history and
+in the restore report.
 
 ## Fork From Checkpoint
 

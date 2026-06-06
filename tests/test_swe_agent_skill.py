@@ -17,7 +17,7 @@ class SWEAgentSkillTests(unittest.TestCase):
             manifest = Path("skills/swe_agent.yaml").read_text(encoding="utf-8")
             registered = runtime.register_skill_from_yaml_text(
                 manifest,
-                actor="test",
+                actor="cli",
                 source_type="workspace",
                 source="skills/swe_agent.yaml",
             )

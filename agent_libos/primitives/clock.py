@@ -9,6 +9,11 @@ from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.external_effects import (
+    classify_external_effect,
+    record_external_effect,
+    require_external_effect_classifier,
+)
 from agent_libos.substrate import ClockProvider, LocalClockProvider
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -48,28 +53,43 @@ class ClockPrimitive:
 
     def now(self, pid: str, tz: str = _TOOL_DEFAULTS.clock_timezone) -> ClockNowResult:
         selected_tz = self._timezone(tz)
+        effect_context = {"timezone": tz}
+        require_external_effect_classifier(self.provider, "now")
         current = self.provider.now(selected_tz)
         result = ClockNowResult(
             iso8601=current.isoformat(),
             unix_seconds=current.timestamp(),
             timezone=tz,
         )
-        self.events.emit(
+        event = self.events.emit(
             EventType.EXTERNAL_READ,
             source=pid,
             target="clock:now",
             payload={"adapter": "clock", "operation": "now", "timezone": tz, "iso8601": result.iso8601},
         )
-        self.audit.record(
+        audit_record = self.audit.record(
             actor=pid,
             action="primitive.clock.now",
             target="clock:now",
             decision={"timezone": tz, "iso8601": result.iso8601},
         )
+        classification = classify_external_effect(self.provider, "now", effect_context, result.__dict__)
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="clock",
+            operation="now",
+            target="clock:now",
+            classification=classification,
+            audit_record=audit_record,
+            event=event,
+            metadata={"context": effect_context, "result": result.__dict__},
+        )
         return result
 
     def sleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
+        require_external_effect_classifier(self.provider, "sleep")
         started = self.provider.monotonic()
         self.provider.sleep(duration)
         elapsed = self.provider.monotonic() - started
@@ -77,6 +97,7 @@ class ClockPrimitive:
 
     async def asleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
+        require_external_effect_classifier(self.provider, "sleep")
         started = self.provider.monotonic()
         await self.provider.asleep(duration)
         elapsed = self.provider.monotonic() - started
@@ -92,7 +113,8 @@ class ClockPrimitive:
 
     def _record_sleep(self, pid: str, duration: float, elapsed: float) -> SleepResult:
         result = SleepResult(requested_seconds=duration, elapsed_seconds=elapsed)
-        self.events.emit(
+        effect_context = {"requested_seconds": duration}
+        event = self.events.emit(
             EventType.EXTERNAL_READ,
             source=pid,
             target="clock:sleep",
@@ -103,11 +125,23 @@ class ClockPrimitive:
                 "elapsed_seconds": elapsed,
             },
         )
-        self.audit.record(
+        audit_record = self.audit.record(
             actor=pid,
             action="primitive.clock.sleep",
             target="clock:sleep",
             decision={"requested_seconds": duration, "elapsed_seconds": elapsed},
+        )
+        classification = classify_external_effect(self.provider, "sleep", effect_context, result.__dict__)
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="clock",
+            operation="sleep",
+            target="clock:sleep",
+            classification=classification,
+            audit_record=audit_record,
+            event=event,
+            metadata={"context": effect_context, "result": result.__dict__},
         )
         return result
 

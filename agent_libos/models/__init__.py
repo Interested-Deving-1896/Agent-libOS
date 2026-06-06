@@ -16,9 +16,25 @@ from agent_libos.models.base import (
     StrEnum,
     ToolID,
 )
-from agent_libos.models.capability import Capability, CapabilityRight
+from agent_libos.models.capability import (
+    Capability,
+    CapabilityDecision,
+    CapabilityEffect,
+    CapabilityRight,
+    CapabilitySpec,
+    CapabilityStatus,
+    OperationContext,
+    ResourcePattern,
+    ResourceScope,
+)
 from agent_libos.models.checkpoint import Checkpoint
 from agent_libos.models.events import Event, EventPriority, EventType
+from agent_libos.models.external_effect import (
+    ExternalEffectClassification,
+    ExternalEffectRecord,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+)
 from agent_libos.models.human import HumanRequest, HumanRequestStatus
 from agent_libos.models.llm import LLMCallRecord
 from agent_libos.models.memory import (
@@ -68,14 +84,22 @@ __all__ = [
     "AuditID",
     "AuditRecord",
     "Capability",
+    "CapabilityDecision",
+    "CapabilityEffect",
     "CapabilityID",
     "CapabilityRight",
+    "CapabilitySpec",
+    "CapabilityStatus",
     "Checkpoint",
     "CheckpointID",
     "Event",
     "EventID",
     "EventPriority",
     "EventType",
+    "ExternalEffectClassification",
+    "ExternalEffectRecord",
+    "ExternalEffectRollbackClass",
+    "ExternalEffectRollbackStatus",
     "ForkMode",
     "HumanRequest",
     "HumanRequestID",
@@ -98,6 +122,7 @@ __all__ = [
     "ObjectQuery",
     "ObjectRight",
     "ObjectType",
+    "OperationContext",
     "PID",
     "PolicyDecision",
     "ProcessMessage",
@@ -110,6 +135,8 @@ __all__ = [
     "Provenance",
     "RelationType",
     "ResourceBudget",
+    "ResourcePattern",
+    "ResourceScope",
     "SnapshotID",
     "StrEnum",
     "ToolCallResult",

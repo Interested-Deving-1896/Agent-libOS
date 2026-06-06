@@ -8,7 +8,13 @@ from typing import Any
 
 from agent_libos import Runtime
 from agent_libos.primitives.shell import ShellAdapter
-from agent_libos.models import CapabilityRight
+from agent_libos.models import (
+    CapabilityRight,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+)
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.substrate import (
     CommandResult,
     LocalClockProvider,
@@ -71,6 +77,22 @@ class ResourceProviderSubstrateTests(unittest.TestCase):
 
             self.assertEqual(result.stdout, "ok\n")
             self.assertEqual(provider.calls, [(["git", "status", "--short"], 2.0)])
+        finally:
+            runtime.close()
+
+    def test_effectful_provider_without_classification_fails_closed(self) -> None:
+        runtime = Runtime.open("local")
+        provider = NoClassificationShellProvider()
+        shell = ShellAdapter(runtime.capability, runtime.audit, provider=provider)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="missing effect classifier")
+            runtime.capability.grant(pid, "shell:git", [CapabilityRight.EXECUTE], issued_by="test")
+
+            with self.assertRaises(ValidationError):
+                shell.run(pid, ["git", "status", "--short"], timeout=2.0)
+
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(runtime.store.list_external_effects(), [])
         finally:
             runtime.close()
 
@@ -145,8 +167,35 @@ class FakeClockProvider:
     async def asleep(self, seconds: float) -> None:
         self.sleeps.append(("async", seconds))
 
+    def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+            rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+            state_mutation=False,
+            information_flow=operation == "now",
+            metadata={"operation": operation},
+        )
+
 
 class FakeShellProvider:
+    def __init__(self):
+        self.calls: list[tuple[list[str], float]] = []
+
+    def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
+        self.calls.append((list(argv), timeout))
+        return CommandResult(argv=list(argv), returncode=0, stdout="ok\n", stderr="")
+
+    def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+            state_mutation=True,
+            information_flow=True,
+            metadata={"operation": operation},
+        )
+
+
+class NoClassificationShellProvider:
     def __init__(self):
         self.calls: list[tuple[list[str], float]] = []
 
@@ -167,6 +216,15 @@ class RecordingHumanProvider:
     def read(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.answers.pop(0) if self.answers else ""
+
+    def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+            rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+            state_mutation=False,
+            information_flow=True,
+            metadata={"operation": operation},
+        )
 
 
 if __name__ == "__main__":

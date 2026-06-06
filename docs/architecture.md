@@ -50,6 +50,12 @@ The Resource Provider Substrate owns concrete host calls. A provider is a
 backend, not a security bypass. Replacing the filesystem or shell provider must
 not change tool schemas or skip primitive authorization.
 
+Providers are also the source of truth for external-effect rollback
+classification. Effectful provider calls must return an external-effect
+classification to the primitive; missing classification fails closed instead of
+silently executing. The runtime persists those records for checkpoint reports,
+but v1 does not apply external compensation.
+
 ## Composition Root
 
 `agent_libos.runtime.runtime.Runtime` wires the runtime together:
@@ -120,6 +126,7 @@ SQLite stores durable runtime metadata and append-only records:
 - Skill registry and trust rows,
 - image registry metadata,
 - checkpoints and checkpoint payload snapshots,
+- provider-decided external effect records,
 - events and audit records,
 - LLM call records with prompt, visible tools, output, tool calls, usage,
   reasoning metadata, raw response, and errors.

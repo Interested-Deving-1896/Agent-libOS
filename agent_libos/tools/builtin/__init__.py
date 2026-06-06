@@ -1,4 +1,10 @@
 from agent_libos.tools.builtin.basic import EchoTool, ParsePytestLogTool
+from agent_libos.tools.builtin.capabilities import (
+    DelegateCapabilityTool,
+    InspectCapabilityTool,
+    ListCapabilitiesTool,
+    RevokeCapabilityTool,
+)
 from agent_libos.tools.builtin.clock import GetCurrentTimeTool, SleepTool
 from agent_libos.tools.builtin.checkpoint import (
     CreateCheckpointTool,
@@ -58,6 +64,7 @@ __all__ = [
     "AppendMemoryObjectTool",
     "DeleteDirectoryTool",
     "DeleteFileTool",
+    "DelegateCapabilityTool",
     "DiscoverSkillsTool",
     "EchoTool",
     "ExecProcessTool",
@@ -67,6 +74,7 @@ __all__ = [
     "AskHumanTool",
     "HumanOutputTool",
     "InspectCheckpointTool",
+    "InspectCapabilityTool",
     "InspectSkillTool",
     "LoadImageFromYamlTool",
     "LoadSkillFromYamlTool",
@@ -74,6 +82,7 @@ __all__ = [
     "ForkChildProcessTool",
     "ForkCheckpointTool",
     "ListChildProcessesTool",
+    "ListCapabilitiesTool",
     "ListCheckpointsTool",
     "MergeChildMemoryTool",
     "ParsePytestLogTool",
@@ -85,6 +94,7 @@ __all__ = [
     "ReadTextFileTool",
     "RequestPermissionTool",
     "RegisterJitTool",
+    "RevokeCapabilityTool",
     "RestoreCheckpointTool",
     "ReadProcessMessagesTool",
     "ReceiveProcessMessagesTool",

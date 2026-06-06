@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import CapabilityRight
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -43,16 +44,23 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
                 "At least one capability right is required.",
                 code=ToolErrorCode.VALIDATION_ERROR,
             )
+        try:
+            rights = [CapabilityRight(str(right)).value for right in args.rights]
+        except ValueError as exc:
+            raise ToolExecutionError(
+                f"Unknown capability right: {exc}",
+                code=ToolErrorCode.VALIDATION_ERROR,
+            ) from exc
         request_id = runtime.human.request_permission(
             pid=ctx.pid,
             human=args.human,
             resource=args.resource,
-            rights=args.rights,
+            rights=rights,
             reason=args.reason,
         )
         return RequestPermissionOutput(
             request_id=request_id,
             resource=args.resource,
-            rights=args.rights,
+            rights=rights,
             status="pending",
         )

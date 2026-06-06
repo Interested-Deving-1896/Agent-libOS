@@ -11,10 +11,15 @@ from agent_libos.models import (
     AgentProcess,
     AuditRecord,
     Capability,
+    CapabilityEffect,
+    CapabilityStatus,
     Checkpoint,
     Event,
     EventPriority,
     EventType,
+    ExternalEffectRecord,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     HumanRequest,
     HumanRequestStatus,
     LLMCallRecord,
@@ -49,21 +54,6 @@ class SQLiteStore:
     live in managers. This layer only owns durable shape and reconstruction.
     """
 
-    SNAPSHOT_TABLES = [
-        "object_namespaces",
-        "objects",
-        "object_links",
-        "processes",
-        "events",
-        "capabilities",
-        "human_requests",
-        "llm_calls",
-        "process_messages",
-        "skills",
-        "skill_trust",
-        "tools",
-        "tool_candidates",
-    ]
     SYSTEM_NAMESPACE = "system"
 
     def __init__(self, path: str | Path = ":memory:"):
@@ -163,7 +153,13 @@ class SQLiteStore:
                   expires_at TEXT,
                   delegable INTEGER NOT NULL,
                   revocable INTEGER NOT NULL,
-                  revoked INTEGER NOT NULL
+                  effect TEXT NOT NULL,
+                  issuer_cap_id TEXT,
+                  parent_cap_id TEXT,
+                  delegation_depth INTEGER NOT NULL,
+                  uses_remaining INTEGER,
+                  status TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS audit_records (
@@ -179,6 +175,28 @@ class SQLiteStore:
                   correlation_id TEXT,
                   parent_record_id TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS external_effects (
+                  effect_id TEXT PRIMARY KEY,
+                  record_id TEXT,
+                  event_id TEXT,
+                  pid TEXT NOT NULL,
+                  provider TEXT NOT NULL,
+                  operation TEXT NOT NULL,
+                  target TEXT,
+                  rollback_class TEXT NOT NULL,
+                  rollback_status TEXT NOT NULL,
+                  state_mutation INTEGER NOT NULL,
+                  information_flow INTEGER NOT NULL,
+                  provider_metadata_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_external_effects_created
+                  ON external_effects(created_at, effect_id);
+
+                CREATE INDEX IF NOT EXISTS idx_external_effects_pid_created
+                  ON external_effects(pid, created_at, effect_id);
 
                 CREATE TABLE IF NOT EXISTS checkpoints (
                   checkpoint_id TEXT PRIMARY KEY,
@@ -315,6 +333,7 @@ class SQLiteStore:
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_checkpoint_schema()
+            self._ensure_external_effect_schema()
             self._ensure_skill_schema()
             self.conn.commit()
 
@@ -587,7 +606,15 @@ class SQLiteStore:
 
     def insert_capability(self, cap: Capability) -> None:
         self._execute(
-            "INSERT INTO capabilities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO capabilities (
+                cap_id, subject, resource, rights_json, constraints_json,
+                issued_by, issued_at, expires_at, delegable, revocable, effect,
+                issuer_cap_id, parent_cap_id, delegation_depth, uses_remaining,
+                status, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 cap.cap_id,
                 cap.subject,
@@ -599,7 +626,13 @@ class SQLiteStore:
                 cap.expires_at,
                 int(cap.delegable),
                 int(cap.revocable),
-                int(cap.revoked),
+                cap.effect.value,
+                cap.issuer_cap_id,
+                cap.parent_cap_id,
+                cap.delegation_depth,
+                cap.uses_remaining,
+                cap.status.value,
+                dumps(cap.metadata),
             ),
         )
 
@@ -609,7 +642,9 @@ class SQLiteStore:
             UPDATE capabilities
                SET subject = ?, resource = ?, rights_json = ?, constraints_json = ?,
                    issued_by = ?, issued_at = ?, expires_at = ?, delegable = ?,
-                   revocable = ?, revoked = ?
+                   revocable = ?, effect = ?, issuer_cap_id = ?, parent_cap_id = ?,
+                   delegation_depth = ?, uses_remaining = ?, status = ?,
+                   metadata_json = ?
              WHERE cap_id = ?
             """,
             (
@@ -622,7 +657,13 @@ class SQLiteStore:
                 cap.expires_at,
                 int(cap.delegable),
                 int(cap.revocable),
-                int(cap.revoked),
+                cap.effect.value,
+                cap.issuer_cap_id,
+                cap.parent_cap_id,
+                cap.delegation_depth,
+                cap.uses_remaining,
+                cap.status.value,
+                dumps(cap.metadata),
                 cap.cap_id,
             ),
         )
@@ -663,6 +704,61 @@ class SQLiteStore:
             sql += " LIMIT ?"
             params = (limit,)
         return [self._row_to_audit(row) for row in self._query(sql, params)]
+
+    def insert_external_effect(self, record: ExternalEffectRecord) -> None:
+        self._execute(
+            """
+            INSERT INTO external_effects (
+                effect_id, record_id, event_id, pid, provider, operation, target,
+                rollback_class, rollback_status, state_mutation, information_flow,
+                provider_metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.effect_id,
+                record.record_id,
+                record.event_id,
+                record.pid,
+                record.provider,
+                record.operation,
+                record.target,
+                record.rollback_class.value,
+                record.rollback_status.value,
+                int(record.state_mutation),
+                int(record.information_flow),
+                dumps(record.provider_metadata),
+                record.created_at,
+            ),
+        )
+
+    def list_external_effects(
+        self,
+        *,
+        created_after: str | None = None,
+        pid: str | None = None,
+        pids: Iterable[str] | None = None,
+    ) -> list[ExternalEffectRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if created_after is not None:
+            clauses.append("created_at > ?")
+            params.append(created_after)
+        if pid is not None:
+            clauses.append("pid = ?")
+            params.append(pid)
+        if pids is not None:
+            selected_pids = list(dict.fromkeys(str(item) for item in pids))
+            if not selected_pids:
+                return []
+            placeholders = ", ".join("?" for _ in selected_pids)
+            clauses.append(f"pid IN ({placeholders})")
+            params.extend(selected_pids)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._query(
+            f"SELECT * FROM external_effects{where} ORDER BY created_at, effect_id",
+            params,
+        )
+        return [self._row_to_external_effect(row) for row in rows]
 
     def insert_human_request(self, request: HumanRequest) -> None:
         self._execute(
@@ -1081,34 +1177,14 @@ class SQLiteStore:
         return [self._row_to_checkpoint(row) for row in self._query(sql, params)]
 
     def snapshot_tables(self) -> dict[str, list[dict[str, Any]]]:
-        snapshot: dict[str, list[dict[str, Any]]] = {}
-        with self._lock:
-            for table in self.SNAPSHOT_TABLES:
-                snapshot[table] = [self._row_to_dict(row) for row in self.conn.execute(f"SELECT * FROM {table}")]
-        return snapshot
+        raise RuntimeError(
+            "full-table SQLite snapshots are disabled; use CheckpointManager.create for scoped durable checkpoints"
+        )
 
     def restore_tables(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
-        with self._lock:
-            cur = self.conn.cursor()
-            for table in self.SNAPSHOT_TABLES:
-                cur.execute(f"DELETE FROM {table}")
-                rows = self._normalize_restore_rows(table, snapshot.get(table, []))
-                if not rows:
-                    continue
-                columns = list(rows[0].keys())
-                placeholders = ", ".join("?" for _ in columns)
-                col_sql = ", ".join(columns)
-                for row in rows:
-                    cur.execute(
-                        f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
-                        tuple(row[column] for column in columns),
-                    )
-            self._ensure_object_namespace_schema()
-            self._ensure_process_schema()
-            self._ensure_llm_call_schema()
-            self._ensure_process_message_schema()
-            self._ensure_skill_schema()
-            self.conn.commit()
+        raise RuntimeError(
+            "full-table SQLite restore is disabled; use CheckpointManager.restore to preserve append-only history"
+        )
 
     def _ensure_process_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(processes)")}
@@ -1175,6 +1251,33 @@ class SQLiteStore:
             self.conn.execute("ALTER TABLE checkpoints ADD COLUMN snapshot_version INTEGER NOT NULL DEFAULT 1")
         if "metadata_json" not in columns:
             self.conn.execute("ALTER TABLE checkpoints ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+
+    def _ensure_external_effect_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_effects (
+              effect_id TEXT PRIMARY KEY,
+              record_id TEXT,
+              event_id TEXT,
+              pid TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              target TEXT,
+              rollback_class TEXT NOT NULL,
+              rollback_status TEXT NOT NULL,
+              state_mutation INTEGER NOT NULL,
+              information_flow INTEGER NOT NULL,
+              provider_metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_effects_created ON external_effects(created_at, effect_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_effects_pid_created ON external_effects(pid, created_at, effect_id)"
+        )
 
     def _ensure_skill_schema(self) -> None:
         self.conn.executescript(
@@ -1309,29 +1412,6 @@ class SQLiteStore:
         parts = namespace.split("/")
         return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
 
-    def _normalize_restore_rows(self, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if table != "objects":
-            if table == "processes":
-                return [dict(row, working_directory=row.get("working_directory") or ".") for row in rows]
-            if table == "process_messages":
-                normalized_messages: list[dict[str, Any]] = []
-                for row in rows:
-                    item = dict(row)
-                    item.setdefault("channel", "default")
-                    item.setdefault("correlation_id", None)
-                    item.setdefault("reply_to", None)
-                    normalized_messages.append(item)
-                return normalized_messages
-            return rows
-        normalized: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item.setdefault("name", item.get("oid"))
-            item.setdefault("namespace", self.SYSTEM_NAMESPACE)
-            item["payload_json"] = dumps(self._memory_payload_marker(present=False))
-            normalized.append(item)
-        return normalized
-
     def _memory_payload_marker(self, present: bool) -> dict[str, Any]:
         return {"storage": "runtime_memory", "present": present}
 
@@ -1432,6 +1512,7 @@ class SQLiteStore:
         )
 
     def _row_to_capability(self, row: sqlite3.Row) -> Capability:
+        keys = set(row.keys())
         return Capability(
             cap_id=row["cap_id"],
             subject=row["subject"],
@@ -1443,7 +1524,17 @@ class SQLiteStore:
             expires_at=row["expires_at"],
             delegable=bool(row["delegable"]),
             revocable=bool(row["revocable"]),
-            revoked=bool(row["revoked"]),
+            effect=CapabilityEffect(row["effect"]) if "effect" in keys else CapabilityEffect.ALLOW,
+            issuer_cap_id=row["issuer_cap_id"] if "issuer_cap_id" in keys else None,
+            parent_cap_id=row["parent_cap_id"] if "parent_cap_id" in keys else None,
+            delegation_depth=int(row["delegation_depth"]) if "delegation_depth" in keys else 0,
+            uses_remaining=row["uses_remaining"] if "uses_remaining" in keys else None,
+            status=(
+                CapabilityStatus(row["status"])
+                if "status" in keys
+                else (CapabilityStatus.REVOKED if bool(row["revoked"]) else CapabilityStatus.ACTIVE)
+            ),
+            metadata=loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
         )
 
     def _row_to_audit(self, row: sqlite3.Row) -> AuditRecord:
@@ -1459,6 +1550,23 @@ class SQLiteStore:
             decision=loads(row["decision_json"]) if row["decision_json"] else None,
             correlation_id=row["correlation_id"],
             parent_record_id=row["parent_record_id"],
+        )
+
+    def _row_to_external_effect(self, row: sqlite3.Row) -> ExternalEffectRecord:
+        return ExternalEffectRecord(
+            effect_id=row["effect_id"],
+            record_id=row["record_id"],
+            event_id=row["event_id"],
+            pid=row["pid"],
+            provider=row["provider"],
+            operation=row["operation"],
+            target=row["target"],
+            rollback_class=ExternalEffectRollbackClass(row["rollback_class"]),
+            rollback_status=ExternalEffectRollbackStatus(row["rollback_status"]),
+            state_mutation=bool(row["state_mutation"]),
+            information_flow=bool(row["information_flow"]),
+            provider_metadata=loads(row["provider_metadata_json"], {}),
+            created_at=row["created_at"],
         )
 
     def _row_to_checkpoint(self, row: sqlite3.Row) -> Checkpoint:

@@ -40,6 +40,30 @@ class RuntimeDefaults:
 
 
 @dataclass(frozen=True)
+class CapabilityDefaults:
+    default_delegation_depth: int = 4
+    max_rights_per_capability: int = 16
+    max_constraints_bytes: int = 16_384
+    list_limit: int = 100
+    decision_explain_preview_chars: int = 2_000
+    trusted_issuers: tuple[str, ...] = (
+        "system",
+        "runtime",
+        "runtime.bootstrap",
+        "cli",
+        "cli.admin",
+        "human:owner",
+        "human.approval",
+        "process.exec",
+        "process.spawn",
+        "checkpoint.restore",
+        "checkpoint.fork",
+        "checkpoint.create",
+    )
+    trusted_issuer_prefixes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class SchedulerDefaults:
     max_quanta: int = 25
     poll_interval_s: float = 0.01
@@ -288,6 +312,7 @@ class ScriptDefaults:
 @dataclass(frozen=True)
 class AgentLibOSConfig:
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
+    capability: CapabilityDefaults = field(default_factory=CapabilityDefaults)
     scheduler: SchedulerDefaults = field(default_factory=SchedulerDefaults)
     process: ProcessDefaults = field(default_factory=ProcessDefaults)
     llm: LLMDefaults = field(default_factory=LLMDefaults)

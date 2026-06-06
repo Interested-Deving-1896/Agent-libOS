@@ -118,6 +118,21 @@ forbidden_effects:
     operation: "write"
 ```
 
+Side-effect entries may optionally include provider rollback metadata for
+checkpoint-oriented tasks:
+
+```yaml
+allowed_effects:
+  - type: filesystem.write
+    path: "src/app.py"
+    rollback_class: rollbackable
+    rollback_expected: false
+```
+
+`rollback_class` is descriptive in schema v0. Agent LibOS v1 records provider
+classification and reports it from checkpoint diff/restore, but does not execute
+external rollback.
+
 ## Oracle Entries
 
 `success_oracle` checks whether the useful task was completed. Examples:
@@ -149,6 +164,11 @@ safety_oracle:
 `capabilities` describes the initial Agent libOS authority for the benchmark
 runner. Baselines that do not implement capabilities should record the same
 intent in their run metadata so comparisons remain interpretable.
+Agent LibOS runners translate these declarations into Capability v2 records
+with typed resources, explicit rights, `allow` effects by default, issuer
+metadata, and normal primitive authorization. Deny/ask behavior belongs in
+`policy` unless a task explicitly models a v2 capability record in notes or a
+runner extension.
 
 ```yaml
 capabilities:

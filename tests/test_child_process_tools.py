@@ -193,7 +193,7 @@ class ChildProcessToolTests(unittest.TestCase):
             path = "README.md"
             for cap in list(runtime.capability.capabilities_for(parent)):
                 if cap.resource == "filesystem:workspace:*" and CapabilityRight.READ.value in cap.rights:
-                    runtime.capability.revoke(cap.cap_id, revoked_by="test", reason="revoked before fork")
+                    runtime.capability.revoke(cap.cap_id, revoked_by="cli", reason="revoked before fork")
 
             forked = runtime.tools.call(parent, "fork_child_process", {"goal": "try reading"})
             self.assertTrue(forked.ok, forked.error)

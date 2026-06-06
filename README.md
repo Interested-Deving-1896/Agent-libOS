@@ -32,8 +32,10 @@ The implementation currently includes:
 - Human queue integration for ordinary questions and per-use approval.
 - Process-private Object Memory namespaces by default, with explicit shared
   namespaces available through capabilities.
-- Capability-controlled filesystem, shell, clock, human, process, image,
-  checkpoint, skill, and Object Memory primitives.
+- Structured Capability v2 authority for filesystem, shell, clock, human,
+  process, image, checkpoint, skill, and Object Memory primitives, including
+  typed resource matching, deny/ask/allow effects, one-shot grants,
+  attenuation, revoke, and audit lineage.
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
   human I/O backends.
 - SQLite persistence for process/object metadata, capabilities, messages,
@@ -182,6 +184,14 @@ uv run agent-libos --db .agent_libos.sqlite skills register skills/swe_agent.yam
 uv run agent-libos --db .agent_libos.sqlite skills load <pid> swe-agent:v0
 ```
 
+Inspect or change runtime authority:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite capabilities list --subject <pid>
+uv run agent-libos --db .agent_libos.sqlite capabilities explain <pid> filesystem:workspace:README.md read
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
+```
+
 Launch a coding agent against another workspace:
 
 ```bash
@@ -199,6 +209,9 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 ## Core Invariants
 
 - Tool visibility is not resource authority.
+- Capability records are typed authority statements with explicit
+  allow/deny/ask effects, issuer lineage, delegation depth, status, expiry, and
+  optional use counts.
 - Skills and JIT tools do not grant filesystem, shell, human, object, process,
   image, or checkpoint authority.
 - JIT syscalls bypass the LLM-facing tool table but not primitive capability
@@ -211,6 +224,9 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Checkpoint restore covers reconstructable process-subtree state only. It does
   not delete append-only audit/events/LLM calls or roll back filesystem, shell,
   image, network, or provider side effects.
+- Providers classify external effects as `irreversible`, `rollbackable`, or
+  `no_rollback_required`; checkpoint restore reports those classes with
+  `restore_external_policy="report_only"`.
 - Resource Provider Substrate backends perform host effects, but primitives own
   capability checks, policy decisions, events, and audit.
 

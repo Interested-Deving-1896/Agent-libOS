@@ -7,7 +7,7 @@ from typing import Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import AgentImage, Capability, CapabilityRight, EventType
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.utils.yaml_loader import load_yaml_mapping
@@ -256,9 +256,18 @@ class ImageRegistryPrimitive:
         resource = spec.get("resource")
         if not isinstance(resource, str) or not resource:
             raise ValidationError("capability spec requires a non-empty resource")
+        try:
+            self.capabilities.parse_resource_pattern(resource)
+        except CapabilityDenied as exc:
+            raise ValidationError(str(exc)) from exc
         rights = spec.get("rights")
         if not isinstance(rights, list) or not rights or not all(isinstance(right, str) and right for right in rights):
             raise ValidationError("capability spec requires a non-empty rights list")
+        for right in rights:
+            try:
+                CapabilityRight(str(right))
+            except ValueError as exc:
+                raise ValidationError(f"unknown capability right: {right}") from exc
         constraints = spec.get("constraints")
         if constraints is not None and not isinstance(constraints, dict):
             raise ValidationError("capability spec constraints must be a mapping")

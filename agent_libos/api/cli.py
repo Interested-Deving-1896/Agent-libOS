@@ -12,7 +12,9 @@ from typing import Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
+    CapabilityEffect,
     CapabilityRight,
+    CapabilitySpec,
     ForkMode,
     MemoryViewSpec,
     ObjectHandle,
@@ -98,6 +100,8 @@ def main(argv: list[str] | None = None) -> None:
     _add_checkpoint_parser_args(checkpoint_parser)
     skills_parser = sub.add_parser("skills", help="Discover, inspect, register, trust, load, or unload skills")
     _add_skills_parser_args(skills_parser)
+    capabilities_parser = sub.add_parser("capabilities", help="List, inspect, grant, delegate, revoke, or explain capabilities")
+    _add_capabilities_parser_args(capabilities_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
     grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
     grant_tool_parser.add_argument("pid")
@@ -142,6 +146,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_run_checkpoint_command(runtime, args))
         elif args.command == "skills":
             _print_json(_run_skills_command(runtime, args))
+        elif args.command == "capabilities":
+            _print_json(_run_capabilities_command(runtime, args))
         elif args.command == "grant-tool":
             raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
         elif args.command == "human":
@@ -567,6 +573,120 @@ def _run_skills_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
             require_capability=require_capability,
         )
     raise SystemExit(f"unknown skills command: {command}")
+
+
+def _add_capabilities_parser_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--actor-pid",
+        help="If set, execute as this process and enforce capability authority. Omit for admin CLI mode.",
+    )
+    sub = parser.add_subparsers(dest="capabilities_command", required=True)
+    list_parser = sub.add_parser("list", help="List capabilities")
+    list_parser.add_argument("--subject", help="Subject pid/name to list. Defaults to actor pid in process mode; all in admin mode.")
+    list_parser.add_argument("--include-inactive", action="store_true")
+    list_parser.add_argument("--limit", type=int)
+    inspect = sub.add_parser("inspect", help="Inspect one capability")
+    inspect.add_argument("capability_id")
+    grant = sub.add_parser("grant", help="Issue a new capability")
+    grant.add_argument("subject")
+    _add_capability_spec_args(grant)
+    delegate = sub.add_parser("delegate", help="Delegate an attenuated capability from parent to child")
+    delegate.add_argument("parent")
+    delegate.add_argument("child")
+    _add_capability_spec_args(delegate)
+    revoke = sub.add_parser("revoke", help="Revoke a capability")
+    revoke.add_argument("capability_id")
+    revoke.add_argument("--reason")
+    explain = sub.add_parser("explain", help="Explain an authorization decision")
+    explain.add_argument("subject")
+    explain.add_argument("resource")
+    explain.add_argument("right", choices=[right.value for right in CapabilityRight])
+    explain.add_argument("--context-json", default="{}", help="Optional authorization context JSON object.")
+
+
+def _add_capability_spec_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("resource")
+    parser.add_argument("--rights", nargs="+", required=True, choices=[right.value for right in CapabilityRight])
+    parser.add_argument("--effect", choices=[effect.value for effect in CapabilityEffect], default=CapabilityEffect.ALLOW.value)
+    parser.add_argument("--delegable", action="store_true")
+    parser.add_argument("--revocable", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--uses-remaining", type=int)
+    parser.add_argument("--expires-at")
+    parser.add_argument("--constraints-json", default="{}", help="Capability constraint JSON object.")
+    parser.add_argument("--metadata-json", default="{}", help="Capability metadata JSON object.")
+
+
+def _run_capabilities_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+    actor = args.actor_pid or "cli.admin"
+    process_mode = args.actor_pid is not None
+    command = args.capabilities_command
+    if command == "list":
+        subject = args.subject or (actor if process_mode else None)
+        if process_mode and subject != actor:
+            runtime.capability.require(actor, f"process:{subject}", CapabilityRight.ADMIN)
+        caps = runtime.capability.list_subject(
+            subject,
+            include_inactive=args.include_inactive,
+            limit=args.limit,
+        ) if subject is not None else runtime.store.list_capabilities()
+        if subject is None:
+            if not args.include_inactive:
+                caps = [cap for cap in caps if cap.active]
+            caps = caps[: (args.limit or runtime.config.capability.list_limit)]
+        return [runtime.capability.inspect(cap.cap_id) for cap in caps]
+    if command == "inspect":
+        cap = runtime.store.get_capability(args.capability_id)
+        if cap is None:
+            raise SystemExit(f"capability not found: {args.capability_id}")
+        if process_mode and cap.subject != actor:
+            runtime.capability.require(actor, cap.resource, CapabilityRight.ADMIN)
+        return runtime.capability.inspect(args.capability_id)
+    if command == "grant":
+        spec = _capability_spec_from_args(args)
+        cap = runtime.capability.issue(
+            actor=actor,
+            subject=args.subject,
+            spec=spec,
+            require_authority=process_mode,
+        )
+        return runtime.capability.inspect(cap.cap_id)
+    if command == "delegate":
+        if process_mode and args.parent != actor:
+            raise SystemExit("--actor-pid delegation may only delegate from that actor process")
+        cap = runtime.capability.delegate(args.parent, args.child, _capability_spec_from_args(args), actor=actor)
+        return runtime.capability.inspect(cap.cap_id)
+    if command == "revoke":
+        cap = runtime.capability.revoke(
+            args.capability_id,
+            revoked_by=actor,
+            reason=args.reason,
+            require_authority=process_mode,
+        )
+        return runtime.capability.inspect(cap.cap_id)
+    if command == "explain":
+        if process_mode and args.subject != actor:
+            runtime.capability.require(actor, args.resource, CapabilityRight.ADMIN)
+        return runtime.capability.explain_decision(
+            args.subject,
+            args.resource,
+            args.right,
+            _parse_json_mapping(args.context_json, "--context-json"),
+        )
+    raise SystemExit(f"unknown capabilities command: {command}")
+
+
+def _capability_spec_from_args(args: argparse.Namespace) -> CapabilitySpec:
+    return CapabilitySpec(
+        resource=args.resource,
+        rights={str(right) for right in args.rights},
+        effect=CapabilityEffect(args.effect),
+        constraints=_parse_json_mapping(args.constraints_json, "--constraints-json"),
+        metadata=_parse_json_mapping(args.metadata_json, "--metadata-json"),
+        expires_at=args.expires_at,
+        uses_remaining=args.uses_remaining,
+        delegable=args.delegable,
+        revocable=args.revocable,
+    )
 
 
 def _message_cli_summary(message: ProcessMessage) -> dict[str, Any]:

@@ -6,6 +6,7 @@ from datetime import datetime, tzinfo
 from typing import Any, Protocol
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.external_effect import ExternalEffectClassification
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -64,6 +65,13 @@ class FilesystemProvider(Protocol):
 
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None: ...
 
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
+
 
 class ClockProvider(Protocol):
     def now(self, timezone: tzinfo) -> datetime: ...
@@ -73,6 +81,13 @@ class ClockProvider(Protocol):
     def sleep(self, seconds: float) -> None: ...
 
     async def asleep(self, seconds: float) -> None: ...
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
 
 
 class ShellProvider(Protocol):
@@ -84,11 +99,25 @@ class ShellProvider(Protocol):
         cwd: str | None = None,
     ) -> CommandResult: ...
 
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
+
 
 class HumanProvider(Protocol):
     def write(self, message: str) -> None: ...
 
     def read(self, prompt: str) -> str: ...
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
 
 
 class ResourceProviderSubstrate(Protocol):

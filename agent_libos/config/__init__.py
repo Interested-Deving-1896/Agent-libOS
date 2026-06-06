@@ -1,6 +1,7 @@
 from agent_libos.config.defaults import (
     DEFAULT_CONFIG,
     AgentLibOSConfig,
+    CapabilityDefaults,
     CheckpointDefaults,
     ImageDefaults,
     LLMContextDefaults,
@@ -21,6 +22,7 @@ from agent_libos.config.defaults import (
 __all__ = [
     "DEFAULT_CONFIG",
     "AgentLibOSConfig",
+    "CapabilityDefaults",
     "CheckpointDefaults",
     "ImageDefaults",
     "LLMContextDefaults",

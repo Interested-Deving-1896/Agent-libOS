@@ -86,6 +86,19 @@ jit_tools:
                         actor="cli",
                         require_capability=False,
                     )
+                with self.assertRaises(ValidationError):
+                    runtime.skills.register_skill_from_yaml_text(
+                        """
+schema_version: 1
+skill_id: bad-right:v0
+name: Bad Right
+required_capabilities:
+  - resource: filesystem:workspace:*
+    rights: ["*"]
+""".lstrip(),
+                        actor="cli",
+                        require_capability=False,
+                    )
             finally:
                 runtime.close()
 
@@ -160,6 +173,25 @@ required_capabilities:
             self.assertFalse(runtime.capability.check(pid, "filesystem:workspace:secret.txt", CapabilityRight.READ))
             self.assertFalse(result.ok)
             self.assertIn("lacks read", result.error or "")
+        finally:
+            runtime.close()
+
+    def test_cross_process_skill_load_requires_target_process_admin(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            actor = runtime.process.spawn(image="base-agent:v0", goal="actor")
+            target = runtime.process.spawn(image="base-agent:v0", goal="target")
+            runtime.register_skill_from_yaml_text(_echo_skill_manifest("cross-load-skill:v0"), actor="cli")
+            runtime.capability.grant(actor, "skill:cross-load-skill:v0", [CapabilityRight.EXECUTE], issued_by="test")
+
+            with self.assertRaises(CapabilityDenied):
+                runtime.skills.load_skill(target, "cross-load-skill:v0", actor=actor)
+
+            runtime.capability.grant(actor, f"process:{target}", [CapabilityRight.ADMIN], issued_by="test")
+            loaded = runtime.skills.load_skill(target, "cross-load-skill:v0", actor=actor)
+
+            self.assertEqual(loaded["pid"], target)
+            self.assertIn("echo", runtime.process.get(target).tool_table)
         finally:
             runtime.close()
 
@@ -240,7 +272,7 @@ tools: [read_text_file]
                     default_tools=["human_output"],
                     default_skills=["image-skill:v0"],
                 ),
-                actor="test",
+                actor="cli",
             )
 
             root = runtime.process.spawn(image="skill-image:v0", goal="root")

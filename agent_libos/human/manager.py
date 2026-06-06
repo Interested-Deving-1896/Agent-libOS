@@ -18,6 +18,11 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.external_effects import (
+    classify_external_effect,
+    record_external_effect,
+    require_external_effect_classifier,
+)
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import HumanProvider
 
@@ -657,23 +662,37 @@ class HumanObjectManager:
     def _deliver_output_request(self, request: HumanRequest) -> HumanRequest:
         message = str(request.payload.get("message", ""))
         channel = str(request.payload.get("channel", self.config.runtime.terminal_channel))
+        effect_context = {"channel": channel, "chars": len(message), "request_id": request.request_id}
+        require_external_effect_classifier(self.provider, "write")
         self.provider.write(message)
         request.status = HumanRequestStatus.DELIVERED
         request.decision = {"delivered": True}
         request.updated_at = utc_now()
         self.store.update_human_request(request)
         resource = f"human:{request.human}"
-        self.events.emit(
+        event = self.events.emit(
             EventType.HUMAN_OUTPUT,
             source=request.pid,
             target=resource,
             payload={"request_id": request.request_id, "channel": channel, "chars": len(message)},
         )
-        self.audit.record(
+        audit_record = self.audit.record(
             actor=request.pid,
             action="human.output",
             target=resource,
             decision={"request_id": request.request_id, "channel": channel, "chars": len(message), "queued": True},
+        )
+        classification = classify_external_effect(self.provider, "write", effect_context, {"delivered": True})
+        record_external_effect(
+            self.store,
+            pid=request.pid,
+            provider="human",
+            operation="write",
+            target=resource,
+            classification=classification,
+            audit_record=audit_record,
+            event=event,
+            metadata={"context": effect_context, "result": {"delivered": True}},
         )
         return request
 

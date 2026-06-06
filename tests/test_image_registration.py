@@ -22,7 +22,7 @@ class ImageRegistrationTests(unittest.TestCase):
                 safety_profile="review",
             )
 
-            runtime.register_image(image, actor="test")
+            runtime.register_image(image, actor="cli")
 
             self.assertIs(runtime.get_image("custom-review:v0"), image)
             self.assertIn("image.register", [record.action for record in runtime.audit.trace()])
@@ -40,7 +40,22 @@ class ImageRegistrationTests(unittest.TestCase):
                         "name": "bad-image",
                         "default_tools": ["not_a_real_tool"],
                     },
-                    actor="test",
+                    actor="cli",
+                )
+        finally:
+            runtime.close()
+
+    def test_register_image_rejects_invalid_required_capability_right(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            with self.assertRaises(ValidationError):
+                runtime.register_image(
+                    {
+                        "image_id": "bad-right-image:v0",
+                        "name": "bad-right-image",
+                        "required_capabilities": [{"resource": "filesystem:workspace:*", "rights": ["*"]}],
+                    },
+                    actor="cli",
                 )
         finally:
             runtime.close()

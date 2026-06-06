@@ -635,14 +635,14 @@ class ProcessManager:
 
     def _validate_inherit_capability_specs(self, parent_pid: str, specs: Iterable[dict[str, Any]]) -> None:
         for spec in specs:
-            resource = spec["resource"]
-            rights = spec.get("rights", [CapabilityRight.READ.value])
-            for right in rights:
-                policy = self.capabilities.permission_policy(parent_pid, resource, right)
-                if policy != CapabilityManager.ALWAYS_ALLOW:
-                    raise CapabilityDenied(
-                        f"{parent_pid} cannot inherit {right} on {resource}; parent policy is {policy}"
-                    )
+            try:
+                self.capabilities.validate_delegation(parent_pid, spec)
+            except CapabilityDenied as exc:
+                resource = spec.get("resource")
+                rights = spec.get("rights", [CapabilityRight.READ.value])
+                raise CapabilityDenied(
+                    f"{parent_pid} cannot inherit {rights} on {resource}: {exc}"
+                ) from exc
 
     def _fork_mode_to_view_mode(self, mode: ForkMode) -> ViewMode:
         if mode == ForkMode.COPY:

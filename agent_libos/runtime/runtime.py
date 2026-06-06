@@ -34,6 +34,7 @@ from agent_libos.tools.builtin import (
     CreateObjectFromFileTool,
     DeleteDirectoryTool,
     DeleteFileTool,
+    DelegateCapabilityTool,
     DiscoverSkillsTool,
     DiffCheckpointTool,
     EchoTool,
@@ -43,12 +44,14 @@ from agent_libos.tools.builtin import (
     GetCurrentTimeTool,
     GetWorkingDirectoryTool,
     HumanOutputTool,
+    InspectCapabilityTool,
     InspectCheckpointTool,
     InspectSkillTool,
     LoadImageFromYamlTool,
     LoadSkillFromYamlTool,
     LoadSkillTool,
     ListChildProcessesTool,
+    ListCapabilitiesTool,
     ListCheckpointsTool,
     ListMemoryNamespaceTool,
     MergeChildMemoryTool,
@@ -62,6 +65,7 @@ from agent_libos.tools.builtin import (
     ReadTextFileTool,
     RequestPermissionTool,
     RegisterJitTool,
+    RevokeCapabilityTool,
     RestoreCheckpointTool,
     RunShellCommandTool,
     SendProcessMessageTool,
@@ -506,6 +510,7 @@ class Runtime:
         self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
         self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
         self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
+        self.tools.register_tool(DelegateCapabilityTool(), registered_by="runtime")
         self.tools.register_tool(DiffCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(DiscoverSkillsTool(), registered_by="runtime")
         self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
@@ -533,13 +538,16 @@ class Runtime:
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
+        self.tools.register_tool(InspectCapabilityTool(), registered_by="runtime")
         self.tools.register_tool(InspectCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(InspectSkillTool(), registered_by="runtime")
         self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
+        self.tools.register_tool(ListCapabilitiesTool(), registered_by="runtime")
         self.tools.register_tool(ListCheckpointsTool(), registered_by="runtime")
         self.tools.register_tool(LoadSkillFromYamlTool(), registered_by="runtime")
         self.tools.register_tool(LoadSkillTool(), registered_by="runtime")
         self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")
+        self.tools.register_tool(RevokeCapabilityTool(), registered_by="runtime")
         self.tools.register_tool(RestoreCheckpointTool(), registered_by="runtime")
         self.tools.register_tool(SendProcessMessageTool(), registered_by="runtime")
         self.tools.register_tool(UnloadSkillTool(), registered_by="runtime")

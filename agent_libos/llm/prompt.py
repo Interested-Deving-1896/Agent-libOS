@@ -113,15 +113,33 @@ def _process_section(process: AgentProcess) -> str:
 def _capability_section(capabilities: list[Capability]) -> str:
     visible = [
         {
+            "cap_id": cap.cap_id,
             "resource": cap.resource,
             "rights": sorted(cap.rights),
-            "permission_policy": cap.constraints.get("permission_policy", "always_allow"),
+            "effect": cap.effect.value,
+            "status": cap.status.value,
+            "policy": _capability_policy(cap),
+            "uses_remaining": cap.uses_remaining,
+            "delegable": cap.delegable,
+            "delegation_depth": cap.delegation_depth,
+            "issuer": cap.issued_by,
+            "parent_cap_id": cap.parent_cap_id,
             "expires_at": cap.expires_at,
         }
         for cap in capabilities
-        if not cap.revoked
+        if cap.active
     ]
     return f"Capabilities:\n{visible}"
+
+
+def _capability_policy(cap: Capability) -> str:
+    if cap.effect.value == "allow":
+        return "allow_once" if cap.uses_remaining is not None else "always_allow"
+    if cap.effect.value == "deny":
+        return "always_deny"
+    if cap.effect.value == "ask":
+        return "ask_each_time"
+    return cap.effect.value
 
 
 def _skill_section(skills: list[dict[str, Any]]) -> str:

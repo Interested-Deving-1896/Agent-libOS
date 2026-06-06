@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
@@ -13,6 +14,9 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
 from agent_libos.models import (
     CapabilityRight,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     HumanRequestStatus,
     ObjectMetadata,
     ObjectPatch,
@@ -23,10 +27,20 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.substrate import CommandResult, LocalHumanProvider, LocalResourceProviderSubstrate
 
 
 class CheckpointManagerTests(unittest.TestCase):
+    def test_legacy_full_table_snapshot_restore_are_disabled(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "full-table SQLite snapshots are disabled"):
+                runtime.store.snapshot_tables()
+            with self.assertRaisesRegex(RuntimeError, "full-table SQLite restore is disabled"):
+                runtime.store.restore_tables({})
+        finally:
+            runtime.close()
+
     def test_restore_recovers_process_subtree_objects_capabilities_and_cwd_only(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -81,7 +95,76 @@ class CheckpointManagerTests(unittest.TestCase):
                 self.assertGreater(after_write_audit_count, before_audit_count)
                 self.assertTrue((Path(temp_dir) / "out.txt").exists())
                 self.assertTrue(result["external_effects_since_checkpoint"])
+                self.assertEqual(result["restore_external_policy"], "report_only")
+                self.assertEqual(result["external_effect_summary"]["by_rollback_class"]["rollbackable"], 1)
+                self.assertEqual(result["external_effects_since_checkpoint"][0]["provider"], "filesystem")
+                self.assertEqual(result["external_effects_since_checkpoint"][0]["rollback_class"], "rollbackable")
                 self.assertIn("checkpoint.restore", [record.action for record in runtime.audit.trace()])
+            finally:
+                runtime.close()
+
+    def test_restore_reports_provider_decided_external_effect_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            substrate = LocalResourceProviderSubstrate(temp_dir)
+            substrate.shell = ClassifiedShellProvider()
+            substrate.human = LocalHumanProvider(output_sink=lambda _message: None)
+            runtime = Runtime.open("local", substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="external effect classes")
+                runtime.filesystem.grant_path(pid, "out.txt", [CapabilityRight.WRITE], issued_by="test")
+                runtime.capability.grant(pid, "shell:git", [CapabilityRight.EXECUTE], issued_by="test")
+                runtime.capability.grant(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test")
+                checkpoint_id = runtime.checkpoint.create(pid, "before external effects", actor=pid)
+
+                runtime.filesystem.write_text(pid, "out.txt", "side effect")
+                runtime.shell.run(pid, ["git", "status", "--short"])
+                runtime.human.output(pid, "visible once")
+
+                result = runtime.checkpoint.restore("cli", checkpoint_id, require_capability=False)
+                summary = result["external_effect_summary"]["by_rollback_class"]
+                effects = result["external_effects_since_checkpoint"]
+
+                self.assertEqual(result["status"], "restored")
+                self.assertEqual(result["restore_external_policy"], "report_only")
+                self.assertEqual(summary["rollbackable"], 1)
+                self.assertEqual(summary["irreversible"], 1)
+                self.assertEqual(summary["no_rollback_required"], 1)
+                self.assertEqual(
+                    {(effect["provider"], effect["rollback_class"]) for effect in effects},
+                    {
+                        ("filesystem", "rollbackable"),
+                        ("shell", "irreversible"),
+                        ("human", "no_rollback_required"),
+                    },
+                )
+            finally:
+                runtime.close()
+
+    def test_checkpoint_external_effect_report_is_scoped_to_process_subtree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                owner = runtime.process.spawn(image="base-agent:v0", goal="owner")
+                child = runtime.spawn_child_process(owner, "child")
+                unrelated = runtime.process.spawn(image="base-agent:v0", goal="other")
+                runtime.filesystem.grant_path(owner, "owner.txt", [CapabilityRight.WRITE], issued_by="test")
+                runtime.filesystem.grant_path(child, "child.txt", [CapabilityRight.WRITE], issued_by="test")
+                runtime.filesystem.grant_path(unrelated, "other.txt", [CapabilityRight.WRITE], issued_by="test")
+                checkpoint_id = runtime.checkpoint.create(owner, "before external writes", actor=owner)
+
+                runtime.filesystem.write_text(owner, "owner.txt", "owner")
+                runtime.filesystem.write_text(child, "child.txt", "child")
+                runtime.filesystem.write_text(unrelated, "other.txt", "other")
+
+                diff = runtime.checkpoint.diff(checkpoint_id, actor=owner)
+                result = runtime.checkpoint.restore("cli", checkpoint_id, require_capability=False)
+
+                self.assertEqual(diff["external_effect_summary"]["total"], 2)
+                self.assertEqual(result["external_effect_summary"]["total"], 2)
+                self.assertEqual(
+                    {effect["target"] for effect in result["external_effects_since_checkpoint"]},
+                    {"filesystem:workspace:owner.txt", "filesystem:workspace:child.txt"},
+                )
             finally:
                 runtime.close()
 
@@ -144,6 +227,29 @@ class CheckpointManagerTests(unittest.TestCase):
             self.assertEqual(fork_obj.namespace, runtime.memory.process_namespace(fork_pid))
             self.assertEqual(fork_obj.payload, {"value": 7})
             self.assertTrue(runtime.capability.check(fork_pid, "filesystem:workspace:README.md", CapabilityRight.READ))
+        finally:
+            runtime.close()
+
+    def test_checkpoint_fork_parent_attachment_requires_authority(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            owner = runtime.process.spawn(image="base-agent:v0", goal="owner")
+            other = runtime.process.spawn(image="base-agent:v0", goal="other")
+            checkpoint_id = runtime.checkpoint.create(owner, "fork parent boundary", actor=owner)
+            runtime.capability.grant(owner, f"checkpoint:{checkpoint_id}", [CapabilityRight.EXECUTE], issued_by="test")
+
+            with self.assertRaises(CapabilityDenied):
+                runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id, parent_pid=other)
+
+            runtime.capability.grant(
+                owner,
+                runtime.checkpoint.process_resource(other),
+                [CapabilityRight.ADMIN],
+                issued_by="test",
+            )
+            forked = runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id, parent_pid=other)
+
+            self.assertEqual(runtime.process.get(forked["fork_root_pid"]).parent_pid, other)
         finally:
             runtime.close()
 
@@ -270,6 +376,20 @@ class CheckpointManagerTests(unittest.TestCase):
         import asyncio
 
         return asyncio.run(awaitable)
+
+
+class ClassifiedShellProvider:
+    def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
+        return CommandResult(argv=list(argv), returncode=0, stdout="ok\n", stderr="")
+
+    def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+            state_mutation=True,
+            information_flow=True,
+            metadata={"operation": operation},
+        )
 
 
 if __name__ == "__main__":

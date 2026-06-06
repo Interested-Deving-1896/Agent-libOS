@@ -272,6 +272,7 @@ class SkillManager:
         skill, metadata = self._get_skill(skill_id)
         if require_capability:
             self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
+            self._require_process_admin_if_cross_actor(selected_actor, pid)
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
@@ -337,6 +338,7 @@ class SkillManager:
         selected_actor = actor or pid
         if require_capability:
             self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
+            self._require_process_admin_if_cross_actor(selected_actor, pid)
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
@@ -589,6 +591,11 @@ class SkillManager:
         )
         raise HumanApprovalRequired(request_id, f"human approval required for skill {skill_id}")
 
+    def _require_process_admin_if_cross_actor(self, actor: str, pid: str) -> None:
+        if actor == pid:
+            return
+        self.capabilities.require(actor, f"process:{pid}", CapabilityRight.ADMIN)
+
     def _require_trusted_global_source(self, source: str, manifest_sha256: str) -> None:
         if not self.config.skills.global_requires_trust:
             return
@@ -773,8 +780,17 @@ class SkillManager:
         rights = spec.get("rights")
         if not isinstance(resource, str) or not resource:
             raise ValidationError("capability spec requires a non-empty resource")
+        try:
+            self.capabilities.parse_resource_pattern(resource)
+        except CapabilityDenied as exc:
+            raise ValidationError(str(exc)) from exc
         if not isinstance(rights, list) or not rights or not all(isinstance(right, str) and right for right in rights):
             raise ValidationError("capability spec requires a non-empty rights list")
+        for right in rights:
+            try:
+                CapabilityRight(str(right))
+            except ValueError as exc:
+                raise ValidationError(f"unknown capability right: {right}") from exc
         constraints = spec.get("constraints")
         if constraints is not None and not isinstance(constraints, dict):
             raise ValidationError("capability spec constraints must be a mapping")

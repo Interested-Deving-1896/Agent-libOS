@@ -1,37 +1,71 @@
-# Capabilities And Permission Policy
+# Capabilities
 
-Agent libOS uses explicit capabilities for resource authority. A visible tool,
-loaded Skill, object name, path string, image id, or checkpoint id is not enough
-to perform a protected operation.
+Agent libOS uses capabilities as the runtime authority subsystem. A visible
+tool, loaded Skill, JIT tool, object name, path string, image id, or checkpoint
+id is not enough to perform a protected operation. Protected effects are
+authorized at primitive use by process identity, typed resource pattern, right,
+effect, constraints, human approval, and audit.
+
+## Capability Record
+
+Capability v2 records are structured authority statements:
+
+- `subject`: process or runtime actor that holds the authority.
+- `resource`: canonical typed resource pattern.
+- `rights`: operation rights such as `read`, `write`, or `execute`.
+- `effect`: `allow`, `deny`, or `ask`.
+- `issuer`: actor that issued the record.
+- `issuer_cap_id` and `parent_cap_id`: lineage for grant/delegation decisions.
+- `delegation_depth`: attenuation depth from a parent capability.
+- `issued_at`, `expires_at`, `uses_remaining`, and `status`.
+- `constraints` and `metadata`.
+
+One-shot authority is not encoded as a policy string. It is an `allow`
+capability with `uses_remaining=1`; successful primitive use consumes it and
+revokes the capability when the count reaches zero.
+
+`deny` records dominate matching allows. To create an exception, revoke the
+broad deny and issue narrower allow/deny records explicitly. The runtime does
+not implement hidden override precedence that could accidentally reopen a
+blocked resource.
 
 ## Rights
 
-Capabilities are checked against a resource string and one or more rights. The
-common rights are:
+The common rights are:
 
 - `read`: inspect or materialize a resource.
 - `write`: create or modify a resource.
 - `delete`: remove a resource.
 - `execute`: run or load a resource.
-- `list`: enumerate namespace-like resources.
 - `materialize`: include object content in a prompt or tool result.
 - `link`: create Object Memory links.
 - `diff`: compare object or checkpoint state.
+- `grant`: issue authority over a covered resource.
+- `revoke`: revoke authority over a covered resource.
+- `approve`: approve a human/request resource.
 - `admin`: perform destructive or policy-changing operations.
 
-The exact right set depends on the primitive.
+The exact right set depends on the primitive. Unknown or unsupported rights do
+not create primitive behavior by themselves. Capability records reject unknown
+rights, including `*`; use explicit rights instead of all-rights wildcards.
 
-## Resource Names
+## Resource Matching
 
-Important resource naming conventions include:
+Resources are typed and canonicalized before authorization. Matching is not a
+raw `startswith` or suffix check.
 
-- `filesystem:workspace:<path>` for workspace files and directories.
-- `filesystem:workspace:<dir>/*` for directory subtree grants.
-- `shell:*` for process-scoped shell policy grants.
+Important resource conventions include:
+
+- `filesystem:workspace:<path>` for exact workspace files and directories.
+- `filesystem:workspace:<dir>/*` for a directory subtree.
+- `filesystem:workspace:*` for the whole workspace namespace.
+- `shell:<executable>` and `shell:*` for shell execution authority.
 - `human:<name>` for human output, questions, and approvals.
 - `object:<oid>` for Object Memory content.
-- `namespace:<namespace>` for Object Memory namespace listing and name
-  resolution.
+- `object_namespace:<namespace>` for Object Memory namespace listing and name
+  lookup.
+- `process:<pid>` and `process:*` for process operations.
+- `message:<pid>` and `message:*` for message queue operations.
 - `image:<image_id>` and `image:*` for image registration.
 - `skill:<skill_id>` and `skill:*` for Skill operations.
 - `skill_source:workspace:<relative_path>` and
@@ -40,64 +74,142 @@ Important resource naming conventions include:
 - `checkpoint:process:<pid>`, `checkpoint:<checkpoint_id>`, and
   `checkpoint:*` for checkpoint operations.
 
-Resource names are matched by the capability manager, not by model text. Prefer
-the narrowest resource that covers the intended operation.
+Wildcard syntax is terminal only. `kind:*` is a typed prefix pattern and
+`kind:body/*` is a subtree pattern. Bare global `*` is rejected; authority must
+stay inside an explicit resource kind. Prefix collisions are rejected: a grant
+for `filesystem:workspace:src/*` covers `src/main.py`, not `src2/main.py`.
 
-## Tool Visibility Is Not Authority
+Requested resources are produced by primitives after their own normalization.
+For example, the filesystem primitive resolves cwd-relative paths, enforces
+workspace containment, then asks for the canonical logical resource. Shell
+authority uses normalized executable identity and argv token policy, not a shell
+string.
 
-The process tool table controls which LLM-facing tools a process may call.
-Capabilities control whether primitives can perform protected effects.
+## Authorization API
+
+The manager entry point is:
+
+```python
+authorize(subject, resource, right, context) -> CapabilityDecision
+```
+
+`require(...)` wraps `authorize(...)` and raises on denial. Primitive code should
+pass operation context such as path, argv, byte counts, hashes, risk labels,
+process lineage, or provider details. The decision records:
+
+- matched capability ids,
+- selected capability id,
+- issuer chain,
+- effect and derived human-facing policy,
+- constraint evaluation results,
+- one-shot consumption id when applicable,
+- human approval request id when a primitive asks the human,
+- operation context preview.
+
+Unknown constraint keys fail closed. Primitive-specific evaluators can define
+new constraint keys, but the default manager does not silently ignore unknown
+policy language.
+
+## Issue, Delegate, Revoke
+
+All authority mutation goes through explicit v2 operations:
+
+- `issue(actor, subject, spec)`: `actor` must be trusted, or hold covering
+  `grant` or `admin` authority for the target resource.
+- `delegate(parent, child, spec)`: `parent` must hold a covering delegable
+  `allow` capability. Delegation can only attenuate resource, rights, expiry,
+  use count, constraints, and delegation depth. Child records cannot drop parent
+  constraints such as `shell_policy_level`.
+- `revoke(actor, cap_id)`: allowed for trusted issuers, the original issuer,
+  the holder relinquishing its own capability, or an actor with covering
+  `revoke`/`admin` authority.
+
+Runtime bootstrap, image bootstrap, human approval, admin CLI, checkpoint
+restore/fork, and tests use explicit trusted issuer paths and emit audit
+records. Trusted issuers are exact configured actor names, not broad prefixes.
+Ordinary AgentProcess, Skill, and JIT tool execution has no implicit signing
+authority.
+
+Fork and spawn inherit authority only through delegation/attenuation. Exec
+switches the image/tool table and may shrink capabilities, but it never grants
+the target image's declared `required_capabilities`.
+
+## Permission Policy And Human Approval
+
+Human-facing policy names are still used at prompts and CLI boundaries:
+
+- `always_allow` maps to `effect=allow`.
+- `always_deny` maps to `effect=deny`.
+- `ask_each_time` maps to `effect=ask`.
+- `allow_once` maps to `effect=allow, uses_remaining=1`.
+
+When `ask_each_time` applies, the primitive creates a human approval request and
+waits inside the operation. The caller eventually receives either the final
+payload or a final denial error; there is no exposed pending/retry syscall
+protocol.
+
+Approval context includes path, resource, overwrite risk, byte count, SHA-256,
+target state, argv, and escaped previews when available.
+
+## Tool, Skill, And JIT Boundary
+
+The process tool table controls LLM-facing tool visibility. Capabilities
+control primitive effects.
 
 For example, a process can see `write_text_file` and still fail to write
 `src/app.py` if it lacks write authority for
 `filesystem:workspace:src/app.py` or a covering subtree grant.
 
-The same rule applies to Skills and JIT tools. Loading a Skill can add
-`run_shell_command` or `swe_run` to one process table, but shell execution still
-requires shell authority and policy approval at the shell primitive.
+Loading a Skill can add instructions, existing tools, and Deno/TypeScript JIT
+tools to one process table. It does not grant filesystem, shell, human, object,
+process, image, checkpoint, or Skill source authority. JIT syscalls bypass the
+LLM-facing tool table, but they still enter the same primitive authorization
+path as built-in tools.
 
-## One-Shot Grants
+Default images expose `list_capabilities` and `inspect_capability` so a process
+can understand its own authority. `delegate_capability` and `revoke_capability`
+are registered static tools but are not included in default image tool tables.
 
-Permission policy can create one-shot capabilities. A one-shot grant is valid
-for one successful primitive use and is then consumed. Failed precondition
-checks do not silently convert into broad persistent authority.
+## CLI And Syscalls
 
-One-shot grants are used for per-use human approvals. They make approval
-decisions explicit in audit without permanently widening the process.
+The CLI supports:
 
-## Human Approval
+```bash
+uv run agent-libos capabilities list [--subject <pid>] [--include-inactive]
+uv run agent-libos capabilities inspect <capability_id>
+uv run agent-libos capabilities grant <subject> <resource> --rights read write
+uv run agent-libos capabilities delegate <parent> <child> <resource> --rights read
+uv run agent-libos capabilities revoke <capability_id> [--reason "..."]
+uv run agent-libos capabilities explain <subject> <resource> <right>
+```
 
-`request_permission` asks the human to choose a policy for a resource/right
-pair. Supported decisions include:
+Without `--actor-pid`, CLI commands run as audited admin operations. With
+`--actor-pid`, the command is executed as that process and strict capability
+checks apply.
 
-- `always_allow`: grant reusable authority.
-- `always_deny`: deny future attempts.
-- `ask_each_time`: prompt for approval at each primitive use.
+Deno/TypeScript JIT tools can use the syscall names:
 
-When `ask_each_time` applies, the primitive creates a human approval request and
-waits inside the operation. The caller eventually receives either the final
-payload or a final denial error.
+- `capability.list`
+- `capability.inspect`
+- `capability.request_permission`
+- `capability.delegate`
+- `capability.revoke`
 
-Approval context includes path, resource, overwrite risk, byte count, SHA-256,
-target state, and an escaped content preview when available.
+Syscalls do not consult the process tool table. They are authorized by pid,
+capability records, primitive rules, human approval, and audit.
 
 ## Filesystem Authority
 
-Filesystem capabilities can target:
-
-- exact files, such as `filesystem:workspace:README.md`,
-- directory subtrees, such as `filesystem:workspace:agent_outputs/*`,
-- the whole workspace, such as `filesystem:workspace:*`.
-
-Relative paths resolve from the caller process working directory. The
-filesystem primitive enforces workspace containment before host provider calls.
-Path strings that escape the workspace are rejected even if a model can produce
-them.
+Filesystem capabilities can target exact files, directory subtrees, or the
+whole workspace. Relative paths resolve from the caller process working
+directory. The filesystem primitive enforces workspace containment before host
+provider calls. Path strings that escape the workspace are rejected even if a
+model can produce them.
 
 Read, write, and delete are separate rights. Granting read over a directory does
 not grant write or delete.
 
-## Shell Policy
+## Shell Authority
 
 Shell execution is argv-only. The model-facing tool and syscall accept token
 arrays, not shell command strings. Pipes, redirects, wildcard expansion, and
@@ -105,26 +217,14 @@ command chaining must be requested explicitly through an interpreter executable
 such as `bash`, `sh`, `cmd`, or `powershell`, where policy matching can inspect
 the interpreter token.
 
-The built-in policy levels are:
+The built-in shell policy levels are:
 
 - `always_deny`: reject every shell command.
 - `allowlist_auto_else_ask`: allow configured safe argv rules, ask otherwise.
-- `blocklist_ask_else_auto`: ask for configured risky argv rules, allow
-  others.
+- `blocklist_ask_else_auto`: ask for configured risky argv rules, allow others.
 - `always_allow`: allow all commands. This is intentionally high risk.
 
 Allow and block lists match tokenized argv rules, not arbitrary substrings.
 Bare executable names do not match path-qualified executables by accident.
 Block-list checks also scan nested executable-looking argv tokens such as
 `bash`, `powershell`, `python`, or `curl`.
-
-## Child Authority
-
-Fork and spawn do not implicitly inherit broad external authority. A child can
-inherit only explicit subsets that the parent already holds. Tests cover the
-important non-escalation cases:
-
-- fork does not inherit parent filesystem write authority by default,
-- spawn creates a fresh child without parent memory or default caps,
-- a child cannot inherit broader authority than the parent has,
-- exec does not grant target-image required capabilities.

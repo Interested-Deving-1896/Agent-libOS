@@ -6,7 +6,9 @@ from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
+    CapabilityEffect,
     CapabilityRight,
+    CapabilitySpec,
     ForkMode,
     HumanRequestStatus,
     MemoryViewSpec,
@@ -209,6 +211,16 @@ class LibOSSyscallSession:
             return self._human_ask(args)
         if name in {"human.request_permission", "permission.request", "request_permission"}:
             return self._request_permission(args)
+        if name == "capability.list":
+            return self._capability_list(args)
+        if name == "capability.inspect":
+            return self._capability_inspect(args)
+        if name == "capability.request_permission":
+            return self._request_permission(args)
+        if name == "capability.delegate":
+            return self._capability_delegate(args)
+        if name == "capability.revoke":
+            return self._capability_revoke(args)
         if name in {"clock.now", "time.now"}:
             return self.runtime.clock.now(self.pid, tz=str(args.get("timezone") or self.config.tools.clock_timezone))
         if name in {"clock.sleep", "sleep"}:
@@ -520,6 +532,56 @@ class LibOSSyscallSession:
             "status": request.status.value,
             "decision": request.decision,
         }
+
+    def _capability_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        subject = str(args.get("subject") or self.pid)
+        if subject != self.pid:
+            raise CapabilityDenied("process syscalls may list only their own capabilities")
+        caps = self.runtime.capability.list_subject(
+            self.pid,
+            include_inactive=bool(args.get("include_inactive", False)),
+            limit=int(args["limit"]) if args.get("limit") is not None else None,
+        )
+        return {"capabilities": [self.runtime.capability.inspect(cap.cap_id) for cap in caps]}
+
+    def _capability_inspect(self, args: dict[str, Any]) -> dict[str, Any]:
+        cap = self.runtime.store.get_capability(str(args["capability_id"]))
+        if cap is None:
+            raise NotFound(f"capability not found: {args['capability_id']}")
+        if cap.subject != self.pid:
+            raise CapabilityDenied("process syscalls may inspect only their own capabilities")
+        return {"capability": self.runtime.capability.inspect(cap.cap_id)}
+
+    def _capability_delegate(self, args: dict[str, Any]) -> dict[str, Any]:
+        child_pid = str(args["child_pid"])
+        child = self.runtime.process.get(child_pid)
+        if child.parent_pid != self.pid:
+            raise CapabilityDenied("capability.delegate may target only a direct child process")
+        cap = self.runtime.capability.delegate(
+            self.pid,
+            child_pid,
+            CapabilitySpec(
+                resource=str(args["resource"]),
+                rights={str(right) for right in args.get("rights", [])},
+                effect=CapabilityEffect(str(args.get("effect", CapabilityEffect.ALLOW.value))),
+                constraints=dict(args.get("constraints") or {}),
+                metadata=dict(args.get("metadata") or {}),
+                expires_at=str(args["expires_at"]) if args.get("expires_at") is not None else None,
+                uses_remaining=int(args["uses_remaining"]) if args.get("uses_remaining") is not None else None,
+                delegable=bool(args.get("delegable", False)),
+                revocable=bool(args.get("revocable", True)),
+            ),
+            actor=self.pid,
+        )
+        return {"capability": self.runtime.capability.inspect(cap.cap_id)}
+
+    def _capability_revoke(self, args: dict[str, Any]) -> dict[str, Any]:
+        cap = self.runtime.capability.revoke(
+            str(args["capability_id"]),
+            revoked_by=self.pid,
+            reason=str(args["reason"]) if args.get("reason") is not None else None,
+        )
+        return {"capability": self.runtime.capability.inspect(cap.cap_id)}
 
     def _process_fork(self, args: dict[str, Any]) -> Any:
         mode = ForkMode(str(args.get("mode", ForkMode.WORKER.value)))

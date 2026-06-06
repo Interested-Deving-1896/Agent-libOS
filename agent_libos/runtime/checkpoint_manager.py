@@ -18,6 +18,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.external_effects import external_effect_summary, external_effect_to_json
 from agent_libos.storage import SQLiteStore
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
@@ -27,13 +28,15 @@ class CheckpointManager:
     """Durable checkpoints for reconstructable AgentProcess runtime state.
 
     Checkpoints deliberately do not roll back audit records, LLM calls, events,
-    or external provider side effects. Restore edits only the scoped process
-    subtree state that can be reconstructed from the checkpoint payload.
+    or external provider side effects. Provider-decided external effect records
+    are reported during diff/restore, while restore edits only the scoped
+    process subtree state that can be reconstructed from the checkpoint payload.
     """
 
     PROCESS_RESOURCE_PREFIX = "checkpoint:process:"
     CHECKPOINT_RESOURCE_PREFIX = "checkpoint:"
-    HISTORY_TABLES = {"audit_records", "events", "llm_calls", "checkpoints"}
+    HISTORY_TABLES = {"audit_records", "events", "llm_calls", "checkpoints", "external_effects"}
+    RESTORE_EXTERNAL_POLICY = "report_only"
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
     def __init__(
@@ -221,7 +224,9 @@ class CheckpointManager:
             "checkpoint_id": checkpoint_id,
             "pid": checkpoint.pid,
             "tables": tables,
-            "external_effects_since_checkpoint": self._external_effects_since(checkpoint),
+            "external_effects_since_checkpoint": self._external_effects_since(checkpoint, snapshot=snapshot),
+            "external_effect_summary": self._external_effect_summary_since(checkpoint, snapshot=snapshot),
+            "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
         }
 
     def restore(
@@ -236,7 +241,9 @@ class CheckpointManager:
             self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
         current_pids = self._subtree_pids(checkpoint.pid)
         snapshot_pids = list(snapshot.get("subtree_pids", []))
-        external_effects = self._external_effects_since(checkpoint)
+        external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
+        external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
+        external_effect_summary = self._external_effect_summary_since(checkpoint, pids=external_effect_pids)
         cancelled_human_requests = self._cancel_pending_human_requests(current_pids, checkpoint)
         superseded_messages = self._supersede_post_checkpoint_messages(current_pids, checkpoint)
         self._restore_scoped_rows(snapshot, current_pids)
@@ -250,6 +257,8 @@ class CheckpointManager:
                 "checkpoint_id": checkpoint_id,
                 "restored_pids": snapshot_pids,
                 "external_effects_since_checkpoint": len(external_effects),
+                "external_effect_summary": external_effect_summary,
+                "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
             },
         )
         self.audit.record(
@@ -263,6 +272,8 @@ class CheckpointManager:
                 "cancelled_human_requests": cancelled_human_requests,
                 "superseded_messages": superseded_messages,
                 "external_effects_since_checkpoint": external_effects,
+                "external_effect_summary": external_effect_summary,
+                "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
             },
         )
         return {
@@ -274,6 +285,8 @@ class CheckpointManager:
             "cancelled_human_requests": cancelled_human_requests,
             "superseded_messages": superseded_messages,
             "external_effects_since_checkpoint": external_effects,
+            "external_effect_summary": external_effect_summary,
+            "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
         }
 
     def rollback(self, pid: str, checkpoint_id: str) -> dict[str, Any]:
@@ -288,6 +301,7 @@ class CheckpointManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        self._validate_fork_parent(actor, parent_pid, require_capability=require_capability)
         if require_capability:
             self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.EXECUTE)
         remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid)
@@ -569,6 +583,17 @@ class CheckpointManager:
             return
         raise CapabilityDenied(f"{actor} lacks read on checkpoint {checkpoint.checkpoint_id}")
 
+    def _validate_fork_parent(self, actor: str, parent_pid: str | None, *, require_capability: bool) -> None:
+        if parent_pid is None:
+            return
+        if self.store.get_process(parent_pid) is None:
+            raise NotFound(f"process not found: {parent_pid}")
+        if not require_capability or actor == parent_pid:
+            return
+        if self.capabilities is None:
+            raise CapabilityDenied("checkpoint fork parent attachment requires a capability manager")
+        self.capabilities.require(actor, self.process_resource(parent_pid), CapabilityRight.ADMIN)
+
     def _subtree_pids(self, root_pid: str) -> list[str]:
         processes = {process.pid: process for process in self.store.list_processes()}
         if root_pid not in processes:
@@ -755,29 +780,42 @@ class CheckpointManager:
             if names is not None:
                 names.setdefault(handle.name, tool_id)
 
-    def _external_effects_since(self, checkpoint: Checkpoint) -> list[dict[str, Any]]:
-        effects: list[dict[str, Any]] = []
-        for record in self.store.list_audit():
-            if record.timestamp <= checkpoint.created_at:
-                continue
-            if record.action in {
-                "primitive.filesystem.write_text",
-                "primitive.filesystem.write_directory",
-                "primitive.filesystem.delete_file",
-                "primitive.filesystem.delete_directory",
-                "primitive.shell.run",
-            }:
-                effects.append(
-                    {
-                        "record_id": record.record_id,
-                        "timestamp": record.timestamp,
-                        "actor": record.actor,
-                        "action": record.action,
-                        "target": record.target,
-                        "decision": record.decision,
-                    }
-                )
-        return effects
+    def _external_effects_since(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        snapshot: dict[str, Any] | None = None,
+        pids: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        selected_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=pids)
+        records = self.store.list_external_effects(created_after=checkpoint.created_at, pids=selected_pids)
+        return [external_effect_to_json(record) for record in records]
+
+    def _external_effect_summary_since(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        snapshot: dict[str, Any] | None = None,
+        pids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        selected_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=pids)
+        return external_effect_summary(self.store.list_external_effects(created_after=checkpoint.created_at, pids=selected_pids))
+
+    def _external_effect_pids(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        snapshot: dict[str, Any] | None = None,
+        current_pids: Iterable[str] | None = None,
+    ) -> list[str]:
+        selected: set[str] = set()
+        if snapshot is not None:
+            selected.update(str(pid) for pid in snapshot.get("subtree_pids", []))
+        if current_pids is None:
+            selected.update(self._subtree_pids(checkpoint.pid))
+        else:
+            selected.update(str(pid) for pid in current_pids)
+        return sorted(selected)
 
     def _cancel_pending_human_requests(self, pids: list[str], checkpoint: Checkpoint) -> list[str]:
         cancelled: list[str] = []
@@ -981,6 +1019,10 @@ class CheckpointManager:
         item = dict(row)
         item["cap_id"] = capability_map[item["cap_id"]]
         item["subject"] = pid_map[item["subject"]]
+        if item.get("issuer_cap_id") in capability_map:
+            item["issuer_cap_id"] = capability_map[item["issuer_cap_id"]]
+        if item.get("parent_cap_id") in capability_map:
+            item["parent_cap_id"] = capability_map[item["parent_cap_id"]]
         resource = str(item["resource"])
         if resource.startswith("object:"):
             oid = resource.split(":", 1)[1]

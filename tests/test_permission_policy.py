@@ -67,6 +67,19 @@ class PermissionPolicyTests(unittest.TestCase):
         self.assertIn("denied write", denied.error or "")
         self.assertFalse((self.runtime.workspace_root / path).exists())
 
+    def test_request_permission_tool_rejects_unknown_right_before_human_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="request invalid right")
+        resource = self.runtime.filesystem.resource_for(self._path())
+
+        request = self.runtime.tools.call(
+            pid,
+            "request_permission",
+            {"resource": resource, "rights": ["*"], "reason": "invalid broad right"},
+        )
+
+        self.assertFalse(request.ok)
+        self.assertEqual(self.runtime.human.pending(), [])
+
     def test_ask_each_time_prompts_from_filesystem_primitive_and_consumes_one_time_grant(self) -> None:
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="ask every write")
         path = self._path()

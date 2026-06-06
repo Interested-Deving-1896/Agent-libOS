@@ -190,6 +190,27 @@ uv run agent-libos --db .agent_libos.sqlite skills untrust ~/.agent-libos/skills
 `--actor-pid <pid>` makes the CLI enforce that process's Skill, source, and
 trust capabilities.
 
+## Capability Commands
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite capabilities list --subject <pid>
+uv run agent-libos --db .agent_libos.sqlite capabilities inspect <capability_id>
+uv run agent-libos --db .agent_libos.sqlite capabilities explain <pid> filesystem:workspace:README.md read
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <child_pid> filesystem:workspace:src/* --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities revoke <capability_id> --reason "no longer needed"
+```
+
+Capability records are structured v2 authority statements: typed resource
+pattern, rights, `allow`/`deny`/`ask` effect, issuer lineage, delegation depth,
+status, expiry, use count, constraints, and metadata. One-shot approval is
+represented as `effect=allow` with `uses_remaining=1`.
+
+Without `--actor-pid`, capability commands run as an audited admin actor. With
+`--actor-pid`, the command runs as that process: `grant` requires grant/admin
+authority, `delegate` requires a covering delegable parent capability, and
+`revoke` requires holder, issuer, revoke, or admin authority.
+
 ## Benchmark Scripts
 
 ```bash

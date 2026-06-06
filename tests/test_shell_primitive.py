@@ -3,10 +3,17 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
-from agent_libos.models import CapabilityRight, HumanRequestStatus
+from agent_libos.models import (
+    CapabilityRight,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+    HumanRequestStatus,
+)
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.substrate import (
     CommandResult,
@@ -61,6 +68,17 @@ class ShellPrimitiveTests(unittest.TestCase):
             pid = runtime.process.spawn(image="review-agent:v0", goal="deny shell")
             runtime.shell.grant_policy(pid, runtime.config.shell.always_deny_level, issued_by="test")
             runtime.capability.grant(pid, "shell:git", [CapabilityRight.EXECUTE], issued_by="test")
+
+            with self.assertRaises(CapabilityDenied):
+                runtime.shell.run(pid, ["git", "status", "--short"])
+        finally:
+            runtime.close()
+
+    def test_non_shell_typed_wildcard_capability_does_not_enable_shell(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image="review-agent:v0", goal="typed wildcard shell")
+            runtime.capability.grant(pid, "filesystem:*", [CapabilityRight.EXECUTE], issued_by="test")
 
             with self.assertRaises(CapabilityDenied):
                 runtime.shell.run(pid, ["git", "status", "--short"])
@@ -223,6 +241,15 @@ class FakeShellProvider:
     def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
         self.calls.append((list(argv), timeout))
         return CommandResult(argv=list(argv), returncode=0, stdout=self.stdout, stderr=self.stderr)
+
+    def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+            state_mutation=True,
+            information_flow=True,
+            metadata={"operation": operation},
+        )
 
 
 if __name__ == "__main__":

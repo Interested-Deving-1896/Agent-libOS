@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight
+from agent_libos.models import (
+    CapabilityRight,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+)
 from agent_libos.substrate import CommandResult, LocalResourceProviderSubstrate
 
 
@@ -16,6 +21,15 @@ class RecordingShellProvider:
     def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
         self.calls.append((list(argv), cwd))
         return CommandResult(argv=list(argv), returncode=0, stdout="ok", stderr="")
+
+    def classify_external_effect(self, operation: str, context: dict, result: object) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+            state_mutation=True,
+            information_flow=True,
+            metadata={"operation": operation},
+        )
 
 
 class ProcessWorkingDirectoryTests(unittest.TestCase):
