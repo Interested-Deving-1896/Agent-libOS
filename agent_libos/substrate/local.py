@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 import time
@@ -8,12 +9,17 @@ from collections.abc import Callable
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
+    JsonRpcEndpointSpec,
+    JsonRpcMethodSpec,
+    JsonRpcTransportResult,
 )
 from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.substrate.base import (
@@ -253,6 +259,104 @@ class LocalHumanProvider:
         raise ValueError(f"unsupported human external effect operation: {operation}")
 
 
+class HttpJsonRpcProvider:
+    """HTTP JSON-RPC client provider used by the default substrate."""
+
+    class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+            return None
+
+    def call(
+        self,
+        endpoint: JsonRpcEndpointSpec,
+        method: JsonRpcMethodSpec,
+        request_body: bytes,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> JsonRpcTransportResult:
+        started = time.monotonic()
+        request = urlrequest.Request(
+            endpoint.url,
+            data=request_body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                **self._resolved_headers(endpoint),
+            },
+            method="POST",
+        )
+        opener = urlrequest.build_opener(self._NoRedirectHandler)
+        try:
+            with opener.open(request, timeout=timeout_s) as response:
+                body = response.read(max_response_bytes + 1)
+                too_large = len(body) > max_response_bytes
+                if too_large:
+                    body = body[:max_response_bytes]
+                return JsonRpcTransportResult(
+                    status_code=int(response.status),
+                    body=body,
+                    elapsed_s=time.monotonic() - started,
+                    response_bytes=len(body),
+                    too_large=too_large,
+                )
+        except urlerror.HTTPError as exc:
+            try:
+                body = exc.read(max_response_bytes + 1)
+                too_large = len(body) > max_response_bytes
+                if too_large:
+                    body = body[:max_response_bytes]
+                return JsonRpcTransportResult(
+                    status_code=int(exc.code),
+                    body=body,
+                    elapsed_s=time.monotonic() - started,
+                    response_bytes=len(body),
+                    too_large=too_large,
+                    error=str(exc),
+                )
+            finally:
+                exc.close()
+        except Exception as exc:
+            return JsonRpcTransportResult(
+                status_code=None,
+                body=b"",
+                elapsed_s=time.monotonic() - started,
+                response_bytes=0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation != "call":
+            raise ValueError(f"unsupported JSON-RPC external effect operation: {operation}")
+        method = context.get("method") if isinstance(context.get("method"), dict) else {}
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass(str(method.get("rollback_class"))),
+            rollback_status=ExternalEffectRollbackStatus(str(method.get("rollback_status"))),
+            state_mutation=bool(method.get("state_mutation")),
+            information_flow=bool(method.get("information_flow")),
+            metadata={
+                "endpoint_id": context.get("endpoint_id"),
+                "method_id": context.get("method_id"),
+                "rpc_method": context.get("rpc_method"),
+                "status": result.get("status") if isinstance(result, dict) else None,
+            },
+        )
+
+    def _resolved_headers(self, endpoint: JsonRpcEndpointSpec) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for name, spec in endpoint.headers.items():
+            value = os.environ.get(spec.env)
+            if value is None:
+                raise RuntimeError(f"missing environment variable for JSON-RPC header {name}: {spec.env}")
+            headers[name] = f"{spec.prefix}{value}{spec.suffix}"
+        return headers
+
+
 class LocalResourceProviderSubstrate:
     """Default Resource Provider Substrate backed by the host OS."""
 
@@ -263,3 +367,4 @@ class LocalResourceProviderSubstrate:
         self.clock = LocalClockProvider()
         self.shell = LocalShellProvider(self.workspace_root)
         self.human = LocalHumanProvider()
+        self.jsonrpc = HttpJsonRpcProvider()

@@ -225,6 +225,12 @@ class LibOSSyscallSession:
             return self.runtime.clock.now(self.pid, tz=str(args.get("timezone") or self.config.tools.clock_timezone))
         if name in {"clock.sleep", "sleep"}:
             return self.runtime.clock.asleep(self.pid, float(args.get("seconds", 0)))
+        if name == "jsonrpc.list":
+            return {"endpoints": self.runtime.jsonrpc.list_endpoints(actor=self.pid)}
+        if name == "jsonrpc.inspect":
+            return self.runtime.jsonrpc.inspect_endpoint(str(args["endpoint_id"]), actor=self.pid)
+        if name == "jsonrpc.call":
+            return self._jsonrpc_call(args)
         if name in {"process.get_working_directory", "process.cwd"}:
             return {"working_directory": self.runtime.process.working_directory(self.pid)}
         if name in {"process.set_working_directory", "process.chdir"}:
@@ -516,6 +522,15 @@ class LibOSSyscallSession:
             blocking=True,
         )
         return self._permission_request_result(request_id, args)
+
+    async def _jsonrpc_call(self, args: dict[str, Any]) -> dict[str, Any]:
+        result = await self.runtime.jsonrpc.acall(
+            self.pid,
+            endpoint_id=str(args["endpoint_id"]),
+            method_id=str(args["method_id"]),
+            params=args.get("params"),
+        )
+        return to_jsonable(result)
 
     async def _answer_human_question(self, request_id: str) -> dict[str, Any]:
         await self._resolve_human_request(request_id)

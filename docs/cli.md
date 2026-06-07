@@ -28,6 +28,7 @@ message       send a normal human process message
 interrupt     send a human interrupt process message
 checkpoint    checkpoint subcommands
 skills        Skill subcommands
+jsonrpc       JSON-RPC endpoint and call subcommands
 human         process pending human messages manually
 grant-tool    deprecated; image tool tables are fixed at creation
 ```
@@ -210,6 +211,26 @@ Without `--actor-pid`, capability commands run as an audited admin actor. With
 `--actor-pid`, the command runs as that process: `grant` requires grant/admin
 authority, `delegate` requires a covering delegable parent capability, and
 `revoke` requires holder, issuer, revoke, or admin authority.
+
+## JSON-RPC Commands
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml
+uv run agent-libos --db .agent_libos.sqlite jsonrpc list
+uv run agent-libos --db .agent_libos.sqlite jsonrpc inspect demo-weather
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
+uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
+uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
+```
+
+Registry commands accept `--actor-pid <pid>` to enforce that process's
+`jsonrpc_endpoint:*` or exact endpoint capabilities. Without `--actor-pid`,
+they run as audited admin registry operations.
+
+`jsonrpc call` always runs as the target process pid and requires that pid to
+hold the method capability, such as
+`jsonrpc:demo-weather:forecast read`. The CLI cannot supply arbitrary URLs,
+headers, raw JSON-RPC method names, or request ids.
 
 ## Benchmark Scripts
 

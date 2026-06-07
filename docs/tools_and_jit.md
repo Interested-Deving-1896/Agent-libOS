@@ -15,6 +15,7 @@ The current built-in tool surface includes tools for:
 - Process lifecycle: fork, spawn, wait, list children, signal, merge memory,
   exec, exit, cwd get/set, and process messages.
 - Shell: argv-only subprocess execution through policy.
+- JSON-RPC: list/inspect registered endpoints and call registered methods.
 - Image registry: load image manifests from YAML.
 - Checkpoint: create, list, inspect, diff, restore, and fork.
 - Skills: discover, inspect, load, unload, and load from workspace YAML.
@@ -130,6 +131,7 @@ The current syscall surface covers existing primitive areas:
 - clock now/sleep,
 - process cwd/fork/spawn/wait/list/signal/merge/exec/exit/messages,
 - shell run,
+- JSON-RPC list/inspect/call,
 - image load/register,
 - checkpoint create/list/inspect/diff/restore/fork/replay,
 - Skill discover/inspect/register/load/unload/load YAML.

@@ -27,6 +27,7 @@ from agent_libos.models import (
     ViewMode,
 )
 from agent_libos.runtime.runtime import Runtime
+from agent_libos.utils.serde import to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 
@@ -102,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
     _add_skills_parser_args(skills_parser)
     capabilities_parser = sub.add_parser("capabilities", help="List, inspect, grant, delegate, revoke, or explain capabilities")
     _add_capabilities_parser_args(capabilities_parser)
+    jsonrpc_parser = sub.add_parser("jsonrpc", help="Register, inspect, or call JSON-RPC over HTTP endpoints")
+    _add_jsonrpc_parser_args(jsonrpc_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
     grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
     grant_tool_parser.add_argument("pid")
@@ -148,6 +151,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_run_skills_command(runtime, args))
         elif args.command == "capabilities":
             _print_json(_run_capabilities_command(runtime, args))
+        elif args.command == "jsonrpc":
+            _print_json(_run_jsonrpc_command(runtime, args))
         elif args.command == "grant-tool":
             raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
         elif args.command == "human":
@@ -673,6 +678,87 @@ def _run_capabilities_command(runtime: Runtime, args: argparse.Namespace) -> dic
             _parse_json_mapping(args.context_json, "--context-json"),
         )
     raise SystemExit(f"unknown capabilities command: {command}")
+
+
+def _add_jsonrpc_parser_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--actor-pid",
+        help="If set, execute registry operations as this process and enforce JSON-RPC endpoint capabilities.",
+    )
+    sub = parser.add_subparsers(dest="jsonrpc_command", required=True)
+    register = sub.add_parser("register", help="Register a JSON-RPC endpoint manifest from YAML or JSON")
+    register.add_argument("path")
+    register.add_argument("--replace", action="store_true")
+    list_parser = sub.add_parser("list", help="List registered JSON-RPC endpoint metadata")
+    list_parser.add_argument("--text")
+    list_parser.add_argument("--limit", type=int)
+    inspect = sub.add_parser("inspect", help="Inspect one registered JSON-RPC endpoint")
+    inspect.add_argument("endpoint_id")
+    call = sub.add_parser("call", help="Call a registered JSON-RPC method as a process")
+    call.add_argument("pid")
+    call.add_argument("endpoint_id")
+    call.add_argument("method_id")
+    call.add_argument("--params-json", help="JSON-RPC params value. Omit for no params member.")
+    unregister = sub.add_parser("unregister", help="Delete a registered JSON-RPC endpoint")
+    unregister.add_argument("endpoint_id")
+
+
+def _run_jsonrpc_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+    actor = args.actor_pid or "cli"
+    require_capability = args.actor_pid is not None
+    command = args.jsonrpc_command
+    if command == "register":
+        if require_capability:
+            cwd = runtime.process.working_directory(actor)
+            read = runtime.filesystem.read_text(
+                actor,
+                args.path,
+                max_bytes=runtime.config.jsonrpc.manifest_max_bytes,
+                cwd=cwd,
+            )
+            return runtime.jsonrpc.register_endpoint_from_yaml_text(
+                read.content,
+                actor=actor,
+                replace=args.replace,
+                require_capability=True,
+                source=read.path,
+            )
+        path = Path(args.path).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        if not path.exists() or not path.is_file():
+            raise SystemExit(f"JSON-RPC endpoint manifest does not exist: {path}")
+        return runtime.jsonrpc.register_endpoint_from_yaml_text(
+            path.read_text(encoding="utf-8"),
+            actor=actor,
+            replace=args.replace,
+            require_capability=False,
+            source=str(path),
+        )
+    if command == "list":
+        return runtime.jsonrpc.list_endpoints(
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+            text=args.text,
+            limit=args.limit,
+        )
+    if command == "inspect":
+        return runtime.jsonrpc.inspect_endpoint(
+            args.endpoint_id,
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+        )
+    if command == "call":
+        params = _parse_json_value(args.params_json) if args.params_json is not None else None
+        return to_jsonable(runtime.jsonrpc.call(args.pid, args.endpoint_id, args.method_id, params))
+    if command == "unregister":
+        return runtime.jsonrpc.unregister_endpoint(
+            args.endpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+    raise SystemExit(f"unknown jsonrpc command: {command}")
 
 
 def _capability_spec_from_args(args: argparse.Namespace) -> CapabilitySpec:

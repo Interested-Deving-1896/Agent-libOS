@@ -37,6 +37,7 @@ Useful smoke commands:
 uv run agent-libos --help
 uv run agent-libos checkpoint --help
 uv run agent-libos skills --help
+uv run agent-libos jsonrpc --help
 uv run python experiments/run_benchmark.py --help
 uv run python experiments/collect_metrics.py --help
 ```
@@ -102,6 +103,7 @@ Current default groups include:
 - filesystem and Object Memory size limits,
 - Deno sandbox limits and JSR import allowlist,
 - shell policy allow/block lists,
+- JSON-RPC endpoint manifest, timeout, and request/response limits,
 - image registry limits,
 - Object Memory and LLM context defaults,
 - checkpoint snapshot limits,
@@ -140,6 +142,8 @@ Preserve the boundary:
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
 - Skills change visibility and prompt materialization only;
+- JSON-RPC remote calls use registered endpoints and primitive capabilities
+  rather than model-supplied URLs or secrets;
 - checkpoint restore is scoped and append-only outside reconstructable state;
   provider-classified external effects are report-only in v1.
 

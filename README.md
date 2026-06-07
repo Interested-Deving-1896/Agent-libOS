@@ -37,13 +37,16 @@ The implementation currently includes:
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
-  human I/O backends.
+  human I/O backends, plus a JSON-RPC over HTTP client provider for
+  pre-registered remote endpoints.
 - SQLite persistence for process/object metadata, capabilities, messages,
   human requests, LLM calls, events, audit records, tools, Skill/JIT metadata,
   and scoped checkpoints.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
   candidates without granting resource authority.
+- Client-only JSON-RPC 2.0 over HTTP through registered endpoints, method
+  capabilities, provider-classified external effects, audit, and checkpoints.
 - A deterministic runtime-safety benchmark harness with 20 checked-in tasks,
   baselines, side-effect oracle, and metrics collection.
 
@@ -61,6 +64,8 @@ Start here, then read the deeper references as needed:
   file/object bridge, context materialization, and payload persistence.
 - [docs/tools_and_jit.md](docs/tools_and_jit.md): built-in tools,
   ToolBroker, Deno/TypeScript JIT tools, syscall protocol, and sandbox rules.
+- [docs/jsonrpc.md](docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
+  capability resources, tools, syscalls, and checkpoint behavior.
 - [docs/skills.md](docs/skills.md): Skill manifest v1, workspace/global
   sources, trust, load/unload semantics, bundled JIT tools, and `swe-agent:v0`.
 - [docs/checkpoints.md](docs/checkpoints.md): scoped snapshots, restore, fork,
@@ -184,6 +189,14 @@ uv run agent-libos --db .agent_libos.sqlite skills register skills/swe_agent.yam
 uv run agent-libos --db .agent_libos.sqlite skills load <pid> swe-agent:v0
 ```
 
+Register and call a preconfigured JSON-RPC endpoint:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
+uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
+```
+
 Inspect or change runtime authority:
 
 ```bash
@@ -213,7 +226,7 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   allow/deny/ask effects, issuer lineage, delegation depth, status, expiry, and
   optional use counts.
 - Skills and JIT tools do not grant filesystem, shell, human, object, process,
-  image, or checkpoint authority.
+  image, checkpoint, or JSON-RPC remote authority.
 - JIT syscalls bypass the LLM-facing tool table but not primitive capability
   checks, permission policy, human approval, or audit.
 - Human approval is part of a primitive/syscall. Callers see a final success or

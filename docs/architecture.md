@@ -30,12 +30,14 @@ Agent personality / application
      - clock provider
      - shell provider
      - human provider
+     - JSON-RPC over HTTP provider
   -> host backend
      - local workspace filesystem
      - host clock
      - subprocess backend
      - terminal or UI human I/O
-     - future remote, container, WASM, or service providers
+     - pre-registered remote JSON-RPC endpoints
+     - future container, WASM, or service providers
 ```
 
 The Skills and tools layer exists for LLM ergonomics. It presents stable action
@@ -65,8 +67,9 @@ but v1 does not apply external compensation.
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
 - `HumanObjectManager` owns questions, approvals, terminal queue processing,
   and human output.
-- `FilesystemAdapter`, `ShellAdapter`, and `ClockPrimitive` expose protected
-  primitive operations over provider backends.
+- `FilesystemAdapter`, `ShellAdapter`, `ClockPrimitive`, and
+  `JsonRpcPrimitive` expose protected primitive operations over provider
+  backends.
 - `ToolBroker` registers static tools and process-local JIT tools.
 - `SkillManager` registers trusted Skill specs and loads them into process tool
   tables.
@@ -99,6 +102,11 @@ Putting a tool in a process table never grants access to files, shell,
 terminal/human I/O, Object Memory, image registration, checkpoints, or other
 resources.
 
+Likewise, `call_jsonrpc_method` visibility never grants network authority. The
+JSON-RPC primitive accepts only endpoint and method ids, resolves URLs and
+env-backed headers from the registry, then checks `jsonrpc:<endpoint>:<method>`
+capabilities before the provider performs a POST.
+
 ## Primitive Boundary
 
 Primitives are the runtime boundary. They are responsible for:
@@ -125,6 +133,7 @@ SQLite stores durable runtime metadata and append-only records:
 - tools and JIT candidates,
 - Skill registry and trust rows,
 - image registry metadata,
+- JSON-RPC endpoint registry rows,
 - checkpoints and checkpoint payload snapshots,
 - provider-decided external effect records,
 - events and audit records,
@@ -148,7 +157,7 @@ agent_libos/
   llm/             prompt, context, OpenAI-compatible client, executor, action parser
   memory/          typed Object Memory and MemoryView implementation
   models/          dataclass and enum models split by runtime domain
-  primitives/      libOS primitives for filesystem, clock, shell, git, and placeholders
+  primitives/      libOS primitives for filesystem, clock, shell, JSON-RPC, and placeholders
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations

@@ -22,6 +22,9 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     HumanRequest,
     HumanRequestStatus,
+    JsonRpcEndpointSpec,
+    JsonRpcHeaderSpec,
+    JsonRpcMethodSpec,
     LLMCallRecord,
     MemoryView,
     ObjectFilter,
@@ -304,6 +307,14 @@ class SQLiteStore:
                   UNIQUE(source_type, source, manifest_sha256)
                 );
 
+                CREATE TABLE IF NOT EXISTS jsonrpc_endpoints (
+                  endpoint_id TEXT PRIMARY KEY,
+                  spec_json TEXT NOT NULL,
+                  registered_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS tools (
                   tool_id TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
@@ -335,6 +346,7 @@ class SQLiteStore:
             self._ensure_checkpoint_schema()
             self._ensure_external_effect_schema()
             self._ensure_skill_schema()
+            self._ensure_jsonrpc_endpoint_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -1136,6 +1148,52 @@ class SQLiteStore:
     def list_skill_trust(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._query("SELECT * FROM skill_trust ORDER BY created_at, source")]
 
+    def upsert_jsonrpc_endpoint(self, endpoint: JsonRpcEndpointSpec, *, registered_by: str, created_at: str) -> None:
+        self._execute(
+            """
+            INSERT INTO jsonrpc_endpoints (
+                endpoint_id, spec_json, registered_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(endpoint_id) DO UPDATE SET
+                spec_json = excluded.spec_json,
+                registered_by = excluded.registered_by,
+                updated_at = excluded.updated_at
+            """,
+            (
+                endpoint.endpoint_id,
+                dumps(endpoint),
+                registered_by,
+                created_at,
+                created_at,
+            ),
+        )
+
+    def get_jsonrpc_endpoint(self, endpoint_id: str) -> tuple[JsonRpcEndpointSpec, dict[str, Any]] | None:
+        rows = self._query("SELECT * FROM jsonrpc_endpoints WHERE endpoint_id = ?", (endpoint_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        return self._dict_to_jsonrpc_endpoint(loads(row["spec_json"], {})), self._jsonrpc_endpoint_row_metadata(row)
+
+    def list_jsonrpc_endpoints(self, text: str | None = None, limit: int | None = None) -> list[tuple[JsonRpcEndpointSpec, dict[str, Any]]]:
+        params: list[Any] = []
+        sql = "SELECT * FROM jsonrpc_endpoints"
+        if text:
+            needle = f"%{text.lower()}%"
+            sql += " WHERE lower(endpoint_id) LIKE ? OR lower(spec_json) LIKE ?"
+            params.extend([needle, needle])
+        sql += " ORDER BY endpoint_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [
+            (self._dict_to_jsonrpc_endpoint(loads(row["spec_json"], {})), self._jsonrpc_endpoint_row_metadata(row))
+            for row in self._query(sql, params)
+        ]
+
+    def delete_jsonrpc_endpoint(self, endpoint_id: str) -> None:
+        self._execute("DELETE FROM jsonrpc_endpoints WHERE endpoint_id = ?", (endpoint_id,))
+
     def insert_checkpoint(self, checkpoint: Checkpoint, snapshot: dict[str, Any]) -> None:
         self._execute(
             """
@@ -1309,6 +1367,19 @@ class SQLiteStore:
               metadata_json TEXT NOT NULL,
               UNIQUE(source_type, source, manifest_sha256)
             );
+            """
+        )
+
+    def _ensure_jsonrpc_endpoint_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jsonrpc_endpoints (
+              endpoint_id TEXT PRIMARY KEY,
+              spec_json TEXT NOT NULL,
+              registered_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
             """
         )
 
@@ -1660,6 +1731,46 @@ class SQLiteStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def _jsonrpc_endpoint_row_metadata(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "registered_by": row["registered_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _dict_to_jsonrpc_endpoint(self, data: dict[str, Any]) -> JsonRpcEndpointSpec:
+        return JsonRpcEndpointSpec(
+            schema_version=int(data.get("schema_version", 1)),
+            endpoint_id=data["endpoint_id"],
+            url=data["url"],
+            headers={
+                str(name): JsonRpcHeaderSpec(
+                    env=str(value["env"]),
+                    prefix=str(value.get("prefix", "")),
+                    suffix=str(value.get("suffix", "")),
+                )
+                for name, value in dict(data.get("headers") or {}).items()
+            },
+            methods=[
+                JsonRpcMethodSpec(
+                    method_id=item["method_id"],
+                    rpc_method=item["rpc_method"],
+                    right=item["right"],
+                    rollback_class=item["rollback_class"],
+                    rollback_status=item.get("rollback_status"),
+                    state_mutation=bool(item["state_mutation"]),
+                    information_flow=bool(item["information_flow"]),
+                    params_schema=dict(item.get("params_schema") or {}),
+                    metadata=dict(item.get("metadata") or {}),
+                )
+                for item in list(data.get("methods") or [])
+            ],
+            timeout_s=float(data["timeout_s"]),
+            max_request_bytes=int(data["max_request_bytes"]),
+            max_response_bytes=int(data["max_response_bytes"]),
+            metadata=dict(data.get("metadata") or {}),
+        )
 
     def _dict_to_skill_spec(self, data: dict[str, Any]) -> SkillSpec:
         return SkillSpec(

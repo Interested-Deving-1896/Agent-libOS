@@ -25,6 +25,11 @@ from agent_libos.tools.builtin.filesystem import (
 from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
 from agent_libos.tools.builtin.images import LoadImageFromYamlTool
 from agent_libos.tools.builtin.jit import ProposeJitTool, RegisterJitTool, ValidateJitTool
+from agent_libos.tools.builtin.jsonrpc import (
+    CallJsonRpcMethodTool,
+    InspectJsonRpcEndpointTool,
+    ListJsonRpcEndpointsTool,
+)
 from agent_libos.tools.builtin.memory import (
     AppendMemoryObjectTool,
     CreateMemoryNamespaceTool,
@@ -62,6 +67,7 @@ __all__ = [
     "CreateObjectFromFileTool",
     "CreateCheckpointTool",
     "AppendMemoryObjectTool",
+    "CallJsonRpcMethodTool",
     "DeleteDirectoryTool",
     "DeleteFileTool",
     "DelegateCapabilityTool",
@@ -74,6 +80,7 @@ __all__ = [
     "AskHumanTool",
     "HumanOutputTool",
     "InspectCheckpointTool",
+    "InspectJsonRpcEndpointTool",
     "InspectCapabilityTool",
     "InspectSkillTool",
     "LoadImageFromYamlTool",
@@ -84,6 +91,7 @@ __all__ = [
     "ListChildProcessesTool",
     "ListCapabilitiesTool",
     "ListCheckpointsTool",
+    "ListJsonRpcEndpointsTool",
     "MergeChildMemoryTool",
     "ParsePytestLogTool",
     "ProcessExitTool",

@@ -36,6 +36,14 @@ from agent_libos.models.external_effect import (
     ExternalEffectRollbackStatus,
 )
 from agent_libos.models.human import HumanRequest, HumanRequestStatus
+from agent_libos.models.jsonrpc import (
+    JsonRpcCallResult,
+    JsonRpcCallStatus,
+    JsonRpcEndpointSpec,
+    JsonRpcHeaderSpec,
+    JsonRpcMethodSpec,
+    JsonRpcTransportResult,
+)
 from agent_libos.models.llm import LLMCallRecord
 from agent_libos.models.memory import (
     AgentObject,
@@ -104,6 +112,12 @@ __all__ = [
     "HumanRequest",
     "HumanRequestID",
     "HumanRequestStatus",
+    "JsonRpcCallResult",
+    "JsonRpcCallStatus",
+    "JsonRpcEndpointSpec",
+    "JsonRpcHeaderSpec",
+    "JsonRpcMethodSpec",
+    "JsonRpcTransportResult",
     "LLMCallRecord",
     "MaterializedContext",
     "MemoryView",

@@ -6,6 +6,7 @@ from datetime import datetime, tzinfo
 from typing import Any, Protocol
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import JsonRpcEndpointSpec, JsonRpcMethodSpec, JsonRpcTransportResult
 from agent_libos.models.external_effect import ExternalEffectClassification
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -120,6 +121,25 @@ class HumanProvider(Protocol):
     ) -> ExternalEffectClassification: ...
 
 
+class JsonRpcProvider(Protocol):
+    def call(
+        self,
+        endpoint: JsonRpcEndpointSpec,
+        method: JsonRpcMethodSpec,
+        request_body: bytes,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> JsonRpcTransportResult: ...
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
+
+
 class ResourceProviderSubstrate(Protocol):
     """Collection of host-effect providers behind libOS primitives.
 
@@ -132,4 +152,5 @@ class ResourceProviderSubstrate(Protocol):
     clock: ClockProvider
     shell: ShellProvider
     human: HumanProvider
+    jsonrpc: JsonRpcProvider
     workspace_display: str

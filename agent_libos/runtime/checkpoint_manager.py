@@ -206,7 +206,7 @@ class CheckpointManager:
             self._require_checkpoint_or_process_read(actor, checkpoint)
         current = self._build_current_state_for_diff(snapshot)
         tables: dict[str, Any] = {}
-        for table in ["processes", "objects", "capabilities", "process_messages", "tool_candidates", "skills"]:
+        for table in ["processes", "objects", "capabilities", "process_messages", "tool_candidates", "skills", "jsonrpc_endpoints"]:
             before = self._index_rows(table, snapshot["rows"].get(table, []))
             after = self._index_rows(table, current.get(table, []))
             added = sorted(set(after) - set(before))
@@ -389,17 +389,19 @@ class CheckpointManager:
         process_rows = [self._safe_point_process_row(row, checkpoint_id) for row in self._rows_by_ids("processes", "pid", subtree_pids)]
         object_oids = self._scoped_object_oids(process_rows, subtree_pids)
         namespace_names = self._scoped_namespaces(object_oids, subtree_pids)
+        capability_rows = self._capability_rows_for_subjects(subtree_pids)
         rows = {
             "processes": process_rows,
             "object_namespaces": self._rows_by_ids("object_namespaces", "namespace", namespace_names),
             "objects": self._rows_by_ids("objects", "oid", object_oids),
             "object_links": self._link_rows_for_objects(object_oids),
-            "capabilities": self._capability_rows_for_subjects(subtree_pids),
+            "capabilities": capability_rows,
             "process_messages": self._message_rows_for_recipients(subtree_pids),
             "skills": self._skill_rows_for_processes(process_rows),
             "skill_trust": self._skill_trust_rows_for_processes(process_rows),
             "tools": self._tool_rows_for_processes(process_rows),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", subtree_pids),
+            "jsonrpc_endpoints": self._jsonrpc_endpoint_rows_for_capabilities(capability_rows),
         }
         object_payloads = self._object_payload_snapshot(object_oids)
         return {
@@ -457,6 +459,8 @@ class CheckpointManager:
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
                     self._insert_row(cur, "tools", row)
+            for row in rows.get("jsonrpc_endpoints", []):
+                self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("process_messages", []):
                 self._upsert_row(cur, "process_messages", row, "message_id")
             for row in rows.get("processes", []):
@@ -542,6 +546,8 @@ class CheckpointManager:
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
                     self._insert_row(cur, "tools", row)
+            for row in rows.get("jsonrpc_endpoints", []):
+                self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
             self.store.conn.commit()
@@ -670,6 +676,27 @@ class CheckpointManager:
     def _capability_rows_for_subjects(self, pids: list[str]) -> list[dict[str, Any]]:
         rows = self._rows_by_ids("capabilities", "subject", pids)
         return [row for row in rows if not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)]
+
+    def _jsonrpc_endpoint_rows_for_capabilities(self, capability_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        endpoint_ids: set[str] = set()
+        include_all = False
+        for row in capability_rows:
+            resource = str(row.get("resource") or "")
+            if resource in {"jsonrpc:*", "jsonrpc_endpoint:*"}:
+                include_all = True
+                continue
+            if resource.startswith("jsonrpc_endpoint:"):
+                endpoint_id = resource.split(":", 1)[1]
+                if endpoint_id and endpoint_id != "*":
+                    endpoint_ids.add(endpoint_id)
+                continue
+            if resource.startswith("jsonrpc:"):
+                parts = resource.split(":")
+                if len(parts) >= 2 and parts[1] and parts[1] != "*":
+                    endpoint_ids.add(parts[1])
+        if include_all:
+            return self.store.select_table_rows("jsonrpc_endpoints", order_by="endpoint_id")
+        return self._rows_by_ids("jsonrpc_endpoints", "endpoint_id", sorted(endpoint_ids))
 
     def _message_rows_for_recipients(self, pids: list[str]) -> list[dict[str, Any]]:
         return self._rows_by_ids("process_messages", "recipient_pid", pids)
@@ -860,6 +887,11 @@ class CheckpointManager:
             "process_messages": self._message_rows_for_recipients(pids),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", pids),
             "skills": self._skill_rows_for_processes(process_rows),
+            "jsonrpc_endpoints": self._rows_by_ids(
+                "jsonrpc_endpoints",
+                "endpoint_id",
+                [row["endpoint_id"] for row in snapshot.get("rows", {}).get("jsonrpc_endpoints", [])],
+            ),
         }
 
     def _index_rows(self, table: str, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -870,6 +902,7 @@ class CheckpointManager:
             "process_messages": "message_id",
             "tool_candidates": "candidate_id",
             "skills": "skill_id",
+            "jsonrpc_endpoints": "endpoint_id",
         }
         key = key_by_table[table]
         return {str(row[key]): row for row in rows}

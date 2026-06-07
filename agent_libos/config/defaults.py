@@ -216,6 +216,25 @@ class ShellDefaults:
 
 
 @dataclass(frozen=True)
+class JsonRpcDefaults:
+    registry_resource: str = "jsonrpc_endpoint:*"
+    endpoint_id_max_chars: int = 96
+    method_id_max_chars: int = 96
+    rpc_method_max_chars: int = 256
+    header_name_max_chars: int = 128
+    header_value_max_chars: int = 8_192
+    manifest_max_bytes: int = 262_144
+    timeout_s: float = 10.0
+    timeout_hard_limit_s: float = 60.0
+    max_request_bytes: int = 65_536
+    max_response_bytes: int = 1_048_576
+    max_request_hard_limit_bytes: int = 1_048_576
+    max_response_hard_limit_bytes: int = 8_388_608
+    list_limit: int = 100
+    audit_preview_chars: int = 512
+
+
+@dataclass(frozen=True)
 class ImageDefaults:
     registry_resource: str = "image:*"
     id_max_chars: int = 128
@@ -318,6 +337,7 @@ class AgentLibOSConfig:
     llm: LLMDefaults = field(default_factory=LLMDefaults)
     tools: ToolDefaults = field(default_factory=ToolDefaults)
     shell: ShellDefaults = field(default_factory=ShellDefaults)
+    jsonrpc: JsonRpcDefaults = field(default_factory=JsonRpcDefaults)
     image: ImageDefaults = field(default_factory=ImageDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)

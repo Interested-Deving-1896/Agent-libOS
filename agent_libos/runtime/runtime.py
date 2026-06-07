@@ -6,7 +6,7 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, ShellAdapter
+from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, JsonRpcPrimitive, ShellAdapter
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.images import build_default_images
 from agent_libos.llm.client import LLMClient
@@ -23,11 +23,12 @@ from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import SQLiteStore
-from agent_libos.substrate import LocalResourceProviderSubstrate, ResourceProviderSubstrate
+from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.builtin import (
     AskHumanTool,
     AppendMemoryObjectTool,
+    CallJsonRpcMethodTool,
     CreateMemoryNamespaceTool,
     CreateMemoryObjectTool,
     CreateCheckpointTool,
@@ -46,6 +47,7 @@ from agent_libos.tools.builtin import (
     HumanOutputTool,
     InspectCapabilityTool,
     InspectCheckpointTool,
+    InspectJsonRpcEndpointTool,
     InspectSkillTool,
     LoadImageFromYamlTool,
     LoadSkillFromYamlTool,
@@ -53,6 +55,7 @@ from agent_libos.tools.builtin import (
     ListChildProcessesTool,
     ListCapabilitiesTool,
     ListCheckpointsTool,
+    ListJsonRpcEndpointsTool,
     ListMemoryNamespaceTool,
     MergeChildMemoryTool,
     ParsePytestLogTool,
@@ -141,6 +144,15 @@ class Runtime:
             self.events,
             human=self.human,
             provider=self.substrate.shell,
+            config=self.config,
+        )
+        self.jsonrpc = JsonRpcPrimitive(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            human=self.human,
+            provider=getattr(self.substrate, "jsonrpc", HttpJsonRpcProvider()),
             config=self.config,
         )
         self.tools = ToolBroker(
@@ -538,12 +550,15 @@ class Runtime:
         self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
         self.tools.register_tool(AskHumanTool(), registered_by="runtime")
         self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
+        self.tools.register_tool(CallJsonRpcMethodTool(), registered_by="runtime")
         self.tools.register_tool(InspectCapabilityTool(), registered_by="runtime")
         self.tools.register_tool(InspectCheckpointTool(), registered_by="runtime")
+        self.tools.register_tool(InspectJsonRpcEndpointTool(), registered_by="runtime")
         self.tools.register_tool(InspectSkillTool(), registered_by="runtime")
         self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
         self.tools.register_tool(ListCapabilitiesTool(), registered_by="runtime")
         self.tools.register_tool(ListCheckpointsTool(), registered_by="runtime")
+        self.tools.register_tool(ListJsonRpcEndpointsTool(), registered_by="runtime")
         self.tools.register_tool(LoadSkillFromYamlTool(), registered_by="runtime")
         self.tools.register_tool(LoadSkillTool(), registered_by="runtime")
         self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")

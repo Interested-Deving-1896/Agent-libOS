@@ -73,6 +73,10 @@ Important resource conventions include:
 - `skill_trust:*` or `skill_trust:<sha256>` for global Skill trust.
 - `checkpoint:process:<pid>`, `checkpoint:<checkpoint_id>`, and
   `checkpoint:*` for checkpoint operations.
+- `jsonrpc_endpoint:<endpoint_id>` and `jsonrpc_endpoint:*` for JSON-RPC
+  endpoint registry metadata.
+- `jsonrpc:<endpoint_id>:<method_id>`, `jsonrpc:<endpoint_id>:*`, and
+  `jsonrpc:*` for JSON-RPC method invocation.
 
 Wildcard syntax is terminal only. `kind:*` is a typed prefix pattern and
 `kind:body/*` is a subtree pattern. Bare global `*` is rejected; authority must
@@ -162,9 +166,9 @@ For example, a process can see `write_text_file` and still fail to write
 
 Loading a Skill can add instructions, existing tools, and Deno/TypeScript JIT
 tools to one process table. It does not grant filesystem, shell, human, object,
-process, image, checkpoint, or Skill source authority. JIT syscalls bypass the
-LLM-facing tool table, but they still enter the same primitive authorization
-path as built-in tools.
+process, image, checkpoint, JSON-RPC, or Skill source authority. JIT syscalls
+bypass the LLM-facing tool table, but they still enter the same primitive
+authorization path as built-in tools.
 
 Default images expose `list_capabilities` and `inspect_capability` so a process
 can understand its own authority. `delegate_capability` and `revoke_capability`
@@ -197,6 +201,32 @@ Deno/TypeScript JIT tools can use the syscall names:
 
 Syscalls do not consult the process tool table. They are authorized by pid,
 capability records, primitive rules, human approval, and audit.
+
+## JSON-RPC Authority
+
+Remote JSON-RPC calls are pre-registered endpoint resources. Agents cannot pass
+URLs or secrets at call time.
+
+Registry inspection and mutation use endpoint resources:
+
+```text
+jsonrpc_endpoint:demo-weather
+jsonrpc_endpoint:*
+```
+
+Method calls use method resources:
+
+```text
+jsonrpc:demo-weather:forecast
+jsonrpc:demo-weather:*
+jsonrpc:*
+```
+
+The required right comes from the endpoint method spec: `read`, `write`, or
+`execute`. Granting `jsonrpc_endpoint:* read` allows endpoint discovery, not
+method invocation. Granting `jsonrpc:demo-weather:forecast read` allows that
+specific remote method, subject to primitive validation, human approval,
+provider classification, audit, and external-effect recording.
 
 ## Filesystem Authority
 

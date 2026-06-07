@@ -17,6 +17,7 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - JIT candidates and registered process-local JIT tools,
 - Skill registry rows needed by loaded Skills,
 - loaded Skill records,
+- JSON-RPC endpoint definitions referenced by subtree capabilities,
 - mailbox delivery state,
 - image definitions needed by the subtree.
 
@@ -34,8 +35,8 @@ Restore never deletes:
 
 Restore itself appends new audit and event records.
 
-External filesystem, shell, image, network, and provider effects are not rolled
-back. Providers classify their own effects as:
+External filesystem, shell, image, JSON-RPC remote calls, and provider effects
+are not rolled back. Providers classify their own effects as:
 
 - `irreversible`,
 - `rollbackable`,
@@ -122,6 +123,9 @@ the process receives a coherent action result.
 If irreversible provider effects exist after the checkpoint, restore still
 continues by default. The irreversible effects stay in append-only history and
 in the restore report.
+
+JSON-RPC endpoint registry rows captured by the snapshot are restored by
+upsert. Restore and fork do not delete unrelated endpoint registry state.
 
 ## Fork From Checkpoint
 
