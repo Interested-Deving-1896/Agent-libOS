@@ -75,6 +75,35 @@ class CapabilityV2ManagerTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_permission_policy_constraint_is_converted_not_evaluated_as_runtime_policy(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="policy conversion")
+            converted = runtime.capability.grant(
+                pid,
+                "object:converted-policy",
+                [CapabilityRight.READ],
+                issued_by="test",
+                constraints={runtime.capability.POLICY_KEY: runtime.capability.ALWAYS_DENY},
+            )
+            injected = runtime.capability.issue_trusted(
+                pid,
+                "object:injected-policy",
+                [CapabilityRight.READ],
+                issued_by="test",
+                constraints={runtime.capability.POLICY_KEY: runtime.capability.ALWAYS_ALLOW},
+            )
+
+            converted_decision = runtime.capability.authorize(pid, "object:converted-policy", CapabilityRight.READ)
+            injected_decision = runtime.capability.authorize(pid, "object:injected-policy", CapabilityRight.READ)
+
+            self.assertEqual(converted.effect, CapabilityEffect.DENY)
+            self.assertFalse(converted_decision.allowed)
+            self.assertFalse(injected_decision.allowed)
+            self.assertFalse(injected_decision.constraint_results[runtime.capability.POLICY_KEY]["ok"])
+        finally:
+            runtime.close()
+
     def test_issue_requires_trusted_actor_or_grant_authority(self) -> None:
         runtime = Runtime.open("local")
         try:

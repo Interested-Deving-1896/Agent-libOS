@@ -14,6 +14,7 @@ Agent personality / application
      - tool schemas
      - Deno/TypeScript JIT candidates
   -> Agent libOS runtime
+     - trusted startup module loader
      - scheduler
      - process manager
      - Object Memory manager
@@ -44,6 +45,13 @@ The Skills and tools layer exists for LLM ergonomics. It presents stable action
 names, schemas, summaries, and workflow instructions. It does not own external
 authority.
 
+Startup Runtime Modules are different from Skills. A module is trusted Python
+host code loaded before `Runtime.open()` returns. Modules extend the runtime
+composition root by registering tools, images, syscalls, provider hooks, and
+startup hooks. Because modules run in the host interpreter, they are part of
+the runtime trusted computing base and are gated by manifest hash trust rather
+than by process capabilities.
+
 The runtime owns agent-level semantics: process identity, capability checks,
 approval, event emission, audit, process wakeups, checkpointing, and durable
 metadata.
@@ -63,6 +71,8 @@ but v1 does not apply external compensation.
 `agent_libos.runtime.runtime.Runtime` wires the runtime together:
 
 - `SQLiteStore` persists metadata and append-only records.
+- `RuntimeModuleRegistry` loads the internal core module and configured trusted
+  startup modules before processes, tools, or LLM execution can run.
 - `CapabilityManager` grants, checks, revokes, and consumes one-shot authority.
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
 - `HumanObjectManager` owns questions, approvals, terminal queue processing,
@@ -83,6 +93,11 @@ but v1 does not apply external compensation.
 
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
+
+The internal core module registers the built-in tool set and default images
+through the same module registration path exposed to trusted external modules.
+This keeps future providers, syscalls, and images from accumulating ad hoc
+startup code in the composition root.
 
 ## Tool Boundary
 
@@ -121,6 +136,9 @@ Primitives are the runtime boundary. They are responsible for:
 
 JIT syscalls enter the same primitive boundary through
 `LibOSSyscallSession`. They do not consult the caller's LLM-facing tool table.
+Trusted startup modules may add new syscall names through the runtime syscall
+router, but module syscalls still execute as libOS syscalls under the caller
+pid and must call primitives for protected effects.
 
 ## Persistence And Audit
 
@@ -132,6 +150,7 @@ SQLite stores durable runtime metadata and append-only records:
 - process messages and human requests,
 - tools and JIT candidates,
 - Skill registry and trust rows,
+- loaded Runtime Module status, source hashes, and registration summaries,
 - image registry metadata,
 - JSON-RPC endpoint registry rows,
 - checkpoints and checkpoint payload snapshots,
@@ -157,6 +176,7 @@ agent_libos/
   llm/             prompt, context, OpenAI-compatible client, executor, action parser
   memory/          typed Object Memory and MemoryView implementation
   models/          dataclass and enum models split by runtime domain
+  modules/         trusted startup Runtime Module loader, registry, and core module
   primitives/      libOS primitives for filesystem, clock, shell, JSON-RPC, and placeholders
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
   skills/          Skill schema, strict loader, trust registry, and SkillManager

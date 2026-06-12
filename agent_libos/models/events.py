@@ -25,6 +25,7 @@ class EventType(StrEnum):
     SKILL_LOADED = "skill_loaded"
     SKILL_UNLOADED = "skill_unloaded"
     SKILL_TRUSTED = "skill_trusted"
+    MODULE_LOADED = "module_loaded"
     TOOL_CALLED = "tool_called"
     TOOL_COMPLETED = "tool_completed"
     TOOL_FAILED = "tool_failed"

@@ -19,7 +19,8 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - loaded Skill records,
 - JSON-RPC endpoint definitions referenced by subtree capabilities,
 - mailbox delivery state,
-- image definitions needed by the subtree.
+- image definitions needed by the subtree,
+- loaded startup Runtime Module ids and source hashes.
 
 Transient `running` state is normalized to `runnable` at snapshot time.
 
@@ -34,6 +35,11 @@ Restore never deletes:
 - human interaction history.
 
 Restore itself appends new audit and event records.
+
+Restore and fork require the current Python runtime to have already loaded the
+same startup Runtime Module ids and source hashes captured in the checkpoint.
+Checkpoint restore does not import Python modules, change module trust, or roll
+back the host module environment.
 
 External filesystem, shell, image, JSON-RPC remote calls, and provider effects
 are not rolled back. Providers classify their own effects as:

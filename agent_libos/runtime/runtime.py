@@ -8,12 +8,12 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, JsonRpcPrimitive, ShellAdapter
 from agent_libos.human.manager import HumanObjectManager
-from agent_libos.images import build_default_images
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import AgentImage
 from agent_libos.models.exceptions import NotFound
+from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
 from agent_libos.runtime.event_bus import EventBus
@@ -21,68 +21,12 @@ from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.scheduler import SimpleScheduler
+from agent_libos.runtime.syscall_router import SyscallRouter
+from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES
 from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate
 from agent_libos.tools.broker import ToolBroker
-from agent_libos.tools.builtin import (
-    AskHumanTool,
-    AppendMemoryObjectTool,
-    CallJsonRpcMethodTool,
-    CreateMemoryNamespaceTool,
-    CreateMemoryObjectTool,
-    CreateCheckpointTool,
-    CreateObjectFromFileTool,
-    DeleteDirectoryTool,
-    DeleteFileTool,
-    DelegateCapabilityTool,
-    DiscoverSkillsTool,
-    DiffCheckpointTool,
-    EchoTool,
-    ExecProcessTool,
-    ForkCheckpointTool,
-    ForkChildProcessTool,
-    GetCurrentTimeTool,
-    GetWorkingDirectoryTool,
-    HumanOutputTool,
-    InspectCapabilityTool,
-    InspectCheckpointTool,
-    InspectJsonRpcEndpointTool,
-    InspectSkillTool,
-    LoadImageFromYamlTool,
-    LoadSkillFromYamlTool,
-    LoadSkillTool,
-    ListChildProcessesTool,
-    ListCapabilitiesTool,
-    ListCheckpointsTool,
-    ListJsonRpcEndpointsTool,
-    ListMemoryNamespaceTool,
-    MergeChildMemoryTool,
-    ParsePytestLogTool,
-    ProcessExitTool,
-    ProposeJitTool,
-    ReadDirectoryTool,
-    ReadMemoryObjectTool,
-    ReadProcessMessagesTool,
-    ReceiveProcessMessagesTool,
-    ReadTextFileTool,
-    RequestPermissionTool,
-    RegisterJitTool,
-    RevokeCapabilityTool,
-    RestoreCheckpointTool,
-    RunShellCommandTool,
-    SendProcessMessageTool,
-    SignalChildProcessTool,
-    SleepTool,
-    SpawnChildProcessTool,
-    SetWorkingDirectoryTool,
-    UnloadSkillTool,
-    ValidateJitTool,
-    WaitChildProcessTool,
-    WriteDirectoryTool,
-    WriteObjectToFileTool,
-    WriteTextFileTool,
-)
 from agent_libos.utils.ids import utc_now
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -103,6 +47,9 @@ class Runtime:
         llm_client: LLMClient | None = None,
         substrate: ResourceProviderSubstrate | None = None,
         config: AgentLibOSConfig | None = None,
+        startup_module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
+        trusted_modules: list[str] | tuple[str, ...] | None = None,
+        trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.substrate = substrate or LocalResourceProviderSubstrate(
@@ -113,6 +60,8 @@ class Runtime:
         self.store = store
         self.audit = AuditManager(store)
         self.events = EventBus(store)
+        self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
+        self.provider_hooks: dict[str, list[Any]] = {}
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
         self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events, config=self.config)
         self.human = HumanObjectManager(
@@ -167,6 +116,7 @@ class Runtime:
         )
         self.tools.runtime = self
         self.process = ProcessManager(store, self.memory, self.capability, self.audit, self.events, config=self.config)
+        self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
         self.scheduler = SimpleScheduler(store, self.audit, poll_interval_s=self.config.scheduler.poll_interval_s)
         self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
         self.checkpoint.bind_runtime(self)
@@ -179,7 +129,7 @@ class Runtime:
             config=self.config,
         )
         self.skills.bind_runtime(self)
-        self.images: dict[str, AgentImage] = build_default_images(self.config)
+        self.images: dict[str, AgentImage] = {}
         self.image_registry = ImageRegistryPrimitive(
             self.images,
             self.capability,
@@ -192,8 +142,14 @@ class Runtime:
         self._current_human_auto_approve: bool | None = None
         self._current_human_auto_policy: str | None = None
         self._current_human_auto_answer: str | None = None
-        self._register_builtin_tools()
-        self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
+        self.modules = RuntimeModuleRegistry(self, config=self.config)
+        self.modules.load_core_module()
+        self.modules.load_startup_modules(
+            startup_module_manifests,
+            trusted_modules=trusted_modules,
+            trusted_sha256=trusted_module_sha256,
+        )
+        self.modules.run_startup_hooks()
 
     @classmethod
     def open(
@@ -201,11 +157,25 @@ class Runtime:
         target: str | Path = _RUNTIME_DEFAULTS.local_store_target,
         substrate: ResourceProviderSubstrate | None = None,
         config: AgentLibOSConfig | None = None,
+        module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
+        trusted_modules: list[str] | tuple[str, ...] | None = None,
+        trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> "Runtime":
         selected_config = config or DEFAULT_CONFIG
-        if str(target) == selected_config.runtime.local_store_target:
-            return cls(SQLiteStore(":memory:"), substrate=substrate, config=selected_config)
-        return cls(SQLiteStore(str(target)), substrate=substrate, config=selected_config)
+        store_target = ":memory:" if str(target) == selected_config.runtime.local_store_target else str(target)
+        store = SQLiteStore(store_target)
+        try:
+            return cls(
+                store,
+                substrate=substrate,
+                config=selected_config,
+                startup_module_manifests=module_manifests,
+                trusted_modules=trusted_modules,
+                trusted_module_sha256=trusted_module_sha256,
+            )
+        except Exception:
+            store.close()
+            raise
 
     def close(self) -> None:
         self.store.close()
@@ -508,61 +478,3 @@ class Runtime:
         process.tool_table = updated
         process.updated_at = utc_now()
         self.store.update_process(process)
-
-    def _register_builtin_tools(self) -> None:
-        self.tools.register_tool(EchoTool(), registered_by="runtime")
-        self.tools.register_tool(ExecProcessTool(), registered_by="runtime")
-        self.tools.register_tool(GetCurrentTimeTool(), registered_by="runtime")
-        self.tools.register_tool(SleepTool(), registered_by="runtime")
-        self.tools.register_tool(ParsePytestLogTool(), registered_by="runtime")
-        self.tools.register_tool(AppendMemoryObjectTool(), registered_by="runtime")
-        self.tools.register_tool(CreateCheckpointTool(), registered_by="runtime")
-        self.tools.register_tool(CreateMemoryNamespaceTool(), registered_by="runtime")
-        self.tools.register_tool(CreateMemoryObjectTool(), registered_by="runtime")
-        self.tools.register_tool(CreateObjectFromFileTool(), registered_by="runtime")
-        self.tools.register_tool(DeleteDirectoryTool(), registered_by="runtime")
-        self.tools.register_tool(DeleteFileTool(), registered_by="runtime")
-        self.tools.register_tool(DelegateCapabilityTool(), registered_by="runtime")
-        self.tools.register_tool(DiffCheckpointTool(), registered_by="runtime")
-        self.tools.register_tool(DiscoverSkillsTool(), registered_by="runtime")
-        self.tools.register_tool(ForkChildProcessTool(), registered_by="runtime")
-        self.tools.register_tool(ForkCheckpointTool(), registered_by="runtime")
-        self.tools.register_tool(GetWorkingDirectoryTool(), registered_by="runtime")
-        self.tools.register_tool(LoadImageFromYamlTool(), registered_by="runtime")
-        self.tools.register_tool(ListChildProcessesTool(), registered_by="runtime")
-        self.tools.register_tool(ListMemoryNamespaceTool(), registered_by="runtime")
-        self.tools.register_tool(MergeChildMemoryTool(), registered_by="runtime")
-        self.tools.register_tool(ProcessExitTool(), registered_by="runtime")
-        self.tools.register_tool(ProposeJitTool(), registered_by="runtime")
-        self.tools.register_tool(RequestPermissionTool(), registered_by="runtime")
-        self.tools.register_tool(ReadDirectoryTool(), registered_by="runtime")
-        self.tools.register_tool(ReadMemoryObjectTool(), registered_by="runtime")
-        self.tools.register_tool(ReadProcessMessagesTool(), registered_by="runtime")
-        self.tools.register_tool(ReceiveProcessMessagesTool(), registered_by="runtime")
-        self.tools.register_tool(ReadTextFileTool(), registered_by="runtime")
-        self.tools.register_tool(RegisterJitTool(), registered_by="runtime")
-        self.tools.register_tool(SignalChildProcessTool(), registered_by="runtime")
-        self.tools.register_tool(SetWorkingDirectoryTool(), registered_by="runtime")
-        self.tools.register_tool(SpawnChildProcessTool(), registered_by="runtime")
-        self.tools.register_tool(ValidateJitTool(), registered_by="runtime")
-        self.tools.register_tool(WriteObjectToFileTool(), registered_by="runtime")
-        self.tools.register_tool(WriteDirectoryTool(), registered_by="runtime")
-        self.tools.register_tool(WriteTextFileTool(), registered_by="runtime")
-        self.tools.register_tool(AskHumanTool(), registered_by="runtime")
-        self.tools.register_tool(HumanOutputTool(), registered_by="runtime")
-        self.tools.register_tool(CallJsonRpcMethodTool(), registered_by="runtime")
-        self.tools.register_tool(InspectCapabilityTool(), registered_by="runtime")
-        self.tools.register_tool(InspectCheckpointTool(), registered_by="runtime")
-        self.tools.register_tool(InspectJsonRpcEndpointTool(), registered_by="runtime")
-        self.tools.register_tool(InspectSkillTool(), registered_by="runtime")
-        self.tools.register_tool(WaitChildProcessTool(), registered_by="runtime")
-        self.tools.register_tool(ListCapabilitiesTool(), registered_by="runtime")
-        self.tools.register_tool(ListCheckpointsTool(), registered_by="runtime")
-        self.tools.register_tool(ListJsonRpcEndpointsTool(), registered_by="runtime")
-        self.tools.register_tool(LoadSkillFromYamlTool(), registered_by="runtime")
-        self.tools.register_tool(LoadSkillTool(), registered_by="runtime")
-        self.tools.register_tool(RunShellCommandTool(), registered_by="runtime")
-        self.tools.register_tool(RevokeCapabilityTool(), registered_by="runtime")
-        self.tools.register_tool(RestoreCheckpointTool(), registered_by="runtime")
-        self.tools.register_tool(SendProcessMessageTool(), registered_by="runtime")
-        self.tools.register_tool(UnloadSkillTool(), registered_by="runtime")

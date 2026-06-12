@@ -9,6 +9,16 @@ in-memory. A filesystem path creates or opens a persistent SQLite database.
 uv run agent-libos --db .agent_libos.sqlite <command>
 ```
 
+Use `--module-manifest` and `--trusted-module` before the command name to load
+trusted Runtime Modules before the runtime is used:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite \
+  --module-manifest modules/example/module.yaml \
+  --trusted-module example-module:v0:<source_sha256> \
+  <command>
+```
+
 ## Top-Level Commands
 
 ```text
@@ -29,8 +39,8 @@ interrupt     send a human interrupt process message
 checkpoint    checkpoint subcommands
 skills        Skill subcommands
 jsonrpc       JSON-RPC endpoint and call subcommands
+modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
-grant-tool    deprecated; image tool tables are fixed at creation
 ```
 
 Run `uv run agent-libos <command> --help` for argparse-generated details.
@@ -231,6 +241,21 @@ they run as audited admin registry operations.
 hold the method capability, such as
 `jsonrpc:demo-weather:forecast read`. The CLI cannot supply arbitrary URLs,
 headers, raw JSON-RPC method names, or request ids.
+
+## Runtime Module Commands
+
+Runtime Modules are trusted Python startup extensions. They are loaded with
+global arguments before the selected command runs:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite modules verify modules/example/module.yaml
+uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/example/module.yaml --trusted-module example-module:v0:<source_sha256> modules list
+uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/example/module.yaml --trusted-module example-module:v0:<source_sha256> modules inspect example-module:v0
+```
+
+`modules verify` resolves the entrypoint and computes the source hash without
+loading the module. `modules list` and `modules inspect` show persisted module
+load records for the opened runtime database.
 
 ## Benchmark Scripts
 

@@ -106,6 +106,7 @@ class CheckpointManager:
                 **(metadata or {}),
                 "subtree_pids": snapshot["subtree_pids"],
                 "object_count": len(snapshot["object_payloads"]),
+                "module_count": len(snapshot.get("modules", [])),
                 "snapshot_bytes": len(dumps(snapshot).encode("utf-8")),
             },
         )
@@ -180,6 +181,7 @@ class CheckpointManager:
             "checkpoint": self._checkpoint_summary(checkpoint),
             "snapshot_version": snapshot.get("version"),
             "subtree_pids": list(snapshot.get("subtree_pids", [])),
+            "modules": list(snapshot.get("modules", [])),
             "counts": self._snapshot_counts(snapshot),
             "processes": [
                 {
@@ -239,6 +241,7 @@ class CheckpointManager:
         checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
         if require_capability:
             self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
+        self._require_snapshot_modules(snapshot)
         current_pids = self._subtree_pids(checkpoint.pid)
         snapshot_pids = list(snapshot.get("subtree_pids", []))
         external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
@@ -304,6 +307,7 @@ class CheckpointManager:
         self._validate_fork_parent(actor, parent_pid, require_capability=require_capability)
         if require_capability:
             self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.EXECUTE)
+        self._require_snapshot_modules(snapshot)
         remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid)
         self._insert_fork_rows(remapped)
         self._restore_images(snapshot)
@@ -418,7 +422,27 @@ class CheckpointManager:
             "object_payloads": object_payloads,
             "images": self._image_snapshot(process_rows),
             "jit_sources": self._jit_source_snapshot(process_rows),
+            "modules": self._module_snapshot(),
         }
+
+    def _module_snapshot(self) -> list[dict[str, Any]]:
+        if self.runtime is None or not hasattr(self.runtime, "modules"):
+            return []
+        return self.runtime.modules.loaded_module_summaries()
+
+    def _require_snapshot_modules(self, snapshot: dict[str, Any]) -> None:
+        if self.runtime is None or not hasattr(self.runtime, "modules"):
+            return
+        missing = []
+        for module in snapshot.get("modules", []):
+            module_id = str(module.get("module_id", ""))
+            source_sha256 = str(module.get("source_sha256", ""))
+            if not module_id:
+                continue
+            if not self.runtime.modules.is_loaded(module_id, source_sha256 or None):
+                missing.append({"module_id": module_id, "source_sha256": source_sha256})
+        if missing:
+            raise ValidationError(f"checkpoint requires startup modules that are not loaded: {missing}")
 
     def _restore_scoped_rows(self, snapshot: dict[str, Any], current_pids: list[str]) -> None:
         rows = snapshot["rows"]
@@ -459,6 +483,9 @@ class CheckpointManager:
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
                     self._insert_row(cur, "tools", row)
+            # Endpoint registry is global provider configuration. Restore only
+            # upserts definitions referenced by restored capabilities; it never
+            # deletes unrelated endpoints registered after the checkpoint.
             for row in rows.get("jsonrpc_endpoints", []):
                 self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("process_messages", []):
@@ -546,6 +573,8 @@ class CheckpointManager:
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
                     self._insert_row(cur, "tools", row)
+            # Forked subtrees need endpoint definitions for their remapped
+            # JSON-RPC capabilities, but the registry remains shared config.
             for row in rows.get("jsonrpc_endpoints", []):
                 self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("processes", []):
@@ -678,6 +707,9 @@ class CheckpointManager:
         return [row for row in rows if not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)]
 
     def _jsonrpc_endpoint_rows_for_capabilities(self, capability_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Snapshot endpoint specs by authority edge, not by process-local state.
+        # This keeps checkpoint payloads small and prevents restore from acting
+        # like a global endpoint-registry rollback.
         endpoint_ids: set[str] = set()
         include_all = False
         for row in capability_rows:

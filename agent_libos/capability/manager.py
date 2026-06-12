@@ -37,7 +37,6 @@ class CapabilityManager:
     POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
 
     _KNOWN_CONSTRAINT_KEYS = {
-        POLICY_KEY,
         "shell_policy_level",
         "inherited_from",
     }
@@ -133,9 +132,9 @@ class CapabilityManager:
         delegable: bool = False,
         revocable: bool = True,
     ) -> Capability:
-        # Compatibility wrapper for runtime bootstrap and tests. New actor-facing
-        # code should call issue(..., require_authority=True).
-        effect, uses_remaining = self._effect_from_legacy_constraints(constraints or {})
+        # Trusted runtime paths still need a compact bootstrap helper, but the
+        # record written to storage is the same Capability v2 shape as issue().
+        effect, uses_remaining = self._effect_from_policy_constraint(constraints or {})
         clean_constraints = {
             key: value
             for key, value in dict(constraints or {}).items()
@@ -507,6 +506,24 @@ class CapabilityManager:
     def capabilities_for(self, subject: str) -> list[Capability]:
         return self.store.list_capabilities(subject=subject)
 
+    def matching_capabilities(
+        self,
+        subject: str,
+        resource: str,
+        right: str | CapabilityRight,
+        *,
+        include_ask: bool = False,
+    ) -> list[Capability]:
+        """Return active Capability v2 records that match a canonical request.
+
+        Primitive-specific policy layers sometimes need to inspect matched
+        records without treating a broad policy capability as final authority.
+        They should still reuse this matcher so typed resource semantics,
+        expiry handling, wildcard rules, and deny precedence stay centralized.
+        """
+
+        return self._matching_capabilities(subject, resource, right, include_ask=include_ask)
+
     def list_subject(self, subject: str, *, include_inactive: bool = False, limit: int | None = None) -> list[Capability]:
         caps = self.capabilities_for(subject)
         if not include_inactive:
@@ -789,7 +806,7 @@ class CapabilityManager:
             raw = raw.replace("//", "/")
         return raw.rstrip("/") if raw.endswith("/") and not raw.endswith(":/") else raw
 
-    def _effect_from_legacy_constraints(self, constraints: dict[str, Any]) -> tuple[CapabilityEffect, int | None]:
+    def _effect_from_policy_constraint(self, constraints: dict[str, Any]) -> tuple[CapabilityEffect, int | None]:
         return self._effect_from_policy(str(constraints.get(self.POLICY_KEY, self.ALWAYS_ALLOW)))
 
     def _effect_from_policy(self, policy: str) -> tuple[CapabilityEffect, int | None]:

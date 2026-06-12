@@ -136,6 +136,11 @@ The current syscall surface covers existing primitive areas:
 - checkpoint create/list/inspect/diff/restore/fork/replay,
 - Skill discover/inspect/register/load/unload/load YAML.
 
+Trusted startup Runtime Modules can add additional syscall names through the
+runtime syscall router. They cannot override built-in syscall names, and the
+handler still runs as part of the same `LibOSSyscallSession` under the caller
+pid.
+
 ## Sandbox Rules
 
 Deno is launched with `--no-prompt` and without read, write, net, env, run, or

@@ -37,6 +37,80 @@ if TYPE_CHECKING:
     from agent_libos.runtime.runtime import Runtime
 
 
+BUILTIN_SYSCALL_NAMES = {
+    "ask_human",
+    "capability.delegate",
+    "capability.inspect",
+    "capability.list",
+    "capability.request_permission",
+    "capability.revoke",
+    "checkpoint.create",
+    "checkpoint.diff",
+    "checkpoint.fork",
+    "checkpoint.fork_from_checkpoint",
+    "checkpoint.inspect",
+    "checkpoint.list",
+    "checkpoint.replay",
+    "checkpoint.replay_to_event",
+    "checkpoint.restore",
+    "clock.now",
+    "clock.sleep",
+    "filesystem.delete_directory",
+    "filesystem.delete_file",
+    "filesystem.list_directory",
+    "filesystem.make_directory",
+    "filesystem.read_directory",
+    "filesystem.read_text",
+    "filesystem.read_text_file",
+    "filesystem.write_directory",
+    "filesystem.write_text",
+    "filesystem.write_text_file",
+    "human.ask",
+    "human.output",
+    "human.request_permission",
+    "human_output",
+    "image.load_yaml",
+    "image.register",
+    "jsonrpc.call",
+    "jsonrpc.inspect",
+    "jsonrpc.list",
+    "memory.append_memory_object",
+    "memory.append_object",
+    "memory.create_namespace",
+    "memory.create_object",
+    "memory.get_object",
+    "memory.list_namespace",
+    "memory.read_object",
+    "permission.request",
+    "process.chdir",
+    "process.cwd",
+    "process.exec",
+    "process.exit",
+    "process.fork",
+    "process.get_working_directory",
+    "process.list_children",
+    "process.merge_child_memory",
+    "process.read_messages",
+    "process.receive_messages",
+    "process.send_message",
+    "process.set_working_directory",
+    "process.signal",
+    "process.spawn_child",
+    "process.wait",
+    "request_permission",
+    "shell.run",
+    "shell.run_command",
+    "skill.discover",
+    "skill.inspect",
+    "skill.load",
+    "skill.load_yaml",
+    "skill.register",
+    "skill.unload",
+    "sleep",
+    "time.now",
+}
+
+
 class LibOSSyscallSession:
     """Per JIT tool-call syscall session.
 
@@ -147,6 +221,9 @@ class LibOSSyscallSession:
             await asyncio.sleep(self.runtime.scheduler.poll_interval_s)
 
     def _dispatch(self, name: str, args: dict[str, Any]) -> Any:
+        registered = self.runtime.syscalls.get(name)
+        if registered is not None:
+            return registered.handler(self, args)
         if name in {"filesystem.read_text", "filesystem.read_text_file"}:
             return self._filesystem_read_text(args)
         if name in {"filesystem.write_text", "filesystem.write_text_file"}:

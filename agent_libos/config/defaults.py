@@ -299,6 +299,27 @@ class SkillDefaults:
 
 
 @dataclass(frozen=True)
+class ModuleDefaults:
+    schema_version: int = 1
+    manifest_paths: tuple[str, ...] = ()
+    trusted_modules: tuple[str, ...] = ()
+    trusted_sha256: tuple[str, ...] = ()
+    manifest_max_bytes: int = 262_144
+    manifest_hard_limit_bytes: int = 1_048_576
+    load_policy: Literal["fail", "warn"] = "fail"
+    discover_limit: int = 100
+    id_max_chars: int = 128
+    name_max_chars: int = 128
+    version_max_chars: int = 64
+    entrypoint_max_chars: int = 512
+    max_declared_tools: int = 128
+    max_declared_images: int = 128
+    max_declared_syscalls: int = 128
+    max_declared_provider_hooks: int = 64
+    max_declared_startup_hooks: int = 64
+
+
+@dataclass(frozen=True)
 class LauncherDefaults:
     permission_presets: tuple[str, ...] = ("read-only", "edit", "full")
     default_permission_preset: str = "edit"
@@ -343,6 +364,7 @@ class AgentLibOSConfig:
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     checkpoint: CheckpointDefaults = field(default_factory=CheckpointDefaults)
     skills: SkillDefaults = field(default_factory=SkillDefaults)
+    modules: ModuleDefaults = field(default_factory=ModuleDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)
     scripts: ScriptDefaults = field(default_factory=ScriptDefaults)
 

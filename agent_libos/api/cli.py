@@ -43,6 +43,24 @@ def main(argv: list[str] | None = None) -> None:
         default=_RUNTIME_DEFAULTS.local_store_target,
         help=f"SQLite DB path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory",
     )
+    parser.add_argument(
+        "--module-manifest",
+        action="append",
+        default=[],
+        help="Trusted startup module manifest to load before the runtime is used. May be passed multiple times.",
+    )
+    parser.add_argument(
+        "--trusted-module",
+        action="append",
+        default=[],
+        help="Trusted startup module entry in the form '<module_id>:<source_sha256>'.",
+    )
+    parser.add_argument(
+        "--trusted-module-sha256",
+        action="append",
+        default=[],
+        help="Trusted startup module source sha256, regardless of module id. Intended for local development only.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Initialize a runtime database")
     sub.add_parser("demo", help="Run the coding-agent MVP demo")
@@ -105,13 +123,18 @@ def main(argv: list[str] | None = None) -> None:
     _add_capabilities_parser_args(capabilities_parser)
     jsonrpc_parser = sub.add_parser("jsonrpc", help="Register, inspect, or call JSON-RPC over HTTP endpoints")
     _add_jsonrpc_parser_args(jsonrpc_parser)
+    modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
+    _add_modules_parser_args(modules_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
-    grant_tool_parser = sub.add_parser("grant-tool", help="Deprecated: process tools are fixed by AgentImage at creation")
-    grant_tool_parser.add_argument("pid")
-    grant_tool_parser.add_argument("tool")
     args = parser.parse_args(argv)
 
-    runtime = Runtime.open(args.db)
+    load_module_manifests = [] if args.command == "modules" and args.modules_command == "verify" else args.module_manifest
+    runtime = Runtime.open(
+        args.db,
+        module_manifests=load_module_manifests,
+        trusted_modules=args.trusted_module,
+        trusted_module_sha256=args.trusted_module_sha256,
+    )
     try:
         if args.command == "init":
             print(f"initialized {args.db}")
@@ -153,8 +176,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_run_capabilities_command(runtime, args))
         elif args.command == "jsonrpc":
             _print_json(_run_jsonrpc_command(runtime, args))
-        elif args.command == "grant-tool":
-            raise SystemExit("tool execute grants are disabled; configure tools in the AgentImage before spawning")
+        elif args.command == "modules":
+            _print_json(_run_modules_command(runtime, args))
         elif args.command == "human":
             _print_json([request.__dict__ for request in runtime.human.drain_terminal_queue()])
     finally:
@@ -759,6 +782,31 @@ def _run_jsonrpc_command(runtime: Runtime, args: argparse.Namespace) -> dict[str
             require_capability=require_capability,
         )
     raise SystemExit(f"unknown jsonrpc command: {command}")
+
+
+def _add_modules_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="modules_command", required=True)
+    list_parser = sub.add_parser("list", help="List loaded startup runtime modules")
+    list_parser.add_argument("--limit", type=int)
+    inspect = sub.add_parser("inspect", help="Inspect one loaded startup runtime module")
+    inspect.add_argument("module_id")
+    verify = sub.add_parser("verify", help="Verify a module manifest without loading it")
+    verify.add_argument("path")
+
+
+def _run_modules_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+    command = args.modules_command
+    if command == "list":
+        return runtime.modules.list_modules(limit=args.limit)
+    if command == "inspect":
+        return runtime.modules.inspect_module(args.module_id)
+    if command == "verify":
+        return runtime.modules.verify_manifest(
+            args.path,
+            trusted_modules=args.trusted_module,
+            trusted_sha256=args.trusted_module_sha256,
+        )
+    raise SystemExit(f"unknown modules command: {command}")
 
 
 def _capability_spec_from_args(args: argparse.Namespace) -> CapabilitySpec:

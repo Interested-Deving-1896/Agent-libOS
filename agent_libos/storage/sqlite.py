@@ -337,6 +337,23 @@ class SQLiteStore:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_modules (
+                  module_id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  version TEXT NOT NULL,
+                  entrypoint TEXT NOT NULL,
+                  manifest_path TEXT NOT NULL,
+                  manifest_sha256 TEXT NOT NULL,
+                  source_path TEXT NOT NULL,
+                  source_sha256 TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  loaded_at TEXT,
+                  registered_json TEXT NOT NULL,
+                  error TEXT,
+                  metadata_json TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_object_namespace_schema()
@@ -347,6 +364,7 @@ class SQLiteStore:
             self._ensure_external_effect_schema()
             self._ensure_skill_schema()
             self._ensure_jsonrpc_endpoint_schema()
+            self._ensure_runtime_module_schema()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -1194,6 +1212,76 @@ class SQLiteStore:
     def delete_jsonrpc_endpoint(self, endpoint_id: str) -> None:
         self._execute("DELETE FROM jsonrpc_endpoints WHERE endpoint_id = ?", (endpoint_id,))
 
+    def upsert_runtime_module(
+        self,
+        *,
+        module_id: str,
+        name: str,
+        version: str,
+        entrypoint: str,
+        manifest_path: str,
+        manifest_sha256: str,
+        source_path: str,
+        source_sha256: str,
+        status: str,
+        loaded_at: str | None,
+        registered: dict[str, Any],
+        error: str | None,
+        metadata: dict[str, Any],
+    ) -> None:
+        updated_at = utc_now()
+        self._execute(
+            """
+            INSERT INTO runtime_modules (
+                module_id, name, version, entrypoint, manifest_path,
+                manifest_sha256, source_path, source_sha256, status, loaded_at,
+                registered_json, error, metadata_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(module_id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                entrypoint = excluded.entrypoint,
+                manifest_path = excluded.manifest_path,
+                manifest_sha256 = excluded.manifest_sha256,
+                source_path = excluded.source_path,
+                source_sha256 = excluded.source_sha256,
+                status = excluded.status,
+                loaded_at = excluded.loaded_at,
+                registered_json = excluded.registered_json,
+                error = excluded.error,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                module_id,
+                name,
+                version,
+                entrypoint,
+                manifest_path,
+                manifest_sha256,
+                source_path,
+                source_sha256,
+                status,
+                loaded_at,
+                dumps(registered),
+                error,
+                dumps(metadata),
+                updated_at,
+            ),
+        )
+
+    def get_runtime_module(self, module_id: str) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM runtime_modules WHERE module_id = ?", (module_id,))
+        return self._runtime_module_row(rows[0]) if rows else None
+
+    def list_runtime_modules(self, limit: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM runtime_modules ORDER BY module_id"
+        params: list[Any] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [self._runtime_module_row(row) for row in self._query(sql, params)]
+
     def insert_checkpoint(self, checkpoint: Checkpoint, snapshot: dict[str, Any]) -> None:
         self._execute(
             """
@@ -1383,6 +1471,28 @@ class SQLiteStore:
             """
         )
 
+    def _ensure_runtime_module_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_modules (
+              module_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              version TEXT NOT NULL,
+              entrypoint TEXT NOT NULL,
+              manifest_path TEXT NOT NULL,
+              manifest_sha256 TEXT NOT NULL,
+              source_path TEXT NOT NULL,
+              source_sha256 TEXT NOT NULL,
+              status TEXT NOT NULL,
+              loaded_at TEXT,
+              registered_json TEXT NOT NULL,
+              error TEXT,
+              metadata_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+
     def _ensure_object_namespace_schema(self) -> None:
         self.conn.execute(
             """
@@ -1508,6 +1618,12 @@ class SQLiteStore:
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {key: row[key] for key in row.keys()}
+
+    def _runtime_module_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = self._row_to_dict(row)
+        data["registered"] = loads(data.pop("registered_json"), {})
+        data["metadata"] = loads(data.pop("metadata_json"), {})
+        return data
 
     def _row_to_object(self, row: sqlite3.Row) -> AgentObject:
         metadata = ObjectMetadata(**loads(row["metadata_json"], {}))

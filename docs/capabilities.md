@@ -59,7 +59,8 @@ Important resource conventions include:
 - `filesystem:workspace:<path>` for exact workspace files and directories.
 - `filesystem:workspace:<dir>/*` for a directory subtree.
 - `filesystem:workspace:*` for the whole workspace namespace.
-- `shell:<executable>` and `shell:*` for shell execution authority.
+- `shell:<executable>` for direct command authority; `shell:*` for shell
+  policy records when paired with `shell_policy_level`.
 - `human:<name>` for human output, questions, and approvals.
 - `object:<oid>` for Object Memory content.
 - `object_namespace:<namespace>` for Object Memory namespace listing and name
@@ -256,5 +257,12 @@ The built-in shell policy levels are:
 
 Allow and block lists match tokenized argv rules, not arbitrary substrings.
 Bare executable names do not match path-qualified executables by accident.
+Direct command capabilities such as `shell:git` or `shell:git:*` can allow a
+specific normalized executable. A bare `shell:* allow` capability is not treated
+as direct command authority; whole-shell authority must be represented as a
+policy capability carrying `shell_policy_level`, so the primitive can still
+apply the four-level shell policy semantics. Broad `deny` and `ask` records
+remain conservative constraints.
+
 Block-list checks also scan nested executable-looking argv tokens such as
 `bash`, `powershell`, `python`, or `curl`.

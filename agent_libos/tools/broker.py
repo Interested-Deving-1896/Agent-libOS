@@ -254,7 +254,7 @@ class ToolBroker:
         self._jit_sources[tool_id] = candidate.source_code
         self._handles[tool_id] = handle
         # JIT tool names are process-local through AgentProcess.tool_table.
-        # Keep the global name index stable for static tools and for legacy
+        # Keep the global name index stable for static tools and for pid-less
         # resolve(name) calls; resolve(name, pid=...) is the authority for
         # process-scoped JIT tools and handles duplicate local names.
         self._tool_ids_by_name.setdefault(candidate.spec.name, tool_id)

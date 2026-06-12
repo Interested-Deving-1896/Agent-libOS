@@ -19,7 +19,6 @@ from agent_libos.runtime.external_effects import (
     require_external_effect_classifier,
 )
 from agent_libos.substrate import CommandResult, LocalShellProvider, ShellProvider
-from agent_libos.utils.ids import utc_now
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -191,18 +190,18 @@ class ShellAdapter:
                 policy_level=self.config.shell.always_deny_level,
             )
 
-        legacy_policy, legacy_consume_once = self._legacy_permission_policy(pid, resource)
-        if legacy_policy == CapabilityManager.ALWAYS_DENY:
-            return ShellPolicyDecision(False, False, "permission policy denied command", legacy_policy)
-        if legacy_policy == CapabilityManager.ASK_EACH_TIME:
-            return ShellPolicyDecision(False, True, "permission policy requires approval", legacy_policy)
-        if legacy_policy in {CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALLOW_ONCE}:
+        explicit_decision = self._explicit_command_decision(pid, resource)
+        if explicit_decision == CapabilityManager.ALWAYS_DENY:
+            return ShellPolicyDecision(False, False, "explicit command capability denied command", explicit_decision)
+        if explicit_decision == CapabilityManager.ASK_EACH_TIME:
+            return ShellPolicyDecision(False, True, "explicit command capability requires approval", explicit_decision)
+        if explicit_decision in {CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALLOW_ONCE}:
             return ShellPolicyDecision(
                 allowed=True,
                 ask_human=False,
                 reason="explicit command capability allowed command",
-                policy_level=legacy_policy,
-                consume_once=legacy_consume_once,
+                policy_level=explicit_decision,
+                consume_once=explicit_decision == CapabilityManager.ALLOW_ONCE,
             )
 
         if not policy_caps:
@@ -331,47 +330,58 @@ class ShellAdapter:
     def _matching_shell_policy_caps(self, pid: str, resource: str) -> list[Capability]:
         caps = [
             cap
-            for cap in self._matching_shell_caps(pid, resource)
+            for cap in self.capabilities.matching_capabilities(
+                pid,
+                resource,
+                CapabilityRight.EXECUTE,
+                include_ask=True,
+            )
             if self.config.shell.policy_capability_key in cap.constraints
         ]
         caps.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
         return caps
 
-    def _legacy_permission_policy(self, pid: str, resource: str) -> tuple[str, bool]:
+    def _explicit_command_decision(self, pid: str, resource: str) -> str:
+        """Classify direct `shell:<command>` authority separate from policy caps.
+
+        A shell policy capability decides how whitelist/blacklist rules are
+        applied. A direct command capability is narrower authority granted by
+        human approval or bootstrap. Both are Capability v2 records and both
+        use the central resource matcher; they are split only so a broad
+        `shell:*` policy does not bypass shell-specific token checks.
+        """
+
         caps = [
             cap
-            for cap in self._matching_shell_caps(pid, resource)
+            for cap in self.capabilities.matching_capabilities(
+                pid,
+                resource,
+                CapabilityRight.EXECUTE,
+                include_ask=True,
+            )
             if self.config.shell.policy_capability_key not in cap.constraints
         ]
+        # A broad `shell:*` allow is a policy grant only when it carries
+        # shell_policy_level. Treating it as direct command authority would turn
+        # a registry-level wildcard into an unreviewed "always allow" shell.
+        caps = [
+            cap
+            for cap in caps
+            if cap.resource != self.config.shell.policy_resource or cap.effect != CapabilityEffect.ALLOW
+        ]
         if not caps:
-            return CapabilityManager.MISSING, False
+            return CapabilityManager.MISSING
         caps.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
         deny = next((cap for cap in caps if cap.effect == CapabilityEffect.DENY), None)
         if deny is not None:
-            return CapabilityManager.ALWAYS_DENY, False
+            return CapabilityManager.ALWAYS_DENY
         ask = next((cap for cap in caps if cap.effect == CapabilityEffect.ASK), None)
         if ask is not None:
-            return CapabilityManager.ASK_EACH_TIME, False
+            return CapabilityManager.ASK_EACH_TIME
         cap = caps[0]
         if cap.uses_remaining is not None:
-            return CapabilityManager.ALLOW_ONCE, True
-        policy = str(cap.constraints.get(CapabilityManager.POLICY_KEY) or CapabilityManager.ALWAYS_ALLOW)
-        return policy, policy == CapabilityManager.ALLOW_ONCE
-
-    def _matching_shell_caps(self, pid: str, resource: str) -> list[Capability]:
-        now = utc_now()
-        result: list[Capability] = []
-        for cap in self.capabilities.capabilities_for(pid):
-            if not cap.active:
-                continue
-            if cap.expires_at is not None and cap.expires_at <= now:
-                continue
-            if CapabilityRight.EXECUTE.value not in cap.rights:
-                continue
-            if not self._resource_matches(cap.resource, resource):
-                continue
-            result.append(cap)
-        return result
+            return CapabilityManager.ALLOW_ONCE
+        return CapabilityManager.ALWAYS_ALLOW
 
     def _selected_policy_level(self, caps: list[Capability]) -> str:
         return self._normalize_policy_level(caps[0].constraints[self.config.shell.policy_capability_key])
@@ -485,10 +495,3 @@ class ShellAdapter:
 
     def _argv0_has_path(self, value: str) -> bool:
         return "/" in value or "\\" in value or PurePath(value).is_absolute()
-
-    def _resource_matches(self, granted: str, requested: str) -> bool:
-        if granted == requested:
-            return True
-        if granted == "shell:*":
-            return requested.startswith(granted[:-1])
-        return False

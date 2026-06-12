@@ -108,6 +108,7 @@ Current default groups include:
 - Object Memory and LLM context defaults,
 - checkpoint snapshot limits,
 - Skill source, trust, and manifest limits,
+- trusted startup Runtime Module manifests, hash trust, and registration limits,
 - launcher presets,
 - script defaults.
 
@@ -142,6 +143,9 @@ Preserve the boundary:
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
 - Skills change visibility and prompt materialization only;
+- Runtime Modules are trusted startup TCB extensions; they may register tools,
+  images, syscalls, and provider hooks but must not be treated as process
+  capabilities;
 - JSON-RPC remote calls use registered endpoints and primitive capabilities
   rather than model-supplied URLs or secrets;
 - checkpoint restore is scoped and append-only outside reconstructable state;

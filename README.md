@@ -39,6 +39,10 @@ The implementation currently includes:
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
   human I/O backends, plus a JSON-RPC over HTTP client provider for
   pre-registered remote endpoints.
+- Trusted startup Runtime Modules loaded from manifest-declared Python
+  entrypoints before `Runtime.open()` returns. Modules can register tools,
+  images, syscalls, provider hooks, and startup hooks, but do not grant process
+  resource authority.
 - SQLite persistence for process/object metadata, capabilities, messages,
   human requests, LLM calls, events, audit records, tools, Skill/JIT metadata,
   and scoped checkpoints.
@@ -64,6 +68,8 @@ Start here, then read the deeper references as needed:
   file/object bridge, context materialization, and payload persistence.
 - [docs/tools_and_jit.md](docs/tools_and_jit.md): built-in tools,
   ToolBroker, Deno/TypeScript JIT tools, syscall protocol, and sandbox rules.
+- [docs/modules.md](docs/modules.md): trusted startup Runtime Module
+  manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
 - [docs/jsonrpc.md](docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
 - [docs/skills.md](docs/skills.md): Skill manifest v1, workspace/global

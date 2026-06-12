@@ -85,6 +85,33 @@ class ShellPrimitiveTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_shell_authorization_uses_capability_v2_resource_matching(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image="review-agent:v0", goal="typed shell matching")
+            runtime.capability.grant(pid, "shell:gi:*", [CapabilityRight.EXECUTE], issued_by="test")
+            with self.assertRaises(CapabilityDenied):
+                runtime.shell.run(pid, ["git", "status"])
+
+            runtime.capability.grant(pid, "shell:git:*", [CapabilityRight.EXECUTE], issued_by="test")
+            result = runtime.shell.run(pid, ["git", "status"])
+
+            self.assertEqual(result.stdout, "ok\n")
+            self.assertEqual(provider.calls, [(["git", "status"], runtime.config.tools.shell_timeout_s)])
+        finally:
+            runtime.close()
+
+    def test_bare_shell_wildcard_allow_does_not_bypass_shell_policy(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image="review-agent:v0", goal="bare wildcard")
+            runtime.capability.grant(pid, "shell:*", [CapabilityRight.EXECUTE], issued_by="test")
+
+            with self.assertRaises(CapabilityDenied):
+                runtime.shell.run(pid, ["git", "status"])
+        finally:
+            runtime.close()
+
     def test_blacklist_policy_asks_for_nested_shell_interpreter(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:
