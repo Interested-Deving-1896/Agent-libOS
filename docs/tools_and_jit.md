@@ -18,7 +18,7 @@ The current built-in tool surface includes tools for:
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
 - Image registry: load image manifests from YAML.
 - Checkpoint: create, list, inspect, diff, restore, and fork.
-- Skills: discover, inspect, load, unload, and load from workspace YAML.
+- Skills: discover, activate, read bundled resources, and unload.
 - JIT: propose, validate, and register Deno/TypeScript tools.
 - Utility actions such as `echo` and `parse_pytest_log`.
 
@@ -56,8 +56,8 @@ The manual lifecycle is:
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
 
-Skill loading uses the same validation and registration path for bundled JIT
-tools.
+Skill activation uses the same validation and registration path for bundled JIT
+tools declared in package metadata and stored as `scripts/*.ts` resources.
 
 ## TypeScript Entry Point
 
@@ -134,7 +134,7 @@ The current syscall surface covers existing primitive areas:
 - JSON-RPC list/inspect/call,
 - image load/register,
 - checkpoint create/list/inspect/diff/restore/fork/replay,
-- Skill discover/inspect/register/load/unload/load YAML.
+- Skill discover/inspect/register_path/activate/read_resource/unload.
 
 Trusted startup Runtime Modules can add additional syscall names through the
 runtime syscall router. They cannot override built-in syscall names, and the

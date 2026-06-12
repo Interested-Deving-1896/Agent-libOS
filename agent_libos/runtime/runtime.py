@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -277,25 +278,20 @@ class Runtime:
     def get_image(self, image_id: str) -> AgentImage:
         return self.images[image_id]
 
-    def register_skill(self, skill: dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> dict[str, Any]:
-        return self.skills.register_skill(skill, actor=actor, replace=replace, require_capability=False)
-
-    def register_skill_from_yaml_text(
+    def register_skill_from_path(
         self,
-        text: str,
+        path: str | os.PathLike[str],
         *,
         actor: str = "runtime",
         replace: bool = False,
-        source_type: str = "inline",
-        source: str | None = None,
+        source_type: str = "runtime",
     ) -> dict[str, Any]:
-        return self.skills.register_skill_from_yaml_text(
-            text,
+        return self.skills.register_skill_from_path(
+            path,
             actor=actor,
             replace=replace,
             require_capability=False,
             source_type=source_type,
-            source=source,
         )
 
     def discover_skills(self, text: str | None = None) -> list[dict[str, Any]]:
@@ -304,18 +300,18 @@ class Runtime:
     def inspect_skill(self, skill_id: str) -> dict[str, Any]:
         return self.skills.inspect_skill(skill_id, require_capability=False)
 
-    def load_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
-        return self.skills.load_skill(pid, skill_id, actor=pid, require_capability=False)
+    def activate_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
+        return self.skills.activate_skill(pid, skill_id, actor=pid, require_capability=False)
 
     def unload_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
         return self.skills.unload_skill(pid, skill_id, actor=pid, require_capability=False)
 
-    def trust_skill_source(self, *, source_type: str, source: str, manifest_sha256: str, actor: str = "runtime") -> dict[str, Any]:
+    def trust_skill_source(self, *, source_type: str, source: str, package_sha256: str, actor: str = "runtime") -> dict[str, Any]:
         return self.skills.trust_skill_source(
             actor=actor,
             source_type=source_type,
             source=source,
-            manifest_sha256=manifest_sha256,
+            package_sha256=package_sha256,
             require_capability=False,
         )
 
@@ -458,7 +454,7 @@ class Runtime:
             process = self.store.get_process(pid)
             if process is not None and skill_id in process.loaded_skills:
                 continue
-            self.skills.load_skill(pid, skill_id, actor=assigned_by, require_capability=False)
+            self.skills.activate_skill(pid, skill_id, actor=assigned_by, require_capability=False)
 
     def _apply_loaded_skill_tool_table(self, pid: str) -> None:
         process = self.store.get_process(pid)

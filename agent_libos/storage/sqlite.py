@@ -46,7 +46,7 @@ from agent_libos.models import (
     ToolSpec,
     ViewMode,
 )
-from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillSpec
+from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillPackage, SkillResource
 from agent_libos.utils.serde import dumps, loads
 
 
@@ -283,11 +283,10 @@ class SQLiteStore:
                   skill_id TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
                   version TEXT NOT NULL,
-                  spec_json TEXT NOT NULL,
+                  package_json TEXT NOT NULL,
                   source_type TEXT NOT NULL,
                   source TEXT,
-                  manifest_sha256 TEXT NOT NULL,
-                  signed INTEGER NOT NULL,
+                  package_sha256 TEXT NOT NULL,
                   registered_by TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
@@ -300,11 +299,11 @@ class SQLiteStore:
                   trust_id TEXT PRIMARY KEY,
                   source_type TEXT NOT NULL,
                   source TEXT NOT NULL,
-                  manifest_sha256 TEXT NOT NULL,
+                  package_sha256 TEXT NOT NULL,
                   trusted_by TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   metadata_json TEXT NOT NULL,
-                  UNIQUE(source_type, source, manifest_sha256)
+                  UNIQUE(source_type, source, package_sha256)
                 );
 
                 CREATE TABLE IF NOT EXISTS jsonrpc_endpoints (
@@ -1059,28 +1058,27 @@ class SQLiteStore:
 
     def upsert_skill(
         self,
-        skill: SkillSpec,
+        skill: SkillPackage,
         *,
         source_type: str,
         source: str | None,
-        manifest_sha256: str,
+        package_sha256: str,
         registered_by: str,
         created_at: str,
     ) -> None:
         self._execute(
             """
             INSERT INTO skills (
-                skill_id, name, version, spec_json, source_type, source,
-                manifest_sha256, signed, registered_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                skill_id, name, version, package_json, source_type, source,
+                package_sha256, registered_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(skill_id) DO UPDATE SET
                 name = excluded.name,
                 version = excluded.version,
-                spec_json = excluded.spec_json,
+                package_json = excluded.package_json,
                 source_type = excluded.source_type,
                 source = excluded.source,
-                manifest_sha256 = excluded.manifest_sha256,
-                signed = excluded.signed,
+                package_sha256 = excluded.package_sha256,
                 registered_by = excluded.registered_by,
                 updated_at = excluded.updated_at
             """,
@@ -1091,34 +1089,33 @@ class SQLiteStore:
                 dumps(skill),
                 source_type,
                 source,
-                manifest_sha256,
-                int(skill.signed),
+                package_sha256,
                 registered_by,
                 created_at,
                 created_at,
             ),
         )
 
-    def get_skill(self, skill_id: str) -> tuple[SkillSpec, dict[str, Any]] | None:
+    def get_skill(self, skill_id: str) -> tuple[SkillPackage, dict[str, Any]] | None:
         rows = self._query("SELECT * FROM skills WHERE skill_id = ?", (skill_id,))
         if not rows:
             return None
         row = rows[0]
-        return self._dict_to_skill_spec(loads(row["spec_json"], {})), self._skill_row_metadata(row)
+        return self._dict_to_skill_package(loads(row["package_json"], {})), self._skill_row_metadata(row)
 
-    def list_skills(self, text: str | None = None, limit: int | None = None) -> list[tuple[SkillSpec, dict[str, Any]]]:
+    def list_skills(self, text: str | None = None, limit: int | None = None) -> list[tuple[SkillPackage, dict[str, Any]]]:
         params: list[Any] = []
         sql = "SELECT * FROM skills"
         if text:
             needle = f"%{text.lower()}%"
-            sql += " WHERE lower(skill_id) LIKE ? OR lower(name) LIKE ? OR lower(spec_json) LIKE ?"
+            sql += " WHERE lower(skill_id) LIKE ? OR lower(name) LIKE ? OR lower(package_json) LIKE ?"
             params.extend([needle, needle, needle])
         sql += " ORDER BY name, skill_id"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
         return [
-            (self._dict_to_skill_spec(loads(row["spec_json"], {})), self._skill_row_metadata(row))
+            (self._dict_to_skill_package(loads(row["package_json"], {})), self._skill_row_metadata(row))
             for row in self._query(sql, params)
         ]
 
@@ -1128,7 +1125,7 @@ class SQLiteStore:
         trust_id: str,
         source_type: str,
         source: str,
-        manifest_sha256: str,
+        package_sha256: str,
         trusted_by: str,
         created_at: str,
         metadata: dict[str, Any] | None = None,
@@ -1136,30 +1133,30 @@ class SQLiteStore:
         self._execute(
             """
             INSERT OR REPLACE INTO skill_trust (
-                trust_id, source_type, source, manifest_sha256, trusted_by, created_at, metadata_json
+                trust_id, source_type, source, package_sha256, trusted_by, created_at, metadata_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trust_id,
                 source_type,
                 source,
-                manifest_sha256,
+                package_sha256,
                 trusted_by,
                 created_at,
                 dumps(metadata or {}),
             ),
         )
 
-    def delete_skill_trust(self, *, source_type: str, source: str, manifest_sha256: str) -> None:
+    def delete_skill_trust(self, *, source_type: str, source: str, package_sha256: str) -> None:
         self._execute(
-            "DELETE FROM skill_trust WHERE source_type = ? AND source = ? AND manifest_sha256 = ?",
-            (source_type, source, manifest_sha256),
+            "DELETE FROM skill_trust WHERE source_type = ? AND source = ? AND package_sha256 = ?",
+            (source_type, source, package_sha256),
         )
 
-    def is_skill_trusted(self, *, source_type: str, source: str, manifest_sha256: str) -> bool:
+    def is_skill_trusted(self, *, source_type: str, source: str, package_sha256: str) -> bool:
         rows = self._query(
-            "SELECT 1 FROM skill_trust WHERE source_type = ? AND source = ? AND manifest_sha256 = ?",
-            (source_type, source, manifest_sha256),
+            "SELECT 1 FROM skill_trust WHERE source_type = ? AND source = ? AND package_sha256 = ?",
+            (source_type, source, package_sha256),
         )
         return bool(rows)
 
@@ -1432,11 +1429,10 @@ class SQLiteStore:
               skill_id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
               version TEXT NOT NULL,
-              spec_json TEXT NOT NULL,
+              package_json TEXT NOT NULL,
               source_type TEXT NOT NULL,
               source TEXT,
-              manifest_sha256 TEXT NOT NULL,
-              signed INTEGER NOT NULL,
+              package_sha256 TEXT NOT NULL,
               registered_by TEXT NOT NULL,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -1449,11 +1445,11 @@ class SQLiteStore:
               trust_id TEXT PRIMARY KEY,
               source_type TEXT NOT NULL,
               source TEXT NOT NULL,
-              manifest_sha256 TEXT NOT NULL,
+              package_sha256 TEXT NOT NULL,
               trusted_by TEXT NOT NULL,
               created_at TEXT NOT NULL,
               metadata_json TEXT NOT NULL,
-              UNIQUE(source_type, source, manifest_sha256)
+              UNIQUE(source_type, source, package_sha256)
             );
             """
         )
@@ -1841,8 +1837,7 @@ class SQLiteStore:
         return {
             "source_type": row["source_type"],
             "source": row["source"],
-            "manifest_sha256": row["manifest_sha256"],
-            "signed": bool(row["signed"]),
+            "package_sha256": row["package_sha256"],
             "registered_by": row["registered_by"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1888,20 +1883,24 @@ class SQLiteStore:
             metadata=dict(data.get("metadata") or {}),
         )
 
-    def _dict_to_skill_spec(self, data: dict[str, Any]) -> SkillSpec:
-        return SkillSpec(
+    def _dict_to_skill_package(self, data: dict[str, Any]) -> SkillPackage:
+        return SkillPackage(
             schema_version=int(data.get("schema_version", 1)),
             skill_id=data["skill_id"],
             name=data["name"],
-            version=data.get("version", "v0"),
             description=data.get("description", ""),
             instructions=data.get("instructions", ""),
-            tools=list(data.get("tools", [])),
+            version=data.get("version", "v0"),
+            license=data.get("license", ""),
+            compatibility=data.get("compatibility", ""),
+            metadata={str(key): str(value) for key, value in dict(data.get("metadata", {})).items()},
+            allowed_tools=list(data.get("allowed_tools", [])),
             actions=[ActionSchema(**item) for item in data.get("actions", [])],
             jit_tools=[JitToolSpec(**item) for item in data.get("jit_tools", [])],
             required_capabilities=list(data.get("required_capabilities", [])),
-            metadata=dict(data.get("metadata", {})),
-            signature=data.get("signature"),
+            resources=[SkillResource(**item) for item in data.get("resources", [])],
+            package_sha256=data.get("package_sha256", ""),
+            diagnostics=list(data.get("diagnostics", [])),
         )
 
     def _dict_to_tool_spec(self, data: dict[str, Any]) -> ToolSpec:

@@ -1,0 +1,10 @@
+[
+  {
+    "resource": "filesystem:workspace:*",
+    "rights": ["read", "write"]
+  },
+  {
+    "resource": "shell:*",
+    "rights": ["execute"]
+  }
+]

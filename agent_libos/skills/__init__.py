@@ -1,3 +1,3 @@
-from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillSpec
+from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillPackage, SkillResource
 
-__all__ = ["ActionSchema", "JitToolSpec", "LoadedSkill", "SkillSpec"]
+__all__ = ["ActionSchema", "JitToolSpec", "LoadedSkill", "SkillPackage", "SkillResource"]

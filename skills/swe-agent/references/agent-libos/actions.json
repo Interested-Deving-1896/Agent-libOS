@@ -1,0 +1,141 @@
+[
+  {
+    "name": "localize_issue",
+    "use_cases": [
+      "Locate files, symbols, failing tests, and likely root causes before editing."
+    ],
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "issue": {"type": "string"},
+        "candidate_paths": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "likely_files": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "evidence": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "required_capabilities": [
+      {
+        "resource": "filesystem:workspace:*",
+        "rights": ["read"]
+      }
+    ],
+    "side_effects": [],
+    "failure_modes": [
+      "Repository search may require shell execute authority for rg.",
+      "Large files may be truncated by runtime read limits."
+    ]
+  },
+  {
+    "name": "patch_with_evidence",
+    "use_cases": [
+      "Apply the smallest patch after the failing behavior and target code are understood."
+    ],
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"},
+        "evidence": {"type": "string"},
+        "patch_strategy": {"type": "string"}
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "changed": {"type": "boolean"},
+        "path": {"type": "string"}
+      }
+    },
+    "required_capabilities": [
+      {
+        "resource": "filesystem:workspace:*",
+        "rights": ["read", "write"]
+      }
+    ],
+    "side_effects": ["filesystem write"],
+    "failure_modes": [
+      "Exact text may be stale or non-unique.",
+      "Line numbers may drift after earlier edits."
+    ]
+  },
+  {
+    "name": "validate_patch",
+    "use_cases": [
+      "Run focused tests, parse failures, and decide whether broader validation is needed."
+    ],
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "passed": {"type": "boolean"},
+        "evidence": {"type": "string"}
+      }
+    },
+    "required_capabilities": [
+      {
+        "resource": "shell:*",
+        "rights": ["execute"]
+      }
+    ],
+    "side_effects": ["shell command"],
+    "failure_modes": [
+      "Shell policy may require approval.",
+      "Tests may be unavailable or too expensive for the current budget."
+    ]
+  },
+  {
+    "name": "submit_resolution",
+    "use_cases": [
+      "Finish the process with a compact SWE-Agent style final report."
+    ],
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "summary": {"type": "string"},
+        "tests": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "residual_risks": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "submitted": {"type": "boolean"}
+      }
+    },
+    "required_capabilities": [],
+    "side_effects": ["process exit"],
+    "failure_modes": [
+      "The process may not have completed enough validation to submit safely."
+    ]
+  }
+]

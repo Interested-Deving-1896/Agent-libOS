@@ -150,10 +150,11 @@ def _skill_section(skills: list[dict[str, Any]]) -> str:
             "version": skill.get("version"),
             "description": skill.get("description", ""),
             "instructions": skill.get("instructions", ""),
-            "tools": skill.get("tools", []),
+            "allowed_tools": skill.get("allowed_tools", []),
             "actions": skill.get("actions", []),
             "jit_tools": skill.get("jit_tools", []),
             "required_capabilities": skill.get("required_capabilities", []),
+            "resources": skill.get("resources", []),
         }
         for skill in skills
     ]

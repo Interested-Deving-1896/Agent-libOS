@@ -54,14 +54,14 @@ from agent_libos.tools.builtin.process import (
 )
 from agent_libos.tools.builtin.shell import RunShellCommandTool
 from agent_libos.tools.builtin.skills import (
+    ActivateSkillTool,
     DiscoverSkillsTool,
-    InspectSkillTool,
-    LoadSkillFromYamlTool,
-    LoadSkillTool,
+    ReadSkillResourceTool,
     UnloadSkillTool,
 )
 
 __all__ = [
+    "ActivateSkillTool",
     "CreateMemoryObjectTool",
     "CreateMemoryNamespaceTool",
     "CreateObjectFromFileTool",
@@ -82,10 +82,7 @@ __all__ = [
     "InspectCheckpointTool",
     "InspectJsonRpcEndpointTool",
     "InspectCapabilityTool",
-    "InspectSkillTool",
     "LoadImageFromYamlTool",
-    "LoadSkillFromYamlTool",
-    "LoadSkillTool",
     "ForkChildProcessTool",
     "ForkCheckpointTool",
     "ListChildProcessesTool",
@@ -98,6 +95,7 @@ __all__ = [
     "ProposeJitTool",
     "ReadDirectoryTool",
     "ReadMemoryObjectTool",
+    "ReadSkillResourceTool",
     "ListMemoryNamespaceTool",
     "ReadTextFileTool",
     "RequestPermissionTool",

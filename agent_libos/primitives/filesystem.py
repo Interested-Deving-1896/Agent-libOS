@@ -31,6 +31,14 @@ class FileReadResult:
 
 
 @dataclass(frozen=True)
+class FileBytesReadResult:
+    path: str
+    content: bytes
+    bytes_read: int
+    truncated: bool
+
+
+@dataclass(frozen=True)
 class FileWriteResult:
     path: str
     bytes_written: int
@@ -155,6 +163,73 @@ class FilesystemAdapter:
             audit_record=audit_record,
         )
         return FileReadResult(path=relative, content=content, bytes_read=len(selected), truncated=truncated)
+
+    def read_bytes(
+        self,
+        pid: str,
+        path: str | os.PathLike[str],
+        max_bytes: int = _TOOL_DEFAULTS.filesystem_read_max_bytes,
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> FileBytesReadResult:
+        max_bytes = self._bounded_positive_int(
+            max_bytes,
+            label="max_bytes",
+            hard_limit=_TOOL_DEFAULTS.filesystem_read_hard_limit_bytes,
+        )
+        target, relative = self._resolve(path, cwd=cwd)
+        resource = self.resource_for(relative)
+        self.capabilities.require(
+            pid,
+            resource,
+            CapabilityRight.READ,
+            self._authorization_context(
+                pid=pid,
+                resource=resource,
+                relative=relative,
+                primitive="runtime.filesystem.read_bytes",
+                operation="read_bytes",
+                right=CapabilityRight.READ.value,
+                extra={"max_bytes": max_bytes},
+            ),
+        )
+        target_state = self.provider.state(target)
+        if not target_state.exists:
+            raise NotFound(f"file does not exist: {relative}")
+        if target_state.kind != "file":
+            raise CapabilityDenied(f"path is not a file: {relative}")
+        effect_context = {"path": relative, "resource": resource, "max_bytes": max_bytes}
+        require_external_effect_classifier(self.provider, "read_bytes")
+        raw = self.provider.read_bytes(target)
+        truncated = len(raw) > max_bytes
+        selected = raw[:max_bytes]
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=resource,
+            payload={
+                "adapter": "filesystem",
+                "operation": "read_bytes",
+                "path": relative,
+                "bytes_read": len(selected),
+                "truncated": truncated,
+            },
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.read_bytes",
+            target=resource,
+            decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="read_bytes",
+            target=resource,
+            context=effect_context,
+            result={"bytes_read": len(selected), "truncated": truncated},
+            event=event,
+            audit_record=audit_record,
+        )
+        return FileBytesReadResult(path=relative, content=selected, bytes_read=len(selected), truncated=truncated)
 
     def write_text(
         self,

@@ -81,8 +81,8 @@ but v1 does not apply external compensation.
   `JsonRpcPrimitive` expose protected primitive operations over provider
   backends.
 - `ToolBroker` registers static tools and process-local JIT tools.
-- `SkillManager` registers trusted Skill specs and loads them into process tool
-  tables.
+- `SkillManager` registers standard Skill packages and activates them into
+  process tool tables and prompt context without granting resource authority.
 - `ProcessManager` owns lifecycle, working directories, child relationships,
   and image transitions.
 - `SimpleScheduler` runs runnable processes and wakes waiting work.
@@ -187,6 +187,6 @@ benchmarks/        deterministic runtime-safety benchmark harness and fixtures
 docs/              current implementation documentation
 experiments/       benchmark entrypoints
 scripts/           real-model smoke and demo scripts
-skills/            workspace Skill manifests
+skills/            workspace standard Agent Skill packages
 tests/             safety-boundary and regression tests
 ```

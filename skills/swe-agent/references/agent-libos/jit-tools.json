@@ -1,0 +1,99 @@
+[
+  {
+    "name": "swe_view",
+    "description": "View a directory listing or a bounded file window with 1-based line numbers.",
+    "source_path": "scripts/swe_view.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "default": "."},
+        "kind": {"type": "string", "enum": ["file", "directory"], "default": "file"},
+        "start_line": {"type": "integer", "minimum": 1, "default": 1},
+        "window": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
+        "max_bytes": {"type": "integer", "minimum": 1, "default": 65536}
+      }
+    },
+    "output_schema": {"type": "object"},
+    "tests": [],
+    "metadata": {"aci_role": "file_viewer"}
+  },
+  {
+    "name": "swe_grep",
+    "description": "Search the workspace with rg and return concise SWE-Agent style matches.",
+    "source_path": "scripts/swe_grep.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {"type": "string"},
+        "path": {"type": "string", "default": "."},
+        "literal": {"type": "boolean", "default": true},
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+        "timeout_s": {"type": "number", "default": 10}
+      }
+    },
+    "output_schema": {"type": "object"},
+    "tests": [],
+    "metadata": {"aci_role": "repository_search"}
+  },
+  {
+    "name": "swe_edit",
+    "description": "Apply a precise file edit by exact text replacement, line range replacement, or create-if-missing write.",
+    "source_path": "scripts/swe_edit.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"},
+        "old_text": {"type": "string"},
+        "new_text": {"type": "string"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "occurrence": {"type": "integer", "minimum": 1, "default": 1},
+        "create_if_missing": {"type": "boolean", "default": false}
+      }
+    },
+    "output_schema": {"type": "object"},
+    "tests": [],
+    "metadata": {"aci_role": "file_editor"}
+  },
+  {
+    "name": "swe_run",
+    "description": "Run an argv command through the shell primitive and normalize empty-output observations.",
+    "source_path": "scripts/swe_run.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "timeout_s": {"type": "number", "default": 60}
+      }
+    },
+    "output_schema": {"type": "object"},
+    "tests": [],
+    "metadata": {"aci_role": "command_runner"}
+  },
+  {
+    "name": "swe_submit",
+    "description": "Submit the final SWE-Agent style resolution and request process exit after the tool result.",
+    "source_path": "scripts/swe_submit.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "summary": {"type": "string"},
+        "tests": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "residual_risks": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "status": {"type": "string", "default": "resolved"}
+      }
+    },
+    "output_schema": {"type": "object"},
+    "tests": [],
+    "metadata": {"aci_role": "submit"}
+  }
+]

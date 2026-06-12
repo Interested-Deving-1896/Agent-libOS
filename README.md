@@ -20,7 +20,7 @@ This project is still in active development. [agent_libos_design_doc.md](agent_l
 is a historical design archive and may describe planned or superseded
 interfaces.
 
-## Current MVP
+## Current System
 
 The implementation currently includes:
 
@@ -72,8 +72,9 @@ Start here, then read the deeper references as needed:
   manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
 - [docs/jsonrpc.md](docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
-- [docs/skills.md](docs/skills.md): Skill manifest v1, workspace/global
-  sources, trust, load/unload semantics, bundled JIT tools, and `swe-agent:v0`.
+- [docs/skills.md](docs/skills.md): standard `SKILL.md` packages,
+  workspace/global sources, trust, activate/unload semantics, bundled JIT
+  tools, and `swe-agent`.
 - [docs/checkpoints.md](docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, append-only history, and external effects.
 - [docs/cli.md](docs/cli.md): stable CLI command reference and examples.
@@ -188,11 +189,12 @@ uv run agent-libos --db .agent_libos.sqlite exec image.yaml "Review README.md" -
 uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
 ```
 
-Register and load the SWE-Agent style Skill:
+Register and activate the SWE-Agent style Skill:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills register skills/swe_agent.yaml
-uv run agent-libos --db .agent_libos.sqlite skills load <pid> swe-agent:v0
+uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
 ```
 
 Register and call a preconfigured JSON-RPC endpoint:

@@ -282,20 +282,33 @@ class SkillDefaults:
     trust_resource: str = "skill_trust:*"
     global_dirs: tuple[str, ...] = ("~/.agent-libos/skills",)
     workspace_dirs: tuple[str, ...] = ("skills", ".agent_libos/skills")
-    trusted_global_sha256: tuple[str, ...] = ()
+    resource_dirs: tuple[str, ...] = ("scripts", "references", "assets")
+    trusted_global_package_sha256: tuple[str, ...] = ()
     global_requires_trust: bool = True
-    manifest_max_bytes: int = 262_144
-    manifest_hard_limit_bytes: int = 1_048_576
+    skill_md_max_bytes: int = 262_144
+    skill_md_hard_limit_bytes: int = 1_048_576
+    resource_read_max_bytes: int = 262_144
+    package_max_bytes: int = 2_097_152
+    max_package_files: int = 256
     max_prompt_instruction_chars: int = 8_000
     max_jit_source_chars: int = 64_000
     discover_limit: int = 100
     id_max_chars: int = 128
     name_max_chars: int = 128
+    description_max_chars: int = 1_024
     version_max_chars: int = 64
     max_tools: int = 128
     max_actions: int = 128
     max_jit_tools: int = 32
     max_required_capabilities: int = 64
+
+    @property
+    def manifest_max_bytes(self) -> int:
+        return self.skill_md_max_bytes
+
+    @property
+    def manifest_hard_limit_bytes(self) -> int:
+        return self.skill_md_hard_limit_bytes
 
 
 @dataclass(frozen=True)

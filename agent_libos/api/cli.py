@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None) -> None:
     _add_message_parser_args(interrupt_parser, include_kind=False)
     checkpoint_parser = sub.add_parser("checkpoint", help="Create, inspect, diff, restore, fork, or replay checkpoints")
     _add_checkpoint_parser_args(checkpoint_parser)
-    skills_parser = sub.add_parser("skills", help="Discover, inspect, register, trust, load, or unload skills")
+    skills_parser = sub.add_parser("skills", help="Discover, inspect, register, trust, activate, or unload skills")
     _add_skills_parser_args(skills_parser)
     capabilities_parser = sub.add_parser("capabilities", help="List, inspect, grant, delegate, revoke, or explain capabilities")
     _add_capabilities_parser_args(capabilities_parser)
@@ -504,21 +504,23 @@ def _add_skills_parser_args(parser: argparse.ArgumentParser) -> None:
     discover = sub.add_parser("discover", help="Discover registered skills")
     discover.add_argument("--text")
     discover.add_argument("--limit", type=int)
-    inspect = sub.add_parser("inspect", help="Inspect a registered skill")
+    inspect = sub.add_parser("inspect", help="Inspect a registered skill package")
     inspect.add_argument("skill_id")
-    register = sub.add_parser("register", help="Register a Skill manifest from a YAML or JSON file")
+    validate = sub.add_parser("validate", help="Validate a standard Agent Skill directory or SKILL.md")
+    validate.add_argument("path")
+    register = sub.add_parser("register", help="Register a standard Agent Skill directory or SKILL.md")
     register.add_argument("path")
     register.add_argument("--replace", action="store_true")
-    register.add_argument("--source-type", choices=["workspace", "global", "inline"], default="workspace")
-    load = sub.add_parser("load", help="Load a registered skill into a process")
-    load.add_argument("pid")
-    load.add_argument("skill_id")
+    register.add_argument("--source-type", choices=["workspace", "global", "runtime"], default=None)
+    activate = sub.add_parser("activate", help="Activate a registered skill in a process")
+    activate.add_argument("pid")
+    activate.add_argument("skill_id")
     unload = sub.add_parser("unload", help="Unload a skill from a process")
     unload.add_argument("pid")
     unload.add_argument("skill_id")
-    trust = sub.add_parser("trust", help="Trust a global Skill manifest by exact SHA256")
+    trust = sub.add_parser("trust", help="Trust a global Skill package by exact package SHA256")
     trust.add_argument("path")
-    untrust = sub.add_parser("untrust", help="Remove trust for the current bytes of a global Skill manifest")
+    untrust = sub.add_parser("untrust", help="Remove trust for the current bytes of a global Skill package")
     untrust.add_argument("path")
 
 
@@ -539,6 +541,8 @@ def _run_skills_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
             actor=actor if require_capability else None,
             require_capability=require_capability,
         )
+    if command == "validate":
+        return runtime.skills.validate_package_path(args.path)
     if command == "register":
         if args.source_type == "global":
             return runtime.skills.register_global_skill_from_path(
@@ -548,56 +552,40 @@ def _run_skills_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
                 require_capability=require_capability,
             )
         if require_capability:
-            cwd = runtime.process.working_directory(actor)
-            read = runtime.filesystem.read_text(
+            return runtime.skills.register_skill_from_workspace_path(
                 actor,
                 args.path,
-                max_bytes=runtime.config.skills.manifest_max_bytes,
-                cwd=cwd,
-            )
-            return runtime.skills.register_skill_from_yaml_text(
-                read.content,
-                actor=actor,
                 replace=args.replace,
                 require_capability=True,
-                source_type=args.source_type,
-                source=read.path,
             )
-        path = Path(args.path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        path = path.resolve()
-        if not path.exists() or not path.is_file():
-            raise SystemExit(f"skill manifest does not exist: {path}")
-        return runtime.skills.register_skill_from_yaml_text(
-            path.read_text(encoding="utf-8"),
+        return runtime.skills.register_skill_from_path(
+            args.path,
             actor=actor,
             replace=args.replace,
             require_capability=require_capability,
             source_type=args.source_type,
-            source=str(path),
         )
-    if command == "load":
-        return runtime.skills.load_skill(args.pid, args.skill_id, actor=actor, require_capability=require_capability)
+    if command == "activate":
+        return runtime.skills.activate_skill(args.pid, args.skill_id, actor=actor, require_capability=require_capability)
     if command == "unload":
         return runtime.skills.unload_skill(args.pid, args.skill_id, actor=actor, require_capability=require_capability)
     if command == "trust":
-        info = runtime.skills.global_manifest_info(args.path)
+        info = runtime.skills.global_package_info(args.path)
         return runtime.skills.trust_skill_source(
             actor=actor,
             source_type="global",
             source=info["source"],
-            manifest_sha256=info["manifest_sha256"],
+            package_sha256=info["package_sha256"],
             require_capability=require_capability,
             metadata={"path": info["path"]},
         )
     if command == "untrust":
-        info = runtime.skills.global_manifest_info(args.path)
+        info = runtime.skills.global_package_info(args.path)
         return runtime.skills.untrust_skill_source(
             actor=actor,
             source_type="global",
             source=info["source"],
-            manifest_sha256=info["manifest_sha256"],
+            package_sha256=info["package_sha256"],
             require_capability=require_capability,
         )
     raise SystemExit(f"unknown skills command: {command}")

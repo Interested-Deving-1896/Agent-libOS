@@ -107,7 +107,7 @@ Current default groups include:
 - image registry limits,
 - Object Memory and LLM context defaults,
 - checkpoint snapshot limits,
-- Skill source, trust, and manifest limits,
+- Skill package source, trust, resource, and `SKILL.md` limits,
 - trusted startup Runtime Module manifests, hash trust, and registration limits,
 - launcher presets,
 - script defaults.
@@ -130,7 +130,7 @@ Current behavior must not claim:
 - direct external framework adapters as trusted boundaries,
 - real MCP/GitHub/provider integrations that are not implemented,
 - provider-level compensation for rollbackable external side effects,
-- Skill loading as a capability grant.
+- Skill activation as a capability grant.
 
 `agent_libos_design_doc.md` remains a historical archive and can be stale.
 

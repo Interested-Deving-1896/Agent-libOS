@@ -746,16 +746,16 @@ class CheckpointManager:
 
     def _skill_trust_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         skill_rows = self._skill_rows_for_processes(process_rows)
-        pairs = {(row["source_type"], row["source"], row["manifest_sha256"]) for row in skill_rows if row.get("source")}
+        pairs = {(row["source_type"], row["source"], row["package_sha256"]) for row in skill_rows if row.get("source")}
         if not pairs:
             return []
         rows: list[dict[str, Any]] = []
-        for source_type, source, manifest_sha256 in sorted(pairs):
+        for source_type, source, package_sha256 in sorted(pairs):
             rows.extend(
                 self.store.select_table_rows(
                     "skill_trust",
-                    "source_type = ? AND source = ? AND manifest_sha256 = ?",
-                    [source_type, source, manifest_sha256],
+                    "source_type = ? AND source = ? AND package_sha256 = ?",
+                    [source_type, source, package_sha256],
                     order_by="created_at",
                 )
             )

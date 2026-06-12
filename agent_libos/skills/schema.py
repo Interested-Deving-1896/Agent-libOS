@@ -20,6 +20,7 @@ class ActionSchema:
 class JitToolSpec:
     name: str
     description: str
+    source_path: str
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
     source: str = ""
@@ -28,23 +29,40 @@ class JitToolSpec:
 
 
 @dataclass(frozen=True)
-class SkillSpec:
+class SkillResource:
+    path: str
+    size_bytes: int
+    sha256: str
+    kind: str = "text"
+    content: str | None = None
+    content_base64: str | None = None
+
+
+@dataclass(frozen=True)
+class SkillPackage:
+    """Snapshot of a standard Agent Skill package.
+
+    A Skill's public identity is the standard SKILL.md frontmatter ``name``.
+    Agent libOS stores a package snapshot so activation and resource reads do
+    not keep authority to the original workspace or global filesystem path.
+    """
+
     skill_id: str
     name: str
+    description: str
+    instructions: str
     version: str = "v0"
-    description: str = ""
-    instructions: str = ""
-    tools: list[str] = field(default_factory=list)
+    license: str = ""
+    compatibility: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
+    allowed_tools: list[str] = field(default_factory=list)
     actions: list[ActionSchema] = field(default_factory=list)
     jit_tools: list[JitToolSpec] = field(default_factory=list)
     required_capabilities: list[dict[str, Any]] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    signature: str | None = None
+    resources: list[SkillResource] = field(default_factory=list)
+    package_sha256: str = ""
+    diagnostics: list[str] = field(default_factory=list)
     schema_version: int = 1
-
-    @property
-    def signed(self) -> bool:
-        return bool(self.signature)
 
 
 @dataclass(frozen=True)
@@ -52,6 +70,7 @@ class LoadedSkill:
     skill_id: str
     version: str
     source: str | None
+    package_sha256: str
     loaded_at: str
     tool_names: list[str]
     tool_ids: dict[str, str]

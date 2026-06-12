@@ -184,18 +184,19 @@ capabilities. Without it, the command runs as an audited admin actor named
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite skills discover
-uv run agent-libos --db .agent_libos.sqlite skills inspect swe-agent:v0
-uv run agent-libos --db .agent_libos.sqlite skills register skills/swe_agent.yaml
-uv run agent-libos --db .agent_libos.sqlite skills load <pid> swe-agent:v0
-uv run agent-libos --db .agent_libos.sqlite skills unload <pid> swe-agent:v0
+uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills inspect swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills unload <pid> swe-agent
 ```
 
-Global Skills require exact-byte trust:
+Global Skills require exact package SHA-256 trust:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review.yaml
-uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review.yaml --source-type global
-uv run agent-libos --db .agent_libos.sqlite skills untrust ~/.agent-libos/skills/review.yaml
+uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review-helper
+uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review-helper --source-type global
+uv run agent-libos --db .agent_libos.sqlite skills untrust ~/.agent-libos/skills/review-helper
 ```
 
 `--actor-pid <pid>` makes the CLI enforce that process's Skill, source, and

@@ -34,9 +34,9 @@ measurably safer under adversarial workloads.
 2. Implementation. The current prototype implements the model in Python with a
    Resource Provider Substrate, SQLite persistence, audit records, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
-   shell/image/filesystem/process/human/memory/skill primitives, declarative
-   Skill manifests, and Deno/TypeScript JIT tools that can reach libOS only
-   through syscall RPC.
+   shell/image/filesystem/process/human/memory/skill primitives, standard
+   `SKILL.md` packages with libOS metadata, and Deno/TypeScript JIT tools that
+   can reach libOS only through syscall RPC.
 
 3. Benchmark suite. The current prototype includes an M1 deterministic
    runtime-safety harness with adversarial tasks, wrapper baselines, ablations,

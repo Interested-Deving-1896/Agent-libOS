@@ -19,25 +19,22 @@ class DiscoverSkillsOutput(BaseModel):
     skills: list[dict[str, Any]]
 
 
-class InspectSkillArgs(BaseModel):
-    skill_id: str
+class ActivateSkillArgs(BaseModel):
+    skill_id: str = Field(description="Standard Skill name to activate.")
 
 
-class InspectSkillOutput(BaseModel):
-    skill: dict[str, Any]
-
-
-class LoadSkillArgs(BaseModel):
-    skill_id: str
-
-
-class LoadSkillFromYamlArgs(BaseModel):
-    path: str = Field(description="Workspace-relative Skill YAML or JSON manifest path.")
-    replace: bool = Field(default=False, description="Replace an existing registered skill with the same id.")
-
-
-class LoadSkillOutput(BaseModel):
+class ActivateSkillOutput(BaseModel):
     result: dict[str, Any]
+
+
+class ReadSkillResourceArgs(BaseModel):
+    skill_id: str = Field(description="Loaded Skill name.")
+    path: str = Field(description="Skill resource path, such as references/foo.md or scripts/tool.ts.")
+    max_bytes: int | None = Field(default=None, description="Optional resource byte limit.")
+
+
+class ReadSkillResourceOutput(BaseModel):
+    resource: dict[str, Any]
 
 
 class UnloadSkillArgs(BaseModel):
@@ -50,7 +47,7 @@ class UnloadSkillOutput(BaseModel):
 
 class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
     name = "discover_skills"
-    description = "Discover registered skills visible to this process."
+    description = "Discover registered standard Agent Skills visible to this process."
     args_schema = DiscoverSkillsArgs
     output_schema = DiscoverSkillsOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
@@ -62,41 +59,35 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
         )
 
 
-class InspectSkillTool(SyncAgentTool[InspectSkillArgs]):
-    name = "inspect_skill"
-    description = "Inspect a registered skill manifest and metadata."
-    args_schema = InspectSkillArgs
-    output_schema = InspectSkillOutput
+class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
+    name = "activate_skill"
+    description = "Activate a registered standard Agent Skill in this process."
+    args_schema = ActivateSkillArgs
+    output_schema = ActivateSkillOutput
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    tags = ["skill", "activate"]
+
+    def run(self, args: ActivateSkillArgs, ctx: ToolContext) -> ActivateSkillOutput:
+        return ActivateSkillOutput(result=_runtime(ctx).skills.activate_skill(ctx.pid, args.skill_id, actor=ctx.pid))
+
+
+class ReadSkillResourceTool(SyncAgentTool[ReadSkillResourceArgs]):
+    name = "read_skill_resource"
+    description = "Read a bundled resource from a loaded standard Agent Skill snapshot."
+    args_schema = ReadSkillResourceArgs
+    output_schema = ReadSkillResourceOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
-    tags = ["skill", "inspect"]
+    tags = ["skill", "resource", "inspect"]
 
-    def run(self, args: InspectSkillArgs, ctx: ToolContext) -> InspectSkillOutput:
-        return InspectSkillOutput(skill=_runtime(ctx).skills.inspect_skill(args.skill_id, actor=ctx.pid))
-
-
-class LoadSkillTool(SyncAgentTool[LoadSkillArgs]):
-    name = "load_skill"
-    description = "Load a registered skill into this process tool table and prompt context."
-    args_schema = LoadSkillArgs
-    output_schema = LoadSkillOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
-    tags = ["skill", "load"]
-
-    def run(self, args: LoadSkillArgs, ctx: ToolContext) -> LoadSkillOutput:
-        return LoadSkillOutput(result=_runtime(ctx).skills.load_skill(ctx.pid, args.skill_id, actor=ctx.pid))
-
-
-class LoadSkillFromYamlTool(SyncAgentTool[LoadSkillFromYamlArgs]):
-    name = "load_skill_from_yaml"
-    description = "Read a workspace Skill manifest through the filesystem primitive, register it, and load it."
-    args_schema = LoadSkillFromYamlArgs
-    output_schema = LoadSkillOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
-    tags = ["skill", "load", "yaml"]
-
-    def run(self, args: LoadSkillFromYamlArgs, ctx: ToolContext) -> LoadSkillOutput:
-        return LoadSkillOutput(
-            result=_runtime(ctx).skills.load_skill_from_workspace_yaml(ctx.pid, args.path, replace=args.replace)
+    def run(self, args: ReadSkillResourceArgs, ctx: ToolContext) -> ReadSkillResourceOutput:
+        return ReadSkillResourceOutput(
+            resource=_runtime(ctx).skills.read_skill_resource(
+                ctx.pid,
+                args.skill_id,
+                args.path,
+                actor=ctx.pid,
+                max_bytes=args.max_bytes,
+            )
         )
 
 

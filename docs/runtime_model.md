@@ -128,8 +128,8 @@ uv run agent-libos --db .agent_libos.sqlite interrupt <pid> "Stop and read this 
 holds them.
 
 `spawn_child_process` creates a fresh direct child with a new process namespace
-and goal-only memory. It does not inherit parent-loaded Skills or broad external
-authority by default.
+and goal-only memory. It does not inherit parent-activated Skills or broad
+external authority by default.
 
 `exec_process` replaces the current image and tool table without changing pid.
 It never grants the target image's declared required capabilities

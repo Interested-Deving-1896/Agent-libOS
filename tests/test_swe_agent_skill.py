@@ -14,20 +14,18 @@ class SWEAgentSkillTests(unittest.TestCase):
         runtime = Runtime.open("local")
         runtime.tools.sandbox = StaticOnlyTypescriptSandbox()
         try:
-            manifest = Path("skills/swe_agent.yaml").read_text(encoding="utf-8")
-            registered = runtime.register_skill_from_yaml_text(
-                manifest,
+            registered = runtime.register_skill_from_path(
+                Path("skills/swe-agent"),
                 actor="cli",
                 source_type="workspace",
-                source="skills/swe_agent.yaml",
             )
             pid = runtime.process.spawn(image="base-agent:v0", goal="fix issue like SWE-Agent")
-            runtime.capability.grant(pid, "skill:swe-agent:v0", [CapabilityRight.EXECUTE], issued_by="test")
+            runtime.capability.grant(pid, "skill:swe-agent", [CapabilityRight.EXECUTE], issued_by="test")
 
-            loaded = runtime.skills.load_skill(pid, "swe-agent:v0", actor=pid)
+            loaded = runtime.skills.activate_skill(pid, "swe-agent", actor=pid)
             process = runtime.process.get(pid)
 
-            self.assertEqual(registered["skill_id"], "swe-agent:v0")
+            self.assertEqual(registered["skill_id"], "swe-agent")
             for name in ["swe_view", "swe_grep", "swe_edit", "swe_run", "swe_submit"]:
                 self.assertIn(name, loaded["jit_tool_ids"])
                 self.assertIn(name, process.tool_table)

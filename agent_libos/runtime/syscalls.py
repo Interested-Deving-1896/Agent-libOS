@@ -100,11 +100,11 @@ BUILTIN_SYSCALL_NAMES = {
     "request_permission",
     "shell.run",
     "shell.run_command",
+    "skill.activate",
     "skill.discover",
     "skill.inspect",
-    "skill.load",
-    "skill.load_yaml",
-    "skill.register",
+    "skill.read_resource",
+    "skill.register_path",
     "skill.unload",
     "sleep",
     "time.now",
@@ -418,31 +418,23 @@ class LibOSSyscallSession:
             }
         if name == "skill.inspect":
             return self.runtime.skills.inspect_skill(str(args["skill_id"]), actor=self.pid)
-        if name == "skill.register":
-            if args.get("yaml") is not None:
-                return self.runtime.skills.register_skill_from_yaml_text(
-                    str(args["yaml"]),
-                    actor=self.pid,
-                    replace=bool(args.get("replace", False)),
-                    source_type=str(args.get("source_type") or "inline"),
-                    source=str(args["source"]) if args.get("source") is not None else None,
-                )
-            return self.runtime.skills.register_skill(
-                dict(args["skill"]),
-                actor=self.pid,
-                replace=bool(args.get("replace", False)),
-                source_type=str(args.get("source_type") or "inline"),
-                source=str(args["source"]) if args.get("source") is not None else None,
-            )
-        if name == "skill.load":
-            return self.runtime.skills.load_skill(self.pid, str(args["skill_id"]), actor=self.pid)
-        if name == "skill.unload":
-            return self.runtime.skills.unload_skill(self.pid, str(args["skill_id"]), actor=self.pid)
-        if name == "skill.load_yaml":
-            return self.runtime.skills.load_skill_from_workspace_yaml(
+        if name == "skill.register_path":
+            return self.runtime.skills.register_skill_from_workspace_path(
                 self.pid,
                 str(args["path"]),
                 replace=bool(args.get("replace", False)),
+            )
+        if name == "skill.activate":
+            return self.runtime.skills.activate_skill(self.pid, str(args["skill_id"]), actor=self.pid)
+        if name == "skill.unload":
+            return self.runtime.skills.unload_skill(self.pid, str(args["skill_id"]), actor=self.pid)
+        if name == "skill.read_resource":
+            return self.runtime.skills.read_skill_resource(
+                self.pid,
+                str(args["skill_id"]),
+                str(args["path"]),
+                actor=self.pid,
+                max_bytes=int(args["max_bytes"]) if args.get("max_bytes") is not None else None,
             )
         if name in {"shell.run", "shell.run_command"}:
             cwd = self.runtime.process.working_directory(self.pid)

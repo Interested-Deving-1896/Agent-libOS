@@ -14,336 +14,350 @@ from agent_libos.api.cli import main as cli_main
 from agent_libos.config import AgentLibOSConfig, SkillDefaults
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ValidationResult
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 
 
 class SkillDynamicLoadingTests(unittest.TestCase):
-    def test_skill_manifest_validation_and_global_trust(self) -> None:
+    def test_standard_package_validation_and_global_trust(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             global_dir = root / "global-skills"
-            global_dir.mkdir()
-            manifest = global_dir / "trusted.yaml"
-            manifest.write_text(_echo_skill_manifest("global-skill:v0"), encoding="utf-8")
+            skill_dir = _write_skill_package(global_dir, "global-skill", allowed_tools=["echo"])
             config = AgentLibOSConfig(skills=replace(SkillDefaults(), global_dirs=(str(global_dir),)))
             runtime = Runtime.open("local", config=config)
             try:
                 with self.assertRaises(CapabilityDenied):
-                    runtime.skills.register_global_skill_from_path(manifest, actor="cli", require_capability=False)
+                    runtime.skills.register_global_skill_from_path(skill_dir, actor="cli", require_capability=False)
 
-                trust = runtime.skills.global_manifest_info(manifest)
+                trust = runtime.skills.global_package_info(skill_dir)
                 runtime.skills.trust_skill_source(
                     actor="cli",
                     source_type="global",
                     source=trust["source"],
-                    manifest_sha256=trust["manifest_sha256"],
+                    package_sha256=trust["package_sha256"],
                     require_capability=False,
                 )
-                registered = runtime.skills.register_global_skill_from_path(manifest, actor="cli", require_capability=False)
+                registered = runtime.skills.register_global_skill_from_path(skill_dir, actor="cli", require_capability=False)
 
-                self.assertEqual(registered["skill_id"], "global-skill:v0")
+                self.assertEqual(registered["skill_id"], "global-skill")
                 self.assertEqual(registered["source_type"], "global")
+                self.assertIn("package_sha256", registered)
                 with self.assertRaises(ValidationError):
-                    runtime.skills.register_skill_from_yaml_text(
-                        "schema_version: 1\nskill_id: bad:v0\nname: Bad\nunknown: nope\n",
+                    runtime.skills.validate_package_path(_write_raw_skill(root, "bad", "name: bad\ndescription: Bad\nunknown: nope\n"))
+                with self.assertRaises(ValidationError):
+                    runtime.skills.validate_package_path(_write_raw_skill(root, "BadName", "name: BadName\ndescription: Bad\n"))
+                with self.assertRaises(ValidationError):
+                    runtime.skills.validate_package_path(
+                        _write_raw_skill(
+                            root,
+                            "bad-metadata",
+                            "name: bad-metadata\ndescription: Bad\nmetadata: {agent-libos.version: 1}\n",
+                        )
+                    )
+                old_yaml = root / "legacy.yaml"
+                old_yaml.write_text("schema_version: 1\nskill_id: legacy:v0\nname: Legacy\n", encoding="utf-8")
+                with self.assertRaises(ValidationError):
+                    runtime.skills.validate_package_path(old_yaml)
+                with self.assertRaises(ValidationError):
+                    runtime.skills.register_skill_package(
+                        {
+                            "schema_version": 1,
+                            "skill_id": "legacy",
+                            "name": "legacy",
+                            "description": "Legacy shape.",
+                            "tools": ["echo"],
+                        },
                         actor="cli",
                         require_capability=False,
                     )
                 with self.assertRaises(ValidationError):
-                    runtime.skills.register_skill_from_yaml_text(
-                        "schema_version: nope\nskill_id: bad:v0\nname: Bad\n",
-                        actor="cli",
-                        require_capability=False,
+                    _write_skill_package(
+                        root,
+                        "bad-jit",
+                        jit_tools=[{"name": "bad", "description": "bad", "source_path": "../escaped.ts"}],
                     )
                 with self.assertRaises(ValidationError):
-                    runtime.skills.register_skill_from_yaml_text(
-                        """
-schema_version: 1
-skill_id: bad-action:v0
-name: Bad Action
-actions:
-  - name: bad_action
-    unexpected: nope
-""".lstrip(),
-                        actor="cli",
-                        require_capability=False,
-                    )
-                with self.assertRaises(ValidationError):
-                    runtime.skills.register_skill_from_yaml_text(
-                        """
-schema_version: 1
-skill_id: bad-jit:v0
-name: Bad JIT
-jit_tools:
-  - name: bad_jit
-    description: Bad nested field.
-    source: export function run(args, libos) { return {}; }
-    source_path: escaped.ts
-""".lstrip(),
-                        actor="cli",
-                        require_capability=False,
-                    )
-                with self.assertRaises(ValidationError):
-                    runtime.skills.register_skill_from_yaml_text(
-                        """
-schema_version: 1
-skill_id: bad-right:v0
-name: Bad Right
-required_capabilities:
-  - resource: filesystem:workspace:*
-    rights: ["*"]
-""".lstrip(),
-                        actor="cli",
-                        require_capability=False,
+                    _write_skill_package(
+                        root,
+                        "bad-right",
+                        required_capabilities=[{"resource": "filesystem:workspace:*", "rights": ["*"]}],
                     )
             finally:
                 runtime.close()
 
-    def test_workspace_load_reads_via_filesystem_and_uses_human_once_for_skill_authority(self) -> None:
+    def test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = Path(temp_dir) / "skill.yaml"
-            manifest.write_text(_echo_skill_manifest("workspace-skill:v0"), encoding="utf-8")
+            _write_skill_package(
+                Path(temp_dir),
+                "workspace-skill",
+                allowed_tools=["echo"],
+                extra_resources={"references/guide.md": "Workspace resource guide."},
+            )
             runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(temp_dir))
             try:
                 pid = runtime.process.spawn(image="base-agent:v0", goal="load workspace skill")
-                runtime.filesystem.grant_path(pid, "skill.yaml", [CapabilityRight.READ], issued_by="test")
+                runtime.filesystem.grant_path(pid, "workspace-skill/SKILL.md", [CapabilityRight.READ], issued_by="test")
+                runtime.filesystem.grant_directory(pid, "workspace-skill/references", [CapabilityRight.READ], issued_by="test")
 
                 with self.assertRaises(HumanApprovalRequired) as raised:
-                    runtime.skills.load_skill_from_workspace_yaml(pid, "skill.yaml")
+                    runtime.skills.activate_skill_from_workspace_path(pid, "workspace-skill")
 
                 runtime.human.approve(raised.exception.request_id)
-                loaded = runtime.skills.load_skill_from_workspace_yaml(pid, "skill.yaml")
+                loaded = runtime.skills.activate_skill_from_workspace_path(pid, "workspace-skill")
 
-                self.assertEqual(loaded["skill_id"], "workspace-skill:v0")
+                self.assertEqual(loaded["skill_id"], "workspace-skill")
                 self.assertIn("echo", runtime.process.get(pid).tool_table)
-                self.assertFalse(runtime.capability.check(pid, "skill:workspace-skill:v0", CapabilityRight.EXECUTE))
+                self.assertFalse(runtime.capability.check(pid, "skill:workspace-skill", CapabilityRight.EXECUTE))
+                resource = runtime.skills.read_skill_resource(pid, "workspace-skill", "references/guide.md")
+                self.assertEqual(resource["content"], "Workspace resource guide.")
             finally:
                 runtime.close()
 
-    def test_skill_syscall_load_yaml_uses_primitive_capabilities_not_tool_table(self) -> None:
+    def test_skill_syscalls_use_primitive_capabilities_not_tool_table(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = Path(temp_dir) / "skill.yaml"
-            manifest.write_text(_echo_skill_manifest("syscall-skill:v0"), encoding="utf-8")
+            _write_skill_package(Path(temp_dir), "syscall-skill", allowed_tools=["echo"])
             runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(temp_dir))
             try:
                 pid = runtime.process.spawn(image="base-agent:v0", goal="syscall skill")
                 process = runtime.process.get(pid)
-                process.tool_table.pop("load_skill_from_yaml", None)
+                process.tool_table.pop("activate_skill", None)
                 runtime.store.update_process(process)
-                runtime.filesystem.grant_path(pid, "skill.yaml", [CapabilityRight.READ], issued_by="test")
+                runtime.filesystem.grant_path(pid, "syscall-skill/SKILL.md", [CapabilityRight.READ], issued_by="test")
                 runtime.capability.grant(
                     pid,
-                    "skill:syscall-skill:v0",
+                    "skill:syscall-skill",
                     [CapabilityRight.WRITE, CapabilityRight.EXECUTE],
                     issued_by="test",
                 )
 
-                result = self._run(LibOSSyscallSession(runtime, pid).handle("skill.load_yaml", {"path": "skill.yaml"}))
+                registered = self._run(LibOSSyscallSession(runtime, pid).handle("skill.register_path", {"path": "syscall-skill"}))
+                loaded = self._run(LibOSSyscallSession(runtime, pid).handle("skill.activate", {"skill_id": "syscall-skill"}))
 
-                self.assertEqual(result["skill_id"], "syscall-skill:v0")
+                self.assertEqual(registered["skill_id"], "syscall-skill")
+                self.assertEqual(loaded["skill_id"], "syscall-skill")
                 self.assertIn("echo", runtime.process.get(pid).tool_table)
+                with self.assertRaises(NotFound):
+                    self._run(
+                        LibOSSyscallSession(runtime, pid).handle(
+                            "skill.register",
+                            {
+                                "skill": {
+                                    "schema_version": 1,
+                                    "skill_id": "inline-skill",
+                                    "name": "inline-skill",
+                                    "description": "Inline package should not be syscall-visible.",
+                                    "instructions": "inline",
+                                }
+                            },
+                        )
+                    )
             finally:
                 runtime.close()
 
     def test_loaded_existing_tool_visibility_does_not_grant_resource_authority(self) -> None:
-        runtime = Runtime.open("local")
-        try:
-            pid = runtime.process.spawn(image="base-agent:v0", goal="load read tool")
-            runtime.register_skill_from_yaml_text(
-                """
-schema_version: 1
-skill_id: read-skill:v0
-name: Read Skill
-tools: [read_text_file]
-required_capabilities:
-  - resource: filesystem:workspace:secret.txt
-    rights: [read]
-""".lstrip(),
-                actor="cli",
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(Path(temp_dir), "read-skill", allowed_tools=["read_text_file"])
+            runtime = Runtime.open("local")
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="load read tool")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                runtime.capability.grant(pid, "skill:read-skill", [CapabilityRight.EXECUTE], issued_by="test")
+
+                runtime.skills.activate_skill(pid, "read-skill", actor=pid)
+                result = runtime.tools.call(pid, "read_text_file", {"path": "secret.txt"})
+
+                self.assertIn("read_text_file", runtime.process.get(pid).tool_table)
+                self.assertFalse(runtime.capability.check(pid, "filesystem:workspace:secret.txt", CapabilityRight.READ))
+                self.assertFalse(result.ok)
+                self.assertIn("lacks read", result.error or "")
+            finally:
+                runtime.close()
+
+    def test_read_skill_resource_requires_loaded_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(
+                Path(temp_dir),
+                "resource-skill",
+                allowed_tools=["echo"],
+                extra_resources={"references/guide.md": "Remember resource-token.\n"},
             )
-            runtime.capability.grant(pid, "skill:read-skill:v0", [CapabilityRight.EXECUTE], issued_by="test")
+            runtime = Runtime.open("local")
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="read resource")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                with self.assertRaises(CapabilityDenied):
+                    runtime.skills.read_skill_resource(pid, "resource-skill", "references/guide.md")
+                runtime.capability.grant(pid, "skill:resource-skill", [CapabilityRight.EXECUTE], issued_by="test")
+                runtime.skills.activate_skill(pid, "resource-skill", actor=pid)
+                resource = runtime.skills.read_skill_resource(pid, "resource-skill", "references/guide.md")
+                self.assertIn("resource-token", resource["content"])
+            finally:
+                runtime.close()
 
-            runtime.skills.load_skill(pid, "read-skill:v0", actor=pid)
-            result = runtime.tools.call(pid, "read_text_file", {"path": "secret.txt"})
+    def test_cross_process_skill_activate_requires_target_process_admin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(Path(temp_dir), "cross-load-skill", allowed_tools=["echo"])
+            runtime = Runtime.open("local")
+            try:
+                actor = runtime.process.spawn(image="base-agent:v0", goal="actor")
+                target = runtime.process.spawn(image="base-agent:v0", goal="target")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                runtime.capability.grant(actor, "skill:cross-load-skill", [CapabilityRight.EXECUTE], issued_by="test")
 
-            self.assertIn("read_text_file", runtime.process.get(pid).tool_table)
-            self.assertFalse(runtime.capability.check(pid, "filesystem:workspace:secret.txt", CapabilityRight.READ))
-            self.assertFalse(result.ok)
-            self.assertIn("lacks read", result.error or "")
-        finally:
-            runtime.close()
+                with self.assertRaises(CapabilityDenied):
+                    runtime.skills.activate_skill(target, "cross-load-skill", actor=actor)
 
-    def test_cross_process_skill_load_requires_target_process_admin(self) -> None:
-        runtime = Runtime.open("local")
-        try:
-            actor = runtime.process.spawn(image="base-agent:v0", goal="actor")
-            target = runtime.process.spawn(image="base-agent:v0", goal="target")
-            runtime.register_skill_from_yaml_text(_echo_skill_manifest("cross-load-skill:v0"), actor="cli")
-            runtime.capability.grant(actor, "skill:cross-load-skill:v0", [CapabilityRight.EXECUTE], issued_by="test")
+                runtime.capability.grant(actor, f"process:{target}", [CapabilityRight.ADMIN], issued_by="test")
+                loaded = runtime.skills.activate_skill(target, "cross-load-skill", actor=actor)
 
-            with self.assertRaises(CapabilityDenied):
-                runtime.skills.load_skill(target, "cross-load-skill:v0", actor=actor)
-
-            runtime.capability.grant(actor, f"process:{target}", [CapabilityRight.ADMIN], issued_by="test")
-            loaded = runtime.skills.load_skill(target, "cross-load-skill:v0", actor=actor)
-
-            self.assertEqual(loaded["pid"], target)
-            self.assertIn("echo", runtime.process.get(target).tool_table)
-        finally:
-            runtime.close()
+                self.assertEqual(loaded["pid"], target)
+                self.assertIn("echo", runtime.process.get(target).tool_table)
+            finally:
+                runtime.close()
 
     def test_unload_skill_consumes_one_time_execute_authority(self) -> None:
-        runtime = Runtime.open("local")
-        try:
-            pid = runtime.process.spawn(image="base-agent:v0", goal="unload skill")
-            runtime.register_skill_from_yaml_text(_echo_skill_manifest("unload-skill:v0"), actor="cli")
-            runtime.load_skill(pid, "unload-skill:v0")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(Path(temp_dir), "unload-skill", allowed_tools=["echo"])
+            runtime = Runtime.open("local")
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="unload skill")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                runtime.activate_skill(pid, "unload-skill")
 
-            runtime.capability.grant_once(
-                pid,
-                "skill:unload-skill:v0",
-                [CapabilityRight.EXECUTE],
-                issued_by="test",
+                runtime.capability.grant_once(
+                    pid,
+                    "skill:unload-skill",
+                    [CapabilityRight.EXECUTE],
+                    issued_by="test",
+                )
+                runtime.skills.unload_skill(pid, "unload-skill", actor=pid)
+
+                self.assertFalse(runtime.capability.check(pid, "skill:unload-skill", CapabilityRight.EXECUTE))
+                self.assertNotIn("echo", runtime.process.get(pid).tool_table)
+            finally:
+                runtime.close()
+
+    def test_jit_skill_tool_is_process_local_and_uses_deno_validation_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(
+                Path(temp_dir),
+                "jit-skill",
+                jit_tools=[
+                    {
+                        "name": "skill_count",
+                        "description": "Count text characters.",
+                        "source_path": "scripts/skill_count.ts",
+                        "input_schema": {"type": "object"},
+                        "output_schema": {"type": "object"},
+                        "tests": [{"args": {"text": "abc"}, "expected": {"count": 3}}],
+                    }
+                ],
+                scripts={"scripts/skill_count.ts": "export function run(args, libos) { /* fake:count_chars */ return {}; }\n"},
             )
-            runtime.skills.unload_skill(pid, "unload-skill:v0", actor=pid)
+            runtime = Runtime.open("local")
+            runtime.tools.sandbox = FakeSkillDenoSandbox()
+            try:
+                owner = runtime.process.spawn(image="base-agent:v0", goal="load jit skill")
+                other = runtime.process.spawn(image="base-agent:v0", goal="other")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                runtime.capability.grant(owner, "skill:jit-skill", [CapabilityRight.EXECUTE], issued_by="test")
 
-            self.assertFalse(runtime.capability.check(pid, "skill:unload-skill:v0", CapabilityRight.EXECUTE))
-            self.assertNotIn("echo", runtime.process.get(pid).tool_table)
-        finally:
-            runtime.close()
+                loaded = runtime.skills.activate_skill(owner, "jit-skill", actor=owner)
+                result = runtime.tools.call(owner, "skill_count", {"text": "hello"})
 
-    def test_jit_skill_tool_is_process_local_and_uses_existing_deno_validation_path(self) -> None:
-        runtime = Runtime.open("local")
-        runtime.tools.sandbox = FakeSkillDenoSandbox()
-        try:
-            owner = runtime.process.spawn(image="base-agent:v0", goal="load jit skill")
-            other = runtime.process.spawn(image="base-agent:v0", goal="other")
-            runtime.register_skill_from_yaml_text(
-                """
-schema_version: 1
-skill_id: jit-skill:v0
-name: JIT Skill
-jit_tools:
-  - name: skill_count
-    description: Count text characters.
-    input_schema:
-      type: object
-    output_schema:
-      type: object
-    source: |
-      export function run(args, libos) { /* fake:count_chars */ return {}; }
-    tests: [{args: {text: abc}, expected: {count: 3}}]
-""".lstrip(),
-                actor="cli",
-            )
-            runtime.capability.grant(owner, "skill:jit-skill:v0", [CapabilityRight.EXECUTE], issued_by="test")
-
-            loaded = runtime.skills.load_skill(owner, "jit-skill:v0", actor=owner)
-            result = runtime.tools.call(owner, "skill_count", {"text": "hello"})
-
-            self.assertIn("skill_count", loaded["jit_tool_ids"])
-            self.assertTrue(result.ok, result.error)
-            self.assertEqual(result.payload, {"count": 5})
-            self.assertIn("skill_count", runtime.process.get(owner).tool_table)
-            self.assertNotIn("skill_count", runtime.process.get(other).tool_table)
-        finally:
-            runtime.close()
+                self.assertIn("skill_count", loaded["jit_tool_ids"])
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.payload, {"count": 5})
+                self.assertIn("skill_count", runtime.process.get(owner).tool_table)
+                self.assertNotIn("skill_count", runtime.process.get(other).tool_table)
+            finally:
+                runtime.close()
 
     def test_image_default_skills_spawn_fork_spawn_child_and_exec_semantics(self) -> None:
-        runtime = Runtime.open("local")
-        try:
-            runtime.register_skill_from_yaml_text(_echo_skill_manifest("image-skill:v0"), actor="cli")
-            runtime.register_skill_from_yaml_text(
-                """
-schema_version: 1
-skill_id: parent-extra:v0
-name: Parent Extra
-tools: [read_text_file]
-""".lstrip(),
-                actor="cli",
-            )
-            runtime.register_image(
-                AgentImage(
-                    image_id="skill-image:v0",
-                    name="skill-image",
-                    default_tools=["human_output"],
-                    default_skills=["image-skill:v0"],
-                ),
-                actor="cli",
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_skill = _write_skill_package(Path(temp_dir), "image-skill", allowed_tools=["echo"])
+            extra_skill = _write_skill_package(Path(temp_dir), "parent-extra", allowed_tools=["read_text_file"])
+            runtime = Runtime.open("local")
+            try:
+                runtime.skills.register_skill_from_path(image_skill, actor="cli", require_capability=False)
+                runtime.skills.register_skill_from_path(extra_skill, actor="cli", require_capability=False)
+                runtime.register_image(
+                    AgentImage(
+                        image_id="skill-image:v0",
+                        name="skill-image",
+                        default_tools=["human_output"],
+                        default_skills=["image-skill"],
+                    ),
+                    actor="cli",
+                )
 
-            root = runtime.process.spawn(image="skill-image:v0", goal="root")
-            runtime.capability.grant(root, "skill:parent-extra:v0", [CapabilityRight.EXECUTE], issued_by="test")
-            runtime.skills.load_skill(root, "parent-extra:v0", actor=root)
-            forked = runtime.process.fork(root, "forked")
-            spawned = runtime.spawn_child_process(root, "spawned", image="base-agent:v0")
-            runtime.exec_process(spawned, "skill-image:v0", goal="exec")
+                root = runtime.process.spawn(image="skill-image:v0", goal="root")
+                runtime.capability.grant(root, "skill:parent-extra", [CapabilityRight.EXECUTE], issued_by="test")
+                runtime.skills.activate_skill(root, "parent-extra", actor=root)
+                forked = runtime.process.fork(root, "forked")
+                spawned = runtime.spawn_child_process(root, "spawned", image="base-agent:v0")
+                runtime.exec_process(spawned, "skill-image:v0", goal="exec")
 
-            self.assertIn("echo", runtime.process.get(root).tool_table)
-            self.assertIn("read_text_file", runtime.process.get(forked).tool_table)
-            self.assertNotIn("read_text_file", runtime.process.get(spawned).tool_table)
-            self.assertIn("echo", runtime.process.get(spawned).tool_table)
-        finally:
-            runtime.close()
+                self.assertIn("echo", runtime.process.get(root).tool_table)
+                self.assertIn("read_text_file", runtime.process.get(forked).tool_table)
+                self.assertNotIn("read_text_file", runtime.process.get(spawned).tool_table)
+                self.assertIn("echo", runtime.process.get(spawned).tool_table)
+            finally:
+                runtime.close()
 
     def test_checkpoint_restore_preserves_loaded_skill_records_and_tool_table(self) -> None:
-        runtime = Runtime.open("local")
-        try:
-            pid = runtime.process.spawn(image="base-agent:v0", goal="checkpoint skill")
-            runtime.register_skill_from_yaml_text(
-                """
-schema_version: 1
-skill_id: checkpoint-skill:v0
-name: Checkpoint Skill
-tools: [read_text_file]
-""".lstrip(),
-                actor="cli",
-            )
-            runtime.capability.grant(pid, "skill:checkpoint-skill:v0", [CapabilityRight.EXECUTE], issued_by="test")
-            runtime.skills.load_skill(pid, "checkpoint-skill:v0", actor=pid)
-            checkpoint_id = runtime.checkpoint.create(pid, "skill loaded", actor=pid)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(Path(temp_dir), "checkpoint-skill", allowed_tools=["read_text_file"])
+            runtime = Runtime.open("local")
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="checkpoint skill")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                runtime.capability.grant(pid, "skill:checkpoint-skill", [CapabilityRight.EXECUTE], issued_by="test")
+                runtime.skills.activate_skill(pid, "checkpoint-skill", actor=pid)
+                checkpoint_id = runtime.checkpoint.create(pid, "skill loaded", actor=pid)
 
-            runtime.skills.unload_skill(pid, "checkpoint-skill:v0", actor=pid)
-            runtime.checkpoint.restore("cli", checkpoint_id, require_capability=False)
+                runtime.skills.unload_skill(pid, "checkpoint-skill", actor=pid)
+                runtime.checkpoint.restore("cli", checkpoint_id, require_capability=False)
 
-            self.assertIn("checkpoint-skill:v0", runtime.process.get(pid).loaded_skills)
-            self.assertIn("read_text_file", runtime.process.get(pid).tool_table)
-        finally:
-            runtime.close()
+                self.assertIn("checkpoint-skill", runtime.process.get(pid).loaded_skills)
+                self.assertIn("read_text_file", runtime.process.get(pid).tool_table)
+            finally:
+                runtime.close()
 
     def test_skill_cli_outputs_stable_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db_path = str(root / "runtime.sqlite")
-            manifest = root / "skill.yaml"
-            manifest.write_text(_echo_skill_manifest("cli-skill:v0"), encoding="utf-8")
+            skill_dir = _write_skill_package(root, "cli-skill", allowed_tools=["echo"])
 
-            registered = self._cli_json(["--db", db_path, "skills", "register", str(manifest)])
+            validated = self._cli_json(["--db", db_path, "skills", "validate", str(skill_dir)])
+            registered = self._cli_json(["--db", db_path, "skills", "register", str(skill_dir)])
             discovered = self._cli_json(["--db", db_path, "skills", "discover", "--text", "cli"])
             spawned = self._cli_json(["--db", db_path, "spawn", "--goal", "cli skill"])
-            loaded = self._cli_json(["--db", db_path, "skills", "load", spawned["pid"], "cli-skill:v0"])
+            loaded = self._cli_json(["--db", db_path, "skills", "activate", spawned["pid"], "cli-skill"])
 
-            self.assertEqual(registered["skill_id"], "cli-skill:v0")
-            self.assertEqual(discovered[0]["skill_id"], "cli-skill:v0")
-            self.assertEqual(loaded["skill_id"], "cli-skill:v0")
+            self.assertEqual(validated["skill_id"], "cli-skill")
+            self.assertEqual(registered["skill_id"], "cli-skill")
+            self.assertEqual(discovered[0]["skill_id"], "cli-skill")
+            self.assertEqual(loaded["skill_id"], "cli-skill")
             self.assertIn("echo", loaded["tool_names"])
 
-    def test_skill_cli_actor_pid_register_reads_workspace_file_through_primitive(self) -> None:
+    def test_skill_cli_actor_pid_register_reads_workspace_package_through_primitive(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             root = Path(temp_dir).resolve()
             db_path = str(root / "runtime.sqlite")
-            manifest = root / "skill.yaml"
-            manifest.write_text(_echo_skill_manifest("cli-actor-skill:v0"), encoding="utf-8")
-            relative_manifest = manifest.relative_to(Path.cwd().resolve()).as_posix()
+            skill_dir = _write_skill_package(root, "cli-actor-skill", allowed_tools=["echo"])
+            relative_skill = skill_dir.relative_to(Path.cwd().resolve()).as_posix()
+            skill_md = f"{relative_skill}/SKILL.md"
             runtime = Runtime.open(db_path)
             try:
                 pid = runtime.process.spawn(image="base-agent:v0", goal="actor cli skill")
                 runtime.capability.grant(
                     pid,
-                    "skill:cli-actor-skill:v0",
+                    "skill:cli-actor-skill",
                     [CapabilityRight.WRITE],
                     issued_by="test",
                 )
@@ -351,47 +365,43 @@ tools: [read_text_file]
                 runtime.close()
 
             with self.assertRaises(CapabilityDenied):
-                self._cli_json(["--db", db_path, "skills", "--actor-pid", pid, "register", relative_manifest])
+                self._cli_json(["--db", db_path, "skills", "--actor-pid", pid, "register", relative_skill])
 
             runtime = Runtime.open(db_path)
             try:
-                runtime.filesystem.grant_path(pid, relative_manifest, [CapabilityRight.READ], issued_by="test")
+                runtime.filesystem.grant_path(pid, skill_md, [CapabilityRight.READ], issued_by="test")
             finally:
                 runtime.close()
 
-            registered = self._cli_json(["--db", db_path, "skills", "--actor-pid", pid, "register", relative_manifest])
+            registered = self._cli_json(["--db", db_path, "skills", "--actor-pid", pid, "register", relative_skill])
 
-            self.assertEqual(registered["skill_id"], "cli-actor-skill:v0")
+            self.assertEqual(registered["skill_id"], "cli-actor-skill")
 
     def test_loaded_skill_instructions_are_materialized_into_llm_prompt_and_persisted_calls(self) -> None:
-        runtime = Runtime.open("local")
-        try:
-            runtime.llm.client = RecordingActionClient([{"action": "process_exit", "payload": {"done": True}}])
-            pid = runtime.process.spawn(image="base-agent:v0", goal="use skill prompt")
-            runtime.register_skill_from_yaml_text(
-                """
-schema_version: 1
-skill_id: prompt-skill:v0
-name: Prompt Skill
-instructions: Always preserve the phrase skill-instruction-token in planning context.
-tools: [echo]
-actions:
-  - name: prompt_action
-    use_cases: [prompt testing]
-""".lstrip(),
-                actor="cli",
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = _write_skill_package(
+                Path(temp_dir),
+                "prompt-skill",
+                allowed_tools=["echo"],
+                body="Always preserve the phrase skill-instruction-token in planning context.\n",
+                actions=[{"name": "prompt_action", "use_cases": ["prompt testing"]}],
             )
-            runtime.capability.grant(pid, "skill:prompt-skill:v0", [CapabilityRight.EXECUTE], issued_by="test")
-            runtime.skills.load_skill(pid, "prompt-skill:v0", actor=pid)
+            runtime = Runtime.open("local")
+            try:
+                runtime.llm.client = RecordingActionClient([{"action": "process_exit", "payload": {"done": True}}])
+                pid = runtime.process.spawn(image="base-agent:v0", goal="use skill prompt")
+                runtime.skills.register_skill_from_path(skill_dir, actor="cli", require_capability=False)
+                runtime.capability.grant(pid, "skill:prompt-skill", [CapabilityRight.EXECUTE], issued_by="test")
+                runtime.skills.activate_skill(pid, "prompt-skill", actor=pid)
 
-            runtime.run_next_process_once()
+                runtime.run_next_process_once()
 
-            self.assertIn("skill-instruction-token", runtime.llm.client.user_prompts[0])
-            persisted = runtime.store.list_llm_calls(pid)
-            self.assertEqual(len(persisted), 1)
-            self.assertIn("skill-instruction-token", persisted[0].messages[1]["content"])
-        finally:
-            runtime.close()
+                self.assertIn("skill-instruction-token", runtime.llm.client.user_prompts[0])
+                persisted = runtime.store.list_llm_calls(pid)
+                self.assertEqual(len(persisted), 1)
+                self.assertIn("skill-instruction-token", persisted[0].messages[1]["content"])
+            finally:
+                runtime.close()
 
     def _cli_json(self, argv: list[str]) -> Any:
         stdout = io.StringIO()
@@ -463,19 +473,70 @@ class RecordingActionClient:
         )
 
 
-def _echo_skill_manifest(skill_id: str) -> str:
-    return f"""
-schema_version: 1
-skill_id: {skill_id}
-name: Echo Skill
-version: v0
-description: Adds echo to the process table.
-instructions: Use echo for tiny deterministic checks.
-tools: [echo]
-actions: []
-jit_tools: []
-required_capabilities: []
-""".lstrip()
+def _write_raw_skill(root: Path, name: str, frontmatter: str) -> Path:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"---\n{frontmatter}---\n\n# {name}\n", encoding="utf-8")
+    return skill_dir
+
+
+def _write_skill_package(
+    root: Path,
+    name: str,
+    *,
+    allowed_tools: list[str] | None = None,
+    actions: list[dict[str, Any]] | None = None,
+    required_capabilities: list[dict[str, Any]] | None = None,
+    jit_tools: list[dict[str, Any]] | None = None,
+    scripts: dict[str, str] | None = None,
+    extra_resources: dict[str, str] | None = None,
+    body: str | None = None,
+) -> Path:
+    skill_dir = root / name
+    metadata: dict[str, str] = {"agent-libos.version": "v0"}
+    if actions:
+        metadata["agent-libos.actions"] = "references/agent-libos/actions.json"
+    if required_capabilities:
+        metadata["agent-libos.required-capabilities"] = "references/agent-libos/required-capabilities.json"
+    if jit_tools:
+        metadata["agent-libos.jit-tools"] = "references/agent-libos/jit-tools.json"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    frontmatter_lines = [
+        "---",
+        f"name: {name}",
+        f"description: Adds tools for {name}.",
+        "allowed-tools:",
+    ]
+    for tool in allowed_tools or []:
+        frontmatter_lines.append(f"  - {tool}")
+    frontmatter_lines.append("metadata:")
+    for key, value in metadata.items():
+        frontmatter_lines.append(f"  {key}: {value}")
+    frontmatter_lines.append("---")
+    selected_body = body or f"# {name}\n\nUse this skill for deterministic checks.\n"
+    (skill_dir / "SKILL.md").write_text("\n".join(frontmatter_lines) + "\n\n" + selected_body, encoding="utf-8")
+    refs = skill_dir / "references" / "agent-libos"
+    refs.mkdir(parents=True, exist_ok=True)
+    if actions:
+        (refs / "actions.json").write_text(json.dumps(actions), encoding="utf-8")
+    if required_capabilities:
+        (refs / "required-capabilities.json").write_text(json.dumps(required_capabilities), encoding="utf-8")
+    if jit_tools:
+        (refs / "jit-tools.json").write_text(json.dumps(jit_tools), encoding="utf-8")
+    for path, content in (scripts or {}).items():
+        target = skill_dir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    for path, content in (extra_resources or {}).items():
+        target = skill_dir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    package = Runtime.open("local")
+    try:
+        package.skills.validate_package_path(skill_dir)
+    finally:
+        package.close()
+    return skill_dir
 
 
 if __name__ == "__main__":

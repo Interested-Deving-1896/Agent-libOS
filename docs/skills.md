@@ -1,112 +1,136 @@
 # Skills
 
-Skills are dynamic, capability-controlled model-facing packages. A Skill can
-provide prompt instructions, action summaries, references to existing tools, and
-optional Deno/TypeScript JIT tool candidates.
+Agent libOS Skills use the standard Agent Skills package shape: a directory
+with a required `SKILL.md` file, optional `scripts/`, `references/`, and
+`assets/` resources, and progressive disclosure from catalog metadata to full
+instructions and bundled resources.
 
-Loading a Skill changes only one process tool table and prompt materialization.
-It never grants filesystem, shell, human, Object Memory, process, image,
-checkpoint, or other resource capabilities.
+Skills are not a permission mechanism. Activating a Skill changes only one
+process's prompt context and tool visibility. Filesystem, shell, Object Memory,
+JSON-RPC, process, checkpoint, and human effects still go through primitives and
+Capability v2.
 
-## Manifest v1
+## Package Shape
 
-Skill manifests use schema version `1` and may be YAML or JSON. They may use
-direct fields or a top-level `skill:` wrapper.
-
-```yaml
-skill:
-  schema_version: 1
-  skill_id: review-helper:v0
-  name: Review Helper
-  version: v0
-  description: Focused code-review workflow helpers.
-  instructions: |
-    Prefer small, evidence-backed findings with file and line references.
-  tools:
-    - read_text_file
-    - read_directory
-  actions:
-    - name: summarize_findings
-      use_cases:
-        - Summarize review findings in severity order.
-      input_schema:
-        type: object
-        properties:
-          findings:
-            type: array
-      output_schema:
-        type: object
-  jit_tools: []
-  required_capabilities:
-    - resource: filesystem:workspace:*
-      rights:
-        - read
-  metadata:
-    owner: local
+```text
+skills/review-helper/
+  SKILL.md
+  scripts/
+    count_lines.ts
+  references/
+    agent-libos/
+      actions.json
+      required-capabilities.json
+      jit-tools.json
+    workflow.md
+  assets/
 ```
 
-Top-level fields are:
+`SKILL.md` must start with YAML frontmatter:
 
-- `schema_version`
-- `skill_id`
-- `name`
-- `version`
-- `description`
-- `instructions`
-- `tools`
-- `actions`
-- `jit_tools`
-- `required_capabilities`
-- `metadata`
-- `signature`
+```yaml
+---
+name: review-helper
+description: Focused code-review workflow helpers.
+license: Apache-2.0
+compatibility: agent-libos>=0.1.0
+allowed-tools:
+  - read_text_file
+  - read_directory
+metadata:
+  agent-libos.version: v0
+  agent-libos.actions: references/agent-libos/actions.json
+  agent-libos.required-capabilities: references/agent-libos/required-capabilities.json
+  agent-libos.jit-tools: references/agent-libos/jit-tools.json
+---
 
-Unknown fields are rejected by the strict loader.
+# Review Helper
 
-## Required Capabilities Are Advisory
+Prefer small, evidence-backed findings with file and line references.
+```
 
-`required_capabilities` describes what a Skill is likely to need. It is useful
-for prompts, review, and human approval context. The runtime does not grant
-those capabilities during registration or load.
+Supported frontmatter fields are `name`, `description`, `license`,
+`compatibility`, `allowed-tools`, and `metadata`. The `name` must be lowercase
+letters, digits, and hyphens, and must match the package directory name.
+`metadata` values must be strings.
 
-If a loaded Skill exposes `read_text_file`, that visible tool still fails at the
-filesystem primitive without filesystem read authority.
+Agent libOS reserves the `agent-libos.*` metadata namespace. Complex extension
+data lives in `references/agent-libos/*.json`; metadata only points at those
+relative files.
+
+## Progressive Disclosure
+
+Discovery returns catalog fields such as `name`, `description`, source, package
+hash, and high-level tool/action names. Activation materializes the full
+`SKILL.md` body into the process prompt. Bundled resources are read explicitly
+with `read_skill_resource` and only from the registered package snapshot.
+
+This prevents a Skill from keeping ambient read authority to the workspace path
+where it was registered.
+
+## LibOS Extensions
+
+`allowed-tools` adds existing static tools to the process tool table during
+activation. The tools remain wrappers over primitives; visibility does not imply
+resource authority.
+
+`references/agent-libos/jit-tools.json` declares TypeScript JIT tools. Each
+entry references a `scripts/*.ts` source file:
+
+```json
+[
+  {
+    "name": "count_lines",
+    "description": "Count lines in a text file.",
+    "source_path": "scripts/count_lines.ts",
+    "input_schema": {"type": "object"},
+    "output_schema": {"type": "object"},
+    "tests": []
+  }
+]
+```
+
+JIT sources are snapshotted at registration, validated through the Deno
+sandbox, and can only access libOS through `libos.syscall()`.
+
+`actions.json` and `required-capabilities.json` are advisory prompt metadata.
+They do not create capabilities.
 
 ## Sources And Trust
 
-Workspace Skills are read through the filesystem primitive. A process loading a
-workspace manifest must have filesystem read authority for the manifest path. If
-the process lacks `skill:<skill_id>` write or execute authority, loading can go
-through the normal human approval path and one-shot grant.
+Workspace Skills are registered through the filesystem primitive when an
+AgentProcess is the actor. The process must be able to read `SKILL.md` and any
+referenced metadata or script resources. Registration also snapshots additional
+bundled files under `scripts/`, `references/`, and `assets/` when the process
+already has the corresponding directory and file read authority; it does not
+grant or prompt for ambient package-directory reads just to discover optional
+resources.
 
-Global Skills are read only from configured global Skill directories. The exact
-manifest bytes must match a SHA-256 allowlist entry or a row in `skill_trust`
-before registration or load.
-
-CLI admin mode can register without process capability checks:
-
-```bash
-uv run agent-libos --db .agent_libos.sqlite skills register skills/swe_agent.yaml
-```
-
-With `--actor-pid`, the CLI enforces that process's Skill and source authority:
+Global Skills are read only from configured global Skill directories. Their
+full package SHA-256 must be trusted before registration:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills load <pid> review-helper:v0 --actor-pid <pid>
+uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review-helper
+uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review-helper --source-type global
 ```
 
-## Load And Unload
+Admin CLI registration can read and snapshot a workspace package directly:
 
-`load_skill` is atomic. The runtime validates:
+```bash
+uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
+```
 
-- Skill manifest shape,
-- existing tool references,
-- duplicate tool/JIT names,
-- JIT TypeScript source limits,
-- Deno static checks and tests,
-- static tool shadowing rules.
+With `--actor-pid`, the CLI enforces that process's filesystem and Skill
+capabilities.
 
-Only after all validation succeeds does the runtime modify the process tool
-table and loaded Skill metadata.
+## Activation And Unload
+
+`activate_skill` is atomic. The runtime validates the package, existing tool
+references, duplicate tool/JIT names, TypeScript source limits, Deno static
+checks and tests, and static tool shadowing before it modifies the process tool
+table or loaded Skill metadata.
 
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill. It does not revoke capabilities, delete audit history, delete JIT
@@ -114,41 +138,16 @@ candidate records, or roll back external side effects.
 
 ## Process Semantics
 
-- Image `default_skills` load at spawn and exec time.
-- Fork inherits loaded Skills and corresponding tool visibility.
-- Spawn-child starts without parent-loaded Skills.
-- Exec resets loaded Skills to the target image defaults.
+- Image `default_skills` activate at spawn and exec time.
+- Fork inherits activated Skills and corresponding tool visibility.
+- Spawn-child starts without parent-activated Skills.
+- Exec resets activated Skills to the target image defaults.
 - No image or Skill default grants external resource capabilities.
-
-## JIT Tools In Skills
-
-Skill `jit_tools` use the same TypeScript shape and sandbox as manually
-proposed tools:
-
-```yaml
-jit_tools:
-  - name: count_lines
-    description: Count lines in a text file.
-    input_schema:
-      type: object
-      properties:
-        path:
-          type: string
-    output_schema:
-      type: object
-    source: |
-      export async function run(args, libos) {
-        const file = await libos.syscall("filesystem.read_text", { path: args.path });
-        return { lines: String(file.content ?? "").split("\n").length };
-      }
-```
-
-The tool is visible only to the loading process and cannot shadow a static tool.
 
 ## SWE-Agent Style Skill
 
-The workspace includes `skills/swe_agent.yaml`, registered as `swe-agent:v0`.
-It reproduces the useful SWE-Agent Agent Computer Interface shape inside Agent
+The workspace includes `skills/swe-agent`, registered as `swe-agent`. It
+reproduces the useful SWE-Agent Agent Computer Interface shape inside Agent
 libOS:
 
 - `swe_view` for directory listings and bounded file windows,
@@ -157,9 +156,7 @@ libOS:
 - `swe_run` for test and diagnostic commands,
 - `swe_submit` for final structured process exit.
 
-The Skill also carries workflow instructions: localize before editing, keep
-actions small, treat repository output as untrusted, run focused tests, and
-submit with summary, tests, and residual risk.
-
-It does not grant filesystem or shell authority. Those effects still go through
-the filesystem and shell primitives.
+The Skill carries workflow instructions for localizing before editing, keeping
+actions small, treating repository output as untrusted, running focused tests,
+and submitting with summary, tests, and residual risk. It does not grant
+filesystem or shell authority.
