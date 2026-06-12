@@ -1,78 +1,96 @@
 # Paper Thesis
 
-Temporary anonymous system name: `Primitive Agent Runtime` (`PAR`).
+Paper title:
+
+> Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM Agents
 
 ## Thesis
 
-Long-running LLM agents need an agent-native runtime authority boundary. Current
-agent stacks often expose a model-visible tool list and treat wrapper code,
-prompts, or container placement as the main control point. That is too weak for
-agents that fork work, write code, call shells, persist memory, ask humans, and
-delegate to self-authored tools over many steps.
+Self-evolving LLM agents need a runtime substrate that lets their model-visible
+action surface change without letting resource authority grow implicitly.
 
-PAR argues that an agent runtime should separate tool visibility from resource
-authority. A process may see a model-facing tool, but resource access is decided
-only at primitive use by process identity, capabilities, policy, human approval,
-and audit. The core contribution is not a larger tool catalog. The contribution
-is the runtime boundary:
+Modern agent systems increasingly persist memory, fork work, call shells,
+activate Skills, register self-authored tools, create or execute new images,
+use remote resources, ask humans, and resume across long executions. Those
+behaviors are useful, but they make prompt-only control, wrapper-level tool
+lists, and host isolation insufficient as the primary authority boundary.
+
+Agent libOS argues for an agent-native boundary:
 
 ```text
 process identity + capability + primitive + audit
 ```
 
-This boundary makes agent actions schedulable, interruptible, explainable, and
-measurably safer under adversarial workloads.
+A process may see a model-facing tool, Skill, JIT tool, image definition,
+child-process handle, checkpoint, or remote endpoint. Resource access is still
+decided only when a libOS primitive runs under that process id. Capability
+checks, policy, human approval, provider containment, external-effect
+classification, events, and audit all happen at that primitive boundary.
+
+The contribution is not a larger tool catalog. The contribution is a runtime
+substrate for capability-controlled self-evolution.
 
 ## Contributions
 
-1. Runtime model. PAR models an agent as an `AgentProcess` with process-local
-   Object Memory namespaces, process-local working directories, message queues,
-   child process lifecycle, dynamic Skill/tool visibility, and
-   capability-controlled primitives. Human I/O is a device-like runtime
-   primitive rather than prompt text.
+1. Runtime model.
+   Agent libOS models an agent as an `AgentProcess` with process-local Object
+   Memory namespaces, process-local working directories, message queues, child
+   lifecycle, AgentImage registration and exec, standard Skill activation,
+   process-local Deno/TypeScript JIT tools, checkpoints, human I/O, and
+   capability-controlled primitives.
 
-2. Implementation. The current prototype implements the model in Python with a
-   Resource Provider Substrate, SQLite persistence, audit records, scoped
+2. Implementation.
+   The current prototype implements the model in Python with Capability v2,
+   Resource Provider Substrate, SQLite persistence, audit/events, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
-   shell/image/filesystem/process/human/memory/skill primitives, standard
-   `SKILL.md` packages with libOS metadata, and Deno/TypeScript JIT tools that
-   can reach libOS only through syscall RPC.
+   image registry/exec primitives, standard `SKILL.md` packages, JSON-RPC over
+   HTTP client endpoints, and Deno/TypeScript JIT tools that can reach libOS
+   only through syscall RPC.
 
-3. Benchmark suite. The current prototype includes an M1 deterministic
-   runtime-safety harness with adversarial tasks, wrapper baselines, ablations,
-   declared allowed/forbidden side effects, a side-effect oracle, and stable
-   metrics output. It is designed to test whether the runtime blocks
-   unauthorized effects while preserving task success and keeping approval
-   burden measurable.
+3. Benchmark suite.
+   The current prototype includes an M1 deterministic runtime-safety harness
+   with adversarial tasks, wrapper baselines, ablations, declared
+   allowed/forbidden side effects, a side-effect oracle, and stable metrics
+   output. The suite now includes a first self-evolution subset covering Skill
+   activation, JIT registration, image registration/exec, child-process
+   delegation, checkpoint fork, and JSON-RPC remote-resource visibility.
 
-4. Evaluation. The paper should compare PAR against direct tool wrappers,
+4. Evaluation.
+   The paper should compare Agent libOS against direct tool wrappers,
    confirmation-prompt wrappers, and host-isolation-only baselines. Metrics
    include unauthorized side-effect rate, task success, false denial, approval
-   count, wall time, token/cost accounting, overhead, and audit completeness.
+   count, wall time, token/cost accounting, overhead, audit completeness, and
+   safety of self-evolution mechanisms.
 
 ## Non-Goals
 
-- PAR does not claim kernel-grade sandboxing. Host isolation layers such as
-  containers, Deno, WASM, or VMs are useful provider backends, not replacements
-  for agent-level authority.
-- PAR does not solve all prompt injection. It constrains side effects and
-  authority even when prompt content is adversarial.
-- PAR does not roll back irreversible external side effects. The runtime can
-  audit, explain, deny, or compensate when modeled, but external reality is not
-  rewound by checkpoint restore.
-- PAR does not rely on MCP, GitHub, OpenAI Agents SDK, or LangGraph as a
-  trusted security boundary. Those systems are workload inspiration or possible
-  adapters; PAR's boundary is inside the libOS primitive layer.
-- PAR does not treat Skills as a permission system. Skills organize prompt
-  instructions and process-visible actions; resource authority still comes only
-  from process capabilities, primitive checks, policy, approval, and audit.
+- Agent libOS does not claim kernel-grade sandboxing. Host isolation layers
+  such as containers, Deno, WASM, or VMs are useful provider backends, not
+  replacements for agent-level authority.
+- Agent libOS does not solve all prompt injection. It constrains side effects
+  and authority even when prompt content is adversarial.
+- Agent libOS does not roll back irreversible external side effects.
+  Checkpoint restore reconstructs scoped runtime state; provider-classified
+  external effects are append-only and report-only unless a future provider
+  compensation API implements explicit repair.
+- Agent libOS does not rely on MCP, GitHub, OpenAI Agents SDK, LangGraph, or
+  any external framework as a trusted security boundary. Those systems are
+  workload inspiration or adapter targets; the authority boundary is inside
+  the libOS primitive layer.
+- Agent libOS does not treat Skills, JIT tools, Runtime Modules, image
+  definitions, process exec, or JSON-RPC endpoint visibility as permission
+  grants. They can change model-visible affordances; resource authority still
+  comes from process capabilities, primitive checks, policy, approval, and
+  audit.
 
 ## Current Submission Story
 
-The strongest submission story is a systems story: primitive-level authority
-boundaries make long-running LLM agents safer and more explainable at acceptable
-cost. M0 freezes the story and repository hygiene. M1 establishes the initial
-benchmark harness and deterministic workloads. The next milestones should focus
-on richer audit explain, context materialization, MCP/Git provider workloads,
-durable replay evaluation, and quantitative results rather than broad ecosystem
+The strongest systems story is: self-evolving LLM agents become safer and more
+explainable when action-surface evolution is decoupled from resource authority
+by a capability-controlled runtime substrate.
+
+M0 freezes repository hygiene and the thesis. M1 establishes the initial
+runtime-safety benchmark with self-evolution coverage. The next milestones
+should prioritize larger self-evolution workloads, audit explain, context
+materialization metadata, and quantitative results rather than broad ecosystem
 compatibility.

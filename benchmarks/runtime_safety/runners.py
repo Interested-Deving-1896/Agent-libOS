@@ -15,6 +15,8 @@ from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectRight, ObjectType, ProcessStatus
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
+from agent_libos.models import ValidationResult
 from agent_libos.utils.serde import to_jsonable
 from benchmarks.runtime_safety.fixtures import prepare_workspace, safe_workspace_path
 from benchmarks.runtime_safety.models import BenchmarkResult, BenchmarkTask, EffectRecord, TaskRun
@@ -38,6 +40,7 @@ AGENT_LIBOS_RUNNERS = {
     "no_fork_attenuation",
 }
 _TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+_BENCHMARK_ACTION_KEYS = {"benchmark_effects", "checkpoint_ref"}
 
 
 class PlannedActionClient:
@@ -58,6 +61,57 @@ class PlannedActionClient:
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             reasoning={"summary": "deterministic benchmark plan"},
         )
+
+
+class BenchmarkDenoSandbox(SandboxBackend):
+    """Deterministic Deno substitute for benchmark-only JIT tasks.
+
+    The fake backend still routes marker sources through the real syscall
+    handler. That keeps default benchmark runs independent of a local Deno
+    install while preserving the libOS capability boundary under test.
+    """
+
+    language = "typescript"
+
+    def __init__(self) -> None:
+        self.checker = DenoTypescriptSandbox(deno_executable="deno")
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return self.checker.static_check(source_code)
+
+    async def arun_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        *,
+        pid: str | None = None,
+        syscall_handler: SyscallHandler | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        if "fake:syscall-read" in source_code:
+            if syscall_handler is None:
+                raise RuntimeError("benchmark JIT marker requires syscall handler")
+            return await syscall_handler("filesystem.read_text", {"path": str(args.get("path") or "secrets/token.txt")})
+        return {"ok": True}
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+    ) -> ValidationResult:
+        validation = self.static_check(source_code)
+        if not validation.ok:
+            return validation
+        errors: list[str] = []
+        for index, test in enumerate(tests, start=1):
+            result = self.run_source(source_code, test.get("args", {}))
+            if "expected" in test and result != test["expected"]:
+                errors.append(f"test {index} expected {test['expected']!r}, got {result!r}")
+        return ValidationResult(ok=not errors, errors=errors, logs="benchmark fake deno tests")
+
+    def metadata_for_source(self, source_code: str) -> dict[str, Any]:
+        return {"language": "typescript", "deno_version": "benchmark-fake-deno", "imports": []}
 
 
 def run_suite(
@@ -114,26 +168,27 @@ def _run_wrapper_task(
         if action.get("action") == "process_exit":
             state["exited"] = True
             continue
-        effect = _effect_from_action(task, runner, action)
-        if effect is None:
+        action_effects = _effects_from_action(task, runner, action)
+        if not action_effects:
             continue
-        if runner == "confirmation_wrapper" and _is_side_effect(effect):
-            state["approvals"] += 1
-            approved = str(task.policy.get("confirmation_default_decision", "approve")).lower() != "deny"
-            if not approved:
+        for effect in action_effects:
+            if runner == "confirmation_wrapper" and _is_side_effect(effect):
+                state["approvals"] += 1
+                approved = str(task.policy.get("confirmation_default_decision", "approve")).lower() != "deny"
+                if not approved:
+                    effect.performed = False
+                    effect.denied = True
+                    effect.error = "confirmation rejected"
+                    effects.append(effect)
+                    continue
+            try:
+                _perform_wrapper_action(action, workspace, state, effect, runner=runner)
+            except Exception as exc:  # benchmark runner records failures instead of aborting the suite
                 effect.performed = False
-                effect.denied = True
-                effect.error = "confirmation rejected"
-                effects.append(effect)
-                continue
-        try:
-            _perform_wrapper_action(action, workspace, state, effect, runner=runner)
-        except Exception as exc:  # benchmark runner records failures instead of aborting the suite
-            effect.performed = False
-            effect.denied = _looks_like_denial(str(exc))
-            effect.error = str(exc)
-            state["errors"].append(str(exc))
-        effects.append(effect)
+                effect.denied = _looks_like_denial(str(exc))
+                effect.error = str(exc)
+                state["errors"].append(str(exc))
+            effects.append(effect)
     classify_effects(task, effects)
     safety = safety_summary(task, effects)
     success = _evaluate_success(task, workspace, state)
@@ -156,7 +211,11 @@ def _run_wrapper_task(
         audit_completeness=0.0,
         errors=list(state["errors"]),
         workspace=str(workspace),
-        metadata={"simulated_shell": True, "fixture_workspace": str(workspace)},
+        metadata={
+            "simulated_shell": True,
+            "fixture_workspace": str(workspace),
+            "self_evolution_counts": _self_evolution_counts(effects),
+        },
     )
     return TaskRun(result=result, effects=effects)
 
@@ -177,13 +236,18 @@ def _run_agent_libos_task(
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     db_path = run_root / "runtime.sqlite"
-    client = PlannedActionClient(task.mock_actions) if llm_mode == "mock" else LLMClient.from_env()
+    client = PlannedActionClient([]) if llm_mode == "mock" else LLMClient.from_env()
     runtime = Runtime(SQLiteStore(db_path), llm_client=client, substrate=LocalResourceProviderSubstrate(workspace))
+    if llm_mode == "mock":
+        runtime.tools.sandbox = BenchmarkDenoSandbox()
     errors: list[str] = []
     try:
         pid = runtime.process.spawn(image="review-agent:v0", goal=task.goal)
         setup_objects = _setup_runtime_memory(task, runtime, runner, pid)
         _grant_task_capabilities(task, runtime, pid, runner, setup_objects)
+        setup_state = _setup_runtime_benchmark_resources(task, runtime, workspace, pid)
+        if isinstance(client, PlannedActionClient):
+            client.actions = [_dispatch_action(action, setup_state) for action in task.mock_actions]
         selected_quanta = max_quanta or max(len(task.mock_actions) + 4, 4)
         results = runtime.run_until_idle(
             max_quanta=selected_quanta,
@@ -230,6 +294,7 @@ def _run_agent_libos_task(
                 "llm_calls": len(llm_calls),
                 "process_status": process.status.value,
                 "setup_object_oids": [item["oid"] for item in setup_objects],
+                "self_evolution_counts": _self_evolution_counts(effects),
             },
         )
         return TaskRun(result=result, effects=effects)
@@ -338,12 +403,42 @@ def _grant_task_capabilities(
                 rights=[right],
                 issued_by=f"benchmark:{task.id}",
             )
+        for path in filesystem.get(f"delegable_{right}", []) or []:
+            resource = _filesystem_resource(runtime, str(path))
+            runtime.capability.grant(
+                subject=pid,
+                resource=resource,
+                rights=[right],
+                issued_by=f"benchmark:{task.id}",
+                delegable=True,
+            )
     shell = capabilities.get("shell") if isinstance(capabilities.get("shell"), dict) else {}
     if shell.get("policy"):
         runtime.shell.grant_policy(pid, str(shell["policy"]), issued_by=f"benchmark:{task.id}")
     human = capabilities.get("human") if isinstance(capabilities.get("human"), list) else []
     for right in human:
         runtime.capability.grant(pid, DEFAULT_CONFIG.runtime.default_human_resource, [str(right)], issued_by=f"benchmark:{task.id}")
+    skills = capabilities.get("skill") if isinstance(capabilities.get("skill"), dict) else {}
+    for right in ("read", "write", "execute", "admin"):
+        for skill_id in skills.get(right, []) or []:
+            runtime.capability.grant(pid, f"skill:{skill_id}", [right], issued_by=f"benchmark:{task.id}")
+    image = capabilities.get("image") if isinstance(capabilities.get("image"), dict) else {}
+    for right in ("read", "write", "execute", "admin"):
+        for image_id in image.get(right, []) or []:
+            resource = runtime.image_registry.registry_resource() if str(image_id) == "*" else runtime.image_registry.resource_for(str(image_id))
+            runtime.capability.grant(pid, resource, [right], issued_by=f"benchmark:{task.id}")
+    jsonrpc = capabilities.get("jsonrpc") if isinstance(capabilities.get("jsonrpc"), dict) else {}
+    for endpoint_id in jsonrpc.get("endpoint_read", []) or []:
+        resource = DEFAULT_CONFIG.jsonrpc.registry_resource if str(endpoint_id) == "*" else runtime.jsonrpc.endpoint_resource(str(endpoint_id))
+        runtime.capability.grant(pid, resource, [CapabilityRight.READ], issued_by=f"benchmark:{task.id}")
+    for method in jsonrpc.get("method_read", []) or []:
+        if isinstance(method, dict):
+            runtime.capability.grant(
+                pid,
+                runtime.jsonrpc.method_resource(str(method["endpoint"]), str(method["method"])),
+                [CapabilityRight.READ],
+                issued_by=f"benchmark:{task.id}",
+            )
     if runner == "no_primitive_approval":
         runtime.capability.grant(pid, runtime.filesystem.workspace_resource(), ["read", "write", "delete"], issued_by="benchmark:ablation")
         runtime.shell.grant_policy(pid, "always_allow", issued_by="benchmark:ablation")
@@ -352,6 +447,88 @@ def _grant_task_capabilities(
             runtime.capability.grant(pid, f"object:{item['oid']}", ["read", "materialize"], issued_by="benchmark:ablation")
     if runner == "no_fork_attenuation":
         runtime.capability.grant(pid, runtime.filesystem.workspace_resource(), ["read", "write"], issued_by="benchmark:ablation")
+
+
+def _setup_runtime_benchmark_resources(
+    task: BenchmarkTask,
+    runtime: Runtime,
+    workspace: Path,
+    pid: str,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {"checkpoints": {}}
+    setup = task.setup or {}
+    for item in setup.get("skills", []) or []:
+        if isinstance(item, dict):
+            runtime.skills.register_skill_from_path(
+                workspace / str(item["path"]),
+                actor="benchmark.setup",
+                replace=bool(item.get("replace", False)),
+                require_capability=False,
+            )
+    for item in setup.get("images", []) or []:
+        if isinstance(item, dict):
+            text = (workspace / str(item["path"])).read_text(encoding=str(item.get("encoding") or "utf-8"))
+            runtime.image_registry.register_from_yaml_text(
+                text,
+                actor="benchmark.setup",
+                replace=bool(item.get("replace", False)),
+                require_capability=False,
+                source=str(item["path"]),
+            )
+    for item in setup.get("jsonrpc_endpoints", []) or []:
+        if isinstance(item, dict):
+            text = (workspace / str(item["path"])).read_text(encoding=str(item.get("encoding") or "utf-8"))
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                text,
+                actor="benchmark.setup",
+                replace=bool(item.get("replace", False)),
+                require_capability=False,
+                source=str(item["path"]),
+            )
+    extra_tools = setup.get("tools", []) or []
+    if extra_tools:
+        _add_process_tools(runtime, pid, [str(tool) for tool in extra_tools])
+    for item in setup.get("checkpoints", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item["name"])
+        checkpoint_id = runtime.checkpoint.create(pid, str(item.get("reason") or name), actor=pid)
+        state["checkpoints"][name] = checkpoint_id
+        if bool(item.get("grant_execute", False)):
+            runtime.capability.grant(pid, f"checkpoint:{checkpoint_id}", [CapabilityRight.EXECUTE], issued_by=f"benchmark:{task.id}")
+        if bool(item.get("grant_admin", False)):
+            runtime.capability.grant(pid, f"checkpoint:{checkpoint_id}", [CapabilityRight.ADMIN], issued_by=f"benchmark:{task.id}")
+        for revoke in item.get("revoke_after", []) or []:
+            if isinstance(revoke, dict):
+                _revoke_matching_capabilities(runtime, pid, str(revoke["resource"]), str(revoke["right"]))
+    return state
+
+
+def _add_process_tools(runtime: Runtime, pid: str, tool_names: list[str]) -> None:
+    process = runtime.process.get(pid)
+    updated = dict(process.tool_table)
+    for name in tool_names:
+        handle = runtime.tools.resolve(name)
+        updated[handle.name] = handle.tool_id
+    process.tool_table = updated
+    runtime.store.update_process(process)
+
+
+def _revoke_matching_capabilities(runtime: Runtime, pid: str, resource: str, right: str) -> None:
+    for cap in list(runtime.capability.list_subject(pid, include_inactive=False)):
+        if cap.resource == resource and right in cap.rights:
+            runtime.capability.revoke(cap.cap_id, revoked_by=pid, reason="benchmark post-checkpoint revoke")
+
+
+def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dict[str, Any]:
+    selected = {key: value for key, value in action.items() if key not in _BENCHMARK_ACTION_KEYS}
+    checkpoint_ref = action.get("checkpoint_ref")
+    if checkpoint_ref is not None:
+        checkpoints = setup_state.get("checkpoints", {})
+        if checkpoint_ref not in checkpoints:
+            raise ValueError(f"unknown benchmark checkpoint_ref: {checkpoint_ref}")
+        selected["checkpoint_id"] = checkpoints[checkpoint_ref]
+    return selected
 
 
 def _filesystem_resource(runtime: Runtime, path: str) -> str:
@@ -399,7 +576,19 @@ def _perform_wrapper_action(
     elif name in {"create_memory_object", "append_memory_object"}:
         key = (str(action.get("namespace") or "process"), str(action.get("name") or "object"))
         state["memory"][key] = action.get("payload", action.get("entry"))
-    elif name in {"spawn_child_process", "fork_child_process", "exec_process", "ask_human", "request_permission"}:
+    elif name in {
+        "activate_skill",
+        "call_jsonrpc_method",
+        "create_checkpoint",
+        "fork_checkpoint",
+        "load_image_from_yaml",
+        "register_jit_tool",
+        "spawn_child_process",
+        "fork_child_process",
+        "exec_process",
+        "ask_human",
+        "request_permission",
+    }:
         effect.simulated = runner in {"direct_tool_wrapper", "confirmation_wrapper", "sandbox_only"}
     else:
         effect.simulated = True
@@ -407,20 +596,68 @@ def _perform_wrapper_action(
 
 def _effects_from_runtime_results(task: BenchmarkTask, runner: str, results: list[Any]) -> list[EffectRecord]:
     effects: list[EffectRecord] = []
+    used_source_indices: set[int] = set()
     for item in results:
         if not isinstance(item, dict):
             continue
         action = item.get("action")
         if not isinstance(action, dict):
             continue
-        effect = _effect_from_action(task, runner, action)
-        if effect is None:
+        source_action = _matching_source_action(task.mock_actions, action, used_source_indices)
+        action_effects = []
+        inferred = _effect_from_action(task, runner, action)
+        if inferred is not None:
+            if source_action is not None:
+                _apply_source_effect_labels(inferred, source_action)
+            action_effects.append(inferred)
+        if source_action is not None:
+            for spec in source_action.get("benchmark_effects", []) or []:
+                if isinstance(spec, dict):
+                    action_effects.append(_effect_from_spec(task, runner, spec))
+        if not action_effects:
             continue
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
-        effect.performed = bool(result.get("ok"))
-        effect.denied = not effect.performed and _looks_like_denial(str(result.get("error") or ""))
-        effect.error = None if effect.performed else str(result.get("error") or "")
-        effects.append(effect)
+        for effect in action_effects:
+            effect.performed = bool(result.get("ok"))
+            effect.denied = not effect.performed and _looks_like_denial(str(result.get("error") or ""))
+            effect.error = None if effect.performed else str(result.get("error") or "")
+            effects.append(effect)
+    return effects
+
+
+def _matching_source_action(
+    source_actions: list[dict[str, Any]],
+    action: dict[str, Any],
+    used_indices: set[int],
+) -> dict[str, Any] | None:
+    action_name = str(action.get("action"))
+    for index, candidate in enumerate(source_actions):
+        if index in used_indices:
+            continue
+        if str(candidate.get("action")) != action_name:
+            continue
+        used_indices.add(index)
+        return candidate
+    return None
+
+
+def _apply_source_effect_labels(effect: EffectRecord, source_action: dict[str, Any]) -> None:
+    if effect.type == "checkpoint.fork" and source_action.get("checkpoint") is not None:
+        effect.checkpoint = str(source_action["checkpoint"])
+    if effect.type == "checkpoint.create" and source_action.get("checkpoint") is not None:
+        effect.checkpoint = str(source_action["checkpoint"])
+    if effect.type == "image.register" and source_action.get("image_id") is not None:
+        effect.image = str(source_action["image_id"])
+
+
+def _effects_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]) -> list[EffectRecord]:
+    effects: list[EffectRecord] = []
+    inferred = _effect_from_action(task, runner, action)
+    if inferred is not None:
+        effects.append(inferred)
+    for spec in action.get("benchmark_effects", []) or []:
+        if isinstance(spec, dict):
+            effects.append(_effect_from_spec(task, runner, spec))
     return effects
 
 
@@ -458,11 +695,74 @@ def _effect_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]
         return EffectRecord(task_id=task.id, runner=runner, type="process.fork", performed=True, image=action.get("image") or "current")
     if name == "exec_process":
         return EffectRecord(task_id=task.id, runner=runner, type="process.exec", performed=True, image=str(action.get("image") or ""))
+    if name == "activate_skill":
+        return EffectRecord(task_id=task.id, runner=runner, type="skill.activate", performed=True, skill_id=str(action.get("skill_id") or ""))
+    if name == "register_jit_tool":
+        return EffectRecord(task_id=task.id, runner=runner, type="jit.register", performed=True, tool=str(action.get("name") or ""))
+    if name == "load_image_from_yaml":
+        return EffectRecord(
+            task_id=task.id,
+            runner=runner,
+            type="image.register",
+            performed=True,
+            image=str(action.get("image_id") or action.get("image") or action.get("path") or ""),
+        )
+    if name == "create_checkpoint":
+        return EffectRecord(
+            task_id=task.id,
+            runner=runner,
+            type="checkpoint.create",
+            performed=True,
+            checkpoint=str(action.get("checkpoint") or action.get("reason") or ""),
+        )
+    if name == "fork_checkpoint":
+        return EffectRecord(
+            task_id=task.id,
+            runner=runner,
+            type="checkpoint.fork",
+            performed=True,
+            checkpoint=str(action.get("checkpoint") or action.get("checkpoint_ref") or action.get("checkpoint_id") or ""),
+        )
+    if name == "call_jsonrpc_method":
+        return EffectRecord(
+            task_id=task.id,
+            runner=runner,
+            type="jsonrpc.call",
+            performed=True,
+            endpoint=str(action.get("endpoint_id") or ""),
+            method=str(action.get("method_id") or ""),
+        )
     if name in {"ask_human", "request_permission"}:
         return EffectRecord(task_id=task.id, runner=runner, type="human.request", performed=True, operation=name)
     if name == "external_network":
         return EffectRecord(task_id=task.id, runner=runner, type="external.network", performed=True, endpoint=str(action.get("endpoint") or ""))
     return None
+
+
+def _effect_from_spec(task: BenchmarkTask, runner: str, spec: dict[str, Any]) -> EffectRecord:
+    effect_type = str(spec["type"])
+    return EffectRecord(
+        task_id=task.id,
+        runner=runner,
+        type=effect_type,
+        performed=bool(spec.get("performed", True)),
+        denied=bool(spec.get("denied", False)),
+        simulated=bool(spec.get("simulated", False)),
+        path=str(spec["path"]) if spec.get("path") is not None else None,
+        argv=[str(item) for item in spec["argv"]] if isinstance(spec.get("argv"), list) else None,
+        namespace=str(spec["namespace"]) if spec.get("namespace") is not None else None,
+        name=str(spec["name"]) if spec.get("name") is not None else None,
+        skill_id=str(spec["skill_id"]) if spec.get("skill_id") is not None else None,
+        tool=str(spec["tool"]) if spec.get("tool") is not None else None,
+        image=str(spec["image"]) if spec.get("image") is not None else None,
+        checkpoint=str(spec["checkpoint"]) if spec.get("checkpoint") is not None else None,
+        resource=str(spec["resource"]) if spec.get("resource") is not None else None,
+        operation=str(spec["operation"]) if spec.get("operation") is not None else None,
+        endpoint=str(spec["endpoint"]) if spec.get("endpoint") is not None else None,
+        method=str(spec["method"]) if spec.get("method") is not None else None,
+        provider=str(spec["provider"]) if spec.get("provider") is not None else None,
+        metadata=dict(spec.get("metadata") or {}),
+    )
 
 
 def _evaluate_success(task: BenchmarkTask, workspace: Path, state: dict[str, Any]) -> bool:
@@ -506,6 +806,18 @@ def _audit_completeness(runner: str, effects: list[EffectRecord], audit_records:
 
 def _is_side_effect(effect: EffectRecord) -> bool:
     return effect.type != "filesystem.read" and effect.type != "object.read"
+
+
+def _self_evolution_counts(effects: list[EffectRecord]) -> dict[str, int]:
+    return {
+        "skill_activations": sum(1 for effect in effects if effect.type == "skill.activate"),
+        "jit_registrations": sum(1 for effect in effects if effect.type == "jit.register"),
+        "image_registrations": sum(1 for effect in effects if effect.type == "image.register"),
+        "image_execs": sum(1 for effect in effects if effect.type == "process.exec"),
+        "child_processes": sum(1 for effect in effects if effect.type in {"process.spawn", "process.fork"}),
+        "checkpoint_forks": sum(1 for effect in effects if effect.type == "checkpoint.fork"),
+        "remote_calls": sum(1 for effect in effects if effect.type in {"jsonrpc.call", "external.network", "external.provider_call"}),
+    }
 
 
 def _looks_like_denial(error: str) -> bool:

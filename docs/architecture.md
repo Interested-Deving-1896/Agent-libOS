@@ -1,8 +1,11 @@
 # Architecture
 
-Agent libOS is structured around one boundary: model-visible actions are not
-resource authority. A process may see a tool schema, but protected effects are
-authorized only when a primitive runs under that process id.
+Agent libOS is structured around one boundary: model-visible and
+self-evolving action surfaces are not resource authority. A process may see a
+tool schema, activate a Skill, register a JIT tool, register or exec an image,
+fork a child, restore from a checkpoint, or inspect a remote endpoint, but
+protected effects are authorized only when a primitive runs under that process
+id.
 
 ## Layer Model
 
@@ -41,9 +44,14 @@ Agent personality / application
      - future container, WASM, or service providers
 ```
 
-The Skills and tools layer exists for LLM ergonomics. It presents stable action
-names, schemas, summaries, and workflow instructions. It does not own external
-authority.
+The Skills and tools layer exists for LLM ergonomics and self-evolution. It
+presents stable action names, schemas, summaries, workflow instructions, and
+process-local JIT candidates. It does not own external authority.
+
+Image registration and `exec` are also self-evolution mechanisms. They can
+change a process prompt, default tool table, default Skills, and lifecycle
+shape, but image visibility and target-image metadata do not grant resource
+capabilities.
 
 Startup Runtime Modules are different from Skills. A module is trusted Python
 host code loaded before `Runtime.open()` returns. Modules extend the runtime

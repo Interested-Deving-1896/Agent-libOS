@@ -122,7 +122,10 @@ README is the entrypoint. Detailed implementation documentation belongs in
 `docs/`.
 
 When behavior changes, update the relevant doc and `docs/invariants.md` in the
-same change. Do not describe future work as current behavior.
+same change. Do not describe future work as current behavior. Paper-facing
+documentation should stay aligned with the fixed title:
+`Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM
+Agents`.
 
 Current behavior must not claim:
 
@@ -143,6 +146,9 @@ Preserve the boundary:
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
 - Skills change visibility and prompt materialization only;
+- self-evolution mechanisms such as Skills, JIT tools, image registration,
+  process exec, checkpoint forks, child processes, and JSON-RPC endpoint
+  visibility must not imply resource authority;
 - Runtime Modules are trusted startup TCB extensions; they may register tools,
   images, syscalls, and provider hooks but must not be treated as process
   capabilities;

@@ -2,7 +2,8 @@
 
 This document maps the current runtime safety invariants to regression tests.
 It is the submission-facing checklist for keeping the implementation, README,
-and paper claims aligned.
+and paper claims aligned with the fixed theme: `Agent libOS: A Runtime
+Substrate for Capability-Controlled Self-Evolving LLM Agents`.
 
 ## Authority Boundary
 
@@ -24,7 +25,7 @@ and paper claims aligned.
 | --- | --- |
 | fork/spawn do not implicitly inherit broad external authority. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps`, `tests/test_external_boundaries.py::ExternalBoundaryTests::test_fork_does_not_inherit_parent_filesystem_write_capability` |
 | Child processes inherit only explicit, parent-held capability subsets through delegation/attenuation. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_spawn_child_process_inherits_only_explicit_capabilities`, `tests/test_granular_permissions.py::GranularPermissionTests::test_child_cannot_inherit_broader_permission_than_parent_has`, `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_delegate_can_only_attenuate_delegable_parent_capability`, `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_delegate_cannot_drop_parent_constraints`, `tests/test_capability_v2.py::CapabilityV2RuntimeInterfaceTests::test_spawn_child_invalid_capability_inheritance_is_preflighted` |
-| exec replaces the process image/tool table without granting target-image capabilities. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_exec_process_swaps_image_without_granting_target_image_capabilities` |
+| exec is a self-evolution mechanism that replaces the process image/tool table without granting target-image capabilities. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_exec_process_swaps_image_without_granting_target_image_capabilities` |
 | Revocation and one-shot capabilities are enforced at the next primitive use. | `tests/test_external_boundaries.py::ExternalBoundaryTests::test_revoked_filesystem_capability_denies_write`, `tests/test_permission_policy.py::PermissionPolicyTests::test_missing_delete_consumes_one_time_grant` |
 | Capability matching is typed and canonical; bare global `*` is rejected, and subtree grants do not prefix-collide with adjacent resources. | `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_typed_resource_matching_rejects_prefix_collision`, `tests/test_shell_primitive.py::ShellMatcherTests::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args` |
 | Deny capabilities dominate matching allow capabilities. | `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_deny_dominates_matching_allow`, `tests/test_shell_primitive.py::ShellPrimitiveTests::test_always_deny_shell_policy_overrides_exact_command_grant` |
@@ -78,13 +79,13 @@ and paper claims aligned.
 | Checkpoint restore/fork preserves scoped Skill registry rows, loaded Skill records, JIT source metadata, and process tool tables without rolling back append-only history. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_checkpoint_restore_preserves_loaded_skill_records_and_tool_table`, `tests/test_checkpoint_manager.py` |
 | Checkpoint restore/fork preserves JSON-RPC endpoint registry rows referenced by restored process capabilities without deleting unrelated endpoint registry state. | `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_checkpoint_restores_referenced_endpoint_and_reports_remote_effect` |
 | Checkpoint restore/fork requires the current runtime to have loaded the same startup module ids and source hashes captured in the checkpoint metadata. | `tests/test_runtime_modules.py::RuntimeModuleTests::test_checkpoint_restore_requires_same_startup_module_loaded` |
-| Image registration goes through the image primitive and requires image/filesystem authority. | `tests/test_image_registration.py::ImageRegistrationTests::test_register_image_primitive_validates_tools_and_emits_audit`, `tests/test_image_registration.py::ImageRegistrationTests::test_load_image_from_yaml_tool_requires_image_write_capability` |
+| Image registration is a self-evolution mechanism that goes through the image primitive and requires image/filesystem authority. | `tests/test_image_registration.py::ImageRegistrationTests::test_register_image_primitive_validates_tools_and_emits_audit`, `tests/test_image_registration.py::ImageRegistrationTests::test_load_image_from_yaml_tool_requires_image_write_capability` |
 | Image `default_skills` activate at spawn/exec, fork inherits activated Skills and corresponding tool visibility, and spawn-child starts without parent-activated Skills. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_image_default_skills_spawn_fork_spawn_child_and_exec_semantics` |
 | Demo and launcher audit counts are scoped and reproducible enough for artifact smoke checks. | `tests/test_demo_contract.py::DemoContractTests::test_run_demo_returns_auditable_contract`, `tests/test_coding_agent_launcher.py::CodingAgentLauncherTests::test_audit_counts_are_scoped_to_launched_process` |
 
 ## Known Test Gaps
 
 - Audit explain is not implemented yet; current tests check audit record emission and selected audit counts, not query/explanation completeness.
-- The M1 runtime-safety benchmark harness, 20 deterministic tasks, side-effect oracle, baselines, ablations, and metrics collection are implemented. It is still an early deterministic workload, not a complete paper evaluation suite.
+- The M1 runtime-safety benchmark harness, 20+ deterministic tasks, self-evolution subset, side-effect oracle, baselines, ablations, and metrics collection are implemented. It is still an early deterministic workload, not a complete paper evaluation suite.
 - Context materialization metadata is not yet complete enough to compute included/omitted/summarized/truncated object statistics for every LLM call.
 - Real MCP, Git worktree, and mock PR providers are planned but not implemented.

@@ -5,6 +5,11 @@ status, a goal object, a memory view, a process-local working directory, a tool
 table, loaded Skills, capabilities, children, message queue state, and resource
 budgets.
 
+The paper frames this process model as the substrate for self-evolving agents:
+a process can change visible tools, activate Skills, register process-local JIT
+tools, register or exec AgentImages, fork children, and fork from checkpoints,
+while resource authority remains separate in Capability v2.
+
 ## Process Lifecycle
 
 The current lifecycle includes:

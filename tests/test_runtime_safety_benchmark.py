@@ -18,9 +18,10 @@ class RuntimeSafetyBenchmarkTests(unittest.TestCase):
     def test_loads_m1_task_suite(self) -> None:
         tasks = load_tasks(SUITE_ROOT)
 
-        self.assertEqual(len(tasks), 20)
+        self.assertGreaterEqual(len(tasks), 26)
         self.assertGreaterEqual(len({task.attack_class for task in tasks}), 4)
         self.assertTrue(all(task.mock_actions for task in tasks))
+        self.assertTrue(any(task.attack_class.startswith("self_evolution") for task in tasks))
 
     def test_schema_rejects_malformed_task(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -64,6 +65,34 @@ safety_oracle: []
         self.assertEqual(summary["unknown_effects"], 1)
         self.assertFalse(summary["safety_passed"])
 
+    def test_oracle_classifies_self_evolution_effects(self) -> None:
+        task = next(task for task in load_tasks(SUITE_ROOT) if task.id == "jsonrpc_visibility_no_method_authority_001")
+        effects = classify_effects(
+            task,
+            [
+                EffectRecord(
+                    task_id=task.id,
+                    runner="test",
+                    type="jsonrpc.call",
+                    performed=False,
+                    denied=True,
+                    endpoint="bench-echo",
+                    method="echo",
+                ),
+                EffectRecord(
+                    task_id=task.id,
+                    runner="test",
+                    type="skill.activate",
+                    performed=False,
+                    denied=True,
+                    skill_id="unrelated",
+                ),
+            ],
+        )
+
+        self.assertEqual([effect.classification for effect in effects], ["forbidden", "unknown"])
+        self.assertTrue(safety_summary(task, effects)["safety_passed"])
+
     def test_deterministic_smoke_run_across_baselines_and_libos(self) -> None:
         selected_ids = {"fs_secret_read_001", "fs_write_forbidden_001", "shell_allowed_version_001"}
         tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in selected_ids]
@@ -82,6 +111,41 @@ safety_oracle: []
             self.assertTrue(any(run.result.forbidden_performed == 0 for run in full))
             self.assertTrue(any(run.result.forbidden_performed > 0 for run in direct))
 
+    def test_self_evolution_smoke_run_across_wrapper_and_libos(self) -> None:
+        selected_ids = {
+            "skill_tool_visibility_001",
+            "skill_jit_secret_read_001",
+            "image_exec_required_capability_001",
+            "child_delegation_attenuation_001",
+            "checkpoint_fork_revoked_capability_001",
+            "jsonrpc_visibility_no_method_authority_001",
+        }
+        tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in selected_ids]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runs = run_suite(tasks, SUITE_ROOT, temp_dir, runners=["direct_tool_wrapper", "agent_libos_full"])
+
+            self.assertEqual(len(runs), 12)
+            full = [run for run in runs if run.result.runner == "agent_libos_full"]
+            self.assertTrue(all(run.result.safety_passed for run in full))
+            counters = {
+                key
+                for run in full
+                for key, value in run.result.metadata.get("self_evolution_counts", {}).items()
+                if value
+            }
+            self.assertGreaterEqual(
+                counters,
+                {
+                    "skill_activations",
+                    "jit_registrations",
+                    "image_registrations",
+                    "image_execs",
+                    "child_processes",
+                    "checkpoint_forks",
+                    "remote_calls",
+                },
+            )
+
     def test_metrics_output_has_stable_columns(self) -> None:
         tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in {"fs_secret_read_001", "shell_allowed_version_001"}]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -95,6 +159,7 @@ safety_oracle: []
             collected = collect_metrics(temp_dir)
             self.assertEqual(collected["result_count"], 4)
             self.assertIn("unauthorized_side_effect_rate", collected["rows"][0])
+            self.assertIn("skill_activations", collected["rows"][0])
 
     def test_agent_libos_runner_denies_missing_authority_and_records_llm(self) -> None:
         task = next(task for task in load_tasks(SUITE_ROOT) if task.id == "fs_secret_read_001")

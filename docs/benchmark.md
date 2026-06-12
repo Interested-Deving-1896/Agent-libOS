@@ -1,15 +1,18 @@
 # Runtime-Safety Benchmark
 
-The M1 benchmark harness is a deterministic runtime-safety workload for Agent
-libOS. It is designed to compare agent runtime boundaries against simpler
-wrappers while avoiding default token spend.
+The M1 benchmark harness is a deterministic runtime-safety workload for
+Agent libOS. It is designed to compare agent runtime boundaries against simpler
+wrappers while avoiding default token spend. The suite now includes a
+self-evolution subset for the paper theme: capability-controlled changes through
+Skills, Deno/TypeScript JIT tools, image registration/exec, child processes,
+checkpoints, Object Memory, and registered remote resources.
 
 The task schema is defined in
 [benchmarks/runtime_safety/schema.md](../benchmarks/runtime_safety/schema.md).
 
 ## Task Suite
 
-The checked-in suite contains 20 YAML tasks under
+The checked-in suite contains 20+ YAML tasks under
 `benchmarks/runtime_safety/tasks/`. They cover at least these classes:
 
 - secret read attempts,
@@ -17,7 +20,9 @@ The checked-in suite contains 20 YAML tasks under
 - forbidden filesystem deletes,
 - shell bypass and exfiltration attempts,
 - object authority leakage,
-- process authority leakage.
+- process authority leakage,
+- self-evolution attempts involving Skills, JIT tools, image registration/exec,
+  child processes, checkpoint fork, and JSON-RPC visibility.
 
 Each task declares:
 
@@ -108,7 +113,7 @@ The command rejects broad real-model runs unless `--limit 1` or exactly one
 - `metrics.json`: aggregate metrics.
 - `metrics.csv`: stable CSV metrics columns.
 
-Agent LibOS runner directories also include per-task runtime SQLite databases
+Agent libOS runner directories also include per-task runtime SQLite databases
 under the output directory.
 
 ## Result Fields
@@ -132,11 +137,13 @@ under the output directory.
 - `audit_completeness`
 - `errors`
 - `workspace`
-- `metadata`
+- `metadata`, including `metadata.self_evolution_counts` for per-run
+  self-evolution attempts.
 
 `effects.jsonl` rows include type-specific fields such as `path`, `argv`,
-`namespace`, `name`, `image`, `endpoint`, `provider`, `operation`, plus
-`performed`, `denied`, `simulated`, `classification`, and `error`.
+`namespace`, `name`, `skill_id`, `tool`, `image`, `checkpoint`, `endpoint`,
+`method`, `provider`, `operation`, plus `performed`, `denied`, `simulated`,
+`classification`, and `error`.
 
 Denied attempts are recorded but do not count as performed unauthorized effects.
 
@@ -156,8 +163,15 @@ Stable metric columns are:
 - `llm_tokens`
 - `wall_time_s`
 - `audit_completeness`
+- `skill_activations`
+- `jit_registrations`
+- `image_registrations`
+- `image_execs`
+- `child_processes`
+- `checkpoint_forks`
+- `remote_calls`
 
 The current benchmark is suitable for deterministic smoke and early evaluation.
 It is not yet a full paper evaluation suite. Audit explain queries, richer
-context materialization metadata, real MCP provider tasks, and Git/worktree
-provider tasks remain future work.
+context materialization metadata, adversarial remote provider tasks, and
+Git/worktree provider tasks remain future work.

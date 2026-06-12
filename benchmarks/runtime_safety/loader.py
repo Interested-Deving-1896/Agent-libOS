@@ -134,6 +134,17 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
         if effect_type in {"process.spawn", "process.fork", "process.exec"} and "image" in effect:
             if not isinstance(effect["image"], str) or not effect["image"]:
                 raise BenchmarkValidationError(f"{source}: {field}[{index}].image must be a string")
+        if effect_type == "skill.activate":
+            _validate_non_empty_string(effect, "skill_id", source, f"{field}[{index}].skill_id")
+        if effect_type == "jit.register":
+            _validate_non_empty_string(effect, "tool", source, f"{field}[{index}].tool")
+        if effect_type == "image.register":
+            _validate_non_empty_string(effect, "image", source, f"{field}[{index}].image")
+        if effect_type in {"checkpoint.create", "checkpoint.fork"}:
+            _validate_non_empty_string(effect, "checkpoint", source, f"{field}[{index}].checkpoint", required=False)
+        if effect_type == "jsonrpc.call":
+            _validate_non_empty_string(effect, "endpoint", source, f"{field}[{index}].endpoint")
+            _validate_non_empty_string(effect, "method", source, f"{field}[{index}].method")
     return effects
 
 
@@ -145,6 +156,12 @@ def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> 
         action["path"] = _safe_relative_path(str(action["path"]), source, f"mock_actions[{index}].path")
     if name == "run_shell_command":
         _validate_argv(action.get("argv"), source, f"mock_actions[{index}].argv")
+    effects = action.get("benchmark_effects")
+    if effects is not None:
+        _validate_effect_list(effects, source, f"mock_actions[{index}].benchmark_effects")
+    checkpoint_ref = action.get("checkpoint_ref")
+    if checkpoint_ref is not None and (not isinstance(checkpoint_ref, str) or not checkpoint_ref.strip()):
+        raise BenchmarkValidationError(f"{source}: mock_actions[{index}].checkpoint_ref must be a non-empty string")
 
 
 def _safe_relative_path(value: str, source: Path, field: str) -> str:
@@ -169,3 +186,19 @@ def _validate_argv(value: Any, source: Path, field: str) -> None:
             raise BenchmarkValidationError(f"{source}: {field}[0] must be non-empty")
         if "\x00" in item:
             raise BenchmarkValidationError(f"{source}: {field}[{index}] may not contain NUL")
+
+
+def _validate_non_empty_string(
+    mapping: dict[str, Any],
+    key: str,
+    source: Path,
+    field: str,
+    *,
+    required: bool = True,
+) -> None:
+    if key not in mapping:
+        if required:
+            raise BenchmarkValidationError(f"{source}: {field} is required")
+        return
+    if not isinstance(mapping[key], str) or not mapping[key].strip():
+        raise BenchmarkValidationError(f"{source}: {field} must be a non-empty string")

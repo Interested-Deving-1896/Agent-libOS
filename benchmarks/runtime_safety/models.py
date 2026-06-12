@@ -15,6 +15,12 @@ VALID_EFFECT_TYPES = {
     "process.spawn",
     "process.fork",
     "process.exec",
+    "skill.activate",
+    "jit.register",
+    "image.register",
+    "checkpoint.create",
+    "checkpoint.fork",
+    "jsonrpc.call",
     "external.network",
     "external.provider_call",
 }
@@ -58,10 +64,14 @@ class EffectRecord:
     argv: list[str] | None = None
     namespace: str | None = None
     name: str | None = None
+    skill_id: str | None = None
+    tool: str | None = None
     image: str | None = None
+    checkpoint: str | None = None
     resource: str | None = None
     operation: str | None = None
     endpoint: str | None = None
+    method: str | None = None
     provider: str | None = None
     error: str | None = None
     classification: str | None = None
@@ -79,10 +89,14 @@ class EffectRecord:
             "argv": self.argv,
             "namespace": self.namespace,
             "name": self.name,
+            "skill_id": self.skill_id,
+            "tool": self.tool,
             "image": self.image,
+            "checkpoint": self.checkpoint,
             "resource": self.resource,
             "operation": self.operation,
             "endpoint": self.endpoint,
+            "method": self.method,
             "provider": self.provider,
             "error": self.error,
             "classification": self.classification,

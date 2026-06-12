@@ -230,6 +230,25 @@ class CheckpointManagerTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_fork_from_checkpoint_does_not_resurrect_revoked_capability(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="fork revoked capability")
+            resource = runtime.filesystem.resource_for_path("secret.txt")
+            cap = runtime.capability.grant(pid, resource, [CapabilityRight.READ], issued_by="test")
+            checkpoint_id = runtime.checkpoint.create(pid, "before revoke", actor=pid)
+            runtime.capability.grant(pid, f"checkpoint:{checkpoint_id}", [CapabilityRight.EXECUTE], issued_by="test")
+            runtime.capability.revoke(cap.cap_id, revoked_by=pid, reason="holder gave up authority")
+
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+            fork_root = forked["fork_root_pid"]
+
+            self.assertFalse(runtime.capability.check(pid, resource, CapabilityRight.READ))
+            self.assertFalse(runtime.capability.check(fork_root, resource, CapabilityRight.READ))
+            self.assertNotIn(resource, [capability.resource for capability in runtime.capability.list_subject(fork_root)])
+        finally:
+            runtime.close()
+
     def test_checkpoint_fork_parent_attachment_requires_authority(self) -> None:
         runtime = Runtime.open("local")
         try:

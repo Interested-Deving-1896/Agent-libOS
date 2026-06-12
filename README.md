@@ -1,9 +1,16 @@
 # Agent libOS
 
-Agent libOS is an experimental agent-native libOS runtime written in Python. It
-models an agent as a long-running, schedulable, interruptible,
+Agent libOS is an experimental agent-native libOS runtime written in Python.
+It supports the paper theme:
+
+> Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM Agents
+
+The runtime models an agent as a long-running, schedulable, interruptible,
 capability-controlled `AgentProcess`, not as a single chat request or workflow
-thread.
+thread. Agents may activate Skills, register Deno/TypeScript JIT tools,
+register or execute new images, fork children, checkpoint/fork state, and use
+registered remote resources, but these self-evolution mechanisms do not grant
+resource authority by themselves.
 
 The current contribution is the runtime authority boundary:
 
@@ -11,7 +18,9 @@ The current contribution is the runtime authority boundary:
 process identity + capability + primitive + audit
 ```
 
-LLM-facing tools are ergonomic wrappers. They are not the security boundary.
+LLM-facing tools, Skills, JIT tools, image definitions, child processes,
+checkpoints, and remote endpoint visibility are ergonomic affordances. They are
+not the security boundary.
 Protected effects happen only inside libOS primitives, where process identity,
 capabilities, human approval, policy, provider containment, events, and audit
 records are enforced.
@@ -51,8 +60,9 @@ The implementation currently includes:
   candidates without granting resource authority.
 - Client-only JSON-RPC 2.0 over HTTP through registered endpoints, method
   capabilities, provider-classified external effects, audit, and checkpoints.
-- A deterministic runtime-safety benchmark harness with 20 checked-in tasks,
-  baselines, side-effect oracle, and metrics collection.
+- A deterministic runtime-safety benchmark harness with 20+ checked-in tasks,
+  including a self-evolution subset, baselines, side-effect oracle, and metrics
+  collection.
 
 ## Documentation
 

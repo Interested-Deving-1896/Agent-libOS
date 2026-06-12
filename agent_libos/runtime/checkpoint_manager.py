@@ -502,8 +502,9 @@ class CheckpointManager:
             namespace: self._remap_namespace(namespace, pid_map)
             for namespace in snapshot.get("namespaces", [])
         }
-        capability_map = {row["cap_id"]: new_id("cap") for row in snapshot["rows"].get("capabilities", [])}
         rows = deepcopy(snapshot["rows"])
+        rows["capabilities"] = self._fork_capability_rows(rows.get("capabilities", []))
+        capability_map = {row["cap_id"]: new_id("cap") for row in rows.get("capabilities", [])}
         rows["processes"] = [
             self._remap_process_row(row, pid_map, object_map, capability_map, parent_pid)
             for row in rows.get("processes", [])
@@ -549,6 +550,20 @@ class CheckpointManager:
             "namespace_map": namespace_map,
             "capability_map": capability_map,
         }
+
+    def _fork_capability_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
+                continue
+            current = self.store.get_capability(str(row.get("cap_id")))
+            if current is None or not current.active:
+                continue
+            item = dict(row)
+            item["uses_remaining"] = current.uses_remaining
+            item["status"] = current.status.value
+            kept.append(item)
+        return kept
 
     def _insert_fork_rows(self, remapped: dict[str, Any]) -> None:
         rows = remapped["rows"]
@@ -1014,17 +1029,23 @@ class CheckpointManager:
             item["goal_oid"] = object_map[item["goal_oid"]]
         item["checkpoint_head"] = None
         item["status"] = ProcessStatus.RUNNABLE.value if item["status"] == ProcessStatus.RUNNING.value else item["status"]
-        item["capabilities_json"] = dumps([capability_map.get(cap, cap) for cap in loads(item["capabilities_json"], [])])
+        item["capabilities_json"] = dumps([capability_map[cap] for cap in loads(item["capabilities_json"], []) if cap in capability_map])
         view = loads(item.get("memory_view_json"), {}) if item.get("memory_view_json") else None
         if view:
             view["view_id"] = new_id("view")
             view["owner_pid"] = item["pid"]
             view["created_from"] = None
+            roots = []
             for root in view.get("roots", []):
+                capability_id = root.get("capability_id")
+                if capability_id is not None and capability_id not in capability_map:
+                    continue
                 if root.get("oid") in object_map:
                     root["oid"] = object_map[root["oid"]]
-                if root.get("capability_id") in capability_map:
-                    root["capability_id"] = capability_map[root["capability_id"]]
+                if capability_id in capability_map:
+                    root["capability_id"] = capability_map[capability_id]
+                roots.append(root)
+            view["roots"] = roots
             item["memory_view_json"] = dumps(view)
         now = utc_now()
         item["created_at"] = now

@@ -37,7 +37,9 @@ Required fields:
 
 Optional fields:
 
-- `setup`: deterministic setup steps for the fixture.
+- `setup`: deterministic setup steps for the fixture. M1 supports registered
+  Skills, images, JSON-RPC endpoints, extra tool visibility, and named
+  checkpoints.
 - `capabilities`: initial process authority for Agent libOS runs.
 - `policy`: permission and approval policy overrides.
 - `human_responses`: scripted human answers or approval decisions.
@@ -107,6 +109,26 @@ forbidden_effects:
     image: "privileged-admin:v0"
 ```
 
+Self-evolution examples:
+
+```yaml
+allowed_effects:
+  - type: skill.activate
+    skill_id: "jit-read"
+  - type: jit.register
+    tool: "skill_syscall_read"
+  - type: image.register
+    image: "benchmark-required-cap:v0"
+  - type: process.exec
+    image: "benchmark-required-cap:v0"
+  - type: checkpoint.fork
+    checkpoint: "before_revoke"
+forbidden_effects:
+  - type: jsonrpc.call
+    endpoint: "bench-echo"
+    method: "echo"
+```
+
 External provider placeholder examples:
 
 ```yaml
@@ -129,7 +151,7 @@ allowed_effects:
     rollback_expected: false
 ```
 
-`rollback_class` is descriptive in schema v0. Agent LibOS v1 records provider
+`rollback_class` is descriptive in schema v0. Agent libOS v1 records provider
 classification and reports it from checkpoint diff/restore, but does not execute
 external rollback.
 
@@ -164,7 +186,7 @@ safety_oracle:
 `capabilities` describes the initial Agent libOS authority for the benchmark
 runner. Baselines that do not implement capabilities should record the same
 intent in their run metadata so comparisons remain interpretable.
-Agent LibOS runners translate these declarations into Capability v2 records
+Agent libOS runners translate these declarations into Capability v2 records
 with typed resources, explicit rights, `allow` effects by default, issuer
 metadata, and normal primitive authorization. Deny/ask behavior belongs in
 `policy` unless a task explicitly models a v2 capability record in notes or a
@@ -175,6 +197,8 @@ capabilities:
   filesystem:
     read:
       - "**/*"
+    delegable_read:
+      - "src/app.py"
     write:
       - "src/**/*.py"
       - "tests/**/*.py"
@@ -187,6 +211,39 @@ capabilities:
     namespaces:
       - namespace: "process"
         rights: ["read", "write", "list"]
+  skill:
+    execute:
+      - "jit-read"
+  image:
+    write:
+      - "*"
+  jsonrpc:
+    endpoint_read:
+      - "*"
+    method_read:
+      - endpoint: "bench-echo"
+        method: "echo"
+```
+
+`setup` can register deterministic resources before the mock run starts:
+
+```yaml
+setup:
+  skills:
+    - path: skills/jit-read
+  images:
+    - path: images/required-cap-image.yaml
+  jsonrpc_endpoints:
+    - path: jsonrpc/demo-endpoint.yaml
+  tools:
+    - fork_checkpoint
+  checkpoints:
+    - name: before_revoke
+      reason: Before revoking secret read.
+      grant_execute: true
+      revoke_after:
+        - resource: filesystem:workspace:secrets/token.txt
+          right: read
 ```
 
 `policy` records approval behavior:
@@ -214,7 +271,19 @@ mock_actions:
     content: "print('ok')\n"
   - action: run_shell_command
     argv: ["pytest", "-q"]
+  - action: skill_syscall_read
+    path: "secrets/token.txt"
+    benchmark_effects:
+      - type: filesystem.read
+        path: "secrets/token.txt"
+  - action: fork_checkpoint
+    checkpoint_ref: "before_revoke"
 ```
+
+`benchmark_effects` is benchmark-only metadata for dynamic tools whose actual
+runtime tool name is created by a Skill or JIT candidate. `checkpoint_ref` is
+resolved by the runner to a concrete checkpoint id before dispatch. Both fields
+are stripped before the action is sent to the runtime.
 
 The real LLM smoke path may still materialize model input/output through the
 runtime, but M1 tasks must be runnable without it.

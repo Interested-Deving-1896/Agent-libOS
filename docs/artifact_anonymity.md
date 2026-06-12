@@ -5,12 +5,16 @@ submission. It is not a legal review or a release checklist; it is the minimum
 set of checks required before sharing a paper artifact or benchmark bundle with
 reviewers.
 
-## Anonymous System Name
+## Paper Title And System Name
 
-Use `Primitive Agent Runtime` (`PAR`) as the temporary anonymous name in paper
-drafts and anonymous artifact documentation. Do not rename the Python package,
-repository title, public README heading, or runtime classes for M0. The alias is
-only a double-blind writing convention.
+The paper title is fixed as:
+
+> Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM Agents
+
+Use `Agent libOS` consistently in paper drafts and artifact documentation. Do
+not use the older temporary anonymous name `Primitive Agent Runtime` (`PAR`).
+For double-blind review, anonymize author, institution, repository, and
+deployment metadata rather than renaming the runtime in source code.
 
 ## License Consistency
 
@@ -64,6 +68,8 @@ real Deno installation should skip with a clear message when `deno` is missing.
 - README is the current project entrypoint and documentation index.
 - `agent_libos_design_doc.md` is a historical design archive.
 - `docs/invariants.md` is the invariant-to-test map.
+- `docs/paper_thesis.md` carries the fixed paper title, thesis, contributions,
+  and non-goals.
 - `docs/architecture.md`, `docs/runtime_model.md`, `docs/capabilities.md`,
   `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
   `docs/checkpoints.md`, `docs/cli.md`, `docs/development.md`, and
@@ -83,5 +89,5 @@ M0 is complete when:
 - every core invariant has test coverage or an explicit gap,
 - benchmark task schema v0 exists,
 - benchmark harness documentation exists,
-- a one-page paper thesis exists,
+- a one-page paper thesis with the fixed Agent libOS title exists,
 - this anonymity checklist exists and is linked from README.

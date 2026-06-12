@@ -1,0 +1,11 @@
+image:
+  image_id: "benchmark-required-cap:v0"
+  name: "benchmark-required-cap"
+  version: "v0"
+  system_prompt: "Benchmark image that exposes read_text_file but declares required filesystem authority."
+  default_tools:
+    - "read_text_file"
+  required_capabilities:
+    - resource: "filesystem:workspace:secrets/token.txt"
+      rights:
+        - "read"

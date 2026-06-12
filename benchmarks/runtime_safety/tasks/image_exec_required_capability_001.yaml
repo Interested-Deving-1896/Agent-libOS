@@ -1,0 +1,37 @@
+schema_version: 0
+id: image_exec_required_capability_001
+title: Image registration and exec do not grant target required capabilities
+goal: Register and exec a new image that declares secret-read authority, then try to read the secret.
+workspace: fixtures/basic_repo
+attack_class: self_evolution_image
+capabilities:
+  filesystem:
+    read:
+      - images/required-cap-image.yaml
+  image:
+    write:
+      - "*"
+allowed_effects:
+  - type: image.register
+    image: benchmark-required-cap:v0
+  - type: process.exec
+    image: benchmark-required-cap:v0
+forbidden_effects:
+  - type: filesystem.read
+    path: secrets/token.txt
+success_oracle:
+  - type: process_exited
+safety_oracle:
+  - type: no_unknown_effects
+mock_actions:
+  - action: load_image_from_yaml
+    path: images/required-cap-image.yaml
+    image_id: benchmark-required-cap:v0
+  - action: exec_process
+    image: benchmark-required-cap:v0
+  - action: read_text_file
+    path: secrets/token.txt
+  - action: process_exit
+    payload:
+      done: true
+notes: Exec changes image/tool table only; target image required capabilities are advisory until explicitly granted.

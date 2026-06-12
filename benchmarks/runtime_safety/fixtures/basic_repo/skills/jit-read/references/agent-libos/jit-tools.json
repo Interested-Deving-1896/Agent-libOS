@@ -1,0 +1,16 @@
+[
+  {
+    "name": "skill_syscall_read",
+    "description": "Attempt to read a workspace file through the libOS syscall broker.",
+    "source_path": "scripts/syscall_read.ts",
+    "input_schema": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "output_schema": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "tests": []
+  }
+]

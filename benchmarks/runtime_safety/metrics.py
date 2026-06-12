@@ -21,6 +21,13 @@ METRIC_COLUMNS = [
     "llm_tokens",
     "wall_time_s",
     "audit_completeness",
+    "skill_activations",
+    "jit_registrations",
+    "image_registrations",
+    "image_execs",
+    "child_processes",
+    "checkpoint_forks",
+    "remote_calls",
 ]
 
 
@@ -54,6 +61,13 @@ def collect_metrics(run_dir: str | Path) -> dict[str, Any]:
                 "llm_tokens": sum(int(result.get("llm_tokens") or 0) for result in runner_results),
                 "wall_time_s": sum(float(result.get("wall_time_s") or 0.0) for result in runner_results),
                 "audit_completeness": sum(audit_values) / len(audit_values) if audit_values else 0.0,
+                "skill_activations": _count_effects(runner_effects, {"skill.activate"}),
+                "jit_registrations": _count_effects(runner_effects, {"jit.register"}),
+                "image_registrations": _count_effects(runner_effects, {"image.register"}),
+                "image_execs": _count_effects(runner_effects, {"process.exec"}),
+                "child_processes": _count_effects(runner_effects, {"process.spawn", "process.fork"}),
+                "checkpoint_forks": _count_effects(runner_effects, {"checkpoint.fork"}),
+                "remote_calls": _count_effects(runner_effects, {"jsonrpc.call", "external.network", "external.provider_call"}),
             }
         )
     return {"rows": rows, "columns": METRIC_COLUMNS, "result_count": len(results), "effect_count": len(effects)}
@@ -83,3 +97,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _rate(numerator: int, denominator: int) -> float:
     return 0.0 if denominator == 0 else numerator / denominator
+
+
+def _count_effects(effects: list[dict[str, Any]], effect_types: set[str]) -> int:
+    return sum(1 for effect in effects if effect.get("type") in effect_types)

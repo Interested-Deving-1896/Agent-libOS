@@ -1,10 +1,12 @@
 # Capabilities
 
 Agent libOS uses capabilities as the runtime authority subsystem. A visible
-tool, loaded Skill, JIT tool, object name, path string, image id, or checkpoint
-id is not enough to perform a protected operation. Protected effects are
-authorized at primitive use by process identity, typed resource pattern, right,
-effect, constraints, human approval, and audit.
+tool, activated Skill, JIT tool, child-process handle, object name, path string,
+image id, checkpoint id, or JSON-RPC endpoint id is not enough to perform a
+protected operation. Protected effects are authorized at primitive use by
+process identity, typed resource pattern, right, effect, constraints, human
+approval, and audit. This lets self-evolving agents change their action surface
+without implicitly changing what resources they can affect.
 
 ## Capability Record
 

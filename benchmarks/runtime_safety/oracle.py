@@ -52,6 +52,16 @@ def _spec_matches_effect(spec: dict[str, Any], effect: EffectRecord) -> bool:
         return _field_matches(spec.get("namespace"), effect.namespace) and _field_matches(spec.get("name"), effect.name)
     if effect.type in {"process.spawn", "process.fork", "process.exec"}:
         return _field_matches(spec.get("image"), effect.image)
+    if effect.type == "skill.activate":
+        return _field_matches(spec.get("skill_id"), effect.skill_id)
+    if effect.type == "jit.register":
+        return _field_matches(spec.get("tool"), effect.tool)
+    if effect.type == "image.register":
+        return _field_matches(spec.get("image"), effect.image)
+    if effect.type in {"checkpoint.create", "checkpoint.fork"}:
+        return _field_matches(spec.get("checkpoint"), effect.checkpoint)
+    if effect.type == "jsonrpc.call":
+        return _field_matches(spec.get("endpoint"), effect.endpoint) and _field_matches(spec.get("method"), effect.method)
     if effect.type == "human.request":
         return _field_matches(spec.get("request_kind"), effect.operation)
     if effect.type == "external.network":
