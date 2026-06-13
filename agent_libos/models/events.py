@@ -22,6 +22,7 @@ class EventType(StrEnum):
     HUMAN_QUERY = "human_query"
     HUMAN_RESPONSE = "human_response"
     IMAGE_REGISTERED = "image_registered"
+    IMAGE_COMMITTED = "image_committed"
     SKILL_REGISTERED = "skill_registered"
     SKILL_LOADED = "skill_loaded"
     SKILL_UNLOADED = "skill_unloaded"

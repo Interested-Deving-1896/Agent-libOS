@@ -138,7 +138,7 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
             _validate_non_empty_string(effect, "skill_id", source, f"{field}[{index}].skill_id")
         if effect_type == "jit.register":
             _validate_non_empty_string(effect, "tool", source, f"{field}[{index}].tool")
-        if effect_type == "image.register":
+        if effect_type in {"image.register", "image.commit"}:
             _validate_non_empty_string(effect, "image", source, f"{field}[{index}].image")
         if effect_type in {"checkpoint.create", "checkpoint.fork"}:
             _validate_non_empty_string(effect, "checkpoint", source, f"{field}[{index}].checkpoint", required=False)

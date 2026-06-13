@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,7 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
-from agent_libos.models import AgentImage, EventType
+from agent_libos.models import AgentImage, EventType, ObjectHandle, ProcessStatus, ToolHandle, ToolSpec
 from agent_libos.models.exceptions import NotFound
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
@@ -28,7 +30,8 @@ from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate
 from agent_libos.tools.broker import ToolBroker
-from agent_libos.utils.ids import utc_now
+from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.serde import dumps, loads
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 
@@ -137,8 +140,10 @@ class Runtime:
             self.audit,
             self.events,
             self.tools.resolve,
+            store=self.store,
             config=self.config,
         )
+        self.image_registry.bind_runtime(self)
         self.llm = LLMProcessExecutor(self, llm_client, config=self.config)
         self._current_human_auto_approve: bool | None = None
         self._current_human_auto_policy: str | None = None
@@ -150,6 +155,7 @@ class Runtime:
             trusted_modules=trusted_modules,
             trusted_sha256=trusted_module_sha256,
         )
+        self.image_registry.load_persisted_images()
         self.modules.run_startup_hooks()
         self._closed = False
         self._shutdown_reason: str | None = None
@@ -408,6 +414,9 @@ class Runtime:
         # apply image required_capabilities. Exec may preserve existing
         # capabilities or shrink them; it never grants new external authority.
         self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
+        selected_image = self._require_image(image)
+        if selected_image.boot.get("kind", "fresh") == "checkpoint_commit":
+            self._instantiate_checkpoint_commit_image(pid, selected_image)
         self._configure_process_skills_for_image(pid, image, assigned_by=f"process.exec:{image}")
         return self.process.get(pid)
 
@@ -452,18 +461,22 @@ class Runtime:
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
         process = self.store.get_process(pid)
-        image = self.images.get(image_id) or self.images[self.config.runtime.default_image_id]
+        try:
+            image = self._require_image(image_id)
+        except Exception as exc:
+            if process is not None:
+                process.status = ProcessStatus.FAILED
+                process.status_message = str(exc)
+                process.updated_at = utc_now()
+                self.store.update_process(process)
+            raise
+        is_checkpoint_commit = image.boot.get("kind", "fresh") == "checkpoint_commit"
         # Tool visibility is fixed from the AgentImage at process creation time.
         # External-resource authority is still enforced later by the primitives.
-        try:
-            self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
-        except Exception as exc:
-            self.audit.record(
-                actor="runtime",
-                action="image.default_tool_configure_failed",
-                target=f"process:{pid}",
-                decision={"image": image_id, "error": str(exc)},
-            )
+        self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
+        if is_checkpoint_commit:
+            self._instantiate_checkpoint_commit_image(pid, image)
+            process = self.store.get_process(pid)
         try:
             self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
         except Exception as exc:
@@ -481,6 +494,18 @@ class Runtime:
                 action="image.default_capability_skipped_for_child",
                 target=f"process:{pid}",
                 decision={"image": image_id, "parent_pid": process.parent_pid},
+            )
+            return
+        if is_checkpoint_commit:
+            self.audit.record(
+                actor="runtime",
+                action="image.required_capabilities_declared_only",
+                target=f"process:{pid}",
+                decision={
+                    "image": image_id,
+                    "required_capabilities": len(image.required_capabilities),
+                    "reason": "checkpoint commit images never grant external authority automatically",
+                },
             )
             return
         for spec in image.required_capabilities:
@@ -525,6 +550,280 @@ class Runtime:
             if process is not None and skill_id in process.loaded_skills:
                 continue
             self.skills.activate_skill(pid, skill_id, actor=assigned_by, require_capability=False)
+
+    def _instantiate_checkpoint_commit_image(self, pid: str, image: AgentImage) -> None:
+        artifact = self._load_image_artifact(image)
+        self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
+        remapped = self._remap_image_artifact_for_process(pid, artifact)
+        self._insert_committed_memory_rows(remapped)
+        self._restore_committed_registry_rows(artifact)
+        tool_table = self._restore_committed_tool_table(pid, artifact)
+        process = self.process.get(pid)
+        process.working_directory = str(artifact.get("working_directory") or process.working_directory or ".")
+        process.loaded_skills = self._remap_loaded_skills(artifact.get("loaded_skills", {}), tool_table)
+        process.tool_table = tool_table
+        self._merge_committed_memory_view(process, artifact, remapped)
+        process.updated_at = utc_now()
+        self.store.update_process(process)
+        self.audit.record(
+            actor=f"image:{image.image_id}",
+            action="image.boot.checkpoint_commit",
+            target=f"process:{pid}",
+            decision={
+                "image_id": image.image_id,
+                "artifact_id": image.boot.get("artifact_id"),
+                "source_checkpoint_id": artifact.get("source_checkpoint_id"),
+                "objects": len(remapped["object_payloads"]),
+                "tools": sorted(tool_table),
+            },
+        )
+
+    def _load_image_artifact(self, image: AgentImage) -> dict[str, Any]:
+        artifact_id = str(image.boot.get("artifact_id") or "")
+        expected_sha256 = str(image.boot.get("artifact_sha256") or "")
+        found = self.store.get_image_artifact(artifact_id)
+        if found is None:
+            raise NotFound(f"image artifact not found: {artifact_id}")
+        artifact, metadata = found
+        if artifact.get("kind") != "checkpoint_commit":
+            raise RuntimeError(f"image artifact has unsupported kind: {artifact.get('kind')}")
+        if artifact.get("artifact_version") != self.config.image_commit.artifact_version:
+            raise RuntimeError(
+                "image artifact version mismatch: "
+                f"{artifact.get('artifact_version')} != {self.config.image_commit.artifact_version}"
+            )
+        actual_sha256 = hashlib.sha256(dumps(artifact).encode("utf-8")).hexdigest()
+        if expected_sha256 and metadata.get("sha256") != expected_sha256:
+            raise RuntimeError(f"image artifact hash mismatch for {artifact_id}")
+        if metadata.get("sha256") != actual_sha256:
+            raise RuntimeError(f"image artifact content hash mismatch for {artifact_id}")
+        return artifact
+
+    def _remap_image_artifact_for_process(self, pid: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        source_pid = str(artifact["source_pid"])
+        old_oids = list(artifact.get("object_oids", []))
+        oid_map = {oid: new_id("obj") for oid in old_oids}
+        namespace_map = {
+            namespace: self._remap_image_artifact_namespace(pid, source_pid, namespace)
+            for namespace in artifact.get("namespaces", [])
+        }
+        cap_rows = artifact.get("rows", {}).get("capabilities", [])
+        cap_map = {row["cap_id"]: new_id("cap") for row in cap_rows}
+        now = utc_now()
+        object_rows = [
+            self._remap_committed_object_row(row, pid, oid_map, namespace_map, now)
+            for row in artifact.get("rows", {}).get("objects", [])
+            if row["oid"] in oid_map
+        ]
+        namespace_rows = [
+            self._remap_committed_namespace_row(row, pid, namespace_map, now)
+            for row in artifact.get("rows", {}).get("object_namespaces", [])
+            if row["namespace"] in namespace_map
+        ]
+        link_rows = [
+            self._remap_committed_link_row(row, oid_map, now)
+            for row in artifact.get("rows", {}).get("object_links", [])
+            if row["src_oid"] in oid_map and row["dst_oid"] in oid_map
+        ]
+        capability_rows = [
+            self._remap_committed_capability_row(row, pid, oid_map, namespace_map, cap_map, now)
+            for row in cap_rows
+            if row["subject"] == source_pid
+        ]
+        payloads = {
+            oid_map[oid]: deepcopy(payload)
+            for oid, payload in artifact.get("object_payloads", {}).items()
+            if oid in oid_map
+        }
+        return {
+            "oid_map": oid_map,
+            "namespace_map": namespace_map,
+            "capability_map": cap_map,
+            "object_namespaces": namespace_rows,
+            "objects": object_rows,
+            "object_links": link_rows,
+            "capabilities": capability_rows,
+            "object_payloads": payloads,
+        }
+
+    def _remap_image_artifact_namespace(self, pid: str, source_pid: str, namespace: str) -> str:
+        source_process_namespace = self.memory.process_namespace(source_pid)
+        if namespace == source_process_namespace:
+            return self.memory.process_namespace(pid)
+        return f"image_commit/{pid}/{namespace}"
+
+    def _remap_committed_namespace_row(
+        self,
+        row: dict[str, Any],
+        pid: str,
+        namespace_map: dict[str, str],
+        now: str,
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["namespace"] = namespace_map[item["namespace"]]
+        if item.get("parent_namespace") in namespace_map:
+            item["parent_namespace"] = namespace_map[item["parent_namespace"]]
+        elif item["namespace"] == self.memory.process_namespace(pid):
+            item["parent_namespace"] = None
+        item["created_by"] = pid
+        metadata = loads(item.get("metadata_json"), {})
+        if metadata.get("kind") == "process":
+            metadata["pid"] = pid
+        item["metadata_json"] = dumps(metadata)
+        item["updated_at"] = now
+        return item
+
+    def _remap_committed_object_row(
+        self,
+        row: dict[str, Any],
+        pid: str,
+        oid_map: dict[str, str],
+        namespace_map: dict[str, str],
+        now: str,
+    ) -> dict[str, Any]:
+        item = dict(row)
+        old_oid = item["oid"]
+        item["oid"] = oid_map[old_oid]
+        if item.get("name") == old_oid:
+            item["name"] = item["oid"]
+        item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
+        item["created_by"] = pid
+        provenance = loads(item.get("provenance_json"), {})
+        provenance["parent_oids"] = [oid_map.get(oid, oid) for oid in provenance.get("parent_oids", [])]
+        item["provenance_json"] = dumps(provenance)
+        item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
+        item["created_at"] = now
+        item["updated_at"] = now
+        return item
+
+    def _remap_committed_link_row(self, row: dict[str, Any], oid_map: dict[str, str], now: str) -> dict[str, Any]:
+        item = dict(row)
+        item["id"] = new_id("link")
+        item["src_oid"] = oid_map[item["src_oid"]]
+        item["dst_oid"] = oid_map[item["dst_oid"]]
+        item["created_at"] = now
+        return item
+
+    def _remap_committed_capability_row(
+        self,
+        row: dict[str, Any],
+        pid: str,
+        oid_map: dict[str, str],
+        namespace_map: dict[str, str],
+        cap_map: dict[str, str],
+        now: str,
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["cap_id"] = cap_map[item["cap_id"]]
+        item["subject"] = pid
+        item["issuer_cap_id"] = cap_map.get(item.get("issuer_cap_id")) if item.get("issuer_cap_id") else None
+        item["parent_cap_id"] = cap_map.get(item.get("parent_cap_id")) if item.get("parent_cap_id") else None
+        resource = str(item["resource"])
+        if resource.startswith("object:"):
+            item["resource"] = f"object:{oid_map[resource.split(':', 1)[1]]}"
+        elif resource.startswith("object_namespace:"):
+            namespace = resource.split(":", 1)[1]
+            item["resource"] = f"object_namespace:{namespace_map[namespace]}"
+        item["issued_by"] = f"image.commit:{item['issued_by']}"
+        item["issued_at"] = now
+        return item
+
+    def _insert_committed_memory_rows(self, remapped: dict[str, Any]) -> None:
+        with self.store._lock:
+            cur = self.store.conn.cursor()
+            for row in remapped["object_namespaces"]:
+                exists = cur.execute("SELECT 1 FROM object_namespaces WHERE namespace = ?", (row["namespace"],)).fetchone()
+                if exists is None:
+                    self.checkpoint._insert_row(cur, "object_namespaces", row)
+            for row in remapped["objects"]:
+                self.checkpoint._insert_row(cur, "objects", row)
+                self.store.set_object_payload(row["oid"], deepcopy(remapped["object_payloads"][row["oid"]]))
+            for table in ["object_links", "capabilities"]:
+                for row in remapped[table]:
+                    self.checkpoint._insert_row(cur, table, row)
+            self.store.conn.commit()
+
+    def _restore_committed_registry_rows(self, artifact: dict[str, Any]) -> None:
+        rows = artifact.get("rows", {})
+        with self.store._lock:
+            cur = self.store.conn.cursor()
+            for row in rows.get("skills", []):
+                self.checkpoint._upsert_row(cur, "skills", row, "skill_id")
+            for row in rows.get("skill_trust", []):
+                self.checkpoint._upsert_row(cur, "skill_trust", row, "trust_id")
+            for row in rows.get("jsonrpc_endpoints", []):
+                self.checkpoint._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
+            self.store.conn.commit()
+
+    def _restore_committed_tool_table(self, pid: str, artifact: dict[str, Any]) -> dict[str, str]:
+        tool_rows = {row["tool_id"]: row for row in artifact.get("rows", {}).get("tools", [])}
+        old_to_new: dict[str, str] = {}
+        table: dict[str, str] = {}
+        jit_sources = artifact.get("jit_sources", {})
+        for name, old_tool_id in artifact.get("tool_table", {}).items():
+            if old_tool_id in jit_sources:
+                row = tool_rows.get(old_tool_id)
+                if row is None:
+                    raise RuntimeError(f"committed JIT tool row is missing: {old_tool_id}")
+                new_tool_id = new_id("tool")
+                old_to_new[old_tool_id] = new_tool_id
+                spec = ToolSpec(**loads(row["spec_json"], {}))
+                handle = ToolHandle(tool_id=new_tool_id, name=row["name"], capability_id=None, scope=row["scope"])
+                self.tools._jit_sources[new_tool_id] = jit_sources[old_tool_id]
+                self.tools._handles[new_tool_id] = handle
+                self.tools._tool_ids_by_name.setdefault(handle.name, new_tool_id)
+                self.store.insert_tool(handle, spec, registered_by=f"image.commit:{pid}", created_at=utc_now(), ephemeral=True)
+                table[name] = new_tool_id
+                continue
+            handle = self.tools.resolve(name)
+            old_to_new[old_tool_id] = handle.tool_id
+            table[name] = handle.tool_id
+        artifact["_tool_id_map"] = old_to_new
+        return table
+
+    def _remap_loaded_skills(self, loaded_skills: dict[str, Any], tool_table: dict[str, str]) -> dict[str, Any]:
+        updated = deepcopy(loaded_skills or {})
+        for loaded in updated.values():
+            if not isinstance(loaded, dict):
+                continue
+            for key in ["tool_ids", "jit_tool_ids"]:
+                mapping = loaded.get(key)
+                if not isinstance(mapping, dict):
+                    continue
+                loaded[key] = {
+                    name: tool_table[name]
+                    for name in mapping
+                    if name in tool_table
+                }
+        return updated
+
+    def _merge_committed_memory_view(self, process: Any, artifact: dict[str, Any], remapped: dict[str, Any]) -> None:
+        source = loads(artifact.get("source_process", {}).get("memory_view_json"), {})
+        if not source:
+            return
+        existing_roots = list(process.memory_view.roots) if process.memory_view is not None else []
+        roots = []
+        cap_map = remapped["capability_map"]
+        oid_map = remapped["oid_map"]
+        for root in source.get("roots", []):
+            old_oid = root.get("oid")
+            if old_oid not in oid_map:
+                continue
+            old_cap = root.get("capability_id")
+            new_oid = oid_map[old_oid]
+            rights = set(root.get("rights", []))
+            new_cap = cap_map.get(old_cap)
+            if new_cap is None:
+                handle = self.capability.handle_for_object(pid=process.pid, oid=new_oid, rights=rights, issued_by="image.commit")
+                new_cap = handle.capability_id
+            roots.append(ObjectHandle(oid=new_oid, rights=rights, capability_id=new_cap, expires_at=root.get("expires_at")))
+        for handle in existing_roots:
+            if all(item.oid != handle.oid for item in roots):
+                roots.append(handle)
+        if process.memory_view is None:
+            process.memory_view = self.memory.create_view(process.pid, roots, mode="mutable")
+        else:
+            process.memory_view.roots = roots
 
     def _apply_loaded_skill_tool_table(self, pid: str) -> None:
         process = self.store.get_process(pid)

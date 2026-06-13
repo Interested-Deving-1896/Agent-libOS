@@ -17,6 +17,7 @@ VALID_EFFECT_TYPES = {
     "process.exec",
     "skill.activate",
     "jit.register",
+    "image.commit",
     "image.register",
     "checkpoint.create",
     "checkpoint.fork",

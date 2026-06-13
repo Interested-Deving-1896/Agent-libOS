@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessSignal, ProcessStatus
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.utils.serde import to_jsonable
 
@@ -399,6 +400,21 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 self._schedule_server_shutdown()
         except GuiServerError as exc:
             self._write_json({"ok": False, "error": {"message": str(exc), **exc.details}}, status=exc.status)
+        except CapabilityDenied as exc:
+            self._write_json(
+                {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}},
+                status=HTTPStatus.FORBIDDEN,
+            )
+        except NotFound as exc:
+            self._write_json(
+                {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}},
+                status=HTTPStatus.NOT_FOUND,
+            )
+        except ValidationError as exc:
+            self._write_json(
+                {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}},
+                status=HTTPStatus.BAD_REQUEST,
+            )
         except Exception as exc:
             self._write_json(
                 {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}},
@@ -448,6 +464,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return self._dispatch_skills(method, route[1:], query)
         if len(route) >= 1 and route[0] == "capabilities":
             return self._dispatch_capabilities(method, route[1:], query)
+        if len(route) >= 1 and route[0] == "images":
+            return self._dispatch_images(method, route[1:])
         if len(route) >= 1 and route[0] == "jsonrpc":
             return self._dispatch_jsonrpc(method, route[1:], query)
         if len(route) >= 1 and route[0] == "modules":
@@ -636,6 +654,45 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             return service.runtime.capability.explain_decision(str(body["subject"]), str(body["resource"]), str(body["right"]))
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown capability endpoint")
+
+    def _dispatch_images(self, method: str, route: list[str]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service.runtime.image_registry.list_images()
+        if method == "GET" and len(route) == 1:
+            return service.runtime.image_registry.inspect(route[0])
+        if method == "POST" and route == ["commit"]:
+            body = self._read_body()
+            self._require_confirmed(
+                "image.commit",
+                body,
+                {
+                    "checkpoint_id": body.get("checkpoint_id"),
+                    "image_id": body.get("image_id"),
+                    "name": body.get("name"),
+                    "admin_mode": body.get("actor") is None,
+                },
+            )
+            result = service.runtime.image_registry.commit_from_checkpoint(
+                actor=str(body.get("actor") or "gui"),
+                checkpoint_id=str(body["checkpoint_id"]),
+                image_id=str(body["image_id"]),
+                name=str(body["name"]),
+                version=str(body.get("version") or "v0"),
+                replace=bool(body.get("replace", False)),
+                metadata=dict(body.get("metadata") or {}),
+                require_capability=body.get("actor") is not None,
+            )
+            service.publish_runtime_changes("image.commit")
+            return {
+                "image_id": result.image.image_id,
+                "name": result.image.name,
+                "version": result.image.version,
+                "replaced": result.replaced,
+                "boot": result.image.boot,
+                "required_capabilities_count": len(result.image.required_capabilities),
+            }
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown image endpoint")
 
     def _dispatch_jsonrpc(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
         service = self.server.service

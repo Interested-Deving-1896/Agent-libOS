@@ -8,9 +8,9 @@ It supports the paper theme:
 The runtime models an agent as a long-running, schedulable, interruptible,
 capability-controlled `AgentProcess`, not as a single chat request or workflow
 thread. Agents may activate Skills, register Deno/TypeScript JIT tools,
-register or execute new images, fork children, checkpoint/fork state, and use
-registered remote resources, but these self-evolution mechanisms do not grant
-resource authority by themselves.
+register, execute, or commit new images from checkpoints, fork children,
+checkpoint/fork state, and use registered remote resources, but these
+self-evolution mechanisms do not grant resource authority by themselves.
 
 The current contribution is the runtime authority boundary:
 
@@ -212,6 +212,13 @@ uv run agent-libos --db .agent_libos.sqlite exec image.yaml "Review README.md" -
 uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
 ```
 
+Commit a checkpoint into a new checkpoint-derived image:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
+uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --goal "Reuse the baked state"
+```
+
 Register and activate the SWE-Agent style Skill:
 
 ```bash
@@ -268,6 +275,9 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Checkpoint restore covers reconstructable process-subtree state only. It does
   not delete append-only audit/events/LLM calls or roll back filesystem, shell,
   image, network, or provider side effects.
+- Checkpoint-derived images capture internal reconstructable runtime state, not
+  external provider state. Their required capabilities are declarations and are
+  not granted automatically at spawn or exec.
 - Providers classify external effects as `irreversible`, `rollbackable`, or
   `no_rollback_required`; checkpoint restore reports those classes with
   `restore_external_policy="report_only"`.

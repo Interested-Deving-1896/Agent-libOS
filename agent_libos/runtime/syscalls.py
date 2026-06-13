@@ -69,6 +69,9 @@ BUILTIN_SYSCALL_NAMES = {
     "human.output",
     "human.request_permission",
     "human_output",
+    "image.commit_checkpoint",
+    "image.inspect",
+    "image.list",
     "image.load_yaml",
     "image.register",
     "jsonrpc.call",
@@ -453,6 +456,28 @@ class LibOSSyscallSession:
                 source=args.get("source"),
             )
             return self._image_result(result)
+        if name == "image.list":
+            self.runtime.capability.require(self.pid, self.runtime.image_registry.registry_resource(), CapabilityRight.READ)
+            return {"images": self.runtime.image_registry.list_images()}
+        if name == "image.inspect":
+            self.runtime.capability.require(
+                self.pid,
+                self.runtime.image_registry.resource_for(str(args["image_id"])),
+                CapabilityRight.READ,
+            )
+            return self.runtime.image_registry.inspect(str(args["image_id"]))
+        if name == "image.commit_checkpoint":
+            result = self.runtime.image_registry.commit_from_checkpoint(
+                actor=self.pid,
+                checkpoint_id=str(args["checkpoint_id"]),
+                image_id=str(args["image_id"]),
+                name=str(args["name"]),
+                version=str(args.get("version") or "v0"),
+                replace=bool(args.get("replace", False)),
+                metadata=dict(args.get("metadata") or {}),
+                require_capability=True,
+            )
+            return self._image_result(result)
         if name == "image.load_yaml":
             return self._image_load_yaml(args)
         raise NotFound(f"unknown libOS syscall: {name}")
@@ -786,6 +811,9 @@ class LibOSSyscallSession:
             "replaced": result.replaced,
             "source": result.source,
             "default_tools": list(image.default_tools),
+            "boot_kind": image.boot.get("kind", "fresh"),
+            "artifact_id": image.boot.get("artifact_id"),
+            "artifact_sha256": image.boot.get("artifact_sha256"),
             "required_capabilities_count": len(image.required_capabilities),
         }
 

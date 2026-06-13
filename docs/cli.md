@@ -43,6 +43,7 @@ message       send a normal human process message
 interrupt     send a human interrupt process message
 checkpoint    checkpoint subcommands
 skills        Skill subcommands
+images        AgentImage list, inspect, and checkpoint commit subcommands
 jsonrpc       JSON-RPC endpoint and call subcommands
 modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
@@ -167,7 +168,28 @@ image:
   safety_profile: review
   metadata:
     role: example
+  boot:
+    kind: fresh
 ```
+
+## Image Commands
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite images list
+uv run agent-libos --db .agent_libos.sqlite images inspect coding-agent:v0
+uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
+```
+
+`images commit` creates a checkpoint-derived image artifact from the checkpoint
+owner root process. It captures internal Object Memory, loaded Skills,
+process-local JIT tools, tool visibility, and cwd. It does not package
+filesystem/provider state. External capabilities from the checkpoint are stored
+as `required_capabilities` declarations and are not granted automatically when
+the committed image is spawned or execed.
+
+Passing `--actor-pid <pid>` makes the CLI enforce that process's checkpoint
+read and image write capabilities. Without it, the command runs as audited
+admin CLI.
 
 ## Checkpoint Commands
 

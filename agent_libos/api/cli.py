@@ -121,6 +121,8 @@ def main(argv: list[str] | None = None) -> None:
     _add_skills_parser_args(skills_parser)
     capabilities_parser = sub.add_parser("capabilities", help="List, inspect, grant, delegate, revoke, or explain capabilities")
     _add_capabilities_parser_args(capabilities_parser)
+    images_parser = sub.add_parser("images", help="List, inspect, or commit AgentImages")
+    _add_images_parser_args(images_parser)
     jsonrpc_parser = sub.add_parser("jsonrpc", help="Register, inspect, or call JSON-RPC over HTTP endpoints")
     _add_jsonrpc_parser_args(jsonrpc_parser)
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
@@ -174,6 +176,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_run_skills_command(runtime, args))
         elif args.command == "capabilities":
             _print_json(_run_capabilities_command(runtime, args))
+        elif args.command == "images":
+            _print_json(_run_images_command(runtime, args))
         elif args.command == "jsonrpc":
             _print_json(_run_jsonrpc_command(runtime, args))
         elif args.command == "modules":
@@ -689,6 +693,59 @@ def _run_capabilities_command(runtime: Runtime, args: argparse.Namespace) -> dic
             _parse_json_mapping(args.context_json, "--context-json"),
         )
     raise SystemExit(f"unknown capabilities command: {command}")
+
+
+def _add_images_parser_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--actor-pid",
+        help="If set, execute as this process and enforce image capabilities. Omit for admin CLI mode.",
+    )
+    sub = parser.add_subparsers(dest="images_command", required=True)
+    sub.add_parser("list", help="List registered AgentImages")
+    inspect = sub.add_parser("inspect", help="Inspect one AgentImage")
+    inspect.add_argument("image_id")
+    commit = sub.add_parser("commit", help="Commit a checkpoint into a checkpoint-derived AgentImage")
+    commit.add_argument("checkpoint_id")
+    commit.add_argument("image_id")
+    commit.add_argument("--name", required=True)
+    commit.add_argument("--version", default="v0")
+    commit.add_argument("--replace", action="store_true")
+    commit.add_argument("--metadata-json", default="{}", help="Optional image metadata JSON object.")
+
+
+def _run_images_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+    actor = args.actor_pid or "cli"
+    require_capability = args.actor_pid is not None
+    command = args.images_command
+    if command == "list":
+        if require_capability:
+            runtime.capability.require(actor, runtime.image_registry.registry_resource(), CapabilityRight.READ)
+        return runtime.image_registry.list_images()
+    if command == "inspect":
+        if require_capability:
+            runtime.capability.require(actor, runtime.image_registry.resource_for(args.image_id), CapabilityRight.READ)
+        return runtime.image_registry.inspect(args.image_id)
+    if command == "commit":
+        result = runtime.image_registry.commit_from_checkpoint(
+            actor=actor,
+            checkpoint_id=args.checkpoint_id,
+            image_id=args.image_id,
+            name=args.name,
+            version=args.version,
+            replace=args.replace,
+            metadata=_parse_json_mapping(args.metadata_json, "--metadata-json"),
+            require_capability=require_capability,
+        )
+        image = result.image
+        return {
+            "image_id": image.image_id,
+            "name": image.name,
+            "version": image.version,
+            "replaced": result.replaced,
+            "boot": image.boot,
+            "required_capabilities_count": len(image.required_capabilities),
+        }
+    raise SystemExit(f"unknown images command: {command}")
 
 
 def _add_jsonrpc_parser_args(parser: argparse.ArgumentParser) -> None:

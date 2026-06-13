@@ -8,6 +8,7 @@ from typing import Any, Iterable
 from agent_libos.utils.ids import utc_now
 from agent_libos.models import (
     AgentObject,
+    AgentImage,
     AgentProcess,
     AuditRecord,
     Capability,
@@ -312,6 +313,25 @@ class SQLiteStore:
                   registered_by TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS images (
+                  image_id TEXT PRIMARY KEY,
+                  manifest_json TEXT NOT NULL,
+                  registered_by TEXT NOT NULL,
+                  source TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS image_artifacts (
+                  artifact_id TEXT PRIMARY KEY,
+                  kind TEXT NOT NULL,
+                  artifact_json TEXT NOT NULL,
+                  sha256 TEXT NOT NULL,
+                  created_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS tools (
@@ -1209,6 +1229,103 @@ class SQLiteStore:
     def delete_jsonrpc_endpoint(self, endpoint_id: str) -> None:
         self._execute("DELETE FROM jsonrpc_endpoints WHERE endpoint_id = ?", (endpoint_id,))
 
+    def upsert_image(
+        self,
+        image: AgentImage,
+        *,
+        registered_by: str,
+        source: str | None,
+        created_at: str,
+    ) -> None:
+        self._execute(
+            """
+            INSERT INTO images (
+                image_id, manifest_json, registered_by, source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                manifest_json = excluded.manifest_json,
+                registered_by = excluded.registered_by,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            (
+                image.image_id,
+                dumps(image),
+                registered_by,
+                source,
+                created_at,
+                created_at,
+            ),
+        )
+
+    def get_image(self, image_id: str) -> tuple[AgentImage, dict[str, Any]] | None:
+        rows = self._query("SELECT * FROM images WHERE image_id = ?", (image_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        return self._dict_to_agent_image(loads(row["manifest_json"], {})), self._image_row_metadata(row)
+
+    def list_images(self) -> list[tuple[AgentImage, dict[str, Any]]]:
+        return [
+            (self._dict_to_agent_image(loads(row["manifest_json"], {})), self._image_row_metadata(row))
+            for row in self._query("SELECT * FROM images ORDER BY image_id")
+        ]
+
+    def insert_image_artifact(
+        self,
+        *,
+        artifact_id: str,
+        kind: str,
+        artifact: dict[str, Any],
+        sha256: str,
+        created_by: str,
+        created_at: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._execute(
+            """
+            INSERT INTO image_artifacts (
+                artifact_id, kind, artifact_json, sha256, created_by, created_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id,
+                kind,
+                dumps(artifact),
+                sha256,
+                created_by,
+                created_at,
+                dumps(metadata or {}),
+            ),
+        )
+
+    def get_image_artifact(self, artifact_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        rows = self._query("SELECT * FROM image_artifacts WHERE artifact_id = ?", (artifact_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        return loads(row["artifact_json"], {}), {
+            "artifact_id": row["artifact_id"],
+            "kind": row["kind"],
+            "sha256": row["sha256"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "metadata": loads(row["metadata_json"], {}),
+        }
+
+    def list_image_artifacts(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "artifact_id": row["artifact_id"],
+                "kind": row["kind"],
+                "sha256": row["sha256"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
+                "metadata": loads(row["metadata_json"], {}),
+            }
+            for row in self._query("SELECT * FROM image_artifacts ORDER BY created_at, artifact_id")
+        ]
+
     def upsert_runtime_module(
         self,
         *,
@@ -1620,6 +1737,19 @@ class SQLiteStore:
         data["registered"] = loads(data.pop("registered_json"), {})
         data["metadata"] = loads(data.pop("metadata_json"), {})
         return data
+
+    def _image_row_metadata(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "registered_by": row["registered_by"],
+            "source": row["source"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _dict_to_agent_image(self, data: dict[str, Any]) -> AgentImage:
+        item = dict(data)
+        item.setdefault("boot", {"kind": "fresh"})
+        return AgentImage(**item)
 
     def _row_to_object(self, row: sqlite3.Row) -> AgentObject:
         metadata = ObjectMetadata(**loads(row["metadata_json"], {}))

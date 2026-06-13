@@ -28,8 +28,8 @@ The central claim is:
 > primitive-mediated effects, and append-only audit.
 
 The runtime should allow adaptation without implicit privilege escalation. A
-Skill, JIT tool, child process, checkpoint fork, newly registered/executed
-image, JSON-RPC endpoint, or future provider may expand what the model can ask
+Skill, JIT tool, child process, checkpoint fork, newly registered/executed or
+checkpoint-committed image, JSON-RPC endpoint, or future provider may expand what the model can ask
 to do, but it must not expand what the process is authorized to affect unless a
 capability, policy decision, or human approval explicitly permits it.
 
@@ -74,9 +74,10 @@ prototype:
   interrupts are runtime objects and queues.
 - Deno/TypeScript JIT: agent-authored tools run with no ambient host
   permissions and can access libOS only through `libos.syscall`.
-- AgentImage registry and exec: images can change prompt, default tool table,
-  default Skills, and lifecycle behavior, while `exec` never grants target-image
-  required capabilities automatically.
+- AgentImage registry, exec, and checkpoint commit: images can change prompt,
+  default tool table, default Skills, baked internal Object Memory/JIT state,
+  and lifecycle behavior, while `exec` and checkpoint-derived image boot never
+  grant target-image required capabilities automatically.
 - Standard Agent Skills: `SKILL.md` packages can add prompt instructions,
   tool visibility, bundled resources, and JIT candidates without granting
   filesystem/shell/object/remote authority.
@@ -113,7 +114,7 @@ The paper should present four contributions.
 3. Benchmark:
    Runtime-safety workloads that exercise not just ordinary tool calls, but
    self-evolution paths: Skill activation, JIT registration, image
-   registration/exec, child process delegation, checkpoint fork, remote endpoint
+   registration/exec/checkpoint commit, child process delegation, checkpoint fork, remote endpoint
    use, shell policy, Object Memory access, and human approval.
 
 4. Evaluation:
@@ -174,11 +175,12 @@ Completed M1 hardening:
 
 - Added self-evolution tasks for Skill activation, Skill-loaded JIT syscall
   denial, image registration/exec without target-image capability grants, child
-  process delegation, checkpoint fork after revocation, and JSON-RPC visibility
-  without method authority.
+  process delegation, checkpoint fork after revocation, checkpoint-to-image
+  commit, and JSON-RPC visibility without method authority.
 - `collect_metrics.py` reports self-evolution-specific counters:
-  `skill_activations`, `jit_registrations`, `image_registrations`,
-  `image_execs`, `child_processes`, `checkpoint_forks`, and `remote_calls`.
+  `skill_activations`, `jit_registrations`, `image_commits`,
+  `image_registrations`, `image_execs`, `child_processes`,
+  `checkpoint_forks`, and `remote_calls`.
 - The default benchmark path remains deterministic and no-token.
 
 Exit criteria:

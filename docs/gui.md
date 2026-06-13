@@ -113,6 +113,7 @@ The GUI requires explicit confirmation for high-risk operations before sending
 the final request to the server:
 
 - process `exec` and `exit`,
+- checkpoint-to-image commit,
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
 - JSON-RPC method calls,
@@ -140,6 +141,6 @@ Important endpoints:
 - `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`
 - `POST /api/human-requests/{request_id}/respond`
 - `GET/POST /api/checkpoints`, `/api/skills`, `/api/capabilities`,
-  `/api/jsonrpc`, and `/api/modules`
+  `/api/images`, `/api/jsonrpc`, and `/api/modules`
 
 All endpoints require `Authorization: Bearer <session-token>`.

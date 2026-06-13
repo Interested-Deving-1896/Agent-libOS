@@ -421,6 +421,7 @@ class CheckpointManager:
             "rows": rows,
             "object_payloads": object_payloads,
             "images": self._image_snapshot(process_rows),
+            "image_artifacts": self._image_artifact_snapshot(process_rows),
             "jit_sources": self._jit_source_snapshot(process_rows),
             "modules": self._module_snapshot(),
         }
@@ -794,12 +795,50 @@ class CheckpointManager:
             if image_id in runtime.images
         }
 
+    def _image_artifact_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        runtime = self.runtime
+        if runtime is None:
+            return {}
+        artifacts: dict[str, Any] = {}
+        for row in process_rows:
+            image = runtime.images.get(row["image_id"])
+            if image is None or image.boot.get("kind") != "checkpoint_commit":
+                continue
+            artifact_id = str(image.boot.get("artifact_id") or "")
+            if not artifact_id:
+                continue
+            found = runtime.store.get_image_artifact(artifact_id)
+            if found is None:
+                continue
+            artifact, metadata = found
+            artifacts[artifact_id] = {"artifact": artifact, **metadata}
+        return artifacts
+
     def _restore_images(self, snapshot: dict[str, Any]) -> None:
         runtime = self.runtime
         if runtime is None:
             return
         for image_id, data in snapshot.get("images", {}).items():
-            runtime.images[image_id] = AgentImage(**data)
+            image = AgentImage(**data)
+            runtime.images[image_id] = image
+            runtime.store.upsert_image(
+                image,
+                registered_by="checkpoint.restore",
+                source=f"checkpoint:{snapshot.get('checkpoint_id')}",
+                created_at=utc_now(),
+            )
+        for artifact_id, data in snapshot.get("image_artifacts", {}).items():
+            if runtime.store.get_image_artifact(artifact_id) is not None:
+                continue
+            runtime.store.insert_image_artifact(
+                artifact_id=artifact_id,
+                kind=str(data.get("kind", "checkpoint_commit")),
+                artifact=data.get("artifact", {}),
+                sha256=str(data.get("sha256", "")),
+                created_by="checkpoint.restore",
+                created_at=utc_now(),
+                metadata=data.get("metadata", {}),
+            )
 
     def _object_payload_snapshot(self, object_oids: list[str]) -> dict[str, Any]:
         payloads: dict[str, Any] = {}

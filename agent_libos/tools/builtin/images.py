@@ -32,6 +32,26 @@ class LoadImageFromYamlOutput(BaseModel):
     required_capabilities_count: int
 
 
+class CommitCheckpointToImageArgs(BaseModel):
+    checkpoint_id: str = Field(description="Checkpoint id to commit into an immutable image artifact.")
+    image_id: str = Field(description="New AgentImage id.")
+    name: str = Field(description="Human-readable image name.")
+    version: str = Field(default="v0", description="Image version.")
+    replace: bool = Field(default=False, description="Whether an existing image id may be replaced.")
+    metadata: dict[str, object] = Field(default_factory=dict, description="Optional image metadata.")
+
+
+class CommitCheckpointToImageOutput(BaseModel):
+    image_id: str
+    name: str
+    version: str
+    replaced: bool
+    boot_kind: str
+    artifact_id: str
+    artifact_sha256: str
+    required_capabilities_count: int
+
+
 class LoadImageFromYamlTool(SyncAgentTool[LoadImageFromYamlArgs]):
     name = "load_image_from_yaml"
     description = (
@@ -95,5 +115,51 @@ class LoadImageFromYamlTool(SyncAgentTool[LoadImageFromYamlArgs]):
             source_path=file_result.path,
             replaced=result.replaced,
             default_tools=list(image.default_tools),
+            required_capabilities_count=len(image.required_capabilities),
+        )
+
+
+class CommitCheckpointToImageTool(SyncAgentTool[CommitCheckpointToImageArgs]):
+    name = "commit_checkpoint_to_image"
+    description = (
+        "Commit a process checkpoint into a new checkpoint-derived AgentImage. "
+        "The image captures reconstructable internal runtime state only and does not grant external capabilities."
+    )
+    args_schema = CommitCheckpointToImageArgs
+    output_schema = CommitCheckpointToImageOutput
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        permissions={"checkpoint.read", "image.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
+    tags = ["image", "checkpoint", "commit", "self_evolution", "high_risk"]
+
+    def run(self, args: CommitCheckpointToImageArgs, ctx: ToolContext) -> CommitCheckpointToImageOutput:
+        runtime = ctx.runtime
+        if runtime is None:
+            raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        try:
+            result = runtime.image_registry.commit_from_checkpoint(
+                actor=ctx.pid,
+                checkpoint_id=args.checkpoint_id,
+                image_id=args.image_id,
+                name=args.name,
+                version=args.version,
+                replace=args.replace,
+                metadata=dict(args.metadata),
+                require_capability=True,
+            )
+        except LibOSValidationError as exc:
+            raise ToolExecutionError(str(exc), code=ToolErrorCode.VALIDATION_ERROR) from exc
+        image = result.image
+        return CommitCheckpointToImageOutput(
+            image_id=image.image_id,
+            name=image.name,
+            version=image.version,
+            replaced=result.replaced,
+            boot_kind=image.boot.get("kind", "fresh"),
+            artifact_id=str(image.boot.get("artifact_id", "")),
+            artifact_sha256=str(image.boot.get("artifact_sha256", "")),
             required_capabilities_count=len(image.required_capabilities),
         )

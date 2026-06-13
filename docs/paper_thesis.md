@@ -10,7 +10,7 @@ Self-evolving LLM agents need a runtime substrate that lets their model-visible
 action surface change without letting resource authority grow implicitly.
 
 Modern agent systems increasingly persist memory, fork work, call shells,
-activate Skills, register self-authored tools, create or execute new images,
+activate Skills, register self-authored tools, create, execute, or commit new images,
 use remote resources, ask humans, and resume across long executions. Those
 behaviors are useful, but they make prompt-only control, wrapper-level tool
 lists, and host isolation insufficient as the primary authority boundary.
@@ -35,7 +35,7 @@ substrate for capability-controlled self-evolution.
 1. Runtime model.
    Agent libOS models an agent as an `AgentProcess` with process-local Object
    Memory namespaces, process-local working directories, message queues, child
-   lifecycle, AgentImage registration and exec, standard Skill activation,
+   lifecycle, AgentImage registration, exec, and checkpoint commit, standard Skill activation,
    process-local Deno/TypeScript JIT tools, checkpoints, human I/O, and
    capability-controlled primitives.
 
@@ -43,7 +43,7 @@ substrate for capability-controlled self-evolution.
    The current prototype implements the model in Python with Capability v2,
    Resource Provider Substrate, SQLite persistence, audit/events, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
-   image registry/exec primitives, standard `SKILL.md` packages, JSON-RPC over
+   image registry/exec/commit primitives, standard `SKILL.md` packages, JSON-RPC over
    HTTP client endpoints, and Deno/TypeScript JIT tools that can reach libOS
    only through syscall RPC.
 
@@ -52,7 +52,7 @@ substrate for capability-controlled self-evolution.
    with adversarial tasks, wrapper baselines, ablations, declared
    allowed/forbidden side effects, a side-effect oracle, and stable metrics
    output. The suite now includes a first self-evolution subset covering Skill
-   activation, JIT registration, image registration/exec, child-process
+   activation, JIT registration, image registration/exec/checkpoint commit, child-process
    delegation, checkpoint fork, and JSON-RPC remote-resource visibility.
 
 4. Evaluation.

@@ -4,8 +4,8 @@ The M1 benchmark harness is a deterministic runtime-safety workload for
 Agent libOS. It is designed to compare agent runtime boundaries against simpler
 wrappers while avoiding default token spend. The suite now includes a
 self-evolution subset for the paper theme: capability-controlled changes through
-Skills, Deno/TypeScript JIT tools, image registration/exec, child processes,
-checkpoints, Object Memory, and registered remote resources.
+Skills, Deno/TypeScript JIT tools, image registration/exec/checkpoint commit,
+child processes, checkpoints, Object Memory, and registered remote resources.
 
 The task schema is defined in
 [benchmarks/runtime_safety/schema.md](../benchmarks/runtime_safety/schema.md).
@@ -21,8 +21,9 @@ The checked-in suite contains 20+ YAML tasks under
 - shell bypass and exfiltration attempts,
 - object authority leakage,
 - process authority leakage,
-- self-evolution attempts involving Skills, JIT tools, image registration/exec,
-  child processes, checkpoint fork, and JSON-RPC visibility.
+- self-evolution attempts involving Skills, JIT tools, image
+  registration/exec/checkpoint commit, child processes, checkpoint fork, and
+  JSON-RPC visibility.
 
 Each task declares:
 
@@ -165,6 +166,7 @@ Stable metric columns are:
 - `audit_completeness`
 - `skill_activations`
 - `jit_registrations`
+- `image_commits`
 - `image_registrations`
 - `image_execs`
 - `child_processes`

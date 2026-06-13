@@ -262,6 +262,17 @@ class ImageDefaults:
 
 
 @dataclass(frozen=True)
+class ImageCommitDefaults:
+    artifact_version: int = 1
+    artifact_hard_limit_bytes: int = 16_777_216
+    payload_capture_limit_bytes: int = 1_048_576
+    max_required_capabilities: int = 128
+    max_committed_tools: int = 256
+    max_committed_jit_sources: int = 64
+    metadata_preview_chars: int = 512
+
+
+@dataclass(frozen=True)
 class ObjectMemoryDefaults:
     object_schema_version: str = "1"
     materialize_budget_tokens: int = 8_000
@@ -389,6 +400,7 @@ class AgentLibOSConfig:
     shell: ShellDefaults = field(default_factory=ShellDefaults)
     jsonrpc: JsonRpcDefaults = field(default_factory=JsonRpcDefaults)
     image: ImageDefaults = field(default_factory=ImageDefaults)
+    image_commit: ImageCommitDefaults = field(default_factory=ImageCommitDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     checkpoint: CheckpointDefaults = field(default_factory=CheckpointDefaults)

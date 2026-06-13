@@ -20,6 +20,7 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - JSON-RPC endpoint definitions referenced by subtree capabilities,
 - mailbox delivery state,
 - image definitions needed by the subtree,
+- checkpoint-derived image artifacts needed by those image definitions,
 - loaded startup Runtime Module ids and source hashes.
 
 Transient `running` state is normalized to `runnable` at snapshot time.
@@ -132,6 +133,35 @@ in the restore report.
 
 JSON-RPC endpoint registry rows captured by the snapshot are restored by
 upsert. Restore and fork do not delete unrelated endpoint registry state.
+
+## Commit To Image
+
+A checkpoint can be committed into a new `AgentImage`, similar in spirit to a
+Docker image commit but scoped to Agent libOS reconstructable runtime state.
+The v1 commit captures only the checkpoint owner root process:
+
+- Object Memory metadata and payloads reachable from that process,
+- process-local namespace state,
+- loaded Skill records and package rows,
+- visible static tools and process-local JIT tool sources,
+- process cwd and image context settings,
+- required startup module summaries.
+
+It does not copy the real filesystem, shell state, remote JSON-RPC state, human
+UI output, network effects, or any other provider-side state. Provider effects
+remain append-only `external_effects` records.
+
+External capabilities in the checkpoint are converted into image
+`required_capabilities` declarations. They are not restored as live authority
+when the committed image is spawned or execed. Internal Object Memory
+capabilities needed to read the baked objects are remapped into the new process.
+
+CLI example:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
+uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --goal "use baked memory"
+```
 
 ## Fork From Checkpoint
 

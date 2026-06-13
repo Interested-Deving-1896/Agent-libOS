@@ -104,6 +104,39 @@ class GuiServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(allowed["process"]["image_id"], "base-agent:v0")
 
+    def test_high_risk_image_commit_requires_confirmation(self) -> None:
+        _status, spawned = self.request("POST", "/api/processes", {"goal": "commit source", "auto_run": False})
+        pid = spawned["pid"]
+        status, created = self.request("POST", "/api/checkpoints/create", {"pid": pid, "reason": "commit"})
+        self.assertEqual(status, 200)
+
+        status, denied = self.request(
+            "POST",
+            "/api/images/commit",
+            {
+                "checkpoint_id": created["checkpoint_id"],
+                "image_id": "gui-committed:v0",
+                "name": "gui-committed",
+            },
+        )
+
+        self.assertEqual(status, 409)
+        self.assertTrue(denied["error"]["confirmation_required"])
+
+        status, forbidden = self.request(
+            "POST",
+            "/api/images/commit",
+            {
+                "checkpoint_id": created["checkpoint_id"],
+                "image_id": "gui-committed:v0",
+                "name": "gui-committed",
+                "actor": pid,
+                "confirmed": True,
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("lacks write", forbidden["error"]["message"])
+
     def test_scheduler_requests_are_serialized(self) -> None:
         first_status, first = self.request("POST", "/api/processes", {"goal": "goal", "auto_run": False})
         self.assertEqual(first_status, 200)

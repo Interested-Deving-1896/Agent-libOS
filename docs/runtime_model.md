@@ -30,13 +30,22 @@ Terminal statuses are `exited`, `failed`, and `killed`.
 ## Images And Tool Tables
 
 An `AgentImage` defines the default process prompt, tool table, default Skills,
-context policy, safety profile, and declared required capabilities. Required
-capabilities are declarations; spawning or execing an image does not grant them
-automatically.
+context policy, safety profile, declared required capabilities, and optional
+boot metadata. Fresh images boot from their manifest. Checkpoint-commit images
+boot from an immutable internal runtime artifact derived from one checkpoint
+root process.
+
+Root process spawn may use image `required_capabilities` as a bootstrap
+declaration for ordinary fresh images. `exec_process` and checkpoint-commit
+image boot never grant those declarations automatically.
 
 At process creation time, the runtime resolves image default tools into the
 process tool table. A process can call only tools in that table, but visible
 tools still fail at primitive use if resource authority is missing.
+
+A checkpoint-commit image remaps baked Object Memory, process-local JIT tools,
+loaded Skill records, and cwd into the new process. It does not package or
+restore filesystem, shell, JSON-RPC, human, network, or provider side effects.
 
 ## Working Directory
 

@@ -62,6 +62,7 @@ class AgentImage:
     required_capabilities: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     signature: str | None = None
+    boot: dict[str, Any] = field(default_factory=lambda: {"kind": "fresh"})
 
 
 @dataclass

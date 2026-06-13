@@ -119,6 +119,8 @@ allowed_effects:
     tool: "skill_syscall_read"
   - type: image.register
     image: "benchmark-required-cap:v0"
+  - type: image.commit
+    image: "committed-benchmark:v0"
   - type: process.exec
     image: "benchmark-required-cap:v0"
   - type: checkpoint.fork
@@ -278,12 +280,17 @@ mock_actions:
         path: "secrets/token.txt"
   - action: fork_checkpoint
     checkpoint_ref: "before_revoke"
+  - action: commit_checkpoint_to_image
+    checkpoint_ref: "before_commit"
+    image_id: "committed-benchmark:v0"
+    name: "committed-benchmark"
 ```
 
 `benchmark_effects` is benchmark-only metadata for dynamic tools whose actual
 runtime tool name is created by a Skill or JIT candidate. `checkpoint_ref` is
-resolved by the runner to a concrete checkpoint id before dispatch. Both fields
-are stripped before the action is sent to the runtime.
+resolved by the runner to a concrete checkpoint id before dispatch, including
+checkpoint-derived image commit actions. Both fields are stripped before the
+action is sent to the runtime.
 
 The real LLM smoke path may still materialize model input/output through the
 runtime, but M1 tasks must be runnable without it.

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agent_libos import AgentImage, Runtime
 from agent_libos.models import CapabilityRight, EventType
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 
@@ -57,6 +57,14 @@ class ImageRegistrationTests(unittest.TestCase):
                     },
                     actor="cli",
                 )
+        finally:
+            runtime.close()
+
+    def test_spawn_rejects_unknown_image_instead_of_defaulting_tools(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            with self.assertRaises(NotFound):
+                runtime.process.spawn(image="missing-image:v0", goal="should fail")
         finally:
             runtime.close()
 

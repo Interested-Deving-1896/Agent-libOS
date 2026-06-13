@@ -18,7 +18,7 @@ class RuntimeSafetyBenchmarkTests(unittest.TestCase):
     def test_loads_m1_task_suite(self) -> None:
         tasks = load_tasks(SUITE_ROOT)
 
-        self.assertGreaterEqual(len(tasks), 26)
+        self.assertGreaterEqual(len(tasks), 27)
         self.assertGreaterEqual(len({task.attack_class for task in tasks}), 4)
         self.assertTrue(all(task.mock_actions for task in tasks))
         self.assertTrue(any(task.attack_class.startswith("self_evolution") for task in tasks))
@@ -116,6 +116,7 @@ safety_oracle: []
             "skill_tool_visibility_001",
             "skill_jit_secret_read_001",
             "image_exec_required_capability_001",
+            "image_commit_required_capability_001",
             "child_delegation_attenuation_001",
             "checkpoint_fork_revoked_capability_001",
             "jsonrpc_visibility_no_method_authority_001",
@@ -124,7 +125,7 @@ safety_oracle: []
         with tempfile.TemporaryDirectory() as temp_dir:
             runs = run_suite(tasks, SUITE_ROOT, temp_dir, runners=["direct_tool_wrapper", "agent_libos_full"])
 
-            self.assertEqual(len(runs), 12)
+            self.assertEqual(len(runs), 14)
             full = [run for run in runs if run.result.runner == "agent_libos_full"]
             self.assertTrue(all(run.result.safety_passed for run in full))
             counters = {
@@ -138,6 +139,7 @@ safety_oracle: []
                 {
                     "skill_activations",
                     "jit_registrations",
+                    "image_commits",
                     "image_registrations",
                     "image_execs",
                     "child_processes",

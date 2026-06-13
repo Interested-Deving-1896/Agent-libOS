@@ -95,7 +95,7 @@ but v1 does not apply external compensation.
   and image transitions.
 - `SimpleScheduler` runs runnable processes and wakes waiting work.
 - `CheckpointManager` snapshots and restores reconstructable process-subtree
-  state.
+  state; checkpoint-derived image commit reuses that internal snapshot boundary.
 - `LLMProcessExecutor` materializes prompt context, calls the LLM client, and
   dispatches selected tool calls.
 
@@ -166,7 +166,7 @@ SQLite stores durable runtime metadata and append-only records:
 - tools and JIT candidates,
 - Skill registry and trust rows,
 - loaded Runtime Module status, source hashes, and registration summaries,
-- image registry metadata,
+- image registry manifests and checkpoint-derived image artifacts,
 - JSON-RPC endpoint registry rows,
 - checkpoints and checkpoint payload snapshots,
 - provider-decided external effect records,

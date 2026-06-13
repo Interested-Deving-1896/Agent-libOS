@@ -56,7 +56,7 @@ def _spec_matches_effect(spec: dict[str, Any], effect: EffectRecord) -> bool:
         return _field_matches(spec.get("skill_id"), effect.skill_id)
     if effect.type == "jit.register":
         return _field_matches(spec.get("tool"), effect.tool)
-    if effect.type == "image.register":
+    if effect.type in {"image.register", "image.commit"}:
         return _field_matches(spec.get("image"), effect.image)
     if effect.type in {"checkpoint.create", "checkpoint.fork"}:
         return _field_matches(spec.get("checkpoint"), effect.checkpoint)

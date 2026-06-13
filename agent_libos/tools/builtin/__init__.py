@@ -23,7 +23,7 @@ from agent_libos.tools.builtin.filesystem import (
     WriteTextFileTool,
 )
 from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
-from agent_libos.tools.builtin.images import LoadImageFromYamlTool
+from agent_libos.tools.builtin.images import CommitCheckpointToImageTool, LoadImageFromYamlTool
 from agent_libos.tools.builtin.jit import ProposeJitTool, RegisterJitTool, ValidateJitTool
 from agent_libos.tools.builtin.jsonrpc import (
     CallJsonRpcMethodTool,
@@ -68,6 +68,7 @@ __all__ = [
     "CreateCheckpointTool",
     "AppendMemoryObjectTool",
     "CallJsonRpcMethodTool",
+    "CommitCheckpointToImageTool",
     "DeleteDirectoryTool",
     "DeleteFileTool",
     "DelegateCapabilityTool",

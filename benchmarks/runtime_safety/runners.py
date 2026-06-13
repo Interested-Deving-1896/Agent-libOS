@@ -347,10 +347,11 @@ def _setup_runtime_memory(
     for item in memory_objects:
         if not isinstance(item, dict):
             continue
-        namespace = str(item.get("namespace") or runtime.memory.process_namespace(owner))
-        _ensure_namespace_chain(runtime, owner, namespace)
+        selected_owner = target_pid if item.get("owner") == "target" else owner
+        namespace = str(item.get("namespace") or runtime.memory.process_namespace(selected_owner))
+        _ensure_namespace_chain(runtime, selected_owner, namespace)
         handle = runtime.memory.create_object(
-            pid=owner,
+            pid=selected_owner,
             object_type=str(item.get("type") or "observation"),
             namespace=namespace,
             name=str(item.get("name") or "object"),
@@ -372,7 +373,8 @@ def _setup_runtime_memory(
                 rights=[ObjectRight.READ.value, ObjectRight.MATERIALIZE.value],
                 issued_by=f"benchmark:{runner}",
             )
-    runtime.process.exit(owner, message="benchmark setup complete")
+    if runtime.process.get(owner).status not in _TERMINAL_STATUSES:
+        runtime.process.exit(owner, message="benchmark setup complete")
     return setup_objects
 
 
@@ -582,6 +584,7 @@ def _perform_wrapper_action(
         "create_checkpoint",
         "fork_checkpoint",
         "load_image_from_yaml",
+        "commit_checkpoint_to_image",
         "register_jit_tool",
         "spawn_child_process",
         "fork_child_process",
@@ -648,6 +651,10 @@ def _apply_source_effect_labels(effect: EffectRecord, source_action: dict[str, A
         effect.checkpoint = str(source_action["checkpoint"])
     if effect.type == "image.register" and source_action.get("image_id") is not None:
         effect.image = str(source_action["image_id"])
+    if effect.type == "image.commit" and source_action.get("image_id") is not None:
+        effect.image = str(source_action["image_id"])
+    if effect.type == "image.commit" and source_action.get("checkpoint_ref") is not None:
+        effect.checkpoint = str(source_action["checkpoint_ref"])
 
 
 def _effects_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]) -> list[EffectRecord]:
@@ -706,6 +713,15 @@ def _effect_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]
             type="image.register",
             performed=True,
             image=str(action.get("image_id") or action.get("image") or action.get("path") or ""),
+        )
+    if name == "commit_checkpoint_to_image":
+        return EffectRecord(
+            task_id=task.id,
+            runner=runner,
+            type="image.commit",
+            performed=True,
+            image=str(action.get("image_id") or ""),
+            checkpoint=str(action.get("checkpoint_ref") or action.get("checkpoint_id") or ""),
         )
     if name == "create_checkpoint":
         return EffectRecord(
@@ -812,6 +828,7 @@ def _self_evolution_counts(effects: list[EffectRecord]) -> dict[str, int]:
     return {
         "skill_activations": sum(1 for effect in effects if effect.type == "skill.activate"),
         "jit_registrations": sum(1 for effect in effects if effect.type == "jit.register"),
+        "image_commits": sum(1 for effect in effects if effect.type == "image.commit"),
         "image_registrations": sum(1 for effect in effects if effect.type == "image.register"),
         "image_execs": sum(1 for effect in effects if effect.type == "process.exec"),
         "child_processes": sum(1 for effect in effects if effect.type in {"process.spawn", "process.fork"}),
