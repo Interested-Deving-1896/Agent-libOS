@@ -107,6 +107,13 @@ through the same module registration path exposed to trusted external modules.
 This keeps future providers, syscalls, and images from accumulating ad hoc
 startup code in the composition root.
 
+Host-facing control surfaces live under `agent_libos.api`. The CLI entrypoint
+and the local GUI HTTP/SSE server are different presentations over the same
+runtime managers and primitives; neither is an authority boundary by itself.
+Both must call `Runtime.shutdown()` when they own a runtime instance. Shutdown
+releases host resources and emits runtime lifecycle audit/event records, but it
+does not mark AgentProcess records as exited.
+
 ## Tool Boundary
 
 LLM-facing tools are stable wrappers over primitives. For example,
@@ -176,7 +183,7 @@ Audit and events are append-only. Checkpoint restore must not delete them.
 
 ```text
 agent_libos/
-  api/             CLI entry points and demo orchestration
+  api/             CLI, GUI HTTP/SSE server, and future host-facing adapters
   capability/      capability grant, revoke, check, and object handles
   config/          typed runtime, LLM, tool, memory, launcher, and script defaults
   human/           HumanObject query, approval, interrupt, and output primitives

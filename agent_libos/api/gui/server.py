@@ -1,0 +1,839 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import secrets
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessSignal, ProcessStatus
+from agent_libos.runtime.runtime import Runtime
+from agent_libos.utils.serde import to_jsonable
+
+_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_GUI_DEFAULTS = DEFAULT_CONFIG.gui
+_TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+
+
+class GuiServerError(Exception):
+    def __init__(self, status: int, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.details = details or {}
+
+
+@dataclass
+class GuiEvent:
+    seq: int
+    event: str
+    data: dict[str, Any]
+
+
+class GuiEventBroadcaster:
+    """In-process event buffer used by the GUI SSE endpoint."""
+
+    def __init__(self, max_events: int = _GUI_DEFAULTS.event_buffer_limit) -> None:
+        self._condition = threading.Condition()
+        self._events: list[GuiEvent] = []
+        self._next_seq = 1
+        self._max_events = max_events
+        self._closed = False
+
+    def publish(self, event: str, data: dict[str, Any] | None = None) -> GuiEvent:
+        with self._condition:
+            item = GuiEvent(seq=self._next_seq, event=event, data=data or {})
+            self._next_seq += 1
+            self._events.append(item)
+            if len(self._events) > self._max_events:
+                self._events = self._events[-self._max_events :]
+            self._condition.notify_all()
+            return item
+
+    def replay_after(self, cursor: int) -> list[GuiEvent]:
+        with self._condition:
+            return [event for event in self._events if event.seq > cursor]
+
+    def wait_after(self, cursor: int, timeout_s: float = 15.0) -> list[GuiEvent]:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while not self._closed:
+                ready = [event for event in self._events if event.seq > cursor]
+                if ready:
+                    return ready
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                self._condition.wait(remaining)
+            return []
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+
+@dataclass
+class SchedulerController:
+    service: "GuiRuntimeService"
+    auto_run: bool = True
+    default_max_quanta: int = _RUNTIME_DEFAULTS.run_until_idle_max_quanta
+    running: bool = False
+    paused: bool = False
+    task_id: str | None = None
+    reason: str | None = None
+    last_result: list[Any] = field(default_factory=list)
+    last_error: str | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+    _thread: threading.Thread | None = None
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "auto_run": self.auto_run,
+                "running": self.running,
+                "paused": self.paused,
+                "task_id": self.task_id,
+                "reason": self.reason,
+                "last_result": to_jsonable(self.last_result),
+                "last_error": self.last_error,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "default_max_quanta": self.default_max_quanta,
+            }
+
+    def set_auto_run(self, enabled: bool) -> dict[str, Any]:
+        with self._lock:
+            self.auto_run = bool(enabled)
+            self.paused = not self.auto_run
+        self.service.publish_scheduler_status()
+        return self.status()
+
+    def pause(self) -> dict[str, Any]:
+        with self._lock:
+            self.paused = True
+            self.auto_run = False
+        self.service.publish_scheduler_status()
+        return self.status()
+
+    def maybe_start(self, *, max_quanta: int | None = None, reason: str = "auto") -> dict[str, Any]:
+        if not self.auto_run or self.paused:
+            return self.status()
+        return self.start(max_quanta=max_quanta, reason=reason)
+
+    def start(self, *, pid: str | None = None, max_quanta: int | None = None, reason: str = "manual") -> dict[str, Any]:
+        with self._lock:
+            if self.running:
+                return self.status()
+            self.running = True
+            self.task_id = f"scheduler-{int(time.time() * 1000)}"
+            self.reason = reason
+            self.started_at = time.time()
+            self.finished_at = None
+            self.last_error = None
+            selected_quanta = max_quanta or self.default_max_quanta
+            thread = threading.Thread(
+                target=self._run_background,
+                args=(selected_quanta, pid),
+                name="agent-libos-gui-scheduler",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+        self.service.publish_scheduler_status()
+        return self.status()
+
+    def shutdown(self, timeout_s: float = _GUI_DEFAULTS.scheduler_shutdown_join_timeout_s) -> bool:
+        with self._lock:
+            self.paused = True
+            self.auto_run = False
+            thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=timeout_s)
+        with self._lock:
+            if thread is None or not thread.is_alive():
+                self.running = False
+                self.finished_at = self.finished_at or time.time()
+                return True
+            return False
+
+    def is_running(self) -> bool:
+        with self._lock:
+            thread = self._thread
+            return self.running and thread is not None and thread.is_alive()
+
+    def run_step(self, pid: str) -> dict[str, Any]:
+        with self._lock:
+            if self.running:
+                return {"started": False, "scheduler": self.status()}
+            self.running = True
+            self.task_id = f"step-{int(time.time() * 1000)}"
+            self.reason = f"step:{pid}"
+            self.started_at = time.time()
+            self.finished_at = None
+            self.last_error = None
+        self.service.publish_scheduler_status()
+        try:
+            result = asyncio.run(self.service.runtime.arun_process_once(pid))
+            self.last_result = [result]
+            self.service.publish_runtime_changes("step")
+            return {"started": True, "result": to_jsonable(result), "scheduler": self.status()}
+        except Exception as exc:
+            self.last_error = str(exc)
+            raise
+        finally:
+            with self._lock:
+                self.running = False
+                self.finished_at = time.time()
+            self.service.publish_scheduler_status()
+
+    def _run_background(self, max_quanta: int, pid: str | None) -> None:
+        try:
+            result = (
+                self.service.runtime.run_process_until_idle(pid, max_quanta=max_quanta)
+                if pid is not None
+                else self.service.runtime.run_until_idle(max_quanta=max_quanta)
+            )
+            with self._lock:
+                self.last_result = result
+        except Exception as exc:  # pragma: no cover - covered through API status assertions
+            with self._lock:
+                self.last_error = str(exc)
+        finally:
+            with self._lock:
+                self.running = False
+                self.finished_at = time.time()
+            self.service.publish_runtime_changes("scheduler")
+            self.service.publish_scheduler_status()
+
+
+class GuiRuntimeService:
+    """Local-only HTTP facade over one Agent libOS Runtime instance."""
+
+    def __init__(
+        self,
+        *,
+        db: str = _RUNTIME_DEFAULTS.local_store_target,
+        runtime: Runtime | None = None,
+        token: str | None = None,
+        auto_run: bool = True,
+        max_quanta: int = _RUNTIME_DEFAULTS.run_until_idle_max_quanta,
+    ) -> None:
+        self.db = db
+        self.runtime = runtime or Runtime.open(db)
+        self.owns_runtime = runtime is None
+        self.token = token or secrets.token_urlsafe(32)
+        self.broadcaster = GuiEventBroadcaster()
+        self.scheduler = SchedulerController(self, auto_run=auto_run, default_max_quanta=max_quanta, paused=not auto_run)
+        self._closed = False
+        self._seen_event_ids: set[str] = set()
+        self._seen_audit_ids: set[str] = set()
+        self._seen_human_request_ids: set[str] = set()
+        self._seen_message_ids: set[str] = set()
+        self._seen_llm_call_ids: set[str] = set()
+        self.publish_runtime_changes("startup")
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        scheduler_stopped = self.scheduler.shutdown()
+        self.broadcaster.close()
+        # A Python thread blocked inside a model/tool quantum cannot be safely
+        # interrupted. In that case the Electron parent will terminate the
+        # process tree; closing SQLite underneath the live quantum would be a
+        # worse race than letting process teardown reclaim the handle.
+        if self.owns_runtime and scheduler_stopped:
+            self.runtime.shutdown(actor="gui-server", reason="gui-server.shutdown")
+
+    def close(self) -> None:
+        self.shutdown()
+
+    def publish_scheduler_status(self) -> None:
+        self.broadcaster.publish("scheduler.status", self.scheduler.status())
+
+    def publish_runtime_changes(self, reason: str) -> None:
+        snapshot = self.snapshot()
+        self.broadcaster.publish("snapshot", {"reason": reason, "snapshot": snapshot})
+        for event in snapshot["events"]:
+            if event["event_id"] in self._seen_event_ids:
+                continue
+            self._seen_event_ids.add(event["event_id"])
+            self.broadcaster.publish("event.appended", event)
+        for record in snapshot["audit"]:
+            if record["record_id"] in self._seen_audit_ids:
+                continue
+            self._seen_audit_ids.add(record["record_id"])
+            self.broadcaster.publish("audit.appended", record)
+        for request in snapshot["human_requests"]:
+            if request["request_id"] in self._seen_human_request_ids:
+                continue
+            self._seen_human_request_ids.add(request["request_id"])
+            self.broadcaster.publish("human_request.updated", request)
+        for process in snapshot["processes"]:
+            for message in process.get("messages", []):
+                if message["message_id"] in self._seen_message_ids:
+                    continue
+                self._seen_message_ids.add(message["message_id"])
+                self.broadcaster.publish("message.posted", message)
+        for call in snapshot["llm_calls"]:
+            if call["call_id"] in self._seen_llm_call_ids:
+                continue
+            self._seen_llm_call_ids.add(call["call_id"])
+            self.broadcaster.publish("llm_call.appended", call)
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "db": self.db,
+            "scheduler": self.scheduler.status(),
+            "process_count": len(self.runtime.process.list()),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        processes = [self._process_summary(process.pid, include_messages=True) for process in self.runtime.process.list()]
+        return {
+            "db": self.db,
+            "scheduler": self.scheduler.status(),
+            "processes": processes,
+            "human_requests": to_jsonable(self.runtime.human.list()),
+            "events": to_jsonable(self.runtime.events.list()[-200:]),
+            "audit": to_jsonable(self.runtime.audit.trace(limit=200)),
+            "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=100)),
+            "tools": self._tool_summaries(),
+            "skills": to_jsonable(self.runtime.skills.discover_skills(require_capability=False)),
+            "jsonrpc_endpoints": to_jsonable(self.runtime.jsonrpc.list_endpoints(require_capability=False)),
+            "modules": to_jsonable(self.runtime.modules.loaded_module_summaries()),
+        }
+
+    def _process_summary(self, pid: str, *, include_messages: bool = False) -> dict[str, Any]:
+        process = self.runtime.process.get(pid)
+        unread = self.runtime.messages.list(pid, include_acked=False)
+        messages = self.runtime.messages.list(pid, include_acked=True, limit=100) if include_messages else []
+        calls = self.runtime.store.list_llm_calls(pid=pid, limit=20)
+        return {
+            **to_jsonable(process),
+            "terminal": process.status in _TERMINAL,
+            "unread_message_count": len(unread),
+            "interrupt_count": len([item for item in unread if item.kind == ProcessMessageKind.INTERRUPT]),
+            "messages": to_jsonable(messages),
+            "llm_call_count": len(calls),
+            "token_total": sum(int((call.usage or {}).get("total_tokens", 0) or 0) for call in calls),
+        }
+
+    def _tool_summaries(self) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        for tool in self.runtime.tools.list():
+            try:
+                spec = json.loads(tool.get("spec_json") or "{}")
+            except json.JSONDecodeError:
+                spec = {}
+            summaries.append(
+                {
+                    "tool_id": tool.get("tool_id"),
+                    "name": tool.get("name"),
+                    "scope": tool.get("scope"),
+                    "registered_by": tool.get("registered_by"),
+                    "ephemeral": bool(tool.get("ephemeral")),
+                    "description": spec.get("description", ""),
+                    "tags": spec.get("tags", []),
+                    "policy": spec.get("policy", {}),
+                }
+            )
+        return summaries
+
+
+class GuiHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int], service: GuiRuntimeService):
+        super().__init__(server_address, GuiRequestHandler)
+        self.service = service
+
+
+class GuiRequestHandler(BaseHTTPRequestHandler):
+    server: GuiHTTPServer
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_common_headers()
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle("GET")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._handle("POST")
+
+    def _handle(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        try:
+            self._require_auth()
+            if method == "GET" and parsed.path == "/api/events/stream":
+                self._handle_sse(parsed)
+                return
+            result = self._dispatch(method, parsed.path, parse_qs(parsed.query))
+            should_shutdown = method == "POST" and parsed.path == "/api/shutdown"
+            if should_shutdown:
+                self.close_connection = True
+            self._write_json(result)
+            if should_shutdown:
+                self._schedule_server_shutdown()
+        except GuiServerError as exc:
+            self._write_json({"ok": False, "error": {"message": str(exc), **exc.details}}, status=exc.status)
+        except Exception as exc:
+            self._write_json(
+                {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def _dispatch(self, method: str, path: str, query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        parts = [part for part in path.strip("/").split("/") if part]
+        if parts[:1] != ["api"]:
+            raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown endpoint")
+        route = parts[1:]
+        if method == "GET" and route == ["health"]:
+            return service.health()
+        if method == "POST" and route == ["shutdown"]:
+            service.scheduler.pause()
+            return {"ok": True, "status": "shutting_down"}
+        if method == "GET" and route == ["snapshot"]:
+            return service.snapshot()
+        if method == "GET" and route == ["processes"]:
+            return [service._process_summary(process.pid, include_messages=True) for process in service.runtime.process.list()]
+        if method == "GET" and route == ["tools"]:
+            return service._tool_summaries()
+        if method == "POST" and route == ["processes"]:
+            body = self._read_body()
+            pid = service.runtime.process.spawn(
+                image=str(body.get("image") or _RUNTIME_DEFAULTS.default_image_id),
+                goal=body.get("goal", ""),
+                working_directory=body.get("working_directory"),
+            )
+            service.publish_runtime_changes("process.spawn")
+            if body.get("auto_run", True):
+                service.scheduler.maybe_start(max_quanta=_int_or_none(body.get("max_quanta")), reason=f"spawn:{pid}")
+            return {"pid": pid, "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
+        if route[:2] == ["scheduler", "auto"] and method == "POST":
+            body = self._read_body()
+            return service.scheduler.set_auto_run(bool(body.get("enabled", True)))
+        if route == ["scheduler", "pause"] and method == "POST":
+            return service.scheduler.pause()
+        if len(route) >= 2 and route[0] == "processes":
+            return self._dispatch_process(method, route[1], route[2:], query)
+        if len(route) >= 1 and route[0] == "human-requests":
+            return self._dispatch_human(method, route[1:])
+        if len(route) >= 1 and route[0] == "checkpoints":
+            return self._dispatch_checkpoints(method, route[1:], query)
+        if len(route) >= 1 and route[0] == "skills":
+            return self._dispatch_skills(method, route[1:], query)
+        if len(route) >= 1 and route[0] == "capabilities":
+            return self._dispatch_capabilities(method, route[1:], query)
+        if len(route) >= 1 and route[0] == "jsonrpc":
+            return self._dispatch_jsonrpc(method, route[1:], query)
+        if len(route) >= 1 and route[0] == "modules":
+            return self._dispatch_modules(method, route[1:])
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown endpoint")
+
+    def _dispatch_process(self, method: str, pid: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service._process_summary(pid, include_messages=True)
+        if method == "GET" and route == ["messages"]:
+            return to_jsonable(service.runtime.messages.list(pid, include_acked=True, limit=_query_int(query, "limit")))
+        if method == "GET" and route == ["human-requests"]:
+            return to_jsonable(service.runtime.human.list(pid=pid))
+        if method == "GET" and route == ["llm-calls"]:
+            return to_jsonable(service.runtime.store.list_llm_calls(pid=pid, limit=_query_int(query, "limit")))
+        if method == "GET" and route == ["audit"]:
+            return [item for item in to_jsonable(service.runtime.audit.trace(limit=_query_int(query, "limit"))) if item.get("actor") == pid or item.get("target") == f"process:{pid}"]
+        if method == "GET" and route == ["events"]:
+            return to_jsonable(service.runtime.events.list(target=pid))
+        if method == "GET" and route == ["capabilities"]:
+            return to_jsonable(service.runtime.capability.list_subject(pid, include_inactive=True))
+        if method == "GET" and route == ["checkpoints"]:
+            return service.runtime.checkpoint.list(pid=pid, actor=None, require_capability=False)
+        if method == "POST" and route == ["run"]:
+            body = self._read_body()
+            return service.scheduler.start(pid=pid, max_quanta=_int_or_none(body.get("max_quanta")), reason=f"run:{pid}")
+        if method == "POST" and route == ["step"]:
+            return service.scheduler.run_step(pid)
+        if method == "POST" and route == ["pause"]:
+            body = self._read_body()
+            service.runtime.process.pause(pid, str(body.get("reason") or "paused from GUI"))
+            service.publish_runtime_changes("process.pause")
+            return service._process_summary(pid, include_messages=True)
+        if method == "POST" and route == ["resume"]:
+            service.runtime.process.resume(pid)
+            service.publish_runtime_changes("process.resume")
+            if self._read_body(optional=True).get("auto_run", False):
+                service.scheduler.maybe_start(reason=f"resume:{pid}")
+            return service._process_summary(pid, include_messages=True)
+        if method == "POST" and route == ["signal"]:
+            body = self._read_body()
+            service.runtime.process.signal(pid, ProcessSignal(str(body.get("signal") or ProcessSignal.INTERRUPT.value)), payload=body.get("payload"))
+            service.publish_runtime_changes("process.signal")
+            return service._process_summary(pid, include_messages=True)
+        if method == "POST" and route in (["message"], ["interrupt"]):
+            body = self._read_body()
+            kind = ProcessMessageKind.INTERRUPT if route == ["interrupt"] else ProcessMessageKind.NORMAL
+            message = service.runtime.human.send_process_message(
+                pid,
+                str(body.get("body") or body.get("message") or ""),
+                kind=kind,
+                human=str(body.get("human") or _RUNTIME_DEFAULTS.default_human),
+                channel=str(body.get("channel") or "human"),
+                correlation_id=body.get("correlation_id"),
+                reply_to=body.get("reply_to"),
+                subject=body.get("subject"),
+                payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
+            )
+            service.publish_runtime_changes(f"process.{kind.value}_message")
+            if body.get("auto_run", True):
+                service.scheduler.maybe_start(max_quanta=_int_or_none(body.get("max_quanta")), reason=f"message:{pid}")
+            return {"message": to_jsonable(message), "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
+        if method == "POST" and route == ["cd"]:
+            body = self._read_body()
+            process = service.runtime.set_process_working_directory(pid, str(body["path"]))
+            service.publish_runtime_changes("process.cd")
+            return to_jsonable(process)
+        if method == "POST" and route == ["exec"]:
+            body = self._read_body()
+            self._require_confirmed("process.exec", body, {"pid": pid, "image": body.get("image"), "goal": body.get("goal")})
+            process = service.runtime.exec_process(
+                pid,
+                str(body["image"]),
+                args=body.get("args") if isinstance(body.get("args"), dict) else {},
+                goal=body.get("goal"),
+                preserve_memory=bool(body.get("preserve_memory", True)),
+                preserve_capabilities=bool(body.get("preserve_capabilities", False)),
+            )
+            service.publish_runtime_changes("process.exec")
+            if body.get("auto_run", True):
+                service.scheduler.maybe_start(max_quanta=_int_or_none(body.get("max_quanta")), reason=f"exec:{pid}")
+            return {"process": to_jsonable(process), "scheduler": service.scheduler.status()}
+        if method == "POST" and route == ["exit"]:
+            body = self._read_body()
+            self._require_confirmed("process.exit", body, {"pid": pid, "failed": body.get("failed", False)})
+            service.runtime.process.exit(pid, failed=bool(body.get("failed", False)), message=body.get("message"))
+            service.publish_runtime_changes("process.exit")
+            return service._process_summary(pid, include_messages=True)
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown process endpoint")
+
+    def _dispatch_human(self, method: str, route: list[str]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return to_jsonable(service.runtime.human.list())
+        if method == "POST" and len(route) == 2 and route[1] == "respond":
+            body = self._read_body()
+            decision = body.get("decision") if isinstance(body.get("decision"), dict) else {}
+            if body.get("answer") is not None:
+                decision = {**decision, "answer": str(body["answer"])}
+            if bool(body.get("approved", True)):
+                request = service.runtime.human.approve(route[0], {"approved": True, "source": "gui", **decision})
+            else:
+                request = service.runtime.human.reject(route[0], {"approved": False, "source": "gui", **decision})
+            service.publish_runtime_changes("human.respond")
+            if body.get("auto_run", True):
+                service.scheduler.maybe_start(reason=f"human:{route[0]}")
+            return {"request": to_jsonable(request), "scheduler": service.scheduler.status()}
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown human endpoint")
+
+    def _dispatch_checkpoints(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service.runtime.checkpoint.list(pid=_query_str(query, "pid"), actor=None, require_capability=False)
+        if method == "POST" and route == ["create"]:
+            body = self._read_body()
+            checkpoint_id = service.runtime.checkpoint.create(str(body["pid"]), str(body.get("reason") or "GUI checkpoint"), actor=str(body.get("actor") or "gui"), require_capability=False)
+            service.publish_runtime_changes("checkpoint.create")
+            return {"checkpoint_id": checkpoint_id}
+        if method == "GET" and len(route) == 1:
+            return service.runtime.checkpoint.inspect(route[0], actor=None, require_capability=False)
+        if method == "GET" and len(route) == 2 and route[1] == "diff":
+            return service.runtime.checkpoint.diff(route[0], actor=None, require_capability=False)
+        if method == "POST" and len(route) == 2 and route[1] == "restore":
+            body = self._read_body()
+            self._require_confirmed("checkpoint.restore", body, {"checkpoint_id": route[0]})
+            result = service.runtime.checkpoint.restore(str(body.get("actor") or "gui"), route[0], require_capability=False)
+            service.publish_runtime_changes("checkpoint.restore")
+            return result
+        if method == "POST" and len(route) == 2 and route[1] == "fork":
+            body = self._read_body()
+            self._require_confirmed("checkpoint.fork", body, {"checkpoint_id": route[0], "parent_pid": body.get("parent_pid")})
+            result = service.runtime.checkpoint.fork_from_checkpoint(str(body.get("actor") or "gui"), route[0], parent_pid=body.get("parent_pid"), require_capability=False)
+            service.publish_runtime_changes("checkpoint.fork")
+            return result
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown checkpoint endpoint")
+
+    def _dispatch_skills(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service.runtime.skills.discover_skills(_query_str(query, "text"), require_capability=False)
+        if method == "GET" and len(route) == 1:
+            return service.runtime.skills.inspect_skill(route[0], require_capability=False)
+        if method == "POST" and route == ["register"]:
+            body = self._read_body()
+            self._require_confirmed("skill.register", body, {"path": body.get("path")})
+            result = service.runtime.skills.register_skill_from_path(str(body["path"]), actor=str(body.get("actor") or "gui"), replace=bool(body.get("replace", False)), require_capability=False)
+            service.publish_runtime_changes("skill.register")
+            return result
+        if method == "POST" and len(route) == 2 and route[1] in {"activate", "unload"}:
+            body = self._read_body()
+            if route[1] == "activate":
+                result = service.runtime.skills.activate_skill(str(body["pid"]), route[0], actor=str(body.get("actor") or body["pid"]), require_capability=False)
+            else:
+                result = service.runtime.skills.unload_skill(str(body["pid"]), route[0], actor=str(body.get("actor") or body["pid"]), require_capability=False)
+            service.publish_runtime_changes(f"skill.{route[1]}")
+            return result
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown skills endpoint")
+
+    def _dispatch_capabilities(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            subject = _query_str(query, "subject")
+            return to_jsonable(service.runtime.capability.list_subject(subject, include_inactive=True) if subject else service.runtime.store.list_capabilities())
+        if method == "GET" and len(route) == 1:
+            return service.runtime.capability.inspect(route[0])
+        if method == "POST" and route == ["grant"]:
+            body = self._read_body()
+            self._require_confirmed("capability.grant", body, {"subject": body.get("subject"), "resource": body.get("resource"), "rights": body.get("rights")})
+            cap = service.runtime.capability.grant(str(body["subject"]), str(body["resource"]), body.get("rights") or [CapabilityRight.READ.value], issued_by=str(body.get("actor") or "gui"))
+            service.publish_runtime_changes("capability.grant")
+            return to_jsonable(cap)
+        if method == "POST" and route == ["delegate"]:
+            body = self._read_body()
+            self._require_confirmed("capability.delegate", body, {"parent": body.get("parent"), "child": body.get("child"), "resource": body.get("resource"), "rights": body.get("rights")})
+            cap = service.runtime.capability.delegate(str(body["parent"]), str(body["child"]), {"resource": body["resource"], "rights": body.get("rights") or [CapabilityRight.READ.value]}, actor=str(body.get("actor") or "gui"))
+            service.publish_runtime_changes("capability.delegate")
+            return to_jsonable(cap)
+        if method == "POST" and len(route) == 2 and route[1] == "revoke":
+            body = self._read_body()
+            self._require_confirmed("capability.revoke", body, {"capability_id": route[0], "reason": body.get("reason")})
+            cap = service.runtime.capability.revoke(route[0], revoked_by=str(body.get("actor") or "gui"), reason=body.get("reason"), require_authority=False)
+            service.publish_runtime_changes("capability.revoke")
+            return to_jsonable(cap)
+        if method == "POST" and route == ["explain"]:
+            body = self._read_body()
+            return service.runtime.capability.explain_decision(str(body["subject"]), str(body["resource"]), str(body["right"]))
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown capability endpoint")
+
+    def _dispatch_jsonrpc(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service.runtime.jsonrpc.list_endpoints(text=_query_str(query, "text"), require_capability=False)
+        if method == "GET" and len(route) == 1:
+            return service.runtime.jsonrpc.inspect_endpoint(route[0], require_capability=False)
+        if method == "POST" and route == ["register"]:
+            body = self._read_body()
+            self._require_confirmed("jsonrpc.register", body, {"source": body.get("source")})
+            if "path" in body:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "GUI JSON-RPC registration accepts manifest_text, not host file paths",
+                )
+            text = str(body["manifest_text"])
+            result = service.runtime.jsonrpc.register_endpoint_from_yaml_text(text, actor=str(body.get("actor") or "gui"), replace=bool(body.get("replace", False)), require_capability=False, source=body.get("source"))
+            service.publish_runtime_changes("jsonrpc.register")
+            return result
+        if method == "POST" and len(route) == 2 and route[1] == "call":
+            body = self._read_body()
+            self._require_confirmed("jsonrpc.call", body, {"pid": body.get("pid"), "endpoint_id": route[0], "method_id": body.get("method_id")})
+            result = service.runtime.jsonrpc.call(str(body["pid"]), route[0], str(body["method_id"]), params=body.get("params"))
+            service.publish_runtime_changes("jsonrpc.call")
+            return to_jsonable(result)
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown JSON-RPC endpoint")
+
+    def _dispatch_modules(self, method: str, route: list[str]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service.runtime.modules.loaded_module_summaries()
+        if method == "GET" and len(route) == 1:
+            return service.runtime.modules.inspect_module(route[0])
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown module endpoint")
+
+    def _handle_sse(self, parsed: Any) -> None:
+        cursor = _int_or_none(parse_qs(parsed.query).get("cursor", ["0"])[0]) or 0
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self._send_common_headers()
+        self.end_headers()
+        try:
+            for event in self.server.service.broadcaster.replay_after(cursor):
+                self._write_sse(event)
+                cursor = event.seq
+            while not self.server.service._closed:
+                events = self.server.service.broadcaster.wait_after(cursor, timeout_s=15)
+                if not events:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                for event in events:
+                    self._write_sse(event)
+                    cursor = event.seq
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+
+    def _schedule_server_shutdown(self) -> None:
+        def shutdown_after_response() -> None:
+            time.sleep(_GUI_DEFAULTS.http_shutdown_delay_s)
+            self.server.shutdown()
+
+        threading.Thread(target=shutdown_after_response, name="agent-libos-gui-http-shutdown", daemon=True).start()
+
+    def _write_sse(self, event: GuiEvent) -> None:
+        payload = json.dumps(to_jsonable(event.data), ensure_ascii=False, default=str)
+        self.wfile.write(f"id: {event.seq}\nevent: {event.event}\ndata: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _read_body(self, optional: bool = False) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > _GUI_DEFAULTS.request_body_max_bytes:
+            if length <= _GUI_DEFAULTS.request_body_max_bytes * 2:
+                self.rfile.read(length)
+            else:
+                self.close_connection = True
+            raise GuiServerError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"request body exceeds {_GUI_DEFAULTS.request_body_max_bytes} bytes",
+            )
+        if length == 0:
+            return {} if optional else {}
+        try:
+            value = json.loads(self.rfile.read(length).decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, f"invalid JSON body: {exc}") from exc
+        if not isinstance(value, dict):
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
+        return value
+
+    def _require_auth(self) -> None:
+        token = self.server.service.token
+        header = self.headers.get("Authorization", "")
+        if header != f"Bearer {token}":
+            raise GuiServerError(HTTPStatus.UNAUTHORIZED, "missing or invalid GUI session token")
+
+    def _require_confirmed(self, action: str, body: dict[str, Any], preview: dict[str, Any]) -> None:
+        if body.get("confirmed") is True:
+            return
+        self.server.service.runtime.audit.record(
+            actor="gui",
+            action="gui.confirmation_required",
+            target=action,
+            decision={"preview": preview},
+        )
+        raise GuiServerError(
+            HTTPStatus.CONFLICT,
+            f"{action} requires explicit confirmation",
+            details={"confirmation_required": True, "action": action, "preview": preview},
+        )
+
+    def _write_json(self, value: Any, *, status: int = HTTPStatus.OK) -> None:
+        payload = json.dumps(to_jsonable(value), ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self._send_common_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def _send_common_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        if self.close_connection:
+            self.send_header("Connection", "close")
+
+
+def create_gui_http_server(
+    *,
+    db: str = _RUNTIME_DEFAULTS.local_store_target,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    token: str | None = None,
+    auto_run: bool = True,
+    max_quanta: int = _RUNTIME_DEFAULTS.run_until_idle_max_quanta,
+    runtime: Runtime | None = None,
+) -> GuiHTTPServer:
+    if host not in {"127.0.0.1", "localhost"}:
+        raise ValueError("GUI server is local-only and must bind 127.0.0.1")
+    service = GuiRuntimeService(db=db, runtime=runtime, token=token, auto_run=auto_run, max_quanta=max_quanta)
+    return GuiHTTPServer(("127.0.0.1", int(port)), service)
+
+
+def serve(
+    *,
+    db: str,
+    port: int,
+    token: str | None,
+    auto_run: bool,
+    max_quanta: int,
+    ready: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    server = create_gui_http_server(db=db, port=port, token=token, auto_run=auto_run, max_quanta=max_quanta)
+    host, selected_port = server.server_address
+    payload = {"url": f"http://{host}:{selected_port}", "token": server.service.token, "db": db}
+    if ready is not None:
+        ready(payload)
+    else:
+        print(json.dumps(payload, ensure_ascii=True), flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.service.shutdown()
+        server.server_close()
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="agent-libos-gui-server")
+    parser.add_argument("--db", default=_RUNTIME_DEFAULTS.local_store_target)
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--token")
+    parser.add_argument("--no-auto-run", action="store_true")
+    parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    args = parser.parse_args(argv)
+    serve(
+        db=args.db,
+        port=args.port,
+        token=args.token,
+        auto_run=not args.no_auto_run,
+        max_quanta=args.max_quanta,
+    )
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in {None, ""}:
+        return None
+    return int(value)
+
+
+def _query_int(query: dict[str, list[str]], key: str) -> int | None:
+    values = query.get(key)
+    return _int_or_none(values[0]) if values else None
+
+
+def _query_str(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    return values[0] if values else None

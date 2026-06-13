@@ -181,7 +181,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "human":
             _print_json([request.__dict__ for request in runtime.human.drain_terminal_queue()])
     finally:
-        runtime.close()
+        runtime.shutdown(actor="cli", reason="cli.command_complete")
 
 
 def _run_cd_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:

@@ -105,7 +105,7 @@ async def run_interleaved_clock_demo(
             raise RuntimeError(f"unexpected output order: {actual_labels}, expected {expected_labels}")
         return report
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 class InterleavingClockClient:

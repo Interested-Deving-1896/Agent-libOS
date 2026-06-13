@@ -88,6 +88,8 @@ Start here, then read the deeper references as needed:
 - [docs/checkpoints.md](docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, append-only history, and external effects.
 - [docs/cli.md](docs/cli.md): stable CLI command reference and examples.
+- [docs/gui.md](docs/gui.md): Electron desktop console, local GUI server,
+  HTTP/SSE APIs, and development commands.
 - [docs/benchmark.md](docs/benchmark.md): M1 runtime-safety benchmark tasks,
   runners, oracle, outputs, and metrics.
 - [docs/development.md](docs/development.md): setup, tests, real LLM smoke,
@@ -119,6 +121,17 @@ Run the deterministic local demo:
 ```bash
 uv run agent-libos demo
 ```
+
+Run the Electron GUI in development mode:
+
+```bash
+npm --prefix gui install
+npm --prefix gui run electron:dev
+```
+
+The GUI starts a local `agent-libos-gui-server`, subscribes to runtime events,
+and provides a process-centered console for concurrent messages, interrupts,
+human approvals, scheduler control, audit inspection, and LLM call visibility.
 
 The demo does not call a real model. It exercises process spawn/fork, Object
 Memory, Deno/TypeScript JIT validation when Deno is available, checkpointing,

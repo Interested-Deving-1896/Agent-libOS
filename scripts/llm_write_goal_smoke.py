@@ -54,7 +54,7 @@ async def amain(args: argparse.Namespace) -> None:
         if process.status != ProcessStatus.EXITED:
             raise SystemExit(3)
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 def _action_name(result: object) -> str | None:

@@ -120,7 +120,7 @@ async def amain(args: argparse.Namespace) -> None:
         if args.trace:
             print(f"source_text_chars={len(source_text)}", file=sys.stderr)
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 def _workspace_relative(raw_path: str, workspace: Path) -> str:

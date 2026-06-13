@@ -12,7 +12,7 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
-from agent_libos.models import AgentImage
+from agent_libos.models import AgentImage, EventType
 from agent_libos.models.exceptions import NotFound
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
@@ -151,6 +151,8 @@ class Runtime:
             trusted_sha256=trusted_module_sha256,
         )
         self.modules.run_startup_hooks()
+        self._closed = False
+        self._shutdown_reason: str | None = None
 
     @classmethod
     def open(
@@ -178,8 +180,59 @@ class Runtime:
             store.close()
             raise
 
-    def close(self) -> None:
+    def shutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:
+        """Shut down this host Runtime instance.
+
+        Shutdown is a host lifecycle operation. It stops accepting further use
+        of this composition root and releases owned handles, but it does not
+        change AgentProcess lifecycle state. A process must still exit through
+        the process primitive/tool path, which keeps process authority and audit
+        semantics separate from host resource cleanup.
+        """
+        if self._closed:
+            return {"ok": True, "already_shutdown": True, "reason": self._shutdown_reason}
+        self._shutdown_reason = reason
+        errors: list[dict[str, str]] = []
+        self.audit.record(
+            actor=actor,
+            action="runtime.shutdown",
+            target="runtime",
+            decision={"reason": reason},
+        )
+        self.events.emit(
+            EventType.RUNTIME_SHUTDOWN,
+            source=actor,
+            target="runtime",
+            payload={"reason": reason},
+        )
+        for name, component in [
+            ("llm.client", getattr(self.llm, "client", None)),
+            ("substrate", self.substrate),
+        ]:
+            try:
+                self._shutdown_component(component)
+            except Exception as exc:
+                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
+        self._closed = True
         self.store.close()
+        if errors:
+            raise RuntimeError(f"runtime shutdown completed with component errors: {errors}")
+        return {"ok": True, "already_shutdown": False, "reason": reason}
+
+    def close(self) -> None:
+        """Compatibility alias for shutdown(); prefer Runtime.shutdown()."""
+        self.shutdown(actor="runtime.close", reason="runtime.close")
+
+    def _shutdown_component(self, component: Any) -> None:
+        if component is None:
+            return
+        shutdown = getattr(component, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+            return
+        close = getattr(component, "close", None)
+        if callable(close):
+            close()
 
     def run_process_once(self, pid: str) -> dict[str, Any]:
         return self.llm.run_once(pid)
@@ -271,6 +324,23 @@ class Runtime:
                 self._current_human_auto_answer,
             ) = previous_human_context
         return results
+
+    def run_process_until_idle(self, pid: str, *, max_quanta: int | None = None) -> list[Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun_process_until_idle(pid, max_quanta=max_quanta))
+        raise RuntimeError(
+            "Cannot call run_process_until_idle() inside a running event loop. "
+            "Use await arun_process_until_idle(...)."
+        )
+
+    async def arun_process_until_idle(self, pid: str, *, max_quanta: int | None = None) -> list[Any]:
+        return await self.scheduler.arun_pid_until_idle(
+            pid,
+            self.arun_process_once,
+            max_quanta=max_quanta or self.config.runtime.run_until_idle_max_quanta,
+        )
 
     def register_image(self, image: AgentImage | dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> None:
         self.image_registry.register(image, actor=actor, replace=replace)

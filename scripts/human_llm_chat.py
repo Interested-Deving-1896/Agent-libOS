@@ -98,7 +98,7 @@ async def run_chat(*, db: str = _RUNTIME_DEFAULTS.local_store_target, responder:
             raise RuntimeError(f"chat process did not exit; status={process.status.value}")
         return report
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 class HumanChatActionClient:

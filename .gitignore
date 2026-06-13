@@ -13,4 +13,11 @@ agent_outputs/
 .idea
 .vscode
 .benchmark_runs/
+gui/node_modules/
+gui/dist/
+gui/dist-electron/
+gui/.vite/
+gui/.smoke-log.jsonl
+gui/.smoke-user-data/
+gui/release/
 !benchmarks/runtime_safety/fixtures/basic_repo/.env

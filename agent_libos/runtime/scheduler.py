@@ -117,6 +117,38 @@ class AsyncProcessScheduler:
     def run_until_idle(self, quantum: Quantum, max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         return _run_sync(self.arun_until_idle(quantum, max_quanta=max_quanta))
 
+    async def arun_pid_until_idle(
+        self,
+        pid: str,
+        quantum: Quantum,
+        max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta,
+    ) -> list[Any]:
+        """Advance one process until it blocks, exits, fails, or exhausts budget."""
+        results: list[Any] = []
+        for _ in range(max_quanta):
+            process = self.store.get_process(pid)
+            if process is None or process.status != ProcessStatus.RUNNABLE:
+                break
+            try:
+                results.append(await self._run_quantum(pid, quantum))
+            except Exception as exc:
+                self._fail_process_task(pid, exc)
+                results.append({"ok": False, "pid": pid, "error": str(exc)})
+                break
+            latest = self.store.get_process(pid)
+            if latest is None or latest.status != ProcessStatus.RUNNABLE:
+                break
+            await asyncio.sleep(0)
+        return results
+
+    def run_pid_until_idle(
+        self,
+        pid: str,
+        quantum: Quantum,
+        max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta,
+    ) -> list[Any]:
+        return _run_sync(self.arun_pid_until_idle(pid, quantum, max_quanta=max_quanta))
+
     async def _run_quantum(self, pid: str, quantum: Quantum) -> Any:
         process = self.store.get_process(pid)
         if process is None or process.status != ProcessStatus.RUNNABLE:

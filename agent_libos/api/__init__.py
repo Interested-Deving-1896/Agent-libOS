@@ -1,2 +1,1 @@
-"""Public CLI and SDK adapters."""
-
+"""Host-facing API surfaces: CLI, GUI server, and future adapters."""

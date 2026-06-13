@@ -40,6 +40,21 @@ class RuntimeDefaults:
 
 
 @dataclass(frozen=True)
+class GuiDefaults:
+    """Local desktop console defaults.
+
+    The GUI server is a localhost-only host control surface, but it still needs
+    bounded buffers and request sizes so a renderer bug cannot exhaust the
+    Python runtime process.
+    """
+
+    event_buffer_limit: int = 1_000
+    request_body_max_bytes: int = 1_048_576
+    scheduler_shutdown_join_timeout_s: float = 2.0
+    http_shutdown_delay_s: float = 0.2
+
+
+@dataclass(frozen=True)
 class CapabilityDefaults:
     default_delegation_depth: int = 4
     max_rights_per_capability: int = 16
@@ -365,6 +380,7 @@ class ScriptDefaults:
 @dataclass(frozen=True)
 class AgentLibOSConfig:
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
+    gui: GuiDefaults = field(default_factory=GuiDefaults)
     capability: CapabilityDefaults = field(default_factory=CapabilityDefaults)
     scheduler: SchedulerDefaults = field(default_factory=SchedulerDefaults)
     process: ProcessDefaults = field(default_factory=ProcessDefaults)

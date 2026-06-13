@@ -322,7 +322,7 @@ def _run_agent_libos_task(
         )
         return TaskRun(result=result, effects=[])
     finally:
-        runtime.close()
+        runtime.shutdown(actor="benchmark", reason="benchmark.run_complete")
 
 
 def _setup_wrapper_memory(task: BenchmarkTask) -> dict[tuple[str, str], Any]:

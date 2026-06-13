@@ -72,7 +72,7 @@ async def amain(args: argparse.Namespace) -> None:
         if args.strict and process.status in {ProcessStatus.FAILED, ProcessStatus.KILLED}:
             raise SystemExit(2)
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 def build_parser() -> argparse.ArgumentParser:

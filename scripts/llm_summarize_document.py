@@ -112,7 +112,7 @@ async def amain(args: argparse.Namespace) -> None:
         if not output_exists and not _had_permission_rejection(runtime, pid):
             raise SystemExit(f"Agent exited without writing summary file: {output_path}")
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 def _workspace_relative_document(raw_path: str, workspace: Path) -> str:

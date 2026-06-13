@@ -2,6 +2,11 @@
 
 The package installs the `agent-libos` command.
 
+The package also installs `agent-libos-gui-server`, which is used by the
+Electron desktop console described in [docs/gui.md](gui.md).
+Both entrypoints are implemented under `agent_libos.api`, because they are
+host-facing control surfaces over the same runtime boundary.
+
 Use `--db` to select a runtime database. The default `local` target is
 in-memory. A filesystem path creates or opens a persistent SQLite database.
 

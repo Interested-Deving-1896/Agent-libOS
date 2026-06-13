@@ -103,7 +103,7 @@ async def run_file_viewer(
             raise RuntimeError(f"process did not exit after {max_quanta} quanta; status={process.status.value}")
         return report
     finally:
-        runtime.close()
+        runtime.shutdown(actor="script", reason="script.complete")
 
 
 class AskFileViewerClient:
