@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--env-file",
-        help="LLM .env file to load before mounting the workspace. Defaults to this Agent-libOS checkout's .env.",
+        help="LLM .env file to load before mounting the workspace. Defaults to this Agent libOS checkout's .env.",
     )
     parser.add_argument("--ephemeral-db", action="store_true", help="Use an in-memory runtime DB.")
     parser.add_argument(

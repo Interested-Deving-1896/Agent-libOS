@@ -19,7 +19,7 @@ _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 
 CHAT_IMAGE_ID = "chat-image:v0"
 CHAT_IMAGE_NAME = "ChatImage"
-DEFAULT_EXIT_WORDS = ["/exit", "/quit"]
+DEFAULT_EXIT_WORDS = ["/exit", "/quit", "quit", "退出", "再见"]
 DEFAULT_SYSTEM_PROMPT = ("You are a helpful assistant in a terminal chat. Reply to the user's latest message directly. "
                          "Keep answers concise unless the user asks for detail.")
 

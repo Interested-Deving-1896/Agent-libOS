@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.14"]
 
     steps:
       - name: Check out repository
@@ -30,7 +30,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Compile Python sources
-        run: uv run python -m compileall agent_libos tests scripts
+        run: uv run python -m compileall agent_libos tests scripts experiments benchmarks
 
       - name: Run unit tests
         run: uv run python -m unittest discover -s tests -v

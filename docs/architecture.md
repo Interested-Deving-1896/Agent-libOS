@@ -185,7 +185,7 @@ agent_libos/
   memory/          typed Object Memory and MemoryView implementation
   models/          dataclass and enum models split by runtime domain
   modules/         trusted startup Runtime Module loader, registry, and core module
-  primitives/      libOS primitives for filesystem, clock, shell, JSON-RPC, and placeholders
+  primitives/      libOS primitives for filesystem, clock, shell, and JSON-RPC
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations
