@@ -45,7 +45,7 @@ class AsyncProcessScheduler:
     def run_once(self, quantum: Quantum) -> Any:
         return _run_sync(self.arun_once(quantum))
 
-    async def arun_until_idle(self, quantum: Quantum, max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
+    async def arun_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         results: list[Any] = []
         tasks: dict[str, asyncio.Task[list[Any]]] = {}
         quanta_used = 0
@@ -55,7 +55,7 @@ class AsyncProcessScheduler:
             # The quantum budget is global across process tasks, not per process.
             nonlocal quanta_used
             async with quanta_lock:
-                if quanta_used >= max_quanta:
+                if _budget_exhausted(quanta_used, max_quanta):
                     return False
                 quanta_used += 1
                 return True
@@ -84,7 +84,7 @@ class AsyncProcessScheduler:
             # Start one task per runnable pid. Each task keeps advancing its own
             # process until it blocks, exits, fails, or the shared budget is used.
             for pid in self.runnable_pids():
-                if quanta_used >= max_quanta:
+                if _budget_exhausted(quanta_used, max_quanta):
                     break
                 if pid not in tasks:
                     tasks[pid] = asyncio.create_task(process_loop(pid), name=f"agent-process:{pid}")
@@ -103,7 +103,7 @@ class AsyncProcessScheduler:
                     tasks.pop(pid, None)
                 results.extend(task.result())
 
-            if quanta_used >= max_quanta and not done:
+            if _budget_exhausted(quanta_used, max_quanta) and not done:
                 done_all, _pending = await asyncio.wait(tasks.values(), return_when=asyncio.ALL_COMPLETED)
                 for task in done_all:
                     pid = self._pid_for_task(tasks, task)
@@ -114,22 +114,24 @@ class AsyncProcessScheduler:
 
         return results
 
-    def run_until_idle(self, quantum: Quantum, max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
+    def run_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         return _run_sync(self.arun_until_idle(quantum, max_quanta=max_quanta))
 
     async def arun_pid_until_idle(
         self,
         pid: str,
         quantum: Quantum,
-        max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta,
+        max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta,
     ) -> list[Any]:
         """Advance one process until it blocks, exits, fails, or exhausts budget."""
         results: list[Any] = []
-        for _ in range(max_quanta):
+        quanta_used = 0
+        while not _budget_exhausted(quanta_used, max_quanta):
             process = self.store.get_process(pid)
             if process is None or process.status != ProcessStatus.RUNNABLE:
                 break
             try:
+                quanta_used += 1
                 results.append(await self._run_quantum(pid, quantum))
             except Exception as exc:
                 self._fail_process_task(pid, exc)
@@ -145,7 +147,7 @@ class AsyncProcessScheduler:
         self,
         pid: str,
         quantum: Quantum,
-        max_quanta: int = _SCHEDULER_DEFAULTS.max_quanta,
+        max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta,
     ) -> list[Any]:
         return _run_sync(self.arun_pid_until_idle(pid, quantum, max_quanta=max_quanta))
 
@@ -204,3 +206,7 @@ def _run_sync(awaitable: Awaitable[Any]) -> Any:
     if inspect.iscoroutine(awaitable):
         awaitable.close()
     raise RuntimeError("Cannot use sync scheduler APIs inside a running event loop. Use async APIs instead.")
+
+
+def _budget_exhausted(quanta_used: int, max_quanta: int | None) -> bool:
+    return max_quanta is not None and quanta_used >= max_quanta

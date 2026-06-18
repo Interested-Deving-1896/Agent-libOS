@@ -288,7 +288,7 @@ class Runtime:
         human_auto_answer: str | None = None,
     ) -> list[Any]:
         results: list[Any] = []
-        remaining = max_quanta if max_quanta is not None else self.config.runtime.run_until_idle_max_quanta
+        remaining = self.config.runtime.run_until_idle_max_quanta if max_quanta is None else max_quanta
         selected_human = human or self.config.runtime.default_human
         previous_human_context = (
             self._current_human_auto_approve,
@@ -299,13 +299,14 @@ class Runtime:
         self._current_human_auto_policy = human_auto_policy
         self._current_human_auto_answer = human_auto_answer
         try:
-            while remaining > 0:
+            while remaining is None or remaining > 0:
                 # Run all currently runnable processes first. Human queue work below
                 # may wake a process, so this loop intentionally alternates between
                 # process execution and terminal queue draining.
                 batch = await self.scheduler.arun_until_idle(self.arun_process_once, max_quanta=remaining)
                 results.extend(batch)
-                remaining -= len(batch)
+                if remaining is not None:
+                    remaining -= len(batch)
                 if not process_human_queue:
                     break
                 processed = await self.human.adrain_terminal_queue(
@@ -342,10 +343,11 @@ class Runtime:
         )
 
     async def arun_process_until_idle(self, pid: str, *, max_quanta: int | None = None) -> list[Any]:
+        selected_quanta = self.config.runtime.run_until_idle_max_quanta if max_quanta is None else max_quanta
         return await self.scheduler.arun_pid_until_idle(
             pid,
             self.arun_process_once,
-            max_quanta=max_quanta or self.config.runtime.run_until_idle_max_quanta,
+            max_quanta=selected_quanta,
         )
 
     def register_image(self, image: AgentImage | dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> None:

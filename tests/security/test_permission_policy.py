@@ -1,0 +1,198 @@
+from __future__ import annotations
+import pytest
+import hashlib
+import json
+from uuid import uuid4
+from agent_libos import Runtime
+from agent_libos.capability.manager import CapabilityManager
+from agent_libos.models.exceptions import HumanApprovalRequired
+from agent_libos.llm.client import LLMCompletion
+from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
+
+class TestPermissionPolicy:
+
+    def setup_method(self) -> None:
+        self.runtime = Runtime.open('local')
+        self.human_output: list[str] = []
+        self.runtime.substrate.human.output_sink = self.human_output.append
+
+    def teardown_method(self) -> None:
+        self.runtime.close()
+
+    def test_request_permission_tool_can_set_always_allow_policy(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request write')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
+        allowed = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'allowed'})
+        assert request.ok
+        assert processed[0].status == HumanRequestStatus.APPROVED
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
+        assert allowed.ok
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'allowed'
+
+    def test_request_permission_tool_can_set_always_deny_policy_and_resume_process(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request denied write')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_DENY)
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'denied'})
+        assert processed[0].status == HumanRequestStatus.REJECTED
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_DENY
+        assert not denied.ok
+        assert 'denied write' in (denied.error or '')
+        assert not (self.runtime.workspace_root / path).exists()
+
+    def test_request_permission_tool_rejects_unknown_right_before_human_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request invalid right')
+        resource = self.runtime.filesystem.resource_for(self._path())
+        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['*'], 'reason': 'invalid broad right'})
+        assert not request.ok
+        assert self.runtime.human.pending() == []
+
+    def test_ask_each_time_prompts_from_filesystem_primitive_and_consumes_one_time_grant(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask every write')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'first'})
+        pending = self.runtime.human.pending()[0]
+        context = pending.payload['context']
+        first_prompt = self.runtime.human.drain_terminal_queue(auto_approve=True)
+        retry = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'first'})
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'second'})
+        assert context['primitive'] == 'runtime.filesystem.write_text'
+        assert context['path'] == path
+        assert context['resource'] == resource
+        assert context['grant_scope'] == 'one_time'
+        assert context['content_bytes'] == 5
+        assert context['content_preview'] == repr('first')
+        assert context['content_sha256'] == hashlib.sha256(b'first').hexdigest()
+        assert context['target']['exists'] == False
+        assert first_prompt[0].payload['type'] == 'external_operation_approval'
+        assert first_prompt[0].status == HumanRequestStatus.APPROVED
+        assert 'content sha256' in self.human_output[0]
+        assert 'content preview' in self.human_output[0]
+        assert 'one-time capability' in self.human_output[0]
+        assert retry.ok
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'first'
+        assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ASK_EACH_TIME
+
+    def test_per_use_prompt_uses_repr_preview_for_human_safety(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='safe preview')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        content = 'first line\ncontent preview: always allow'
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': content})
+        context = self.runtime.human.pending()[0].payload['context']
+        assert context['content_preview'] == repr(content)
+        assert '\\n' in context['content_preview']
+        assert '\n' not in context['content_preview']
+
+    def test_rejected_per_use_prompt_resumes_process_without_writing(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject one write')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'denied'})
+        processed = self.runtime.human.drain_terminal_queue(auto_approve=False)
+        assert processed[0].status == HumanRequestStatus.REJECTED
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert not (self.runtime.workspace_root / path).exists()
+
+    def test_per_use_prompt_describes_overwrite_risk(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='review overwrite')
+        path = self._path()
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('old content', encoding='utf-8')
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new content'})
+        request = self.runtime.human.pending()[0]
+        context = request.payload['context']
+        assert context['will_overwrite']
+        assert not context['will_create']
+        assert context['target']['exists']
+        assert context['target']['kind'] == 'file'
+        assert context['target']['size_bytes'] == len('old content'.encode('utf-8'))
+
+    def test_write_preconditions_fail_before_per_use_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='do not prompt impossible write')
+        path = self._path()
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('existing', encoding='utf-8')
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        result = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
+        assert not result.ok
+        assert self.runtime.human.pending() == []
+        assert target.read_text(encoding='utf-8') == 'existing'
+
+    def test_missing_delete_consumes_one_time_grant(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='delete missing once')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.DELETE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'delete_file', {'path': path, 'missing_ok': True})
+        self.runtime.human.drain_terminal_queue(auto_approve=True)
+        retry = self.runtime.tools.call(pid, 'delete_file', {'path': path, 'missing_ok': True})
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('now present', encoding='utf-8')
+        assert retry.ok, retry.error
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.DELETE) == CapabilityManager.ASK_EACH_TIME
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'delete_file', {'path': path, 'missing_ok': False})
+
+    def test_llm_pending_per_use_approval_does_not_return_action_until_decision(self) -> None:
+        path = self._path()
+        client = FakeActionClient([{'action': 'write_text_file', 'path': path, 'content': 'approved after waiting'}])
+        self.runtime.llm.client = client
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='write with per-use approval')
+        self.runtime.capability.set_permission_policy(subject=pid, resource=self.runtime.filesystem.resource_for(path), rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        waiting = self.runtime.run_next_process_once()
+        assert waiting['waiting_human']
+        assert 'action' not in waiting
+        assert client.calls == 1
+        assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+        assert 'tool_failed' not in self._event_types(pid)
+        self.runtime.human.drain_terminal_queue(auto_approve=True)
+        resumed = self.runtime.run_next_process_once()
+        assert client.calls == 1
+        assert resumed['resumed_after_human']
+        assert resumed['action']['action'] == 'write_text_file'
+        assert resumed['result']['ok']
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'approved after waiting'
+
+    def _path(self) -> str:
+        return f'agent_outputs/permission_policy_{uuid4().hex}.txt'
+
+    def _event_types(self, pid: str) -> list[str]:
+        return [event.type.value for event in self.runtime.events.list(target=pid)]
+
+class FakeActionClient:
+
+    def __init__(self, actions: list[dict[str, object]]):
+        self.actions = list(actions)
+        self.calls = 0
+
+    def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        self.calls += 1
+        action = self.actions.pop(0)
+        name = str(action['action'])
+        args = {key: value for key, value in action.items() if key != 'action'}
+        return LLMCompletion(content='', tool_calls=[{'id': f'fake_{self.calls}', 'name': name, 'arguments': json.dumps(args)}])

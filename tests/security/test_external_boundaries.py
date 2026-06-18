@@ -1,0 +1,126 @@
+from __future__ import annotations
+import pytest
+from uuid import uuid4
+from agent_libos import Runtime
+from agent_libos.models import CapabilityRight, ForkMode, HumanRequestStatus
+
+class TestExternalBoundary:
+
+    def setup_method(self) -> None:
+        self.runtime = Runtime.open('local')
+        self.human_output: list[str] = []
+        self.runtime.substrate.human.output_sink = self.human_output.append
+
+    def teardown_method(self) -> None:
+        self.runtime.close()
+
+    def test_read_file_tool_cannot_bypass_filesystem_capability(self) -> None:
+        path = self._write_workspace_fixture('hello from workspace')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='read a file')
+        denied = self.runtime.tools.call(pid, 'read_text_file', {'path': path})
+        assert not denied.ok
+        assert 'lacks read' in (denied.error or '')
+        assert 'primitive.filesystem.read_text' not in self._audit_actions()
+        self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by='test')
+        allowed = self.runtime.tools.call(pid, 'read_text_file', {'path': path})
+        assert allowed.ok
+        assert allowed.payload['content'] == 'hello from workspace'
+        assert 'primitive.filesystem.read_text' in self._audit_actions()
+
+    def test_write_file_tool_cannot_bypass_filesystem_capability(self) -> None:
+        path = f'agent_outputs/boundary_write_{uuid4().hex}.txt'
+        target = self.runtime.workspace_root / path
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='write a file')
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'denied'})
+        assert not denied.ok
+        assert not target.exists()
+        self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by='test')
+        allowed = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'allowed'})
+        assert allowed.ok
+        assert target.read_text(encoding='utf-8') == 'allowed'
+        assert 'primitive.filesystem.write_text' in self._audit_actions()
+
+    def test_write_precondition_does_not_leak_existing_file_without_capability(self) -> None:
+        path = self._write_workspace_fixture('existing')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='probe existing file')
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
+        assert not denied.ok
+        assert 'lacks write' in (denied.error or '')
+        assert 'already exists' not in (denied.error or '')
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'existing'
+
+    def test_delete_precondition_does_not_leak_missing_file_without_capability(self) -> None:
+        path = f'agent_outputs/missing_delete_{uuid4().hex}.txt'
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='probe missing file')
+        denied = self.runtime.tools.call(pid, 'delete_file', {'path': path})
+        assert not denied.ok
+        assert 'lacks delete' in (denied.error or '')
+        assert 'does not exist' not in (denied.error or '')
+
+    def test_human_output_tool_cannot_bypass_human_capability(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='speak to the human')
+        denied = self.runtime.tools.call(pid, 'human_output', {'message': 'denied'})
+        assert not denied.ok
+        assert self.human_output == []
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+        allowed = self.runtime.tools.call(pid, 'human_output', {'message': 'allowed'})
+        assert allowed.ok
+        assert self.human_output == ['allowed']
+        assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
+        assert 'human.output' in self._audit_actions()
+
+    def test_one_time_human_output_capability_is_consumed_after_delivery(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='speak once')
+        self.runtime.capability.grant_once(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+        first = self.runtime.tools.call(pid, 'human_output', {'message': 'first'})
+        second = self.runtime.tools.call(pid, 'human_output', {'message': 'second'})
+        assert first.ok, first.error
+        assert not second.ok
+        assert self.human_output == ['first']
+        assert not self.runtime.capability.check(pid, 'human:owner', CapabilityRight.WRITE)
+
+    def test_process_cannot_call_tool_outside_creation_tool_table(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='call unavailable tool')
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': 'agent_outputs/no_tool.txt', 'content': 'x'})
+        assert not denied.ok
+        assert 'not in process tool table' in (denied.error or '')
+        assert 'human.query' not in self._audit_actions()
+
+    def test_path_escape_is_denied_by_filesystem_primitive(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='escape workspace')
+        self.runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by='test')
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': '../outside.txt', 'content': 'denied'})
+        assert not denied.ok
+        assert 'escapes filesystem adapter root' in (denied.error or '')
+        assert 'primitive.filesystem.write_text' not in self._audit_actions()
+
+    def test_revoked_filesystem_capability_denies_write(self) -> None:
+        path = f'agent_outputs/revoked_write_{uuid4().hex}.txt'
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='revoked write')
+        cap = self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by='test')
+        self.runtime.capability.revoke(cap.cap_id, revoked_by='test', reason='boundary test')
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'denied'})
+        assert not denied.ok
+        assert not (self.runtime.workspace_root / path).exists()
+        assert 'primitive.filesystem.write_text' not in self._audit_actions()
+
+    def test_fork_does_not_inherit_parent_filesystem_write_capability(self) -> None:
+        path = f'agent_outputs/fork_write_{uuid4().hex}.txt'
+        parent = self.runtime.process.spawn(image='review-agent:v0', goal='parent')
+        self.runtime.filesystem.grant_path(parent, path, [CapabilityRight.WRITE], issued_by='test')
+        child = self.runtime.process.fork(parent, goal='child', mode=ForkMode.WORKER)
+        denied = self.runtime.tools.call(child, 'write_text_file', {'path': path, 'content': 'denied'})
+        allowed = self.runtime.tools.call(parent, 'write_text_file', {'path': path, 'content': 'allowed'})
+        assert not denied.ok
+        assert allowed.ok
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'allowed'
+
+    def _write_workspace_fixture(self, content: str) -> str:
+        path = f'agent_outputs/boundary_read_{uuid4().hex}.txt'
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+        return path
+
+    def _audit_actions(self) -> list[str]:
+        return [record.action for record in self.runtime.audit.trace()]

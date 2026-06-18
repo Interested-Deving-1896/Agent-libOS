@@ -8,7 +8,7 @@ export type SchedulerStatus = {
   last_error: string | null;
   started_at: number | null;
   finished_at: number | null;
-  default_max_quanta: number;
+  default_max_quanta: number | null;
 };
 
 export type RuntimeProcess = {
@@ -102,6 +102,45 @@ export type ToolSummary = {
   ephemeral: boolean;
 };
 
+export type ImageSummary = {
+  image_id: string;
+  name: string;
+  version: string;
+  boot_kind: string;
+  default_tools: string[];
+  default_skills: string[];
+  required_capabilities_count: number;
+  [key: string]: unknown;
+};
+
+export type ImageInspectResult = {
+  image: {
+    image_id: string;
+    name: string;
+    version: string;
+    default_tools: string[];
+    default_skills: string[];
+    required_capabilities: Record<string, unknown>[];
+    boot: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  registry: Record<string, unknown>;
+  artifact: Record<string, unknown> | null;
+};
+
+export type ImageMutationResult = {
+  image_id: string;
+  name: string;
+  version: string;
+  replaced: boolean;
+  boot: Record<string, unknown>;
+  default_tools?: string[];
+  default_skills?: string[];
+  required_capabilities_count: number;
+  source?: string | null;
+};
+
 export type RuntimeSnapshot = {
   db: string;
   scheduler: SchedulerStatus;
@@ -111,6 +150,7 @@ export type RuntimeSnapshot = {
   audit: AuditRecord[];
   llm_calls: LlmCall[];
   tools: ToolSummary[];
+  images: ImageSummary[];
   skills: Record<string, unknown>[];
   jsonrpc_endpoints: Record<string, unknown>[];
   modules: Record<string, unknown>[];
@@ -120,6 +160,12 @@ export type GuiConnection = {
   url: string;
   token: string;
   db: string;
+};
+
+export type ImageManifestFile = {
+  path: string;
+  name: string;
+  content: string;
 };
 
 export type SseMessage = {

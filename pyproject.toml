@@ -23,9 +23,40 @@ dependencies = [
     "pydantic>=2.13.4",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-cov>=6.2.0",
+    "pytest-timeout>=2.4.0",
+]
+
 [project.scripts]
 agent-libos = "agent_libos.api.cli:main"
 agent-libos-gui-server = "agent_libos.api.gui.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_libos"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+timeout = 120
+filterwarnings = [
+    "error::RuntimeWarning",
+    "default::DeprecationWarning",
+]
+markers = [
+    "unit: fast pure-Python and parser/model tests",
+    "runtime: runtime lifecycle, scheduler, process, persistence, and memory tests",
+    "security: capability, policy, approval, filesystem, shell, and JIT containment tests",
+    "self_evolution: Skill, checkpoint, image, launcher, and agent self-evolution tests",
+    "providers: provider substrate, CLI, GUI server, JSON-RPC, clock, and script smoke tests",
+    "benchmark: deterministic runtime-safety benchmark harness tests",
+    "invariant(id): runtime safety invariant covered by the test",
+    "real_deno: requires --run-real-deno and a deno executable",
+    "real_llm: requires --run-real-llm and OpenAI-compatible credentials",
+]

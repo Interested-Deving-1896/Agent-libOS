@@ -5,12 +5,13 @@ on:
   pull_request:
 
 jobs:
-  unit:
+  python:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.14"]
+        lane: ["unit", "runtime", "security", "self-evolution", "providers", "benchmark"]
 
     steps:
       - name: Check out repository
@@ -27,10 +28,39 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --all-groups
 
       - name: Compile Python sources
         run: uv run python -m compileall agent_libos tests scripts experiments benchmarks
 
-      - name: Run unit tests
-        run: uv run python -m unittest discover -s tests -v
+      - name: Check pytest collection
+        run: uv run python -m pytest --collect-only -q tests
+
+      - name: Check invariant manifest
+        run: uv run python scripts/check_test_invariants.py
+
+      - name: Run pytest lane
+        run: uv run python scripts/test_matrix.py --lane ${{ matrix.lane }}
+
+  gui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Install GUI dependencies
+        run: npm --prefix gui ci
+
+      - name: Run GUI checks
+        run: |
+          npm --prefix gui run test
+          npm --prefix gui run typecheck
+          npm --prefix gui run build

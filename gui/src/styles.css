@@ -90,6 +90,21 @@ button.secondary {
   padding: 4px 7px;
 }
 
+.imageSelect {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: #52606d;
+  font-size: 12px;
+}
+
+.imageSelect input,
+.imageSelect select {
+  min-width: 0;
+}
+
 input, textarea, select {
   border: 1px solid #cbd2d9;
   border-radius: 6px;
@@ -211,6 +226,10 @@ textarea {
   background: #ffffff;
 }
 
+.userStart .imageSelect {
+  grid-column: 1 / -1;
+}
+
 .userStart h1 {
   grid-column: 1 / -1;
   margin: 0;
@@ -223,6 +242,98 @@ textarea {
   padding: 10px 14px;
   border-bottom: 1px solid #e0b98d;
   background: #fff8ed;
+}
+
+.userImageControls {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.4fr) auto minmax(130px, 1fr) minmax(120px, 0.8fr) 86px auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid #d9e2ec;
+  background: #ffffff;
+}
+
+.userImageControls input {
+  min-width: 0;
+}
+
+.imagePanel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.imagePanel.compact {
+  padding: 10px 14px;
+  border-bottom: 1px solid #d9e2ec;
+  background: #ffffff;
+}
+
+.imagePanelActions,
+.imageCommitBox,
+.imageRow,
+.imageRowActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.imageCommitBox {
+  flex-wrap: wrap;
+}
+
+.imageCommitBox input {
+  min-width: 130px;
+  flex: 1 1 130px;
+}
+
+.imageList {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.imageRow {
+  justify-content: space-between;
+  padding: 8px;
+  border: 1px solid #d9e2ec;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.imageRow > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.imageRow strong,
+.imageRow span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.imageRow span {
+  color: #627d98;
+  font-size: 12px;
+}
+
+.imageRowActions {
+  flex-shrink: 0;
+}
+
+.inlineToggle {
+  height: 32px;
+  white-space: nowrap;
+}
+
+.inlineToast {
+  position: static;
+  width: auto;
 }
 
 .userRequestCard {
@@ -284,6 +395,105 @@ textarea {
   white-space: pre-wrap;
   margin: 0;
   line-height: 1.45;
+}
+
+.markdownMessage {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.markdownMessage > :first-child {
+  margin-top: 0;
+}
+
+.markdownMessage > :last-child {
+  margin-bottom: 0;
+}
+
+.markdownMessage p,
+.markdownMessage ul,
+.markdownMessage ol,
+.markdownMessage blockquote,
+.markdownMessage pre,
+.markdownTableWrap {
+  margin: 0 0 8px;
+}
+
+.markdownMessage p {
+  white-space: normal;
+}
+
+.markdownMessage ul,
+.markdownMessage ol {
+  padding-left: 20px;
+}
+
+.markdownMessage li {
+  margin: 2px 0;
+}
+
+.markdownMessage blockquote {
+  padding-left: 10px;
+  border-left: 3px solid #cbd2d9;
+  color: #486581;
+}
+
+.markdownMessage code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: #edf2f7;
+  color: #243b53;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
+.markdownMessage pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 9px 10px;
+  border-radius: 6px;
+  background: #1f2933;
+  color: #eef2f6;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.markdownMessage pre code {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  white-space: pre;
+}
+
+.markdownMessage a {
+  color: #16697a;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdownTableWrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdownMessage table {
+  width: max-content;
+  max-width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.markdownMessage th,
+.markdownMessage td {
+  padding: 5px 7px;
+  border: 1px solid #d9e2ec;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdownMessage th {
+  background: #f2f5f7;
 }
 
 .conversationBubble time,
@@ -402,6 +612,11 @@ textarea {
   gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid #d9e2ec;
+}
+
+.spawnBox .imageSelect,
+.quickActions > .imageSelect {
+  grid-template-columns: 1fr;
 }
 
 .processTree {
@@ -567,8 +782,8 @@ textarea {
   border-bottom: 1px solid #d9e2ec;
 }
 
-.quickActions input:nth-of-type(2),
-.quickActions input:nth-of-type(3) {
+.quickActions > .imageSelect,
+.quickActions > input[aria-label] {
   grid-column: 1 / -1;
 }
 

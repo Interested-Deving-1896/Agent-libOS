@@ -62,7 +62,7 @@ function snapshot(): RuntimeSnapshot {
       last_error: null,
       started_at: null,
       finished_at: null,
-      default_max_quanta: 25
+      default_max_quanta: null
     },
     processes: [
       {
@@ -174,6 +174,7 @@ function snapshot(): RuntimeSnapshot {
       }
     ],
     tools: [],
+    images: [],
     skills: [],
     jsonrpc_endpoints: [],
     modules: []

@@ -63,7 +63,9 @@ uv run agent-libos --db .agent_libos.sqlite tools
 ```
 
 `run` uses the high-level async supervisor, so human terminal messages are
-processed as part of runtime execution.
+processed as part of runtime execution. Without `--max-quanta`, it runs until
+the runtime becomes idle; pass `--max-quanta <n>` to bound the number of LLM/tool
+quanta.
 
 Manual queue processing remains available:
 
@@ -120,7 +122,7 @@ Useful options:
 - `--reply-to <message_id>`
 - `--payload-json <object>`
 - `--run`
-- `--max-quanta <n>`
+- `--max-quanta <n>`: optional; omitted means run until idle.
 
 ## Process Builtins
 
@@ -142,7 +144,7 @@ Useful exec options:
 - `--preserve-memory` / `--no-preserve-memory`
 - `--preserve-capabilities`
 - `--run` / `--no-run`
-- `--max-quanta <n>`
+- `--max-quanta <n>`: optional when `--run` is set; omitted means run until idle.
 
 Exec never grants target-image `required_capabilities` automatically.
 

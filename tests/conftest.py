@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import os
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+from agent_libos.utils.yaml_loader import load_yaml_mapping
+
+LANE_DIRS = {
+    "unit": "unit",
+    "runtime": "runtime",
+    "security": "security",
+    "self_evolution": "self_evolution",
+    "providers": "providers",
+    "benchmark": "benchmarks",
+}
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-real-deno",
+        action="store_true",
+        default=False,
+        help="run tests that execute a real deno binary",
+    )
+    parser.addoption(
+        "--run-real-llm",
+        action="store_true",
+        default=False,
+        help="run tests that spend real LLM/provider calls",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    root = Path(config.rootpath)
+    run_real_deno = bool(config.getoption("--run-real-deno"))
+    run_real_llm = bool(config.getoption("--run-real-llm"))
+    invariant_marks = _load_invariant_marks(root)
+
+    for item in items:
+        _mark_lane(root, item)
+        for invariant_id in invariant_marks.get(item.nodeid.replace("\\", "/"), ()):
+            item.add_marker(pytest.mark.invariant(invariant_id))
+        if "real_deno" in item.keywords:
+            if not run_real_deno:
+                item.add_marker(pytest.mark.skip(reason="real Deno tests require --run-real-deno"))
+            elif shutil.which("deno") is None:
+                item.add_marker(pytest.mark.skip(reason="deno not installed"))
+        if "real_llm" in item.keywords:
+            if not run_real_llm:
+                item.add_marker(pytest.mark.skip(reason="real LLM tests require --run-real-llm"))
+            elif not _has_real_llm_environment():
+                item.add_marker(pytest.mark.skip(reason="real LLM environment is not configured"))
+
+
+def _mark_lane(root: Path, item: pytest.Item) -> None:
+    try:
+        rel = Path(str(item.fspath)).resolve().relative_to(root)
+    except ValueError:
+        return
+    parts = rel.parts
+    if len(parts) < 2 or parts[0] != "tests":
+        return
+    for marker, directory in LANE_DIRS.items():
+        if parts[1] == directory:
+            item.add_marker(getattr(pytest.mark, marker))
+            return
+
+
+def _has_real_llm_environment() -> bool:
+    return bool(
+        os.getenv("OPENAI_API_KEY")
+        and (os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"))
+    )
+
+
+def _load_invariant_marks(root: Path) -> dict[str, list[str]]:
+    manifest = root / "tests" / "invariants.yaml"
+    if not manifest.exists():
+        return {}
+    text = manifest.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = load_yaml_mapping(text)
+    marks: dict[str, list[str]] = {}
+    for invariant in data.get("invariants", []):
+        invariant_id = str(invariant.get("id", "")).strip()
+        if not invariant_id:
+            continue
+        for node_id in invariant.get("node_ids", []):
+            if isinstance(node_id, str) and node_id:
+                marks.setdefault(node_id.replace("\\", "/"), []).append(invariant_id)
+    return marks

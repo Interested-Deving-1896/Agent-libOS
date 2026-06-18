@@ -5,22 +5,30 @@
 Agent libOS is a Python runtime with an optional Electron GUI. Core runtime code
 lives in `agent_libos/`, organized by subsystem: `runtime/`, `primitives/`,
 `capability/`, `memory/`, `skills/`, `modules/`, `tools/`, `substrate/`, and
-`api/` for CLI/GUI server entrypoints. Tests live in `tests/` and follow the
-same feature boundaries. Benchmark code and fixtures are under
-`benchmarks/runtime_safety/`, with runners in `experiments/`. Documentation is
-in `docs/`; the Electron/React frontend is in `gui/`; example skills live in
-`skills/`.
+`api/` for CLI/GUI server entrypoints. Pytest tests live in `tests/` and are
+split by lane: `unit/`, `runtime/`, `security/`, `self_evolution/`,
+`providers/`, `benchmarks/`, and shared helpers in `support/`. Benchmark code
+and fixtures are under `benchmarks/runtime_safety/`, with runners in
+`experiments/`. Documentation is in `docs/`; the Electron/React frontend is in
+`gui/`; example skills live in `skills/`.
 
 ## Build, Test, and Development Commands
 
-- `uv sync --frozen`: install the locked Python environment.
+- `uv sync --frozen --all-groups`: install the locked Python environment,
+  including pytest tooling.
 - `uv run python -m compileall agent_libos tests scripts experiments benchmarks`:
   catch syntax/import errors.
-- `uv run python -m unittest discover -s tests -v`: run the Python test suite.
+- `uv run python scripts/test_matrix.py --lane unit`: run fast pure-Python tests.
+- `uv run python scripts/test_matrix.py --lane security`: run capability,
+  approval, filesystem, shell, and JIT containment tests.
+- `uv run python scripts/test_matrix.py --lane all`: run all deterministic
+  Python pytest lanes.
+- `uv run python scripts/check_test_invariants.py`: verify the invariant
+  coverage manifest.
 - `uv run agent-libos --help`: inspect CLI commands.
 - `uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/smoke`: run a deterministic benchmark smoke.
-- `npm --prefix gui run typecheck` and `npm --prefix gui run build`: validate
-  the Electron/React app.
+- `uv run python scripts/test_matrix.py --lane gui`: run GUI Vitest,
+  typecheck, and build.
 
 ## Coding Style & Naming Conventions
 
@@ -34,10 +42,11 @@ Capability v2, human approval, provider policy, events, and audit. TypeScript in
 ## Testing Guidelines
 
 Add or update tests with each behavior change. Name Python tests
-`tests/test_<feature>.py` and test methods `test_<expected_behavior>`. Security
-or authority changes need denial-path tests, audit/event assertions, and, where
-relevant, benchmark coverage. Real LLM and Deno paths must remain opt-in; default
-tests should be deterministic and token-free.
+`tests/<lane>/test_<feature>.py` and test methods `test_<expected_behavior>`.
+Security or authority changes need denial-path tests, audit/event assertions,
+and an entry in `tests/invariants.yaml` when they protect a runtime invariant.
+Real LLM and Deno paths must remain opt-in through pytest markers; default tests
+should be deterministic and token-free.
 
 ## Commit & Pull Request Guidelines
 

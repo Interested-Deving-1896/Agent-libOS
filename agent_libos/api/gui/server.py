@@ -85,7 +85,7 @@ class GuiEventBroadcaster:
 class SchedulerController:
     service: "GuiRuntimeService"
     auto_run: bool = True
-    default_max_quanta: int = _RUNTIME_DEFAULTS.run_until_idle_max_quanta
+    default_max_quanta: int | None = _RUNTIME_DEFAULTS.run_until_idle_max_quanta
     running: bool = False
     paused: bool = False
     task_id: str | None = None
@@ -141,7 +141,7 @@ class SchedulerController:
             self.started_at = time.time()
             self.finished_at = None
             self.last_error = None
-            selected_quanta = max_quanta or self.default_max_quanta
+            selected_quanta = max_quanta if max_quanta is not None else self.default_max_quanta
             thread = threading.Thread(
                 target=self._run_background,
                 args=(selected_quanta, pid),
@@ -197,7 +197,7 @@ class SchedulerController:
                 self.finished_at = time.time()
             self.service.publish_scheduler_status()
 
-    def _run_background(self, max_quanta: int, pid: str | None) -> None:
+    def _run_background(self, max_quanta: int | None, pid: str | None) -> None:
         try:
             result = (
                 self.service.runtime.run_process_until_idle(pid, max_quanta=max_quanta)
@@ -227,7 +227,7 @@ class GuiRuntimeService:
         runtime: Runtime | None = None,
         token: str | None = None,
         auto_run: bool = True,
-        max_quanta: int = _RUNTIME_DEFAULTS.run_until_idle_max_quanta,
+        max_quanta: int | None = _RUNTIME_DEFAULTS.run_until_idle_max_quanta,
     ) -> None:
         self.db = db
         self.runtime = runtime or Runtime.open(db)
@@ -311,6 +311,7 @@ class GuiRuntimeService:
             "audit": to_jsonable(self.runtime.audit.trace(limit=200)),
             "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=100)),
             "tools": self._tool_summaries(),
+            "images": to_jsonable(self.runtime.image_registry.list_images()),
             "skills": to_jsonable(self.runtime.skills.discover_skills(require_capability=False)),
             "jsonrpc_endpoints": to_jsonable(self.runtime.jsonrpc.list_endpoints(require_capability=False)),
             "modules": to_jsonable(self.runtime.modules.loaded_module_summaries()),
@@ -447,7 +448,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             )
             service.publish_runtime_changes("process.spawn")
             if body.get("auto_run", True):
-                service.scheduler.maybe_start(max_quanta=_int_or_none(body.get("max_quanta")), reason=f"spawn:{pid}")
+                service.scheduler.maybe_start(
+                    max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                    reason=f"spawn:{pid}",
+                )
             return {"pid": pid, "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
         if route[:2] == ["scheduler", "auto"] and method == "POST":
             body = self._read_body()
@@ -492,7 +496,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service.runtime.checkpoint.list(pid=pid, actor=None, require_capability=False)
         if method == "POST" and route == ["run"]:
             body = self._read_body()
-            return service.scheduler.start(pid=pid, max_quanta=_int_or_none(body.get("max_quanta")), reason=f"run:{pid}")
+            return service.scheduler.start(
+                pid=pid,
+                max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                reason=f"run:{pid}",
+            )
         if method == "POST" and route == ["step"]:
             return service.scheduler.run_step(pid)
         if method == "POST" and route == ["pause"]:
@@ -527,7 +535,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             )
             service.publish_runtime_changes(f"process.{kind.value}_message")
             if body.get("auto_run", True):
-                service.scheduler.maybe_start(max_quanta=_int_or_none(body.get("max_quanta")), reason=f"message:{pid}")
+                service.scheduler.maybe_start(
+                    max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                    reason=f"message:{pid}",
+                )
             return {"message": to_jsonable(message), "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
         if method == "POST" and route == ["cd"]:
             body = self._read_body()
@@ -547,7 +558,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             )
             service.publish_runtime_changes("process.exec")
             if body.get("auto_run", True):
-                service.scheduler.maybe_start(max_quanta=_int_or_none(body.get("max_quanta")), reason=f"exec:{pid}")
+                service.scheduler.maybe_start(
+                    max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                    reason=f"exec:{pid}",
+                )
             return {"process": to_jsonable(process), "scheduler": service.scheduler.status()}
         if method == "POST" and route == ["exit"]:
             body = self._read_body()
@@ -582,7 +596,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service.runtime.checkpoint.list(pid=_query_str(query, "pid"), actor=None, require_capability=False)
         if method == "POST" and route == ["create"]:
             body = self._read_body()
-            checkpoint_id = service.runtime.checkpoint.create(str(body["pid"]), str(body.get("reason") or "GUI checkpoint"), actor=str(body.get("actor") or "gui"), require_capability=False)
+            checkpoint_id = service.runtime.checkpoint.create(
+                str(body["pid"]),
+                str(body.get("reason") or "GUI checkpoint"),
+                actor=str(body.get("actor") or "gui"),
+                require_capability=body.get("actor") is not None,
+            )
             service.publish_runtime_changes("checkpoint.create")
             return {"checkpoint_id": checkpoint_id}
         if method == "GET" and len(route) == 1:
@@ -592,13 +611,22 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and len(route) == 2 and route[1] == "restore":
             body = self._read_body()
             self._require_confirmed("checkpoint.restore", body, {"checkpoint_id": route[0]})
-            result = service.runtime.checkpoint.restore(str(body.get("actor") or "gui"), route[0], require_capability=False)
+            result = service.runtime.checkpoint.restore(
+                str(body.get("actor") or "gui"),
+                route[0],
+                require_capability=body.get("actor") is not None,
+            )
             service.publish_runtime_changes("checkpoint.restore")
             return result
         if method == "POST" and len(route) == 2 and route[1] == "fork":
             body = self._read_body()
             self._require_confirmed("checkpoint.fork", body, {"checkpoint_id": route[0], "parent_pid": body.get("parent_pid")})
-            result = service.runtime.checkpoint.fork_from_checkpoint(str(body.get("actor") or "gui"), route[0], parent_pid=body.get("parent_pid"), require_capability=False)
+            result = service.runtime.checkpoint.fork_from_checkpoint(
+                str(body.get("actor") or "gui"),
+                route[0],
+                parent_pid=body.get("parent_pid"),
+                require_capability=body.get("actor") is not None,
+            )
             service.publish_runtime_changes("checkpoint.fork")
             return result
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown checkpoint endpoint")
@@ -661,6 +689,44 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service.runtime.image_registry.list_images()
         if method == "GET" and len(route) == 1:
             return service.runtime.image_registry.inspect(route[0])
+        if method == "POST" and route == ["register"]:
+            body = self._read_body()
+            self._require_confirmed(
+                "image.register",
+                body,
+                {
+                    "source": body.get("source"),
+                    "replace": body.get("replace", False),
+                    "admin_mode": body.get("actor") is None,
+                },
+            )
+            if "path" in body:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "GUI image registration accepts manifest_text, not host file paths",
+                )
+            manifest_text = body.get("manifest_text")
+            if not isinstance(manifest_text, str) or not manifest_text.strip():
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "image registration requires non-empty manifest_text")
+            result = service.runtime.image_registry.register_from_yaml_text(
+                manifest_text,
+                actor=str(body.get("actor") or "gui"),
+                replace=bool(body.get("replace", False)),
+                require_capability=body.get("actor") is not None,
+                source=body.get("source"),
+            )
+            service.publish_runtime_changes("image.register")
+            return {
+                "image_id": result.image.image_id,
+                "name": result.image.name,
+                "version": result.image.version,
+                "source": result.source,
+                "replaced": result.replaced,
+                "boot": result.image.boot,
+                "default_tools": list(result.image.default_tools),
+                "default_skills": list(result.image.default_skills),
+                "required_capabilities_count": len(result.image.required_capabilities),
+            }
         if method == "POST" and route == ["commit"]:
             body = self._read_body()
             self._require_confirmed(
@@ -708,7 +774,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST,
                     "GUI JSON-RPC registration accepts manifest_text, not host file paths",
                 )
-            text = str(body["manifest_text"])
+            text = body.get("manifest_text")
+            if not isinstance(text, str) or not text.strip():
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "JSON-RPC registration requires non-empty manifest_text")
             result = service.runtime.jsonrpc.register_endpoint_from_yaml_text(text, actor=str(body.get("actor") or "gui"), replace=bool(body.get("replace", False)), require_capability=False, source=body.get("source"))
             service.publish_runtime_changes("jsonrpc.register")
             return result
@@ -765,7 +833,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _read_body(self, optional: bool = False) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_length = self.headers.get("Content-Length", "0") or "0"
+        try:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, "invalid Content-Length header") from exc
+        if length < 0:
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, "invalid Content-Length header")
         if length > _GUI_DEFAULTS.request_body_max_bytes:
             if length <= _GUI_DEFAULTS.request_body_max_bytes * 2:
                 self.rfile.read(length)
@@ -788,7 +862,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
     def _require_auth(self) -> None:
         token = self.server.service.token
         header = self.headers.get("Authorization", "")
-        if header != f"Bearer {token}":
+        if not secrets.compare_digest(header, f"Bearer {token}"):
             raise GuiServerError(HTTPStatus.UNAUTHORIZED, "missing or invalid GUI session token")
 
     def _require_confirmed(self, action: str, body: dict[str, Any], preview: dict[str, Any]) -> None:
@@ -817,7 +891,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_common_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = _allowed_cors_origin(self.headers.get("Origin"))
+        if origin is not None:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         if self.close_connection:
@@ -831,7 +908,7 @@ def create_gui_http_server(
     port: int = 0,
     token: str | None = None,
     auto_run: bool = True,
-    max_quanta: int = _RUNTIME_DEFAULTS.run_until_idle_max_quanta,
+    max_quanta: int | None = _RUNTIME_DEFAULTS.run_until_idle_max_quanta,
     runtime: Runtime | None = None,
 ) -> GuiHTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
@@ -846,7 +923,7 @@ def serve(
     port: int,
     token: str | None,
     auto_run: bool,
-    max_quanta: int,
+    max_quanta: int | None,
     ready: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     server = create_gui_http_server(db=db, port=port, token=token, auto_run=auto_run, max_quanta=max_quanta)
@@ -869,8 +946,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--token")
     parser.add_argument("--no-auto-run", action="store_true")
-    parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    parser.add_argument("--max-quanta", type=int, help="Optional default quantum budget for GUI scheduler runs; omitted is unlimited.")
     args = parser.parse_args(argv)
+    if args.max_quanta is not None and args.max_quanta <= 0:
+        parser.error("--max-quanta must be a positive integer when provided")
     serve(
         db=args.db,
         port=args.port,
@@ -883,7 +962,19 @@ def main(argv: list[str] | None = None) -> None:
 def _int_or_none(value: Any) -> int | None:
     if value in {None, ""}:
         return None
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, "integer value expected") from exc
+
+
+def _positive_int_or_none(value: Any, name: str) -> int | None:
+    parsed = _int_or_none(value)
+    if parsed is None:
+        return None
+    if parsed <= 0:
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{name} must be a positive integer or omitted")
+    return parsed
 
 
 def _query_int(query: dict[str, list[str]], key: str) -> int | None:
@@ -894,3 +985,14 @@ def _query_int(query: dict[str, list[str]], key: str) -> int | None:
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _allowed_cors_origin(origin: str | None) -> str | None:
+    if not origin:
+        return None
+    if origin == "null":
+        return origin
+    parsed = urlparse(origin)
+    if parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost"}:
+        return origin
+    return None

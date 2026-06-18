@@ -22,9 +22,9 @@ export function TopBar({
 }: {
   db: string;
   scheduler: SchedulerStatus | null;
-  maxQuanta: number;
+  maxQuanta: number | null;
   selectedPid: string | null;
-  onMaxQuantaChange(value: number): void;
+  onMaxQuantaChange(value: number | null): void;
   onOpenDb(): void;
   onUseDb(value: string): void;
   onSpawn(): void;
@@ -60,7 +60,15 @@ export function TopBar({
       </label>
       <label className="quanta">
         {t("top.quanta")}
-        <input type="number" min={1} max={200} value={maxQuanta} onChange={(event) => onMaxQuantaChange(Number(event.currentTarget.value))} />
+        <input
+          type="number"
+          min={1}
+          step={1}
+          value={maxQuanta ?? ""}
+          placeholder={t("scheduler.unlimitedPlaceholder")}
+          title={t("scheduler.unlimitedHint")}
+          onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
+        />
       </label>
       <button title={t("top.runSelected")} disabled={!selectedPid || scheduler?.running} onClick={onRun}><Play size={16} />{t("user.run")}</button>
       <button title={t("top.stepSelected")} disabled={!selectedPid || scheduler?.running} onClick={onStep}><StepForward size={16} />{t("top.step")}</button>
@@ -71,4 +79,10 @@ export function TopBar({
       <span className={`scheduler ${scheduler?.running ? "running" : ""}`}><Square size={11} />{scheduler?.running ? t("top.running") : scheduler?.paused ? t("top.paused") : t("top.idle")}</span>
     </header>
   );
+}
+
+function parseOptionalQuanta(value: string): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }

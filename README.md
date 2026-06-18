@@ -107,13 +107,15 @@ Start here, then read the deeper references as needed:
 Install dependencies:
 
 ```bash
-uv sync
+uv sync --frozen --all-groups
 ```
 
 Run tests:
 
 ```bash
-uv run python -m unittest discover -s tests -v
+uv run python scripts/test_matrix.py --lane unit
+uv run python scripts/test_matrix.py --lane security
+uv run python scripts/check_test_invariants.py
 ```
 
 Run the deterministic local demo:
@@ -131,7 +133,8 @@ npm --prefix gui run electron:dev
 
 The GUI starts a local `agent-libos-gui-server`, subscribes to runtime events,
 and provides a process-centered console for concurrent messages, interrupts,
-human approvals, scheduler control, audit inspection, and LLM call visibility.
+human approvals, scheduler control, image selection/registration/commit, audit
+inspection, and LLM call visibility.
 
 The demo does not call a real model. It exercises process spawn/fork, Object
 Memory, Deno/TypeScript JIT validation when Deno is available, checkpointing,
@@ -160,6 +163,9 @@ uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite audit
 ```
+
+Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
+you want a bounded run.
 
 Every LLM action-selection call is persisted as an `llm_calls` row with prompt
 messages, visible tool schemas, model output, tool calls, token usage when
@@ -291,9 +297,11 @@ See [docs/invariants.md](docs/invariants.md) for test coverage.
 Run the standard local checks:
 
 ```bash
-uv sync --frozen
+uv sync --frozen --all-groups
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
-uv run python -m unittest discover -s tests -v
+uv run python scripts/test_matrix.py --lane all
+uv run python scripts/check_test_invariants.py
+uv run python scripts/test_matrix.py --lane gui
 git diff --check
 ```
 

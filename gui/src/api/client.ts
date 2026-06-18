@@ -1,6 +1,7 @@
-import type { GuiConnection, RuntimeSnapshot, SseMessage } from "./types";
+import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImageSummary, RuntimeSnapshot, SseMessage } from "./types";
 
 type JsonBody = Record<string, unknown>;
+export type OptionalQuanta = number | null;
 
 export class LibOSClient {
   constructor(private connection: GuiConnection) {}
@@ -21,6 +22,56 @@ export class LibOSClient {
     return this.request("GET", "/api/health");
   }
 
+  async images(): Promise<ImageSummary[]> {
+    return this.request<ImageSummary[]>("GET", "/api/images");
+  }
+
+  async inspectImage(imageId: string): Promise<ImageInspectResult> {
+    return this.request<ImageInspectResult>("GET", `/api/images/${encodeURIComponent(imageId)}`);
+  }
+
+  async registerImageFromManifest(manifestText: string, source: string, confirmed: boolean, replace = false, actor?: string) {
+    return this.request<ImageMutationResult>("POST", "/api/images/register", {
+      manifest_text: manifestText,
+      source,
+      confirmed,
+      replace,
+      ...(actor ? { actor } : {})
+    });
+  }
+
+  async createCheckpoint(pid: string, reason: string) {
+    return this.request<{ checkpoint_id: string }>("POST", "/api/checkpoints/create", { pid, reason });
+  }
+
+  async commitCheckpointToImage({
+    checkpointId,
+    imageId,
+    name,
+    version,
+    confirmed,
+    replace = false,
+    actor
+  }: {
+    checkpointId: string;
+    imageId: string;
+    name: string;
+    version: string;
+    confirmed: boolean;
+    replace?: boolean;
+    actor?: string;
+  }) {
+    return this.request<ImageMutationResult>("POST", "/api/images/commit", {
+      checkpoint_id: checkpointId,
+      image_id: imageId,
+      name,
+      version,
+      confirmed,
+      replace,
+      ...(actor ? { actor } : {})
+    });
+  }
+
   async setAutoRun(enabled: boolean) {
     return this.request("POST", "/api/scheduler/auto", { enabled });
   }
@@ -29,12 +80,12 @@ export class LibOSClient {
     return this.request("POST", "/api/scheduler/pause", {});
   }
 
-  async spawn(goal: string, image: string, maxQuanta: number, autoRun: boolean) {
-    return this.request("POST", "/api/processes", { goal, image, max_quanta: maxQuanta, auto_run: autoRun });
+  async spawn(goal: string, image: string, maxQuanta: OptionalQuanta, autoRun: boolean) {
+    return this.request("POST", "/api/processes", withOptionalQuanta({ goal, image, auto_run: autoRun }, maxQuanta));
   }
 
-  async run(pid: string, maxQuanta: number) {
-    return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/run`, { max_quanta: maxQuanta });
+  async run(pid: string, maxQuanta: OptionalQuanta) {
+    return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/run`, withOptionalQuanta({}, maxQuanta));
   }
 
   async step(pid: string) {
@@ -49,13 +100,12 @@ export class LibOSClient {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/resume`, { auto_run: autoRun });
   }
 
-  async sendMessage(pid: string, body: string, kind: "message" | "interrupt", autoRun: boolean, maxQuanta: number) {
-    return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/${kind}`, {
+  async sendMessage(pid: string, body: string, kind: "message" | "interrupt", autoRun: boolean, maxQuanta: OptionalQuanta) {
+    return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/${kind}`, withOptionalQuanta({
       body,
       auto_run: autoRun,
-      max_quanta: maxQuanta,
       channel: "gui"
-    });
+    }, maxQuanta));
   }
 
   async changeDirectory(pid: string, path: string) {
@@ -126,6 +176,10 @@ export class LibOSClient {
       }
     }
   }
+}
+
+function withOptionalQuanta(body: JsonBody, maxQuanta: OptionalQuanta): JsonBody {
+  return maxQuanta === null ? body : { ...body, max_quanta: maxQuanta };
 }
 
 export function parseSseFrame(frame: string): SseMessage | null {

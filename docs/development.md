@@ -8,13 +8,13 @@ documentation rules for Agent libOS contributors.
 Install dependencies:
 
 ```bash
-uv sync
+uv sync --all-groups
 ```
 
 Use frozen dependency resolution for artifact and CI-style checks:
 
 ```bash
-uv sync --frozen
+uv sync --frozen --all-groups
 ```
 
 Deno is optional for the default Python test suite. Install `deno` or configure
@@ -27,8 +27,24 @@ Run:
 
 ```bash
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
-uv run python -m unittest discover -s tests -v
+uv run python scripts/test_matrix.py --lane unit
+uv run python scripts/test_matrix.py --lane security
+uv run python scripts/check_test_invariants.py
+uv run python scripts/test_matrix.py --lane gui
 git diff --check
+```
+
+Run all deterministic Python lanes:
+
+```bash
+uv run python scripts/test_matrix.py --lane all
+```
+
+Run a specific pytest lane with one of `unit`, `runtime`, `security`,
+`self-evolution`, `providers`, or `benchmark`:
+
+```bash
+uv run python scripts/test_matrix.py --lane runtime
 ```
 
 Useful smoke commands:

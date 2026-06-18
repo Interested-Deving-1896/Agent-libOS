@@ -27,7 +27,7 @@ class RuntimeDefaults:
     coding_image_id: str = "coding-agent:v0"
     default_human: str = "owner"
     terminal_channel: str = "terminal"
-    run_until_idle_max_quanta: int = 25
+    run_until_idle_max_quanta: int | None = None
     launcher_max_quanta: int = 40
 
     @property
@@ -80,7 +80,7 @@ class CapabilityDefaults:
 
 @dataclass(frozen=True)
 class SchedulerDefaults:
-    max_quanta: int = 25
+    max_quanta: int | None = None
     poll_interval_s: float = 0.01
 
 

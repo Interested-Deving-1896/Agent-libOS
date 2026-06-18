@@ -48,16 +48,17 @@ make the credential requirement explicit and must not embed secrets.
 These commands are the M0 baseline checks for the code artifact:
 
 ```bash
-uv sync --frozen
+uv sync --frozen --all-groups
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
-uv run python -m unittest discover -s tests -v
+uv run python scripts/test_matrix.py --lane all
+uv run python scripts/check_test_invariants.py
 ```
 
 For an anonymous artifact branch, add a fresh-clone dry run before submission:
 
 ```bash
-uv sync --frozen
-uv run python -m unittest discover -s tests -v
+uv sync --frozen --all-groups
+uv run python scripts/test_matrix.py --lane all
 ```
 
 The Deno executable is optional for the Python unit suite. Tests that require a

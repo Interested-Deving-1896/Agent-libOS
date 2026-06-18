@@ -1,23 +1,30 @@
 import { AlertTriangle, Bot, Database, MessageSquare, Pause, Play, RefreshCw, Send, Settings, Square } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { GuiConnection, HumanRequest, RuntimeProcess, RuntimeSnapshot } from "../api/types";
+import type { GuiConnection, HumanRequest, ImageSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import { useI18n } from "../i18n";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
+import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
+import { MarkdownMessage } from "./MarkdownMessage";
 
 type UserPageProps = {
   connection: GuiConnection | null;
   snapshot: RuntimeSnapshot | null;
   selectedPid: string | null;
   selectedProcess: RuntimeProcess | null;
-  maxQuanta: number;
+  maxQuanta: number | null;
   spawnGoal: string;
+  spawnImage: string;
   message: string;
+  images: ImageSummary[];
   onSelectPid(pid: string): void;
-  onMaxQuantaChange(value: number): void;
+  onMaxQuantaChange(value: number | null): void;
   onSpawnGoalChange(value: string): void;
+  onSpawnImageChange(value: string): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
+  onImportImage(): void;
+  onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
   onSend(kind: "message" | "interrupt"): void;
   onRespond(request: HumanRequest, approved: boolean, answer?: string): void;
   onRun(): void;
@@ -35,12 +42,17 @@ export function UserPage({
   selectedProcess,
   maxQuanta,
   spawnGoal,
+  spawnImage,
   message,
+  images,
   onSelectPid,
   onMaxQuantaChange,
   onSpawnGoalChange,
+  onSpawnImageChange,
   onMessageChange,
   onSpawn,
+  onImportImage,
+  onCommitImage,
   onSend,
   onRespond,
   onRun,
@@ -52,10 +64,14 @@ export function UserPage({
 }: UserPageProps) {
   const { t } = useI18n();
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [commitImageId, setCommitImageId] = useState("");
+  const [commitName, setCommitName] = useState("");
+  const [commitVersion, setCommitVersion] = useState("v0");
   const conversation = useMemo(() => deriveUserConversation(snapshot, selectedPid), [snapshot, selectedPid]);
   const pendingRequests = conversation.filter((item): item is Extract<UserConversationItem, { role: "request" }> => item.role === "request");
   const isRunning = Boolean(snapshot?.scheduler.running);
   const hasProcess = Boolean(selectedProcess);
+  const commitReady = Boolean(hasProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
 
   function answerFor(requestId: string) {
     return answers[requestId] ?? "";
@@ -120,7 +136,15 @@ export function UserPage({
         <div className="userRunControls">
           <label className="quanta">
             {t("user.quanta")}
-            <input type="number" min={1} max={200} value={maxQuanta} onChange={(event) => onMaxQuantaChange(Number(event.currentTarget.value))} />
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={maxQuanta ?? ""}
+              placeholder={t("scheduler.unlimitedPlaceholder")}
+              title={t("scheduler.unlimitedHint")}
+              onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
+            />
           </label>
           <button disabled={!hasProcess || isRunning} onClick={onRun}><Play size={15} />{t("user.run")}</button>
           <button onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
@@ -129,6 +153,26 @@ export function UserPage({
       </section>
 
       <div className="userNotices">
+        <section className="userImageControls">
+          <ImageSelect images={images} value={spawnImage} onChange={onSpawnImageChange} />
+          <button onClick={() => onImportImage()}>{t("image.import")}</button>
+          <input value={commitImageId} onChange={(event) => setCommitImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
+          <input value={commitName} onChange={(event) => setCommitName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
+          <input value={commitVersion} onChange={(event) => setCommitVersion(event.currentTarget.value)} placeholder={t("image.version")} />
+          <button
+            className="warning"
+            disabled={!commitReady}
+            onClick={() => onCommitImage({
+              imageId: commitImageId.trim(),
+              name: commitName.trim(),
+              version: commitVersion.trim(),
+              replace: false
+            })}
+          >
+            {t("image.save")}
+          </button>
+        </section>
+
         {!hasProcess ? (
           <section className="userStart">
             <h1>{t("user.startTask")}</h1>
@@ -186,6 +230,12 @@ export function UserPage({
   );
 }
 
+function parseOptionalQuanta(value: string): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function ConversationBubble({ item }: { item: UserConversationItem }) {
   const { formatTime, t } = useI18n();
   if (item.role === "request") {
@@ -200,7 +250,11 @@ function ConversationBubble({ item }: { item: UserConversationItem }) {
   return (
     <article className={`conversationBubble ${item.role}`}>
       <span className="bubbleRole">{item.role === "assistant" ? t("user.agent") : t("user.you")}</span>
-      <p>{item.text || t("user.empty")}</p>
+      {item.role === "assistant" ? (
+        <MarkdownMessage text={item.text} fallback={t("user.empty")} />
+      ) : (
+        <p>{item.text || t("user.empty")}</p>
+      )}
       <time>{formatTime(item.time)}</time>
     </article>
   );

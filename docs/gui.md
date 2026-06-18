@@ -1,8 +1,9 @@
 # Electron GUI
 
 Agent libOS includes a local desktop management console for supervising
-processes, messages, human approvals, checkpoints, capabilities, Skills,
-JSON-RPC endpoints, audit records, and persisted LLM calls.
+processes, messages, human approvals, AgentImage selection/registration/commit,
+checkpoints, capabilities, Skills, JSON-RPC endpoints, audit records, and
+persisted LLM calls.
 
 The GUI is a local-only Electron app. Electron starts
 `agent-libos-gui-server`, receives a random session bearer token, and connects
@@ -97,15 +98,27 @@ The first screen is process-centered:
 - left pane: process tree, status, image, cwd, unread message badges,
 - center pane: selected process timeline and human request cards,
 - right pane: details for overview, capabilities, tools/Skills, checkpoints,
-  audit, LLM calls, JSON-RPC, and Object Memory summary,
+  audit, LLM calls, Images, JSON-RPC, and Object Memory summary,
 - top bar: database, spawn, auto-run, quanta budget, run, step, pause, refresh.
 
+The default user page exposes the image workflow without opening raw runtime
+panels: users can choose a registered image for a new task, import an
+AgentImage manifest, or save the current selected process as a checkpoint-
+derived image. Import and commit both require explicit confirmation. Saving as
+an image creates a checkpoint only after that confirmation, then commits the
+checkpoint into an immutable image artifact.
+
+The operator console provides the fuller registry view: image list, inspect,
+spawn/exec selection, manifest registration, checkpoint commit, and explicit
+replace controls.
+
 The scheduler defaults to automatic mode. Users can pause auto-run, step a
-selected process, or run the selected process with a bounded quantum count.
-Automatic runs after spawn/message/exec may advance all runnable processes, but
-`POST /api/processes/{pid}/run` is intentionally scoped to that pid. Real LLM
-calls are still persisted in `llm_calls`, so the GUI can show token usage and
-errors.
+selected process, or run the selected process with an optional quantum budget.
+Leaving the budget blank runs until the process/runtime becomes idle; entering a
+number bounds that run. Automatic runs after spawn/message/exec may advance all
+runnable processes, but `POST /api/processes/{pid}/run` is intentionally scoped
+to that pid. Real LLM calls are still persisted in `llm_calls`, so the GUI can
+show token usage and errors.
 
 ## High-Risk Operations
 
@@ -113,7 +126,7 @@ The GUI requires explicit confirmation for high-risk operations before sending
 the final request to the server:
 
 - process `exec` and `exit`,
-- checkpoint-to-image commit,
+- image manifest registration and checkpoint-to-image commit,
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
 - JSON-RPC method calls,
@@ -126,6 +139,12 @@ calls fail closed before invoking the runtime operation.
 JSON-RPC endpoint registration through the GUI accepts manifest text only. The
 renderer cannot ask the Python GUI server to read an arbitrary host file path;
 file/path based registration remains a CLI/admin workflow.
+
+Image manifest registration follows the same rule. Electron may read a file
+selected by the user and pass manifest text to the local GUI server, but the
+server rejects host file paths. Registering or committing an image changes
+image visibility and baked internal runtime state only; it does not grant the
+target image's declared capabilities or package filesystem/provider state.
 
 ## API Summary
 

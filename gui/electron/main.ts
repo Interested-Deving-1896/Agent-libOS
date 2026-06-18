@@ -21,6 +21,8 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
 const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
+const imageManifestMaxBytes = 1_048_576;
+const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
 
 if (smokeMode) {
   const smokeUserDataPath = path.join(repoRoot, "gui", ".smoke-user-data");
@@ -218,11 +220,16 @@ async function startRuntimeServer(db = "local"): Promise<ServerConnection> {
     child.on("error", (error) => {
       fail(error);
     });
+  }).catch(async (error) => {
+    await killProcessTree(child, 3000);
+    if (serverProcess === child) serverProcess = null;
+    throw error;
   });
   try {
     await waitForServerHealth(startup, 15000);
   } catch (error) {
     await killProcessTree(child, 3000);
+    if (serverProcess === child) serverProcess = null;
     throw error;
   }
   connection = startup;
@@ -294,14 +301,14 @@ async function createWindow() {
     }
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//.test(url)) void shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
     return { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event, url) => {
     const current = mainWindow?.webContents.getURL();
     if (url === current) return;
     event.preventDefault();
-    if (/^https?:\/\//.test(url)) void shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
   });
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -349,15 +356,47 @@ ipcMain.handle("libos:chooseDatabase", async () => {
   return startRuntimeServer(result.filePaths[0]);
 });
 
+ipcMain.handle("libos:chooseImageManifest", async () => {
+  const options: OpenDialogOptions = {
+    title: "Open AgentImage manifest",
+    properties: ["openFile"],
+    filters: [
+      { name: "AgentImage manifests", extensions: ["yaml", "yml", "json"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  };
+  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const selected = result.filePaths[0];
+  const stats = fs.statSync(selected);
+  if (!stats.isFile()) throw new Error("Selected image manifest is not a file.");
+  if (stats.size > imageManifestMaxBytes) {
+    throw new Error(`Image manifest exceeds ${imageManifestMaxBytes} bytes.`);
+  }
+  return {
+    path: selected,
+    name: path.basename(selected),
+    content: fs.readFileSync(selected, "utf8")
+  };
+});
+
 ipcMain.handle("libos:useDatabase", async (_event, db: string) => {
   return startRuntimeServer(db && db.trim() ? db.trim() : "local");
 });
 
 ipcMain.handle("libos:openExternal", async (_event, url: string) => {
-  if (!/^https?:\/\//.test(url)) return false;
+  if (!isAllowedExternalUrl(url)) return false;
   await shell.openExternal(url);
   return true;
 });
+
+function isAllowedExternalUrl(url: string): boolean {
+  try {
+    return allowedExternalProtocols.has(new URL(url).protocol);
+  } catch {
+    return false;
+  }
+}
 
 app.whenReady().then(createWindow).catch((error) => {
   console.error(error instanceof Error ? error.stack : String(error));

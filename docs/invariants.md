@@ -1,93 +1,54 @@
 # Agent libOS Runtime Invariants
 
-This document maps the current runtime safety invariants to regression tests.
-It is the submission-facing checklist for keeping the implementation, README,
-and paper claims aligned with the fixed theme: `Agent libOS: A Runtime
-Substrate for Capability-Controlled Self-Evolving LLM Agents`.
+The machine-checked runtime invariant map lives in
+`tests/invariants.yaml`. It is the authoritative source for connecting safety
+claims to pytest node ids and benchmark attack classes.
 
-## Authority Boundary
+Validate it with:
 
-| Invariant | Current regression coverage |
-| --- | --- |
-| Tool visibility is not resource authority. A visible tool still fails at the primitive boundary without the required resource capability. | `tests/test_demo_contract.py::DemoContractTests::test_tool_outside_process_tool_table_is_denied_without_human_approval`, `tests/test_external_boundaries.py::ExternalBoundaryTests::test_read_file_tool_cannot_bypass_filesystem_capability`, `tests/test_external_boundaries.py::ExternalBoundaryTests::test_write_file_tool_cannot_bypass_filesystem_capability` |
-| A process can call only tools in its process tool table. | `tests/test_external_boundaries.py::ExternalBoundaryTests::test_process_cannot_call_tool_outside_creation_tool_table`, `tests/test_llm_context_memory.py::LLMContextMemoryTests::test_llm_prompt_lists_only_process_visible_tools` |
-| LLM-facing tools are wrappers over primitives and must not directly touch host filesystem, terminal, network, shell, database, or secrets. | `tests/test_stage2_security.py::Stage2SecurityTests::test_builtin_tools_do_not_directly_touch_host_boundaries`, `tests/test_resource_substrate.py` |
-| Primitive checks happen at point of use, before protected side effects. | `tests/test_filesystem_directory_tools.py::FilesystemDirectoryToolTests::test_filesystem_primitive_enforces_read_limits_without_tool_schema`, `tests/test_shell_primitive.py::ShellPrimitiveTests::test_shell_primitive_enforces_timeout_limit_without_tool_schema`, `tests/test_permission_policy.py::PermissionPolicyTests::test_write_preconditions_fail_before_per_use_prompt` |
-| Skill visibility is not resource authority. Activating a standard `SKILL.md` package can add tools, JIT tools, and prompt instructions, but declared `required_capabilities` are advisory and never auto-granted. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_loaded_existing_tool_visibility_does_not_grant_resource_authority`, `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_loaded_skill_instructions_are_materialized_into_llm_prompt_and_persisted_calls` |
-| Skill registration and activation are primitive operations controlled by Skill/source capabilities, global package trust, workspace filesystem reads, human approval, and audit. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_standard_package_validation_and_global_trust`, `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once`, `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_skill_syscalls_use_primitive_capabilities_not_tool_table` |
-| Startup Runtime Modules are trusted TCB extensions, not process authority. A module can register tools/images/syscalls before startup, but module loading does not grant resource capabilities. | `tests/test_runtime_modules.py::RuntimeModuleTests::test_trusted_startup_module_registers_tool_image_syscall_and_hook`, `tests/test_runtime_modules.py::RuntimeModuleTests::test_module_tool_visibility_does_not_grant_filesystem_authority` |
-| Startup Runtime Modules require explicit source hash trust and fail without leaving partial runtime registrations. | `tests/test_runtime_modules.py::RuntimeModuleTests::test_untrusted_module_is_rejected`, `tests/test_runtime_modules.py::RuntimeModuleTests::test_source_hash_mismatch_is_rejected`, `tests/test_runtime_modules.py::RuntimeModuleTests::test_failed_module_does_not_leave_partial_tool_registration` |
-| JSON-RPC endpoint visibility and tool visibility are not remote authority. Agents can call only registered endpoint/method ids, and method calls require exact JSON-RPC method capabilities. | `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_call_requires_method_capability_and_records_http_effect`, `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_syscall_bypasses_tool_table_but_not_capabilities` |
+```bash
+uv run python scripts/check_test_invariants.py
+```
 
-## Process And Capability Semantics
+The checker accepts JSON-subset or YAML syntax and fails when a listed pytest
+node cannot be collected, an invariant lacks deterministic regression coverage,
+an invariant's `benchmark_attack_classes` declaration diverges from the
+top-level mapping, or a runtime-safety benchmark task uses an unmapped
+`attack_class`.
 
-| Invariant | Current regression coverage |
-| --- | --- |
-| fork/spawn do not implicitly inherit broad external authority. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps`, `tests/test_external_boundaries.py::ExternalBoundaryTests::test_fork_does_not_inherit_parent_filesystem_write_capability` |
-| Child processes inherit only explicit, parent-held capability subsets through delegation/attenuation. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_spawn_child_process_inherits_only_explicit_capabilities`, `tests/test_granular_permissions.py::GranularPermissionTests::test_child_cannot_inherit_broader_permission_than_parent_has`, `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_delegate_can_only_attenuate_delegable_parent_capability`, `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_delegate_cannot_drop_parent_constraints`, `tests/test_capability_v2.py::CapabilityV2RuntimeInterfaceTests::test_spawn_child_invalid_capability_inheritance_is_preflighted` |
-| exec is a self-evolution mechanism that replaces the process image/tool table without granting target-image capabilities. | `tests/test_child_process_tools.py::ChildProcessToolTests::test_exec_process_swaps_image_without_granting_target_image_capabilities` |
-| Revocation and one-shot capabilities are enforced at the next primitive use. | `tests/test_external_boundaries.py::ExternalBoundaryTests::test_revoked_filesystem_capability_denies_write`, `tests/test_permission_policy.py::PermissionPolicyTests::test_missing_delete_consumes_one_time_grant`, `tests/test_filesystem_directory_tools.py::FilesystemDirectoryToolTests::test_one_time_read_capabilities_are_consumed_after_provider_read`, `tests/test_external_boundaries.py::ExternalBoundaryTests::test_one_time_human_output_capability_is_consumed_after_delivery`, `tests/test_human_question_tool.py::HumanQuestionToolTests::test_one_time_ask_human_capability_is_consumed_after_question_is_queued`, `tests/test_object_memory.py::ObjectMemoryNameTests::test_one_time_object_name_lookup_does_not_become_persistent_handle` |
-| Capability matching is typed and canonical; bare global `*` is rejected, and subtree grants do not prefix-collide with adjacent resources. | `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_typed_resource_matching_rejects_prefix_collision`, `tests/test_shell_primitive.py::ShellMatcherTests::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args` |
-| Deny capabilities dominate matching allow capabilities. | `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_deny_dominates_matching_allow`, `tests/test_shell_primitive.py::ShellPrimitiveTests::test_always_deny_shell_policy_overrides_exact_command_grant` |
-| Capability issue, delegate, and revoke require trusted issuer, holder, issuer, or explicit grant/revoke/admin authority. | `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_issue_requires_trusted_actor_or_grant_authority`, `tests/test_capability_v2.py::CapabilityV2ManagerTests::test_revoke_requires_holder_issuer_or_revoke_authority` |
-| Capability syscalls and default LLM-facing capability tools do not bypass authority or expose high-risk mutation tools by default. | `tests/test_capability_v2.py::CapabilityV2RuntimeInterfaceTests::test_capability_syscalls_do_not_bypass_authority`, `tests/test_capability_v2.py::CapabilityV2RuntimeInterfaceTests::test_default_images_expose_only_low_risk_capability_tools` |
-| Process cwd is process-local; relative filesystem and shell paths resolve from that cwd without changing host process cwd. | `tests/test_process_working_directory.py::ProcessWorkingDirectoryTests::test_filesystem_tools_resolve_paths_from_process_working_directory`, `tests/test_process_working_directory.py::ProcessWorkingDirectoryTests::test_shell_tool_runs_from_process_working_directory`, `tests/test_coding_agent_launcher.py::CodingAgentLauncherTests::test_launcher_does_not_change_host_working_directory` |
+## Current Invariant Groups
 
-## Object Memory And Context
-
-| Invariant | Current regression coverage |
-| --- | --- |
-| Bare Object Memory names resolve in the caller process namespace. | `tests/test_object_memory.py::ObjectMemoryNameTests::test_same_bare_name_is_isolated_between_process_namespaces` |
-| Object and namespace names are not capabilities. | `tests/test_object_memory.py::ObjectMemoryNameTests::test_name_lookup_does_not_bypass_object_capability`, `tests/test_object_memory.py::ObjectMemoryNameTests::test_namespace_write_and_list_rights_are_enforced` |
-| Same local object name can exist independently across namespaces. | `tests/test_object_memory.py::ObjectMemoryNameTests::test_same_local_name_is_allowed_in_process_and_explicit_namespaces` |
-| Object payloads are not durable ordinary Object rows; checkpoint snapshots are the explicit durable payload exception. | `tests/test_object_memory.py::ObjectMemoryNameTests::test_object_payload_is_not_written_to_sqlite`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_restore_recovers_process_subtree_objects_capabilities_and_cwd_only` |
-| Large file/object transfer paths can avoid materializing full content into a process-visible tool result. | `tests/test_object_file_tools.py::ObjectFileToolTests::test_copy_file_via_named_object_without_materializing_content_to_process` |
-
-## Human, IPC, And Scheduling
-
-| Invariant | Current regression coverage |
-| --- | --- |
-| Human approval is a blocking runtime operation that resumes the pending action after a decision. | `tests/test_permission_policy.py::PermissionPolicyTests::test_llm_pending_per_use_approval_does_not_return_action_until_decision`, `tests/test_human_question_tool.py::HumanQuestionToolTests::test_async_runtime_resumes_human_question_with_answer` |
-| Human output/questions route through HumanObject and the Resource Provider Substrate. | `tests/test_resource_substrate.py::ResourceProviderSubstrateTests::test_runtime_human_primitive_uses_injected_provider`, `tests/test_external_boundaries.py::ExternalBoundaryTests::test_human_output_tool_cannot_bypass_human_capability` |
-| Process messages are explicit mailbox entries, not prompt text. Interrupts preempt before non-message tool calls; normal messages notify after a tool call. | `tests/test_process_messages.py::ProcessMessageTests::test_interrupt_message_preempts_tool_call_until_read`, `tests/test_process_messages.py::ProcessMessageTests::test_normal_message_notifies_after_tool_call_without_preempting` |
-| Blocking process-message receive waits inside the syscall/tool action and resumes when a matching message arrives. | `tests/test_process_messages.py::ProcessMessageTests::test_receive_process_messages_blocks_until_matching_message_then_resumes`, `tests/test_process_messages.py::ProcessMessageTests::test_receive_message_syscall_waits_inside_single_syscall_until_matching_message`, `tests/test_process_messages.py::ProcessMessageTests::test_receive_message_syscall_blocks_by_default` |
-| Async sleep and waiting processes do not block unrelated runnable processes. | `tests/test_async_scheduler.py::AsyncSchedulerTests::test_two_processes_alternate_time_output_via_async_sleep`, `tests/test_async_scheduler.py::AsyncSchedulerTests::test_async_runtime_drains_human_queue_and_resumes_pending_permission_action` |
-
-## Shell And JIT Containment
-
-| Invariant | Current regression coverage |
-| --- | --- |
-| Shell execution uses argv tokens, not implicit shell strings; unsafe command strings and broad bare shell wildcards cannot bypass policy matching. | `tests/test_shell_primitive.py::ShellMatcherTests::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args`, `tests/test_shell_primitive.py::ShellPrimitiveTests::test_blacklist_policy_asks_for_nested_shell_interpreter`, `tests/test_shell_primitive.py::ShellPrimitiveTests::test_bare_shell_wildcard_allow_does_not_bypass_shell_policy`, `tests/test_stage2_security.py::Stage2SecurityTests::test_shell_syscall_rejects_non_list_argv_before_policy` |
-| Shell allow/block policies enforce always-deny, allowlist, blocklist, per-use approval, timeout, and output bounds. | `tests/test_shell_primitive.py` |
-| Deno/TypeScript JIT tools are process-local and cannot shadow static tools. | `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_jit_tool_is_visible_only_to_registering_process`, `tests/test_stage2_security.py::Stage2SecurityTests::test_jit_tool_names_are_process_local`, `tests/test_stage2_security.py::Stage2SecurityTests::test_jit_tool_cannot_shadow_existing_tool_name` |
-| JIT syscalls bypass the LLM-facing tool table but still require primitive capabilities and policy approval. | `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities`, `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_jit_syscall_denies_missing_capability`, `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_jit_human_approval_is_internal_to_syscall` |
-| Deno tools do not receive ambient host permissions or unsafe imports. | `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_static_check_rejects_unsafe_typescript`, `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_static_check_import_allowlist`, `tests/test_stage2_security.py::Stage2SecurityTests::test_real_deno_tool_runs_and_has_no_host_read_permission` |
-| JIT `process.exit` and `process.exec` are applied after the Deno tool returns its normal result. | `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_jit_process_exit_is_applied_after_tool_result`, `tests/test_stage2_security.py::Stage2SecurityTests::test_deno_jit_process_exec_is_applied_after_tool_result` |
-| JIT tools loaded from Skills use the same ToolBroker registration path, Deno sandbox checks, process-local visibility, and no-static-shadowing rules as manually proposed JIT tools. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_jit_skill_tool_is_process_local_and_uses_deno_validation_path` |
-
-## Persistence And Audit
-
-| Invariant | Current regression coverage |
-| --- | --- |
-| Runtime metadata persists across SQLite reopen where the current MVP claims persistence. | `tests/test_persistent_runtime.py::PersistentRuntimeTests::test_static_tool_ids_survive_runtime_reopen`, `tests/test_process_working_directory.py::ProcessWorkingDirectoryTests::test_process_working_directory_persists_in_sqlite`, `tests/test_process_messages.py::ProcessMessageTests::test_process_messages_are_durable_in_sqlite` |
-| Real LLM calls are persisted with prompt, visible tools, output, tool calls, token usage, reasoning metadata, raw response, and errors when available. | `tests/test_llm_context_memory.py::LLMContextMemoryTests::test_llm_call_records_persist_prompt_output_usage_and_reasoning`, `tests/test_human_llm_chat_script.py::HumanLLMChatScriptTests::test_model_responder_persists_nested_text_llm_call` |
-| Provider-classified external effects are append-only; checkpoint restore reports rollback class summaries but does not apply external compensation. | `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_restore_preserves_append_only_history_and_reports_external_effects`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_restore_reports_provider_decided_external_effect_classes` |
-| Effectful provider calls fail closed when the provider cannot classify the external effect. | `tests/test_resource_substrate.py::ResourceProviderSubstrateTests::test_effectful_provider_without_classification_fails_closed`, `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_effectful_provider_without_classifier_fails_closed` |
-| JSON-RPC external effects are provider-classified, audited without resolved secrets, and reported by checkpoint diff/restore without remote compensation. | `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_call_requires_method_capability_and_records_http_effect`, `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_checkpoint_restores_referenced_endpoint_and_reports_remote_effect` |
-| Checkpoint restore is scoped to a process subtree and does not delete append-only audit, event, LLM call, checkpoint, or external-effect history. | `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_restore_preserves_append_only_history_and_reports_external_effects`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_restore_recovers_process_subtree_objects_capabilities_and_cwd_only` |
-| Checkpoint inspect, restore, fork, and syscall access are capability-controlled independently of LLM-facing tool visibility. | `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_checkpoint_capabilities_gate_inspect_restore_and_fork`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_checkpoint_syscalls_use_primitive_capabilities`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_default_images_expose_only_low_risk_checkpoint_tools` |
-| Checkpoint restore/fork preserves scoped Skill registry rows, loaded Skill records, JIT source metadata, and process tool tables without rolling back append-only history. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_checkpoint_restore_preserves_loaded_skill_records_and_tool_table`, `tests/test_checkpoint_manager.py` |
-| Checkpoint restore/fork preserves JSON-RPC endpoint registry rows referenced by restored process capabilities without deleting unrelated endpoint registry state. | `tests/test_jsonrpc_primitive.py::JsonRpcPrimitiveTests::test_checkpoint_restores_referenced_endpoint_and_reports_remote_effect` |
-| Checkpoint restore/fork requires the current runtime to have loaded the same startup module ids and source hashes captured in the checkpoint metadata. | `tests/test_runtime_modules.py::RuntimeModuleTests::test_checkpoint_restore_requires_same_startup_module_loaded` |
-| Checkpoint fork does not resurrect revoked, expired, or currently narrowed capability authority, and transient wait states are normalized to runnable in the forked subtree. | `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_fork_from_checkpoint_does_not_resurrect_revoked_capability`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_fork_from_checkpoint_respects_post_checkpoint_deny_policy`, `tests/test_checkpoint_manager.py::CheckpointManagerTests::test_fork_from_checkpoint_normalizes_waiting_process_state` |
-| Image registration is a self-evolution mechanism that goes through the image primitive and requires image/filesystem authority. | `tests/test_image_registration.py::ImageRegistrationTests::test_register_image_primitive_validates_tools_and_emits_audit`, `tests/test_image_registration.py::ImageRegistrationTests::test_load_image_from_yaml_tool_requires_image_write_capability` |
-| Checkpoint commit images capture internal reconstructable state but do not bake or grant external provider authority. External checkpoint capabilities become `required_capabilities` declarations only. | `tests/test_image_commit.py::ImageCommitTests::test_committed_image_spawns_baked_memory_without_external_authority`, `tests/test_image_commit.py::ImageCommitTests::test_exec_into_committed_image_restores_baked_memory_without_granting_required_caps` |
-| Image `default_skills` activate at spawn/exec, fork inherits activated Skills and corresponding tool visibility, and spawn-child starts without parent-activated Skills. | `tests/test_skills_dynamic_loading.py::SkillDynamicLoadingTests::test_image_default_skills_spawn_fork_spawn_child_and_exec_semantics` |
-| Demo and launcher audit counts are scoped and reproducible enough for artifact smoke checks. | `tests/test_demo_contract.py::DemoContractTests::test_run_demo_returns_auditable_contract`, `tests/test_coding_agent_launcher.py::CodingAgentLauncherTests::test_audit_counts_are_scoped_to_launched_process` |
+- `tool-visibility-is-not-authority`: visible tools and endpoints do not grant
+  protected resource authority.
+- `primitive-checks-before-effects`: primitives enforce capability, policy,
+  approval, and validation before side effects.
+- `capability-v2-matching-and-delegation`: typed matching, deny dominance,
+  one-shot grants, revocation, and delegation attenuation.
+- `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
+  imply broader authority.
+- `object-memory-names-are-not-capabilities`: Object Memory names and
+  namespaces do not bypass object capabilities.
+- `human-approval-is-blocking-and-audited`: human questions and approvals block,
+  resume, consume one-shot grants, and route through primitives.
+- `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
+  sandboxed, process-local, and syscall-mediated.
+- `skill-activation-does-not-grant-authority`: Skills change visibility and
+  prompt context without granting resources.
+- `checkpoint-restore-and-fork-are-scoped`: checkpoint restore/fork are scoped,
+  capability-controlled, and append-only outside reconstructable state.
+- `image-self-evolution-requires-image-authority`: image registration, exec, and
+  checkpoint commit require image authority and do not bake external authority.
+- `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC calls use
+  registered endpoint/method authority and classified provider effects.
+- `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
+  remain deterministic and token-free by default.
 
 ## Known Test Gaps
 
-- Audit explain is not implemented yet; current tests check audit record emission and selected audit counts, not query/explanation completeness.
-- The M1 runtime-safety benchmark harness, 20+ deterministic tasks, self-evolution subset, side-effect oracle, baselines, ablations, and metrics collection are implemented. It is still an early deterministic workload, not a complete paper evaluation suite.
-- Context materialization metadata is not yet complete enough to compute included/omitted/summarized/truncated object statistics for every LLM call.
+- Audit explain is not implemented yet; current tests check audit record
+  emission and selected audit counts, not query/explanation completeness.
+- The runtime-safety benchmark is an early deterministic workload, not a
+  complete paper evaluation suite.
+- Context materialization metadata is not complete enough to compute
+  included/omitted/summarized/truncated object statistics for every LLM call.
 - Real MCP, Git worktree, and mock PR providers are planned but not implemented.

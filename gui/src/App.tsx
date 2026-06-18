@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Send } from "lucide-react";
-import { LibOSClient } from "./api/client";
+import { LibOSClient, type OptionalQuanta } from "./api/client";
 import type { GuiConnection, HumanRequest, RuntimeSnapshot } from "./api/types";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
+import { ImageSelect } from "./components/ImageSelect";
 import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
 import { TopBar } from "./components/TopBar";
 import { UserPage } from "./components/UserPage";
+import { previewImageManifest } from "./imagePreview";
 import { useI18n } from "./i18n";
 
 type PendingConfirm = {
@@ -24,7 +26,7 @@ export function App() {
   const [client, setClient] = useState<LibOSClient | null>(null);
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
   const [selectedPid, setSelectedPid] = useState<string | null>(null);
-  const [maxQuanta, setMaxQuanta] = useState(25);
+  const [maxQuanta, setMaxQuanta] = useState<OptionalQuanta>(null);
   const [spawnGoal, setSpawnGoal] = useState("Summarize the current project state.");
   const [spawnImage, setSpawnImage] = useState("coding-agent:v0");
   const [message, setMessage] = useState("");
@@ -74,7 +76,7 @@ export function App() {
       const nextSnapshot = await nextClient.snapshot();
       setSnapshot(nextSnapshot);
       setSelectedPid(nextSnapshot.processes[0]?.pid ?? null);
-      setMaxQuanta(nextSnapshot.scheduler.default_max_quanta);
+      setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
     } catch (reason) {
       setError(String(reason));
     }
@@ -92,7 +94,9 @@ export function App() {
     const nextClient = new LibOSClient(next);
     setConnection(next);
     setClient(nextClient);
-    setSnapshot(await nextClient.snapshot());
+    const nextSnapshot = await nextClient.snapshot();
+    setSnapshot(nextSnapshot);
+    setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
   }
 
   async function safe(action: () => Promise<void>) {
@@ -162,6 +166,71 @@ export function App() {
     });
   }
 
+  async function chooseAndConfirmImageImport(replace = false) {
+    if (!client) return;
+    try {
+      const manifest = await window.libosApi?.chooseImageManifest();
+      if (!manifest) return;
+      const preview = previewImageManifest(manifest.content);
+      setPendingConfirm({
+        title: t("image.register.title"),
+        message: t("image.register.message"),
+        details: {
+          source: manifest.name,
+          image_id: preview.image_id,
+          name: preview.name,
+          version: preview.version,
+          default_tools_count: preview.default_tools_count,
+          required_capabilities_count: preview.required_capabilities_count,
+          bytes: preview.bytes,
+          replace
+        },
+        action: async () => {
+          const result = await client.registerImageFromManifest(manifest.content, manifest.name, true, replace);
+          setSpawnImage(result.image_id);
+          setExecImage(result.image_id);
+          setPendingConfirm(null);
+          await refresh();
+        }
+      });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  function confirmCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }) {
+    if (!client || !selectedPid) return;
+    const pid = selectedPid;
+    setPendingConfirm({
+      title: t("image.commit.title"),
+      message: t("image.commit.message"),
+      details: {
+        pid,
+        checkpoint: request.checkpointId ?? t("image.autoCheckpoint"),
+        image_id: request.imageId,
+        name: request.name,
+        version: request.version,
+        replace: request.replace
+      },
+      action: async () => {
+        const checkpointId = request.checkpointId
+          ?? (await client.createCheckpoint(pid, "GUI image commit")).checkpoint_id;
+        const result = await client.commitCheckpointToImage({
+          checkpointId,
+          imageId: request.imageId,
+          name: request.name,
+          version: request.version,
+          confirmed: true,
+          replace: request.replace
+        });
+        setSpawnImage(result.image_id);
+        setExecImage(result.image_id);
+        setPendingConfirm(null);
+        await refresh();
+      }
+    });
+  }
+
   return (
     <div className={view === "user" ? "userAppShell" : "appShell"}>
       {view === "user" ? (
@@ -172,12 +241,17 @@ export function App() {
           selectedProcess={selectedProcess}
           maxQuanta={maxQuanta}
           spawnGoal={spawnGoal}
+          spawnImage={spawnImage}
           message={message}
+          images={snapshot?.images ?? []}
           onSelectPid={setSelectedPid}
           onMaxQuantaChange={setMaxQuanta}
           onSpawnGoalChange={setSpawnGoal}
+          onSpawnImageChange={setSpawnImage}
           onMessageChange={setMessage}
           onSpawn={() => void spawnProcess()}
+          onImportImage={() => void chooseAndConfirmImageImport(false)}
+          onCommitImage={confirmCommitImage}
           onSend={(kind) => void send(kind)}
           onRespond={(request, approved, answer = "") => void respond(request, approved, answer)}
           onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
@@ -213,7 +287,7 @@ export function App() {
                 <span>{snapshot?.processes.length ?? 0}</span>
               </div>
               <div className="spawnBox">
-                <input value={spawnImage} onChange={(event) => setSpawnImage(event.currentTarget.value)} aria-label={t("operator.spawnImage")} />
+                <ImageSelect images={snapshot?.images ?? []} value={spawnImage} label={t("operator.spawnImage")} onChange={setSpawnImage} />
                 <textarea value={spawnGoal} onChange={(event) => setSpawnGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
               </div>
               <ProcessTree processes={snapshot?.processes ?? []} selectedPid={selectedPid} onSelect={setSelectedPid} />
@@ -261,12 +335,23 @@ export function App() {
               <div className="quickActions">
                 <input value={cwd} placeholder={t("operator.newCwdPlaceholder")} onChange={(event) => setCwd(event.currentTarget.value)} />
                 <button disabled={!client || !selectedPid || !cwd.trim()} onClick={() => selectedPid && void safe(() => client!.changeDirectory(selectedPid, cwd).then(() => undefined))}>cd</button>
-                <input value={execImage} onChange={(event) => setExecImage(event.currentTarget.value)} aria-label={t("operator.exec")} />
+                <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} onChange={setExecImage} />
                 <input value={execGoal} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
                 <button disabled={!selectedPid} className="warning" onClick={confirmExec}>{t("operator.exec")}</button>
                 <button disabled={!selectedPid} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
               </div>
-              <DetailTabs process={selectedProcess} snapshot={snapshot} />
+              <DetailTabs
+                process={selectedProcess}
+                snapshot={snapshot}
+                onImportImage={(replace) => void chooseAndConfirmImageImport(replace)}
+                onCommitImage={confirmCommitImage}
+                onUseImageForSpawn={setSpawnImage}
+                onUseImageForExec={setExecImage}
+                onInspectImage={(imageId) => {
+                  if (!client) throw new Error(t("app.clientUnavailable"));
+                  return client.inspectImage(imageId);
+                }}
+              />
             </section>
           </main>
         </>

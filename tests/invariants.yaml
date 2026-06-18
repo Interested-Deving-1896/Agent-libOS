@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "invariants": [
+    {
+      "id": "tool-visibility-is-not-authority",
+      "title": "Tool visibility does not grant protected resource authority.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_external_boundaries.py::TestExternalBoundary::test_read_file_tool_cannot_bypass_filesystem_capability",
+        "tests/security/test_external_boundaries.py::TestExternalBoundary::test_write_file_tool_cannot_bypass_filesystem_capability",
+        "tests/providers/test_demo_contract.py::TestDemoContract::test_tool_outside_process_tool_table_is_denied_without_human_approval"
+      ],
+      "benchmark_attack_classes": ["secret_file_read"]
+    },
+    {
+      "id": "primitive-checks-before-effects",
+      "title": "Primitives enforce capability, policy, approval, and validation before side effects.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_primitive_enforces_read_limits_without_tool_schema",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt"
+      ],
+      "benchmark_attack_classes": ["forbidden_file_write", "forbidden_file_delete"]
+    },
+    {
+      "id": "capability-v2-matching-and-delegation",
+      "title": "Capability v2 matching, denial, revocation, one-shot use, and delegation stay typed and attenuated.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_capability_v2.py::TestCapabilityV2Manager::test_typed_resource_matching_rejects_prefix_collision",
+        "tests/security/test_capability_v2.py::TestCapabilityV2Manager::test_deny_dominates_matching_allow",
+        "tests/security/test_capability_v2.py::TestCapabilityV2Manager::test_delegate_can_only_attenuate_delegable_parent_capability",
+        "tests/security/test_capability_v2.py::TestCapabilityV2RuntimeInterface::test_capability_syscalls_do_not_bypass_authority"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "process-authority-is-explicit",
+      "title": "Spawn, fork, exec, and process-local state never imply broader external authority.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_inherits_only_explicit_capabilities",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exec_process_swaps_image_without_granting_target_image_capabilities",
+        "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_shell_tool_runs_from_process_working_directory"
+      ],
+      "benchmark_attack_classes": ["process_authority_leakage", "self_evolution_process"]
+    },
+    {
+      "id": "object-memory-names-are-not-capabilities",
+      "title": "Object Memory names and namespaces do not bypass object capabilities.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_same_bare_name_is_isolated_between_process_namespaces",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_name_lookup_does_not_bypass_object_capability",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_namespace_write_and_list_rights_are_enforced",
+        "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_copy_file_via_named_object_without_materializing_content_to_process"
+      ],
+      "benchmark_attack_classes": ["object_namespace_leakage"]
+    },
+    {
+      "id": "human-approval-is-blocking-and-audited",
+      "title": "Human questions and approvals block, resume, consume one-shot grants, and route through primitives.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_llm_pending_per_use_approval_does_not_return_action_until_decision",
+        "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_async_runtime_resumes_human_question_with_answer",
+        "tests/security/test_external_boundaries.py::TestExternalBoundary::test_one_time_human_output_capability_is_consumed_after_delivery",
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_runtime_human_primitive_uses_injected_provider"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "shell-and-jit-containment",
+      "title": "Shell and Deno JIT execution use constrained argv, sandbox validation, process-local visibility, and primitive syscalls.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_bare_shell_wildcard_allow_does_not_bypass_shell_policy",
+        "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name"
+      ],
+      "benchmark_attack_classes": ["shell_policy_bypass", "self_evolution_jit"]
+    },
+    {
+      "id": "skill-activation-does-not-grant-authority",
+      "title": "Skill registration and activation alter visibility and prompt context without granting resource authority.",
+      "lane": "self-evolution",
+      "node_ids": [
+        "tests/self_evolution/test_skills_dynamic_loading.py::TestSkillDynamicLoading::test_loaded_existing_tool_visibility_does_not_grant_resource_authority",
+        "tests/self_evolution/test_skills_dynamic_loading.py::TestSkillDynamicLoading::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once",
+        "tests/self_evolution/test_skills_dynamic_loading.py::TestSkillDynamicLoading::test_skill_syscalls_use_primitive_capabilities_not_tool_table",
+        "tests/self_evolution/test_swe_agent_skill.py::TestSWEAgentSkill::test_swe_agent_skill_registers_and_loads_without_granting_resource_authority"
+      ],
+      "benchmark_attack_classes": ["self_evolution_skill"]
+    },
+    {
+      "id": "checkpoint-restore-and-fork-are-scoped",
+      "title": "Checkpoint restore and fork are capability-controlled, scoped, and append-only outside reconstructable state.",
+      "lane": "self-evolution",
+      "node_ids": [
+        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_restore_preserves_append_only_history_and_reports_external_effects",
+        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
+        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
+        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_fork_from_checkpoint_normalizes_waiting_process_state"
+      ],
+      "benchmark_attack_classes": ["self_evolution_checkpoint"]
+    },
+    {
+      "id": "image-self-evolution-requires-image-authority",
+      "title": "Image registration, exec, and checkpoint commit require image authority and do not bake external provider authority.",
+      "lane": "self-evolution",
+      "node_ids": [
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_register_image_primitive_validates_tools_and_emits_audit",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_load_image_from_yaml_tool_requires_image_write_capability",
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_spawns_baked_memory_without_external_authority",
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_exec_into_committed_image_restores_baked_memory_without_granting_required_caps"
+      ],
+      "benchmark_attack_classes": ["self_evolution_image"]
+    },
+    {
+      "id": "jsonrpc-provider-effects-are-registered-and-classified",
+      "title": "JSON-RPC calls require registered endpoint/method authority and classified provider effects.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_requires_method_capability_and_records_http_effect",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_syscall_bypasses_tool_table_but_not_capabilities",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_effectful_provider_without_classifier_fails_closed",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_checkpoint_restores_referenced_endpoint_and_reports_remote_effect"
+      ],
+      "benchmark_attack_classes": ["self_evolution_remote"]
+    },
+    {
+      "id": "runtime-safety-benchmark-is-deterministic",
+      "title": "Runtime-safety benchmark tasks and smoke runs remain deterministic and token-free by default.",
+      "lane": "benchmark",
+      "node_ids": [
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_m1_task_suite",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_deterministic_smoke_run_across_baselines_and_libos",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_self_evolution_smoke_run_across_wrapper_and_libos"
+      ],
+      "benchmark_attack_classes": []
+    }
+  ],
+  "benchmark_attack_classes": {
+    "secret_file_read": "tool-visibility-is-not-authority",
+    "forbidden_file_write": "primitive-checks-before-effects",
+    "forbidden_file_delete": "primitive-checks-before-effects",
+    "shell_policy_bypass": "shell-and-jit-containment",
+    "object_namespace_leakage": "object-memory-names-are-not-capabilities",
+    "process_authority_leakage": "process-authority-is-explicit",
+    "self_evolution_skill": "skill-activation-does-not-grant-authority",
+    "self_evolution_jit": "shell-and-jit-containment",
+    "self_evolution_image": "image-self-evolution-requires-image-authority",
+    "self_evolution_process": "process-authority-is-explicit",
+    "self_evolution_checkpoint": "checkpoint-restore-and-fork-are-scoped",
+    "self_evolution_remote": "jsonrpc-provider-effects-are-registered-and-classified"
+  }
+}

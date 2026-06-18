@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
     run_group = exec_parser.add_mutually_exclusive_group()
     run_group.add_argument("--run", dest="run", action="store_true", default=False, help="Run the scheduler after exec.")
     run_group.add_argument("--no-run", dest="run", action="store_false", help="Only apply exec; do not run the scheduler.")
-    exec_parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    exec_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget when --run is set; omitted runs until idle.")
     exit_parser = sub.add_parser("exit", help="Exit an AgentProcess")
     exit_parser.add_argument("pid")
     exit_parser.add_argument("--message", help="Optional process status message.")
@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> None:
     llm_once_parser = sub.add_parser("llm-once", help="Run one LLM quantum for a process")
     llm_once_parser.add_argument("pid")
     run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
-    run_parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    run_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget; omitted runs until idle.")
     run_parser.add_argument("--interactive", action="store_true", help="Read human input while running and post it as process messages.")
     run_parser.add_argument("--pid", help="Default target process for interactive human messages.")
     run_parser.add_argument("--human", default=_RUNTIME_DEFAULTS.default_human, help="Human actor name for interactive messages.")
@@ -308,17 +308,18 @@ async def _run_interactive_command(runtime: Runtime, args: argparse.Namespace) -
     results: list[Any] = []
     posted: list[dict[str, Any]] = []
     state = {"pid": target_pid, "shown_request_id": ""}
-    remaining = int(args.max_quanta)
+    remaining: int | None = args.max_quanta
     selected_human = args.human or _RUNTIME_DEFAULTS.default_human
     try:
-        while remaining > 0:
+        while remaining is None or remaining > 0:
             command = _drain_interactive_queue(runtime, queue, state, selected_human, args.message_channel, posted)
             if command in {"exit", "eof"}:
                 break
 
             batch = await runtime.scheduler.arun_until_idle(runtime.arun_process_once, max_quanta=remaining)
             results.extend(batch)
-            remaining -= len(batch)
+            if remaining is not None:
+                remaining -= len(batch)
 
             processed = _process_interactive_terminal_outputs(runtime, selected_human)
             if processed:
@@ -418,7 +419,7 @@ def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: b
     parser.add_argument("--reply-to", help="Optional message id this message replies to.")
     parser.add_argument("--payload-json", default="{}", help="Structured JSON object to include in the message payload.")
     parser.add_argument("--run", action="store_true", help="Run the scheduler after posting the message.")
-    parser.add_argument("--max-quanta", type=int, default=_RUNTIME_DEFAULTS.run_until_idle_max_quanta)
+    parser.add_argument("--max-quanta", type=int, help="Optional quantum budget when --run is set; omitted runs until idle.")
 
 
 def _add_checkpoint_parser_args(parser: argparse.ArgumentParser) -> None:
