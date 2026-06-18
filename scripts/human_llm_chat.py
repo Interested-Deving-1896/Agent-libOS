@@ -19,9 +19,18 @@ _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 
 CHAT_IMAGE_ID = "chat-image:v0"
 CHAT_IMAGE_NAME = "ChatImage"
-DEFAULT_EXIT_WORDS = ["/exit", "/quit", "quit", "退出", "再见"]
+DEFAULT_EXIT_WORDS = ("/exit", "/quit", "quit", "退出", "再见")
 DEFAULT_SYSTEM_PROMPT = ("You are a helpful assistant in a terminal chat. Reply to the user's latest message directly. "
                          "Keep answers concise unless the user asks for detail.")
+CHAT_PROCESS_GOAL = (
+    "You are an AI assistant interacting via a terminal interface. To ensure a smooth and efficient conversation, "
+    "please adhere to the following rules: "
+    "1. Do not repeat the same text, greetings, or explanations in one turn. Keep responses concise and strictly "
+    "relevant to the new context. "
+    "2. Every turn MUST conclude with a tool call to either `ask_human` (to receive the next user message) or "
+    "`process_exit` (when the user wants to exit or the task is done). Never end a turn without calling one of these "
+    "tools."
+)
 
 
 class ChatResponder(Protocol):
@@ -46,29 +55,60 @@ def main() -> None:
     )
     parser.add_argument("--max-quanta", type=int, default=None, help="Maximum Agent execution quanta.")
     parser.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT, help="System prompt for the chat model.")
-    parser.add_argument("--exit-word", action="append", default=None,
-        help="Exit word. Can be repeated. Defaults include /exit, quit, 退出, 再见.", )
-    parser.add_argument("--auto-message", action="append", default=None,
-        help="Non-interactive human message. Repeat for multiple turns; /exit is used when exhausted.", )
-    parser.add_argument("--mock", action="store_true",
-        help="Use a deterministic local echo responder instead of calling the configured LLM provider.", )
+    parser.add_argument(
+        "--exit-word",
+        action="append",
+        default=None,
+        help="Exit word. Can be repeated. Defaults include /exit, quit, 退出, 再见.",
+    )
+    parser.add_argument(
+        "--auto-message",
+        action="append",
+        default=None,
+        help="Non-interactive human message. Repeat for multiple turns; /exit is used when exhausted.",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Use a deterministic local echo responder instead of calling the configured LLM provider.",
+    )
     args = parser.parse_args()
 
     responder: ChatResponder = EchoResponder() if args.mock else ModelResponder(system_prompt=args.system)
-    report = asyncio.run(run_chat(db=args.db, responder=responder, max_turns=args.max_turns, max_quanta=args.max_quanta,
-        exit_words=args.exit_word or DEFAULT_EXIT_WORDS, auto_messages=args.auto_message, ))
+    report = asyncio.run(
+        run_chat(
+            db=args.db,
+            responder=responder,
+            max_turns=args.max_turns,
+            max_quanta=args.max_quanta,
+            exit_words=args.exit_word or DEFAULT_EXIT_WORDS,
+            auto_messages=args.auto_message,
+        )
+    )
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
 
 
-async def run_chat(*, db: str = _RUNTIME_DEFAULTS.local_store_target, responder: ChatResponder | None = None, max_turns: int = _SCRIPT_DEFAULTS.chat_max_turns,
-        max_quanta: int | None = None, exit_words: Sequence[str] = DEFAULT_EXIT_WORDS,
-        auto_messages: Sequence[str] | None = None, echo: bool = True, ) -> dict[str, Any]:
+async def run_chat(
+    *,
+    db: str = _RUNTIME_DEFAULTS.local_store_target,
+    responder: ChatResponder | None = None,
+    max_turns: int = _SCRIPT_DEFAULTS.chat_max_turns,
+    max_quanta: int | None = None,
+    exit_words: Sequence[str] | None = DEFAULT_EXIT_WORDS,
+    auto_messages: Sequence[str] | None = None,
+    echo: bool = True,
+) -> dict[str, Any]:
+    if exit_words is None or len(exit_words) == 0:
+        exit_words = DEFAULT_EXIT_WORDS
     if max_turns < 1:
         raise ValueError("max_turns must be positive")
     runtime = Runtime.open(db)
     outputs: list[str] = []
-    client = HumanChatActionClient(responder=responder or ModelResponder(system_prompt=DEFAULT_SYSTEM_PROMPT),
-        max_turns=max_turns, exit_words=exit_words, )
+    client = HumanChatActionClient(
+        responder=responder or ModelResponder(system_prompt=DEFAULT_SYSTEM_PROMPT),
+        max_turns=max_turns,
+        exit_words=exit_words,
+    )
     runtime.llm.client = client
     runtime.register_image(chat_image())
 
@@ -82,11 +122,11 @@ async def run_chat(*, db: str = _RUNTIME_DEFAULTS.local_store_target, responder:
     if input_fn is not None:
         runtime.substrate.human.input_reader = input_fn
     try:
-        pid = runtime.process.spawn(image=CHAT_IMAGE_ID, goal=(
-            "You are an AI assistant interacting via a terminal interface. To ensure a smooth and efficient conversation, please adhere to the following rules:"
-            "1. Do not repeat the same text, greetings, or explanations in one turn. Keep responses concise and strictly relevant to the new context.",
-            "2. Every turn MUST conclude with a tool call to either `ask_human` (to receive the next user message) or `process_exit` (when the user wants to exit or the task is done). Never end a turn without calling one of these tools."),
-            resource_budget=ResourceBudget(max_materialized_tokens=_SCRIPT_DEFAULTS.chat_context_tokens), )
+        pid = runtime.process.spawn(
+            image=CHAT_IMAGE_ID,
+            goal=CHAT_PROCESS_GOAL,
+            resource_budget=ResourceBudget(max_materialized_tokens=_SCRIPT_DEFAULTS.chat_context_tokens),
+        )
         client.bind_runtime(runtime, pid)
         default_max_quanta = max_turns * _SCRIPT_DEFAULTS.chat_quanta_per_turn + _SCRIPT_DEFAULTS.chat_quanta_overhead
         results = await runtime.arun_until_idle(max_quanta=max_quanta or default_max_quanta)

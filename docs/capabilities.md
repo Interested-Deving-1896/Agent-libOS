@@ -24,7 +24,10 @@ Capability v2 records are structured authority statements:
 
 One-shot authority is not encoded as a policy string. It is an `allow`
 capability with `uses_remaining=1`; successful primitive use consumes it and
-revokes the capability when the count reaches zero.
+revokes the capability when the count reaches zero. If one-shot Object Memory
+authority is resolved through a namespace/name lookup, any handle minted from
+that lookup remains one-shot; name lookup cannot turn temporary authority into
+a persistent object handle.
 
 `deny` records dominate matching allows. To create an exception, revoke the
 broad deny and issue narrower allow/deny records explicitly. The runtime does

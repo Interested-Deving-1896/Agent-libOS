@@ -1,0 +1,306 @@
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+
+export type Language = "zh-CN" | "en";
+
+const LANGUAGE_STORAGE_KEY = "agent-libos.gui.language";
+
+const en = {
+    "app.defaultDb": "local",
+    "app.preloadMissing": "Electron preload did not provide a GUI connection.",
+    "app.confirmationRequiredSuffix": "Re-run this operation from its explicit confirmation control.",
+    "app.exec.title": "Exec process",
+    "app.exec.message": "This replaces the selected process image and goal. It does not grant target-image capabilities.",
+    "app.exit.title": "Exit process",
+    "app.exit.message": "This marks the selected process as exited.",
+    "operator.processes.title": "Processes",
+    "operator.noProcessSelected": "No process selected",
+    "operator.cwd": "cwd",
+    "operator.interruptPending": "Interrupt pending",
+    "operator.humanRequestFallback": "Human request",
+    "operator.answerPlaceholder": "Answer or approval note",
+    "operator.approve": "Approve",
+    "operator.reject": "Reject",
+    "operator.messagePlaceholder": "Send a message to the selected process",
+    "operator.message": "Message",
+    "operator.interrupt": "Interrupt",
+    "operator.newCwdPlaceholder": "New cwd",
+    "operator.exec": "Exec",
+    "operator.exit": "Exit",
+    "operator.spawnImage": "Spawn image",
+    "operator.spawnGoal": "Spawn goal",
+    "user.openDb": "Open DB",
+    "user.openDbTitle": "Open database",
+    "user.refreshTitle": "Refresh",
+    "user.operatorConsole": "Operator Console",
+    "user.process": "Process",
+    "user.noProcess": "No process",
+    "user.running": "Running",
+    "user.paused": "Paused",
+    "user.idle": "Idle",
+    "user.llmCalls": "{count} LLM calls",
+    "user.tokens": "{count} tokens",
+    "user.noProcessYet": "No process yet.",
+    "user.quanta": "Quanta",
+    "user.run": "Run",
+    "user.pause": "Pause",
+    "user.stop": "Stop",
+    "user.startTask": "Start a task",
+    "user.start": "Start",
+    "user.pendingRequests": "Pending human requests",
+    "user.answerPlaceholder": "Answer or approval note",
+    "user.submit": "Submit",
+    "user.reject": "Reject",
+    "user.conversation": "User conversation",
+    "user.emptyConversation": "Messages and Agent output will appear here.",
+    "user.messageAgent": "Message the Agent",
+    "user.send": "Send",
+    "user.interrupt": "Interrupt",
+    "user.needsInput": "Needs input",
+    "user.agent": "Agent",
+    "user.you": "You",
+    "user.empty": "(empty)",
+    "top.runtimeDatabase": "Runtime database",
+    "top.openSqlite": "Open SQLite database",
+    "top.open": "Open",
+    "top.spawn": "Spawn",
+    "top.autoRun": "Auto Run",
+    "top.quanta": "Quanta",
+    "top.runSelected": "Run selected process",
+    "top.stepSelected": "Step selected process",
+    "top.step": "Step",
+    "top.pauseScheduler": "Pause scheduler",
+    "top.refreshSnapshot": "Refresh snapshot",
+    "top.userPage": "User Page",
+    "top.running": "Running",
+    "top.paused": "Paused",
+    "top.idle": "Idle",
+    "details.overview": "Overview",
+    "details.capabilities": "Capabilities",
+    "details.toolsSkills": "Tools/Skills",
+    "details.checkpoints": "Checkpoints",
+    "details.audit": "Audit",
+    "details.llmCalls": "LLM Calls",
+    "details.jsonRpc": "JSON-RPC",
+    "details.objectMemory": "Object Memory",
+    "details.snapshotMissing": "Runtime snapshot is not loaded.",
+    "details.selectProcess": "Select a process.",
+    "details.rawData": "Raw data",
+    "details.objectMemoryNote": "Object payload materialization remains capability-controlled in the runtime.",
+    "processTree.label": "Process tree",
+    "processTree.empty": "No processes yet.",
+    "timeline.selectProcess": "Select a process to inspect its timeline.",
+    "timeline.empty": "No timeline entries for this process yet.",
+    "timeline.label": "Process timeline",
+    "timeline.messageTitle": "{kind} message",
+    "timeline.agentOutput": "Agent output",
+    "timeline.humanRequest": "human request {status}",
+    "timeline.llmStatus": "LLM {status}",
+    "timeline.emptyMessage": "(empty message)",
+    "timeline.emptyOutput": "(empty output)",
+    "timeline.humanInteraction": "human interaction",
+    "timeline.auditRecord": "audit record",
+    "confirm.confirm": "Confirm",
+    "confirm.cancel": "Cancel",
+    "confirm.preview": "Preview",
+    "json.details": "Details",
+    "json.show": "Show",
+    "json.hide": "Hide",
+    "json.null": "null",
+    "json.undefined": "undefined",
+    "json.empty": "(empty)",
+    "json.arrayEmpty": "[]",
+    "json.objectEmpty": "{}",
+    "json.arrayPreview": "[{count} {itemLabel}] {preview}",
+    "json.item": "item",
+    "json.items": "items",
+    "json.fields": "{count} fields, {size}",
+    "json.itemsMeta": "{count} items, {size}",
+    "language.label": "Language",
+    "language.en": "English",
+    "language.zh": "中文"
+} as const;
+
+export type TranslationKey = keyof typeof en;
+
+const zhCN: Record<TranslationKey, string> = {
+    "app.defaultDb": "本地",
+    "app.preloadMissing": "Electron preload 没有提供 GUI 连接。",
+    "app.confirmationRequiredSuffix": "请从对应的显式确认控件重新执行该操作。",
+    "app.exec.title": "执行新镜像",
+    "app.exec.message": "这会替换所选进程的镜像和目标，但不会授予目标镜像声明的能力。",
+    "app.exit.title": "退出进程",
+    "app.exit.message": "这会将所选进程标记为已退出。",
+    "operator.processes.title": "进程",
+    "operator.noProcessSelected": "未选择进程",
+    "operator.cwd": "工作目录",
+    "operator.interruptPending": "有待处理中断",
+    "operator.humanRequestFallback": "人类请求",
+    "operator.answerPlaceholder": "回答或审批说明",
+    "operator.approve": "批准",
+    "operator.reject": "拒绝",
+    "operator.messagePlaceholder": "向所选进程发送消息",
+    "operator.message": "消息",
+    "operator.interrupt": "中断",
+    "operator.newCwdPlaceholder": "新工作目录",
+    "operator.exec": "执行镜像",
+    "operator.exit": "退出",
+    "operator.spawnImage": "启动镜像",
+    "operator.spawnGoal": "启动目标",
+    "user.openDb": "打开 DB",
+    "user.openDbTitle": "打开数据库",
+    "user.refreshTitle": "刷新",
+    "user.operatorConsole": "高级控制台",
+    "user.process": "进程",
+    "user.noProcess": "无进程",
+    "user.running": "运行中",
+    "user.paused": "已暂停",
+    "user.idle": "空闲",
+    "user.llmCalls": "{count} 次 LLM 调用",
+    "user.tokens": "{count} tokens",
+    "user.noProcessYet": "还没有进程。",
+    "user.quanta": "步数预算",
+    "user.run": "运行",
+    "user.pause": "暂停",
+    "user.stop": "停止",
+    "user.startTask": "开始任务",
+    "user.start": "开始",
+    "user.pendingRequests": "待处理人类请求",
+    "user.answerPlaceholder": "回答或审批说明",
+    "user.submit": "提交",
+    "user.reject": "拒绝",
+    "user.conversation": "用户对话",
+    "user.emptyConversation": "消息和 Agent 输出会显示在这里。",
+    "user.messageAgent": "给 Agent 发送消息",
+    "user.send": "发送",
+    "user.interrupt": "中断",
+    "user.needsInput": "需要输入",
+    "user.agent": "Agent",
+    "user.you": "你",
+    "user.empty": "（空）",
+    "top.runtimeDatabase": "运行时数据库",
+    "top.openSqlite": "打开 SQLite 数据库",
+    "top.open": "打开",
+    "top.spawn": "启动",
+    "top.autoRun": "自动运行",
+    "top.quanta": "步数预算",
+    "top.runSelected": "运行所选进程",
+    "top.stepSelected": "单步执行所选进程",
+    "top.step": "单步",
+    "top.pauseScheduler": "暂停调度器",
+    "top.refreshSnapshot": "刷新快照",
+    "top.userPage": "使用者页",
+    "top.running": "运行中",
+    "top.paused": "已暂停",
+    "top.idle": "空闲",
+    "details.overview": "概览",
+    "details.capabilities": "能力",
+    "details.toolsSkills": "工具/Skills",
+    "details.checkpoints": "检查点",
+    "details.audit": "审计",
+    "details.llmCalls": "LLM 调用",
+    "details.jsonRpc": "JSON-RPC",
+    "details.objectMemory": "对象记忆",
+    "details.snapshotMissing": "运行时快照尚未加载。",
+    "details.selectProcess": "请选择一个进程。",
+    "details.rawData": "原始数据",
+    "details.objectMemoryNote": "对象 payload materialization 仍由运行时 capability 控制。",
+    "processTree.label": "进程树",
+    "processTree.empty": "还没有进程。",
+    "timeline.selectProcess": "选择一个进程以查看时间线。",
+    "timeline.empty": "该进程还没有时间线记录。",
+    "timeline.label": "进程时间线",
+    "timeline.messageTitle": "{kind} 消息",
+    "timeline.agentOutput": "Agent 输出",
+    "timeline.humanRequest": "人类请求 {status}",
+    "timeline.llmStatus": "LLM {status}",
+    "timeline.emptyMessage": "（空消息）",
+    "timeline.emptyOutput": "（空输出）",
+    "timeline.humanInteraction": "人类交互",
+    "timeline.auditRecord": "审计记录",
+    "confirm.confirm": "确认",
+    "confirm.cancel": "取消",
+    "confirm.preview": "预览",
+    "json.details": "详情",
+    "json.show": "展开",
+    "json.hide": "收起",
+    "json.null": "null",
+    "json.undefined": "undefined",
+    "json.empty": "（空）",
+    "json.arrayEmpty": "[]",
+    "json.objectEmpty": "{}",
+    "json.arrayPreview": "[{count} 项] {preview}",
+    "json.item": "item",
+    "json.items": "items",
+    "json.fields": "{count} 个字段，{size}",
+    "json.itemsMeta": "{count} 项，{size}",
+    "language.label": "语言",
+    "language.en": "English",
+    "language.zh": "中文"
+};
+
+const translations: Record<Language, Record<TranslationKey, string>> = { en, "zh-CN": zhCN };
+
+type I18nContextValue = {
+  language: Language;
+  setLanguage(language: Language): void;
+  t(key: TranslationKey, vars?: Record<string, string | number>): string;
+  formatTime(value: string): string;
+};
+
+const I18nContext = createContext<I18nContextValue | null>(null);
+
+export function I18nProvider({ children }: { children: ReactNode }) {
+  const [language, setLanguageState] = useState<Language>(() => resolveInitialLanguage());
+
+  function setLanguage(next: Language) {
+    setLanguageState(next);
+    storage()?.setItem(LANGUAGE_STORAGE_KEY, next);
+  }
+
+  const value = useMemo<I18nContextValue>(() => ({
+    language,
+    setLanguage,
+    t: (key, vars) => translate(language, key, vars),
+    formatTime: (input) => formatTime(input, language)
+  }), [language]);
+
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
+}
+
+export function useI18n(): I18nContextValue {
+  const context = useContext(I18nContext);
+  if (!context) throw new Error("useI18n must be used inside I18nProvider.");
+  return context;
+}
+
+export function translate(language: Language, key: string, vars: Record<string, string | number> = {}): string {
+  const table = translations[language] as Record<string, string>;
+  const template = table[key] ?? translations.en[key as TranslationKey] ?? key;
+  return template.replace(/\{(\w+)\}/g, (_, name: string) => String(vars[name] ?? `{${name}}`));
+}
+
+export function resolveInitialLanguage(
+  saved = storage()?.getItem(LANGUAGE_STORAGE_KEY) ?? null,
+  navigatorLanguage = globalThis.navigator?.language ?? "en"
+): Language {
+  if (saved === "zh-CN" || saved === "en") return saved;
+  return navigatorLanguage.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+}
+
+export function formatTime(value: string, language: Language): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(language, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(date);
+}
+
+function storage(): Storage | null {
+  try {
+    return globalThis.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}

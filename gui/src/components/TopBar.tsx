@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Database, Pause, Play, RefreshCw, Square, StepForward } from "lucide-react";
 import type { SchedulerStatus } from "../api/types";
+import { useI18n } from "../i18n";
+import { LanguageSwitch } from "./LanguageSwitch";
 
 export function TopBar({
   db,
@@ -15,7 +17,8 @@ export function TopBar({
   onStep,
   onPause,
   onAutoRunChange,
-  onRefresh
+  onRefresh,
+  onShowUser
 }: {
   db: string;
   scheduler: SchedulerStatus | null;
@@ -30,7 +33,9 @@ export function TopBar({
   onPause(): void;
   onAutoRunChange(value: boolean): void;
   onRefresh(): void;
+  onShowUser?: () => void;
 }) {
+  const { t } = useI18n();
   const [dbValue, setDbValue] = useState(db);
   useEffect(() => setDbValue(db), [db]);
 
@@ -39,29 +44,31 @@ export function TopBar({
       <div className="dbGroup">
         <Database size={17} />
         <input
-          aria-label="Runtime database"
+          aria-label={t("top.runtimeDatabase")}
           value={dbValue}
           onChange={(event) => setDbValue(event.currentTarget.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") onUseDb(dbValue);
           }}
         />
-        <button title="Open SQLite database" onClick={onOpenDb}>Open</button>
+        <button title={t("top.openSqlite")} onClick={onOpenDb}>{t("top.open")}</button>
       </div>
-      <button className="primary" onClick={onSpawn}>Spawn</button>
+      <button className="primary" onClick={onSpawn}>{t("top.spawn")}</button>
       <label className="toggle">
         <input type="checkbox" checked={Boolean(scheduler?.auto_run)} onChange={(event) => onAutoRunChange(event.currentTarget.checked)} />
-        Auto Run
+        {t("top.autoRun")}
       </label>
       <label className="quanta">
-        Quanta
+        {t("top.quanta")}
         <input type="number" min={1} max={200} value={maxQuanta} onChange={(event) => onMaxQuantaChange(Number(event.currentTarget.value))} />
       </label>
-      <button title="Run selected process" disabled={!selectedPid || scheduler?.running} onClick={onRun}><Play size={16} />Run</button>
-      <button title="Step selected process" disabled={!selectedPid || scheduler?.running} onClick={onStep}><StepForward size={16} />Step</button>
-      <button title="Pause scheduler" onClick={onPause}><Pause size={16} />Pause</button>
-      <button title="Refresh snapshot" onClick={onRefresh}><RefreshCw size={16} /></button>
-      <span className={`scheduler ${scheduler?.running ? "running" : ""}`}><Square size={11} />{scheduler?.running ? "Running" : scheduler?.paused ? "Paused" : "Idle"}</span>
+      <button title={t("top.runSelected")} disabled={!selectedPid || scheduler?.running} onClick={onRun}><Play size={16} />{t("user.run")}</button>
+      <button title={t("top.stepSelected")} disabled={!selectedPid || scheduler?.running} onClick={onStep}><StepForward size={16} />{t("top.step")}</button>
+      <button title={t("top.pauseScheduler")} onClick={onPause}><Pause size={16} />{t("user.pause")}</button>
+      <button title={t("top.refreshSnapshot")} onClick={onRefresh}><RefreshCw size={16} /></button>
+      <LanguageSwitch />
+      {onShowUser ? <button className="secondary" onClick={onShowUser}>{t("top.userPage")}</button> : null}
+      <span className={`scheduler ${scheduler?.running ? "running" : ""}`}><Square size={11} />{scheduler?.running ? t("top.running") : scheduler?.paused ? t("top.paused") : t("top.idle")}</span>
     </header>
   );
 }

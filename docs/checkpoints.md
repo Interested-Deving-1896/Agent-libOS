@@ -23,7 +23,10 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - checkpoint-derived image artifacts needed by those image definitions,
 - loaded startup Runtime Module ids and source hashes.
 
-Transient `running` state is normalized to `runnable` at snapshot time.
+Transient `running` state is normalized to `runnable` at snapshot time. Forking
+from a checkpoint also normalizes transient wait states such as waiting for an
+event, tool, or human response back to `runnable`; the forked process must
+re-enter those waits explicitly under its new identity.
 
 ## Append-Only Boundary
 
@@ -171,6 +174,14 @@ pids, object ids, capability ids, namespace ids, and process-local tool records.
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result
 objects by reference.
+
+Fork capability copying is checked against current capability state before rows
+are remapped. Revoked or expired capabilities are not copied. If a current
+restrictive `deny` or `ask` capability may overlap a checkpointed `allow`
+capability, the overlapping right is dropped from the forked copy. This is
+conservative by design: capability records do not encode exceptions, so a fork
+must not recreate broad authority that current policy has narrowed since the
+checkpoint was taken.
 
 ## Replay To Event
 

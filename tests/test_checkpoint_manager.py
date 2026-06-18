@@ -13,6 +13,7 @@ from agent_libos.api.cli import main as cli_main
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
 from agent_libos.models import (
+    CapabilityEffect,
     CapabilityRight,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -246,6 +247,50 @@ class CheckpointManagerTests(unittest.TestCase):
             self.assertFalse(runtime.capability.check(pid, resource, CapabilityRight.READ))
             self.assertFalse(runtime.capability.check(fork_root, resource, CapabilityRight.READ))
             self.assertNotIn(resource, [capability.resource for capability in runtime.capability.list_subject(fork_root)])
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_respects_post_checkpoint_deny_policy(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="fork denied capability")
+            secret = runtime.filesystem.resource_for_path("secret.txt")
+            runtime.capability.grant(pid, "filesystem:workspace:*", [CapabilityRight.READ], issued_by="test")
+            checkpoint_id = runtime.checkpoint.create(pid, "before deny policy", actor=pid)
+            runtime.capability.grant(pid, f"checkpoint:{checkpoint_id}", [CapabilityRight.EXECUTE], issued_by="test")
+            runtime.capability.issue_trusted(
+                pid,
+                secret,
+                [CapabilityRight.READ],
+                issued_by="test",
+                effect=CapabilityEffect.DENY,
+            )
+
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+            fork_root = forked["fork_root_pid"]
+
+            self.assertFalse(runtime.capability.check(pid, secret, CapabilityRight.READ))
+            self.assertFalse(runtime.capability.check(fork_root, secret, CapabilityRight.READ))
+            self.assertFalse(runtime.capability.check(fork_root, "filesystem:workspace:public.txt", CapabilityRight.READ))
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_normalizes_waiting_process_state(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="waiting parent")
+            child = runtime.spawn_child_process(parent, "unfinished child")
+            with self.assertRaises(TimeoutError):
+                runtime.process.wait(parent, child, timeout=0)
+            self.assertEqual(runtime.process.get(parent).status, ProcessStatus.WAITING_EVENT)
+            checkpoint_id = runtime.checkpoint.create(parent, "waiting fork point", actor=parent)
+            runtime.capability.grant(parent, f"checkpoint:{checkpoint_id}", [CapabilityRight.EXECUTE], issued_by="test")
+
+            forked = runtime.checkpoint.fork_from_checkpoint(parent, checkpoint_id)
+            fork_root = runtime.process.get(forked["fork_root_pid"])
+
+            self.assertEqual(fork_root.status, ProcessStatus.RUNNABLE)
+            self.assertIsNone(fork_root.status_message)
         finally:
             runtime.close()
 

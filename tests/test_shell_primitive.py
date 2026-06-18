@@ -251,6 +251,7 @@ class ShellMatcherTests(unittest.TestCase):
 
 class RecordingShellSubstrate(LocalResourceProviderSubstrate):
     def __init__(self, root: str, shell: "FakeShellProvider"):
+        super().__init__(Path(root).resolve())
         self.workspace_root = Path(root).resolve()
         self.workspace_display = str(self.workspace_root)
         self.filesystem = LocalFilesystemProvider(root)

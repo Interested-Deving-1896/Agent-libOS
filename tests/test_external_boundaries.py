@@ -85,6 +85,18 @@ class ExternalBoundaryTests(unittest.TestCase):
         self.assertEqual(self.runtime.human.list(pid)[0].status, HumanRequestStatus.DELIVERED)
         self.assertIn("human.output", self._audit_actions())
 
+    def test_one_time_human_output_capability_is_consumed_after_delivery(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="speak once")
+        self.runtime.capability.grant_once(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test")
+
+        first = self.runtime.tools.call(pid, "human_output", {"message": "first"})
+        second = self.runtime.tools.call(pid, "human_output", {"message": "second"})
+
+        self.assertTrue(first.ok, first.error)
+        self.assertFalse(second.ok)
+        self.assertEqual(self.human_output, ["first"])
+        self.assertFalse(self.runtime.capability.check(pid, "human:owner", CapabilityRight.WRITE))
+
     def test_process_cannot_call_tool_outside_creation_tool_table(self) -> None:
         pid = self.runtime.process.spawn(image="toolmaker-agent:v0", goal="call unavailable tool")
 

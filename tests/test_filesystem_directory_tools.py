@@ -107,6 +107,26 @@ class FilesystemDirectoryToolTests(unittest.TestCase):
         self.assertEqual(result.bytes_read, 1)
         self.assertEqual(result.content, "")
 
+    def test_one_time_read_capabilities_are_consumed_after_provider_read(self) -> None:
+        base = f"agent_outputs/read_once_{uuid4().hex}"
+        text_path = self._write_fixture(f"{base}/text.txt", "text")
+        bytes_path = self._write_fixture(f"{base}/bytes.bin", "bytes")
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="read once")
+        text_resource = self.runtime.filesystem.resource_for_path(text_path)
+        bytes_resource = self.runtime.filesystem.resource_for_path(bytes_path)
+        directory_resource = self.runtime.filesystem.directory_resource_for_path(base)
+        self.runtime.capability.grant_once(pid, text_resource, [CapabilityRight.READ], issued_by="test")
+        self.runtime.capability.grant_once(pid, bytes_resource, [CapabilityRight.READ], issued_by="test")
+        self.runtime.capability.grant_once(pid, directory_resource, [CapabilityRight.READ], issued_by="test")
+
+        self.assertEqual(self.runtime.filesystem.read_text(pid, text_path).content, "text")
+        self.assertEqual(self.runtime.filesystem.read_bytes(pid, bytes_path).content, b"bytes")
+        self.assertEqual(self.runtime.filesystem.read_directory(pid, base).count, 2)
+
+        self.assertFalse(self.runtime.capability.check(pid, text_resource, CapabilityRight.READ))
+        self.assertFalse(self.runtime.capability.check(pid, bytes_resource, CapabilityRight.READ))
+        self.assertFalse(self.runtime.capability.check(pid, directory_resource, CapabilityRight.READ))
+
     def test_filesystem_primitive_enforces_read_limits_without_tool_schema(self) -> None:
         path = self._write_fixture(f"agent_outputs/read_limit_{uuid4().hex}.txt", "content")
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="read limit")

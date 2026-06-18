@@ -6,10 +6,15 @@ import unittest
 
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from scripts.human_llm_chat import EchoResponder, ModelResponder, run_chat
+from scripts.human_llm_chat import CHAT_PROCESS_GOAL, EchoResponder, ModelResponder, run_chat
 
 
 class HumanLLMChatScriptTests(unittest.TestCase):
+    def test_chat_process_goal_is_plain_prompt_text(self) -> None:
+        self.assertIsInstance(CHAT_PROCESS_GOAL, str)
+        self.assertIn("Every turn MUST conclude with a tool call", CHAT_PROCESS_GOAL)
+        self.assertIn("ask_human", CHAT_PROCESS_GOAL)
+
     def test_chat_uses_human_question_and_output_tools(self) -> None:
         report = asyncio.run(
             run_chat(

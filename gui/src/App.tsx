@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Send } from "lucide-react";
 import { LibOSClient } from "./api/client";
-import type { GuiConnection, HumanRequest, RuntimeProcess, RuntimeSnapshot } from "./api/types";
+import type { GuiConnection, HumanRequest, RuntimeSnapshot } from "./api/types";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
 import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
 import { TopBar } from "./components/TopBar";
+import { UserPage } from "./components/UserPage";
+import { useI18n } from "./i18n";
 
 type PendingConfirm = {
   title: string;
@@ -16,6 +18,8 @@ type PendingConfirm = {
 };
 
 export function App() {
+  const { t } = useI18n();
+  const [view, setView] = useState<"user" | "operator">("user");
   const [connection, setConnection] = useState<GuiConnection | null>(null);
   const [client, setClient] = useState<LibOSClient | null>(null);
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
@@ -63,7 +67,7 @@ export function App() {
   async function initialize() {
     try {
       const conn = await window.libosApi?.getConnection();
-      if (!conn) throw new Error("Electron preload did not provide a GUI connection.");
+      if (!conn) throw new Error(t("app.preloadMissing"));
       const nextClient = new LibOSClient(conn);
       setConnection(conn);
       setClient(nextClient);
@@ -99,7 +103,7 @@ export function App() {
     } catch (reason) {
       const err = reason as Error & { payload?: { error?: { confirmation_required?: boolean; preview?: Record<string, unknown>; action?: string } } };
       if (err.payload?.error?.confirmation_required) {
-        setError(`${err.message}. Re-run this operation from its explicit confirmation control.`);
+        setError(`${err.message}. ${t("app.confirmationRequiredSuffix")}`);
       } else {
         setError(err.message ?? String(reason));
       }
@@ -133,8 +137,8 @@ export function App() {
   function confirmExec() {
     if (!client || !selectedPid) return;
     setPendingConfirm({
-      title: "Exec process",
-      message: "This replaces the selected process image and goal. It does not grant target-image capabilities.",
+      title: t("app.exec.title"),
+      message: t("app.exec.message"),
       details: { pid: selectedPid, image: execImage, goal: execGoal, auto_run: snapshot?.scheduler.auto_run },
       action: async () => {
         await client.execProcess(selectedPid, execImage, execGoal, true, Boolean(snapshot?.scheduler.auto_run));
@@ -147,8 +151,8 @@ export function App() {
   function confirmExit() {
     if (!client || !selectedPid) return;
     setPendingConfirm({
-      title: "Exit process",
-      message: "This marks the selected process as exited.",
+      title: t("app.exit.title"),
+      message: t("app.exit.message"),
       details: { pid: selectedPid },
       action: async () => {
         await client.exitProcess(selectedPid, "Exited from GUI", false, true);
@@ -159,86 +163,114 @@ export function App() {
   }
 
   return (
-    <div className="appShell">
-      <TopBar
-        db={connection?.db ?? "local"}
-        scheduler={snapshot?.scheduler ?? null}
-        maxQuanta={maxQuanta}
-        selectedPid={selectedPid}
-        onMaxQuantaChange={setMaxQuanta}
-        onOpenDb={() => void window.libosApi?.chooseDatabase().then(reconnect)}
-        onUseDb={(db) => void window.libosApi?.useDatabase(db).then(reconnect)}
-        onSpawn={spawnProcess}
-        onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
-        onStep={() => selectedPid && client && void safe(() => client.step(selectedPid).then(() => undefined))}
-        onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
-        onAutoRunChange={(value) => client && void safe(() => client.setAutoRun(value).then(() => undefined))}
-        onRefresh={() => void refresh()}
-      />
-
-      <main className="workspace">
-        <section className="leftPane">
-          <div className="paneHeader">
-            <h1>Processes</h1>
-            <span>{snapshot?.processes.length ?? 0}</span>
-          </div>
-          <div className="spawnBox">
-            <input value={spawnImage} onChange={(event) => setSpawnImage(event.currentTarget.value)} aria-label="Spawn image" />
-            <textarea value={spawnGoal} onChange={(event) => setSpawnGoal(event.currentTarget.value)} aria-label="Spawn goal" />
-          </div>
-          <ProcessTree processes={snapshot?.processes ?? []} selectedPid={selectedPid} onSelect={setSelectedPid} />
-        </section>
-
-        <section className="centerPane">
-          <div className="paneHeader">
-            <div>
-              <h1>{selectedProcess?.pid ?? "No process selected"}</h1>
-              {selectedProcess ? <span>{selectedProcess.image_id} · {selectedProcess.status} · cwd {selectedProcess.working_directory}</span> : null}
-            </div>
-            {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={16} /> Interrupt pending</span> : null}
-          </div>
-
-          <div className="humanRequests">
-            {(snapshot?.human_requests ?? []).filter((request) => request.status === "pending").map((request) => (
-              <div className="humanCard" key={request.request_id}>
-                <strong>{String(request.payload?.question ?? request.payload?.type ?? "Human request")}</strong>
-                <input placeholder="Answer or approval note" onKeyDown={(event) => {
-                  if (event.key === "Enter") void respond(request, true, event.currentTarget.value);
-                }} />
-                <button onClick={() => void respond(request, true)}>Approve</button>
-                <button className="danger" onClick={() => void respond(request, false)}>Reject</button>
-              </div>
-            ))}
-          </div>
-
-          <Timeline
-            pid={selectedPid}
-            messages={selectedProcess?.messages ?? []}
-            humanRequests={snapshot?.human_requests ?? []}
-            llmCalls={snapshot?.llm_calls ?? []}
-            events={snapshot?.events ?? []}
-            audit={snapshot?.audit ?? []}
+    <div className={view === "user" ? "userAppShell" : "appShell"}>
+      {view === "user" ? (
+        <UserPage
+          connection={connection}
+          snapshot={snapshot}
+          selectedPid={selectedPid}
+          selectedProcess={selectedProcess}
+          maxQuanta={maxQuanta}
+          spawnGoal={spawnGoal}
+          message={message}
+          onSelectPid={setSelectedPid}
+          onMaxQuantaChange={setMaxQuanta}
+          onSpawnGoalChange={setSpawnGoal}
+          onMessageChange={setMessage}
+          onSpawn={() => void spawnProcess()}
+          onSend={(kind) => void send(kind)}
+          onRespond={(request, approved, answer = "") => void respond(request, approved, answer)}
+          onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
+          onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
+          onRefresh={() => void refresh()}
+          onOpenDb={() => void window.libosApi?.chooseDatabase().then(reconnect)}
+          onShowOperator={() => setView("operator")}
+          onStop={confirmExit}
+        />
+      ) : (
+        <>
+          <TopBar
+            db={connection?.db ?? t("app.defaultDb")}
+            scheduler={snapshot?.scheduler ?? null}
+            maxQuanta={maxQuanta}
+            selectedPid={selectedPid}
+            onMaxQuantaChange={setMaxQuanta}
+            onOpenDb={() => void window.libosApi?.chooseDatabase().then(reconnect)}
+            onUseDb={(db) => void window.libosApi?.useDatabase(db).then(reconnect)}
+            onSpawn={() => void spawnProcess()}
+            onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
+            onStep={() => selectedPid && client && void safe(() => client.step(selectedPid).then(() => undefined))}
+            onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
+            onAutoRunChange={(value) => client && void safe(() => client.setAutoRun(value).then(() => undefined))}
+            onRefresh={() => void refresh()}
+            onShowUser={() => setView("user")}
           />
 
-          <div className="composer">
-            <input value={message} onChange={(event) => setMessage(event.currentTarget.value)} placeholder="Send a message to the selected process" />
-            <button disabled={!selectedPid || !message.trim()} onClick={() => void send("message")}><Send size={16} />Message</button>
-            <button disabled={!selectedPid || !message.trim()} className="warning" onClick={() => void send("interrupt")}>Interrupt</button>
-          </div>
-        </section>
+          <main className="workspace">
+            <section className="leftPane">
+              <div className="paneHeader">
+                <h1>{t("operator.processes.title")}</h1>
+                <span>{snapshot?.processes.length ?? 0}</span>
+              </div>
+              <div className="spawnBox">
+                <input value={spawnImage} onChange={(event) => setSpawnImage(event.currentTarget.value)} aria-label={t("operator.spawnImage")} />
+                <textarea value={spawnGoal} onChange={(event) => setSpawnGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
+              </div>
+              <ProcessTree processes={snapshot?.processes ?? []} selectedPid={selectedPid} onSelect={setSelectedPid} />
+            </section>
 
-        <section className="rightPane">
-          <div className="quickActions">
-            <input value={cwd} placeholder="New cwd" onChange={(event) => setCwd(event.currentTarget.value)} />
-            <button disabled={!client || !selectedPid || !cwd.trim()} onClick={() => selectedPid && void safe(() => client!.changeDirectory(selectedPid, cwd).then(() => undefined))}>cd</button>
-            <input value={execImage} onChange={(event) => setExecImage(event.currentTarget.value)} aria-label="Exec image" />
-            <input value={execGoal} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label="Exec goal" />
-            <button disabled={!selectedPid} className="warning" onClick={confirmExec}>Exec</button>
-            <button disabled={!selectedPid} className="danger" onClick={confirmExit}>Exit</button>
-          </div>
-          <DetailTabs process={selectedProcess} snapshot={snapshot} />
-        </section>
-      </main>
+            <section className="centerPane">
+              <div className="paneHeader">
+                <div>
+                  <h1>{selectedProcess?.pid ?? t("operator.noProcessSelected")}</h1>
+                  {selectedProcess ? <span>{selectedProcess.image_id} · {selectedProcess.status} · {t("operator.cwd")} {selectedProcess.working_directory}</span> : null}
+                </div>
+                {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={16} /> {t("operator.interruptPending")}</span> : null}
+              </div>
+
+              <div className="humanRequests">
+                {(snapshot?.human_requests ?? []).filter((request) => request.status === "pending").map((request) => (
+                  <div className="humanCard" key={request.request_id}>
+                    <strong>{String(request.payload?.question ?? request.payload?.type ?? t("operator.humanRequestFallback"))}</strong>
+                    <input placeholder={t("operator.answerPlaceholder")} onKeyDown={(event) => {
+                      if (event.key === "Enter") void respond(request, true, event.currentTarget.value);
+                    }} />
+                    <button onClick={() => void respond(request, true)}>{t("operator.approve")}</button>
+                    <button className="danger" onClick={() => void respond(request, false)}>{t("operator.reject")}</button>
+                  </div>
+                ))}
+              </div>
+
+              <Timeline
+                pid={selectedPid}
+                messages={selectedProcess?.messages ?? []}
+                humanRequests={snapshot?.human_requests ?? []}
+                llmCalls={snapshot?.llm_calls ?? []}
+                events={snapshot?.events ?? []}
+                audit={snapshot?.audit ?? []}
+              />
+
+              <div className="composer">
+                <input value={message} onChange={(event) => setMessage(event.currentTarget.value)} placeholder={t("operator.messagePlaceholder")} />
+                <button disabled={!selectedPid || !message.trim()} onClick={() => void send("message")}><Send size={16} />{t("operator.message")}</button>
+                <button disabled={!selectedPid || !message.trim()} className="warning" onClick={() => void send("interrupt")}>{t("operator.interrupt")}</button>
+              </div>
+            </section>
+
+            <section className="rightPane">
+              <div className="quickActions">
+                <input value={cwd} placeholder={t("operator.newCwdPlaceholder")} onChange={(event) => setCwd(event.currentTarget.value)} />
+                <button disabled={!client || !selectedPid || !cwd.trim()} onClick={() => selectedPid && void safe(() => client!.changeDirectory(selectedPid, cwd).then(() => undefined))}>cd</button>
+                <input value={execImage} onChange={(event) => setExecImage(event.currentTarget.value)} aria-label={t("operator.exec")} />
+                <input value={execGoal} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
+                <button disabled={!selectedPid} className="warning" onClick={confirmExec}>{t("operator.exec")}</button>
+                <button disabled={!selectedPid} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
+              </div>
+              <DetailTabs process={selectedProcess} snapshot={snapshot} />
+            </section>
+          </main>
+        </>
+      )}
 
       {error ? <div className="toast" role="alert">{error}</div> : null}
       {pendingConfirm ? (

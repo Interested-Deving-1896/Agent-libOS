@@ -483,6 +483,12 @@ class CapabilityManager:
         decision = self.authorize(subject, f"object:{handle.oid}", requested)
         if not decision.allowed:
             raise CapabilityDenied(f"capability lacks {requested}: {handle.oid}")
+        if decision.consume_capability_id is not None:
+            self.consume_use(
+                decision.consume_capability_id,
+                used_by="object_memory",
+                reason="one-time object handle permission consumed",
+            )
 
     def handle_for_object(
         self,
@@ -491,6 +497,7 @@ class CapabilityManager:
         rights: Iterable[str | CapabilityRight],
         issued_by: str = "system",
         expires_at: str | None = None,
+        uses_remaining: int | None = None,
     ) -> ObjectHandle:
         normalized = self._normalize_rights(rights)
         cap = self.issue_trusted(
@@ -499,6 +506,7 @@ class CapabilityManager:
             rights=normalized,
             issued_by=issued_by,
             expires_at=expires_at,
+            uses_remaining=uses_remaining,
             delegable=False,
         )
         return ObjectHandle(oid=oid, rights=normalized, capability_id=cap.cap_id, expires_at=expires_at)

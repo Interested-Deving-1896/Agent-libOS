@@ -7,6 +7,7 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     AgentImage,
+    CapabilityEffect,
     CapabilityRight,
     Checkpoint,
     EventType,
@@ -38,6 +39,12 @@ class CheckpointManager:
     HISTORY_TABLES = {"audit_records", "events", "llm_calls", "checkpoints", "external_effects"}
     RESTORE_EXTERNAL_POLICY = "report_only"
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+    FORK_TRANSIENT_STATUSES = {
+        ProcessStatus.RUNNING.value,
+        ProcessStatus.WAITING_EVENT.value,
+        ProcessStatus.WAITING_TOOL.value,
+        ProcessStatus.WAITING_HUMAN.value,
+    }
 
     def __init__(
         self,
@@ -560,11 +567,85 @@ class CheckpointManager:
             current = self.store.get_capability(str(row.get("cap_id")))
             if current is None or not current.active:
                 continue
+            if self._capability_is_expired(current):
+                continue
             item = dict(row)
             item["uses_remaining"] = current.uses_remaining
             item["status"] = current.status.value
+            item["rights_json"] = dumps(sorted(current.rights))
+            item["effect"] = current.effect.value
+            if current.effect == CapabilityEffect.ALLOW:
+                allowed_rights = self._currently_allowed_fork_rights(current)
+                if not allowed_rights:
+                    continue
+                item["rights_json"] = dumps(allowed_rights)
             kept.append(item)
         return kept
+
+    def _capability_is_expired(self, capability: Any) -> bool:
+        if self.capabilities is None:
+            return False
+        return bool(self.capabilities._is_expired(capability))
+
+    def _currently_allowed_fork_rights(self, capability: Any) -> list[str]:
+        """Keep only rights that still survive current policy before checkpoint fork.
+
+        A checkpoint may contain a broad allow capability. If a narrower deny or
+        ask policy was added after the checkpoint, copying the broad allow into a
+        new subject would bypass the current restriction because that new subject
+        does not hold the post-checkpoint restrictive record. Capabilities have
+        no exception syntax, so the conservative fork rule is to drop any right
+        whose resource may overlap a currently active restrictive policy.
+        """
+
+        if self.capabilities is None:
+            return sorted(capability.rights)
+        restrictive = self._current_restrictive_capabilities(capability.subject)
+        allowed: list[str] = []
+        for right in sorted(capability.rights):
+            if any(
+                right in cap.rights and self._resources_may_overlap(capability.resource, cap.resource)
+                for cap in restrictive
+            ):
+                continue
+            decision = self.capabilities.authorize(
+                capability.subject,
+                capability.resource,
+                right,
+                {"primitive": "checkpoint", "operation": "fork_capability_filter"},
+            )
+            if decision.allowed and decision.selected_capability_id == capability.cap_id:
+                allowed.append(right)
+        return allowed
+
+    def _current_restrictive_capabilities(self, subject: str) -> list[Any]:
+        if self.capabilities is None:
+            return []
+        result = []
+        for cap in self.store.list_capabilities(subject=subject):
+            if not cap.active or self._capability_is_expired(cap):
+                continue
+            if cap.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}:
+                result.append(cap)
+        return result
+
+    def _resources_may_overlap(self, left: str, right: str) -> bool:
+        if self.capabilities is None:
+            return left == right
+        try:
+            left_pattern = self.capabilities.parse_resource_pattern(left)
+            right_pattern = self.capabilities.parse_resource_pattern(right)
+        except CapabilityDenied:
+            return left == right
+        if left_pattern.kind != right_pattern.kind:
+            return False
+        if self.capabilities._resource_matches(left, right) or self.capabilities._resource_matches(right, left):
+            return True
+        left_has_wildcard = left.endswith(":*") or left.endswith("/*")
+        right_has_wildcard = right.endswith(":*") or right.endswith("/*")
+        if left_has_wildcard or right_has_wildcard:
+            return left_pattern.body.startswith(right_pattern.body) or right_pattern.body.startswith(left_pattern.body)
+        return False
 
     def _insert_fork_rows(self, remapped: dict[str, Any]) -> None:
         rows = remapped["rows"]
@@ -962,7 +1043,7 @@ class CheckpointManager:
             superseded.append(message.message_id)
         return superseded
 
-    def _build_current_state_for_diff(self, snapshot: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    def _build_current_state_for_diff(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         pids = self._subtree_pids(snapshot["pid"])
         process_rows = self._rows_by_ids("processes", "pid", pids)
         object_oids = self._current_scoped_object_oids(pids)
@@ -1067,7 +1148,9 @@ class CheckpointManager:
         if item.get("goal_oid") in object_map:
             item["goal_oid"] = object_map[item["goal_oid"]]
         item["checkpoint_head"] = None
-        item["status"] = ProcessStatus.RUNNABLE.value if item["status"] == ProcessStatus.RUNNING.value else item["status"]
+        if item.get("status") in self.FORK_TRANSIENT_STATUSES:
+            item["status"] = ProcessStatus.RUNNABLE.value
+            item["status_message"] = None
         item["capabilities_json"] = dumps([capability_map[cap] for cap in loads(item["capabilities_json"], []) if cap in capability_map])
         view = loads(item.get("memory_view_json"), {}) if item.get("memory_view_json") else None
         if view:

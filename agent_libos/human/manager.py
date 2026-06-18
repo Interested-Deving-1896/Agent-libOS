@@ -131,8 +131,8 @@ class HumanObjectManager:
     ) -> str:
         selected_human = human or self.config.runtime.default_human
         resource = f"human:{selected_human}"
-        self.capabilities.require(pid, resource, CapabilityRight.WRITE)
-        return self.query(
+        decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
+        request_id = self.query(
             pid=pid,
             human=selected_human,
             request={
@@ -142,6 +142,8 @@ class HumanObjectManager:
             },
             blocking=blocking,
         )
+        self._consume_one_time_decision(decision, used_by="human")
+        return request_id
 
     def answer_for_request(self, request_id: str) -> str:
         request = self.get(request_id)
@@ -271,7 +273,7 @@ class HumanObjectManager:
         if selected_channel != self.config.runtime.terminal_channel:
             selected_channel = self.config.runtime.terminal_channel
         resource = f"human:{selected_human}"
-        self.capabilities.require(pid, resource, CapabilityRight.WRITE)
+        decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
         request = HumanRequest(
             request_id=new_id("hreq"),
             pid=pid,
@@ -285,6 +287,7 @@ class HumanObjectManager:
         )
         self.store.insert_human_request(request)
         delivered = self._deliver_output_request(request)
+        self._consume_one_time_decision(decision, used_by="human")
         return {
             "delivered": True,
             "request_id": delivered.request_id,
@@ -526,6 +529,15 @@ class HumanObjectManager:
             decision={"status": status.value, "decision": decision},
         )
         return request
+
+    def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
+        if decision.consume_capability_id is None:
+            return
+        self.capabilities.consume_use(
+            decision.consume_capability_id,
+            used_by=used_by,
+            reason="one-time human permission consumed",
+        )
 
     def _select_permission_policy(
         self,

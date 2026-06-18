@@ -116,7 +116,7 @@ class FilesystemAdapter:
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
-        self.capabilities.require(
+        decision = self.capabilities.require(
             pid,
             resource,
             CapabilityRight.READ,
@@ -137,32 +137,38 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "encoding": encoding, "max_bytes": max_bytes}
         require_external_effect_classifier(self.provider, "read_bytes")
-        raw = self.provider.read_bytes(target)
-        truncated = len(raw) > max_bytes
-        selected = raw[:max_bytes]
-        content = self._decode_text_prefix(selected, encoding, truncated=truncated)
-        event = self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=resource,
-            payload={"adapter": "filesystem", "path": relative, "bytes_read": len(selected), "truncated": truncated},
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.filesystem.read_text",
-            target=resource,
-            decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
-        )
-        self._record_external_effect(
-            pid=pid,
-            operation="read_bytes",
-            target=resource,
-            context=effect_context,
-            result={"bytes_read": len(selected), "truncated": truncated},
-            event=event,
-            audit_record=audit_record,
-        )
-        return FileReadResult(path=relative, content=content, bytes_read=len(selected), truncated=truncated)
+        attempted = False
+        try:
+            attempted = True
+            raw = self.provider.read_bytes(target)
+            truncated = len(raw) > max_bytes
+            selected = raw[:max_bytes]
+            content = self._decode_text_prefix(selected, encoding, truncated=truncated)
+            event = self.events.emit(
+                EventType.EXTERNAL_READ,
+                source=pid,
+                target=resource,
+                payload={"adapter": "filesystem", "path": relative, "bytes_read": len(selected), "truncated": truncated},
+            )
+            audit_record = self.audit.record(
+                actor=pid,
+                action="primitive.filesystem.read_text",
+                target=resource,
+                decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
+            )
+            self._record_external_effect(
+                pid=pid,
+                operation="read_bytes",
+                target=resource,
+                context=effect_context,
+                result={"bytes_read": len(selected), "truncated": truncated},
+                event=event,
+                audit_record=audit_record,
+            )
+            return FileReadResult(path=relative, content=content, bytes_read=len(selected), truncated=truncated)
+        finally:
+            if attempted:
+                self._consume_one_time_decision(decision, used_by="filesystem")
 
     def read_bytes(
         self,
@@ -178,7 +184,7 @@ class FilesystemAdapter:
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
-        self.capabilities.require(
+        decision = self.capabilities.require(
             pid,
             resource,
             CapabilityRight.READ,
@@ -199,37 +205,43 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "max_bytes": max_bytes}
         require_external_effect_classifier(self.provider, "read_bytes")
-        raw = self.provider.read_bytes(target)
-        truncated = len(raw) > max_bytes
-        selected = raw[:max_bytes]
-        event = self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=resource,
-            payload={
-                "adapter": "filesystem",
-                "operation": "read_bytes",
-                "path": relative,
-                "bytes_read": len(selected),
-                "truncated": truncated,
-            },
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.filesystem.read_bytes",
-            target=resource,
-            decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
-        )
-        self._record_external_effect(
-            pid=pid,
-            operation="read_bytes",
-            target=resource,
-            context=effect_context,
-            result={"bytes_read": len(selected), "truncated": truncated},
-            event=event,
-            audit_record=audit_record,
-        )
-        return FileBytesReadResult(path=relative, content=selected, bytes_read=len(selected), truncated=truncated)
+        attempted = False
+        try:
+            attempted = True
+            raw = self.provider.read_bytes(target)
+            truncated = len(raw) > max_bytes
+            selected = raw[:max_bytes]
+            event = self.events.emit(
+                EventType.EXTERNAL_READ,
+                source=pid,
+                target=resource,
+                payload={
+                    "adapter": "filesystem",
+                    "operation": "read_bytes",
+                    "path": relative,
+                    "bytes_read": len(selected),
+                    "truncated": truncated,
+                },
+            )
+            audit_record = self.audit.record(
+                actor=pid,
+                action="primitive.filesystem.read_bytes",
+                target=resource,
+                decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
+            )
+            self._record_external_effect(
+                pid=pid,
+                operation="read_bytes",
+                target=resource,
+                context=effect_context,
+                result={"bytes_read": len(selected), "truncated": truncated},
+                event=event,
+                audit_record=audit_record,
+            )
+            return FileBytesReadResult(path=relative, content=selected, bytes_read=len(selected), truncated=truncated)
+        finally:
+            if attempted:
+                self._consume_one_time_decision(decision, used_by="filesystem")
 
     def write_text(
         self,
@@ -332,7 +344,7 @@ class FilesystemAdapter:
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
-        self.capabilities.require(
+        decision = self.capabilities.require(
             pid,
             resource,
             CapabilityRight.READ,
@@ -353,38 +365,44 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path is not a directory: {relative}")
         effect_context = {"path": relative, "resource": resource, "limit": limit}
         require_external_effect_classifier(self.provider, "list_directory")
-        children = list(self.provider.list_directory(target))
-        selected = children[:limit]
-        entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
-        truncated = len(children) > len(selected)
-        event = self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=resource,
-            payload={
-                "adapter": "filesystem",
-                "operation": "read_directory",
-                "path": relative,
-                "count": len(entries),
-                "truncated": truncated,
-            },
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.filesystem.read_directory",
-            target=resource,
-            decision={"path": relative, "count": len(entries), "truncated": truncated},
-        )
-        self._record_external_effect(
-            pid=pid,
-            operation="list_directory",
-            target=resource,
-            context=effect_context,
-            result={"count": len(entries), "truncated": truncated},
-            event=event,
-            audit_record=audit_record,
-        )
-        return DirectoryReadResult(path=relative, entries=entries, count=len(entries), truncated=truncated)
+        attempted = False
+        try:
+            attempted = True
+            children = list(self.provider.list_directory(target))
+            selected = children[:limit]
+            entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
+            truncated = len(children) > len(selected)
+            event = self.events.emit(
+                EventType.EXTERNAL_READ,
+                source=pid,
+                target=resource,
+                payload={
+                    "adapter": "filesystem",
+                    "operation": "read_directory",
+                    "path": relative,
+                    "count": len(entries),
+                    "truncated": truncated,
+                },
+            )
+            audit_record = self.audit.record(
+                actor=pid,
+                action="primitive.filesystem.read_directory",
+                target=resource,
+                decision={"path": relative, "count": len(entries), "truncated": truncated},
+            )
+            self._record_external_effect(
+                pid=pid,
+                operation="list_directory",
+                target=resource,
+                context=effect_context,
+                result={"count": len(entries), "truncated": truncated},
+                event=event,
+                audit_record=audit_record,
+            )
+            return DirectoryReadResult(path=relative, entries=entries, count=len(entries), truncated=truncated)
+        finally:
+            if attempted:
+                self._consume_one_time_decision(decision, used_by="filesystem")
 
     def write_directory(
         self,
@@ -777,6 +795,15 @@ class FilesystemAdapter:
             audit_record=audit_record,
             event=event,
             metadata={"context": context, "result": result},
+        )
+
+    def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
+        if decision.consume_capability_id is None:
+            return
+        self.capabilities.consume_use(
+            decision.consume_capability_id,
+            used_by=used_by,
+            reason="one-time filesystem permission consumed",
         )
 
     def _resolve(

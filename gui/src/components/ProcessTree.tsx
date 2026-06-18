@@ -1,5 +1,6 @@
 import { Circle, Pause, Play, Square } from "lucide-react";
 import type { RuntimeProcess } from "../api/types";
+import { useI18n } from "../i18n";
 
 type ProcessTreeProps = {
   processes: RuntimeProcess[];
@@ -8,6 +9,7 @@ type ProcessTreeProps = {
 };
 
 export function ProcessTree({ processes, selectedPid, onSelect }: ProcessTreeProps) {
+  const { t } = useI18n();
   const roots = processes.filter((process) => !process.parent_pid);
   const children = new Map<string, RuntimeProcess[]>();
   for (const process of processes) {
@@ -16,7 +18,7 @@ export function ProcessTree({ processes, selectedPid, onSelect }: ProcessTreePro
   }
 
   return (
-    <nav className="processTree" aria-label="Process tree">
+    <nav className="processTree" aria-label={t("processTree.label")}>
       {roots.map((process) => (
         <ProcessNode
           key={process.pid}
@@ -27,7 +29,7 @@ export function ProcessTree({ processes, selectedPid, onSelect }: ProcessTreePro
           depth={0}
         />
       ))}
-      {processes.length === 0 ? <div className="empty">No processes yet.</div> : null}
+      {processes.length === 0 ? <div className="empty">{t("processTree.empty")}</div> : null}
     </nav>
   );
 }

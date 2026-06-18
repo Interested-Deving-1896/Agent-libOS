@@ -1,8 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions } from "electron";
 import { ChildProcess, ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import fs from "node:fs";
-import http from "node:http";
-import path from "node:path";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 type ServerConnection = {
@@ -278,7 +278,6 @@ async function createWindow() {
     smokeLog("smoke.exiting", { code: health.ok ? 0 : 2 });
     app.exit(health.ok ? 0 : 2);
     process.exit(health.ok ? 0 : 2);
-    return;
   }
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -310,7 +309,7 @@ async function createWindow() {
 
   if (smokeMode) {
     await withTimeout(
-      mainWindow.loadURL("data:text/html;charset=utf-8,<html><body>Agent libOS smoke</body></html>"),
+      mainWindow.loadURL("data:text/html;charset=utf-8,<html lang=\"zh-Hans\"><body>Agent libOS smoke</body></html>"),
       15000,
       "renderer smoke loadURL"
     );

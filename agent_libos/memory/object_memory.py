@@ -261,7 +261,7 @@ class ObjectMemoryManager:
             raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
         # Name lookup never bypasses the object capability model.
         self._require_namespace_right(pid, object_namespace, "read")
-        self.capabilities.require(pid, f"object:{obj.oid}", ObjectRight.READ)
+        decision = self.capabilities.require(pid, f"object:{obj.oid}", ObjectRight.READ)
         self.audit.record(
             actor=pid,
             action="memory.get_object_by_name",
@@ -269,6 +269,7 @@ class ObjectMemoryManager:
             input_refs=[obj.oid],
             decision={"namespace": obj.namespace, "name": obj.name, "oid": obj.oid},
         )
+        self._consume_one_time_decision(decision)
         return obj
 
     def handle_for_name(
@@ -287,9 +288,19 @@ class ObjectMemoryManager:
         requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
         # A name can be resolved only into rights the process already has.
         self._require_namespace_right(pid, object_namespace, "read")
+        decisions = []
         for right in requested:
-            self.capabilities.require(pid, f"object:{obj.oid}", right)
-        handle = self.capabilities.handle_for_object(pid, obj.oid, requested, issued_by=issued_by)
+            decisions.append(self.capabilities.require(pid, f"object:{obj.oid}", right))
+        one_time = any(decision.consume_capability_id is not None for decision in decisions)
+        handle = self.capabilities.handle_for_object(
+            pid,
+            obj.oid,
+            requested,
+            issued_by=issued_by,
+            uses_remaining=1 if one_time else None,
+        )
+        for decision in decisions:
+            self._consume_one_time_decision(decision)
         self.audit.record(
             actor=pid,
             action="memory.handle_for_name",
@@ -400,10 +411,18 @@ class ObjectMemoryManager:
                 continue
             if query.text and query.text.lower() not in self._search_text(obj).lower():
                 continue
-            if not self.capabilities.check(pid, f"object:{obj.oid}", ObjectRight.READ):
+            decision = self.capabilities.authorize(pid, f"object:{obj.oid}", ObjectRight.READ)
+            if not decision.allowed:
                 continue
             rights = {"read", "materialize", "link", "diff"}
-            handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory.query")
+            handle = self.capabilities.handle_for_object(
+                pid,
+                obj.oid,
+                rights,
+                issued_by="memory.query",
+                uses_remaining=1 if decision.consume_capability_id is not None else None,
+            )
+            self._consume_one_time_decision(decision)
             results.append(handle)
             if len(results) >= query.limit:
                 break
@@ -636,6 +655,15 @@ class ObjectMemoryManager:
             priority = {ObjectType.ERROR_TRACE: 0, ObjectType.TEST_RESULT: 1, ObjectType.CODE_PATCH: 2}
             return sorted(objects, key=lambda obj: priority.get(obj.type, 10))
         return objects
+
+    def _consume_one_time_decision(self, decision: Any) -> None:
+        if decision.consume_capability_id is None:
+            return
+        self.capabilities.consume_use(
+            decision.consume_capability_id,
+            used_by="object_memory",
+            reason="one-time object memory permission consumed",
+        )
 
     def _render_object(self, obj: AgentObject) -> str:
         title = f" title={obj.metadata.title!r}" if obj.metadata.title else ""

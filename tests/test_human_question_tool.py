@@ -50,6 +50,23 @@ class HumanQuestionToolTests(unittest.TestCase):
         self.assertEqual(result.payload["answer"], "blue")
         self.assertEqual(result.payload["request_id"], pending.request_id)
 
+    def test_one_time_ask_human_capability_is_consumed_after_question_is_queued(self) -> None:
+        pid = self.runtime.process.spawn(image="review-agent:v0", goal="ask once")
+        self.runtime.capability.grant_once(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test")
+
+        with self.assertRaises(HumanResponseRequired):
+            self.runtime.tools.call(pid, "ask_human", {"question": "Proceed?"})
+        pending = self.runtime.human.pending()[0]
+        self.assertFalse(self.runtime.capability.check(pid, "human:owner", CapabilityRight.WRITE))
+
+        self.runtime.substrate.human.input_reader = lambda _prompt: "yes"
+        self.runtime.human.drain_terminal_queue()
+        result = self.runtime.tools.call(pid, "ask_human", {"question": "Proceed?"})
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.payload["request_id"], pending.request_id)
+        self.assertEqual(result.payload["answer"], "yes")
+
     def test_ask_human_tool_cannot_bypass_human_capability(self) -> None:
         pid = self.runtime.process.spawn(image="review-agent:v0", goal="ask without authority")
 

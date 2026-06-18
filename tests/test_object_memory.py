@@ -255,6 +255,48 @@ class ObjectMemoryNameTests(unittest.TestCase):
         with self.assertRaises(CapabilityDenied):
             self.runtime.memory.handle_for_name(other, "private.evidence", rights=["write"], namespace=owner_namespace)
 
+    def test_one_time_object_name_lookup_does_not_become_persistent_handle(self) -> None:
+        owner = self.runtime.process.spawn(image="base-agent:v0", goal="owner one-shot")
+        by_name_reader = self.runtime.process.spawn(image="base-agent:v0", goal="reader by name")
+        handle_reader = self.runtime.process.spawn(image="base-agent:v0", goal="reader handle")
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={"secret": "read once"},
+            name="one.shot",
+        )
+        owner_namespace = self.runtime.memory.resolve_namespace(owner)
+        for pid in [by_name_reader, handle_reader]:
+            self.runtime.capability.grant(
+                subject=pid,
+                resource=f"object_namespace:{owner_namespace}",
+                rights=["read"],
+                issued_by="test",
+            )
+
+        self.runtime.capability.grant_once(
+            by_name_reader,
+            f"object:{handle.oid}",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        obj = self.runtime.memory.get_object_by_name(by_name_reader, "one.shot", namespace=owner_namespace)
+        self.assertEqual(obj.payload, {"secret": "read once"})
+        with self.assertRaises(CapabilityDenied):
+            self.runtime.memory.get_object_by_name(by_name_reader, "one.shot", namespace=owner_namespace)
+
+        source_cap = self.runtime.capability.grant_once(
+            handle_reader,
+            f"object:{handle.oid}",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        one_shot_handle = self.runtime.memory.handle_for_name(handle_reader, "one.shot", namespace=owner_namespace)
+        self.assertFalse(self.runtime.store.get_capability(source_cap.cap_id).active)
+        self.assertEqual(self.runtime.memory.get_object(handle_reader, one_shot_handle).payload, {"secret": "read once"})
+        with self.assertRaises(CapabilityDenied):
+            self.runtime.memory.get_object(handle_reader, one_shot_handle)
+
     def test_query_by_name_only_returns_accessible_objects(self) -> None:
         owner = self.runtime.process.spawn(image="base-agent:v0", goal="owner query")
         other = self.runtime.process.spawn(image="base-agent:v0", goal="other query")

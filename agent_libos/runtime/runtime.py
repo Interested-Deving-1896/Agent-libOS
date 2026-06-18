@@ -814,7 +814,7 @@ class Runtime:
             rights = set(root.get("rights", []))
             new_cap = cap_map.get(old_cap)
             if new_cap is None:
-                handle = self.capability.handle_for_object(pid=process.pid, oid=new_oid, rights=rights, issued_by="image.commit")
+                handle = self.capability.handle_for_object(subject=process.pid, oid=new_oid, rights=rights, issued_by="image.commit")
                 new_cap = handle.capability_id
             roots.append(ObjectHandle(oid=new_oid, rights=rights, capability_id=new_cap, expires_at=root.get("expires_at")))
         for handle in existing_roots:

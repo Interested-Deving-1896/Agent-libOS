@@ -96,6 +96,14 @@ class GuiServerTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertTrue(denied["error"]["confirmation_required"])
 
+        status, string_confirmed = self.request(
+            "POST",
+            f"/api/processes/{pid}/exec",
+            {"image": "base-agent:v0", "goal": "new", "confirmed": "true"},
+        )
+        self.assertEqual(status, 409)
+        self.assertTrue(string_confirmed["error"]["confirmation_required"])
+
         status, allowed = self.request(
             "POST",
             f"/api/processes/{pid}/exec",
