@@ -52,8 +52,8 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        requires_confirmation=False,
-        permissions={"human.output"},
+        declared_confirmation_required=False,
+        declared_permissions={"human.output"},
         timeout_s=_TOOL_DEFAULTS.interactive_timeout_s,
     )
     tags = ["human", "terminal", "output"]
@@ -82,8 +82,8 @@ class AskHumanTool(SyncAgentTool[AskHumanArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        requires_confirmation=False,
-        permissions={"human.ask"},
+        declared_confirmation_required=False,
+        declared_permissions={"human.ask"},
         timeout_s=_TOOL_DEFAULTS.interactive_timeout_s,
     )
     tags = ["human", "terminal", "question"]

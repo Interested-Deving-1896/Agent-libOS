@@ -53,7 +53,7 @@ class ListJsonRpcEndpointsTool(BaseAgentTool[ListJsonRpcEndpointsArgs]):
     description = "List registered JSON-RPC endpoint metadata through the libOS JSON-RPC primitive."
     args_schema = ListJsonRpcEndpointsArgs
     output_schema = ListJsonRpcEndpointsOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, permissions={"jsonrpc_endpoint.read"})
+    policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"jsonrpc_endpoint.read"})
     tags = ["jsonrpc", "remote"]
 
     async def execute(self, args: ListJsonRpcEndpointsArgs, ctx: ToolContext) -> ListJsonRpcEndpointsOutput:
@@ -69,7 +69,7 @@ class InspectJsonRpcEndpointTool(BaseAgentTool[InspectJsonRpcEndpointArgs]):
     description = "Inspect one registered JSON-RPC endpoint without exposing resolved secrets."
     args_schema = InspectJsonRpcEndpointArgs
     output_schema = InspectJsonRpcEndpointOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, permissions={"jsonrpc_endpoint.read"})
+    policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"jsonrpc_endpoint.read"})
     tags = ["jsonrpc", "remote"]
 
     async def execute(self, args: InspectJsonRpcEndpointArgs, ctx: ToolContext) -> InspectJsonRpcEndpointOutput:
@@ -89,7 +89,7 @@ class CallJsonRpcMethodTool(BaseAgentTool[CallJsonRpcMethodArgs]):
     )
     args_schema = CallJsonRpcMethodArgs
     output_schema = CallJsonRpcMethodOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, permissions={"jsonrpc.call"}, timeout_s=None)
+    policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"jsonrpc.call"}, timeout_s=None)
     tags = ["jsonrpc", "remote", "external"]
 
     async def execute(self, args: CallJsonRpcMethodArgs, ctx: ToolContext) -> CallJsonRpcMethodOutput:

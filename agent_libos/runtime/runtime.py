@@ -80,7 +80,7 @@ class Runtime:
             provider=self.substrate.human,
             config=self.config,
         )
-        self.messages = ProcessMessageManager(store, self.audit, self.events)
+        self.messages = ProcessMessageManager(store, self.audit, self.events, config=self.config)
         self.human.bind_messages(self.messages)
         self.clock = ClockPrimitive(
             self.audit,
@@ -424,7 +424,9 @@ class Runtime:
         preserve_memory: bool = True,
         preserve_capabilities: bool = False,
     ) -> Any:
-        self._require_image(image)
+        selected_image = self._require_image(image)
+        self._preflight_process_image_boot(selected_image)
+        previous_state = self._snapshot_process_exec_state()
         self.process.exec(
             pid,
             image,
@@ -433,14 +435,28 @@ class Runtime:
             preserve_memory=preserve_memory,
             preserve_capabilities=preserve_capabilities,
         )
-        # Exec swaps the process image and tool table, but deliberately does not
-        # apply image required_capabilities. Exec may preserve existing
-        # capabilities or shrink them; it never grants new external authority.
-        self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
-        selected_image = self._require_image(image)
-        if selected_image.boot.get("kind", "fresh") == "checkpoint_commit":
-            self._instantiate_checkpoint_commit_image(pid, selected_image)
-        self._configure_process_skills_for_image(pid, image, assigned_by=f"process.exec:{image}")
+        try:
+            # Exec swaps the process image and tool table, but deliberately does
+            # not apply image required_capabilities. Exec may preserve existing
+            # capabilities or shrink them; it never grants new external
+            # authority. Package workspaces are private materialized state, so
+            # they are instantiated here just as they are during spawn.
+            self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
+            boot_kind = selected_image.boot.get("kind", "fresh")
+            if boot_kind == "checkpoint_commit":
+                self._instantiate_checkpoint_commit_image(pid, selected_image)
+            elif boot_kind == "image_package":
+                self._instantiate_image_package(pid, selected_image)
+            self._configure_process_skills_for_image(pid, image, assigned_by=f"process.exec:{image}")
+        except Exception as exc:
+            self._restore_process_exec_state(previous_state)
+            self.audit.record(
+                actor="runtime",
+                action="image.boot.failed",
+                target=f"process:{pid}",
+                decision={"image": image, "phase": "process.exec", "error": str(exc), "rolled_back": True},
+            )
+            raise
         return self.process.get(pid)
 
     def spawn_child_process(
@@ -485,28 +501,26 @@ class Runtime:
         return relative or "."
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
-        process = self.store.get_process(pid)
         try:
             image = self._require_image(image_id)
         except Exception as exc:
-            if process is not None:
-                process.status = ProcessStatus.FAILED
-                process.status_message = str(exc)
-                process.updated_at = utc_now()
-                self.store.update_process(process)
+            self._fail_process_image_boot(pid, image_id, exc, phase="process.spawn")
             raise
-        boot_kind = image.boot.get("kind", "fresh")
-        is_checkpoint_commit = boot_kind == "checkpoint_commit"
-        is_image_package = boot_kind == "image_package"
-        # Tool visibility is fixed from the AgentImage at process creation time.
-        # External-resource authority is still enforced later by the primitives.
-        self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
-        if is_checkpoint_commit:
-            self._instantiate_checkpoint_commit_image(pid, image)
+        try:
+            boot_kind = image.boot.get("kind", "fresh")
+            is_checkpoint_commit = boot_kind == "checkpoint_commit"
+            is_image_package = boot_kind == "image_package"
+            # Tool visibility is fixed from the AgentImage at process creation time.
+            # External-resource authority is still enforced later by the primitives.
+            self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
+            if is_checkpoint_commit:
+                self._instantiate_checkpoint_commit_image(pid, image)
+            elif is_image_package:
+                self._instantiate_image_package(pid, image)
             process = self.store.get_process(pid)
-        elif is_image_package:
-            self._instantiate_image_package(pid, image)
-            process = self.store.get_process(pid)
+        except Exception as exc:
+            self._fail_process_image_boot(pid, image_id, exc, phase="process.spawn")
+            raise
         try:
             self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
         except Exception as exc:
@@ -564,10 +578,65 @@ class Runtime:
             raise NotFound(f"agent image not found: {image_id}")
         return image
 
+    def _preflight_process_image_boot(self, image: AgentImage) -> None:
+        boot_kind = image.boot.get("kind", "fresh")
+        if boot_kind == "checkpoint_commit":
+            artifact = self._load_image_artifact(image, expected_kind="checkpoint_commit")
+            self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
+        elif boot_kind == "image_package":
+            self._load_image_artifact(image, expected_kind="image_package")
+
+    def _snapshot_process_exec_state(self) -> dict[str, Any]:
+        tables = [
+            "processes",
+            "object_namespaces",
+            "objects",
+            "object_links",
+            "capabilities",
+            "tools",
+            "tool_candidates",
+            "skills",
+            "skill_trust",
+            "jsonrpc_endpoints",
+        ]
+        return {
+            "tables": {table: self.store.select_table_rows(table) for table in tables},
+            "object_payloads": deepcopy(self.store._object_payloads),
+            "tool_handles": deepcopy(getattr(self.tools, "_handles", {})),
+            "tool_ids_by_name": deepcopy(getattr(self.tools, "_tool_ids_by_name", {})),
+            "jit_sources": deepcopy(getattr(self.tools, "_jit_sources", {})),
+        }
+
+    def _restore_process_exec_state(self, state: dict[str, Any]) -> None:
+        tables = state["tables"]
+        with self.store.transaction(include_object_payloads=True) as cur:
+            for table in reversed(list(tables)):
+                cur.execute(f"DELETE FROM {table}")
+            for table, rows in tables.items():
+                for row in rows:
+                    self.checkpoint._insert_row(cur, table, row)
+            self.store._object_payloads = deepcopy(state["object_payloads"])
+        self.tools._handles = deepcopy(state["tool_handles"])
+        self.tools._tool_ids_by_name = deepcopy(state["tool_ids_by_name"])
+        self.tools._jit_sources = deepcopy(state["jit_sources"])
+
+    def _fail_process_image_boot(self, pid: str, image_id: str, exc: Exception, *, phase: str) -> None:
+        process = self.store.get_process(pid)
+        if process is not None:
+            process.status = ProcessStatus.FAILED
+            process.status_message = str(exc)
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+        self.audit.record(
+            actor="runtime",
+            action="image.boot.failed",
+            target=f"process:{pid}",
+            decision={"image": image_id, "phase": phase, "error": str(exc)},
+        )
+
     def _configure_process_tools_for_image(self, pid: str, image_id: str, assigned_by: str) -> dict[str, str]:
         image = self._require_image(image_id)
-        tool_names = {"process_exit", "create_memory_object", *image.default_tools}
-        return self.tools.configure_process_tools(pid, sorted(tool_names), assigned_by=assigned_by)
+        return self.tools.configure_process_tools(pid, sorted(image.default_tools), assigned_by=assigned_by)
 
     def _configure_process_skills_for_image(self, pid: str, image_id: str, assigned_by: str) -> None:
         process = self.store.get_process(pid)
@@ -610,11 +679,14 @@ class Runtime:
 
     def _instantiate_image_package(self, pid: str, image: AgentImage) -> None:
         artifact = self._load_image_artifact(image, expected_kind="image_package")
-        workspace_root = self._materialize_image_package_workspace(pid, image, artifact)
+        workspace_paths = self._materialize_image_package_workspace(pid, image, artifact)
         registered_jit = self._register_image_package_jit_tools(pid, image, artifact)
         process = self.process.get(pid)
-        if workspace_root is not None:
-            process.working_directory = workspace_root
+        workspace_root = None
+        working_directory = None
+        if workspace_paths is not None:
+            workspace_root, working_directory = workspace_paths
+            process.working_directory = working_directory
             process.updated_at = utc_now()
             self.store.update_process(process)
             self._grant_image_package_workspace(pid, image, artifact, workspace_root)
@@ -627,6 +699,7 @@ class Runtime:
                 "artifact_id": image.boot.get("artifact_id"),
                 "package_sha256": artifact.get("package_sha256"),
                 "workspace_root": workspace_root,
+                "working_directory": working_directory,
                 "jit_tools": registered_jit,
             },
         )
@@ -636,14 +709,15 @@ class Runtime:
         pid: str,
         image: AgentImage,
         artifact: dict[str, Any],
-    ) -> str | None:
+    ) -> tuple[str, str] | None:
         workspace = artifact.get("workspace") or {}
         source = workspace.get("source")
         if not source:
             return None
         artifact_id = self._safe_materialized_segment(str(image.boot.get("artifact_id") or "image"))
         pid_segment = self._safe_materialized_segment(pid)
-        root_relative = Path(self.config.image.materialized_workspace_root) / pid_segment / artifact_id / "workspace"
+        boot_segment = self._safe_materialized_segment(new_id("boot"))
+        root_relative = Path(self.config.image.materialized_workspace_root) / pid_segment / boot_segment / artifact_id / "workspace"
         root = (self.workspace_root / root_relative).resolve()
         if self.workspace_root not in root.parents and root != self.workspace_root:
             raise RuntimeError("image workspace materialization escaped workspace root")
@@ -676,7 +750,7 @@ class Runtime:
             raise RuntimeError("image workspace working_directory escaped materialized root")
         cwd.mkdir(parents=True, exist_ok=True)
         self.resources.charge(pid, usage, source="image.workspace.materialize", context=context)
-        return cwd.relative_to(self.workspace_root).as_posix()
+        return root.relative_to(self.workspace_root).as_posix(), cwd.relative_to(self.workspace_root).as_posix()
 
     def _grant_image_package_workspace(
         self,
@@ -732,7 +806,7 @@ class Runtime:
                 description=str(item.get("description") or ""),
                 input_schema=dict(item.get("input_schema") or {}),
                 output_schema=dict(item.get("output_schema") or {}),
-                policy={"permissions": [], "side_effects": False},
+                policy={"declared_permissions": [], "side_effects": False},
                 tags=["image", "jit", "package"],
                 metadata={
                     "image_id": image.image_id,
@@ -745,7 +819,6 @@ class Runtime:
             handle = ToolHandle(tool_id=tool_id, name=name, capability_id=None, scope="ephemeral_process")
             self.tools._jit_sources[tool_id] = str(item.get("source") or "")
             self.tools._handles[tool_id] = handle
-            self.tools._tool_ids_by_name.setdefault(name, tool_id)
             self.store.insert_tool(handle, spec, registered_by=f"image.package:{image.image_id}", created_at=utc_now(), ephemeral=True)
             process.tool_table[name] = tool_id
             registered.append(name)

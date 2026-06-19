@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_libos.models import AgentImage, AgentProcess, Capability, Event, MaterializedContext
+from agent_libos.models import (
+    AgentImage,
+    AgentProcess,
+    Capability,
+    Event,
+    MaterializedContext,
+    PROMPT_MODE_IMAGE_ONLY,
+    PROMPT_MODE_LIBOS_DEFAULT,
+    PROMPT_MODE_MINIMAL_RUNTIME,
+    PROMPT_MODES,
+)
 from agent_libos.utils.serde import loads
 
 
@@ -51,9 +61,19 @@ Execution discipline:
 - If the process goal is complete, call exit with a compact final payload.
 """.strip()
 
+MINIMAL_RUNTIME_PROMPT = """
+Available tools are supplied through the model tool schema for this turn.
+Runtime state, capabilities, and budgets are factual context; enforcement happens outside the prompt.
+""".strip()
+
 
 def build_system_prompt(image: AgentImage) -> str:
     image_prompt = image.system_prompt.strip() if image.system_prompt else "General purpose process image."
+    mode = _prompt_mode(image)
+    if mode == PROMPT_MODE_IMAGE_ONLY:
+        return image.system_prompt.strip()
+    if mode == PROMPT_MODE_MINIMAL_RUNTIME:
+        return "\n\n".join([image_prompt, MINIMAL_RUNTIME_PROMPT])
     return "\n\n".join(
         [
             BASE_SYSTEM_PROMPT,
@@ -70,7 +90,20 @@ def build_user_prompt(
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]] | None = None,
+    prompt_mode: str = PROMPT_MODE_LIBOS_DEFAULT,
 ) -> str:
+    mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
+    if mode == PROMPT_MODE_IMAGE_ONLY:
+        return context.text.strip()
+    if mode == PROMPT_MODE_MINIMAL_RUNTIME:
+        return _minimal_runtime_user_prompt(
+            process=process,
+            context=context,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
+            skills=skills or [],
+        )
     if context.policy_used == "llm_context_object":
         return "\n\n".join(
             [
@@ -91,6 +124,45 @@ def build_user_prompt(
             _context_section(context),
             "Choose the next single runtime action. Prefer an OpenAI tool call; otherwise put a fallback JSON action object at the end.",
         ]
+    )
+
+
+def _prompt_mode(image: AgentImage) -> str:
+    mode = getattr(image, "prompt_mode", PROMPT_MODE_LIBOS_DEFAULT)
+    return mode if mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
+
+
+def _minimal_runtime_user_prompt(
+    *,
+    process: AgentProcess,
+    context: MaterializedContext,
+    events: list[Event],
+    capabilities: list[Capability],
+    tools: list[dict[str, Any]],
+    skills: list[dict[str, Any]],
+) -> str:
+    parts = [
+        _process_fact_section(process),
+        _skill_section(skills),
+        _capability_section(capabilities),
+        _tool_section(tools),
+        _event_section(events),
+        _context_section(context),
+    ]
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _process_fact_section(process: AgentProcess) -> str:
+    return (
+        "Process facts:\n"
+        f"- pid: {process.pid}\n"
+        f"- parent_pid: {process.parent_pid}\n"
+        f"- image_id: {process.image_id}\n"
+        f"- status: {process.status.value}\n"
+        f"- working_directory: {process.working_directory}\n"
+        f"- goal_oid: {process.goal_oid}\n"
+        f"- checkpoint_head: {process.checkpoint_head}\n"
+        f"- status_message: {process.status_message}"
     )
 
 

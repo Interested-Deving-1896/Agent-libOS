@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
-from agent_libos.models import ObjectRight
+from agent_libos.models import ObjectRight, ProcessStatus
 from tests.support.fakes import RecordingActionClient
 
 class TestLLMContextMemory:
@@ -64,6 +64,24 @@ class TestLLMContextMemory:
             assert 'process_exit' in tool_names
             assert 'read_text_file' not in tool_names
             assert 'read_text_file' not in runtime.llm.client.user_prompts[0]
+        finally:
+            runtime.close()
+
+    def test_llm_executor_fails_closed_when_process_image_is_missing(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = ExplodingClient()
+            pid = runtime.process.spawn(image='base-agent:v0', goal='missing image')
+            process = runtime.process.get(pid)
+            process.image_id = 'missing-image:v0'
+            runtime.store.update_process(process)
+
+            result = runtime.run_process_once(pid)
+
+            assert not result['ok']
+            assert 'agent image not found' in result['error']
+            assert runtime.process.get(pid).status == ProcessStatus.FAILED
+            assert 'llm.image_missing' in [record.action for record in runtime.audit.trace()]
         finally:
             runtime.close()
 
@@ -125,3 +143,9 @@ class MetadataActionClient:
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         return LLMCompletion(content='visible assistant text', tool_calls=[{'id': 'tool_123', 'name': 'process_exit', 'arguments': json.dumps({'payload': {'done': True}})}], raw=SimpleNamespace(id='raw_resp', provider='fake'), api='chat', response_id='resp_123', request_id='req_123', model='test-model', usage={'prompt_tokens': 13, 'completion_tokens': 4, 'total_tokens': 17}, reasoning={'summary': 'selected process_exit'})
+
+
+class ExplodingClient:
+
+    def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
+        raise AssertionError('LLM client should not be called when the process image is missing')

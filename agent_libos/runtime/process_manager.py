@@ -353,12 +353,12 @@ class ProcessManager:
         parent = self._get(pid)
         child_proc = self._require_child(parent.pid, child)
         if child_proc.status not in self.TERMINAL_STATUSES:
+            if timeout == 0:
+                raise TimeoutError(f"child still running: {child}")
             parent.status = ProcessStatus.WAITING_EVENT
             parent.status_message = f"waiting for {child}"
             parent.updated_at = utc_now()
             self.store.update_process(parent)
-            if timeout == 0:
-                raise TimeoutError(f"child still running: {child}")
             raise ProcessWaitRequired(child_pid=child, message=f"{pid} is waiting for child process {child}")
         result_handle = None
         if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
@@ -370,7 +370,7 @@ class ProcessManager:
                 issued_by=f"process.wait:{child}",
             )
             self._add_handle_to_process_view(parent, result_handle)
-        if parent.status == ProcessStatus.WAITING_EVENT:
+        if parent.status == ProcessStatus.WAITING_EVENT and parent.status_message == f"waiting for {child}":
             parent.status = ProcessStatus.RUNNABLE
             parent.status_message = None
             parent.updated_at = utc_now()
@@ -483,6 +483,8 @@ class ProcessManager:
         actor: str,
         action: str,
     ) -> None:
+        if proc.status in self.TERMINAL_STATUSES:
+            raise ProcessError(f"cannot signal terminal process: {proc.pid} status={proc.status.value}")
         if sig == ProcessSignal.PAUSE:
             proc.status = ProcessStatus.PAUSED
         elif sig == ProcessSignal.RESUME:

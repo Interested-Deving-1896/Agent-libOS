@@ -198,6 +198,12 @@ available.
 The process tool table controls LLM-facing tool visibility. Capabilities
 control primitive effects.
 
+`ToolPolicy` is declaration metadata only. Fields such as
+`declared_permissions` and `declared_confirmation_required` can help a GUI or a
+human reviewer understand a tool, but the broker does not convert them into
+grants or confirmations. Real authorization still happens in the primitive that
+touches the resource.
+
 For example, a process can see `write_text_file` and still fail to write
 `src/app.py` if it lacks write authority for
 `filesystem:workspace:src/app.py` or a covering subtree grant.

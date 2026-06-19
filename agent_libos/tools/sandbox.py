@@ -22,6 +22,7 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import SandboxError
 from agent_libos.models import ValidationResult
 from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
+from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.serde import to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -90,6 +91,9 @@ class SandboxBackend:
         source_code: str,
         tests: list[dict[str, Any]],
         timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
     ) -> ValidationResult:
         raise NotImplementedError
 
@@ -110,15 +114,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         re.MULTILINE,
     )
     _SIDE_EFFECT_IMPORT_RE = re.compile(r"^\s*import\s*[\"']([^\"']+)[\"']", re.MULTILINE)
-    _RUN_EXPORT_RE = re.compile(r"export\s+(?:async\s+)?function\s+run\s*\(")
-    _DANGEROUS_PATTERNS = {
-        "Deno": re.compile(r"(?<![\w$])Deno(?![\w$])"),
-        "globalThis.Deno": re.compile(r"globalThis\s*\.\s*Deno"),
-        "eval": re.compile(r"(?<![\w$])eval\s*\("),
-        "Function": re.compile(r"(?<![\w$])Function\s*\("),
-        "Worker": re.compile(r"(?<![\w$])Worker\s*\("),
-        "WebAssembly": re.compile(r"(?<![\w$])WebAssembly(?![\w$])"),
-    }
+    _RUN_EXPORT_RE = re.compile(r"export\s+(?:async\s+)?function\s+run\s*\(\s*args\b[\s\S]*?,\s*libos\b")
 
     def __init__(
         self,
@@ -129,6 +125,9 @@ class DenoTypescriptSandbox(SandboxBackend):
         max_stdout_bytes: int = _TOOL_DEFAULTS.deno_max_stdout_bytes,
         max_stderr_bytes: int = _TOOL_DEFAULTS.deno_max_stderr_bytes,
         jsr_allowlist: tuple[str, ...] = _TOOL_DEFAULTS.deno_jsr_allowlist,
+        max_source_chars: int = _TOOL_DEFAULTS.jit_source_max_chars,
+        max_tests: int = _TOOL_DEFAULTS.jit_tests_max_count,
+        max_test_case_bytes: int = _TOOL_DEFAULTS.jit_test_case_max_bytes,
     ) -> None:
         self.deno_executable = deno_executable
         self.default_timeout_s = default_timeout_s
@@ -136,18 +135,20 @@ class DenoTypescriptSandbox(SandboxBackend):
         self.max_stdout_bytes = max_stdout_bytes
         self.max_stderr_bytes = max_stderr_bytes
         self.jsr_allowlist = tuple(jsr_allowlist)
+        self.max_source_chars = max_source_chars
+        self.max_tests = max_tests
+        self.max_test_case_bytes = max_test_case_bytes
         self.profile_builder = SandboxProfileBuilder()
 
     def static_check(self, source_code: str) -> ValidationResult:
         errors: list[str] = []
         warnings: list[str] = []
+        if len(source_code) > self.max_source_chars:
+            errors.append(f"TypeScript tool source exceeds max chars: {self.max_source_chars}")
         if not self._RUN_EXPORT_RE.search(source_code):
             errors.append("TypeScript tool source must export function run(args, libos)")
         if re.search(r"\bimport\s*\(", source_code):
             errors.append("dynamic import() is not allowed")
-        for label, pattern in self._DANGEROUS_PATTERNS.items():
-            if pattern.search(source_code):
-                errors.append(f"dangerous TypeScript API is not allowed: {label}")
         for specifier in self._extract_imports(source_code):
             package = self._jsr_package(specifier)
             if package is None:
@@ -253,16 +254,23 @@ class DenoTypescriptSandbox(SandboxBackend):
         source_code: str,
         tests: list[dict[str, Any]],
         timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
     ) -> ValidationResult:
         validation = self.static_check(source_code)
         if not validation.ok:
             return validation
+        size_errors = self._test_size_errors(tests)
+        if size_errors:
+            return ValidationResult(ok=False, errors=size_errors)
         try:
             version = self.deno_version()
         except SandboxError as exc:
             return ValidationResult(ok=False, errors=[str(exc)])
         errors: list[str] = []
         logs: list[str] = [f"language=typescript", f"deno={version}"]
+        metrics: list[CommandMetrics] = []
         for index, test in enumerate(tests, start=1):
             syscall_handler, assert_syscalls_consumed = self._test_syscall_handler(test, index)
             try:
@@ -271,15 +279,25 @@ class DenoTypescriptSandbox(SandboxBackend):
                     test.get("args", {}),
                     syscall_handler=syscall_handler,
                     timeout=timeout,
+                    limits=limits,
+                    return_metrics=True,
                 )
+                if isinstance(result, SandboxExecutionResult):
+                    metrics.append(result.metrics or CommandMetrics())
+                    result_value = result.value
+                else:
+                    result_value = result
                 assert_syscalls_consumed()
+            except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
+                raise
             except Exception as exc:
                 errors.append(f"test {index} failed to run: {exc}")
                 continue
-            logs.append(f"test {index} result: {result!r}")
-            if "expected" in test and result != test["expected"]:
-                errors.append(f"test {index} expected {test['expected']!r}, got {result!r}")
-        return ValidationResult(ok=not errors, errors=errors, logs="\n".join(logs))
+            logs.append(f"test {index} result: {result_value!r}")
+            if "expected" in test and result_value != test["expected"]:
+                errors.append(f"test {index} expected {test['expected']!r}, got {result_value!r}")
+        metadata = {"metrics": self._aggregate_metrics(metrics)} if return_metrics else {}
+        return ValidationResult(ok=not errors, errors=errors, logs="\n".join(logs), metadata=metadata)
 
     def metadata_for_source(self, source_code: str) -> dict[str, Any]:
         metadata: dict[str, Any] = {
@@ -529,6 +547,34 @@ class DenoTypescriptSandbox(SandboxBackend):
                 raise SandboxError(f"test {index} expected syscall(s) not performed: {missing}")
 
         return handler, assert_consumed
+
+    def _test_size_errors(self, tests: list[dict[str, Any]]) -> list[str]:
+        errors: list[str] = []
+        if len(tests) > self.max_tests:
+            errors.append(f"JIT tests exceed max count: {self.max_tests}")
+        for index, test in enumerate(tests, start=1):
+            try:
+                ensure_json_size(test, self.max_test_case_bytes, f"JIT test {index}")
+            except Exception as exc:
+                errors.append(str(exc))
+        return errors
+
+    def _aggregate_metrics(self, metrics: list[CommandMetrics]) -> dict[str, Any]:
+        if not metrics:
+            return {
+                "wall_seconds": 0.0,
+                "cpu_seconds": 0.0,
+                "peak_memory_bytes": 0,
+                "killed": False,
+                "limit_kind": None,
+            }
+        return {
+            "wall_seconds": sum(item.wall_seconds for item in metrics),
+            "cpu_seconds": sum(item.cpu_seconds for item in metrics),
+            "peak_memory_bytes": max(item.peak_memory_bytes for item in metrics),
+            "killed": any(item.killed for item in metrics),
+            "limit_kind": next((item.limit_kind for item in metrics if item.limit_kind), None),
+        }
 
     def _extract_imports(self, source_code: str) -> list[str]:
         imports = [match.group(1) for match in self._IMPORT_RE.finditer(source_code)]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from copy import deepcopy
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -32,6 +33,8 @@ from agent_libos.models.exceptions import (
     ProcessWaitRequired,
     ValidationError,
 )
+from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
+from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 
 if TYPE_CHECKING:
@@ -130,6 +133,7 @@ class LibOSSyscallSession:
         self.config = config or DEFAULT_CONFIG
         self._deferred_exit: dict[str, Any] | None = None
         self._deferred_exec: dict[str, Any] | None = None
+        self._tracked_wait_states: set[tuple[ProcessStatus, str]] = set()
 
     async def handle(self, name: str, args: dict[str, Any]) -> Any:
         normalized = name.strip()
@@ -140,9 +144,13 @@ class LibOSSyscallSession:
             actor=self.pid,
             action="syscall.request",
             target=normalized,
-            decision={"args": to_jsonable(args)},
+            decision={"args": sanitize_for_observability(args)},
         )
-        result = await self._with_blocking(lambda: self._dispatch(normalized, args))
+        try:
+            result = await self._with_blocking(lambda: self._dispatch(normalized, args))
+        except BaseException:
+            self._cleanup_interrupted_wait(normalized)
+            raise
         self.runtime.audit.record(
             actor=self.pid,
             action="syscall.result",
@@ -193,11 +201,39 @@ class LibOSSyscallSession:
                     return await result
                 return result
             except HumanApprovalRequired as exc:
+                self._remember_wait_state()
                 await self._resolve_human_request(exc.request_id)
             except ProcessWaitRequired as exc:
+                self._remember_wait_state()
                 await self._wait_for_child_terminal(exc.child_pid)
             except ProcessMessageWaitRequired as exc:
+                self._remember_wait_state()
                 await self._wait_for_process_message(exc.recipient_pid, exc.filters)
+
+    def _remember_wait_state(self) -> None:
+        process = self.runtime.store.get_process(self.pid)
+        if process is None or process.status not in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_HUMAN}:
+            return
+        if not process.status_message:
+            return
+        self._tracked_wait_states.add((process.status, process.status_message))
+
+    def _cleanup_interrupted_wait(self, syscall_name: str) -> None:
+        process = self.runtime.store.get_process(self.pid)
+        if process is None or not process.status_message:
+            return
+        if (process.status, process.status_message) not in self._tracked_wait_states:
+            return
+        process.status = ProcessStatus.RUNNABLE
+        process.status_message = None
+        process.updated_at = utc_now()
+        self.runtime.store.update_process(process)
+        self.runtime.audit.record(
+            actor=self.pid,
+            action="syscall.wait_interrupted",
+            target=syscall_name,
+            decision={"restored_status": ProcessStatus.RUNNABLE.value},
+        )
 
     async def _resolve_human_request(self, request_id: str) -> None:
         while True:
@@ -581,7 +617,8 @@ class LibOSSyscallSession:
             namespace=args.get("namespace"),
         )
         obj = self.runtime.memory.get_object(self.pid, handle)
-        payload = obj.payload
+        ensure_json_size(args.get("entry"), self.config.tools.memory_append_entry_max_bytes, "memory append entry")
+        payload = deepcopy(obj.payload)
         list_field = str(args.get("list_field", "entries"))
         if isinstance(payload, dict):
             values = payload.setdefault(list_field, [])
@@ -595,6 +632,7 @@ class LibOSSyscallSession:
             length = len(payload)
         else:
             raise ValidationError("target object payload is not appendable")
+        ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, "memory payload")
         self.runtime.memory.update_object(self.pid, handle, ObjectPatch(payload=payload))
         updated = self.runtime.memory.get_object(self.pid, handle)
         return {

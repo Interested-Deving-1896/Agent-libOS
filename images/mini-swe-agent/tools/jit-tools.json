@@ -1,0 +1,34 @@
+[
+  {
+    "name": "bash",
+    "description": "Run one bash command for the current mini-swe-agent step and return the command observation.",
+    "source_path": "tools/scripts/bash.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Bash command to run for this step."
+        }
+      },
+      "required": ["command"],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "returncode": {"type": "integer"},
+        "output": {"type": "string"},
+        "output_head": {"type": "string"},
+        "output_tail": {"type": "string"},
+        "elided_chars": {"type": "integer"},
+        "warning": {"type": "string"},
+        "exception_info": {"type": "string"}
+      }
+    },
+    "tests": [],
+    "metadata": {
+      "compatibility": "mini-swe-agent mini.yaml bash tool"
+    }
+  }
+]

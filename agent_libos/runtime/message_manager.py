@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import EventPriority, EventType, ProcessMessage, ProcessMessageKind, ProcessMessageStatus, ProcessStatus
-from agent_libos.models.exceptions import NotFound, ProcessError, ProcessMessageWaitRequired
+from agent_libos.models.exceptions import NotFound, ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
+from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 
 
@@ -17,7 +19,14 @@ class ProcessMessageManager:
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
     WAIT_STATUS_PREFIX = "waiting_message:"
 
-    def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus):
+    def __init__(
+        self,
+        store: SQLiteStore,
+        audit: AuditManager,
+        events: EventBus,
+        config: AgentLibOSConfig | None = None,
+    ):
+        self.config = config or DEFAULT_CONFIG
         self.store = store
         self.audit = audit
         self.events = events
@@ -41,6 +50,12 @@ class ProcessMessageManager:
         if recipient.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot post message to terminal process: {recipient_pid}")
         selected_kind = ProcessMessageKind(kind)
+        subject_text = str(subject or "")
+        body_text = str(body or "")
+        payload_dict = dict(payload or {})
+        self._validate_text_limit(subject_text, self.config.tools.message_subject_max_chars, "process message subject")
+        self._validate_text_limit(body_text, self.config.tools.message_body_max_chars, "process message body")
+        ensure_json_size(payload_dict, self.config.tools.message_payload_max_bytes, "process message payload")
         now = utc_now()
         message = ProcessMessage(
             message_id=new_id("pmsg"),
@@ -50,9 +65,9 @@ class ProcessMessageManager:
             channel=self._normalize_channel(channel),
             correlation_id=correlation_id,
             reply_to=reply_to,
-            subject=str(subject or ""),
-            body=str(body or ""),
-            payload=dict(payload or {}),
+            subject=subject_text,
+            body=body_text,
+            payload=payload_dict,
             status=ProcessMessageStatus.UNREAD,
             created_at=now,
             updated_at=now,
@@ -127,6 +142,7 @@ class ProcessMessageManager:
         message_ids: list[str] | None = None,
     ) -> list[ProcessMessage]:
         self._require_process(pid)
+        self._validate_message_ids(message_ids)
         return self.store.list_process_messages(
             pid,
             status=ProcessMessageStatus.UNREAD,
@@ -152,6 +168,8 @@ class ProcessMessageManager:
         limit: int | None = None,
     ) -> list[ProcessMessage]:
         self._require_process(pid)
+        selected_limit = self._normalize_limit(limit)
+        self._validate_message_ids(message_ids)
         messages = self.store.list_process_messages(
             pid,
             status=None if include_acked else ProcessMessageStatus.UNREAD,
@@ -161,9 +179,8 @@ class ProcessMessageManager:
             correlation_id=correlation_id,
             reply_to=reply_to,
             message_ids=message_ids,
+            limit=selected_limit,
         )
-        if limit is not None:
-            return messages[: max(0, int(limit))]
         return messages
 
     def receive(
@@ -391,3 +408,25 @@ class ProcessMessageManager:
         if len(selected) > 128:
             raise ProcessError("process message channel is too long")
         return selected
+
+    def _normalize_limit(self, limit: int | None) -> int:
+        selected = self.config.tools.message_read_limit if limit is None else int(limit)
+        if selected < 0:
+            raise ValidationError("process message read limit must be non-negative")
+        if selected > self.config.tools.message_read_hard_limit:
+            raise ValidationError(
+                f"process message read limit exceeds {self.config.tools.message_read_hard_limit}"
+            )
+        return selected
+
+    def _validate_message_ids(self, message_ids: list[str] | None) -> None:
+        if message_ids is None:
+            return
+        if len(message_ids) > self.config.tools.message_filter_ids_hard_limit:
+            raise ValidationError(
+                f"process message id filter exceeds {self.config.tools.message_filter_ids_hard_limit}"
+            )
+
+    def _validate_text_limit(self, value: str, limit: int, label: str) -> None:
+        if len(value) > limit:
+            raise ValidationError(f"{label} exceeds {limit} chars")

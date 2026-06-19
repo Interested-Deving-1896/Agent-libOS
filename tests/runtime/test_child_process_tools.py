@@ -6,6 +6,7 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus, ResourceBudget
+from agent_libos.models.exceptions import NotFound, ProcessError, ProcessWaitRequired
 from scripts.llm_context_probe import last_tool_result, static_prefix
 
 class TestChildProcessTool:
@@ -64,6 +65,51 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_nonblocking_wait_child_process_does_not_suspend_parent(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='poll child')
+            child = runtime.spawn_child_process(parent, 'still running')
+
+            waited = runtime.tools.call(parent, 'wait_child_process', {'child_pid': child, 'block': False})
+
+            assert waited.ok, waited.error
+            assert waited.payload['ready'] is False
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(parent).status_message is None
+        finally:
+            runtime.close()
+
+    def test_terminal_process_cannot_be_resumed_by_signal(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='exit once')
+            runtime.process.exit(pid, message='done')
+
+            with pytest.raises(ProcessError, match='cannot signal terminal process'):
+                runtime.process.resume(pid)
+
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+        finally:
+            runtime.close()
+
+    def test_resource_kill_wakes_parent_waiting_on_child(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='wait for killed child')
+            child = runtime.spawn_child_process(parent, 'will be killed')
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
+            assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+
+            runtime.resources.kill_if_exceeded(child, reason='test budget exhausted')
+
+            assert runtime.process.get(child).status == ProcessStatus.KILLED
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(parent).status_message is None
+        finally:
+            runtime.close()
+
     def test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -112,6 +158,36 @@ class TestChildProcessTool:
             assert not runtime.capability.check(pid, read_resource, CapabilityRight.READ)
             assert [handle.oid for handle in process.memory_view.roots] == [process.goal_oid]
             assert 'process.exec' in [record.action for record in runtime.audit.trace()]
+        finally:
+            runtime.close()
+
+    def test_failed_exec_process_rolls_back_to_previous_process_state(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.register_image(
+                {
+                    'image_id': 'missing-package:v0',
+                    'name': 'missing-package',
+                    'boot': {
+                        'kind': 'image_package',
+                        'artifact_id': 'missing-artifact',
+                        'artifact_sha256': 'missing-sha',
+                    },
+                },
+                actor='cli',
+            )
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stay on base')
+            before = runtime.process.get(pid)
+            before_tools = dict(before.tool_table)
+
+            with pytest.raises(NotFound):
+                runtime.exec_process(pid, 'missing-package:v0', goal='should not apply')
+
+            after = runtime.process.get(pid)
+            assert after.status == ProcessStatus.RUNNABLE
+            assert after.image_id == 'base-agent:v0'
+            assert after.goal_oid == before.goal_oid
+            assert after.tool_table == before_tools
         finally:
             runtime.close()
 

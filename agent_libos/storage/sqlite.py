@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -399,6 +401,27 @@ class SQLiteStore:
     def _query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
             return list(self.conn.execute(sql, tuple(params)))
+
+    @contextmanager
+    def transaction(self, *, include_object_payloads: bool = False):
+        """Run direct SQL mutations atomically.
+
+        Object payloads live outside SQLite, so callers that change object rows
+        and payloads together must ask for an in-memory payload rollback too.
+        """
+
+        with self._lock:
+            payloads = deepcopy(self._object_payloads) if include_object_payloads else None
+            try:
+                self.conn.execute("BEGIN")
+                yield self.conn.cursor()
+            except Exception:
+                self.conn.rollback()
+                if payloads is not None:
+                    self._object_payloads = payloads
+                raise
+            else:
+                self.conn.commit()
 
     def insert_object(self, obj: AgentObject) -> None:
         self._object_payloads[obj.oid] = obj.payload
@@ -985,6 +1008,7 @@ class SQLiteStore:
         correlation_id: str | None = None,
         reply_to: str | None = None,
         message_ids: list[str] | None = None,
+        limit: int | None = None,
     ) -> list[ProcessMessage]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1018,7 +1042,11 @@ class SQLiteStore:
             clauses.append(f"message_id IN ({placeholders})")
             params.extend(message_ids)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._query(f"SELECT * FROM process_messages{where} ORDER BY created_at, message_id", params)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self._query(f"SELECT * FROM process_messages{where} ORDER BY created_at, message_id{limit_sql}", params)
         return [self._row_to_process_message(row) for row in rows]
 
     def insert_tool(self, handle: ToolHandle, spec: ToolSpec, registered_by: str, created_at: str, ephemeral: bool) -> None:

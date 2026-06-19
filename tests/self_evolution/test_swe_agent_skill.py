@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ValidationResult
+from agent_libos.substrate import SubprocessLimits
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 
 class TestSWEAgentSkill:
@@ -40,11 +41,28 @@ class StaticOnlyTypescriptSandbox(SandboxBackend):
     async def arun_source(self, source_code: str, args: dict[str, Any], *, pid: str | None=None, syscall_handler: SyscallHandler | None=None, timeout: float | None=None) -> Any:
         return {'ok': True}
 
-    def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float | None=None) -> ValidationResult:
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
         validation = self.static_check(source_code)
         if not validation.ok:
             return validation
-        return ValidationResult(ok=True, logs='static-only TypeScript validation')
+        metadata = {}
+        if return_metrics:
+            metadata['metrics'] = {
+                'wall_seconds': 0.0,
+                'cpu_seconds': 0.0,
+                'peak_memory_bytes': 0,
+                'killed': False,
+                'limit_kind': None,
+            }
+        return ValidationResult(ok=True, logs='static-only TypeScript validation', metadata=metadata)
 
     def metadata_for_source(self, source_code: str) -> dict[str, Any]:
         return {'language': 'typescript', 'imports': [], 'validation': 'static-only'}

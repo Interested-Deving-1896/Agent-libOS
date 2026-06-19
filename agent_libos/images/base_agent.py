@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import AgentImage
+from agent_libos.models import AgentImage, PROMPT_MODE_LIBOS_DEFAULT
 
 
 BASE_AGENT_PROMPT = """
@@ -161,6 +161,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
             name="base-agent",
             version="v0",
             system_prompt=BASE_AGENT_PROMPT,
+            prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
             default_tools=[
                 "append_memory_object",
                 "ask_human",
@@ -209,6 +210,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
             name="coding-agent",
             version="v0",
             system_prompt=CODING_AGENT_PROMPT,
+            prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
             default_tools=[
                 "append_memory_object",
                 "ask_human",
@@ -282,6 +284,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "Ephemeral Deno/TypeScript tool generation and validation image. "
                 "Generated tools export run(args, libos) and access libOS only through libos.syscall()."
             ),
+            prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
             default_tools=[
                 "create_memory_object",
                 "human_output",
@@ -303,11 +306,13 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
             name="review-agent",
             version="v0",
             system_prompt=REVIEW_AGENT_PROMPT,
+            prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
             default_tools=[
                 "append_memory_object",
                 "ask_human",
                 "create_checkpoint",
                 "create_memory_namespace",
+                "create_memory_object",
                 "create_object_from_file",
                 "delete_directory",
                 "delete_file",
@@ -330,6 +335,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "list_jsonrpc_endpoints",
                 "list_memory_namespace",
                 "merge_child_memory",
+                "process_exit",
                 "read_directory",
                 "read_memory_object",
                 "read_process_messages",

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import ToolSpec
+from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.observability import ensure_json_size
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -14,10 +16,23 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 class ProposeJitToolArgs(BaseModel):
     name: str = Field(description="Name of the TypeScript JIT tool to create.")
     description: str = Field(description="Human-readable tool description.")
-    source_code: str = Field(description="TypeScript source exporting run(args, libos).")
+    source_code: str = Field(
+        max_length=_TOOL_DEFAULTS.jit_source_max_chars,
+        description="TypeScript source exporting run(args, libos).",
+    )
     input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
     output_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
-    tests: list[dict[str, Any]] = Field(default_factory=list)
+    tests: list[dict[str, Any]] = Field(default_factory=list, max_length=_TOOL_DEFAULTS.jit_tests_max_count)
+
+    @field_validator("tests")
+    @classmethod
+    def _validate_test_sizes(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for index, test in enumerate(value, start=1):
+            try:
+                ensure_json_size(test, _TOOL_DEFAULTS.jit_test_case_max_bytes, f"JIT test {index}")
+            except LibOSValidationError as exc:
+                raise ValueError(str(exc)) from exc
+        return value
 
 
 class ProposeJitToolOutput(BaseModel):

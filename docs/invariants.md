@@ -37,6 +37,14 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
   profiles are derived from the same capability decision that authorizes the
   operation.
+- `tool-observability-redacts-sensitive-payloads`: tool audit/event
+  observability stores bounded preview, hash, size, and truncation metadata
+  instead of raw sensitive args or results.
+- `jit-security-does-not-rely-on-static-blacklist`: JIT safety is enforced by
+  Deno no-permission isolation, libOS syscalls, capabilities, human approval,
+  and budgets rather than dangerous API regex blacklists.
+- `tool-policy-cannot-self-grant-authority`: ToolPolicy declarations cannot
+  grant execution, resource authority, or confirmation.
 - `resource-budgets-are-hierarchical`: resource usage is charged to the acting
   process and its parent chain, and visibility/capability mechanisms cannot
   mint additional budget.

@@ -192,6 +192,7 @@ images/review-agent/
 image_id: review-agent:v0
 name: review-agent
 prompt: prompt.md
+prompt_mode: image_only
 default_tools:
   - read_memory_object
   - human_output
@@ -208,6 +209,16 @@ workspace:
 `tools/jit-tools.json` declares process-local TypeScript JIT tools whose source
 files live under `tools/scripts/*.ts`. JIT tools are snapshotted as immutable
 package content and are not copied into the materialized workspace.
+
+`prompt_mode` is optional and defaults to `image_only` for custom packages.
+Use `minimal_runtime` for factual runtime state sections, or `libos_default`
+only when the image intentionally wants the native Agent libOS planner prompt.
+
+`default_tools` is exact. The runtime does not add `process_exit`,
+`create_memory_object`, or any other builtin automatically. List every
+LLM-facing builtin the image should be able to call; package JIT tools can still
+use authorized libOS syscalls internally without being mirrored as builtin
+tools in the process tool table.
 
 ## Image Commands
 

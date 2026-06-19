@@ -3,6 +3,13 @@
 LLM-facing tools are stable wrappers over libOS primitives. They provide names,
 schemas, validation, and model ergonomics. Primitives enforce authority.
 
+Tool visibility is not resource authority. A process can call only tools in its
+process tool table, but filesystem, shell, JSON-RPC, human, memory, image, and
+process effects are still authorized by the primitive path. `ToolPolicy`
+contains declaration metadata such as `declared_permissions` and
+`declared_confirmation_required`; it is shown in tool specs for humans and UI,
+but it does not grant permissions or approve execution.
+
 ## Built-In Tools
 
 The current built-in tool surface includes tools for:
@@ -51,8 +58,8 @@ are intentionally not supported.
 The manual lifecycle is:
 
 1. `propose_jit_tool`: store candidate metadata and TypeScript source.
-2. `validate_jit_tool`: run static checks, import allowlist checks, and
-   configured tests.
+2. `validate_jit_tool`: run format/dependency lint, import allowlist checks,
+   and configured tests under the sandbox backend.
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
 
@@ -148,10 +155,32 @@ ffi host permissions. External effects must go through syscalls.
 
 Static imports are limited to configured `jsr:` packages. The default allowlist
 is a small `@std/*` subset. `npm:`, `node:`, `http:`, `https:`, `file:`,
-dynamic imports, and unsafe host APIs are rejected.
+and dynamic imports are rejected. Static checking is lint, not the security
+boundary: it checks that the source exports `run(args, libos)`, blocks dynamic
+imports, enforces source/test size limits, and restricts dependencies to the
+JSR allowlist. It intentionally does not try to blacklist every dangerous
+JavaScript spelling. Runtime safety comes from Deno no-permission execution,
+the libOS syscall protocol, primitive Capability checks, human approval, and
+resource budgets.
+
+Validation and execution both use subprocess resource budgets when the process
+has them. A sandbox backend that cannot accept limits or return subprocess
+metrics fails closed for budgeted validation or execution.
 
 If Deno is missing, validation returns a clear error. Python unit tests skip or
 mock true Deno execution where appropriate.
+
+## Observability Limits
+
+Tool calls, failed tool results, LLM actions/results, and JIT syscall args are
+recorded as bounded observable envelopes: preview, SHA-256, byte size, and
+truncation status. Sensitive fields such as `content`, `body`, `payload`,
+`params`, `question`, `answer`, `source_code`, `tests`, `context`, `metadata`,
+`stdout`, and `stderr` are redacted before audit/event persistence.
+
+Full tool results are stored only as Tool Result Object Memory objects and are
+subject to a hard serialized payload limit. Larger content should be passed by
+file or object reference rather than returned inline from a tool.
 
 ## Deferred Lifecycle
 

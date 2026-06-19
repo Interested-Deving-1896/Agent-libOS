@@ -11,7 +11,16 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import AgentImage, Capability, CapabilityRight, EventType, ToolHandle, ToolSpec
+from agent_libos.models import (
+    AgentImage,
+    Capability,
+    CapabilityRight,
+    EventType,
+    PROMPT_MODE_IMAGE_ONLY,
+    PROMPT_MODES,
+    ToolHandle,
+    ToolSpec,
+)
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -41,6 +50,7 @@ class ImageRegistryPrimitive:
         "name",
         "version",
         "system_prompt",
+        "prompt_mode",
         "planner",
         "action_schema",
         "default_skills",
@@ -202,6 +212,7 @@ class ImageRegistryPrimitive:
             name=image.name,
             version=image.version,
             system_prompt=image.system_prompt,
+            prompt_mode=image.prompt_mode,
             planner=dict(image.planner),
             action_schema=dict(image.action_schema),
             default_skills=list(image.default_skills),
@@ -485,11 +496,13 @@ class ImageRegistryPrimitive:
             if tool not in jit_names
         ]
         workspace = self._coerce_package_workspace(image_data.get("workspace"))
+        self._validate_package_workspace_paths(files, workspace)
         image = AgentImage(
             image_id=self._require_string(image_data["image_id"], "image_id"),
             name=self._require_string(image_data["name"], "name"),
             version=self._optional_string(image_data.get("version"), "version") or "v0",
             system_prompt=prompt,
+            prompt_mode=self._optional_string(image_data.get("prompt_mode"), "prompt_mode") or PROMPT_MODE_IMAGE_ONLY,
             planner=self._mapping(image_data.get("planner"), "planner"),
             action_schema=self._mapping(image_data.get("action_schema"), "action_schema"),
             default_skills=self._string_list(image_data.get("default_skills"), "default_skills"),
@@ -534,6 +547,7 @@ class ImageRegistryPrimitive:
             "name",
             "version",
             "prompt",
+            "prompt_mode",
             "planner",
             "action_schema",
             "default_skills",
@@ -577,6 +591,7 @@ class ImageRegistryPrimitive:
             tool = self._coerce_package_jit_tool(item)
             if tool.name in names:
                 raise ValidationError(f"duplicate image package JIT tool: {tool.name}")
+            self._validate_package_jit_name_available(tool.name)
             names.append(tool.name)
             source_raw = files.get(tool.source_path)
             if source_raw is None:
@@ -601,6 +616,17 @@ class ImageRegistryPrimitive:
                 )
             )
         return result
+
+    def _validate_package_jit_name_available(self, name: str) -> None:
+        runtime = self.runtime
+        tools = getattr(runtime, "tools", None)
+        if tools is not None and tools._name_collides_with_static_tool(name):
+            raise ValidationError(f"image package JIT tool conflicts with static tool: {name}")
+        try:
+            self.tool_exists(name)
+        except NotFound:
+            return
+        raise ValidationError(f"image package JIT tool conflicts with existing tool: {name}")
 
     def _coerce_package_jit_tool(self, value: Any) -> JitToolSpec:
         if not isinstance(value, dict):
@@ -698,6 +724,18 @@ class ImageRegistryPrimitive:
                 }
             )
         return grants
+
+    def _validate_package_workspace_paths(self, files: dict[str, bytes], workspace: dict[str, Any]) -> None:
+        source = workspace.get("source")
+        if not source:
+            return
+        file_paths = set(files)
+        if source in file_paths:
+            raise ValidationError("workspace.source must point to a directory, not a file")
+        working_directory = str(workspace.get("working_directory") or ".")
+        working_directory_path = source if working_directory == "." else self._join_relative(source, working_directory)
+        if working_directory_path in file_paths:
+            raise ValidationError("workspace.working_directory must point to a directory, not a file")
 
     def _package_file_record(self, path: str, content: bytes) -> dict[str, Any]:
         sha = hashlib.sha256(content).hexdigest()
@@ -887,6 +925,7 @@ class ImageRegistryPrimitive:
             name=name,
             version=version,
             system_prompt=source_image.system_prompt if source_image is not None else "",
+            prompt_mode=source_image.prompt_mode if source_image is not None else PROMPT_MODE_IMAGE_ONLY,
             planner=dict(source_image.planner) if source_image is not None else {},
             action_schema=dict(source_image.action_schema) if source_image is not None else {},
             default_skills=list(artifact.get("default_skills", [])),
@@ -982,6 +1021,7 @@ class ImageRegistryPrimitive:
             name=self._require_string(image["name"], "name"),
             version=self._optional_string(image.get("version"), "version") or "v0",
             system_prompt=self._optional_text(image.get("system_prompt"), "system_prompt") or "",
+            prompt_mode=self._optional_string(image.get("prompt_mode"), "prompt_mode") or PROMPT_MODE_IMAGE_ONLY,
             planner=self._mapping(image.get("planner"), "planner"),
             action_schema=self._mapping(image.get("action_schema"), "action_schema"),
             default_skills=self._string_list(image.get("default_skills"), "default_skills"),
@@ -998,6 +1038,8 @@ class ImageRegistryPrimitive:
         self._validate_identifier(image.image_id, "image_id", self.config.image.id_max_chars)
         self._validate_string_length(image.name, "name", self.config.image.name_max_chars)
         self._validate_string_length(image.version, "version", self.config.image.version_max_chars)
+        if image.prompt_mode not in PROMPT_MODES:
+            raise ValidationError(f"unknown prompt_mode: {image.prompt_mode}")
         if len(image.default_tools) > self.config.image.max_default_tools:
             raise ValidationError(f"default_tools exceeds max_default_tools={self.config.image.max_default_tools}")
         if len(image.default_skills) > self.config.skills.max_tools:
@@ -1322,6 +1364,7 @@ class ImageRegistryPrimitive:
             "name": image.name,
             "version": image.version,
             "system_prompt": image.system_prompt,
+            "prompt_mode": image.prompt_mode,
             "planner": image.planner,
             "action_schema": image.action_schema,
             "default_skills": list(image.default_skills),
@@ -1340,6 +1383,7 @@ class ImageRegistryPrimitive:
             "name": image.name,
             "version": image.version,
             "boot_kind": (image.boot or {}).get("kind", "fresh"),
+            "prompt_mode": image.prompt_mode,
             "default_tools": list(image.default_tools),
             "default_skills": list(image.default_skills),
             "required_capabilities_count": len(image.required_capabilities),

@@ -33,8 +33,8 @@ class SendProcessMessageArgs(BaseModel):
     channel: str = Field(default="default", description="Mailbox channel for selective receive.")
     correlation_id: str | None = Field(default=None, description="Optional conversation/request correlation id.")
     reply_to: str | None = Field(default=None, description="Optional message id this message replies to.")
-    subject: str = Field(default="", description="Short message subject.")
-    body: str = Field(default="", description="Message body.")
+    subject: str = Field(default="", max_length=_TOOL_DEFAULTS.message_subject_max_chars, description="Short message subject.")
+    body: str = Field(default="", max_length=_TOOL_DEFAULTS.message_body_max_chars, description="Message body.")
     payload: dict[str, Any] = Field(default_factory=dict, description="Structured message payload.")
 
 
@@ -55,8 +55,17 @@ class ReadProcessMessagesArgs(BaseModel):
     channel: str | None = Field(default=None, description="Optional channel filter.")
     correlation_id: str | None = Field(default=None, description="Optional correlation id filter.")
     reply_to: str | None = Field(default=None, description="Optional reply-to message id filter.")
-    message_ids: list[str] | None = Field(default=None, description="Optional exact message ids to return.")
-    limit: int | None = Field(default=None, description="Maximum number of messages to return.")
+    message_ids: list[str] | None = Field(
+        default=None,
+        max_length=_TOOL_DEFAULTS.message_filter_ids_hard_limit,
+        description="Optional exact message ids to return.",
+    )
+    limit: int | None = Field(
+        default=None,
+        ge=0,
+        le=_TOOL_DEFAULTS.message_read_hard_limit,
+        description="Maximum number of messages to return.",
+    )
     ack: bool = Field(default=True, description="Acknowledge returned unread messages after reading.")
 
 

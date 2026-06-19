@@ -41,8 +41,8 @@ class ToolErrorCode(str, Enum):
 class ToolPolicy(BaseModel):
     side_effects: bool = False
     idempotent: bool = True
-    requires_confirmation: bool = False
-    permissions: set[str] = Field(default_factory=set)
+    declared_confirmation_required: bool = False
+    declared_permissions: set[str] = Field(default_factory=set)
     timeout_s: float | None = _TOOL_DEFAULTS.default_timeout_s
     max_retries: int = 0
 
@@ -53,7 +53,6 @@ class ToolContext(BaseModel):
     pid: str
     workspace_id: str | None = None
     runtime: Any | None = Field(default=None, exclude=True)
-    granted_permissions: set[str] = Field(default_factory=set)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
@@ -150,11 +149,8 @@ class BaseAgentTool(ABC, Generic[InputT]):
             policy=policy,
             tags=list(self.tags),
             metadata=dict(self.metadata),
-            required_capabilities=[
-                {"resource": f"permission:{permission}", "rights": ["execute"]}
-                for permission in sorted(self.policy.permissions)
-            ],
-            side_effects=sorted(self.policy.permissions) if self.policy.side_effects else [],
+            required_capabilities=[],
+            side_effects=sorted(self.policy.declared_permissions) if self.policy.side_effects else [],
         )
 
     def to_openai_chat_tool(self) -> dict[str, Any]:
@@ -201,7 +197,6 @@ class BaseAgentTool(ABC, Generic[InputT]):
             )
 
         try:
-            self._check_policy(ctx)
             if self.policy.timeout_s is None:
                 raw_result = await self.execute(args, ctx)
             else:
@@ -284,20 +279,6 @@ class BaseAgentTool(ABC, Generic[InputT]):
         if isinstance(raw_args, Mapping):
             return self.args_schema.model_validate(dict(raw_args))
         raise TypeError(f"Tool arguments must be {self.args_schema.__name__}, dict, or JSON string.")
-
-    def _check_policy(self, ctx: ToolContext) -> None:
-        missing_permissions = self.policy.permissions - ctx.granted_permissions
-        if missing_permissions:
-            raise ToolExecutionError(
-                f"Permission denied for tool `{self.name}`.",
-                code=ToolErrorCode.PERMISSION_DENIED,
-                details={"missing_permissions": sorted(missing_permissions)},
-            )
-        if self.policy.requires_confirmation and not ctx.metadata.get("confirmed", False):
-            raise ToolExecutionError(
-                f"Confirmation required before executing tool `{self.name}`.",
-                code=ToolErrorCode.CONFIRMATION_REQUIRED,
-            )
 
     def _normalize_result(self, raw_result: Any) -> ToolResult:
         if isinstance(raw_result, ToolResult):

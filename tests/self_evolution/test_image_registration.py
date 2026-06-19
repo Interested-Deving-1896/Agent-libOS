@@ -3,7 +3,7 @@ import pytest
 import tempfile
 from pathlib import Path
 from agent_libos import AgentImage, Runtime
-from agent_libos.models import CapabilityRight, EventType
+from agent_libos.models import CapabilityRight, EventType, ProcessStatus
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
@@ -25,6 +25,25 @@ class TestImageRegistration:
         try:
             with pytest.raises(ValidationError):
                 runtime.register_image({'image_id': 'bad-image:v0', 'name': 'bad-image', 'default_tools': ['not_a_real_tool']}, actor='cli')
+        finally:
+            runtime.close()
+
+    def test_image_default_tools_are_not_implicitly_augmented(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.register_image(AgentImage(image_id='empty-tools:v0', name='empty-tools'), actor='cli')
+            runtime.register_image(
+                AgentImage(image_id='one-tool:v0', name='one-tool', default_tools=['human_output']),
+                actor='cli',
+            )
+
+            empty = runtime.process.spawn(image='empty-tools:v0', goal='no implicit tools')
+            one = runtime.process.spawn(image='one-tool:v0', goal='single explicit tool')
+
+            assert runtime.process.get(empty).tool_table == {}
+            assert set(runtime.process.get(one).tool_table) == {'human_output'}
+            assert 'process_exit' not in runtime.process.get(one).tool_table
+            assert 'create_memory_object' not in runtime.process.get(one).tool_table
         finally:
             runtime.close()
 
@@ -132,8 +151,141 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_image_package_jit_tool_name_does_not_become_global_default_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                owner = runtime.process.spawn(image='package-agent:v0', goal='owner')
+                other = runtime.process.spawn(image='base-agent:v0', goal='other')
 
-def _write_image_package(root: Path, *, workspace_grants: bool = True, with_jit: bool = False) -> Path:
+                assert 'package_count' in runtime.process.get(owner).tool_table
+                with pytest.raises(ValidationError):
+                    runtime.register_image(
+                        AgentImage(
+                            image_id='leak-image:v0',
+                            name='leak-image',
+                            default_tools=['package_count'],
+                        ),
+                        actor='cli',
+                    )
+                other_call = runtime.tools.call(other, 'package_count', {'text': 'abcd'})
+                assert not other_call.ok
+                assert 'not in process tool table' in (other_call.error or '')
+            finally:
+                runtime.close()
+
+    def test_image_package_prompt_mode_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', prompt_mode='minimal_runtime')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                result = runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                inspected = runtime.image_registry.inspect('package-agent:v0')
+
+                assert result.image.prompt_mode == 'minimal_runtime'
+                assert inspected['image']['prompt_mode'] == 'minimal_runtime'
+                listed = {image['image_id']: image for image in runtime.image_registry.list_images()}
+                assert listed['package-agent:v0']['prompt_mode'] == 'minimal_runtime'
+            finally:
+                runtime.close()
+
+    def test_image_package_rejects_jit_name_shadowing_static_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True, jit_name='process_exit')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='conflicts with static tool'):
+                    runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                with pytest.raises(KeyError):
+                    runtime.get_image('package-agent:v0')
+            finally:
+                runtime.close()
+
+    def test_exec_process_instantiates_image_package_workspace_and_jit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
+                runtime.exec_process(pid, 'package-agent:v0', goal='after exec', preserve_capabilities=False)
+                process = runtime.process.get(pid)
+
+                assert process.status == ProcessStatus.RUNNABLE
+                assert process.image_id == 'package-agent:v0'
+                assert process.working_directory != '.'
+                assert 'package_count' in process.tool_table
+                assert runtime.filesystem.read_text(pid, 'seed.txt', cwd=process.working_directory).content.replace('\r\n', '\n') == 'seed\n'
+            finally:
+                runtime.close()
+
+    def test_image_package_workspace_grants_are_relative_to_source_root_not_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root, workspace_grants=False)
+            (root / 'workspace' / 'app').mkdir()
+            (root / 'workspace' / 'data').mkdir()
+            (root / 'workspace' / 'data' / 'x.txt').write_text('x\n', encoding='utf-8')
+            root.joinpath('IMAGE.yaml').write_text("""
+image_id: package-agent:v0
+name: package-agent
+prompt: prompt.md
+workspace:
+  source: workspace
+  working_directory: app
+  grants:
+    - path: data
+      rights: [read]
+      recursive: true
+""".lstrip(), encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                runtime.image_registry.register_from_package_path(root, actor='cli')
+                pid = runtime.process.spawn(image='package-agent:v0', goal='cwd grant')
+                cwd = runtime.process.working_directory(pid)
+
+                assert cwd.endswith('/workspace/app')
+                assert runtime.filesystem.read_text(pid, '../data/x.txt', cwd=cwd).content.replace('\r\n', '\n') == 'x\n'
+                with pytest.raises((CapabilityDenied, HumanApprovalRequired, NotFound)):
+                    runtime.filesystem.read_text(pid, 'data/x.txt', cwd=cwd)
+            finally:
+                runtime.close()
+
+    def test_image_package_rejects_workspace_source_that_points_to_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root, workspace_grants=False)
+            root.joinpath('IMAGE.yaml').write_text("""
+image_id: package-agent:v0
+name: package-agent
+prompt: prompt.md
+workspace:
+  source: workspace/seed.txt
+  grants:
+    - path: .
+      rights: [read]
+      recursive: true
+""".lstrip(), encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='workspace.source must point to a directory'):
+                    runtime.image_registry.register_from_package_path(root, actor='cli')
+                with pytest.raises(KeyError):
+                    runtime.get_image('package-agent:v0')
+            finally:
+                runtime.close()
+
+
+def _write_image_package(
+    root: Path,
+    *,
+    workspace_grants: bool = True,
+    with_jit: bool = False,
+    jit_name: str = 'package_count',
+    prompt_mode: str | None = None,
+) -> Path:
     root.mkdir(parents=True)
     grants = """
   grants:
@@ -142,12 +294,13 @@ def _write_image_package(root: Path, *, workspace_grants: bool = True, with_jit:
       recursive: true
 """.rstrip() if workspace_grants else "  grants: []"
     jit_line = "\njit_tools: tools/jit-tools.json" if with_jit else ""
+    prompt_mode_line = f"prompt_mode: {prompt_mode}\n" if prompt_mode else ""
     root.joinpath('IMAGE.yaml').write_text(f"""
 image_id: package-agent:v0
 name: package-agent
 version: v0
 prompt: prompt.md
-default_tools:
+{prompt_mode_line}default_tools:
   - human_output
   - read_memory_object
 context_policy: evidence_first
@@ -167,7 +320,7 @@ workspace:
         scripts = root / 'tools' / 'scripts'
         scripts.mkdir(parents=True)
         root.joinpath('tools', 'jit-tools.json').write_text(
-            '[{"name":"package_count","description":"Count text characters.","source_path":"tools/scripts/package_count.ts","input_schema":{"type":"object"},"output_schema":{"type":"object"},"tests":[]}]',
+            f'[{{"name":"{jit_name}","description":"Count text characters.","source_path":"tools/scripts/package_count.ts","input_schema":{{"type":"object"}},"output_schema":{{"type":"object"}},"tests":[]}}]',
             encoding='utf-8',
         )
         scripts.joinpath('package_count.ts').write_text(

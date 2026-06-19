@@ -33,6 +33,34 @@ class TestObjectMemoryName:
         with pytest.raises(ValidationError):
             self.runtime.memory.create_object(pid=pid, object_type=ObjectType.OBSERVATION, payload={'value': 2}, name='duplicate.name')
 
+    def test_object_memory_payload_limits_reject_create_update_and_append_without_partial_write(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory limits')
+        oversized_payload = {'blob': 'x' * self.runtime.config.tools.memory_payload_hard_limit_bytes}
+        with pytest.raises(ValidationError):
+            self.runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.OBSERVATION,
+                payload=oversized_payload,
+                name='too.large',
+            )
+
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='append.log',
+            immutable=False,
+        )
+        with pytest.raises(ValidationError):
+            self.runtime.memory.update_object(pid, handle, ObjectPatch(payload=oversized_payload))
+        assert self.runtime.memory.get_object(pid, handle).payload == {'entries': []}
+
+        oversized_entry = {'blob': 'x' * self.runtime.config.tools.memory_append_entry_max_bytes}
+        appended = self.runtime.tools.call(pid, 'append_memory_object', {'name': 'append.log', 'entry': oversized_entry})
+        assert not appended.ok
+        assert 'memory append entry exceeds' in (appended.error or '')
+        assert self.runtime.memory.get_object(pid, handle).payload == {'entries': []}
+
     @pytest.mark.parametrize('name', ('project/note', 'project\\note', '.', '..'))
     def test_object_name_cannot_contain_namespace_separators(self, name: str) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='invalid local names')

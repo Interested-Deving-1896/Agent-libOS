@@ -7,6 +7,7 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessMessageKind, ProcessStatus
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
 class TestProcessMessage:
@@ -96,6 +97,35 @@ class TestProcessMessage:
         finally:
             runtime.close()
 
+    def test_process_message_payload_limits_and_read_limit_are_enforced(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='message limits')
+            too_long_subject = 's' * (runtime.config.tools.message_subject_max_chars + 1)
+            too_long_body = 'b' * (runtime.config.tools.message_body_max_chars + 1)
+            oversized_payload = {'blob': 'x' * runtime.config.tools.message_payload_max_bytes}
+
+            with pytest.raises(ValidationError):
+                runtime.messages.post(sender='test', recipient_pid=pid, subject=too_long_subject)
+            with pytest.raises(ValidationError):
+                runtime.messages.post(sender='test', recipient_pid=pid, body=too_long_body)
+            with pytest.raises(ValidationError):
+                runtime.messages.post(sender='test', recipient_pid=pid, payload=oversized_payload)
+
+            for index in range(runtime.config.tools.message_read_limit + 5):
+                runtime.messages.post(sender='test', recipient_pid=pid, subject=f'msg-{index}')
+
+            assert len(runtime.messages.list(pid)) == runtime.config.tools.message_read_limit
+            with pytest.raises(ValidationError):
+                runtime.messages.list(pid, limit=runtime.config.tools.message_read_hard_limit + 1)
+            with pytest.raises(ValidationError):
+                runtime.messages.list(
+                    pid,
+                    message_ids=[f'pmsg_{index}' for index in range(runtime.config.tools.message_filter_ids_hard_limit + 1)],
+                )
+        finally:
+            runtime.close()
+
     def test_receive_process_messages_blocks_until_matching_message_then_resumes(self) -> None:
         client = PlannedActionClient([{'action': 'receive_process_messages', 'channel': 'control', 'correlation_id': 'job-1'}])
         runtime = Runtime.open('local')
@@ -179,6 +209,28 @@ class TestProcessMessage:
             assert result['ready']
             assert result['messages'][0]['message_id'] == result['expected_message_id']
             assert runtime.process.get(child).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_interrupted_message_syscall_restores_runnable_state(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.scheduler.poll_interval_s = 0.001
+            child = runtime.process.spawn(image='base-agent:v0', goal='wait then interrupt')
+            session = LibOSSyscallSession(runtime, child)
+
+            async def scenario() -> None:
+                task = asyncio.create_task(session.handle('process.receive_messages', {'block': True, 'channel': 'control'}))
+                await asyncio.sleep(0.01)
+                assert runtime.process.get(child).status == ProcessStatus.WAITING_EVENT
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+            asyncio.run(scenario())
+            assert runtime.process.get(child).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(child).status_message is None
+            assert 'syscall.wait_interrupted' in _audit_actions(runtime)
         finally:
             runtime.close()
 

@@ -4,7 +4,7 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectType, ProcessStatus
-from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.models.exceptions import CapabilityDenied, ProcessWaitRequired
 
 
 class TestCheckpointFork:
@@ -67,8 +67,8 @@ class TestCheckpointFork:
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='waiting parent')
             child = runtime.spawn_child_process(parent, 'unfinished child')
-            with pytest.raises(TimeoutError):
-                runtime.process.wait(parent, child, timeout=0)
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
             assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
             checkpoint_id = runtime.checkpoint.create(parent, 'waiting fork point', actor=parent)
             runtime.capability.grant(parent, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
@@ -76,6 +76,30 @@ class TestCheckpointFork:
             fork_root = runtime.process.get(forked['fork_root_pid'])
             assert fork_root.status == ProcessStatus.RUNNABLE
             assert fork_root.status_message is None
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_rolls_back_rows_and_payloads_when_insert_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork rollback')
+            original = runtime.memory.create_object(pid, ObjectType.SUMMARY, {'value': 7}, name='state')
+            checkpoint_id = runtime.checkpoint.create(pid, 'fork rollback point', actor=pid)
+            runtime.capability.grant(pid, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+            before_pids = {process.pid for process in runtime.process.list()}
+            original_insert = runtime.checkpoint._insert_row
+
+            def fail_on_process_insert(cur, table, row):
+                if table == 'processes':
+                    raise RuntimeError('injected fork failure')
+                return original_insert(cur, table, row)
+
+            monkeypatch.setattr(runtime.checkpoint, '_insert_row', fail_on_process_insert)
+            with pytest.raises(RuntimeError, match='injected fork failure'):
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+            assert runtime.memory.get_object(pid, original).payload == {'value': 7}
         finally:
             runtime.close()
 

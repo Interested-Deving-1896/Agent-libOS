@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.models import CapabilityRight, ProcessStatus, ResourceBudget, ValidationResult
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import LocalResourceProviderSubstrate
-from agent_libos.tools.sandbox import DenoTypescriptSandbox
+from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
+from agent_libos.utils.serde import dumps
 from tests.support.fakes import FakeDenoSandbox, NoSyscallDenoSandbox
 
 class TestJitSecurity:
@@ -150,12 +151,18 @@ class TestJitSecurity:
         assert process.image_id == 'base-agent:v0'
         assert process.status == ProcessStatus.RUNNABLE
 
-    def test_deno_static_check_rejects_unsafe_typescript(self) -> None:
+    def test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
-        validation = checker.static_check('import x from "npm:left-pad";\nexport async function run(args, libos) { Deno.readTextFileSync("x"); return {}; }')
-        assert not validation.ok
-        assert any(('import is not allowed: npm:left-pad' in error for error in validation.errors))
-        assert any(('dangerous TypeScript API is not allowed: Deno' in error for error in validation.errors))
+        computed_deno = checker.static_check(
+            'export async function run(args, libos) { '
+            'const d = (globalThis as Record<string, any>)["De" + "no"]; '
+            'return d.readTextFileSync("x"); }'
+        )
+        denied_import = checker.static_check('import x from "npm:left-pad";\nexport async function run(args, libos) { return {}; }')
+
+        assert computed_deno.ok, computed_deno.errors
+        assert not denied_import.ok
+        assert any(('import is not allowed: npm:left-pad' in error for error in denied_import.errors))
 
     def test_deno_static_check_import_allowlist(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
@@ -173,6 +180,98 @@ class TestJitSecurity:
         validation = sandbox.run_tests('export function run(args, libos) { return { ok: true }; }', [{'args': {}, 'syscalls': [{'name': 'filesystem.read_text', 'args': {'path': 'README.md'}}], 'expected': {'ok': True}}])
         assert not validation.ok
         assert any(('expected syscall(s) not performed' in error for error in validation.errors))
+
+    def test_jit_proposal_limits_source_and_tests_before_persistence(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='jit limits')
+        with pytest.raises(ValidationError):
+            self.runtime.tools.propose(
+                pid,
+                {'name': 'huge_source', 'description': 'Huge source.', 'input_schema': {'type': 'object'}},
+                source_code='x' * (self.runtime.config.tools.jit_source_max_chars + 1),
+            )
+        with pytest.raises(ValidationError):
+            self.runtime.tools.propose(
+                pid,
+                {'name': 'too_many_tests', 'description': 'Too many tests.', 'input_schema': {'type': 'object'}},
+                source_code='export function run(args, libos) { return {}; }',
+                tests=[{} for _ in range(self.runtime.config.tools.jit_tests_max_count + 1)],
+            )
+        with pytest.raises(ValidationError):
+            self.runtime.tools.propose(
+                pid,
+                {'name': 'huge_test', 'description': 'Huge test.', 'input_schema': {'type': 'object'}},
+                source_code='export function run(args, libos) { return {}; }',
+                tests=[{'args': {'blob': 'x' * self.runtime.config.tools.jit_test_case_max_bytes}}],
+            )
+
+    def test_jit_validation_fails_closed_without_budget_limit_support(self) -> None:
+        self.runtime.tools.sandbox = NoLimitValidationSandbox()
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='budgeted jit validation',
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=1.0),
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {'name': 'budgeted_no_limits', 'description': 'No limits.', 'input_schema': {'type': 'object'}},
+            source_code='export function run(args, libos) { return {}; }',
+        )
+
+        with pytest.raises(ValidationError):
+            self.runtime.tools.validate(candidate)
+
+    def test_jit_validation_charges_returned_subprocess_metrics(self) -> None:
+        sandbox = RecordingValidationSandbox()
+        self.runtime.tools.sandbox = sandbox
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='budgeted jit validation metrics',
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=1.0),
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {'name': 'budgeted_metrics', 'description': 'Metrics.', 'input_schema': {'type': 'object'}},
+            source_code='export function run(args, libos) { return {}; }',
+        )
+
+        validation = self.runtime.tools.validate(candidate)
+
+        assert validation.ok, validation.errors
+        assert isinstance(sandbox.last_limits, SubprocessLimits)
+        assert self.runtime.process.get(pid).resource_usage.subprocess_wall_seconds == pytest.approx(0.25)
+
+    def test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='redact tool args')
+                secret = 'SECRET_TOOL_ARG_SHOULD_NOT_APPEAR'
+                runtime.tools.configure_process_tools(pid, ['write_text_file', 'send_process_message'], assigned_by='test')
+                runtime.filesystem.grant_path(pid, 'secret.txt', [CapabilityRight.WRITE], issued_by='test')
+
+                written = runtime.tools.call(
+                    pid,
+                    'write_text_file',
+                    {'path': 'secret.txt', 'content': secret, 'overwrite': True},
+                )
+                sent = runtime.tools.call(
+                    pid,
+                    'send_process_message',
+                    {'recipient_pid': pid, 'subject': 'secret', 'body': secret, 'payload': {'token': secret}},
+                )
+
+                assert written.ok, written.error
+                assert sent.ok, sent.error
+                observed = dumps(
+                    {
+                        'events': [event.payload for event in runtime.events.list(target=pid)],
+                        'audit': [record.decision for record in runtime.audit.trace()],
+                    }
+                )
+                assert secret not in observed
+                assert 'sha256' in observed
+            finally:
+                runtime.close()
 
     @pytest.mark.real_deno
     def test_real_deno_tool_runs_and_has_no_host_read_permission(self) -> None:
@@ -218,3 +317,46 @@ class TestJitSecurity:
         candidate = self.runtime.tools.propose(pid, {'name': name, 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }', tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
         assert self.runtime.tools.validate(candidate).ok
         return self.runtime.tools.register(pid, candidate)
+
+
+class NoLimitValidationSandbox(SandboxBackend):
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(self, source_code: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float | None = None) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+
+class RecordingValidationSandbox(SandboxBackend):
+    def __init__(self) -> None:
+        self.last_limits: SubprocessLimits | None = None
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(self, source_code: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        self.last_limits = limits
+        metadata = {}
+        if return_metrics:
+            metadata["metrics"] = {
+                "wall_seconds": 0.25,
+                "cpu_seconds": 0.05,
+                "peak_memory_bytes": 1024,
+                "killed": False,
+                "limit_kind": None,
+            }
+        return ValidationResult(ok=True, metadata=metadata)

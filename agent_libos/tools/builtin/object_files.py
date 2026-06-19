@@ -64,7 +64,7 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        permissions={"filesystem.read", "object.write"},
+        declared_permissions={"filesystem.read", "object.write"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["memory", "filesystem", "object"]
@@ -141,7 +141,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        permissions={"filesystem.write", "object.read"},
+        declared_permissions={"filesystem.write", "object.read"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["memory", "filesystem", "object", "side_effect"]

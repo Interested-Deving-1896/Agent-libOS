@@ -105,8 +105,8 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     policy = ToolPolicy(
         side_effects=False,
         idempotent=True,
-        requires_confirmation=False,
-        permissions={"filesystem.read"},
+        declared_confirmation_required=False,
+        declared_permissions={"filesystem.read"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "read"]
@@ -149,8 +149,8 @@ class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
     policy = ToolPolicy(
         side_effects=False,
         idempotent=True,
-        requires_confirmation=False,
-        permissions={"filesystem.read"},
+        declared_confirmation_required=False,
+        declared_permissions={"filesystem.read"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "read", "directory"]
@@ -186,8 +186,8 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        requires_confirmation=True,
-        permissions={"filesystem.write"},
+        declared_confirmation_required=True,
+        declared_permissions={"filesystem.write"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect"]
@@ -230,8 +230,8 @@ class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        requires_confirmation=True,
-        permissions={"filesystem.write"},
+        declared_confirmation_required=True,
+        declared_permissions={"filesystem.write"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect", "directory"]
@@ -269,8 +269,8 @@ class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        requires_confirmation=True,
-        permissions={"filesystem.delete"},
+        declared_confirmation_required=True,
+        declared_permissions={"filesystem.delete"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect", "delete"]
@@ -305,8 +305,8 @@ class DeleteDirectoryTool(SyncAgentTool[DeleteDirectoryArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        requires_confirmation=True,
-        permissions={"filesystem.delete"},
+        declared_confirmation_required=True,
+        declared_permissions={"filesystem.delete"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["filesystem", "workspace", "side_effect", "delete", "directory"]

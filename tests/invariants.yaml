@@ -89,7 +89,9 @@
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_with_shell_syntax_payload_requires_approval",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_uses_argv_without_shell_interpreter",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
-        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name"
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_fails_closed_without_budget_limit_support",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_charges_returned_subprocess_metrics"
       ],
       "benchmark_attack_classes": ["shell_policy_bypass", "self_evolution_jit"]
     },
@@ -116,8 +118,39 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_high_risk_network_command_requires_approval_with_rule_profile",
-        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_unsafe_typescript",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_requires_method_capability_and_records_http_effect"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "tool-observability-redacts-sensitive-payloads",
+      "title": "Tool observability records bounded preview, size, and hash instead of raw sensitive args or results.",
+      "lane": "security",
+      "node_ids": [
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_sanitizes_sensitive_fields_with_stable_hash",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "jit-security-does-not-rely-on-static-blacklist",
+      "title": "JIT security relies on Deno isolation and libOS syscall authority, not static dangerous API blacklists.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "tool-policy-cannot-self-grant-authority",
+      "title": "ToolPolicy declarations are metadata and cannot self-grant execution or resource authority.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_tool_policy_is_metadata_not_self_granted_authority",
+        "tests/security/test_external_boundaries.py::TestExternalBoundary::test_process_cannot_call_tool_outside_creation_tool_table"
       ],
       "benchmark_attack_classes": []
     },

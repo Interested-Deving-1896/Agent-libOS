@@ -404,7 +404,12 @@ def _is_image_package_arg(value: str) -> bool:
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
-    return path.exists() and (path.is_dir() or path.name == DEFAULT_CONFIG.image.package_manifest_name)
+    manifest_name = DEFAULT_CONFIG.image.package_manifest_name
+    return (
+        path.is_dir() and (path / manifest_name).is_file()
+    ) or (
+        path.is_file() and path.name == manifest_name
+    )
 
 
 def _parse_json_mapping(value: str, label: str) -> dict[str, Any]:

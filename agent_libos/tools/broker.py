@@ -33,6 +33,7 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 from agent_libos.tools.base import BaseAgentTool, ToolContext
+from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -163,6 +164,7 @@ class ToolBroker:
         requested_capabilities: builtins.list[dict[str, Any]] | None = None,
     ) -> str:
         tool_spec = spec if isinstance(spec, ToolSpec) else ToolSpec(**spec)
+        self._validate_jit_source_and_tests(source_code, tests or [])
         now = utc_now()
         candidate = ToolCandidate(
             candidate_id=new_id("tcand"),
@@ -207,20 +209,52 @@ class ToolBroker:
 
     def validate(self, candidate_id: str, *, pid: str | None = None) -> ValidationResult:
         candidate = self._get_candidate(candidate_id)
-        if pid is not None:
-            self._require_candidate_owner(candidate, pid)
-        result = self.sandbox.run_tests(candidate.source_code, candidate.tests)
+        owner_pid = pid or candidate.pid
+        self._require_candidate_owner(candidate, owner_pid)
+        limits = self._subprocess_limits(owner_pid)
+        try:
+            result = self._run_candidate_tests(candidate, limits)
+        except SubprocessLimitExceeded as exc:
+            self._charge_subprocess_metrics(
+                owner_pid,
+                exc.metrics,
+                source="tool.validate.deno",
+                context={"candidate_id": candidate_id, "tool": candidate.spec.name},
+            )
+            raise
+        except SubprocessTimeoutExpired as exc:
+            self._charge_subprocess_metrics(
+                owner_pid,
+                exc.metrics,
+                source="tool.validate.deno",
+                context={"candidate_id": candidate_id, "tool": candidate.spec.name},
+            )
+            raise
+        metrics = self._metrics_from_validation(result.metadata.get("metrics"))
+        self._charge_subprocess_metrics(
+            owner_pid,
+            metrics,
+            source="tool.validate.deno",
+            context={"candidate_id": candidate_id, "tool": candidate.spec.name},
+        )
         errors = list(result.errors)
         warnings = list(result.warnings)
         if candidate.requested_capabilities:
             errors.append("Deno/TypeScript JIT tools cannot request external capabilities")
-        validation = ValidationResult(ok=not errors and result.ok, errors=errors, warnings=warnings, logs=result.logs)
+        validation = ValidationResult(
+            ok=not errors and result.ok,
+            errors=errors,
+            warnings=warnings,
+            logs=result.logs,
+            metadata=result.metadata,
+        )
         metadata = self.sandbox.metadata_for_source(candidate.source_code)
         candidate.validation = {
             "ok": validation.ok,
             "errors": validation.errors,
             "warnings": validation.warnings,
             "logs": validation.logs,
+            "metrics": validation.metadata.get("metrics"),
             **metadata,
         }
         candidate.status = ToolCandidateStatus.VALIDATED if validation.ok else ToolCandidateStatus.REJECTED
@@ -261,11 +295,10 @@ class ToolBroker:
         handle = ToolHandle(tool_id=tool_id, name=candidate.spec.name, capability_id=None, scope=scope)
         self._jit_sources[tool_id] = candidate.source_code
         self._handles[tool_id] = handle
-        # JIT tool names are process-local through AgentProcess.tool_table.
-        # Keep the global name index stable for static tools and for pid-less
-        # resolve(name) calls; resolve(name, pid=...) is the authority for
-        # process-scoped JIT tools and handles duplicate local names.
-        self._tool_ids_by_name.setdefault(candidate.spec.name, tool_id)
+        # JIT tool names are process-local through AgentProcess.tool_table. Do
+        # not add them to the global name index, otherwise later pid-less
+        # resolve(name) calls can turn one process' JIT into a globally
+        # referenceable tool.
         self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
         candidate.status = ToolCandidateStatus.REGISTERED
         candidate.updated_at = utc_now()
@@ -364,7 +397,7 @@ class ToolBroker:
             EventType.TOOL_CALLED,
             source=pid,
             target=resource,
-            payload={"call_id": call_id, "args": args},
+            payload={"call_id": call_id, "args": sanitize_for_observability(args)},
         )
         started_at = time.perf_counter()
         try:
@@ -377,7 +410,11 @@ class ToolBroker:
                         EventType.TOOL_FAILED,
                         source=resource,
                         target=pid,
-                        payload={"call_id": call_id, "error": error_message, "tool_result": tool_result.model_dump(mode="json")},
+                        payload={
+                            "call_id": call_id,
+                            "error": error_message,
+                            "tool_result": sanitize_for_observability(tool_result.model_dump(mode="json")),
+                        },
                     )
                     self.audit.record(
                         actor=pid,
@@ -387,7 +424,7 @@ class ToolBroker:
                             "ok": False,
                             "tool": handle.name,
                             "policy_decision": "allow",
-                            "tool_result": tool_result.model_dump(mode="json"),
+                            "tool_result": sanitize_for_observability(tool_result.model_dump(mode="json")),
                             "tool_wall_seconds": self._elapsed(started_at),
                         },
                     )
@@ -502,7 +539,7 @@ class ToolBroker:
                 EventType.TOOL_FAILED,
                 source=resource,
                 target=pid,
-                payload={"call_id": call_id, "error": str(exc)},
+                payload={"call_id": call_id, "error": sanitize_for_observability(str(exc))},
             )
             self.audit.record(
                 actor=pid,
@@ -512,11 +549,40 @@ class ToolBroker:
                     "ok": False,
                     "tool": handle.name,
                     "policy_decision": "allow",
-                    "error": str(exc),
+                    "error": sanitize_for_observability(str(exc)),
                     "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
             return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=str(exc))
+
+        try:
+            ensure_json_size(
+                result_payload,
+                self.config.tools.tool_result_payload_hard_limit_bytes,
+                "tool result payload",
+            )
+        except ValidationError as exc:
+            error = str(exc)
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={"call_id": call_id, "error": error, "policy_decision": "validation_error"},
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "validation_error",
+                    "error": error,
+                    "result": sanitize_for_observability(result_payload),
+                    "tool_wall_seconds": self._elapsed(started_at),
+                },
+            )
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
 
         result_handle = self.memory.create_object(
             pid=pid,
@@ -595,12 +661,57 @@ class ToolBroker:
             return {"pid", "syscall_handler", "timeout", "limits", "return_metrics"}
         return set(signature.parameters)
 
+    def _supported_run_tests_kwargs(self) -> set[str]:
+        signature = inspect.signature(self.sandbox.run_tests)
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return {"timeout", "limits", "return_metrics"}
+        return set(signature.parameters)
+
     def _require_sandbox_resource_controls(self) -> None:
         supported = self._supported_sandbox_kwargs()
         if "limits" not in supported:
             raise ValidationError("sandbox backend must accept SubprocessLimits when resource limits are configured")
         if "return_metrics" not in supported:
             raise ValidationError("sandbox backend must return subprocess metrics")
+
+    def _require_sandbox_validation_resource_controls(self) -> None:
+        supported = self._supported_run_tests_kwargs()
+        if "limits" not in supported:
+            raise ValidationError("sandbox backend must accept SubprocessLimits when validating with resource limits")
+        if "return_metrics" not in supported:
+            raise ValidationError("sandbox backend must return validation subprocess metrics")
+
+    def _run_candidate_tests(
+        self,
+        candidate: ToolCandidate,
+        limits: SubprocessLimits | None,
+    ) -> ValidationResult:
+        kwargs: dict[str, Any] = {
+            "timeout": self.config.tools.jit_validation_timeout_s,
+            "limits": limits,
+            "return_metrics": True,
+        }
+        if limits is not None:
+            self._require_sandbox_validation_resource_controls()
+        supported = self._supported_run_tests_kwargs()
+        selected_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+        if limits is not None and "limits" not in selected_kwargs:
+            raise ValidationError("sandbox backend must accept SubprocessLimits when validating with resource limits")
+        if limits is not None and "return_metrics" not in selected_kwargs:
+            raise ValidationError("sandbox backend must return validation subprocess metrics")
+        return self.sandbox.run_tests(candidate.source_code, candidate.tests, **selected_kwargs)
+
+    def _validate_jit_source_and_tests(self, source_code: str, tests: list[dict[str, Any]]) -> None:
+        if len(source_code) > self.config.tools.jit_source_max_chars:
+            raise ValidationError(
+                f"JIT source exceeds {self.config.tools.jit_source_max_chars} chars"
+            )
+        if len(tests) > self.config.tools.jit_tests_max_count:
+            raise ValidationError(
+                f"JIT tests exceed {self.config.tools.jit_tests_max_count} cases"
+            )
+        for index, test in enumerate(tests, start=1):
+            ensure_json_size(test, self.config.tools.jit_test_case_max_bytes, f"JIT test {index}")
 
     def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
         if self.resources is None:
@@ -746,30 +857,53 @@ class ToolBroker:
             "limit_kind": metrics.limit_kind,
         }
 
+    def _metrics_from_validation(self, value: Any) -> CommandMetrics | None:
+        if not isinstance(value, dict):
+            return None
+        return CommandMetrics(
+            wall_seconds=float(value.get("wall_seconds") or 0.0),
+            cpu_seconds=float(value.get("cpu_seconds") or 0.0),
+            peak_memory_bytes=int(value.get("peak_memory_bytes") or 0),
+            killed=bool(value.get("killed", False)),
+            limit_kind=str(value["limit_kind"]) if value.get("limit_kind") is not None else None,
+        )
+
     def _elapsed(self, started_at: float) -> float:
         return max(0.0, time.perf_counter() - started_at)
 
     def resolve(self, tool: ToolHandle | str, pid: str | None = None) -> ToolHandle:
         if isinstance(tool, ToolHandle):
             return tool
+        process_tool_id: str | None = None
         if pid is not None:
             process = self.store.get_process(pid)
             if process is not None and tool in process.tool_table:
-                tool_id = process.tool_table[tool]
-                if tool_id in self._handles:
-                    return self._handles[tool_id]
+                process_tool_id = process.tool_table[tool]
+                if process_tool_id in self._handles:
+                    return self._handles[process_tool_id]
         if tool in self._handles:
-            return self._handles[tool]
+            handle = self._handles[tool]
+            if pid is None and handle.tool_id in self._jit_sources:
+                raise NotFound(f"tool not found: {tool}")
+            return handle
         if tool in self._tool_ids_by_name:
             return self._handles[self._tool_ids_by_name[tool]]
         for row in self.store.list_tools():
-            if row["tool_id"] == tool or row["name"] == tool:
-                if row["tool_id"] not in self._tools and row["tool_id"] not in self._jit_sources:
-                    raise NotFound(f"tool implementation not loaded: {row['tool_id']}")
-                handle = ToolHandle(tool_id=row["tool_id"], name=row["name"], capability_id=None, scope=row["scope"])
-                self._handles[handle.tool_id] = handle
+            row_tool_id = str(row["tool_id"])
+            is_direct_id = row_tool_id == tool
+            is_process_local_name = process_tool_id is not None and row_tool_id == process_tool_id
+            is_name_match = row["name"] == tool
+            if not (is_direct_id or is_name_match):
+                continue
+            if bool(row["ephemeral"]) and pid is None:
+                continue
+            if row_tool_id not in self._tools and row_tool_id not in self._jit_sources:
+                raise NotFound(f"tool implementation not loaded: {row_tool_id}")
+            handle = ToolHandle(tool_id=row_tool_id, name=row["name"], capability_id=None, scope=row["scope"])
+            self._handles[handle.tool_id] = handle
+            if not bool(row["ephemeral"]):
                 self._tool_ids_by_name.setdefault(handle.name, handle.tool_id)
-                return handle
+            return handle
         raise NotFound(f"tool not found: {tool}")
 
     def list(self) -> builtins.list[dict[str, Any]]:
@@ -804,18 +938,15 @@ class ToolBroker:
         return schemas
 
     def _context(self, pid: str, handle: ToolHandle, call_id: str) -> ToolContext:
-        tool = self._tools[handle.tool_id]
         return ToolContext(
             trace_id=call_id,
             call_id=call_id,
             pid=pid,
             workspace_id=str(self.workspace_root),
             runtime=getattr(self, "runtime", None),
-            granted_permissions=set(tool.policy.permissions),
             metadata={
                 "tool_id": handle.tool_id,
                 "tool_name": handle.name,
-                "confirmed": True,
             },
         )
 

@@ -5,13 +5,19 @@ import inspect
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import HumanApprovalRequired, ProcessMessageWaitRequired, ProcessWaitRequired, ResourceLimitExceeded
+from agent_libos.models.exceptions import (
+    HumanApprovalRequired,
+    ProcessMessageWaitRequired,
+    ProcessWaitRequired,
+    ResourceLimitExceeded,
+)
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.context_memory import LLMContextMemory
 from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
 from agent_libos.llm.tool_protocol import tool_call_to_action
+from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.models import (
     EventType,
     HumanRequestStatus,
@@ -59,7 +65,17 @@ class LLMProcessExecutor:
             return await self._resume_pending_wait_action(pid)
         if pid in self._pending_message_actions:
             return await self._resume_pending_message_action(pid)
-        image = self.runtime.images.get(process.image_id) or self.runtime.images[self.config.runtime.default_image_id]
+        image = self.runtime.images.get(process.image_id)
+        if image is None:
+            error = f"agent image not found for process {pid}: {process.image_id}"
+            self.runtime.process.exit(pid, failed=True, message=error)
+            self.runtime.audit.record(
+                actor=pid,
+                action="llm.image_missing",
+                target=f"image:{process.image_id}",
+                decision={"error": error},
+            )
+            return {"ok": False, "error": error}
         if process.memory_view is None:
             process.memory_view = self.runtime.memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
             process.updated_at = utc_now()
@@ -100,6 +116,7 @@ class LLMProcessExecutor:
                     capabilities=capabilities,
                     tools=tools,
                     skills=skills,
+                    prompt_mode=image.prompt_mode,
                 ),
             },
         ]
@@ -210,8 +227,8 @@ class LLMProcessExecutor:
             action="llm.action",
             target=action.get("action"),
             decision={
-                "action": action,
-                "result": result,
+                "action": sanitize_for_observability(action),
+                "result": sanitize_for_observability(result),
                 "content_preview": content_preview,
                 "tool_call_count": tool_call_count,
                 "resumed_after_human": resumed_after_human,
@@ -246,7 +263,7 @@ class LLMProcessExecutor:
             target=f"human_request:{request_id}",
             decision={
                 "request_id": request_id,
-                "action": action,
+                "action": sanitize_for_observability(action),
                 "message": message,
                 "tool_call_count": tool_call_count,
             },
@@ -274,7 +291,7 @@ class LLMProcessExecutor:
             target=f"process:{child_pid}",
             decision={
                 "child_pid": child_pid,
-                "action": action,
+                "action": sanitize_for_observability(action),
                 "message": message,
                 "tool_call_count": tool_call_count,
             },
@@ -302,7 +319,7 @@ class LLMProcessExecutor:
             target=f"process:{pid}",
             decision={
                 "filters": filters,
-                "action": action,
+                "action": sanitize_for_observability(action),
                 "message": message,
                 "tool_call_count": tool_call_count,
             },
@@ -490,7 +507,7 @@ class LLMProcessExecutor:
             actor=pid,
             action="llm.pending_action_rejected",
             target=tool_name,
-            decision={"request_id": request_id, "action": action, "error": error},
+            decision={"request_id": request_id, "action": sanitize_for_observability(action), "error": error},
         )
 
     def _completion_to_action(self, content: str, tool_calls: list[dict[str, Any]]) -> dict[str, Any]:

@@ -30,20 +30,33 @@ Terminal statuses are `exited`, `failed`, and `killed`.
 ## Images And Tool Tables
 
 An `AgentImage` defines the default process prompt, tool table, default Skills,
-context policy, safety profile, declared required capabilities, and optional
-boot metadata. Fresh images boot from their manifest. Checkpoint-commit images
-boot from an immutable internal runtime artifact derived from one checkpoint
-root process. Image-package images boot from an immutable directory-package
-artifact created from `IMAGE.yaml`, `prompt.md`, optional `tools/`, optional
-`resources/`, and optional `workspace/`.
+prompt mode, context policy, safety profile, declared required capabilities,
+and optional boot metadata. Fresh images boot from their manifest.
+Checkpoint-commit images boot from an immutable internal runtime artifact
+derived from one checkpoint root process. Image-package images boot from an
+immutable directory-package artifact created from `IMAGE.yaml`, `prompt.md`,
+optional `tools/`, optional `resources/`, and optional `workspace/`.
+
+`prompt_mode` controls prompt composition. `image_only` uses the image prompt as
+the system prompt and gives the model only materialized task context; this is
+the default for custom images and image packages. `minimal_runtime` adds a
+short factual runtime note and state sections. `libos_default` preserves the
+native Agent libOS planner envelope and fallback JSON instructions used by the
+built-in images.
 
 Root process spawn may use image `required_capabilities` as a bootstrap
 declaration for ordinary fresh images. `exec_process`, checkpoint-commit image
 boot, and image-package boot never grant those declarations automatically.
 
-At process creation time, the runtime resolves image default tools into the
-process tool table. A process can call only tools in that table, but visible
-tools still fail at primitive use if resource authority is missing.
+At process creation time, the runtime resolves only the image's explicit
+`default_tools` into the process tool table. No lifecycle, Object Memory, or
+other builtin tool is implicitly added. A process can call only tools in that
+table, but visible tools still fail at primitive use if resource authority is
+missing. If an image wants LLM-facing `process_exit`, Object Memory, filesystem,
+shell, or other builtin access, it must list that tool explicitly. Internal
+runtime paths such as JIT syscalls may still call primitives directly through
+their syscall session without exposing the corresponding builtin tool to the
+model.
 
 A checkpoint-commit image remaps baked Object Memory, process-local JIT tools,
 loaded Skill records, and cwd into the new process. It does not package or

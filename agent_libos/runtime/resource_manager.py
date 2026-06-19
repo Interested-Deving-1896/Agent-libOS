@@ -153,6 +153,8 @@ class ResourceManager:
                 process.updated_at = utc_now()
                 self.store.update_process(process)
                 killed.append(process.pid)
+            for killed_pid in killed:
+                self._wake_parent_waiting_on_child(killed_pid)
             self.events.emit(
                 EventType.RESOURCE_LIMIT_EXCEEDED,
                 source="resource_manager",
@@ -166,6 +168,28 @@ class ResourceManager:
                 target=f"process:{pid}",
                 decision={"reason": reason, "owner_pid": owner_pid or pid, "killed_pids": killed, "limit": limit or {}},
             )
+
+    def _wake_parent_waiting_on_child(self, child_pid: str) -> None:
+        child = self.store.get_process(child_pid)
+        if child is None or child.parent_pid is None:
+            return
+        parent = self.store.get_process(child.parent_pid)
+        if parent is None:
+            return
+        if parent.status != ProcessStatus.WAITING_EVENT:
+            return
+        if parent.status_message != f"waiting for {child.pid}":
+            return
+        parent.status = ProcessStatus.RUNNABLE
+        parent.status_message = None
+        parent.updated_at = utc_now()
+        self.store.update_process(parent)
+        self.audit.record(
+            actor="resource_manager",
+            action="process.wait_wake",
+            target=f"process:{parent.pid}",
+            decision={"child": child.pid, "child_status": child.status.value},
+        )
 
     def has_limit(self, pid: str, budget_field: str) -> bool:
         if budget_field not in _BUDGET_USAGE_MAP:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -7,6 +8,7 @@ from pydantic import BaseModel, Field
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import ObjectMetadata, ObjectPatch, ObjectType, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.observability import ensure_json_size
 
 _MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -269,7 +271,8 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
             namespace=args.namespace,
         )
         obj = runtime.memory.get_object(ctx.pid, handle)
-        payload = obj.payload
+        ensure_json_size(args.entry, _TOOL_DEFAULTS.memory_append_entry_max_bytes, "memory append entry")
+        payload = deepcopy(obj.payload)
         if isinstance(payload, dict):
             values = payload.setdefault(args.list_field, [])
             if not isinstance(values, list):
@@ -291,6 +294,7 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
                 code=ToolErrorCode.VALIDATION_ERROR,
                 details={"name": args.name, "payload_type": type(payload).__name__},
             )
+        ensure_json_size(payload, _TOOL_DEFAULTS.memory_payload_hard_limit_bytes, "memory payload")
         runtime.memory.update_object(ctx.pid, handle, ObjectPatch(payload=payload))
         updated = runtime.memory.get_object(ctx.pid, handle)
         return AppendMemoryObjectOutput(

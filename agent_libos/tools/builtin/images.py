@@ -60,7 +60,7 @@ class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        permissions={"filesystem.read", "image.write"},
+        declared_permissions={"filesystem.read", "image.write"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["image", "registry", "package", "side_effect"]
@@ -108,7 +108,7 @@ class CommitCheckpointToImageTool(SyncAgentTool[CommitCheckpointToImageArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        permissions={"checkpoint.read", "image.write"},
+        declared_permissions={"checkpoint.read", "image.write"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["image", "checkpoint", "commit", "self_evolution", "high_risk"]

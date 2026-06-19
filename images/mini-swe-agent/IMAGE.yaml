@@ -1,0 +1,18 @@
+image_id: mini-swe-agent:v0
+name: mini-swe-agent
+version: v0
+prompt: prompt.md
+prompt_mode: image_only
+context_policy: recency_first
+safety_profile: mini-swe-agent
+jit_tools: tools/jit-tools.json
+default_tools: []
+required_capabilities:
+  - resource: filesystem:workspace:*
+    rights: [read, write]
+  - resource: shell:*
+    rights: [execute]
+metadata:
+  upstream_project: SWE-agent/mini-swe-agent
+  upstream_config: src/minisweagent/config/mini.yaml
+  compatibility_target: tool-call bash command interface

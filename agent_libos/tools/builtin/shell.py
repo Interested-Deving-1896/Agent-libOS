@@ -54,7 +54,7 @@ class RunShellCommandTool(BaseAgentTool[RunShellCommandArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        permissions={"shell.execute"},
+        declared_permissions={"shell.execute"},
         timeout_s=None,
     )
     tags = ["shell", "external", "side_effect"]

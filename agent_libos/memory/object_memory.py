@@ -31,6 +31,7 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
+from agent_libos.tools.observability import ensure_json_size
 
 
 class ObjectMemoryManager:
@@ -63,6 +64,7 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         now = utc_now()
         obj_type = ObjectType(object_type)
+        self._validate_payload_size(payload, "object payload")
         oid = new_id("obj")
         object_namespace = self.resolve_namespace(pid, namespace)
         object_name = self._normalize_name(name or self._default_name(obj_type, oid))
@@ -329,6 +331,8 @@ class ObjectMemoryManager:
         if next_namespace != current.namespace or next_name != current.name:
             self._require_namespace_right(pid, current.namespace, "write")
             self._require_unique_name(next_name, next_namespace, except_oid=current.oid)
+        if patch.payload is not None:
+            self._validate_payload_size(patch.payload, "object payload")
         updated = replace(
             current,
             namespace=next_namespace,
@@ -735,3 +739,6 @@ class ObjectMemoryManager:
     def _require_unique_name(self, name: str, namespace: str, except_oid: str | None = None) -> None:
         if self.store.object_name_exists(name, except_oid=except_oid, namespace=namespace):
             raise ValidationError(f"object name already exists in namespace {namespace}: {name}")
+
+    def _validate_payload_size(self, payload: Any, label: str) -> None:
+        ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, label)

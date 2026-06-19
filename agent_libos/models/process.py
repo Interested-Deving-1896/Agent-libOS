@@ -94,12 +94,25 @@ def _validate_resource_number(name: str, value: Any, *, allow_none: bool) -> Non
         raise ValueError(f"{name} cannot be negative")
 
 
+PROMPT_MODE_IMAGE_ONLY = "image_only"
+PROMPT_MODE_MINIMAL_RUNTIME = "minimal_runtime"
+PROMPT_MODE_LIBOS_DEFAULT = "libos_default"
+PROMPT_MODES = frozenset(
+    {
+        PROMPT_MODE_IMAGE_ONLY,
+        PROMPT_MODE_MINIMAL_RUNTIME,
+        PROMPT_MODE_LIBOS_DEFAULT,
+    }
+)
+
+
 @dataclass(frozen=True)
 class AgentImage:
     image_id: str
     name: str
     version: str = "v0"
     system_prompt: str = ""
+    prompt_mode: str = PROMPT_MODE_IMAGE_ONLY
     planner: dict[str, Any] = field(default_factory=dict)
     action_schema: dict[str, Any] = field(default_factory=dict)
     default_skills: list[str] = field(default_factory=list)

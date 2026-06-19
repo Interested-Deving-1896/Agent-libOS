@@ -456,8 +456,7 @@ class CheckpointManager:
         rows = snapshot["rows"]
         object_oids = set(snapshot.get("object_oids", [])) | set(self._current_scoped_object_oids(current_pids))
         namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
-        with self.store._lock:
-            cur = self.store.conn.cursor()
+        with self.store.transaction(include_object_payloads=True) as cur:
             self._delete_object_links(cur, object_oids)
             self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
             for oid in object_oids:
@@ -500,7 +499,6 @@ class CheckpointManager:
                 self._upsert_row(cur, "process_messages", row, "message_id")
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
-            self.store.conn.commit()
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None) -> dict[str, Any]:
         original_pids = list(snapshot["subtree_pids"])
@@ -649,8 +647,7 @@ class CheckpointManager:
 
     def _insert_fork_rows(self, remapped: dict[str, Any]) -> None:
         rows = remapped["rows"]
-        with self.store._lock:
-            cur = self.store.conn.cursor()
+        with self.store.transaction(include_object_payloads=True) as cur:
             for row in rows.get("object_namespaces", []):
                 if cur.execute("SELECT 1 FROM object_namespaces WHERE namespace = ?", (row["namespace"],)).fetchone() is None:
                     self._insert_row(cur, "object_namespaces", row)
@@ -676,7 +673,6 @@ class CheckpointManager:
                 self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
-            self.store.conn.commit()
 
     def _load_checkpoint(self, checkpoint_id: str) -> tuple[Checkpoint, dict[str, Any]]:
         found = self.store.get_checkpoint_snapshot(checkpoint_id)
