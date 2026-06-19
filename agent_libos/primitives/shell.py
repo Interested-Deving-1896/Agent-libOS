@@ -3,16 +3,18 @@ from __future__ import annotations
 import os
 import asyncio
 import hashlib
+import inspect
 import subprocess
 from dataclasses import dataclass
-from pathlib import PurePath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY, ShellRuleEngine
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellPolicyLevel
-from agent_libos.models import AuthorityRisk, AuthorityRule, Capability, CapabilityEffect, CapabilityRight, EventType, SandboxProfile
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
+from agent_libos.models import AuthorityRisk, AuthorityRule, Capability, CapabilityEffect, CapabilityRight, EventType, ResourceUsage, SandboxProfile
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
@@ -20,7 +22,15 @@ from agent_libos.runtime.external_effects import (
     record_external_effect,
     require_external_effect_classifier,
 )
-from agent_libos.substrate import CommandResult, LocalShellProvider, ShellProvider
+from agent_libos.substrate import (
+    CommandMetrics,
+    CommandResult,
+    LocalShellProvider,
+    ShellProvider,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
+    SubprocessTimeoutExpired,
+)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -60,12 +70,14 @@ class ShellAdapter:
         human: Any | None = None,
         provider: ShellProvider | None = None,
         config: AgentLibOSConfig | None = None,
+        resources: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
         self.human = human
+        self.resources = resources
         self.provider = provider or LocalShellProvider(cwd or ".")
         self.rule_engine = ShellRuleEngine(self._configured_rules())
 
@@ -80,6 +92,7 @@ class ShellAdapter:
         selected_timeout = self._validate_timeout(timeout)
         resource = self.resource_for(checked)
         selected_cwd = os.fspath(cwd) if cwd is not None else "."
+        self._enforce_workspace_argv_scope(checked, cwd=selected_cwd)
         decision = self._authorize(pid, checked, resource, timeout=selected_timeout, cwd=selected_cwd)
         if decision.ask_human:
             self._request_human_approval(pid, checked, resource, decision, timeout=selected_timeout, cwd=cwd)
@@ -97,13 +110,38 @@ class ShellAdapter:
             "rule_effect": decision.rule_effect.value,
             "sandbox_profile": self._profile_json(decision.sandbox_profile),
         }
+        limits = self._subprocess_limits(pid)
         require_external_effect_classifier(self.provider, "run")
         try:
-            if cwd is None:
-                proc = self.provider.run(checked, timeout=selected_timeout)
-            else:
-                proc = self.provider.run(checked, timeout=selected_timeout, cwd=os.fspath(cwd))
+            proc = self._provider_run(checked, timeout=selected_timeout, cwd=cwd, limits=limits)
             proc = self._bounded_result(proc)
+        except SubprocessTimeoutExpired as exc:
+            charge_error: ResourceLimitExceeded | None = None
+            try:
+                self._charge_subprocess_metrics(
+                    pid,
+                    exc.metrics,
+                    resource=resource,
+                    argv=checked,
+                    cwd=cwd,
+                    allow_overage=True,
+                )
+            except ResourceLimitExceeded as resource_exc:
+                charge_error = resource_exc
+            self.audit.record(
+                actor=pid,
+                action="primitive.shell.timeout",
+                target=resource,
+                decision={
+                    "argv": checked,
+                    "timeout_s": selected_timeout,
+                    "cwd": os.fspath(cwd) if cwd is not None else None,
+                    "metrics": self._metrics_json(exc.metrics),
+                },
+            )
+            if charge_error is not None:
+                raise charge_error from exc
+            raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
         except subprocess.TimeoutExpired as exc:
             self.audit.record(
                 actor=pid,
@@ -112,6 +150,39 @@ class ShellAdapter:
                 decision={"argv": checked, "timeout_s": selected_timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
             )
             raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
+        except SubprocessLimitExceeded as exc:
+            metrics = exc.metrics
+            charge_error: ResourceLimitExceeded | None = None
+            try:
+                self._charge_subprocess_metrics(
+                    pid,
+                    metrics,
+                    resource=resource,
+                    argv=checked,
+                    cwd=cwd,
+                    allow_overage=True,
+                )
+            except ResourceLimitExceeded as resource_exc:
+                charge_error = resource_exc
+            reason = str(exc)
+            if self.resources is not None:
+                self.resources.kill_if_exceeded(
+                    pid,
+                    reason=reason,
+                    limit={"kind": metrics.limit_kind, "metrics": self._metrics_json(metrics)},
+                )
+            self.audit.record(
+                actor=pid,
+                action="primitive.shell.resource_limit_exceeded",
+                target=resource,
+                decision={
+                    "argv": checked,
+                    "cwd": os.fspath(cwd) if cwd is not None else None,
+                    "metrics": self._metrics_json(metrics),
+                    "reason": reason,
+                },
+            )
+            raise (charge_error or ResourceLimitExceeded(reason)) from exc
         finally:
             if decision.consume_once:
                 if decision.consume_capability_id is not None:
@@ -136,6 +207,7 @@ class ShellAdapter:
                 "rule_id": decision.rule_id,
                 "sandbox_profile": self._profile_json(decision.sandbox_profile),
                 "cwd": os.fspath(cwd) if cwd is not None else None,
+                "metrics": self._metrics_json(proc.metrics),
                 "stdout_truncated": proc.stdout_truncated,
                 "stderr_truncated": proc.stderr_truncated,
             },
@@ -156,6 +228,14 @@ class ShellAdapter:
             audit_record=audit_record,
             event=event,
             metadata={"context": effect_context, "returncode": proc.returncode},
+        )
+        self._charge_subprocess_metrics(
+            pid,
+            proc.metrics,
+            resource=resource,
+            argv=checked,
+            cwd=cwd,
+            allow_overage=True,
         )
         return proc
 
@@ -682,7 +762,110 @@ class ShellAdapter:
             stderr=stderr,
             stdout_truncated=proc.stdout_truncated or stdout_truncated,
             stderr_truncated=proc.stderr_truncated or stderr_truncated,
+            metrics=proc.metrics,
         )
+
+    def _provider_run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float,
+        cwd: str | os.PathLike[str] | None,
+        limits: SubprocessLimits | None,
+    ) -> CommandResult:
+        kwargs: dict[str, Any] = {"timeout": timeout}
+        if cwd is not None:
+            kwargs["cwd"] = os.fspath(cwd)
+        if limits is not None:
+            if not bool(getattr(self.provider, "supports_subprocess_limits", False)):
+                raise ValidationError("shell provider must explicitly support SubprocessLimits before budgeted execution")
+            kwargs["limits"] = limits
+        kwargs["stdout_limit_chars"] = self.config.shell.stdout_hard_limit_chars
+        kwargs["stderr_limit_chars"] = self.config.shell.stderr_hard_limit_chars
+        self._require_provider_run_parameters_support(kwargs)
+        return self.provider.run(argv, **kwargs)
+
+    def _require_provider_run_parameters_support(self, kwargs: dict[str, Any]) -> None:
+        try:
+            signature = inspect.signature(self.provider.run)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("shell provider must expose a signature that accepts shell execution controls") from exc
+        supports_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        if supports_kwargs:
+            return
+        missing = sorted(key for key in kwargs if key not in signature.parameters and key not in {"timeout", "cwd"})
+        if missing:
+            if "limits" in missing:
+                raise ValidationError("shell provider must accept SubprocessLimits when resource limits are configured")
+            raise ValidationError(f"shell provider must accept execution control parameters: {missing}")
+
+    def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+        if self.resources is None:
+            return None
+        wall = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_wall_seconds",
+            "subprocess_wall_seconds",
+        )
+        cpu = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_cpu_seconds",
+            "subprocess_cpu_seconds",
+        )
+        memory = self.resources.peak_limit(pid, "max_subprocess_memory_bytes")
+        if wall is not None and wall <= 0:
+            raise ResourceLimitExceeded(f"process {pid} exhausted subprocess wall-time budget")
+        if cpu is not None and cpu <= 0:
+            raise ResourceLimitExceeded(f"process {pid} exhausted subprocess CPU budget")
+        if memory is not None and memory <= 0:
+            raise ResourceLimitExceeded(f"process {pid} exhausted subprocess memory budget")
+        if wall is None and cpu is None and memory is None:
+            return None
+        return SubprocessLimits(wall_seconds=wall, cpu_seconds=cpu, memory_bytes=memory)
+
+    def _charge_subprocess_metrics(
+        self,
+        pid: str,
+        metrics: CommandMetrics | None,
+        *,
+        resource: str,
+        argv: list[str],
+        cwd: str | os.PathLike[str] | None,
+        allow_overage: bool,
+    ) -> None:
+        if self.resources is None or metrics is None:
+            return
+        self.resources.charge(
+            pid,
+            ResourceUsage(
+                subprocess_wall_seconds=max(0.0, metrics.wall_seconds),
+                subprocess_cpu_seconds=max(0.0, metrics.cpu_seconds),
+                subprocess_peak_memory_bytes=max(0, metrics.peak_memory_bytes),
+            ),
+            source="primitive.shell.run",
+            context={
+                "resource": resource,
+                "argv": list(argv),
+                "cwd": os.fspath(cwd) if cwd is not None else None,
+                "metrics": self._metrics_json(metrics),
+            },
+            allow_overage=allow_overage,
+            kill_on_exceed=True,
+        )
+
+    def _metrics_json(self, metrics: CommandMetrics | None) -> dict[str, Any] | None:
+        if metrics is None:
+            return None
+        return {
+            "wall_seconds": metrics.wall_seconds,
+            "cpu_seconds": metrics.cpu_seconds,
+            "peak_memory_bytes": metrics.peak_memory_bytes,
+            "killed": metrics.killed,
+            "limit_kind": metrics.limit_kind,
+        }
 
     def _truncate_output(self, value: str, limit: int) -> tuple[str, bool]:
         if len(value) <= limit:
@@ -703,3 +886,69 @@ class ShellAdapter:
 
     def _argv0_has_path(self, value: str) -> bool:
         return "/" in value or "\\" in value or PurePath(value).is_absolute()
+
+    def _enforce_workspace_argv_scope(self, argv: list[str], *, cwd: str) -> None:
+        root = self._provider_workspace_root()
+        if root is None:
+            return
+        selected_cwd = self._resolve_workspace_cwd(root, cwd)
+        for token in self._argv_path_tokens(argv):
+            target = self._resolve_argument_path(token, root=root, cwd=selected_cwd)
+            if root not in target.parents and target != root:
+                raise CapabilityDenied(f"shell argument path escapes workspace root: {token}")
+
+    def _provider_workspace_root(self) -> Path | None:
+        provider_cwd = getattr(self.provider, "cwd", None)
+        if provider_cwd is None:
+            return None
+        try:
+            return Path(provider_cwd).resolve()
+        except (OSError, RuntimeError):
+            return None
+
+    def _resolve_workspace_cwd(self, root: Path, cwd: str) -> Path:
+        if cwd in {"", "."}:
+            return root
+        raw = Path(cwd)
+        target = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
+        if root not in target.parents and target != root:
+            raise CapabilityDenied(f"shell working directory escapes workspace root: {cwd}")
+        return target
+
+    def _argv_path_tokens(self, argv: list[str]) -> list[str]:
+        tokens: list[str] = []
+        for index, value in enumerate(argv):
+            candidates = [value]
+            if index > 0 and value.startswith("-") and "=" in value:
+                candidates = [value.split("=", 1)[1]]
+            for candidate in candidates:
+                if self._is_path_like_argument(candidate, argv0=index == 0):
+                    tokens.append(candidate)
+        return tokens
+
+    def _is_path_like_argument(self, value: str, *, argv0: bool) -> bool:
+        if not value or self._looks_like_url(value):
+            return False
+        if argv0:
+            return self._argv0_has_path(value)
+        normalized = value.replace("\\", "/")
+        if normalized.startswith(("~", "./", "../")) or normalized in {".", ".."}:
+            return True
+        if self._is_absolute_path(value):
+            return True
+        return "/" in value or "\\" in value
+
+    def _looks_like_url(self, value: str) -> bool:
+        parsed = urlsplit(value)
+        return bool(parsed.scheme and parsed.netloc)
+
+    def _is_absolute_path(self, value: str) -> bool:
+        return Path(value).is_absolute() or PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
+
+    def _resolve_argument_path(self, value: str, *, root: Path, cwd: Path) -> Path:
+        if value.startswith("~"):
+            raise CapabilityDenied(f"shell argument path uses host home expansion: {value}")
+        raw = Path(value)
+        if self._is_absolute_path(value):
+            return raw.resolve()
+        return (cwd / raw).resolve()

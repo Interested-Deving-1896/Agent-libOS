@@ -33,11 +33,13 @@ An `AgentImage` defines the default process prompt, tool table, default Skills,
 context policy, safety profile, declared required capabilities, and optional
 boot metadata. Fresh images boot from their manifest. Checkpoint-commit images
 boot from an immutable internal runtime artifact derived from one checkpoint
-root process.
+root process. Image-package images boot from an immutable directory-package
+artifact created from `IMAGE.yaml`, `prompt.md`, optional `tools/`, optional
+`resources/`, and optional `workspace/`.
 
 Root process spawn may use image `required_capabilities` as a bootstrap
-declaration for ordinary fresh images. `exec_process` and checkpoint-commit
-image boot never grant those declarations automatically.
+declaration for ordinary fresh images. `exec_process`, checkpoint-commit image
+boot, and image-package boot never grant those declarations automatically.
 
 At process creation time, the runtime resolves image default tools into the
 process tool table. A process can call only tools in that table, but visible
@@ -46,6 +48,13 @@ tools still fail at primitive use if resource authority is missing.
 A checkpoint-commit image remaps baked Object Memory, process-local JIT tools,
 loaded Skill records, and cwd into the new process. It does not package or
 restore filesystem, shell, JSON-RPC, human, network, or provider side effects.
+
+An image-package boot materializes the package `workspace/` seed into a private
+per-process directory under `agent_outputs/image_workspaces/`, sets the process
+cwd from the package manifest, and grants only the manifest-declared
+`workspace.grants` for that private copy. Package JIT tools live under
+`tools/jit-tools.json` and `tools/scripts/*.ts`; they are registered as
+process-local ephemeral tools and are not copied into the workspace.
 
 ## Working Directory
 
@@ -90,6 +99,34 @@ For debugging pending approval states, disable human queue processing:
 ```python
 results = await runtime.arun_until_idle(max_quanta=1, process_human_queue=False)
 ```
+
+## Resource Budgets
+
+Resource limits are runtime constraints, not Capabilities. A process may have a
+`ResourceBudget` covering tool calls, child processes, runtime seconds, LLM
+calls and tokens, subprocess wall/CPU/RSS usage, external filesystem bytes,
+JSON-RPC bytes, and Deno syscalls. Observed consumption is stored as
+`ResourceUsage` on the process row.
+
+Every charge applies to the acting process and its parent chain, so a parent can
+bound an entire child tree. Fork and spawn may request a child budget, but it
+must fit within the parent's remaining budget. `exec_process` keeps the same pid
+and does not reset usage or increase budget. Checkpoint restore replays recorded
+process rows, including their resource state, for the restored processes.
+Checkpoint-committed images do not store or restore resource budgets or usage;
+only the caller that starts the process may set launch-time resource limits.
+
+LLM token usage is charged after provider completion using provider-reported
+usage. If a token budget exists and the provider does not return billable usage,
+the LLM action fails closed. When an LLM completion pushes usage over budget,
+the call record is retained but model-selected tools are not dispatched.
+
+Shell and Deno subprocesses are run through provider-level monitors. The
+default local provider uses cross-platform process-tree sampling to enforce wall
+time, CPU time, and peak RSS budgets, then records metrics and audits limit
+exceedance. In-process Python primitives are not hard CPU/RSS isolated; they
+remain bounded by call count, wall time, byte limits, and primitive-specific
+caps.
 
 ## Human Queue
 

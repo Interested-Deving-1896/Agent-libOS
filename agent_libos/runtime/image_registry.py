@@ -1,23 +1,31 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import AgentImage, Capability, CapabilityRight, EventType
+from agent_libos.models import AgentImage, Capability, CapabilityRight, EventType, ToolHandle, ToolSpec
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.skills.schema import JitToolSpec
 from agent_libos.storage import SQLiteStore
-from agent_libos.utils.ids import utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _IMAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
+_PACKAGE_BOOT_KIND = "image_package"
+_CHECKPOINT_BOOT_KIND = "checkpoint_commit"
+
+
 @dataclass(frozen=True)
 class ImageRegistrationResult:
     image: AgentImage
@@ -118,25 +126,655 @@ class ImageRegistryPrimitive:
         )
         return ImageRegistrationResult(image=candidate, replaced=existing is not None, source=source)
 
-    def register_from_yaml_text(
+    def validate_package_path(self, path: str | Path) -> dict[str, Any]:
+        files, source = self._read_host_package(path)
+        image, artifact = self._image_package_from_files(files, source=source)
+        return self._package_validation_summary(image, artifact)
+
+    def validate_workspace_package(self, pid: str, path: str) -> dict[str, Any]:
+        files, source = self._read_workspace_package(pid, path)
+        image, artifact = self._image_package_from_files(files, source=source)
+        return self._package_validation_summary(image, artifact)
+
+    def register_from_package_path(
         self,
-        text: str,
+        path: str | Path,
         *,
         actor: str,
         replace: bool = False,
         require_capability: bool = False,
         source: str | None = None,
     ) -> ImageRegistrationResult:
-        data = load_yaml_mapping(text)
-        if set(data) == {"image"} and isinstance(data["image"], dict):
-            data = data["image"]
-        return self.register(
-            data,
+        files, detected_source = self._read_host_package(path)
+        return self.register_from_package_files(
+            files,
             actor=actor,
             replace=replace,
             require_capability=require_capability,
+            source=source or detected_source,
+        )
+
+    def register_from_workspace_package(
+        self,
+        pid: str,
+        path: str,
+        *,
+        replace: bool = False,
+    ) -> ImageRegistrationResult:
+        files, source = self._read_workspace_package(pid, path)
+        return self.register_from_package_files(
+            files,
+            actor=pid,
+            replace=replace,
+            require_capability=True,
             source=source,
         )
+
+    def register_from_package_files(
+        self,
+        files: dict[str, bytes | str],
+        *,
+        actor: str,
+        replace: bool = False,
+        require_capability: bool = False,
+        source: str | None = None,
+    ) -> ImageRegistrationResult:
+        if self.store is None:
+            raise ValidationError("image package registration requires SQLiteStore artifact persistence")
+        normalized_files = self._normalize_package_files(files)
+        image, artifact = self._image_package_from_files(normalized_files, source=source)
+        if require_capability:
+            self.capabilities.require(actor, self.resource_for(image.image_id), CapabilityRight.WRITE)
+        existing = self.images.get(image.image_id)
+        if existing is not None and not replace:
+            raise ValidationError(f"agent image already exists: {image.image_id}")
+        artifact_json = dumps(artifact)
+        artifact_bytes = len(artifact_json.encode("utf-8"))
+        if artifact_bytes > self.config.image_commit.artifact_hard_limit_bytes:
+            raise ValidationError(
+                "image package artifact exceeded "
+                f"artifact_hard_limit_bytes={self.config.image_commit.artifact_hard_limit_bytes}"
+            )
+        artifact_sha256 = hashlib.sha256(artifact_json.encode("utf-8")).hexdigest()
+        artifact_id = f"imgpkg_{artifact_sha256[:24]}"
+        image = AgentImage(
+            image_id=image.image_id,
+            name=image.name,
+            version=image.version,
+            system_prompt=image.system_prompt,
+            planner=dict(image.planner),
+            action_schema=dict(image.action_schema),
+            default_skills=list(image.default_skills),
+            default_tools=list(image.default_tools),
+            context_policy=image.context_policy,
+            safety_profile=image.safety_profile,
+            required_capabilities=list(image.required_capabilities),
+            metadata={
+                **dict(image.metadata),
+                "package_sha256": artifact["package_sha256"],
+                "artifact_sha256": artifact_sha256,
+                "artifact_bytes": artifact_bytes,
+                "package_kind": _PACKAGE_BOOT_KIND,
+                "package_jit_tools": [tool["name"] for tool in artifact.get("jit_tools", [])],
+            },
+            signature=image.signature,
+            boot={
+                "kind": _PACKAGE_BOOT_KIND,
+                "artifact_id": artifact_id,
+                "artifact_sha256": artifact_sha256,
+                "package_sha256": artifact["package_sha256"],
+                "workspace": artifact.get("workspace", {}),
+            },
+        )
+        self._validate_image(image)
+        created_at = utc_now()
+        if self.store.get_image_artifact(artifact_id) is None:
+            self.store.insert_image_artifact(
+                artifact_id=artifact_id,
+                kind=_PACKAGE_BOOT_KIND,
+                artifact=artifact,
+                sha256=artifact_sha256,
+                created_by=actor,
+                created_at=created_at,
+                metadata={
+                    "source": source,
+                    "package_sha256": artifact["package_sha256"],
+                    "artifact_bytes": artifact_bytes,
+                    "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
+                    "jit_tools": len(artifact.get("jit_tools", [])),
+                },
+            )
+        result = self.register(
+            image,
+            actor=actor,
+            replace=replace,
+            require_capability=False,
+            source=source,
+        )
+        self.audit.record(
+            actor=actor,
+            action="image.package.register",
+            target=self.resource_for(image.image_id),
+            decision={
+                "source": source,
+                "artifact_id": artifact_id,
+                "artifact_sha256": artifact_sha256,
+                "package_sha256": artifact["package_sha256"],
+                "files": artifact.get("counts", {}).get("files", 0),
+                "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
+                "jit_tools": len(artifact.get("jit_tools", [])),
+                "replaced": result.replaced,
+            },
+        )
+        return result
+
+    def _package_validation_summary(self, image: AgentImage, artifact: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "image_id": image.image_id,
+            "name": image.name,
+            "version": image.version,
+            "package_sha256": artifact["package_sha256"],
+            "default_tools": list(image.default_tools),
+            "default_skills": list(image.default_skills),
+            "jit_tools": [tool["name"] for tool in artifact.get("jit_tools", [])],
+            "workspace": artifact.get("workspace", {}),
+            "counts": artifact.get("counts", {}),
+        }
+
+    def _read_host_package(self, path: str | Path) -> tuple[dict[str, bytes], str]:
+        manifest_path = self._resolve_host_image_manifest(path)
+        root = manifest_path.parent
+        root_resolved = root.resolve()
+        files: dict[str, bytes] = {}
+        for file in sorted(root_resolved.rglob("*")):
+            if file.is_symlink():
+                raise ValidationError(f"image package symlinks are not supported: {file}")
+            if not file.is_file():
+                if file.exists() and not file.is_dir():
+                    raise ValidationError(f"image package path is not a regular file or directory: {file}")
+                continue
+            relative = file.relative_to(root_resolved).as_posix()
+            self._validate_package_relative_path(relative)
+            if ".git" in Path(relative).parts:
+                raise ValidationError("image packages must not include .git directories")
+            files[relative] = self._read_package_file_limited(file)
+        if self.config.image.package_manifest_name not in files:
+            raise ValidationError(f"image package is missing {self.config.image.package_manifest_name}")
+        self._validate_package_size(files)
+        return files, str(root_resolved)
+
+    def _resolve_host_image_manifest(self, path: str | Path) -> Path:
+        selected = Path(path).expanduser()
+        if not selected.is_absolute():
+            selected = Path.cwd() / selected
+        selected = selected.resolve()
+        if selected.is_dir():
+            selected = selected / self.config.image.package_manifest_name
+        if selected.name != self.config.image.package_manifest_name:
+            raise ValidationError(f"image package path must be a directory or {self.config.image.package_manifest_name}")
+        if not selected.exists():
+            raise NotFound(f"image package manifest not found: {selected}")
+        if selected.is_symlink() or not selected.is_file():
+            raise ValidationError(f"image package manifest is not a regular file: {selected}")
+        return selected
+
+    def _read_package_file_limited(self, path: Path) -> bytes:
+        size = path.stat().st_size
+        if size > self.config.image.package_file_max_bytes:
+            raise ValidationError(f"image package file exceeds package_file_max_bytes={self.config.image.package_file_max_bytes}: {path}")
+        return path.read_bytes()
+
+    def _read_workspace_package(self, pid: str, path: str) -> tuple[dict[str, bytes], str]:
+        runtime = self._runtime()
+        cwd = runtime.process.working_directory(pid)
+        package_root, manifest_path = self._workspace_package_paths(path)
+        manifest = runtime.filesystem.read_bytes(
+            pid,
+            manifest_path,
+            max_bytes=self.config.image.package_manifest_max_bytes,
+            cwd=cwd,
+        )
+        if manifest.truncated:
+            raise ValidationError(
+                f"image package manifest exceeds package_manifest_max_bytes={self.config.image.package_manifest_max_bytes}"
+            )
+        _target, workspace_package_root = runtime.filesystem.resolve_path(package_root, cwd=cwd)
+        files: dict[str, bytes] = {self.config.image.package_manifest_name: manifest.content}
+        self._read_workspace_package_tree(pid, workspace_package_root, files)
+        self._validate_package_size(files)
+        return files, workspace_package_root
+
+    def _workspace_package_paths(self, path: str) -> tuple[str, str]:
+        normalized = self._normalize_package_reference(path)
+        manifest_name = self.config.image.package_manifest_name
+        if normalized.endswith(f"/{manifest_name}"):
+            return normalized[: -len(f"/{manifest_name}")], normalized
+        if normalized == manifest_name:
+            return ".", manifest_name
+        if Path(normalized).suffix.lower() in {".yaml", ".yml"}:
+            raise ValidationError(f"image package path must be a directory or {manifest_name}")
+        return normalized, self._join_relative(normalized, manifest_name)
+
+    def _read_workspace_package_tree(
+        self,
+        pid: str,
+        workspace_package_root: str,
+        files: dict[str, bytes],
+    ) -> None:
+        runtime = self._runtime()
+        visited_dirs: set[str] = set()
+
+        def visit(directory: str) -> None:
+            normalized_dir = directory.strip("/")
+            if normalized_dir in visited_dirs:
+                return
+            visited_dirs.add(normalized_dir)
+            listing = runtime.filesystem.read_directory(
+                pid,
+                normalized_dir or ".",
+                limit=self.config.image.package_max_files,
+                cwd=None,
+            )
+            if listing.truncated:
+                raise ValidationError(f"image package exceeds package_max_files={self.config.image.package_max_files}")
+            for entry in listing.entries:
+                relative = self._workspace_package_relative_path(workspace_package_root, entry.path)
+                if relative is None:
+                    continue
+                if ".git" in Path(relative).parts:
+                    raise ValidationError("image packages must not include .git directories")
+                if entry.kind == "directory":
+                    visit(entry.path)
+                    continue
+                if entry.kind != "file":
+                    raise ValidationError(f"image package path is not a regular file: {relative}")
+                self._validate_package_relative_path(relative)
+                if relative in files:
+                    continue
+                read = runtime.filesystem.read_bytes(
+                    pid,
+                    entry.path,
+                    max_bytes=self.config.image.package_file_max_bytes,
+                    cwd=None,
+                )
+                if read.truncated:
+                    raise ValidationError(
+                        f"image package file exceeds package_file_max_bytes={self.config.image.package_file_max_bytes}: {relative}"
+                    )
+                files[relative] = read.content
+                if len(files) > self.config.image.package_max_files:
+                    raise ValidationError(f"image package exceeds package_max_files={self.config.image.package_max_files}")
+
+        visit(workspace_package_root)
+
+    def _workspace_package_relative_path(self, workspace_package_root: str, workspace_path: str) -> str | None:
+        root = workspace_package_root.strip("/")
+        path = workspace_path.strip("/")
+        if root in {"", "."}:
+            return self._normalize_package_reference(path) if path else None
+        if path == root:
+            return None
+        prefix = f"{root}/"
+        if not path.startswith(prefix):
+            return None
+        return self._normalize_package_reference(path[len(prefix) :])
+
+    def _normalize_package_files(self, files: dict[str, bytes | str]) -> dict[str, bytes]:
+        result: dict[str, bytes] = {}
+        for path, content in files.items():
+            relative = self._normalize_package_reference(path)
+            self._validate_package_relative_path(relative)
+            if ".git" in Path(relative).parts:
+                raise ValidationError("image packages must not include .git directories")
+            if isinstance(content, str):
+                data = content.encode("utf-8")
+            elif isinstance(content, bytes):
+                data = content
+            else:
+                raise ValidationError(f"image package file content must be bytes or text: {relative}")
+            if len(data) > self.config.image.package_file_max_bytes:
+                raise ValidationError(f"image package file exceeds package_file_max_bytes={self.config.image.package_file_max_bytes}: {relative}")
+            if relative in result:
+                raise ValidationError(f"duplicate image package file: {relative}")
+            result[relative] = data
+        if self.config.image.package_manifest_name not in result:
+            raise ValidationError(f"image package is missing {self.config.image.package_manifest_name}")
+        self._validate_package_size(result)
+        return result
+
+    def _validate_package_size(self, files: dict[str, bytes]) -> None:
+        if len(files) > self.config.image.package_max_files:
+            raise ValidationError(f"image package exceeds package_max_files={self.config.image.package_max_files}")
+        total = sum(len(content) for content in files.values())
+        if total > self.config.image.package_max_bytes:
+            raise ValidationError(f"image package exceeds package_max_bytes={self.config.image.package_max_bytes}")
+
+    def _image_package_from_files(self, files: dict[str, bytes], *, source: str | None) -> tuple[AgentImage, dict[str, Any]]:
+        manifest_name = self.config.image.package_manifest_name
+        manifest_raw = files.get(manifest_name)
+        if manifest_raw is None:
+            raise ValidationError(f"image package is missing {manifest_name}")
+        if len(manifest_raw) > self.config.image.package_manifest_hard_limit_bytes:
+            raise ValidationError(
+                f"image package manifest exceeds package_manifest_hard_limit_bytes={self.config.image.package_manifest_hard_limit_bytes}"
+            )
+        try:
+            manifest_text = manifest_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(f"{manifest_name} must be UTF-8 text") from exc
+        data = load_yaml_mapping(manifest_text)
+        if set(data) == {"image"} and isinstance(data["image"], dict):
+            data = data["image"]
+        if not isinstance(data, dict):
+            raise ValidationError("IMAGE.yaml must contain an image mapping")
+        image_data = self._normalize_image_package_manifest(data)
+        prompt_path = self._normalize_package_reference(image_data["prompt"])
+        prompt_raw = files.get(prompt_path)
+        if prompt_raw is None:
+            raise ValidationError(f"image package prompt file is missing: {prompt_path}")
+        try:
+            prompt = prompt_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(f"image package prompt must be UTF-8 text: {prompt_path}") from exc
+        if len(prompt) > self.config.image.prompt_max_chars:
+            raise ValidationError(f"image package prompt exceeds prompt_max_chars={self.config.image.prompt_max_chars}")
+        jit_tools = self._load_package_jit_tools(files, image_data.get("jit_tools"))
+        jit_names = {tool.name for tool in jit_tools}
+        default_tools = [
+            tool for tool in self._string_list(image_data.get("default_tools"), "default_tools")
+            if tool not in jit_names
+        ]
+        workspace = self._coerce_package_workspace(image_data.get("workspace"))
+        image = AgentImage(
+            image_id=self._require_string(image_data["image_id"], "image_id"),
+            name=self._require_string(image_data["name"], "name"),
+            version=self._optional_string(image_data.get("version"), "version") or "v0",
+            system_prompt=prompt,
+            planner=self._mapping(image_data.get("planner"), "planner"),
+            action_schema=self._mapping(image_data.get("action_schema"), "action_schema"),
+            default_skills=self._string_list(image_data.get("default_skills"), "default_skills"),
+            default_tools=default_tools,
+            context_policy=self._optional_string(image_data.get("context_policy"), "context_policy") or "plan_first",
+            safety_profile=self._optional_string(image_data.get("safety_profile"), "safety_profile") or "default",
+            required_capabilities=self._capability_specs(image_data.get("required_capabilities")),
+            metadata=self._mapping(image_data.get("metadata"), "metadata"),
+            signature=self._optional_string(image_data.get("signature"), "signature"),
+            boot={"kind": "fresh"},
+        )
+        self._validate_image(image)
+        file_records = [self._package_file_record(path, content) for path, content in sorted(files.items())]
+        package_sha256 = self._package_hash(file_records)
+        workspace_source = workspace.get("source")
+        workspace_files = [
+            record for record in file_records
+            if workspace_source and self._is_under_package_path(record["path"], workspace_source)
+        ]
+        artifact = {
+            "artifact_version": 1,
+            "kind": _PACKAGE_BOOT_KIND,
+            "source": source,
+            "package_sha256": package_sha256,
+            "manifest_path": manifest_name,
+            "prompt_path": prompt_path,
+            "files": file_records,
+            "jit_tools": [self._jit_tool_to_artifact(tool) for tool in jit_tools],
+            "workspace": workspace,
+            "counts": {
+                "files": len(file_records),
+                "bytes": sum(record["size_bytes"] for record in file_records),
+                "workspace_files": len(workspace_files),
+                "jit_tools": len(jit_tools),
+            },
+        }
+        return image, artifact
+
+    def _normalize_image_package_manifest(self, data: dict[str, Any]) -> dict[str, Any]:
+        fields = {
+            "image_id",
+            "name",
+            "version",
+            "prompt",
+            "planner",
+            "action_schema",
+            "default_skills",
+            "default_tools",
+            "context_policy",
+            "safety_profile",
+            "required_capabilities",
+            "metadata",
+            "signature",
+            "jit_tools",
+            "workspace",
+        }
+        unknown = sorted(set(data) - fields)
+        if unknown:
+            raise ValidationError(f"unknown IMAGE.yaml fields: {unknown}")
+        missing = sorted(key for key in ["image_id", "name", "prompt"] if key not in data)
+        if missing:
+            raise ValidationError(f"missing required IMAGE.yaml fields: {missing}")
+        return dict(data)
+
+    def _load_package_jit_tools(self, files: dict[str, bytes], jit_tools_path: Any) -> list[JitToolSpec]:
+        if jit_tools_path is None:
+            return []
+        path = self._normalize_package_reference(self._require_string(jit_tools_path, "jit_tools"))
+        if not path.startswith(f"{self.config.image.package_tools_dir}/") or not path.endswith(".json"):
+            raise ValidationError("image package jit_tools must point to tools/*.json")
+        raw = files.get(path)
+        if raw is None:
+            raise ValidationError(f"image package jit_tools file is missing: {path}")
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationError(f"invalid image package jit_tools JSON: {path}: {exc}") from exc
+        if not isinstance(data, list):
+            raise ValidationError("image package jit_tools JSON must be a list")
+        if len(data) > self.config.image.max_package_jit_tools:
+            raise ValidationError(f"image package exceeds max_package_jit_tools={self.config.image.max_package_jit_tools}")
+        result: list[JitToolSpec] = []
+        names: list[str] = []
+        for item in data:
+            tool = self._coerce_package_jit_tool(item)
+            if tool.name in names:
+                raise ValidationError(f"duplicate image package JIT tool: {tool.name}")
+            names.append(tool.name)
+            source_raw = files.get(tool.source_path)
+            if source_raw is None:
+                raise ValidationError(f"image package JIT source is missing: {tool.source_path}")
+            try:
+                source = source_raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValidationError(f"image package JIT source must be UTF-8 text: {tool.source_path}") from exc
+            if len(source) > self.config.skills.max_jit_source_chars:
+                raise ValidationError(f"image package JIT source exceeds max_jit_source_chars={self.config.skills.max_jit_source_chars}")
+            self._static_check_package_jit_source(source, tool.name)
+            result.append(
+                JitToolSpec(
+                    name=tool.name,
+                    description=tool.description,
+                    source_path=tool.source_path,
+                    input_schema=tool.input_schema,
+                    output_schema=tool.output_schema,
+                    source=source,
+                    tests=tool.tests,
+                    metadata=tool.metadata,
+                )
+            )
+        return result
+
+    def _coerce_package_jit_tool(self, value: Any) -> JitToolSpec:
+        if not isinstance(value, dict):
+            raise ValidationError("image package jit_tools entries must be mappings")
+        allowed = {"name", "description", "input_schema", "output_schema", "source_path", "tests", "metadata"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValidationError(f"unknown image package JIT tool fields: {unknown}")
+        source_path = self._normalize_package_reference(self._require_string(value.get("source_path"), "jit_tools[].source_path"))
+        expected_prefix = f"{self.config.image.package_tools_dir}/scripts/"
+        if not source_path.startswith(expected_prefix) or not source_path.endswith(".ts"):
+            raise ValidationError("image package JIT source_path must point to tools/scripts/*.ts")
+        tests: list[dict[str, Any]] = []
+        for item in value.get("tests") or []:
+            if not isinstance(item, dict):
+                raise ValidationError("jit_tools[].tests entries must be mappings")
+            tests.append(dict(item))
+        name = self._require_string(value.get("name"), "jit_tools[].name")
+        self._validate_identifier(name, "jit_tools[].name", self.config.skills.id_max_chars)
+        return JitToolSpec(
+            name=name,
+            description=self._require_string(value.get("description"), "jit_tools[].description"),
+            source_path=source_path,
+            input_schema=self._mapping(value.get("input_schema"), "jit_tools[].input_schema"),
+            output_schema=self._mapping(value.get("output_schema"), "jit_tools[].output_schema"),
+            tests=tests,
+            metadata=self._mapping(value.get("metadata"), "jit_tools[].metadata"),
+        )
+
+    def _static_check_package_jit_source(self, source: str, name: str) -> None:
+        runtime = self.runtime
+        sandbox = getattr(getattr(runtime, "tools", None), "sandbox", None)
+        static_check = getattr(sandbox, "static_check", None)
+        if not callable(static_check):
+            return
+        result = static_check(source)
+        if not result.ok:
+            raise ValidationError(f"image package JIT tool {name} failed static validation: {'; '.join(result.errors)}")
+
+    def _coerce_package_workspace(self, value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValidationError("workspace must be a mapping")
+        allowed = {"source", "working_directory", "grants"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValidationError(f"unknown workspace fields: {unknown}")
+        source = self._normalize_package_reference(
+            self._optional_string(value.get("source"), "workspace.source")
+            or self.config.image.package_workspace_dir
+        )
+        if source != self.config.image.package_workspace_dir and not source.startswith(f"{self.config.image.package_workspace_dir}/"):
+            raise ValidationError("workspace.source must point inside workspace/")
+        working_directory = self._normalize_package_reference(
+            self._optional_string(value.get("working_directory"), "workspace.working_directory") or "."
+        )
+        if working_directory != "." and not self._is_under_package_path(self._join_relative(source, working_directory), source):
+            raise ValidationError("workspace.working_directory must stay inside workspace.source")
+        grants = self._coerce_workspace_grants(value.get("grants"), source)
+        return {
+            "source": source,
+            "working_directory": working_directory,
+            "grants": grants,
+        }
+
+    def _coerce_workspace_grants(self, value: Any, source: str) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValidationError("workspace.grants must be a list")
+        if len(value) > self.config.image.max_workspace_grants:
+            raise ValidationError(f"workspace.grants exceeds max_workspace_grants={self.config.image.max_workspace_grants}")
+        grants: list[dict[str, Any]] = []
+        allowed_rights = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, CapabilityRight.DELETE.value}
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValidationError("workspace.grants entries must be mappings")
+            unknown = sorted(set(item) - {"path", "rights", "recursive", "delegable"})
+            if unknown:
+                raise ValidationError(f"unknown workspace grant fields: {unknown}")
+            grant_path = self._normalize_package_reference(self._optional_string(item.get("path"), "workspace.grants[].path") or ".")
+            target = source if grant_path == "." else self._join_relative(source, grant_path)
+            if not self._is_under_package_path(target, source):
+                raise ValidationError("workspace grant path must stay inside workspace.source")
+            rights = self._string_list(item.get("rights"), "workspace.grants[].rights")
+            if not rights or any(right not in allowed_rights for right in rights):
+                raise ValidationError("workspace grants may include only read, write, and delete rights")
+            grants.append(
+                {
+                    "path": grant_path,
+                    "rights": sorted(set(rights)),
+                    "recursive": bool(item.get("recursive", False)),
+                    "delegable": bool(item.get("delegable", False)),
+                }
+            )
+        return grants
+
+    def _package_file_record(self, path: str, content: bytes) -> dict[str, Any]:
+        sha = hashlib.sha256(content).hexdigest()
+        record: dict[str, Any] = {
+            "path": path,
+            "size_bytes": len(content),
+            "sha256": sha,
+        }
+        try:
+            record["kind"] = "text"
+            record["content"] = content.decode("utf-8")
+        except UnicodeDecodeError:
+            record["kind"] = "base64"
+            record["content_base64"] = base64.b64encode(content).decode("ascii")
+        return record
+
+    def _package_hash(self, file_records: list[dict[str, Any]]) -> str:
+        canonical = [
+            {"path": record["path"], "size_bytes": record["size_bytes"], "sha256": record["sha256"]}
+            for record in file_records
+        ]
+        return hashlib.sha256(dumps({"kind": _PACKAGE_BOOT_KIND, "files": canonical}).encode("utf-8")).hexdigest()
+
+    def _jit_tool_to_artifact(self, tool: JitToolSpec) -> dict[str, Any]:
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "source_path": tool.source_path,
+            "input_schema": tool.input_schema,
+            "output_schema": tool.output_schema,
+            "source": tool.source,
+            "tests": list(tool.tests),
+            "metadata": dict(tool.metadata),
+        }
+
+    def _normalize_package_reference(self, path: str) -> str:
+        if not isinstance(path, str) or not path.strip():
+            raise ValidationError("image package path must be a non-empty string")
+        raw = path.replace("\\", "/").strip()
+        if raw.startswith("/"):
+            raise ValidationError(f"image package path must be relative: {path!r}")
+        parts: list[str] = []
+        for part in raw.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                raise ValidationError(f"image package path escapes package root: {path!r}")
+            parts.append(part)
+        return "/".join(parts) or "."
+
+    def _validate_package_relative_path(self, path: str) -> None:
+        normalized = self._normalize_package_reference(path)
+        if normalized != path:
+            raise ValidationError(f"image package path must be normalized: {path!r}")
+        if normalized == ".":
+            raise ValidationError("image package file path cannot be package root")
+        if any(ord(char) < 32 for char in normalized):
+            raise ValidationError(f"image package path contains control characters: {path!r}")
+
+    def _join_relative(self, base: str, path: str) -> str:
+        normalized_base = self._normalize_package_reference(base)
+        normalized_path = self._normalize_package_reference(path)
+        if normalized_base == ".":
+            return normalized_path
+        if normalized_path == ".":
+            return normalized_base
+        return f"{normalized_base}/{normalized_path}"
+
+    def _is_under_package_path(self, path: str, root: str) -> bool:
+        normalized_path = self._normalize_package_reference(path)
+        normalized_root = self._normalize_package_reference(root)
+        return normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}/")
+
+    def _runtime(self) -> Any:
+        if self.runtime is None:
+            raise ValidationError("image package operation requires a bound Runtime")
+        return self.runtime
 
     def load_persisted_images(self) -> None:
         if self.store is None:
@@ -164,17 +802,27 @@ class ImageRegistryPrimitive:
             raise NotFound(f"agent image not found: {image_id}")
         artifact = None
         boot = image.boot or {"kind": "fresh"}
-        if boot.get("kind") == "checkpoint_commit" and self.store is not None:
+        if boot.get("kind") in {_CHECKPOINT_BOOT_KIND, _PACKAGE_BOOT_KIND} and self.store is not None:
             found = self.store.get_image_artifact(str(boot.get("artifact_id")))
             if found is not None:
                 artifact_data, artifact_meta = found
-                artifact = {
-                    **artifact_meta,
-                    "source_checkpoint_id": artifact_data.get("source_checkpoint_id"),
-                    "source_pid": artifact_data.get("source_pid"),
-                    "counts": artifact_data.get("counts", {}),
-                    "modules": artifact_data.get("modules", []),
-                }
+                if boot.get("kind") == _CHECKPOINT_BOOT_KIND:
+                    artifact = {
+                        **artifact_meta,
+                        "source_checkpoint_id": artifact_data.get("source_checkpoint_id"),
+                        "source_pid": artifact_data.get("source_pid"),
+                        "counts": artifact_data.get("counts", {}),
+                        "modules": artifact_data.get("modules", []),
+                    }
+                else:
+                    artifact = {
+                        **artifact_meta,
+                        "source": artifact_data.get("source"),
+                        "package_sha256": artifact_data.get("package_sha256"),
+                        "counts": artifact_data.get("counts", {}),
+                        "workspace": artifact_data.get("workspace", {}),
+                        "jit_tools": [tool.get("name") for tool in artifact_data.get("jit_tools", [])],
+                    }
         return {
             "image": self._image_to_dict(image),
             "registry": metadata,
@@ -426,16 +1074,16 @@ class ImageRegistryPrimitive:
 
     def _validate_boot(self, boot: dict[str, Any]) -> None:
         kind = boot.get("kind", "fresh")
-        if kind not in {"fresh", "checkpoint_commit"}:
+        if kind not in {"fresh", _CHECKPOINT_BOOT_KIND, _PACKAGE_BOOT_KIND}:
             raise ValidationError(f"unsupported image boot kind: {kind}")
         if kind == "fresh":
             return
         artifact_id = boot.get("artifact_id")
         artifact_sha256 = boot.get("artifact_sha256")
         if not isinstance(artifact_id, str) or not artifact_id:
-            raise ValidationError("checkpoint_commit boot requires artifact_id")
+            raise ValidationError(f"{kind} boot requires artifact_id")
         if not isinstance(artifact_sha256, str) or not artifact_sha256:
-            raise ValidationError("checkpoint_commit boot requires artifact_sha256")
+            raise ValidationError(f"{kind} boot requires artifact_sha256")
 
     def _capability_specs(self, value: Any) -> list[dict[str, Any]]:
         if value is None:
@@ -477,6 +1125,12 @@ class ImageRegistryPrimitive:
         if not process_rows:
             raise ValidationError(f"checkpoint root process row is missing: {source_pid}")
         process_row = dict(process_rows[0])
+        # Resource constraints are launch-time policy, not image state. A
+        # checkpoint-committed image may replay reconstructable memory/tool
+        # context, but it must not carry the source process budget or usage into
+        # a newly started process.
+        process_row.pop("resource_budget_json", None)
+        process_row.pop("resource_usage_json", None)
         object_oids = self._root_object_oids(snapshot, process_row, source_pid)
         object_rows = [row for row in snapshot.get("rows", {}).get("objects", []) if row["oid"] in object_oids]
         namespace_names = self._root_namespace_names(snapshot, object_rows, source_pid)

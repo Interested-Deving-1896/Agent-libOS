@@ -177,44 +177,68 @@ class ShellRuleEngine:
             )
 
         if self._is_medium_risk(normalized):
-            return self._match(
-                f"shell.medium.{direct}",
-                CapabilityEffect.ASK,
-                AuthorityRisk.MEDIUM,
-                tuple(normalized[: min(len(normalized), 3)]),
-                "project code execution requires approval",
+            return self._guard_auto_allow(
+                argv,
+                self._match(
+                    f"shell.medium.{direct}",
+                    CapabilityEffect.ASK,
+                    AuthorityRisk.MEDIUM,
+                    tuple(normalized[: min(len(normalized), 3)]),
+                    "project code execution requires approval",
+                ),
+            )
+
+        if self._is_high_risk_workspace_write(normalized):
+            return self._guard_auto_allow(
+                argv,
+                self._match(
+                    "shell.high.compileall",
+                    CapabilityEffect.ASK,
+                    AuthorityRisk.HIGH,
+                    tuple(normalized[: min(len(normalized), 3)]),
+                    "shell command writes project build artifacts and requires approval",
+                ),
             )
 
         package = self._first_in({direct, *nested}, _PACKAGE_EXECUTABLES)
         if package is not None:
-            return self._match(
-                "shell.package-manager.default",
-                CapabilityEffect.ASK,
-                AuthorityRisk.HIGH,
-                (package,),
-                "package manager command requires approval",
+            return self._guard_auto_allow(
+                argv,
+                self._match(
+                    "shell.package-manager.default",
+                    CapabilityEffect.ASK,
+                    AuthorityRisk.HIGH,
+                    (package,),
+                    "package manager command requires approval",
+                ),
             )
 
         script = self._first_in({direct, *nested}, _SCRIPT_EXECUTABLES)
         if script is not None:
-            return self._match(
-                "shell.interpreter.default",
-                CapabilityEffect.ASK,
-                AuthorityRisk.HIGH,
-                (script,),
-                "script interpreter command requires approval",
+            return self._guard_auto_allow(
+                argv,
+                self._match(
+                    "shell.interpreter.default",
+                    CapabilityEffect.ASK,
+                    AuthorityRisk.HIGH,
+                    (script,),
+                    "script interpreter command requires approval",
+                ),
             )
 
         for rule in self.custom_rules:
             if self._matches_rule(argv, normalized, rule):
                 return self._guard_auto_allow(argv, RuleMatch(rule=rule, matched_argv=self._rule_argv(rule)))
 
-        return self._match(
-            "shell.unknown.default",
-            CapabilityEffect.ASK,
-            AuthorityRisk.MEDIUM,
-            (direct,),
-            "unclassified shell command requires approval",
+        return self._guard_auto_allow(
+            argv,
+            self._match(
+                "shell.unknown.default",
+                CapabilityEffect.ASK,
+                AuthorityRisk.MEDIUM,
+                (direct,),
+                "unclassified shell command requires approval",
+            ),
         )
 
     def _matches_rule(self, raw_argv: list[str], argv: list[str], rule: AuthorityRule) -> bool:
@@ -290,10 +314,6 @@ class ShellRuleEngine:
     def _is_low_risk(self, argv: list[str]) -> bool:
         if argv == ["git", "diff"]:
             return True
-        if argv[:3] == ["pytest", "--collect-only", "-q"] or argv[:2] == ["pytest", "--collect-only"]:
-            return True
-        if argv[:3] == ["python", "-m", "compileall"] or argv[:3] == ["python3", "-m", "compileall"]:
-            return True
         return False
 
     def _is_medium_risk(self, argv: list[str]) -> bool:
@@ -304,6 +324,9 @@ class ShellRuleEngine:
         if argv[:2] == ["uv", "run"]:
             return True
         return False
+
+    def _is_high_risk_workspace_write(self, argv: list[str]) -> bool:
+        return argv[:3] in (["python", "-m", "compileall"], ["python3", "-m", "compileall"], ["py", "-m", "compileall"])
 
     def _first_in(self, values: set[str], candidates: set[str]) -> str | None:
         for candidate in sorted(candidates):
@@ -318,7 +341,7 @@ class ShellRuleEngine:
         return None
 
     def _guard_auto_allow(self, raw_argv: list[str], match: RuleMatch) -> RuleMatch:
-        if match.rule.effect != CapabilityEffect.ALLOW:
+        if match.rule.effect == CapabilityEffect.DENY:
             return match
         token = self._first_shell_syntax_token(raw_argv)
         if token is None:

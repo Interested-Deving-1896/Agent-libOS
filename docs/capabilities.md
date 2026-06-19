@@ -160,6 +160,12 @@ Fork and spawn inherit authority only through delegation/attenuation. Exec
 switches the image/tool table and may shrink capabilities, but it never grants
 the target image's declared `required_capabilities`.
 
+Image-package boot is also not an external authority grant. Its
+`workspace.grants` entries apply only to the package workspace seed after it is
+materialized into that process's private directory under
+`agent_outputs/image_workspaces/`; they cannot name arbitrary host or workspace
+paths.
+
 ## Permission Policy And Human Approval
 
 Human-facing policy names are still used at prompts and CLI boundaries:
@@ -283,12 +289,12 @@ Shell command risk is classified by argv-token rules before the provider runs:
 
 - `harmless`: read-only status/version/inspection commands such as
   `git status --short` or `python --version`.
-- `low`: read-only project inspection such as `git diff`, pytest collection, or
-  `python -m compileall`.
-- `medium`: project code execution such as `pytest`, `npm test`, or
-  `uv run ...`.
-- `high`: package managers, network-capable tools, script interpreters, service
-  startup, and other commands likely to change host state or cross a boundary.
+- `low`: read-only project inspection such as `git diff`.
+- `medium`: project code execution such as `pytest`, pytest collection,
+  `npm test`, or `uv run ...`.
+- `high`: package managers, network-capable tools, script interpreters,
+  `python -m compileall`, service startup, and other commands likely to change
+  host state or cross a boundary.
 - `destructive`: delete/move/permission/system-control operations. These are
   denied by the built-in rule set even under broad shell policy.
 

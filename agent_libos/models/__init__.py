@@ -80,6 +80,7 @@ from agent_libos.models.process import (
     ProcessSignal,
     ProcessStatus,
     ResourceBudget,
+    ResourceUsage,
 )
 from agent_libos.models.tools import (
     ToolCallResult,
@@ -158,6 +159,7 @@ __all__ = [
     "Provenance",
     "RelationType",
     "ResourceBudget",
+    "ResourceUsage",
     "ResourcePattern",
     "ResourceScope",
     "SandboxProfile",

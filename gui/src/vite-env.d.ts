@@ -6,10 +6,11 @@ export type GuiConnection = {
   db: string;
 };
 
-export type ImageManifestFile = {
+export type ImagePackageFile = {
   path: string;
   name: string;
-  content: string;
+  manifest: string;
+  files: Record<string, string | { base64: string }>;
 };
 
 declare global {
@@ -17,7 +18,7 @@ declare global {
     libosApi?: {
       getConnection(): Promise<GuiConnection | null>;
       chooseDatabase(): Promise<GuiConnection | null>;
-      chooseImageManifest(): Promise<ImageManifestFile | null>;
+      chooseImagePackage(): Promise<ImagePackageFile | null>;
       useDatabase(db: string): Promise<GuiConnection | null>;
       openExternal(url: string): Promise<boolean>;
     };

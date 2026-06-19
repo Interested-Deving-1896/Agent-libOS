@@ -92,6 +92,15 @@ class ProcessDefaults:
     max_child_processes: int = 16
     max_runtime_seconds: int | None = None
     max_materialized_tokens: int = 65_536
+    max_llm_calls: int | None = None
+    max_llm_total_tokens: int | None = None
+    max_subprocess_wall_seconds: float | None = None
+    max_subprocess_cpu_seconds: float | None = None
+    max_subprocess_memory_bytes: int | None = None
+    max_external_read_bytes: int | None = None
+    max_external_write_bytes: int | None = None
+    max_jsonrpc_bytes: int | None = None
+    max_deno_syscalls: int | None = None
     default_goal_text: str = "Run agent process"
     default_working_directory: str = "."
     fork_budget_divisor: int = 2
@@ -260,8 +269,19 @@ class ImageDefaults:
     version_max_chars: int = 64
     max_default_tools: int = 128
     max_required_capabilities: int = 64
-    yaml_max_bytes: int = 262_144
-    yaml_hard_limit_bytes: int = 1_048_576
+    package_manifest_name: str = "IMAGE.yaml"
+    package_workspace_dir: str = "workspace"
+    package_tools_dir: str = "tools"
+    package_resources_dir: str = "resources"
+    materialized_workspace_root: str = "agent_outputs/image_workspaces"
+    package_manifest_max_bytes: int = 262_144
+    package_manifest_hard_limit_bytes: int = 1_048_576
+    package_file_max_bytes: int = 1_048_576
+    package_max_bytes: int = 16_777_216
+    package_max_files: int = 512
+    prompt_max_chars: int = 64_000
+    max_package_jit_tools: int = 64
+    max_workspace_grants: int = 64
 
 
 @dataclass(frozen=True)

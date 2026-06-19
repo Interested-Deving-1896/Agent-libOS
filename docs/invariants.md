@@ -37,12 +37,20 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
   profiles are derived from the same capability decision that authorizes the
   operation.
+- `resource-budgets-are-hierarchical`: resource usage is charged to the acting
+  process and its parent chain, and visibility/capability mechanisms cannot
+  mint additional budget.
+- `llm-token-usage-is-charged-before-tool-dispatch`: provider-reported LLM token
+  usage is settled before any model-selected tool call is dispatched.
+- `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
+  CPU, and RSS limits are enforced by providers and audited on exceedance.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
   prompt context without granting resources.
 - `checkpoint-restore-and-fork-are-scoped`: checkpoint restore/fork are scoped,
   capability-controlled, and append-only outside reconstructable state.
-- `image-self-evolution-requires-image-authority`: image registration, exec, and
-  checkpoint commit require image authority and do not bake external authority.
+- `image-self-evolution-requires-image-authority`: image registration, package
+  boot, exec, and checkpoint commit require image authority and do not bake
+  external authority.
 - `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC calls use
   registered endpoint/method authority and classified provider effects.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs

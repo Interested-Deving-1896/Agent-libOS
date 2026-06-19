@@ -1,5 +1,6 @@
 from __future__ import annotations
 import pytest
+import sys
 import tempfile
 from datetime import datetime, tzinfo
 from pathlib import Path
@@ -8,7 +9,7 @@ from agent_libos import Runtime
 from agent_libos.primitives.shell import ShellAdapter
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath
+from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 
 class TestResourceProviderSubstrate:
 
@@ -25,6 +26,23 @@ class TestResourceProviderSubstrate:
                 assert 'resolve' in substrate.filesystem.calls
                 assert 'write_text' in substrate.filesystem.calls
                 assert (Path(temp_dir) / path).read_text(encoding='utf-8') == 'via provider'
+            finally:
+                runtime.close()
+
+    def test_filesystem_directory_limit_is_pushed_to_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index in range(5):
+                (root / f"item-{index}.txt").write_text("x", encoding="utf-8")
+            substrate = RecordingSubstrate(temp_dir)
+            runtime = Runtime.open("local", substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="bounded directory listing")
+                runtime.filesystem.grant_directory(pid, ".", [CapabilityRight.READ], issued_by="test")
+                result = runtime.filesystem.read_directory(pid, ".", limit=2)
+                assert result.count == 2
+                assert result.truncated
+                assert substrate.filesystem.list_limits == [3]
             finally:
                 runtime.close()
 
@@ -58,6 +76,42 @@ class TestResourceProviderSubstrate:
             assert provider.calls == [(['git', 'status', '--short'], 2.0)]
         finally:
             runtime.close()
+
+    def test_local_shell_provider_enforces_subprocess_wall_limit_with_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            with pytest.raises(SubprocessLimitExceeded) as exc_info:
+                provider.run(
+                    [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                    timeout=5.0,
+                    limits=SubprocessLimits(wall_seconds=0.05),
+                )
+            assert exc_info.value.metrics.killed
+            assert exc_info.value.metrics.limit_kind == "subprocess_wall_seconds"
+            assert exc_info.value.metrics.wall_seconds > 0
+
+    def test_local_shell_provider_timeout_returns_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            with pytest.raises(SubprocessTimeoutExpired) as exc_info:
+                provider.run(
+                    [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                    timeout=0.05,
+                )
+            assert exc_info.value.metrics.killed
+            assert exc_info.value.metrics.limit_kind == "subprocess_timeout"
+            assert exc_info.value.metrics.wall_seconds > 0
+
+    def test_local_shell_provider_drains_large_stdout_while_monitoring(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            result = provider.run(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 200000)"],
+                timeout=5.0,
+            )
+            assert result.returncode == 0
+            assert len(result.stdout) == 200000
+            assert result.metrics is not None
 
     def test_effectful_provider_without_classification_fails_closed(self) -> None:
         runtime = Runtime.open('local')
@@ -109,6 +163,7 @@ class RecordingFilesystemProvider:
         self.namespace = self.inner.namespace
         self.root_display = self.inner.root_display
         self.calls: list[str] = []
+        self.list_limits: list[int | None] = []
 
     def resolve(self, path: Any) -> ResolvedPath:
         self.calls.append('resolve')
@@ -121,6 +176,11 @@ class RecordingFilesystemProvider:
     def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None='\n') -> None:
         self.calls.append('write_text')
         self.inner.write_text(path, text, encoding, newline)
+
+    def list_directory(self, path: ResolvedPath, *, limit: int | None = None):
+        self.calls.append('list_directory')
+        self.list_limits.append(limit)
+        return self.inner.list_directory(path, limit=limit)
 
     def __getattr__(self, name: str):
         return getattr(self.inner, name)
@@ -151,7 +211,16 @@ class FakeShellProvider:
     def __init__(self):
         self.calls: list[tuple[list[str], float]] = []
 
-    def run(self, argv: list[str], *, timeout: float=30.0, cwd: str | None=None) -> CommandResult:
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: object | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
         self.calls.append((list(argv), timeout))
         return CommandResult(argv=list(argv), returncode=0, stdout='ok\n', stderr='')
 
@@ -163,7 +232,16 @@ class NoClassificationShellProvider:
     def __init__(self):
         self.calls: list[tuple[list[str], float]] = []
 
-    def run(self, argv: list[str], *, timeout: float=30.0, cwd: str | None=None) -> CommandResult:
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: object | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
         self.calls.append((list(argv), timeout))
         return CommandResult(argv=list(argv), returncode=0, stdout='ok\n', stderr='')
 

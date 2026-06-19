@@ -234,7 +234,7 @@ setup:
   skills:
     - path: skills/jit-read
   images:
-    - path: images/required-cap-image.yaml
+    - path: images/required-cap-image
   jsonrpc_endpoints:
     - path: jsonrpc/demo-endpoint.yaml
   tools:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
@@ -41,10 +41,57 @@ class ProcessSignal(StrEnum):
 
 @dataclass
 class ResourceBudget:
-    max_tool_calls: int = _PROCESS_DEFAULTS.max_tool_calls
-    max_child_processes: int = _PROCESS_DEFAULTS.max_child_processes
+    max_tool_calls: int | None = _PROCESS_DEFAULTS.max_tool_calls
+    max_child_processes: int | None = _PROCESS_DEFAULTS.max_child_processes
     max_runtime_seconds: int | None = _PROCESS_DEFAULTS.max_runtime_seconds
     max_materialized_tokens: int = _PROCESS_DEFAULTS.max_materialized_tokens
+    max_llm_calls: int | None = _PROCESS_DEFAULTS.max_llm_calls
+    max_llm_total_tokens: int | None = _PROCESS_DEFAULTS.max_llm_total_tokens
+    max_subprocess_wall_seconds: float | None = _PROCESS_DEFAULTS.max_subprocess_wall_seconds
+    max_subprocess_cpu_seconds: float | None = _PROCESS_DEFAULTS.max_subprocess_cpu_seconds
+    max_subprocess_memory_bytes: int | None = _PROCESS_DEFAULTS.max_subprocess_memory_bytes
+    max_external_read_bytes: int | None = _PROCESS_DEFAULTS.max_external_read_bytes
+    max_external_write_bytes: int | None = _PROCESS_DEFAULTS.max_external_write_bytes
+    max_jsonrpc_bytes: int | None = _PROCESS_DEFAULTS.max_jsonrpc_bytes
+    max_deno_syscalls: int | None = _PROCESS_DEFAULTS.max_deno_syscalls
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            value = getattr(self, item.name)
+            allow_none = item.name != "max_materialized_tokens"
+            _validate_resource_number(item.name, value, allow_none=allow_none)
+
+
+@dataclass
+class ResourceUsage:
+    runtime_seconds: float = 0.0
+    tool_calls: int = 0
+    child_processes: int = 0
+    llm_calls: int = 0
+    llm_prompt_tokens: int = 0
+    llm_completion_tokens: int = 0
+    llm_total_tokens: int = 0
+    subprocess_wall_seconds: float = 0.0
+    subprocess_cpu_seconds: float = 0.0
+    subprocess_peak_memory_bytes: int = 0
+    external_read_bytes: int = 0
+    external_write_bytes: int = 0
+    jsonrpc_request_bytes: int = 0
+    jsonrpc_response_bytes: int = 0
+    deno_syscalls: int = 0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            _validate_resource_number(item.name, getattr(self, item.name), allow_none=False)
+
+
+def _validate_resource_number(name: str, value: Any, *, allow_none: bool) -> None:
+    if value is None and allow_none:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    if value < 0:
+        raise ValueError(f"{name} cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -79,6 +126,7 @@ class AgentProcess:
     event_cursor: EventID | None
     checkpoint_head: CheckpointID | None
     resource_budget: ResourceBudget
+    resource_usage: ResourceUsage
     created_at: str
     updated_at: str
     working_directory: str = "."

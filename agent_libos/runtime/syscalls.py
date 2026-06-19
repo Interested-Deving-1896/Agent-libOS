@@ -21,6 +21,7 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
+    ResourceUsage,
     ViewMode,
 )
 from agent_libos.models.exceptions import (
@@ -72,8 +73,7 @@ BUILTIN_SYSCALL_NAMES = {
     "image.commit_checkpoint",
     "image.inspect",
     "image.list",
-    "image.load_yaml",
-    "image.register",
+    "image.load_package",
     "jsonrpc.call",
     "jsonrpc.inspect",
     "jsonrpc.list",
@@ -135,6 +135,7 @@ class LibOSSyscallSession:
         normalized = name.strip()
         if not normalized:
             raise ValidationError("syscall name must be non-empty")
+        self._charge_syscall(normalized)
         self.runtime.audit.record(
             actor=self.pid,
             action="syscall.request",
@@ -149,6 +150,19 @@ class LibOSSyscallSession:
             decision={"ok": True},
         )
         return to_jsonable(result)
+
+    def _charge_syscall(self, name: str) -> None:
+        resources = getattr(self.runtime, "resources", None)
+        if resources is None:
+            return
+        resources.charge(
+            self.pid,
+            ResourceUsage(deno_syscalls=1),
+            source="deno.syscall",
+            context={"syscall": name},
+            allow_overage=False,
+            kill_on_exceed=False,
+        )
 
     async def apply_deferred_lifecycle(self, tool_result: ObjectHandle | None = None) -> None:
         if self._deferred_exec is not None:
@@ -447,15 +461,6 @@ class LibOSSyscallSession:
                 timeout=float(args.get("timeout_s", self.config.tools.shell_timeout_s)),
                 cwd=cwd,
             )
-        if name == "image.register":
-            result = self.runtime.image_registry.register(
-                dict(args["image"]),
-                actor=self.pid,
-                replace=bool(args.get("replace", False)),
-                require_capability=True,
-                source=args.get("source"),
-            )
-            return self._image_result(result)
         if name == "image.list":
             self.runtime.capability.require(self.pid, self.runtime.image_registry.registry_resource(), CapabilityRight.READ)
             return {"images": self.runtime.image_registry.list_images()}
@@ -478,8 +483,13 @@ class LibOSSyscallSession:
                 require_capability=True,
             )
             return self._image_result(result)
-        if name == "image.load_yaml":
-            return self._image_load_yaml(args)
+        if name == "image.load_package":
+            result = self.runtime.image_registry.register_from_workspace_package(
+                self.pid,
+                str(args["path"]),
+                replace=bool(args.get("replace", False)),
+            )
+            return self._image_result(result)
         raise NotFound(f"unknown libOS syscall: {name}")
 
     def _filesystem_read_text(self, args: dict[str, Any]) -> Any:
@@ -703,6 +713,7 @@ class LibOSSyscallSession:
                 include_parent_roots=bool(args.get("include_parent_roots", True)),
             ),
             inherit_capabilities=list(args.get("inherit_capabilities") or []),
+            resource_budget=args.get("resource_budget"),
             image=args.get("image"),
             mode=mode,
             working_directory=args.get("working_directory"),
@@ -716,6 +727,7 @@ class LibOSSyscallSession:
             goal=args.get("goal", ""),
             image=args.get("image"),
             inherit_capabilities=list(args.get("inherit_capabilities") or []),
+            resource_budget=args.get("resource_budget"),
             working_directory=args.get("working_directory"),
         )
         child = self.runtime.process.get(child_pid)
@@ -782,25 +794,6 @@ class LibOSSyscallSession:
             "created_at": message.created_at,
             "acked_at": message.acked_at,
         }
-
-    def _image_load_yaml(self, args: dict[str, Any]) -> Any:
-        file_result = self._filesystem_read_text(
-            {
-                "path": args["path"],
-                "encoding": args.get("encoding", self.config.tools.default_text_encoding),
-                "max_bytes": args.get("max_bytes", self.config.image.yaml_max_bytes),
-            }
-        )
-        if file_result.truncated:
-            raise ValidationError("image YAML exceeded max_bytes")
-        result = self.runtime.image_registry.register_from_yaml_text(
-            file_result.content,
-            actor=self.pid,
-            replace=bool(args.get("replace", False)),
-            require_capability=True,
-            source=file_result.path,
-        )
-        return self._image_result(result)
 
     def _image_result(self, result: Any) -> dict[str, Any]:
         image = result.image

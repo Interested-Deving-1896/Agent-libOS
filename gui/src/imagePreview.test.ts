@@ -22,11 +22,11 @@ describe("previewImageManifest", () => {
     });
   });
 
-  it("previews simple YAML image manifests", () => {
+  it("previews simple IMAGE.yaml package manifests", () => {
     const preview = previewImageManifest(`
 image:
-  image_id: yaml-agent:v0
-  name: yaml-agent
+  image_id: package-agent:v0
+  name: package-agent
   version: v1
   default_tools:
     - echo
@@ -37,8 +37,8 @@ image:
 `);
 
     expect(preview).toMatchObject({
-      image_id: "yaml-agent:v0",
-      name: "yaml-agent",
+      image_id: "package-agent:v0",
+      name: "package-agent",
       version: "v1",
       default_tools_count: 2,
       required_capabilities_count: 1

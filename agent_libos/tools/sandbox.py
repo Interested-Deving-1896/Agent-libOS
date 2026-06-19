@@ -9,19 +9,30 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
+from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+import psutil
 
 from agent_libos.capability.profiles import SandboxProfileBuilder
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import SandboxError
 from agent_libos.models import ValidationResult
+from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 from agent_libos.utils.serde import to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
+
+
+@dataclass(frozen=True)
+class SandboxExecutionResult:
+    value: Any
+    metrics: CommandMetrics | None = None
 
 
 class SandboxBackend:
@@ -38,6 +49,8 @@ class SandboxBackend:
         pid: str | None = None,
         syscall_handler: SyscallHandler | None = None,
         timeout: float | None = None,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
     ) -> Any:
         raise NotImplementedError
 
@@ -49,20 +62,28 @@ class SandboxBackend:
         pid: str | None = None,
         syscall_handler: SyscallHandler | None = None,
         timeout: float | None = None,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
     ) -> Any:
+        kwargs = self._arun_source_kwargs(
+            pid=pid,
+            syscall_handler=syscall_handler,
+            timeout=timeout,
+            limits=limits,
+            return_metrics=return_metrics,
+        )
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(
-                self.arun_source(
-                    source_code,
-                    args,
-                    pid=pid,
-                    syscall_handler=syscall_handler,
-                    timeout=timeout,
-                )
-            )
+            return asyncio.run(self.arun_source(source_code, args, **kwargs))
         raise RuntimeError("Cannot call run_source() inside a running event loop. Use await arun_source(...).")
+
+    def _arun_source_kwargs(self, **kwargs: Any) -> dict[str, Any]:
+        """Pass new optional sandbox controls only to backends that support them."""
+        signature = inspect.signature(self.arun_source)
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+            return kwargs
+        return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
     def run_tests(
         self,
@@ -144,6 +165,8 @@ class DenoTypescriptSandbox(SandboxBackend):
         pid: str | None = None,
         syscall_handler: SyscallHandler | None = None,
         timeout: float | None = None,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
     ) -> Any:
         validation = self.static_check(source_code)
         if not validation.ok:
@@ -164,17 +187,66 @@ class DenoTypescriptSandbox(SandboxBackend):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            monitor_task = asyncio.create_task(self._monitor_process(proc, limits), name="deno-resource-monitor")
+            serve_task = asyncio.create_task(
+                self._serve_process(proc, args, syscall_handler),
+                name="deno-syscall-server",
+            )
             try:
-                return await asyncio.wait_for(
-                    self._serve_process(proc, args, syscall_handler),
+                done, pending = await asyncio.wait(
+                    {serve_task, monitor_task},
                     timeout=selected_timeout,
+                    return_when=asyncio.FIRST_EXCEPTION,
                 )
+                if not done:
+                    await self._kill_process(proc)
+                    for task in pending:
+                        task.cancel()
+                    raise SubprocessTimeoutExpired(
+                        f"Deno JIT tool timed out after {selected_timeout}s",
+                        metrics=CommandMetrics(
+                            wall_seconds=float(selected_timeout),
+                            killed=True,
+                            limit_kind="subprocess_timeout",
+                        ),
+                    )
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        await self._kill_process(proc)
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        raise exc
+                if serve_task not in done:
+                    done_all, pending = await asyncio.wait(
+                        {serve_task, monitor_task},
+                        timeout=1.0,
+                        return_when=asyncio.ALL_COMPLETED,
+                    )
+                    if serve_task not in done_all:
+                        await self._kill_process(proc)
+                        for task in pending:
+                            task.cancel()
+                        raise SandboxError("Deno JIT tool exited before result")
+                value = serve_task.result()
+                if not monitor_task.done():
+                    await asyncio.wait({monitor_task}, timeout=1.0, return_when=asyncio.ALL_COMPLETED)
+                metrics = monitor_task.result() if monitor_task.done() and not monitor_task.cancelled() else None
+                wrapped = SandboxExecutionResult(value=value, metrics=metrics)
+                return wrapped if return_metrics else value
+            except SubprocessTimeoutExpired:
+                await self._kill_process(proc)
+                raise
             except TimeoutError as exc:
                 await self._kill_process(proc)
                 raise TimeoutError(f"Deno JIT tool timed out after {selected_timeout}s") from exc
             except Exception:
                 await self._kill_process(proc)
                 raise
+            finally:
+                for task in (serve_task, monitor_task):
+                    if not task.done():
+                        task.cancel()
 
     def run_tests(
         self,
@@ -295,6 +367,86 @@ class DenoTypescriptSandbox(SandboxBackend):
                 message = str(frame.get("message") or stderr or "Deno JIT tool failed")
                 raise SandboxError(message)
             raise SandboxError(f"unknown Deno JIT protocol frame: {frame_type!r}")
+
+    async def _monitor_process(
+        self,
+        proc: asyncio.subprocess.Process,
+        limits: SubprocessLimits | None,
+    ) -> CommandMetrics:
+        started_at = time.monotonic()
+        peak_memory = 0
+        cpu_seconds = 0.0
+        try:
+            ps_proc = psutil.Process(proc.pid)
+        except psutil.Error:
+            return CommandMetrics(wall_seconds=max(0.0, time.monotonic() - started_at))
+        while proc.returncode is None:
+            wall_seconds = time.monotonic() - started_at
+            cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+            limit_kind = self._limit_kind(
+                wall_seconds=wall_seconds,
+                cpu_seconds=cpu_seconds,
+                peak_memory=peak_memory,
+                limits=limits,
+            )
+            if limit_kind is not None:
+                await self._kill_process(proc)
+                metrics = CommandMetrics(
+                    wall_seconds=wall_seconds,
+                    cpu_seconds=cpu_seconds,
+                    peak_memory_bytes=peak_memory,
+                    killed=True,
+                    limit_kind=limit_kind,
+                )
+                raise SubprocessLimitExceeded(
+                    f"Deno JIT subprocess exceeded {limit_kind}",
+                    metrics=metrics,
+                )
+            await asyncio.sleep(0.02)
+        wall_seconds = time.monotonic() - started_at
+        final_cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+        return CommandMetrics(
+            wall_seconds=wall_seconds,
+            cpu_seconds=max(cpu_seconds, final_cpu_seconds),
+            peak_memory_bytes=peak_memory,
+            killed=False,
+            limit_kind=None,
+        )
+
+    def _limit_kind(
+        self,
+        *,
+        wall_seconds: float,
+        cpu_seconds: float,
+        peak_memory: int,
+        limits: SubprocessLimits | None,
+    ) -> str | None:
+        if limits is None:
+            return None
+        if limits.wall_seconds is not None and wall_seconds > limits.wall_seconds:
+            return "subprocess_wall_seconds"
+        if limits.cpu_seconds is not None and cpu_seconds > limits.cpu_seconds:
+            return "subprocess_cpu_seconds"
+        if limits.memory_bytes is not None and peak_memory > limits.memory_bytes:
+            return "subprocess_memory_bytes"
+        return None
+
+    def _sample_process_tree(self, proc: psutil.Process, peak_memory: int) -> tuple[float, int]:
+        cpu_seconds = 0.0
+        memory_bytes = 0
+        processes = [proc]
+        try:
+            processes.extend(proc.children(recursive=True))
+        except psutil.Error:
+            pass
+        for item in processes:
+            try:
+                times = item.cpu_times()
+                cpu_seconds += float(times.user) + float(times.system)
+                memory_bytes += int(item.memory_info().rss)
+            except psutil.Error:
+                continue
+        return cpu_seconds, max(peak_memory, memory_bytes)
 
     async def _handle_syscall_frame(
         self,

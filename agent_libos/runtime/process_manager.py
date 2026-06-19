@@ -26,6 +26,7 @@ from agent_libos.models import (
     ProcessSignal,
     ProcessStatus,
     ResourceBudget,
+    ResourceUsage,
     ViewMode,
 )
 from agent_libos.runtime.audit_manager import AuditManager
@@ -48,6 +49,7 @@ class ProcessManager:
         audit: AuditManager,
         events: EventBus,
         config: AgentLibOSConfig | None = None,
+        resources: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -55,6 +57,7 @@ class ProcessManager:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.resources = resources
         self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
 
     def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
@@ -84,6 +87,7 @@ class ProcessManager:
             event_cursor=None,
             checkpoint_head=None,
             resource_budget=resource_budget or self._default_resource_budget(),
+            resource_usage=ResourceUsage(),
             created_at=now,
             updated_at=now,
             working_directory=cwd,
@@ -123,6 +127,7 @@ class ProcessManager:
         memory_view: MemoryView | MemoryViewSpec | None = None,
         capabilities: builtins.list[dict[str, Any]] | None = None,
         inherit_capabilities: builtins.list[dict[str, Any]] | None = None,
+        resource_budget: ResourceBudget | dict[str, Any] | None = None,
         image: str | None = None,
         mode: ForkMode | str = ForkMode.RESTRICTED,
         working_directory: str | None = None,
@@ -134,6 +139,8 @@ class ProcessManager:
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
+        selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
+        self._charge_child_creation(parent)
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
         now = utc_now()
         child_pid = new_id("pid")
@@ -149,18 +156,8 @@ class ProcessManager:
             tool_table={},
             event_cursor=None,
             checkpoint_head=None,
-            resource_budget=ResourceBudget(
-                max_tool_calls=max(
-                    self.config.process.fork_min_tool_calls,
-                    parent_proc.resource_budget.max_tool_calls // self.config.process.fork_budget_divisor,
-                ),
-                max_child_processes=max(
-                    self.config.process.fork_min_child_processes,
-                    parent_proc.resource_budget.max_child_processes // self.config.process.fork_budget_divisor,
-                ),
-                max_runtime_seconds=parent_proc.resource_budget.max_runtime_seconds,
-                max_materialized_tokens=parent_proc.resource_budget.max_materialized_tokens,
-            ),
+            resource_budget=selected_budget,
+            resource_usage=ResourceUsage(),
             created_at=now,
             updated_at=now,
             working_directory=cwd,
@@ -213,6 +210,7 @@ class ProcessManager:
         goal: dict[str, Any] | str | ObjectHandle,
         capabilities: builtins.list[dict[str, Any]] | None = None,
         inherit_capabilities: builtins.list[dict[str, Any]] | None = None,
+        resource_budget: ResourceBudget | dict[str, Any] | None = None,
         image: str | None = None,
         working_directory: str | None = None,
     ) -> str:
@@ -222,6 +220,8 @@ class ProcessManager:
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
+        selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
+        self._charge_child_creation(parent)
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
         now = utc_now()
         child_pid = new_id("pid")
@@ -237,7 +237,8 @@ class ProcessManager:
             tool_table={},
             event_cursor=None,
             checkpoint_head=None,
-            resource_budget=self._child_resource_budget(parent_proc),
+            resource_budget=selected_budget,
+            resource_usage=ResourceUsage(),
             created_at=now,
             updated_at=now,
             working_directory=cwd,
@@ -556,6 +557,15 @@ class ProcessManager:
             max_child_processes=defaults.max_child_processes,
             max_runtime_seconds=defaults.max_runtime_seconds,
             max_materialized_tokens=defaults.max_materialized_tokens,
+            max_llm_calls=defaults.max_llm_calls,
+            max_llm_total_tokens=defaults.max_llm_total_tokens,
+            max_subprocess_wall_seconds=defaults.max_subprocess_wall_seconds,
+            max_subprocess_cpu_seconds=defaults.max_subprocess_cpu_seconds,
+            max_subprocess_memory_bytes=defaults.max_subprocess_memory_bytes,
+            max_external_read_bytes=defaults.max_external_read_bytes,
+            max_external_write_bytes=defaults.max_external_write_bytes,
+            max_jsonrpc_bytes=defaults.max_jsonrpc_bytes,
+            max_deno_syscalls=defaults.max_deno_syscalls,
         )
 
     def _normalize_working_directory(self, path: str | None) -> str:
@@ -577,18 +587,73 @@ class ProcessManager:
         return "/".join(parts) if parts else "."
 
     def _child_resource_budget(self, parent: AgentProcess) -> ResourceBudget:
+        budget = parent.resource_budget
+        divisor = self.config.process.fork_budget_divisor
         return ResourceBudget(
-            max_tool_calls=max(
-                self.config.process.fork_min_tool_calls,
-                parent.resource_budget.max_tool_calls // self.config.process.fork_budget_divisor,
-            ),
-            max_child_processes=max(
+            max_tool_calls=self._attenuate_int(budget.max_tool_calls, divisor, self.config.process.fork_min_tool_calls),
+            max_child_processes=self._attenuate_int(
+                budget.max_child_processes,
+                divisor,
                 self.config.process.fork_min_child_processes,
-                parent.resource_budget.max_child_processes // self.config.process.fork_budget_divisor,
             ),
-            max_runtime_seconds=parent.resource_budget.max_runtime_seconds,
-            max_materialized_tokens=parent.resource_budget.max_materialized_tokens,
+            max_runtime_seconds=self._attenuate_float(budget.max_runtime_seconds, divisor),
+            max_materialized_tokens=budget.max_materialized_tokens,
+            max_llm_calls=self._attenuate_int(budget.max_llm_calls, divisor, 0),
+            max_llm_total_tokens=self._attenuate_int(budget.max_llm_total_tokens, divisor, 0),
+            max_subprocess_wall_seconds=self._attenuate_float(budget.max_subprocess_wall_seconds, divisor),
+            max_subprocess_cpu_seconds=self._attenuate_float(budget.max_subprocess_cpu_seconds, divisor),
+            max_subprocess_memory_bytes=self._attenuate_int(budget.max_subprocess_memory_bytes, divisor, 0),
+            max_external_read_bytes=self._attenuate_int(budget.max_external_read_bytes, divisor, 0),
+            max_external_write_bytes=self._attenuate_int(budget.max_external_write_bytes, divisor, 0),
+            max_jsonrpc_bytes=self._attenuate_int(budget.max_jsonrpc_bytes, divisor, 0),
+            max_deno_syscalls=self._attenuate_int(budget.max_deno_syscalls, divisor, 0),
         )
+
+    def _select_child_resource_budget(
+        self,
+        parent: AgentProcess,
+        requested: ResourceBudget | dict[str, Any] | None,
+    ) -> ResourceBudget:
+        selected = self._coerce_resource_budget(requested) if requested is not None else self._child_resource_budget(parent)
+        if self.resources is not None:
+            self.resources.validate_child_budget(parent.pid, selected, reserved_usage=ResourceUsage(child_processes=1))
+        return selected
+
+    def _charge_child_creation(self, parent_pid: str) -> None:
+        if self.resources is None:
+            return
+        self.resources.charge(
+            parent_pid,
+            ResourceUsage(child_processes=1),
+            source="process.child_create",
+            context={"parent_pid": parent_pid},
+            allow_overage=False,
+            kill_on_exceed=False,
+        )
+
+    def _coerce_resource_budget(self, value: ResourceBudget | dict[str, Any]) -> ResourceBudget:
+        if isinstance(value, ResourceBudget):
+            return value
+        if not isinstance(value, dict):
+            raise ProcessError("resource_budget must be a mapping")
+        allowed = set(ResourceBudget.__dataclass_fields__)
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ProcessError(f"unknown resource_budget fields: {unknown}")
+        try:
+            return ResourceBudget(**{key: item for key, item in value.items() if key in allowed})
+        except ValueError as exc:
+            raise ProcessError(str(exc)) from exc
+
+    def _attenuate_int(self, value: int | None, divisor: int, minimum: int) -> int | None:
+        if value is None:
+            return None
+        return max(minimum, int(value) // divisor)
+
+    def _attenuate_float(self, value: float | int | None, divisor: int) -> float | None:
+        if value is None:
+            return None
+        return float(value) / divisor
 
     def _ensure_goal(self, pid: str, goal: dict[str, Any] | str | ObjectHandle | None) -> ObjectHandle:
         if isinstance(goal, ObjectHandle):
@@ -665,6 +730,10 @@ class ProcessManager:
         return child_proc
 
     def _require_child_budget(self, parent: AgentProcess) -> None:
+        if self.resources is not None:
+            return
+        if parent.resource_budget.max_child_processes is None:
+            return
         child_count = len([process for process in self.store.list_processes() if process.parent_pid == parent.pid])
         if child_count >= parent.resource_budget.max_child_processes:
             raise ProcessError(

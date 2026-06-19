@@ -10,25 +10,22 @@ _IMAGE_DEFAULTS = DEFAULT_CONFIG.image
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
-class LoadImageFromYamlArgs(BaseModel):
-    path: str = Field(description="Workspace-relative YAML file path containing one AgentImage manifest.")
-    encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
-    max_bytes: int = Field(
-        default=_IMAGE_DEFAULTS.yaml_max_bytes,
-        ge=1,
-        le=_IMAGE_DEFAULTS.yaml_hard_limit_bytes,
-        description="Maximum YAML bytes to read.",
-    )
+class LoadImagePackageArgs(BaseModel):
+    path: str = Field(description="Workspace-relative image package directory containing IMAGE.yaml.")
     replace: bool = Field(default=False, description="Whether an existing image with the same id may be replaced.")
 
 
-class LoadImageFromYamlOutput(BaseModel):
+class LoadImagePackageOutput(BaseModel):
     image_id: str
     name: str
     version: str
     source_path: str
     replaced: bool
     default_tools: list[str]
+    package_jit_tools: list[str]
+    boot_kind: str
+    artifact_id: str
+    package_sha256: str
     required_capabilities_count: int
 
 
@@ -52,69 +49,50 @@ class CommitCheckpointToImageOutput(BaseModel):
     required_capabilities_count: int
 
 
-class LoadImageFromYamlTool(SyncAgentTool[LoadImageFromYamlArgs]):
-    name = "load_image_from_yaml"
+class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
+    name = "load_image_package"
     description = (
-        "Read an AgentImage registration manifest from a workspace YAML file and register it with the runtime. "
+        "Read an AgentImage package directory from the workspace and register it with the runtime. "
         "The filesystem primitive enforces file read authority; the image registry primitive enforces image write authority."
     )
-    args_schema = LoadImageFromYamlArgs
-    output_schema = LoadImageFromYamlOutput
+    args_schema = LoadImagePackageArgs
+    output_schema = LoadImagePackageOutput
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
         permissions={"filesystem.read", "image.write"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
-    tags = ["image", "registry", "yaml", "side_effect"]
+    tags = ["image", "registry", "package", "side_effect"]
 
-    def run(self, args: LoadImageFromYamlArgs, ctx: ToolContext) -> LoadImageFromYamlOutput:
+    def run(self, args: LoadImagePackageArgs, ctx: ToolContext) -> LoadImagePackageOutput:
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        cwd = runtime.process.working_directory(ctx.pid)
         try:
-            file_result = runtime.filesystem.read_text(
-                pid=ctx.pid,
-                path=args.path,
-                encoding=args.encoding,
-                max_bytes=args.max_bytes,
-                cwd=cwd,
-            )
-        except UnicodeDecodeError as exc:
-            raise ToolExecutionError(
-                "Image YAML file could not be decoded with the requested encoding.",
-                code=ToolErrorCode.EXECUTION_ERROR,
-                details={"encoding": args.encoding, "path": args.path},
-            ) from exc
-        if file_result.truncated:
-            raise ToolExecutionError(
-                "Image YAML exceeded max_bytes; no image was registered.",
-                code=ToolErrorCode.VALIDATION_ERROR,
-                details={"path": file_result.path, "bytes_read": file_result.bytes_read, "max_bytes": args.max_bytes},
-            )
-        try:
-            result = runtime.image_registry.register_from_yaml_text(
-                file_result.content,
-                actor=ctx.pid,
+            result = runtime.image_registry.register_from_workspace_package(
+                ctx.pid,
+                args.path,
                 replace=args.replace,
-                require_capability=True,
-                source=file_result.path,
             )
         except LibOSValidationError as exc:
             raise ToolExecutionError(
                 str(exc),
                 code=ToolErrorCode.VALIDATION_ERROR,
-                details={"path": file_result.path},
+                details={"path": args.path},
             ) from exc
         image = result.image
-        return LoadImageFromYamlOutput(
+        return LoadImagePackageOutput(
             image_id=image.image_id,
             name=image.name,
             version=image.version,
-            source_path=file_result.path,
+            source_path=result.source or args.path,
             replaced=result.replaced,
             default_tools=list(image.default_tools),
+            package_jit_tools=list(image.metadata.get("package_jit_tools", [])),
+            boot_kind=image.boot.get("kind", "fresh"),
+            artifact_id=str(image.boot.get("artifact_id", "")),
+            package_sha256=str(image.boot.get("package_sha256", "")),
             required_capabilities_count=len(image.required_capabilities),
         )
 

@@ -151,8 +151,11 @@ The v1 commit captures only the checkpoint owner root process:
 - required startup module summaries.
 
 It does not copy the real filesystem, shell state, remote JSON-RPC state, human
-UI output, network effects, or any other provider-side state. Provider effects
-remain append-only `external_effects` records.
+UI output, network effects, resource budgets/usage, or any other provider-side
+state. Provider effects remain append-only `external_effects` records. Resource
+limits for a process booted from the committed image must come from the caller
+that starts that process. Use an image package `workspace/` seed when an image
+needs filesystem content at boot time.
 
 External capabilities in the checkpoint are converted into image
 `required_capabilities` declarations. They are not restored as live authority

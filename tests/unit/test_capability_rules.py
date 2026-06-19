@@ -29,6 +29,8 @@ class TestShellRuleEngine:
         assert engine.classify(["git", "status", "--short"]).rule.risk == AuthorityRisk.HARMLESS
         assert engine.classify(["git", "diff"]).rule.risk == AuthorityRisk.LOW
         assert engine.classify(["pytest"]).rule.risk == AuthorityRisk.MEDIUM
+        assert engine.classify(["pytest", "--collect-only"]).rule.risk == AuthorityRisk.MEDIUM
+        assert engine.classify(["python", "-m", "compileall", "agent_libos"]).rule.risk == AuthorityRisk.HIGH
         assert engine.classify(["curl", "https://example.test"]).rule.risk == AuthorityRisk.HIGH
         assert engine.classify(["rm", "-rf", "build"]).rule.risk == AuthorityRisk.DESTRUCTIVE
 

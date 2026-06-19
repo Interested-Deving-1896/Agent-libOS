@@ -109,7 +109,7 @@ Tool-use guidance:
 - exec_process: switch your current process to a different image/tool table
   without changing pid. Exec does not automatically grant the target image's
   required capabilities.
-- load_image_from_yaml: register a new AgentImage from a workspace YAML file.
+- load_image_package: register a new AgentImage from a workspace image package directory.
   The file still needs filesystem read authority, and registration needs image
   write authority such as `image:*`.
 - propose_jit_tool / validate_jit_tool / register_jit_tool: create a
@@ -178,7 +178,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "inspect_checkpoint",
                 "inspect_jsonrpc_endpoint",
                 "read_skill_resource",
-                "load_image_from_yaml",
+                "load_image_package",
                 "activate_skill",
                 "list_child_processes",
                 "list_capabilities",
@@ -229,7 +229,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "inspect_checkpoint",
                 "inspect_jsonrpc_endpoint",
                 "read_skill_resource",
-                "load_image_from_yaml",
+                "load_image_package",
                 "activate_skill",
                 "list_child_processes",
                 "list_capabilities",
@@ -322,7 +322,7 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
                 "inspect_checkpoint",
                 "inspect_jsonrpc_endpoint",
                 "read_skill_resource",
-                "load_image_from_yaml",
+                "load_image_package",
                 "activate_skill",
                 "list_child_processes",
                 "list_capabilities",

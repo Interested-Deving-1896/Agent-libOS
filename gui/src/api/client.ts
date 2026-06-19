@@ -1,4 +1,4 @@
-import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImageSummary, RuntimeSnapshot, SseMessage } from "./types";
+import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, RuntimeSnapshot, SseMessage } from "./types";
 
 type JsonBody = Record<string, unknown>;
 export type OptionalQuanta = number | null;
@@ -30,10 +30,10 @@ export class LibOSClient {
     return this.request<ImageInspectResult>("GET", `/api/images/${encodeURIComponent(imageId)}`);
   }
 
-  async registerImageFromManifest(manifestText: string, source: string, confirmed: boolean, replace = false, actor?: string) {
+  async registerImagePackage(imagePackage: ImagePackageFile, confirmed: boolean, replace = false, actor?: string) {
     return this.request<ImageMutationResult>("POST", "/api/images/register", {
-      manifest_text: manifestText,
-      source,
+      files: imagePackage.files,
+      source: imagePackage.name,
       confirmed,
       replace,
       ...(actor ? { actor } : {})

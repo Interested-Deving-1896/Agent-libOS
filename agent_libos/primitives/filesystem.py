@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -9,7 +10,7 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.models import AuthorityRisk, Capability, CapabilityEffect, CapabilityRight, EventType
+from agent_libos.models import AuthorityRisk, Capability, CapabilityEffect, CapabilityRight, EventType, ResourceUsage
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
@@ -89,6 +90,7 @@ class FilesystemAdapter:
         namespace: str = _RUNTIME_DEFAULTS.workspace_namespace,
         human: Any | None = None,
         provider: FilesystemProvider | None = None,
+        resources: Any | None = None,
     ):
         self.capabilities = capabilities
         self.audit = audit
@@ -101,6 +103,7 @@ class FilesystemAdapter:
         self.root = provider.root_display
         self.namespace = provider.namespace
         self.human = human
+        self.resources = resources
 
     def read_text(
         self,
@@ -137,12 +140,19 @@ class FilesystemAdapter:
         if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "encoding": encoding, "max_bytes": max_bytes}
+        read_limit = self._read_limit_for_state(target_state.size_bytes, max_bytes)
+        self._preflight_resource_usage(
+            pid,
+            ResourceUsage(external_read_bytes=read_limit),
+            source="primitive.filesystem.read_text",
+            context=effect_context,
+        )
         require_external_effect_classifier(self.provider, "read_bytes")
         attempted = False
         try:
             attempted = True
-            raw = self.provider.read_bytes(target)
-            truncated = len(raw) > max_bytes
+            raw = self._provider_read_bytes(target, max_bytes=read_limit)
+            truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
             selected = raw[:max_bytes]
             content = self._decode_text_prefix(selected, encoding, truncated=truncated)
             event = self.events.emit(
@@ -165,6 +175,12 @@ class FilesystemAdapter:
                 result={"bytes_read": len(selected), "truncated": truncated},
                 event=event,
                 audit_record=audit_record,
+            )
+            self._charge_resource_usage(
+                pid,
+                ResourceUsage(external_read_bytes=len(raw)),
+                source="primitive.filesystem.read_text",
+                context=effect_context,
             )
             return FileReadResult(path=relative, content=content, bytes_read=len(selected), truncated=truncated)
         finally:
@@ -205,12 +221,19 @@ class FilesystemAdapter:
         if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "max_bytes": max_bytes}
+        read_limit = self._read_limit_for_state(target_state.size_bytes, max_bytes)
+        self._preflight_resource_usage(
+            pid,
+            ResourceUsage(external_read_bytes=read_limit),
+            source="primitive.filesystem.read_bytes",
+            context=effect_context,
+        )
         require_external_effect_classifier(self.provider, "read_bytes")
         attempted = False
         try:
             attempted = True
-            raw = self.provider.read_bytes(target)
-            truncated = len(raw) > max_bytes
+            raw = self._provider_read_bytes(target, max_bytes=read_limit)
+            truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
             selected = raw[:max_bytes]
             event = self.events.emit(
                 EventType.EXTERNAL_READ,
@@ -238,6 +261,12 @@ class FilesystemAdapter:
                 result={"bytes_read": len(selected), "truncated": truncated},
                 event=event,
                 audit_record=audit_record,
+            )
+            self._charge_resource_usage(
+                pid,
+                ResourceUsage(external_read_bytes=len(raw)),
+                source="primitive.filesystem.read_bytes",
+                context=effect_context,
             )
             return FileBytesReadResult(path=relative, content=selected, bytes_read=len(selected), truncated=truncated)
         finally:
@@ -283,6 +312,13 @@ class FilesystemAdapter:
             encoding=encoding,
             overwrite=overwrite,
         )
+        bytes_to_write = len(text.encode(encoding))
+        self._preflight_resource_usage(
+            pid,
+            ResourceUsage(external_write_bytes=bytes_to_write),
+            source="primitive.filesystem.write_text",
+            context={"path": relative, "resource": resource, "encoding": encoding, "overwrite": overwrite},
+        )
         try:
             target_state = self.provider.state(target)
             created = not target_state.exists
@@ -299,7 +335,7 @@ class FilesystemAdapter:
             }
             require_external_effect_classifier(self.provider, "write_text")
             self.provider.write_text(target, text, encoding=encoding, newline="\n")
-            bytes_written = len(text.encode(encoding))
+            bytes_written = bytes_to_write
             event = self.events.emit(
                 EventType.EXTERNAL_WRITE,
                 source=pid,
@@ -320,6 +356,12 @@ class FilesystemAdapter:
                 result={"bytes_written": bytes_written, "created": created},
                 event=event,
                 audit_record=audit_record,
+            )
+            self._charge_resource_usage(
+                pid,
+                ResourceUsage(external_write_bytes=bytes_written),
+                source="primitive.filesystem.write_text",
+                context=effect_context,
             )
         finally:
             if consume_capability_id is not None:
@@ -368,10 +410,11 @@ class FilesystemAdapter:
         attempted = False
         try:
             attempted = True
-            children = list(self.provider.list_directory(target))
+            children = list(self.provider.list_directory(target, limit=limit + 1))
             selected = children[:limit]
             entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
             truncated = len(children) > len(selected)
+            metadata_bytes = self._directory_metadata_bytes(children)
             event = self.events.emit(
                 EventType.EXTERNAL_READ,
                 source=pid,
@@ -398,6 +441,12 @@ class FilesystemAdapter:
                 result={"count": len(entries), "truncated": truncated},
                 event=event,
                 audit_record=audit_record,
+            )
+            self._charge_resource_usage(
+                pid,
+                ResourceUsage(external_read_bytes=metadata_bytes),
+                source="primitive.filesystem.read_directory",
+                context={**effect_context, "metadata_bytes": metadata_bytes, "listed_entries": len(children)},
             )
             return DirectoryReadResult(path=relative, entries=entries, count=len(entries), truncated=truncated)
         finally:
@@ -793,6 +842,59 @@ class FilesystemAdapter:
             event=event,
             metadata={"context": context, "result": result},
         )
+
+    def _preflight_resource_usage(
+        self,
+        pid: str,
+        usage: ResourceUsage,
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> None:
+        if self.resources is None:
+            return
+        self.resources.preflight(pid, usage, source=source, context=context)
+
+    def _charge_resource_usage(
+        self,
+        pid: str,
+        usage: ResourceUsage,
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> None:
+        if self.resources is None:
+            return
+        self.resources.charge(
+            pid,
+            usage,
+            source=source,
+            context=context,
+            allow_overage=True,
+            kill_on_exceed=True,
+        )
+
+    def _read_limit_for_state(self, size_bytes: int | None, max_bytes: int) -> int:
+        if size_bytes is None:
+            # Unknown-size providers must read one extra byte to detect
+            # truncation. Known-size providers can avoid that extra I/O.
+            return max_bytes + 1
+        return min(max(0, size_bytes), max_bytes)
+
+    def _is_truncated_read(self, size_bytes: int | None, bytes_read: int, max_bytes: int) -> bool:
+        if size_bytes is not None:
+            return size_bytes > max_bytes
+        return bytes_read > max_bytes
+
+    def _provider_read_bytes(self, target: ResolvedPath, *, max_bytes: int) -> bytes:
+        try:
+            return self.provider.read_bytes(target, max_bytes=max_bytes)
+        except TypeError as exc:
+            raise ValidationError("filesystem provider must support max_bytes-limited reads") from exc
+
+    def _directory_metadata_bytes(self, entries: Iterable[Any]) -> int:
+        payload = [getattr(entry, "__dict__", {"entry": str(entry)}) for entry in entries]
+        return len(json.dumps(payload, ensure_ascii=True, default=str).encode("utf-8"))
 
     def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
         if decision.consume_capability_id is None:

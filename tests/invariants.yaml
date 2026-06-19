@@ -101,7 +101,8 @@
         "tests/unit/test_capability_rules.py::TestShellRuleEngine::test_classifies_default_shell_risk_levels",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_git_diff_with_output_requires_approval",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_high_risk_network_command_requires_approval_with_rule_profile",
-        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_allowlist_policy_asks_for_shell_syntax_payloads_in_auto_allow_argv",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_compileall_requires_approval_because_it_writes_artifacts",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_pytest_collect_only_requires_approval_because_collection_executes_project_code",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_request_permission_shell_command_class_is_rule_constrained",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_cannot_override_script_interpreter_risk",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_destructive_command_is_denied_even_with_always_allow_policy",
@@ -146,11 +147,14 @@
     },
     {
       "id": "image-self-evolution-requires-image-authority",
-      "title": "Image registration, exec, and checkpoint commit require image authority and do not bake external provider authority.",
+      "title": "Image registration, package boot, exec, and checkpoint commit require image authority and do not bake external provider authority.",
       "lane": "self-evolution",
       "node_ids": [
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_register_image_primitive_validates_tools_and_emits_audit",
-        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_load_image_from_yaml_tool_requires_image_write_capability",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_load_image_package_tool_requires_image_write_capability",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_workspace_is_private_and_manifest_granted",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_without_workspace_grants_cannot_read_materialized_workspace",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_tools_are_process_local_and_not_workspace_files",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_spawns_baked_memory_without_external_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_exec_into_committed_image_restores_baked_memory_without_granting_required_caps"
       ],
@@ -167,6 +171,51 @@
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_checkpoint_restores_referenced_endpoint_and_reports_remote_effect"
       ],
       "benchmark_attack_classes": ["self_evolution_remote"]
+    },
+    {
+      "id": "resource-budgets-are-hierarchical",
+      "title": "Resource budgets are hierarchical and cannot be bypassed by capabilities or tool visibility.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/unit/test_resource_manager.py::TestResourceManager::test_hierarchical_charge_updates_child_and_parent_usage",
+        "tests/unit/test_resource_manager.py::TestResourceManager::test_child_budget_cannot_exceed_parent_remaining_budget",
+        "tests/unit/test_resource_manager.py::TestResourceManager::test_jsonrpc_remaining_budget_counts_request_and_response_together",
+        "tests/unit/test_resource_manager.py::TestResourceManager::test_child_process_creation_is_hierarchical_usage",
+        "tests/unit/test_resource_manager.py::TestResourceManager::test_parent_budget_exceedance_kills_parent_subtree",
+        "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_tool_call_budget_is_consumed_and_denies_next_tool_before_execution",
+        "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_child_llm_usage_counts_against_parent_budget",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_capability_grant_does_not_expand_tool_call_budget",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_exec_process_does_not_reset_resource_usage_or_budget",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_terminal_process_cannot_call_visible_tools_directly",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_filesystem_read_uses_provider_limited_read_and_charges_actual_bytes",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_directory_listing_metadata_is_charged_to_external_read_budget",
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_save_or_restore_resource_state"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-token-usage-is-charged-before-tool-dispatch",
+      "title": "LLM token usage is charged before model-selected tool dispatch.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_llm_token_overage_kills_process_before_dispatching_tool",
+        "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_llm_missing_usage_with_token_budget_kills_process"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "subprocess-resource-profiles-are-enforced",
+      "title": "Subprocess resource profiles are enforced by providers and audited.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_enforces_subprocess_wall_limit_with_metrics",
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_timeout_returns_metrics",
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_drains_large_stdout_while_monitoring",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_always_allow_shell_policy_does_not_bypass_subprocess_wall_budget",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_shell_provider_without_limits_support_fails_closed_when_budgeted",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_shell_timeout_charges_metrics_without_killing_when_budget_remains"
+      ],
+      "benchmark_attack_classes": []
     },
     {
       "id": "runtime-safety-benchmark-is-deterministic",

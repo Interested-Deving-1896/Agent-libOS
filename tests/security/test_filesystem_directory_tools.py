@@ -1,11 +1,16 @@
 from __future__ import annotations
+import os
 import pytest
+import shutil
+import tempfile
+from pathlib import Path
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.models import CapabilityRight, HumanRequestStatus
+from agent_libos.substrate import LocalFilesystemProvider, LocalResourceProviderSubstrate, ResolvedPath
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 DEFAULT_FILESYSTEM_READ_HARD_LIMIT = _TOOL_DEFAULTS.filesystem_read_hard_limit_bytes
 DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT = _TOOL_DEFAULTS.directory_entry_hard_limit
@@ -113,8 +118,44 @@ class TestFilesystemDirectoryTool:
         with pytest.raises(ValidationError):
             self.runtime.filesystem.read_directory(pid, base, limit=DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT + 1)
 
+    def test_filesystem_write_rechecks_symlink_escape_after_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            (root / 'dir').mkdir()
+            try:
+                os.symlink(Path(outside), root / 'probe-link', target_is_directory=True)
+                (root / 'probe-link').unlink()
+            except OSError:
+                pytest.skip('symlink creation is not available in this environment')
+            provider = SwappingSymlinkProvider(root, Path(outside))
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='symlink escape')
+                runtime.filesystem.grant_path(pid, 'dir/payload.txt', [CapabilityRight.WRITE], issued_by='test')
+                with pytest.raises(CapabilityDenied):
+                    runtime.filesystem.write_text(pid, 'dir/payload.txt', 'escaped')
+                assert not (Path(outside) / 'payload.txt').exists()
+            finally:
+                runtime.close()
+
     def _write_fixture(self, path: str, content: str) -> str:
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding='utf-8')
         return path
+
+
+class SwappingSymlinkProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path, outside: Path):
+        super().__init__(root)
+        self.outside = outside
+        self.swapped = False
+
+    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = '\n') -> None:
+        if not self.swapped:
+            shutil.rmtree(Path(self.root_display) / 'dir')
+            os.symlink(self.outside, Path(self.root_display) / 'dir', target_is_directory=True)
+            self.swapped = True
+        super().write_text(path, text, encoding=encoding, newline=newline)

@@ -77,6 +77,7 @@ The registry rejects:
 - URL fragments,
 - non-HTTP(S) schemes,
 - non-local plain HTTP,
+- private, link-local, reserved, multicast, or metadata-service IP targets,
 - unsafe endpoint or method ids,
 - literal secret header values,
 - forbidden request headers such as `Host` or `Content-Length`.

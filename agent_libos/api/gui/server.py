@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import secrets
 import threading
@@ -330,6 +331,7 @@ class GuiRuntimeService:
             "messages": to_jsonable(messages),
             "llm_call_count": len(calls),
             "token_total": sum(int((call.usage or {}).get("total_tokens", 0) or 0) for call in calls),
+            "resource_remaining": to_jsonable(self.runtime.resources.remaining_budget(pid)),
         }
 
     def _tool_summaries(self) -> list[dict[str, Any]]:
@@ -703,13 +705,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if "path" in body:
                 raise GuiServerError(
                     HTTPStatus.BAD_REQUEST,
-                    "GUI image registration accepts manifest_text, not host file paths",
+                    "GUI image registration accepts package files, not host file paths",
                 )
-            manifest_text = body.get("manifest_text")
-            if not isinstance(manifest_text, str) or not manifest_text.strip():
-                raise GuiServerError(HTTPStatus.BAD_REQUEST, "image registration requires non-empty manifest_text")
-            result = service.runtime.image_registry.register_from_yaml_text(
-                manifest_text,
+            files = self._coerce_image_package_files(body.get("files"))
+            result = service.runtime.image_registry.register_from_package_files(
+                files,
                 actor=str(body.get("actor") or "gui"),
                 replace=bool(body.get("replace", False)),
                 require_capability=body.get("actor") is not None,
@@ -725,6 +725,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 "boot": result.image.boot,
                 "default_tools": list(result.image.default_tools),
                 "default_skills": list(result.image.default_skills),
+                "package_sha256": result.image.metadata.get("package_sha256"),
+                "package_jit_tools": result.image.metadata.get("package_jit_tools", []),
                 "required_capabilities_count": len(result.image.required_capabilities),
             }
         if method == "POST" and route == ["commit"]:
@@ -759,6 +761,25 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 "required_capabilities_count": len(result.image.required_capabilities),
             }
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown image endpoint")
+
+    def _coerce_image_package_files(self, value: Any) -> dict[str, bytes | str]:
+        if not isinstance(value, dict) or not value:
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, "image registration requires non-empty package files")
+        files: dict[str, bytes | str] = {}
+        for path, content in value.items():
+            if not isinstance(path, str) or not path:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "image package file paths must be non-empty strings")
+            if isinstance(content, str):
+                files[path] = content
+                continue
+            if isinstance(content, dict) and isinstance(content.get("base64"), str):
+                try:
+                    files[path] = base64.b64decode(content["base64"], validate=True)
+                except Exception as exc:
+                    raise GuiServerError(HTTPStatus.BAD_REQUEST, f"invalid base64 image package file: {path}") from exc
+                continue
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, f"image package file content must be text or base64: {path}")
+        return files
 
     def _dispatch_jsonrpc(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
         service = self.server.service

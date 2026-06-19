@@ -469,9 +469,8 @@ def _setup_runtime_benchmark_resources(
             )
     for item in setup.get("images", []) or []:
         if isinstance(item, dict):
-            text = (workspace / str(item["path"])).read_text(encoding=str(item.get("encoding") or "utf-8"))
-            runtime.image_registry.register_from_yaml_text(
-                text,
+            runtime.image_registry.register_from_package_path(
+                workspace / str(item["path"]),
                 actor="benchmark.setup",
                 replace=bool(item.get("replace", False)),
                 require_capability=False,
@@ -583,7 +582,7 @@ def _perform_wrapper_action(
         "call_jsonrpc_method",
         "create_checkpoint",
         "fork_checkpoint",
-        "load_image_from_yaml",
+        "load_image_package",
         "commit_checkpoint_to_image",
         "register_jit_tool",
         "spawn_child_process",
@@ -706,7 +705,7 @@ def _effect_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]
         return EffectRecord(task_id=task.id, runner=runner, type="skill.activate", performed=True, skill_id=str(action.get("skill_id") or ""))
     if name == "register_jit_tool":
         return EffectRecord(task_id=task.id, runner=runner, type="jit.register", performed=True, tool=str(action.get("name") or ""))
-    if name == "load_image_from_yaml":
+    if name == "load_image_package":
         return EffectRecord(
             task_id=task.id,
             runner=runner,

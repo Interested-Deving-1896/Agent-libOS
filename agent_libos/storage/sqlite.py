@@ -41,6 +41,7 @@ from agent_libos.models import (
     Provenance,
     RelationType,
     ResourceBudget,
+    ResourceUsage,
     ToolCandidate,
     ToolCandidateStatus,
     ToolHandle,
@@ -129,6 +130,7 @@ class SQLiteStore:
                   checkpoint_head TEXT,
                   status_message TEXT,
                   resource_budget_json TEXT NOT NULL,
+                  resource_usage_json TEXT NOT NULL DEFAULT '{}',
                   working_directory TEXT NOT NULL DEFAULT '.',
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
@@ -550,7 +552,12 @@ class SQLiteStore:
     def insert_process(self, process: AgentProcess) -> None:
         self._execute(
             """
-            INSERT INTO processes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO processes (
+                pid, parent_pid, image_id, status, goal_oid, memory_view_json,
+                capabilities_json, loaded_skills_json, tool_table_json, event_cursor,
+                checkpoint_head, status_message, resource_budget_json, resource_usage_json,
+                working_directory, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._process_params(process),
         )
@@ -562,8 +569,8 @@ class SQLiteStore:
                SET parent_pid = ?, image_id = ?, status = ?, goal_oid = ?,
                    memory_view_json = ?, capabilities_json = ?, loaded_skills_json = ?,
                    tool_table_json = ?, event_cursor = ?, checkpoint_head = ?,
-                   status_message = ?, resource_budget_json = ?, working_directory = ?, created_at = ?,
-                   updated_at = ?
+                   status_message = ?, resource_budget_json = ?, resource_usage_json = ?,
+                   working_directory = ?, created_at = ?, updated_at = ?
              WHERE pid = ?
             """,
             (
@@ -579,6 +586,7 @@ class SQLiteStore:
                 process.checkpoint_head,
                 process.status_message,
                 dumps(process.resource_budget),
+                dumps(process.resource_usage),
                 process.working_directory,
                 process.created_at,
                 process.updated_at,
@@ -1454,6 +1462,8 @@ class SQLiteStore:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(processes)")}
         if "working_directory" not in columns:
             self.conn.execute("ALTER TABLE processes ADD COLUMN working_directory TEXT NOT NULL DEFAULT '.'")
+        if "resource_usage_json" not in columns:
+            self.conn.execute("ALTER TABLE processes ADD COLUMN resource_usage_json TEXT NOT NULL DEFAULT '{}'")
 
     def _ensure_capability_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
@@ -1733,6 +1743,7 @@ class SQLiteStore:
             process.checkpoint_head,
             process.status_message,
             dumps(process.resource_budget),
+            dumps(process.resource_usage),
             process.working_directory,
             process.created_at,
             process.updated_at,
@@ -1814,6 +1825,7 @@ class SQLiteStore:
             event_cursor=row["event_cursor"],
             checkpoint_head=row["checkpoint_head"],
             resource_budget=ResourceBudget(**loads(row["resource_budget_json"], {})),
+            resource_usage=ResourceUsage(**loads(row["resource_usage_json"] if "resource_usage_json" in row.keys() else None, {})),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             working_directory=row["working_directory"] if "working_directory" in row.keys() else ".",

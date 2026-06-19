@@ -35,6 +35,9 @@ The implementation currently includes:
 
 - Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`,
   `resume`, and `exit`.
+- Hierarchical process resource budgets for tool calls, LLM token usage,
+  subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, and Deno
+  syscalls.
 - Async runtime supervision through `Runtime.arun_until_idle()`.
 - Process-local working directories for filesystem and shell operations.
 - Durable process message queues for IPC, including interrupt delivery.
@@ -161,6 +164,7 @@ uv run agent-libos --db .agent_libos.sqlite init
 uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
 uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
+uv run agent-libos --db .agent_libos.sqlite resources <pid>
 uv run agent-libos --db .agent_libos.sqlite audit
 ```
 
@@ -214,7 +218,7 @@ Manually control process cwd and lifecycle:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite cd <pid> src
-uv run agent-libos --db .agent_libos.sqlite exec image.yaml "Review README.md" --pid <pid> --run
+uv run agent-libos --db .agent_libos.sqlite exec images/review-agent "Review README.md" --pid <pid> --run
 uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
 ```
 

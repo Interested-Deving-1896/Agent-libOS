@@ -22,6 +22,8 @@ const repoRoot = path.resolve(__dirname, "..", "..");
 const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
 const imageManifestMaxBytes = 1_048_576;
+const imagePackageMaxBytes = 16_777_216;
+const imagePackageMaxFiles = 512;
 const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
 
 if (smokeMode) {
@@ -356,29 +358,61 @@ ipcMain.handle("libos:chooseDatabase", async () => {
   return startRuntimeServer(result.filePaths[0]);
 });
 
-ipcMain.handle("libos:chooseImageManifest", async () => {
+ipcMain.handle("libos:chooseImagePackage", async () => {
   const options: OpenDialogOptions = {
-    title: "Open AgentImage manifest",
-    properties: ["openFile"],
-    filters: [
-      { name: "AgentImage manifests", extensions: ["yaml", "yml", "json"] },
-      { name: "All files", extensions: ["*"] }
-    ]
+    title: "Open AgentImage package",
+    properties: ["openDirectory"]
   };
   const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
   if (result.canceled || result.filePaths.length === 0) return null;
   const selected = result.filePaths[0];
   const stats = fs.statSync(selected);
-  if (!stats.isFile()) throw new Error("Selected image manifest is not a file.");
-  if (stats.size > imageManifestMaxBytes) {
+  if (!stats.isDirectory()) throw new Error("Selected image package is not a directory.");
+  const manifestPath = path.join(selected, "IMAGE.yaml");
+  const manifestStats = fs.statSync(manifestPath);
+  if (!manifestStats.isFile()) throw new Error("Selected image package is missing IMAGE.yaml.");
+  if (manifestStats.size > imageManifestMaxBytes) {
     throw new Error(`Image manifest exceeds ${imageManifestMaxBytes} bytes.`);
   }
+  const files = readImagePackageFiles(selected);
   return {
     path: selected,
     name: path.basename(selected),
-    content: fs.readFileSync(selected, "utf8")
+    manifest: fs.readFileSync(manifestPath, "utf8"),
+    files
   };
 });
+
+function readImagePackageFiles(root: string) {
+  const files: Record<string, { base64: string }> = {};
+  let totalBytes = 0;
+  function visit(directory: string) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const fullPath = path.join(directory, entry.name);
+      const relative = path.relative(root, fullPath).split(path.sep).join("/");
+      if (relative.split("/").includes(".git")) {
+        throw new Error("Image packages must not include .git directories.");
+      }
+      if (entry.isSymbolicLink()) throw new Error(`Image package symlinks are not supported: ${relative}`);
+      if (entry.isDirectory()) {
+        visit(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) throw new Error(`Image package path is not a regular file: ${relative}`);
+      const content = fs.readFileSync(fullPath);
+      totalBytes += content.byteLength;
+      if (Object.keys(files).length + 1 > imagePackageMaxFiles) {
+        throw new Error(`Image package exceeds ${imagePackageMaxFiles} files.`);
+      }
+      if (totalBytes > imagePackageMaxBytes) {
+        throw new Error(`Image package exceeds ${imagePackageMaxBytes} bytes.`);
+      }
+      files[relative] = { base64: content.toString("base64") };
+    }
+  }
+  visit(root);
+  return files;
+}
 
 ipcMain.handle("libos:useDatabase", async (_event, db: string) => {
   return startRuntimeServer(db && db.trim() ? db.trim() : "local");

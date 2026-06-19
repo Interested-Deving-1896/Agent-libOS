@@ -160,23 +160,24 @@ class TestGuiServer:
         assert status == 403
         assert 'checkpoint' in body['error']['message']
 
-    def test_image_register_accepts_manifest_text_and_rejects_host_file_path(self) -> None:
-        manifest = '\nimage:\n  image_id: gui-yaml-agent:v0\n  name: gui-yaml-agent\n  version: v0\n  system_prompt: Registered from GUI manifest text.\n'
-        status, denied = self.request('POST', '/api/images/register', {'manifest_text': manifest, 'source': 'gui-yaml-agent.yaml'})
+    def test_image_register_accepts_package_files_and_rejects_host_file_path(self) -> None:
+        files = _gui_image_package_files()
+        status, denied = self.request('POST', '/api/images/register', {'files': files, 'source': 'gui-package-agent'})
         assert status == 409
         assert denied['error']['confirmation_required']
-        status, string_confirmed = self.request('POST', '/api/images/register', {'manifest_text': manifest, 'source': 'gui-yaml-agent.yaml', 'confirmed': 'true'})
+        status, string_confirmed = self.request('POST', '/api/images/register', {'files': files, 'source': 'gui-package-agent', 'confirmed': 'true'})
         assert status == 409
         assert string_confirmed['error']['confirmation_required']
-        status, path_rejected = self.request('POST', '/api/images/register', {'path': 'image.yaml', 'confirmed': True})
+        status, path_rejected = self.request('POST', '/api/images/register', {'path': 'image-package', 'confirmed': True})
         assert status == 400
-        assert 'manifest_text' in path_rejected['error']['message']
-        status, registered = self.request('POST', '/api/images/register', {'manifest_text': manifest, 'source': 'gui-yaml-agent.yaml', 'confirmed': True})
+        assert 'package files' in path_rejected['error']['message']
+        status, registered = self.request('POST', '/api/images/register', {'files': files, 'source': 'gui-package-agent', 'confirmed': True})
         assert status == 200
-        assert registered['image_id'] == 'gui-yaml-agent:v0'
+        assert registered['image_id'] == 'gui-package-agent:v0'
+        assert registered['boot']['kind'] == 'image_package'
         status, listed = self.request('GET', '/api/images')
         assert status == 200
-        assert 'gui-yaml-agent:v0' in {item['image_id'] for item in listed}
+        assert 'gui-package-agent:v0' in {item['image_id'] for item in listed}
 
     def test_scheduler_requests_are_serialized(self) -> None:
         first_status, first = self.request('POST', '/api/processes', {'goal': 'goal', 'auto_run': False})
@@ -239,3 +240,17 @@ class TestGuiServer:
         self.thread.join(timeout=5)
         assert not self.thread.is_alive()
         self.server.service.shutdown()
+
+
+def _gui_image_package_files() -> dict[str, str]:
+    return {
+        "IMAGE.yaml": """
+image_id: gui-package-agent:v0
+name: gui-package-agent
+version: v0
+prompt: prompt.md
+default_tools:
+  - human_output
+""".lstrip(),
+        "prompt.md": "Registered from GUI package files.\n",
+    }

@@ -113,7 +113,7 @@ Current default groups include:
 
 - runtime database and default ids,
 - scheduler quanta and poll interval,
-- process budgets and default cwd,
+- process resource budgets, usage accounting, and default cwd,
 - LLM timeouts and provider compatibility knobs,
 - tool limits and text encodings,
 - filesystem and Object Memory size limits,
@@ -164,7 +164,7 @@ Preserve the boundary:
 - Skills change visibility and prompt materialization only;
 - self-evolution mechanisms such as Skills, JIT tools, image registration,
   process exec, checkpoint forks, child processes, and JSON-RPC endpoint
-  visibility must not imply resource authority;
+  visibility must not imply resource authority or additional resource budget;
 - Runtime Modules are trusted startup TCB extensions; they may register tools,
   images, syscalls, and provider hooks but must not be treated as process
   capabilities;

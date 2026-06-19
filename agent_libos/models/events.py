@@ -38,6 +38,8 @@ class EventType(StrEnum):
     EXTERNAL_READ = "external_read"
     EXTERNAL_WRITE = "external_write"
     HUMAN_OUTPUT = "human_output"
+    RESOURCE_CHARGED = "resource_charged"
+    RESOURCE_LIMIT_EXCEEDED = "resource_limit_exceeded"
 
 
 class EventPriority(StrEnum):

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone, tzinfo
@@ -11,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
+
+import psutil
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
@@ -23,14 +27,34 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.substrate.base import (
+    CommandMetrics,
     CommandResult,
     DirectoryEntrySnapshot,
     PathState,
     ResolvedPath,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
+    SubprocessTimeoutExpired,
 )
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_SHELL_DEFAULTS = DEFAULT_CONFIG.shell
+_SAFE_SHELL_ENV_KEYS = {
+    "COMSPEC",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "PATHEXT",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR",
+}
 
 
 class LocalFilesystemProvider:
@@ -62,19 +86,27 @@ class LocalFilesystemProvider:
             modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
         )
 
-    def read_bytes(self, path: ResolvedPath) -> bytes:
-        return self._target(path).read_bytes()
+    def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
+        if max_bytes is None:
+            return self._target(path).read_bytes()
+        with self._target(path).open("rb") as handle:
+            return handle.read(max(0, max_bytes))
 
     def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = "\n") -> None:
         target = self._target(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        target = self._target(path)
         target.write_text(text, encoding=encoding, newline=newline)
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None:
         self._target(path).mkdir(parents=parents, exist_ok=exist_ok)
 
-    def list_directory(self, path: ResolvedPath) -> list[DirectoryEntrySnapshot]:
-        children = sorted(self._target(path).iterdir(), key=lambda item: item.name)
+    def list_directory(self, path: ResolvedPath, *, limit: int | None = None) -> list[DirectoryEntrySnapshot]:
+        target = self._target(path)
+        if limit is not None and limit > 0:
+            children = heapq.nsmallest(limit, target.iterdir(), key=lambda item: item.name)
+        else:
+            children = sorted(target.iterdir(), key=lambda item: item.name)
         return [self._directory_entry(child) for child in children]
 
     def delete_file(self, path: ResolvedPath) -> None:
@@ -112,7 +144,31 @@ class LocalFilesystemProvider:
         raise ValueError(f"unsupported filesystem external effect operation: {operation}")
 
     def _target(self, path: ResolvedPath) -> Path:
-        return Path(path.display)
+        target = Path(path.display)
+        resolved = target.resolve()
+        if self.root not in resolved.parents and resolved != self.root:
+            raise CapabilityDenied(f"path escapes filesystem adapter root: {path.relative}")
+        self._reject_reparse_components(target)
+        return target
+
+    def _reject_reparse_components(self, target: Path) -> None:
+        try:
+            relative_parts = target.relative_to(self.root).parts
+        except ValueError as exc:
+            raise CapabilityDenied(f"path escapes filesystem adapter root: {target}") from exc
+        current = self.root
+        for part in relative_parts:
+            current = current / part
+            if not current.exists() and not current.is_symlink():
+                break
+            if self._is_reparse_path(current):
+                raise CapabilityDenied(f"filesystem path contains a symlink or junction: {current}")
+
+    def _is_reparse_path(self, path: Path) -> bool:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(is_junction()) if callable(is_junction) else False
 
     def _directory_entry(self, target: Path) -> DirectoryEntrySnapshot:
         stat = target.stat()
@@ -171,6 +227,8 @@ class LocalClockProvider:
 class LocalShellProvider:
     """Subprocess-backed shell provider scoped to a configured working directory."""
 
+    supports_subprocess_limits = True
+
     def __init__(self, cwd: str | Path):
         self.cwd = Path(cwd).resolve()
 
@@ -180,15 +238,99 @@ class LocalShellProvider:
         *,
         timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
         cwd: str | None = None,
+        limits: SubprocessLimits | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
     ) -> CommandResult:
         selected_cwd = self._resolve_cwd(cwd)
-        proc = subprocess.run(argv, cwd=selected_cwd, text=True, capture_output=True, timeout=timeout)
-        return CommandResult(
-            argv=list(argv),
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-        )
+        stdout_limit = _SHELL_DEFAULTS.stdout_hard_limit_chars if stdout_limit_chars is None else max(0, int(stdout_limit_chars))
+        stderr_limit = _SHELL_DEFAULTS.stderr_hard_limit_chars if stderr_limit_chars is None else max(0, int(stderr_limit_chars))
+        started_at = time.monotonic()
+        with tempfile.TemporaryFile("w+b") as stdout_file, tempfile.TemporaryFile("w+b") as stderr_file:
+            proc = subprocess.Popen(
+                argv,
+                cwd=selected_cwd,
+                env=self._safe_env(),
+                shell=False,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+            ps_proc = psutil.Process(proc.pid)
+            peak_memory = 0
+            cpu_seconds = 0.0
+            limit_kind: str | None = None
+            timed_out = False
+            try:
+                while True:
+                    wall_seconds = time.monotonic() - started_at
+                    cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+                    limit_kind = self._limit_kind(
+                        wall_seconds=wall_seconds,
+                        cpu_seconds=cpu_seconds,
+                        peak_memory=peak_memory,
+                        limits=limits,
+                    )
+                    if limit_kind is None:
+                        limit_kind = self._output_limit_kind(stdout_file, stderr_file, stdout_limit, stderr_limit)
+                    if limit_kind is not None:
+                        self._kill_process_tree(ps_proc, proc)
+                        try:
+                            proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
+                    if timeout is not None and wall_seconds > timeout:
+                        timed_out = True
+                        self._kill_process_tree(ps_proc, proc)
+                        try:
+                            proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+            finally:
+                if proc.poll() is None:
+                    self._kill_process_tree(ps_proc, proc)
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+            stdout, stdout_truncated = self._read_limited_output(stdout_file, stdout_limit)
+            stderr, stderr_truncated = self._read_limited_output(stderr_file, stderr_limit)
+            wall_seconds = time.monotonic() - started_at
+            final_cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+            cpu_seconds = max(cpu_seconds, final_cpu_seconds)
+            metrics = CommandMetrics(
+                wall_seconds=wall_seconds,
+                cpu_seconds=cpu_seconds,
+                peak_memory_bytes=peak_memory,
+                killed=timed_out or limit_kind is not None,
+                limit_kind="subprocess_timeout" if timed_out else limit_kind,
+            )
+            result = CommandResult(
+                argv=list(argv),
+                returncode=proc.returncode if proc.returncode is not None else -9,
+                stdout=stdout,
+                stderr=stderr,
+                stdout_truncated=stdout_truncated,
+                stderr_truncated=stderr_truncated,
+                metrics=metrics,
+            )
+            if timed_out:
+                raise SubprocessTimeoutExpired(
+                    f"subprocess timed out after {timeout}s",
+                    metrics=metrics,
+                    result=result,
+                )
+            if limit_kind is not None:
+                raise SubprocessLimitExceeded(
+                    f"subprocess exceeded {limit_kind}",
+                    metrics=metrics,
+                    result=result,
+                )
+            return result
 
     def classify_external_effect(
         self,
@@ -214,6 +356,90 @@ class LocalShellProvider:
         if self.cwd not in target.parents and target != self.cwd:
             raise CapabilityDenied(f"shell working directory escapes workspace root: {cwd}")
         return target
+
+    def _safe_env(self) -> dict[str, str]:
+        return {key: value for key, value in os.environ.items() if key.upper() in _SAFE_SHELL_ENV_KEYS}
+
+    def _output_limit_kind(
+        self,
+        stdout_file: Any,
+        stderr_file: Any,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> str | None:
+        if os.fstat(stdout_file.fileno()).st_size > stdout_limit:
+            return "subprocess_stdout_bytes"
+        if os.fstat(stderr_file.fileno()).st_size > stderr_limit:
+            return "subprocess_stderr_bytes"
+        return None
+
+    def _read_limited_output(self, handle: Any, limit: int) -> tuple[str, bool]:
+        handle.flush()
+        handle.seek(0)
+        data = handle.read(limit + 1)
+        truncated = len(data) > limit
+        if truncated:
+            data = data[:limit]
+        return data.decode("utf-8", errors="replace"), truncated
+
+    def _limit_kind(
+        self,
+        *,
+        wall_seconds: float,
+        cpu_seconds: float,
+        peak_memory: int,
+        limits: SubprocessLimits | None,
+    ) -> str | None:
+        if limits is None:
+            return None
+        if limits.wall_seconds is not None and wall_seconds > limits.wall_seconds:
+            return "subprocess_wall_seconds"
+        if limits.cpu_seconds is not None and cpu_seconds > limits.cpu_seconds:
+            return "subprocess_cpu_seconds"
+        if limits.memory_bytes is not None and peak_memory > limits.memory_bytes:
+            return "subprocess_memory_bytes"
+        return None
+
+    def _sample_process_tree(self, proc: psutil.Process, peak_memory: int) -> tuple[float, int]:
+        cpu_seconds = 0.0
+        memory_bytes = 0
+        processes = [proc]
+        try:
+            processes.extend(proc.children(recursive=True))
+        except psutil.Error:
+            pass
+        for item in processes:
+            try:
+                times = item.cpu_times()
+                cpu_seconds += float(times.user) + float(times.system)
+                memory_bytes += int(item.memory_info().rss)
+            except psutil.Error:
+                continue
+        return cpu_seconds, max(peak_memory, memory_bytes)
+
+    def _kill_process_tree(self, ps_proc: psutil.Process, proc: subprocess.Popen[str]) -> None:
+        processes: list[psutil.Process] = []
+        try:
+            processes.extend(ps_proc.children(recursive=True))
+            processes.append(ps_proc)
+        except psutil.Error:
+            pass
+        for item in processes:
+            try:
+                item.terminate()
+            except psutil.Error:
+                continue
+        alive = psutil.wait_procs(processes, timeout=1.0)[1] if processes else []
+        for item in alive:
+            try:
+                item.kill()
+            except psutil.Error:
+                continue
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
 
 class LocalHumanProvider:

@@ -47,12 +47,12 @@ class TestCLIBuiltinCommand:
             finally:
                 runtime.close()
 
-    def test_cli_exec_loads_yaml_image_from_first_arg_and_uses_second_arg_as_goal(self) -> None:
+    def test_cli_exec_loads_image_package_from_first_arg_and_uses_second_arg_as_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'
-            manifest = root / 'image.yaml'
-            manifest.write_text('\nimage:\n  image_id: cli-yaml-agent:v0\n  name: cli-yaml-agent\n  system_prompt: |\n    CLI loaded image.\n  default_tools:\n    - human_output\n  context_policy: evidence_first\n'.lstrip(), encoding='utf-8')
+            package = root / 'cli-image'
+            _write_cli_image_package(package)
             with _temporary_cwd(root):
                 spawn = _run_cli_json(['--db', str(db), 'spawn', '--image', 'base-agent:v0', '--goal', 'old goal'])
                 before = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
@@ -60,16 +60,16 @@ class TestCLIBuiltinCommand:
                     old_goal_oid = before.process.get(spawn['pid']).goal_oid
                 finally:
                     before.close()
-                result = _run_cli_json(['--db', str(db), 'exec', str(manifest), 'new goal from first arg', '--pid', spawn['pid'], '--no-run'])
+                result = _run_cli_json(['--db', str(db), 'exec', str(package), 'new goal from first arg', '--pid', spawn['pid'], '--no-run'])
             runtime = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
             try:
                 process = runtime.process.get(spawn['pid'])
                 assert result['goal'] == 'new goal from first arg'
-                assert result['image_arg'] == str(manifest)
-                assert result['loaded_image']['image_id'] == 'cli-yaml-agent:v0'
-                assert result['process']['image'] == 'cli-yaml-agent:v0'
+                assert result['image_arg'] == str(package)
+                assert result['loaded_image']['image_id'] == 'cli-package-agent:v0'
+                assert result['process']['image'] == 'cli-package-agent:v0'
                 assert not result['ran']
-                assert process.image_id == 'cli-yaml-agent:v0'
+                assert process.image_id == 'cli-package-agent:v0'
                 assert process.goal_oid != old_goal_oid
                 assert 'human_output' in process.tool_table
             finally:
@@ -109,3 +109,16 @@ def _run_cli_json(argv: list[str]) -> dict[str, object]:
     with contextlib.redirect_stdout(stdout):
         cli_main(argv)
     return json.loads(stdout.getvalue())
+
+
+def _write_cli_image_package(root: Path) -> None:
+    root.mkdir(parents=True)
+    root.joinpath('IMAGE.yaml').write_text("""
+image_id: cli-package-agent:v0
+name: cli-package-agent
+prompt: prompt.md
+default_tools:
+  - human_output
+context_policy: evidence_first
+""".lstrip(), encoding='utf-8')
+    root.joinpath('prompt.md').write_text('CLI loaded image.\n', encoding='utf-8')

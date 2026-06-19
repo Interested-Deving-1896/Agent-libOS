@@ -1,5 +1,6 @@
 from agent_libos.substrate.base import (
     ClockProvider,
+    CommandMetrics,
     CommandResult,
     DirectoryEntrySnapshot,
     FilesystemProvider,
@@ -9,6 +10,9 @@ from agent_libos.substrate.base import (
     ResolvedPath,
     ResourceProviderSubstrate,
     ShellProvider,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
+    SubprocessTimeoutExpired,
 )
 from agent_libos.substrate.local import (
     LocalClockProvider,
@@ -21,6 +25,7 @@ from agent_libos.substrate.local import (
 
 __all__ = [
     "ClockProvider",
+    "CommandMetrics",
     "CommandResult",
     "DirectoryEntrySnapshot",
     "FilesystemProvider",
@@ -36,4 +41,7 @@ __all__ = [
     "ResolvedPath",
     "ResourceProviderSubstrate",
     "ShellProvider",
+    "SubprocessLimitExceeded",
+    "SubprocessLimits",
+    "SubprocessTimeoutExpired",
 ]

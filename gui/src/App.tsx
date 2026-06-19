@@ -169,24 +169,25 @@ export function App() {
   async function chooseAndConfirmImageImport(replace = false) {
     if (!client) return;
     try {
-      const manifest = await window.libosApi?.chooseImageManifest();
-      if (!manifest) return;
-      const preview = previewImageManifest(manifest.content);
+      const imagePackage = await window.libosApi?.chooseImagePackage();
+      if (!imagePackage) return;
+      const preview = previewImageManifest(imagePackage.manifest);
       setPendingConfirm({
         title: t("image.register.title"),
         message: t("image.register.message"),
         details: {
-          source: manifest.name,
+          source: imagePackage.name,
           image_id: preview.image_id,
           name: preview.name,
           version: preview.version,
           default_tools_count: preview.default_tools_count,
           required_capabilities_count: preview.required_capabilities_count,
-          bytes: preview.bytes,
+          files: Object.keys(imagePackage.files).length,
+          bytes: JSON.stringify(imagePackage.files).length,
           replace
         },
         action: async () => {
-          const result = await client.registerImageFromManifest(manifest.content, manifest.name, true, replace);
+          const result = await client.registerImagePackage(imagePackage, true, replace);
           setSpawnImage(result.image_id);
           setExecImage(result.image_id);
           setPendingConfirm(null);

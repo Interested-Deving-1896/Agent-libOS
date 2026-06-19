@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import builtins
 import hashlib
+import inspect
+import time
 from pathlib import Path
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ResourceLimitExceeded, ValidationError
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -16,6 +18,8 @@ from agent_libos.models import (
     EventType,
     ObjectMetadata,
     ObjectType,
+    ProcessStatus,
+    ResourceUsage,
     ToolCallResult,
     ToolCandidate,
     ToolCandidateStatus,
@@ -27,10 +31,12 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.storage import SQLiteStore
+from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 from agent_libos.tools.base import BaseAgentTool, ToolContext
-from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
 
 class ToolBroker:
@@ -47,6 +53,7 @@ class ToolBroker:
         sandbox: SandboxBackend | None = None,
         workspace_root: str | Path | None = None,
         config: AgentLibOSConfig | None = None,
+        resources: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -55,6 +62,7 @@ class ToolBroker:
         self.human = human
         self.audit = audit
         self.events = events
+        self.resources = resources
         self.sandbox = sandbox or DenoTypescriptSandbox(
             deno_executable=self.config.tools.deno_executable,
             default_timeout_s=self.config.tools.deno_timeout_s,
@@ -283,6 +291,28 @@ class ToolBroker:
     async def acall(self, pid: str, tool: ToolHandle | str, args: dict[str, Any]) -> ToolCallResult:
         handle = self.resolve(tool, pid=pid)
         resource = f"tool:{handle.tool_id}"
+        terminal_error = self._terminal_process_error(pid)
+        if terminal_error is not None:
+            call_id = new_id("tcall")
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={"call_id": call_id, "error": terminal_error, "policy_decision": "deny"},
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "deny",
+                    "policy_reason": "terminal_process",
+                    "error": terminal_error,
+                },
+            )
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=terminal_error)
         if not self._process_has_tool(pid, handle):
             # The process tool table gates only LLM-facing tool visibility.
             # Host resources are checked by the primitive each tool calls into.
@@ -308,12 +338,35 @@ class ToolBroker:
             return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
 
         call_id = new_id("tcall")
+        try:
+            self._charge_tool_call(pid, handle, call_id)
+        except ResourceLimitExceeded as exc:
+            error = str(exc)
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={"call_id": call_id, "error": error, "policy_decision": "resource_limit"},
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "resource_limit",
+                    "error": error,
+                },
+            )
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
         self.events.emit(
             EventType.TOOL_CALLED,
             source=pid,
             target=resource,
             payload={"call_id": call_id, "args": args},
         )
+        started_at = time.perf_counter()
         try:
             jit_session: LibOSSyscallSession | None = None
             if handle.tool_id in self._tools:
@@ -335,6 +388,7 @@ class ToolBroker:
                             "tool": handle.name,
                             "policy_decision": "allow",
                             "tool_result": tool_result.model_dump(mode="json"),
+                            "tool_wall_seconds": self._elapsed(started_at),
                         },
                     )
                     return ToolCallResult(
@@ -359,15 +413,45 @@ class ToolBroker:
                 if runtime is None:
                     raise RuntimeError("Runtime is unavailable for Deno JIT syscall execution.")
                 jit_session = LibOSSyscallSession(runtime, pid, config=self.config)
-                payload = await self.sandbox.arun_source(
+                deno_result = await self._run_sandbox_source(
                     self._jit_sources[handle.tool_id],
                     args,
                     pid=pid,
                     syscall_handler=jit_session.handle,
                 )
+                if isinstance(deno_result, SandboxExecutionResult):
+                    payload = deno_result.value
+                    self._charge_subprocess_metrics(
+                        pid,
+                        deno_result.metrics,
+                        source="tool.deno",
+                        context={"tool": handle.name, "tool_id": handle.tool_id},
+                    )
+                else:
+                    payload = deno_result
                 result_payload = {"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload}
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
+        except SubprocessLimitExceeded as exc:
+            self._handle_subprocess_limit(pid, handle, resource, call_id, exc)
+            return ToolCallResult(
+                call_id=call_id,
+                tool_id=handle.tool_id,
+                result_handle=None,
+                payload=None,
+                ok=False,
+                error=str(exc),
+            )
+        except SubprocessTimeoutExpired as exc:
+            error = self._handle_subprocess_timeout(pid, handle, resource, call_id, exc)
+            return ToolCallResult(
+                call_id=call_id,
+                tool_id=handle.tool_id,
+                result_handle=None,
+                payload=None,
+                ok=False,
+                error=error,
+            )
         except HumanApprovalRequired as exc:
             # Do not convert this into a ToolCallResult: the LLM quantum has not
             # completed and must be resumed after the human decision.
@@ -380,6 +464,7 @@ class ToolBroker:
                     "tool": handle.name,
                     "policy_decision": "require_human_approval",
                     "request_id": exc.request_id,
+                    "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
             raise
@@ -393,6 +478,7 @@ class ToolBroker:
                     "tool": handle.name,
                     "policy_decision": "wait_for_child",
                     "child_pid": exc.child_pid,
+                    "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
             raise
@@ -407,6 +493,7 @@ class ToolBroker:
                     "policy_decision": "wait_for_process_message",
                     "recipient_pid": exc.recipient_pid,
                     "filters": exc.filters,
+                    "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
             raise
@@ -421,7 +508,13 @@ class ToolBroker:
                 actor=pid,
                 action="tool.call",
                 target=resource,
-                decision={"ok": False, "tool": handle.name, "policy_decision": "allow", "error": str(exc)},
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "allow",
+                    "error": str(exc),
+                    "tool_wall_seconds": self._elapsed(started_at),
+                },
             )
             return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=str(exc))
 
@@ -443,7 +536,12 @@ class ToolBroker:
             action="tool.call",
             target=resource,
             output_refs=[result_handle.oid],
-            decision={"ok": True, "tool": handle.name, "policy_decision": "allow"},
+            decision={
+                "ok": True,
+                "tool": handle.name,
+                "policy_decision": "allow",
+                "tool_wall_seconds": self._elapsed(started_at),
+            },
         )
         if jit_session is not None:
             await jit_session.apply_deferred_lifecycle(result_handle)
@@ -454,6 +552,202 @@ class ToolBroker:
             payload=payload,
             ok=True,
         )
+
+    def _charge_tool_call(self, pid: str, handle: ToolHandle, call_id: str) -> None:
+        if self.resources is None:
+            return
+        self.resources.charge(
+            pid,
+            ResourceUsage(tool_calls=1),
+            source="tool.call",
+            context={"tool": handle.name, "tool_id": handle.tool_id, "call_id": call_id},
+            allow_overage=False,
+            kill_on_exceed=False,
+        )
+
+    async def _run_sandbox_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        *,
+        pid: str,
+        syscall_handler: Any,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "pid": pid,
+            "syscall_handler": syscall_handler,
+            "limits": self._subprocess_limits(pid),
+            "return_metrics": True,
+        }
+        if kwargs["limits"] is not None:
+            self._require_sandbox_resource_controls()
+        supported = self._supported_sandbox_kwargs()
+        selected_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+        if kwargs["limits"] is not None and "limits" not in selected_kwargs:
+            raise ValidationError("sandbox backend must accept SubprocessLimits when resource limits are configured")
+        if kwargs["limits"] is not None and "return_metrics" not in selected_kwargs:
+            raise ValidationError("sandbox backend must return subprocess metrics")
+        return await self.sandbox.arun_source(source_code, args, **selected_kwargs)
+
+    def _supported_sandbox_kwargs(self) -> set[str]:
+        signature = inspect.signature(self.sandbox.arun_source)
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return {"pid", "syscall_handler", "timeout", "limits", "return_metrics"}
+        return set(signature.parameters)
+
+    def _require_sandbox_resource_controls(self) -> None:
+        supported = self._supported_sandbox_kwargs()
+        if "limits" not in supported:
+            raise ValidationError("sandbox backend must accept SubprocessLimits when resource limits are configured")
+        if "return_metrics" not in supported:
+            raise ValidationError("sandbox backend must return subprocess metrics")
+
+    def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+        if self.resources is None:
+            return None
+        wall = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_wall_seconds",
+            "subprocess_wall_seconds",
+        )
+        cpu = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_cpu_seconds",
+            "subprocess_cpu_seconds",
+        )
+        memory = self.resources.peak_limit(pid, "max_subprocess_memory_bytes")
+        if wall is None and cpu is None and memory is None:
+            return None
+        return SubprocessLimits(wall_seconds=wall, cpu_seconds=cpu, memory_bytes=memory)
+
+    def _charge_subprocess_metrics(
+        self,
+        pid: str,
+        metrics: CommandMetrics | None,
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> None:
+        if self.resources is None or metrics is None:
+            return
+        self.resources.charge(
+            pid,
+            ResourceUsage(
+                subprocess_wall_seconds=max(0.0, metrics.wall_seconds),
+                subprocess_cpu_seconds=max(0.0, metrics.cpu_seconds),
+                subprocess_peak_memory_bytes=max(0, metrics.peak_memory_bytes),
+            ),
+            source=source,
+            context={**context, "metrics": self._metrics_json(metrics)},
+            allow_overage=True,
+            kill_on_exceed=True,
+        )
+
+    def _handle_subprocess_limit(
+        self,
+        pid: str,
+        handle: ToolHandle,
+        resource: str,
+        call_id: str,
+        exc: SubprocessLimitExceeded,
+    ) -> None:
+        charge_error: ResourceLimitExceeded | None = None
+        try:
+            self._charge_subprocess_metrics(
+                pid,
+                exc.metrics,
+                source="tool.deno",
+                context={"tool": handle.name, "tool_id": handle.tool_id},
+            )
+        except ResourceLimitExceeded as resource_exc:
+            charge_error = resource_exc
+        reason = str(charge_error or exc)
+        if self.resources is not None:
+            self.resources.kill_if_exceeded(
+                pid,
+                reason=reason,
+                limit={"kind": exc.metrics.limit_kind, "metrics": self._metrics_json(exc.metrics)},
+            )
+        self.events.emit(
+            EventType.TOOL_FAILED,
+            source=resource,
+            target=pid,
+            payload={"call_id": call_id, "error": reason, "policy_decision": "resource_limit"},
+        )
+        self.audit.record(
+            actor=pid,
+            action="tool.call",
+            target=resource,
+            decision={
+                "ok": False,
+                "tool": handle.name,
+                "policy_decision": "resource_limit",
+                "error": reason,
+                "metrics": self._metrics_json(exc.metrics),
+            },
+        )
+
+    def _handle_subprocess_timeout(
+        self,
+        pid: str,
+        handle: ToolHandle,
+        resource: str,
+        call_id: str,
+        exc: SubprocessTimeoutExpired,
+    ) -> str:
+        charge_error: ResourceLimitExceeded | None = None
+        try:
+            self._charge_subprocess_metrics(
+                pid,
+                exc.metrics,
+                source="tool.deno",
+                context={"tool": handle.name, "tool_id": handle.tool_id},
+            )
+        except ResourceLimitExceeded as resource_exc:
+            charge_error = resource_exc
+        if charge_error is not None:
+            reason = str(charge_error)
+            if self.resources is not None:
+                self.resources.kill_if_exceeded(
+                    pid,
+                    reason=reason,
+                    limit={"kind": exc.metrics.limit_kind, "metrics": self._metrics_json(exc.metrics)},
+                )
+        else:
+            reason = str(exc)
+        self.events.emit(
+            EventType.TOOL_FAILED,
+            source=resource,
+            target=pid,
+            payload={"call_id": call_id, "error": reason, "policy_decision": "timeout"},
+        )
+        self.audit.record(
+            actor=pid,
+            action="tool.call",
+            target=resource,
+            decision={
+                "ok": False,
+                "tool": handle.name,
+                "policy_decision": "timeout" if charge_error is None else "resource_limit",
+                "error": reason,
+                "metrics": self._metrics_json(exc.metrics),
+            },
+        )
+        return reason
+
+    def _metrics_json(self, metrics: CommandMetrics | None) -> dict[str, Any] | None:
+        if metrics is None:
+            return None
+        return {
+            "wall_seconds": metrics.wall_seconds,
+            "cpu_seconds": metrics.cpu_seconds,
+            "peak_memory_bytes": metrics.peak_memory_bytes,
+            "killed": metrics.killed,
+            "limit_kind": metrics.limit_kind,
+        }
+
+    def _elapsed(self, started_at: float) -> float:
+        return max(0.0, time.perf_counter() - started_at)
 
     def resolve(self, tool: ToolHandle | str, pid: str | None = None) -> ToolHandle:
         if isinstance(tool, ToolHandle):
@@ -548,6 +842,14 @@ class ToolBroker:
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return process.tool_table.get(handle.name) == handle.tool_id
+
+    def _terminal_process_error(self, pid: str) -> str | None:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        if process.status in _TERMINAL_PROCESS_STATUSES:
+            return f"cannot call tools for terminal process {pid}: {process.status.value}"
+        return None
 
     def _visible_tool_ids(self, pid: str) -> set[str]:
         process = self.store.get_process(pid)

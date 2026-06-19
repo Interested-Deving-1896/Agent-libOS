@@ -44,6 +44,10 @@ class ProcessError(LibOSError):
     pass
 
 
+class ResourceLimitExceeded(ProcessError):
+    pass
+
+
 class ValidationError(LibOSError):
     pass
 

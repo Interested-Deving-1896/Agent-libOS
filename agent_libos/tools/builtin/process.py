@@ -18,6 +18,7 @@ from agent_libos.models import (
     ObjectRight,
     ObjectType,
     ProcessSignal,
+    ResourceBudget,
     ViewMode,
 )
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
@@ -129,6 +130,10 @@ class ForkChildProcessArgs(BaseModel):
         default=None,
         description="Optional child working directory. Defaults to the parent's current working directory.",
     )
+    resource_budget: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional child ResourceBudget override. It must fit inside the parent process remaining budget.",
+    )
 
 
 class ForkChildProcessOutput(BaseModel):
@@ -168,6 +173,10 @@ class SpawnChildProcessArgs(BaseModel):
     working_directory: str | None = Field(
         default=None,
         description="Optional child working directory. Defaults to the parent's current working directory.",
+    )
+    resource_budget: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional child ResourceBudget override. It must fit inside the parent process remaining budget.",
     )
 
 
@@ -395,6 +404,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             goal=args.goal,
             memory_view=view_spec,
             inherit_capabilities=inherit_specs,
+            resource_budget=_resource_budget_from_spec(args.resource_budget),
             image=image,
             mode=fork_mode,
             working_directory=child_cwd,
@@ -476,6 +486,7 @@ class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
             goal=args.goal,
             image=args.image,
             inherit_capabilities=inherit_specs,
+            resource_budget=_resource_budget_from_spec(args.resource_budget),
             working_directory=args.working_directory,
         )
         child = runtime.process.get(child_pid)
@@ -665,6 +676,27 @@ def _normalize_capability_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if isinstance(constraints, dict):
         normalized["constraints"] = constraints
     return normalized
+
+
+def _resource_budget_from_spec(spec: dict[str, Any] | None) -> ResourceBudget | None:
+    if spec is None:
+        return None
+    allowed = set(ResourceBudget.__dataclass_fields__)
+    unknown = sorted(set(spec) - allowed)
+    if unknown:
+        raise ToolExecutionError(
+            "Unknown resource_budget fields.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+            details={"unknown_fields": unknown},
+        )
+    try:
+        return ResourceBudget(**{key: value for key, value in spec.items() if key in allowed})
+    except ValueError as exc:
+        raise ToolExecutionError(
+            "Invalid resource_budget.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+            details={"error": str(exc)},
+        ) from exc
 
 
 def _coalesce_capability_specs(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:

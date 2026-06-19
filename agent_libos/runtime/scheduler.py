@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.utils.ids import utc_now
-from agent_libos.models import ProcessStatus
+from agent_libos.models import ProcessStatus, ResourceUsage
+from agent_libos.models.exceptions import ResourceLimitExceeded
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.storage import SQLiteStore
 
@@ -21,10 +23,17 @@ class AsyncProcessScheduler:
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
-    def __init__(self, store: SQLiteStore, audit: AuditManager, poll_interval_s: float = _SCHEDULER_DEFAULTS.poll_interval_s):
+    def __init__(
+        self,
+        store: SQLiteStore,
+        audit: AuditManager,
+        poll_interval_s: float = _SCHEDULER_DEFAULTS.poll_interval_s,
+        resources: Any | None = None,
+    ):
         self.store = store
         self.audit = audit
         self.poll_interval_s = poll_interval_s
+        self.resources = resources
 
     def next_runnable(self) -> str | None:
         runnable = [p for p in self.store.list_processes() if p.status == ProcessStatus.RUNNABLE]
@@ -159,12 +168,30 @@ class AsyncProcessScheduler:
         process.updated_at = utc_now()
         self.store.update_process(process)
         self.audit.record(actor="scheduler", action="scheduler.run_quantum", target=f"process:{pid}")
+        started_at = time.perf_counter()
+        result: Any = None
+        error: BaseException | None = None
+        resource_error: ResourceLimitExceeded | None = None
         try:
             result = quantum(pid)
             if inspect.isawaitable(result):
-                return await result
-            return result
+                result = await result
+        except BaseException as exc:
+            error = exc
         finally:
+            if self.resources is not None:
+                elapsed = max(0.0, time.perf_counter() - started_at)
+                try:
+                    self.resources.charge(
+                        pid,
+                        ResourceUsage(runtime_seconds=elapsed),
+                        source="scheduler.quantum",
+                        context={"elapsed_s": elapsed},
+                        allow_overage=True,
+                        kill_on_exceed=True,
+                    )
+                except ResourceLimitExceeded as exc:
+                    resource_error = exc
             latest = self.store.get_process(pid)
             # A primitive may deliberately set WAITING_HUMAN, EXITED, or another
             # status during the quantum. Only restore RUNNABLE for plain returns.
@@ -172,6 +199,11 @@ class AsyncProcessScheduler:
                 latest.status = ProcessStatus.RUNNABLE
                 latest.updated_at = utc_now()
                 self.store.update_process(latest)
+        if error is not None:
+            raise error
+        if resource_error is not None:
+            raise resource_error
+        return result
 
     def _fail_process_task(self, pid: str, exc: Exception) -> None:
         process = self.store.get_process(pid)

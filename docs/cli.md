@@ -32,6 +32,7 @@ demo          run the deterministic local demo
 audit         print audit records
 llm-calls     print persisted LLM call records
 processes     print process table
+resources     print process resource budget, usage, and remaining budget
 tools         print registered tools
 spawn         spawn a process
 cd            set a process working directory
@@ -58,6 +59,7 @@ uv run agent-libos --db .agent_libos.sqlite init
 uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
 uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
+uv run agent-libos --db .agent_libos.sqlite resources <pid>
 uv run agent-libos --db .agent_libos.sqlite audit
 uv run agent-libos --db .agent_libos.sqlite tools
 ```
@@ -85,6 +87,20 @@ uv run agent-libos --db .agent_libos.sqlite llm-calls --limit 20
 Records include prompt messages, visible tools, output, tool calls, provider
 ids, model/API mode, token usage when available, reasoning fields when exposed,
 raw response JSON, and errors.
+
+## Process Resources
+
+Inspect one process's configured budget, observed usage, and remaining budget:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite resources <pid>
+```
+
+Resource accounting is process-tree scoped. Tool calls, LLM calls/tokens,
+subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, Deno syscalls,
+and child-process creation are charged to the acting process and its ancestors.
+Capabilities, Skill activation, image exec, checkpoint restore, and human
+approval do not increase these budgets.
 
 ## Interactive Run
 
@@ -128,14 +144,14 @@ Useful options:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite cd <pid> src
-uv run agent-libos --db .agent_libos.sqlite exec image.yaml "Review README.md" --pid <pid> --run
+uv run agent-libos --db .agent_libos.sqlite exec images/review-agent "Review README.md" --pid <pid> --run
 uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
 ```
 
 For `exec`, the first positional argument is the target image. It can be an
-already registered image id such as `coding-agent:v0`, or a `.yaml` / `.yml`
-AgentImage manifest path. The second positional argument is the replacement
-goal.
+already registered image id such as `coding-agent:v0`, or an image package
+directory containing `IMAGE.yaml`. The second positional argument is the
+replacement goal.
 
 Useful exec options:
 
@@ -146,39 +162,60 @@ Useful exec options:
 - `--run` / `--no-run`
 - `--max-quanta <n>`: optional when `--run` is set; omitted means run until idle.
 
-Exec never grants target-image `required_capabilities` automatically.
+Exec never grants target-image `required_capabilities` automatically. If the
+target is an image package, its `workspace/` seed is materialized into a private
+per-process directory under `agent_outputs/image_workspaces/`.
 
 Exit accepts either `--payload` or `--result-oid`, not both. Non-JSON payload
 text is wrapped as `{"content": "<text>"}`.
 
-## AgentImage YAML
+## AgentImage Packages
 
-Image manifests accepted by CLI exec or `load_image_from_yaml` can use a
-top-level `image:` mapping or direct image fields:
+User-defined images are directory packages:
+
+```text
+images/review-agent/
+  IMAGE.yaml
+  prompt.md
+  tools/
+    jit-tools.json
+    scripts/
+      summarize.ts
+  resources/
+  workspace/
+    seed.txt
+```
+
+`IMAGE.yaml` holds structured metadata and references `prompt.md`:
 
 ```yaml
-image:
-  image_id: yaml-agent:v0
-  name: yaml-agent
-  system_prompt: |
-    Use the smallest safe tool sequence.
-  default_tools:
-    - read_memory_object
-    - human_output
-  default_skills: []
-  context_policy: evidence_first
-  safety_profile: review
-  metadata:
-    role: example
-  boot:
-    kind: fresh
+image_id: review-agent:v0
+name: review-agent
+prompt: prompt.md
+default_tools:
+  - read_memory_object
+  - human_output
+jit_tools: tools/jit-tools.json
+workspace:
+  source: workspace
+  working_directory: .
+  grants:
+    - path: .
+      rights: [read, write]
+      recursive: true
 ```
+
+`tools/jit-tools.json` declares process-local TypeScript JIT tools whose source
+files live under `tools/scripts/*.ts`. JIT tools are snapshotted as immutable
+package content and are not copied into the materialized workspace.
 
 ## Image Commands
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite images list
 uv run agent-libos --db .agent_libos.sqlite images inspect coding-agent:v0
+uv run agent-libos --db .agent_libos.sqlite images validate images/review-agent
+uv run agent-libos --db .agent_libos.sqlite images register images/review-agent
 uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
 ```
 

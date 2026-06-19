@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -14,7 +16,7 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
-from agent_libos.models import AgentImage, EventType, ObjectHandle, ProcessStatus, ToolHandle, ToolSpec
+from agent_libos.models import AgentImage, CapabilityRight, EventType, ObjectHandle, ProcessStatus, ResourceUsage, ToolHandle, ToolSpec
 from agent_libos.models.exceptions import NotFound
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
@@ -23,6 +25,7 @@ from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.process_manager import ProcessManager
+from agent_libos.runtime.resource_manager import ResourceManager
 from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.runtime.syscall_router import SyscallRouter
 from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES
@@ -64,6 +67,7 @@ class Runtime:
         self.store = store
         self.audit = AuditManager(store)
         self.events = EventBus(store)
+        self.resources = ResourceManager(store, self.audit, self.events)
         self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
         self.provider_hooks: dict[str, list[Any]] = {}
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
@@ -90,6 +94,7 @@ class Runtime:
             self.events,
             human=self.human,
             provider=self.substrate.filesystem,
+            resources=self.resources,
         )
         self.shell = ShellAdapter(
             self.capability,
@@ -98,6 +103,7 @@ class Runtime:
             human=self.human,
             provider=self.substrate.shell,
             config=self.config,
+            resources=self.resources,
         )
         self.jsonrpc = JsonRpcPrimitive(
             store,
@@ -107,6 +113,7 @@ class Runtime:
             human=self.human,
             provider=getattr(self.substrate, "jsonrpc", HttpJsonRpcProvider()),
             config=self.config,
+            resources=self.resources,
         )
         self.tools = ToolBroker(
             store,
@@ -117,11 +124,25 @@ class Runtime:
             self.events,
             workspace_root=self.workspace_root,
             config=self.config,
+            resources=self.resources,
         )
         self.tools.runtime = self
-        self.process = ProcessManager(store, self.memory, self.capability, self.audit, self.events, config=self.config)
+        self.process = ProcessManager(
+            store,
+            self.memory,
+            self.capability,
+            self.audit,
+            self.events,
+            config=self.config,
+            resources=self.resources,
+        )
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
-        self.scheduler = SimpleScheduler(store, self.audit, poll_interval_s=self.config.scheduler.poll_interval_s)
+        self.scheduler = SimpleScheduler(
+            store,
+            self.audit,
+            poll_interval_s=self.config.scheduler.poll_interval_s,
+            resources=self.resources,
+        )
         self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
         self.checkpoint.bind_runtime(self)
         self.skills = SkillManager(
@@ -429,6 +450,7 @@ class Runtime:
         *,
         image: str | None = None,
         inherit_capabilities: list[dict[str, Any]] | None = None,
+        resource_budget: Any | None = None,
         working_directory: str | None = None,
     ) -> str:
         parent_process = self.process.get(parent)
@@ -444,6 +466,7 @@ class Runtime:
             goal=goal,
             image=selected_image,
             inherit_capabilities=inherit_capabilities,
+            resource_budget=resource_budget,
             working_directory=selected_cwd,
         )
 
@@ -472,12 +495,17 @@ class Runtime:
                 process.updated_at = utc_now()
                 self.store.update_process(process)
             raise
-        is_checkpoint_commit = image.boot.get("kind", "fresh") == "checkpoint_commit"
+        boot_kind = image.boot.get("kind", "fresh")
+        is_checkpoint_commit = boot_kind == "checkpoint_commit"
+        is_image_package = boot_kind == "image_package"
         # Tool visibility is fixed from the AgentImage at process creation time.
         # External-resource authority is still enforced later by the primitives.
         self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
         if is_checkpoint_commit:
             self._instantiate_checkpoint_commit_image(pid, image)
+            process = self.store.get_process(pid)
+        elif is_image_package:
+            self._instantiate_image_package(pid, image)
             process = self.store.get_process(pid)
         try:
             self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
@@ -498,7 +526,7 @@ class Runtime:
                 decision={"image": image_id, "parent_pid": process.parent_pid},
             )
             return
-        if is_checkpoint_commit:
+        if is_checkpoint_commit or is_image_package:
             self.audit.record(
                 actor="runtime",
                 action="image.required_capabilities_declared_only",
@@ -506,7 +534,7 @@ class Runtime:
                 decision={
                     "image": image_id,
                     "required_capabilities": len(image.required_capabilities),
-                    "reason": "checkpoint commit images never grant external authority automatically",
+                    "reason": f"{boot_kind} images never grant external authority automatically",
                 },
             )
             return
@@ -554,7 +582,7 @@ class Runtime:
             self.skills.activate_skill(pid, skill_id, actor=assigned_by, require_capability=False)
 
     def _instantiate_checkpoint_commit_image(self, pid: str, image: AgentImage) -> None:
-        artifact = self._load_image_artifact(image)
+        artifact = self._load_image_artifact(image, expected_kind="checkpoint_commit")
         self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
         remapped = self._remap_image_artifact_for_process(pid, artifact)
         self._insert_committed_memory_rows(remapped)
@@ -580,19 +608,173 @@ class Runtime:
             },
         )
 
-    def _load_image_artifact(self, image: AgentImage) -> dict[str, Any]:
+    def _instantiate_image_package(self, pid: str, image: AgentImage) -> None:
+        artifact = self._load_image_artifact(image, expected_kind="image_package")
+        workspace_root = self._materialize_image_package_workspace(pid, image, artifact)
+        registered_jit = self._register_image_package_jit_tools(pid, image, artifact)
+        process = self.process.get(pid)
+        if workspace_root is not None:
+            process.working_directory = workspace_root
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+            self._grant_image_package_workspace(pid, image, artifact, workspace_root)
+        self.audit.record(
+            actor=f"image:{image.image_id}",
+            action="image.boot.package",
+            target=f"process:{pid}",
+            decision={
+                "image_id": image.image_id,
+                "artifact_id": image.boot.get("artifact_id"),
+                "package_sha256": artifact.get("package_sha256"),
+                "workspace_root": workspace_root,
+                "jit_tools": registered_jit,
+            },
+        )
+
+    def _materialize_image_package_workspace(
+        self,
+        pid: str,
+        image: AgentImage,
+        artifact: dict[str, Any],
+    ) -> str | None:
+        workspace = artifact.get("workspace") or {}
+        source = workspace.get("source")
+        if not source:
+            return None
+        artifact_id = self._safe_materialized_segment(str(image.boot.get("artifact_id") or "image"))
+        pid_segment = self._safe_materialized_segment(pid)
+        root_relative = Path(self.config.image.materialized_workspace_root) / pid_segment / artifact_id / "workspace"
+        root = (self.workspace_root / root_relative).resolve()
+        if self.workspace_root not in root.parents and root != self.workspace_root:
+            raise RuntimeError("image workspace materialization escaped workspace root")
+        files = [
+            record for record in artifact.get("files", [])
+            if self._artifact_path_under(str(record.get("path", "")), str(source))
+        ]
+        total_bytes = sum(int(record.get("size_bytes") or 0) for record in files)
+        usage = ResourceUsage(external_write_bytes=total_bytes)
+        context = {
+            "image_id": image.image_id,
+            "artifact_id": image.boot.get("artifact_id"),
+            "workspace_root": root_relative.as_posix(),
+            "files": len(files),
+            "bytes": total_bytes,
+        }
+        self.resources.preflight(pid, usage, source="image.workspace.materialize", context=context)
+        root.mkdir(parents=True, exist_ok=True)
+        for record in files:
+            package_path = str(record["path"])
+            relative = self._relative_artifact_path(package_path, str(source))
+            target = (root / relative).resolve()
+            if root not in target.parents and target != root:
+                raise RuntimeError(f"image workspace file escaped materialized root: {package_path}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self._artifact_file_bytes(record))
+        working_directory = str(workspace.get("working_directory") or ".")
+        cwd = (root / "" if working_directory == "." else root / working_directory).resolve()
+        if root not in cwd.parents and cwd != root:
+            raise RuntimeError("image workspace working_directory escaped materialized root")
+        cwd.mkdir(parents=True, exist_ok=True)
+        self.resources.charge(pid, usage, source="image.workspace.materialize", context=context)
+        return cwd.relative_to(self.workspace_root).as_posix()
+
+    def _grant_image_package_workspace(
+        self,
+        pid: str,
+        image: AgentImage,
+        artifact: dict[str, Any],
+        workspace_root: str,
+    ) -> None:
+        workspace = artifact.get("workspace") or {}
+        granted: list[dict[str, Any]] = []
+        for grant in workspace.get("grants", []):
+            relative = str(grant.get("path") or ".")
+            target = workspace_root if relative == "." else f"{workspace_root.rstrip('/')}/{relative}"
+            rights = [CapabilityRight(right) for right in grant.get("rights", [])]
+            if grant.get("recursive"):
+                cap = self.filesystem.grant_directory(
+                    pid,
+                    target,
+                    rights,
+                    issued_by=f"image.package:{image.image_id}",
+                    delegable=bool(grant.get("delegable", False)),
+                )
+            else:
+                cap = self.filesystem.grant_path(
+                    pid,
+                    target,
+                    rights,
+                    issued_by=f"image.package:{image.image_id}",
+                    delegable=bool(grant.get("delegable", False)),
+                )
+            granted.append({"capability_id": cap.cap_id, "resource": cap.resource, "rights": sorted(cap.rights)})
+        if granted:
+            self.audit.record(
+                actor=f"image:{image.image_id}",
+                action="image.workspace.grants",
+                target=f"process:{pid}",
+                decision={"grants": granted},
+            )
+
+    def _register_image_package_jit_tools(self, pid: str, image: AgentImage, artifact: dict[str, Any]) -> list[str]:
+        process = self.process.get(pid)
+        registered: list[str] = []
+        for item in artifact.get("jit_tools", []):
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            if name in process.tool_table:
+                raise RuntimeError(f"image package JIT tool conflicts with visible tool: {name}")
+            if self.tools._name_collides_with_static_tool(name):
+                raise RuntimeError(f"image package JIT tool conflicts with static tool: {name}")
+            spec = ToolSpec(
+                name=name,
+                description=str(item.get("description") or ""),
+                input_schema=dict(item.get("input_schema") or {}),
+                output_schema=dict(item.get("output_schema") or {}),
+                policy={"permissions": [], "side_effects": False},
+                tags=["image", "jit", "package"],
+                metadata={
+                    "image_id": image.image_id,
+                    "artifact_id": image.boot.get("artifact_id"),
+                    "source_path": item.get("source_path"),
+                    **dict(item.get("metadata") or {}),
+                },
+            )
+            tool_id = new_id("tool")
+            handle = ToolHandle(tool_id=tool_id, name=name, capability_id=None, scope="ephemeral_process")
+            self.tools._jit_sources[tool_id] = str(item.get("source") or "")
+            self.tools._handles[tool_id] = handle
+            self.tools._tool_ids_by_name.setdefault(name, tool_id)
+            self.store.insert_tool(handle, spec, registered_by=f"image.package:{image.image_id}", created_at=utc_now(), ephemeral=True)
+            process.tool_table[name] = tool_id
+            registered.append(name)
+        if registered:
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+            self.audit.record(
+                actor=f"image:{image.image_id}",
+                action="image.package_jit.register",
+                target=f"process:{pid}",
+                decision={"tools": sorted(registered)},
+            )
+        return sorted(registered)
+
+    def _load_image_artifact(self, image: AgentImage, *, expected_kind: str | None = None) -> dict[str, Any]:
         artifact_id = str(image.boot.get("artifact_id") or "")
         expected_sha256 = str(image.boot.get("artifact_sha256") or "")
+        expected_kind = expected_kind or str(image.boot.get("kind") or "")
         found = self.store.get_image_artifact(artifact_id)
         if found is None:
             raise NotFound(f"image artifact not found: {artifact_id}")
         artifact, metadata = found
-        if artifact.get("kind") != "checkpoint_commit":
-            raise RuntimeError(f"image artifact has unsupported kind: {artifact.get('kind')}")
-        if artifact.get("artifact_version") != self.config.image_commit.artifact_version:
+        if expected_kind and artifact.get("kind") != expected_kind:
+            raise RuntimeError(f"image artifact kind mismatch: {artifact.get('kind')} != {expected_kind}")
+        expected_version = self.config.image_commit.artifact_version if artifact.get("kind") == "checkpoint_commit" else 1
+        if artifact.get("artifact_version") != expected_version:
             raise RuntimeError(
                 "image artifact version mismatch: "
-                f"{artifact.get('artifact_version')} != {self.config.image_commit.artifact_version}"
+                f"{artifact.get('artifact_version')} != {expected_version}"
             )
         actual_sha256 = hashlib.sha256(dumps(artifact).encode("utf-8")).hexdigest()
         if expected_sha256 and metadata.get("sha256") != expected_sha256:
@@ -600,6 +782,25 @@ class Runtime:
         if metadata.get("sha256") != actual_sha256:
             raise RuntimeError(f"image artifact content hash mismatch for {artifact_id}")
         return artifact
+
+    def _artifact_file_bytes(self, record: dict[str, Any]) -> bytes:
+        if record.get("kind") == "base64":
+            return base64.b64decode(str(record.get("content_base64") or ""))
+        return str(record.get("content") or "").encode("utf-8")
+
+    def _artifact_path_under(self, path: str, root: str) -> bool:
+        return path == root or path.startswith(f"{root.rstrip('/')}/")
+
+    def _relative_artifact_path(self, path: str, root: str) -> Path:
+        root = root.rstrip("/")
+        if path == root:
+            return Path()
+        if not path.startswith(f"{root}/"):
+            raise RuntimeError(f"artifact path is outside root: {path}")
+        return Path(path[len(root) + 1 :])
+
+    def _safe_materialized_segment(self, value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.@+-]", "_", value)[:160] or "image"
 
     def _remap_image_artifact_for_process(self, pid: str, artifact: dict[str, Any]) -> dict[str, Any]:
         source_pid = str(artifact["source_pid"])

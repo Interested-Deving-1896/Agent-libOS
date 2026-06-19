@@ -11,7 +11,16 @@ class RecordingShellProvider:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
 
-    def run(self, argv: list[str], *, timeout: float=30.0, cwd: str | None=None) -> CommandResult:
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: object | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
         self.calls.append((list(argv), cwd))
         return CommandResult(argv=list(argv), returncode=0, stdout='ok', stderr='')
 

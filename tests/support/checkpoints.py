@@ -22,7 +22,16 @@ def checkpoint_cli_json(argv: list[str]) -> Any:
 
 
 class ClassifiedShellProvider:
-    def run(self, argv: list[str], *, timeout: float = 30.0, cwd: str | None = None) -> CommandResult:
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: object | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
         return CommandResult(argv=list(argv), returncode=0, stdout="ok\n", stderr="")
 
     def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:

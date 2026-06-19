@@ -69,6 +69,8 @@ def main(argv: list[str] | None = None) -> None:
     llm_calls_parser.add_argument("--pid", help="Filter by process id.")
     llm_calls_parser.add_argument("--limit", type=int, help="Maximum number of records to print.")
     sub.add_parser("processes", help="Print process table")
+    resources_parser = sub.add_parser("resources", help="Print process resource budget and usage")
+    resources_parser.add_argument("pid")
     sub.add_parser("tools", help="Print registered tools")
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image", default=_RUNTIME_DEFAULTS.default_image_id)
@@ -77,10 +79,10 @@ def main(argv: list[str] | None = None) -> None:
     cd_parser.add_argument("pid")
     cd_parser.add_argument("path")
     exec_parser = sub.add_parser("exec", help="Exec an AgentProcess into another image")
-    exec_parser.add_argument("image", help="Target AgentImage id, or a .yaml/.yml AgentImage manifest to load first.")
+    exec_parser.add_argument("image", help="Target AgentImage id, or an image package directory containing IMAGE.yaml.")
     exec_parser.add_argument("goal", help="Replacement process goal.")
     exec_parser.add_argument("--pid", required=True, help="Process id to exec.")
-    exec_parser.add_argument("--replace-image", action="store_true", help="Allow a YAML image manifest to replace an existing image id.")
+    exec_parser.add_argument("--replace-image", action="store_true", help="Allow an image package to replace an existing image id.")
     exec_parser.add_argument("--args-json", default="{}", help="JSON object recorded as structured exec args.")
     exec_parser.add_argument(
         "--preserve-memory",
@@ -148,6 +150,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json([record.__dict__ for record in runtime.store.list_llm_calls(pid=args.pid, limit=args.limit)])
         elif args.command == "processes":
             _print_json([process.__dict__ for process in runtime.process.list()])
+        elif args.command == "resources":
+            _print_json(_resource_summary(runtime, args.pid))
         elif args.command == "tools":
             _print_json(runtime.tools.list())
         elif args.command == "spawn":
@@ -188,6 +192,18 @@ def main(argv: list[str] | None = None) -> None:
         runtime.shutdown(actor="cli", reason="cli.command_complete")
 
 
+def _resource_summary(runtime: Runtime, pid: str) -> dict[str, Any]:
+    process = runtime.process.get(pid)
+    return {
+        "pid": pid,
+        "status": process.status.value,
+        "status_message": process.status_message,
+        "budget": to_jsonable(process.resource_budget),
+        "usage": to_jsonable(process.resource_usage),
+        "remaining": to_jsonable(runtime.resources.remaining_budget(pid)),
+    }
+
+
 def _run_cd_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
     before = runtime.process.working_directory(args.pid)
     process = runtime.set_process_working_directory(args.pid, args.path)
@@ -200,8 +216,8 @@ def _run_cd_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any
 
 async def _run_exec_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
     loaded_image = (
-        _load_cli_image_from_yaml(runtime, args.image, replace=args.replace_image)
-        if _is_yaml_image_arg(args.image)
+        _load_cli_image_from_package(runtime, args.image, replace=args.replace_image)
+        if _is_image_package_arg(args.image)
         else None
     )
     target_image = loaded_image["image_id"] if loaded_image is not None else args.image
@@ -360,21 +376,18 @@ async def _run_interactive_command(runtime: Runtime, args: argparse.Namespace) -
     }
 
 
-def _load_cli_image_from_yaml(runtime: Runtime, value: str, *, replace: bool) -> dict[str, Any]:
+def _load_cli_image_from_package(runtime: Runtime, value: str, *, replace: bool) -> dict[str, Any]:
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
     path = path.resolve()
     if not path.exists():
-        raise SystemExit(f"image YAML does not exist: {path}")
-    if not path.is_file():
-        raise SystemExit(f"image YAML is not a file: {path}")
-    result = runtime.image_registry.register_from_yaml_text(
-        path.read_text(encoding="utf-8"),
+        raise SystemExit(f"image package does not exist: {path}")
+    result = runtime.image_registry.register_from_package_path(
+        path,
         actor="cli",
         replace=replace,
         require_capability=False,
-        source=str(path),
     )
     return {
         "image_id": result.image.image_id,
@@ -382,11 +395,16 @@ def _load_cli_image_from_yaml(runtime: Runtime, value: str, *, replace: bool) ->
         "version": result.image.version,
         "replaced": result.replaced,
         "source": result.source,
+        "boot": result.image.boot,
+        "package_sha256": result.image.metadata.get("package_sha256"),
     }
 
 
-def _is_yaml_image_arg(value: str) -> bool:
-    return Path(value).suffix.lower() in {".yaml", ".yml"}
+def _is_image_package_arg(value: str) -> bool:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.exists() and (path.is_dir() or path.name == DEFAULT_CONFIG.image.package_manifest_name)
 
 
 def _parse_json_mapping(value: str, label: str) -> dict[str, Any]:
@@ -705,6 +723,11 @@ def _add_images_parser_args(parser: argparse.ArgumentParser) -> None:
     sub.add_parser("list", help="List registered AgentImages")
     inspect = sub.add_parser("inspect", help="Inspect one AgentImage")
     inspect.add_argument("image_id")
+    validate = sub.add_parser("validate", help="Validate an image package directory")
+    validate.add_argument("path")
+    register = sub.add_parser("register", help="Register an image package directory")
+    register.add_argument("path")
+    register.add_argument("--replace", action="store_true")
     commit = sub.add_parser("commit", help="Commit a checkpoint into a checkpoint-derived AgentImage")
     commit.add_argument("checkpoint_id")
     commit.add_argument("image_id")
@@ -726,6 +749,32 @@ def _run_images_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
         if require_capability:
             runtime.capability.require(actor, runtime.image_registry.resource_for(args.image_id), CapabilityRight.READ)
         return runtime.image_registry.inspect(args.image_id)
+    if command == "validate":
+        if require_capability:
+            return runtime.image_registry.validate_workspace_package(actor, args.path)
+        return runtime.image_registry.validate_package_path(args.path)
+    if command == "register":
+        if require_capability:
+            result = runtime.image_registry.register_from_workspace_package(actor, args.path, replace=args.replace)
+        else:
+            result = runtime.image_registry.register_from_package_path(
+                args.path,
+                actor=actor,
+                replace=args.replace,
+                require_capability=False,
+            )
+        image = result.image
+        return {
+            "image_id": image.image_id,
+            "name": image.name,
+            "version": image.version,
+            "replaced": result.replaced,
+            "source": result.source,
+            "boot": image.boot,
+            "package_sha256": image.metadata.get("package_sha256"),
+            "package_jit_tools": image.metadata.get("package_jit_tools", []),
+            "required_capabilities_count": len(image.required_capabilities),
+        }
     if command == "commit":
         result = runtime.image_registry.commit_from_checkpoint(
             actor=actor,

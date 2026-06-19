@@ -29,6 +29,9 @@ export type RuntimeProcess = {
   messages: ProcessMessage[];
   llm_call_count: number;
   token_total: number;
+  resource_budget?: Record<string, unknown>;
+  resource_usage?: Record<string, unknown>;
+  resource_remaining?: Record<string, unknown>;
 };
 
 export type ProcessMessage = {
@@ -137,6 +140,8 @@ export type ImageMutationResult = {
   boot: Record<string, unknown>;
   default_tools?: string[];
   default_skills?: string[];
+  package_sha256?: string;
+  package_jit_tools?: string[];
   required_capabilities_count: number;
   source?: string | null;
 };
@@ -162,10 +167,13 @@ export type GuiConnection = {
   db: string;
 };
 
-export type ImageManifestFile = {
+export type ImagePackageFileValue = string | { base64: string };
+
+export type ImagePackageFile = {
   path: string;
   name: string;
-  content: string;
+  manifest: string;
+  files: Record<string, ImagePackageFileValue>;
 };
 
 export type SseMessage = {

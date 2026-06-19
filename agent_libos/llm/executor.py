@@ -5,7 +5,7 @@ import inspect
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import HumanApprovalRequired, ProcessMessageWaitRequired, ProcessWaitRequired
+from agent_libos.models.exceptions import HumanApprovalRequired, ProcessMessageWaitRequired, ProcessWaitRequired, ResourceLimitExceeded
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
@@ -19,6 +19,7 @@ from agent_libos.models import (
     ObjectHandle,
     ProcessMessageKind,
     ProcessStatus,
+    ResourceUsage,
     ViewMode,
 )
 
@@ -175,6 +176,15 @@ class LLMProcessExecutor:
                 decision={"recipient_pid": exc.recipient_pid, "filters": exc.filters, "message": str(exc)},
             )
             return {"ok": False, "waiting_message": True, "filters": exc.filters}
+        except ResourceLimitExceeded as exc:
+            self.runtime.resources.kill_if_exceeded(pid, reason=str(exc))
+            self.runtime.audit.record(
+                actor=pid,
+                action="llm.resource_limit_exceeded",
+                target=f"process:{pid}",
+                decision={"error": str(exc)},
+            )
+            return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
         except Exception as exc:
             self.runtime.process.exit(pid, failed=True, message=f"LLM quantum failed: {exc}")
             self.runtime.audit.record(
@@ -597,6 +607,7 @@ class LLMProcessExecutor:
             "client_class": type(self.client).__name__,
             "real_llm_client": isinstance(self.client, LLMClient),
         }
+        self._preflight_llm_call(pid)
         try:
             completion = await self._complete_action(messages, tools)
         except Exception as exc:
@@ -639,7 +650,66 @@ class LLMProcessExecutor:
                 completed_at=utc_now(),
             )
         )
+        self._charge_llm_completion(pid, completion)
         return completion
+
+    def _preflight_llm_call(self, pid: str) -> None:
+        resources = getattr(self.runtime, "resources", None)
+        if resources is None:
+            return
+        resources.preflight(
+            pid,
+            ResourceUsage(llm_calls=1),
+            source="llm.request",
+            context={"purpose": "action_selection"},
+        )
+
+    def _charge_llm_completion(self, pid: str, completion: Any) -> None:
+        resources = getattr(self.runtime, "resources", None)
+        if resources is None:
+            return
+        usage = dict(getattr(completion, "usage", {}) or {})
+        has_token_limit = resources.has_limit(pid, "max_llm_total_tokens")
+        token_keys = {"prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"}
+        if has_token_limit and not any(key in usage for key in token_keys):
+            resources.charge(
+                pid,
+                ResourceUsage(llm_calls=1),
+                source="llm.completion",
+                context={"usage_missing": True},
+                allow_overage=False,
+                kill_on_exceed=False,
+            )
+            raise ResourceLimitExceeded("LLM token budget is configured, but provider response did not include token usage")
+        prompt_tokens = self._usage_int(usage, "prompt_tokens", "input_tokens")
+        completion_tokens = self._usage_int(usage, "completion_tokens", "output_tokens")
+        total_tokens = self._usage_int(usage, "total_tokens")
+        if total_tokens == 0 and (prompt_tokens or completion_tokens):
+            total_tokens = prompt_tokens + completion_tokens
+        resources.charge(
+            pid,
+            ResourceUsage(
+                llm_calls=1,
+                llm_prompt_tokens=prompt_tokens,
+                llm_completion_tokens=completion_tokens,
+                llm_total_tokens=total_tokens,
+            ),
+            source="llm.completion",
+            context={"usage": usage},
+            allow_overage=True,
+            kill_on_exceed=True,
+        )
+
+    def _usage_int(self, usage: dict[str, Any], *keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0
 
     async def _complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
         if hasattr(self.client, "acomplete_action"):

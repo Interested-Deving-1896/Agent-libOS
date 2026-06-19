@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from agent_libos.models import (
     JsonRpcHeaderSpec,
     JsonRpcMethodSpec,
     JsonRpcTransportResult,
+    ResourceUsage,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
@@ -47,6 +49,7 @@ _ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HEADER_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _FORBIDDEN_HEADERS = {"connection", "content-length", "host", "transfer-encoding", "upgrade"}
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_FORBIDDEN_JSONRPC_HOSTS = {"metadata.google.internal"}
 _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, CapabilityRight.EXECUTE.value}
 
 
@@ -63,6 +66,7 @@ class JsonRpcPrimitive:
         human: HumanObjectManager | None,
         provider: JsonRpcProvider,
         config: AgentLibOSConfig | None = None,
+        resources: Any | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -71,6 +75,7 @@ class JsonRpcPrimitive:
         self.events = events
         self.human = human
         self.provider = provider
+        self.resources = resources
 
     def endpoint_resource(self, endpoint_id: str) -> str:
         return f"jsonrpc_endpoint:{endpoint_id}"
@@ -218,6 +223,12 @@ class JsonRpcPrimitive:
         request_body = self._request_body(method, params, request_id)
         if len(request_body) > spec.max_request_bytes:
             raise ValidationError(f"JSON-RPC request exceeds max_request_bytes={spec.max_request_bytes}")
+        self._preflight_resource_usage(
+            pid,
+            ResourceUsage(jsonrpc_request_bytes=len(request_body)),
+            source="primitive.jsonrpc.call",
+            context={"endpoint_id": endpoint_id, "method_id": method_id, "request_bytes": len(request_body)},
+        )
         effect_context = self._effect_context(spec, method, operation_context, request_bytes=len(request_body))
         require_external_effect_classifier(self.provider, "call")
         classify_external_effect(self.provider, "call", effect_context, {"preflight": True})
@@ -245,6 +256,18 @@ class JsonRpcPrimitive:
             event = self._emit_call_event(pid, resource, result, method)
             audit_record = self._record_call_audit(pid, resource, result, method, operation_context)
             self._record_external_effect(pid, resource, effect_context, result, event, audit_record)
+            self._charge_resource_usage(
+                pid,
+                ResourceUsage(jsonrpc_request_bytes=len(request_body), jsonrpc_response_bytes=result.response_bytes),
+                source="primitive.jsonrpc.call",
+                context={
+                    "endpoint_id": endpoint_id,
+                    "method_id": method_id,
+                    "request_bytes": len(request_body),
+                    "response_bytes": result.response_bytes,
+                    "status": result.status.value,
+                },
+            )
             return result
         finally:
             if attempted and decision.consume_capability_id is not None:
@@ -504,6 +527,37 @@ class JsonRpcPrimitive:
             metadata={"context": context, "result": result_payload},
         )
 
+    def _preflight_resource_usage(
+        self,
+        pid: str,
+        usage: ResourceUsage,
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> None:
+        if self.resources is None:
+            return
+        self.resources.preflight(pid, usage, source=source, context=context)
+
+    def _charge_resource_usage(
+        self,
+        pid: str,
+        usage: ResourceUsage,
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> None:
+        if self.resources is None:
+            return
+        self.resources.charge(
+            pid,
+            usage,
+            source=source,
+            context=context,
+            allow_overage=True,
+            kill_on_exceed=True,
+        )
+
     def _operation_context(
         self,
         pid: str,
@@ -718,9 +772,28 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC endpoint URL must not include a fragment")
         if parsed.scheme not in {"https", "http"} or not parsed.netloc:
             raise ValidationError("JSON-RPC endpoint URL must be HTTP(S)")
-        host = parsed.hostname or ""
+        host = (parsed.hostname or "").rstrip(".").lower()
+        self._validate_remote_host(host)
         if parsed.scheme == "http" and host not in _LOCAL_HTTP_HOSTS:
             raise ValidationError("plain HTTP JSON-RPC endpoints are restricted to localhost")
+
+    def _validate_remote_host(self, host: str) -> None:
+        if host in _FORBIDDEN_JSONRPC_HOSTS:
+            raise ValidationError("JSON-RPC endpoint host is blocked")
+        try:
+            address = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            return
+        if address.is_loopback:
+            return
+        if (
+            address.is_private
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        ):
+            raise ValidationError("JSON-RPC endpoint IP address is not allowed")
 
     def _validate_identifier(self, value: str, field: str, max_chars: int) -> None:
         if len(value) > max_chars or not _ID_PATTERN.match(value):

@@ -19,13 +19,14 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "openai>=2.41.1",
+    "openai>=2.43.0",
+    "psutil>=7.0.0",
     "pydantic>=2.13.4",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.4.0",
+    "pytest>=9.1.0",
     "pytest-cov>=6.2.0",
     "pytest-timeout>=2.4.0",
 ]

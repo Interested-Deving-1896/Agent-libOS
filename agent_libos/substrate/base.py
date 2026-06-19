@@ -44,6 +44,37 @@ class CommandResult:
     stderr: str
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    metrics: "CommandMetrics | None" = None
+
+
+@dataclass(frozen=True)
+class CommandMetrics:
+    wall_seconds: float = 0.0
+    cpu_seconds: float = 0.0
+    peak_memory_bytes: int = 0
+    killed: bool = False
+    limit_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class SubprocessLimits:
+    wall_seconds: float | None = None
+    cpu_seconds: float | None = None
+    memory_bytes: int | None = None
+
+
+class SubprocessLimitExceeded(Exception):
+    def __init__(self, message: str, *, metrics: CommandMetrics, result: CommandResult | None = None) -> None:
+        super().__init__(message)
+        self.metrics = metrics
+        self.result = result
+
+
+class SubprocessTimeoutExpired(TimeoutError):
+    def __init__(self, message: str, *, metrics: CommandMetrics, result: CommandResult | None = None) -> None:
+        super().__init__(message)
+        self.metrics = metrics
+        self.result = result
 
 
 class FilesystemProvider(Protocol):
@@ -54,13 +85,13 @@ class FilesystemProvider(Protocol):
 
     def state(self, path: ResolvedPath) -> PathState: ...
 
-    def read_bytes(self, path: ResolvedPath) -> bytes: ...
+    def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes: ...
 
     def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = "\n") -> None: ...
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None: ...
 
-    def list_directory(self, path: ResolvedPath) -> Sequence[DirectoryEntrySnapshot]: ...
+    def list_directory(self, path: ResolvedPath, *, limit: int | None = None) -> Sequence[DirectoryEntrySnapshot]: ...
 
     def delete_file(self, path: ResolvedPath) -> None: ...
 
@@ -98,6 +129,9 @@ class ShellProvider(Protocol):
         *,
         timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
         cwd: str | None = None,
+        limits: SubprocessLimits | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
     ) -> CommandResult: ...
 
     def classify_external_effect(

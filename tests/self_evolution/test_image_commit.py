@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType
+from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 
 class TestImageCommit:
@@ -57,6 +57,36 @@ class TestImageCommit:
             runtime.exec_process(target, 'exec-state:v0', goal='new goal', preserve_capabilities=False)
             assert runtime.memory.get_object_by_name(target, 'role').payload == {'role': 'committed'}
             assert not runtime.capability.check(target, 'shell:python', CapabilityRight.EXECUTE)
+
+    def test_committed_image_does_not_save_or_restore_resource_state(self) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='source',
+                resource_budget=ResourceBudget(max_tool_calls=5, max_llm_total_tokens=20),
+            )
+            runtime.resources.charge(source, ResourceUsage(tool_calls=2, llm_total_tokens=7), source='test')
+            checkpoint_id = runtime.checkpoint.create(source, 'resource state', actor=source)
+            runtime.image_registry.grant_register(source, 'resource-state:v0', issued_by='test')
+            result = runtime.image_registry.commit_from_checkpoint(actor=source, checkpoint_id=checkpoint_id, image_id='resource-state:v0', name='resource-state')
+
+            found = runtime.store.get_image_artifact(result.image.boot['artifact_id'])
+            assert found is not None
+            artifact, _metadata = found
+            assert 'resource_budget_json' not in artifact['source_process']
+            assert 'resource_usage_json' not in artifact['source_process']
+
+            spawned = runtime.process.spawn(
+                image='resource-state:v0',
+                goal='spawned',
+                resource_budget=ResourceBudget(max_tool_calls=3, max_llm_total_tokens=30),
+            )
+            process = runtime.process.get(spawned)
+
+            assert process.resource_budget.max_tool_calls == 3
+            assert process.resource_budget.max_llm_total_tokens == 30
+            assert process.resource_usage.tool_calls == 0
+            assert process.resource_usage.llm_total_tokens == 0
 
     def test_duplicate_commit_requires_replace(self) -> None:
         with _runtime() as runtime:

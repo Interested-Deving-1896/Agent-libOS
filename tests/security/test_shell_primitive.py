@@ -11,18 +11,6 @@ from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, C
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate
 
-SHELL_INJECTION_PAYLOADS = [
-    "safe$(printf${IFS}__INJECTED__)",
-    "safe`printf${IFS}__INJECTED__`",
-    "safe;printf${IFS}__INJECTED__",
-    "safe;{printf,__INJECTED__}",
-    "safe;p''rintf${IFS}__INJECTED__",
-    "safe\nprintf${IFS}__INJECTED__",
-    "badhost||printf${IFS}__INJECTED__",
-    "safe;printf${IFS}__INJECTED__${IFS}#",
-    "<(printf${IFS}__INJECTED__)",
-]
-
 class TestShellPrimitive:
     def setup_method(self) -> None:
         self._temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
@@ -130,18 +118,46 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
-    def test_allowlist_policy_asks_for_shell_syntax_payloads_in_auto_allow_argv(self) -> None:
-        for payload in SHELL_INJECTION_PAYLOADS:
-            runtime, provider = self._runtime_with_fake_shell()
+    def test_compileall_requires_approval_because_it_writes_artifacts(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='compileall shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['python', '-m', 'compileall', 'agent_libos'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['rule_id'] == 'shell.high.compileall'
+            assert context['risk'] == 'high'
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_pytest_collect_only_requires_approval_because_collection_executes_project_code(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='pytest collect shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['pytest', '--collect-only'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['rule_id'] == 'shell.medium.pytest'
+            assert context['risk'] == 'medium'
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_shell_denies_workspace_external_path_arguments_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            outside_path = Path(outside)
+            (outside_path / 'outside_mod.py').write_text('x = 1\n', encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(workspace))
             try:
-                pid = runtime.process.spawn(image='review-agent:v0', goal='injection payload shell')
+                pid = runtime.process.spawn(image='review-agent:v0', goal='outside path shell')
                 runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
-                with pytest.raises(HumanApprovalRequired):
-                    runtime.shell.run(pid, ['python', '-m', 'compileall', payload])
-                context = runtime.human.pending()[0].payload['context']
-                assert context['rule_id'] == 'shell.syntax.default'
-                assert context['risk'] == 'high'
-                assert provider.calls == []
+                with pytest.raises(CapabilityDenied):
+                    runtime.shell.run(pid, ['python', '-m', 'compileall', str(outside_path)], timeout=5.0)
+                assert runtime.human.pending() == []
+                assert not any(outside_path.rglob('__pycache__'))
             finally:
                 runtime.close()
 
@@ -388,23 +404,54 @@ class TestShellMatcher:
     def test_local_shell_provider_uses_argv_without_shell_interpreter(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         captured: dict[str, Any] = {}
 
-        class Completed:
+        class FakePopen:
+            pid = 12345
             returncode = 0
-            stdout = 'ok\n'
-            stderr = ''
 
-        def fake_run(argv: list[str], **kwargs: Any) -> Completed:
+            def __init__(self, argv: list[str], **kwargs: Any) -> None:
+                captured['argv'] = argv
+                captured['kwargs'] = kwargs
+                kwargs['stdout'].write(b'ok\n')
+                kwargs['stdout'].flush()
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return 'ok\n', ''
+
+        class FakePsutilProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def children(self, recursive: bool = False) -> list[Any]:
+                return []
+
+            def cpu_times(self) -> Any:
+                return type('Times', (), {'user': 0.0, 'system': 0.0})()
+
+            def memory_info(self) -> Any:
+                return type('Mem', (), {'rss': 0})()
+
+        def fake_popen(argv: list[str], **kwargs: Any) -> FakePopen:
             captured['argv'] = argv
             captured['kwargs'] = kwargs
-            return Completed()
+            return FakePopen(argv, **kwargs)
 
-        monkeypatch.setattr(local_substrate.subprocess, 'run', fake_run)
+        monkeypatch.setattr(local_substrate.subprocess, 'Popen', fake_popen)
+        monkeypatch.setattr(local_substrate.psutil, 'Process', FakePsutilProcess)
         provider = local_substrate.LocalShellProvider(tmp_path)
         result = provider.run(['echo', 'safe$(printf${IFS}__INJECTED__)'])
 
         assert result.stdout == 'ok\n'
         assert captured['argv'] == ['echo', 'safe$(printf${IFS}__INJECTED__)']
-        assert 'shell' not in captured['kwargs'] or captured['kwargs']['shell'] is False
+        assert captured['kwargs']['stdout'] is not local_substrate.subprocess.PIPE
+        assert captured['kwargs']['stderr'] is not local_substrate.subprocess.PIPE
+        assert captured['kwargs']['shell'] is False
+        assert 'OPENAI_API_KEY' not in captured['kwargs']['env']
 
     def _runtime_with_config(self, config: AgentLibOSConfig) -> tuple[Runtime, 'FakeShellProvider']:
         temp_dir = tempfile.TemporaryDirectory()
@@ -433,7 +480,16 @@ class FakeShellProvider:
         self.stdout = 'ok\n'
         self.stderr = ''
 
-    def run(self, argv: list[str], *, timeout: float=30.0, cwd: str | None=None) -> CommandResult:
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: Any | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
         self.calls.append((list(argv), timeout))
         return CommandResult(argv=list(argv), returncode=0, stdout=self.stdout, stderr=self.stderr)
 

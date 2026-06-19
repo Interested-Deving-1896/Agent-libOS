@@ -51,7 +51,10 @@ process-local JIT candidates. It does not own external authority.
 Image registration and `exec` are also self-evolution mechanisms. They can
 change a process prompt, default tool table, default Skills, and lifecycle
 shape, but image visibility and target-image metadata do not grant resource
-capabilities.
+capabilities or impose resource budgets. Launch-time callers own resource
+limits for newly started processes. Image packages may seed a private
+per-process workspace and process-local JIT tools, but those are scoped to the
+booted process and do not expose the package source directory.
 
 Startup Runtime Modules are different from Skills. A module is trusted Python
 host code loaded before `Runtime.open()` returns. Modules extend the runtime
