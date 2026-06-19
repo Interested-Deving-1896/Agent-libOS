@@ -9,7 +9,7 @@ Skills are not a permission mechanism. Activating a Skill changes only one
 process's prompt context and tool visibility. They are part of the
 self-evolving action surface, not the authority subsystem. Filesystem, shell,
 Object Memory, JSON-RPC, process, checkpoint, and human effects still go
-through primitives and Capability v2.
+through primitives and Capability.
 
 ## Package Shape
 

@@ -4,8 +4,13 @@ import json
 from dataclasses import replace
 from typing import Any, Iterable
 
+from agent_libos.capability.profiles import SandboxProfileBuilder
+from agent_libos.capability.resources import ResourceAuthority
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY, AuthorityRuleCodec
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
+    AuthorityRisk,
+    CapabilityLease,
     Capability,
     CapabilityDecision,
     CapabilityEffect,
@@ -15,8 +20,9 @@ from agent_libos.models import (
     EventType,
     ObjectHandle,
     OperationContext,
+    DelegationPolicy,
     ResourcePattern,
-    ResourceScope,
+    SandboxProfile,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
@@ -26,7 +32,7 @@ from agent_libos.utils.ids import new_id, utc_now
 
 
 class CapabilityManager:
-    """Capability v2 directory, authorization engine, and delegation helper."""
+    """Capability directory, authorization engine, and delegation helper."""
 
     POLICY_KEY = "permission_policy"
     ALWAYS_ALLOW = "always_allow"
@@ -39,6 +45,7 @@ class CapabilityManager:
     _KNOWN_CONSTRAINT_KEYS = {
         "shell_policy_level",
         "inherited_from",
+        AUTHORITY_RULES_KEY,
     }
 
     def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
@@ -46,6 +53,9 @@ class CapabilityManager:
         self.store = store
         self.audit = audit
         self.events = events
+        self.resources = ResourceAuthority()
+        self.rule_codec = AuthorityRuleCodec()
+        self.profiles = SandboxProfileBuilder()
 
     def issue(
         self,
@@ -58,7 +68,10 @@ class CapabilityManager:
     ) -> Capability:
         selected = self._coerce_spec(spec)
         if require_authority:
-            issuer_cap_id = self._require_issue_authority(actor, selected)
+            authority_decision = self._require_issue_authority(actor, selected)
+            issuer_cap_id = authority_decision.selected_capability_id if authority_decision is not None else None
+        else:
+            authority_decision = None
         cap = self._insert_capability(
             subject=subject,
             resource=selected.resource,
@@ -70,11 +83,13 @@ class CapabilityManager:
             issuer_cap_id=issuer_cap_id,
             parent_cap_id=None,
             delegation_depth=0,
+            max_delegation_depth=self._initial_max_delegation_depth(selected),
             expires_at=selected.expires_at,
             uses_remaining=selected.uses_remaining,
             delegable=selected.delegable,
             revocable=selected.revocable,
         )
+        self._consume_mutation_authority(authority_decision, used_by=actor, reason="one-time issue authority consumed")
         self.audit.record(
             actor=actor,
             action="capability.issue",
@@ -132,8 +147,8 @@ class CapabilityManager:
         delegable: bool = False,
         revocable: bool = True,
     ) -> Capability:
-        # Trusted runtime paths still need a compact bootstrap helper, but the
-        # record written to storage is the same Capability v2 shape as issue().
+        # Trusted runtime paths keep this compact bootstrap helper, while all
+        # records still flow through issue() for canonical spec conversion.
         effect, uses_remaining = self._effect_from_policy_constraint(constraints or {})
         clean_constraints = {
             key: value
@@ -164,6 +179,7 @@ class CapabilityManager:
         selected = self._coerce_spec(spec)
         parent_cap = self._find_delegation_parent(parent, selected)
         self._validate_delegation_parent(parent_cap, selected)
+        child_max_depth = self._delegated_max_delegation_depth(parent_cap, selected)
         cap = self._insert_capability(
             subject=child,
             resource=selected.resource,
@@ -175,6 +191,7 @@ class CapabilityManager:
             issuer_cap_id=parent_cap.cap_id,
             parent_cap_id=parent_cap.cap_id,
             delegation_depth=parent_cap.delegation_depth + 1,
+            max_delegation_depth=child_max_depth,
             expires_at=selected.expires_at or parent_cap.expires_at,
             uses_remaining=selected.uses_remaining,
             delegable=selected.delegable,
@@ -230,32 +247,67 @@ class CapabilityManager:
         requested_right = str(right)
         selected_context = self._context_dict(context)
         matches = self._matching_capabilities(subject, resource, requested_right, include_ask=True)
+        return self._decision_from_matches(
+            subject=subject,
+            resource=resource,
+            requested_right=requested_right,
+            matches=matches,
+            selected_context=selected_context,
+            audit=audit,
+        )
+
+    def authorize_matching_capabilities(
+        self,
+        subject: str,
+        resource: str,
+        right: str | CapabilityRight,
+        capabilities: Iterable[Capability],
+        context: OperationContext | dict[str, Any] | None = None,
+        *,
+        audit: bool = False,
+    ) -> CapabilityDecision:
+        requested_right = str(right)
+        selected_context = self._context_dict(context)
+        matches = [
+            cap
+            for cap in capabilities
+            if cap.active
+            and not self._is_expired(cap)
+            and self._resource_matches(cap.resource, resource)
+            and requested_right in cap.rights
+        ]
+        return self._decision_from_matches(
+            subject=subject,
+            resource=resource,
+            requested_right=requested_right,
+            matches=matches,
+            selected_context=selected_context,
+            audit=audit,
+        )
+
+    def _decision_from_matches(
+        self,
+        *,
+        subject: str,
+        resource: str,
+        requested_right: str,
+        matches: list[Capability],
+        selected_context: dict[str, Any],
+        audit: bool,
+    ) -> CapabilityDecision:
         matched_ids = [cap.cap_id for cap in matches]
-        deny = next((cap for cap in matches if cap.effect == CapabilityEffect.DENY), None)
-        if deny is not None:
-            decision = CapabilityDecision(
-                subject=subject,
-                resource=resource,
-                right=requested_right,
-                allowed=False,
-                effect=CapabilityEffect.DENY,
-                reason=f"{subject} denied {requested_right} on {resource}",
-                matched_capability_ids=matched_ids,
-                selected_capability_id=deny.cap_id,
-                issuer_chain=self._issuer_chain(deny),
-                context=selected_context,
-            )
-            return self._record_decision(decision, audit=audit)
+        failed_constraints: list[tuple[Capability, dict[str, Any]]] = []
         for cap in matches:
             constraint_results = self._evaluate_constraints(cap, selected_context)
-            if not all(bool(item.get("ok")) for item in constraint_results.values()):
+            constraint_effect = self._constraint_effect(constraint_results)
+            if constraint_effect == CapabilityEffect.DENY:
                 decision = CapabilityDecision(
                     subject=subject,
                     resource=resource,
                     right=requested_right,
                     allowed=False,
-                    effect=cap.effect,
-                    reason=f"capability constraints rejected {requested_right} on {resource}",
+                    effect=CapabilityEffect.DENY,
+                    reason=f"capability constraints denied {requested_right} on {resource}",
                     matched_capability_ids=matched_ids,
                     selected_capability_id=cap.cap_id,
                     issuer_chain=self._issuer_chain(cap),
@@ -263,7 +315,30 @@ class CapabilityManager:
                     context=selected_context,
                 )
                 return self._record_decision(decision, audit=audit)
-            if cap.effect == CapabilityEffect.ASK:
+            if not all(bool(item.get("ok")) for item in constraint_results.values()):
+                failed_constraints.append((cap, constraint_results))
+                continue
+            if cap.effect == CapabilityEffect.DENY:
+                # Unconstrained deny still dominates all matching grants. A
+                # deny carrying AuthorityRule constraints is scoped: it only
+                # dominates when those rules match the current operation
+                # context, which lets policy express "deny git push" without
+                # denying every `shell:git` operation.
+                decision = CapabilityDecision(
+                    subject=subject,
+                    resource=resource,
+                    right=requested_right,
+                    allowed=False,
+                    effect=CapabilityEffect.DENY,
+                    reason=f"{subject} denied {requested_right} on {resource}",
+                    matched_capability_ids=matched_ids,
+                    selected_capability_id=cap.cap_id,
+                    issuer_chain=self._issuer_chain(cap),
+                    constraint_results=constraint_results,
+                    context=selected_context,
+                )
+                return self._record_decision(decision, audit=audit)
+            if cap.effect == CapabilityEffect.ASK or constraint_effect == CapabilityEffect.ASK:
                 decision = CapabilityDecision(
                     subject=subject,
                     resource=resource,
@@ -294,6 +369,22 @@ class CapabilityManager:
                     context=selected_context,
                 )
                 return self._record_decision(decision, audit=audit)
+        if failed_constraints:
+            cap, constraint_results = failed_constraints[0]
+            decision = CapabilityDecision(
+                subject=subject,
+                resource=resource,
+                right=requested_right,
+                allowed=False,
+                effect=None,
+                reason=f"capability constraints rejected {requested_right} on {resource}",
+                matched_capability_ids=matched_ids,
+                selected_capability_id=cap.cap_id,
+                issuer_chain=self._issuer_chain(cap),
+                constraint_results=constraint_results,
+                context=selected_context,
+            )
+            return self._record_decision(decision, audit=audit)
         decision = CapabilityDecision(
             subject=subject,
             resource=resource,
@@ -432,9 +523,12 @@ class CapabilityManager:
         if not cap.revocable:
             raise CapabilityDenied(f"capability is not revocable: {cap_id}")
         if require_authority:
-            self._require_revoke_authority(revoked_by, cap)
+            authority_decision = self._require_revoke_authority(revoked_by, cap)
+        else:
+            authority_decision = None
         revoked = replace(cap, status=CapabilityStatus.REVOKED)
         self.store.update_capability(revoked)
+        self._consume_mutation_authority(authority_decision, used_by=revoked_by, reason="one-time revoke authority consumed")
         self.events.emit(
             EventType.CAPABILITY_REVOKED,
             source=revoked_by,
@@ -522,7 +616,7 @@ class CapabilityManager:
         *,
         include_ask: bool = False,
     ) -> list[Capability]:
-        """Return active Capability v2 records that match a canonical request.
+        """Return active Capability records that match a canonical request.
 
         Primitive-specific policy layers sometimes need to inspect matched
         records without treating a broad policy capability as final authority.
@@ -554,6 +648,36 @@ class CapabilityManager:
         decision = self.authorize(subject, resource, right, context)
         return self._decision_json(decision)
 
+    def sandbox_profile_for_decision(
+        self,
+        decision: CapabilityDecision,
+        *,
+        operation: str,
+        risk: str = "medium",
+        rule_id: str | None = None,
+        restrictions: dict[str, Any] | None = None,
+    ) -> SandboxProfile:
+        """Create a primitive-facing profile from a finalized decision.
+
+        The profile is derived from the same decision that authorized the
+        operation. Primitive code can therefore audit and enforce sandbox
+        restrictions without inventing a second, weaker authority model.
+        """
+
+        return SandboxProfile(
+            operation=operation,
+            resource=decision.resource,
+            effect=decision.effect or CapabilityEffect.DENY,
+            risk=self._coerce_risk(risk),
+            rule_id=rule_id,
+            restrictions=dict(restrictions or {}),
+        )
+
+    def constraints_satisfied(self, cap: Capability, context: OperationContext | dict[str, Any] | None = None) -> bool:
+        selected_context = self._context_dict(context)
+        results = self._evaluate_constraints(cap, selected_context)
+        return all(bool(item.get("ok")) for item in results.values()) and self._constraint_effect(results) != CapabilityEffect.DENY
+
     def spec(
         self,
         resource: str,
@@ -573,23 +697,7 @@ class CapabilityManager:
         return self.spec(f"object:{oid}", rights, **kwargs)
 
     def parse_resource_pattern(self, resource: str, *, requested: bool = False) -> ResourcePattern:
-        raw = self._canonical_resource(resource)
-        if raw == "*":
-            raise CapabilityDenied("capability resources must be typed; use '<kind>:*' instead of global '*'")
-        if "*" in raw and not (raw.endswith(":*") or raw.endswith("/*")):
-            raise CapabilityDenied(f"resource wildcard must be terminal and canonical: {resource}")
-        if ":" not in raw:
-            raise CapabilityDenied(f"resource must be typed: {resource}")
-        kind, body = raw.split(":", 1)
-        if not kind or not body:
-            raise CapabilityDenied(f"resource must be typed: {resource}")
-        if raw.endswith(":*"):
-            if requested and raw != resource:
-                raise CapabilityDenied(f"requested resource is not canonical: {resource}")
-            return ResourcePattern(raw=raw, kind=kind, body=body[:-2], scope=ResourceScope.PREFIX)
-        if raw.endswith("/*"):
-            return ResourcePattern(raw=raw, kind=kind, body=body[:-2].rstrip("/"), scope=ResourceScope.SUBTREE)
-        return ResourcePattern(raw=raw, kind=kind, body=body, scope=ResourceScope.EXACT)
+        return self.resources.parse(resource, requested=requested)
 
     def _insert_capability(
         self,
@@ -604,6 +712,7 @@ class CapabilityManager:
         issuer_cap_id: str | None,
         parent_cap_id: str | None,
         delegation_depth: int,
+        max_delegation_depth: int | None,
         expires_at: str | None,
         uses_remaining: int | None,
         delegable: bool,
@@ -616,6 +725,8 @@ class CapabilityManager:
         self._validate_constraints(constraints)
         if uses_remaining is not None and uses_remaining < 1:
             raise ValidationError("uses_remaining must be >= 1 when set")
+        if max_delegation_depth is not None and max_delegation_depth < delegation_depth:
+            raise ValidationError("max_delegation_depth cannot be less than delegation_depth")
         cap = Capability(
             cap_id=new_id("cap"),
             subject=subject,
@@ -631,6 +742,7 @@ class CapabilityManager:
             issuer_cap_id=issuer_cap_id,
             parent_cap_id=parent_cap_id,
             delegation_depth=delegation_depth,
+            max_delegation_depth=max_delegation_depth,
             uses_remaining=uses_remaining,
             status=CapabilityStatus.ACTIVE,
             metadata=dict(metadata),
@@ -651,33 +763,35 @@ class CapabilityManager:
         )
         return cap
 
-    def _require_issue_authority(self, actor: str, spec: CapabilitySpec) -> str | None:
+    def _consume_mutation_authority(self, decision: CapabilityDecision | None, *, used_by: str, reason: str) -> None:
+        if decision is None or decision.consume_capability_id is None:
+            return
+        self.consume_use(decision.consume_capability_id, used_by=used_by, reason=reason)
+
+    def _require_issue_authority(self, actor: str, spec: CapabilitySpec) -> CapabilityDecision | None:
         if self._is_trusted_issuer(actor):
             return None
-        for right in spec.rights:
-            grant = self.authorize(actor, spec.resource, CapabilityRight.GRANT)
-            if grant.allowed:
-                continue
-            admin = self.authorize(actor, spec.resource, CapabilityRight.ADMIN)
-            if admin.allowed:
-                continue
-            raise CapabilityDenied(f"{actor} lacks grant/admin authority to issue {right} on {spec.resource}")
         grant = self.authorize(actor, spec.resource, CapabilityRight.GRANT)
-        return grant.selected_capability_id if grant.allowed else None
+        if grant.allowed:
+            return grant
+        admin = self.authorize(actor, spec.resource, CapabilityRight.ADMIN)
+        if admin.allowed:
+            return admin
+        raise CapabilityDenied(f"{actor} lacks grant/admin authority to issue {sorted(spec.rights)} on {spec.resource}")
 
-    def _require_revoke_authority(self, actor: str, cap: Capability) -> None:
+    def _require_revoke_authority(self, actor: str, cap: Capability) -> CapabilityDecision | None:
         if self._is_trusted_issuer(actor) or actor == cap.issued_by:
-            return
+            return None
         if actor == cap.subject:
             if cap.effect == CapabilityEffect.ALLOW:
-                return
+                return None
             raise CapabilityDenied(f"{actor} cannot self-revoke restrictive capability {cap.cap_id}")
         revoke = self.authorize(actor, cap.resource, CapabilityRight.REVOKE)
         if revoke.allowed:
-            return
+            return revoke
         admin = self.authorize(actor, cap.resource, CapabilityRight.ADMIN)
         if admin.allowed:
-            return
+            return admin
         raise CapabilityDenied(f"{actor} lacks revoke/admin authority for capability {cap.cap_id}")
 
     def _find_delegation_parent(self, parent: str, spec: CapabilitySpec) -> Capability:
@@ -704,10 +818,31 @@ class CapabilityManager:
         if parent_cap.uses_remaining is not None:
             if selected.uses_remaining is None or selected.uses_remaining > parent_cap.uses_remaining:
                 raise CapabilityDenied("delegated capability cannot have broader use count than parent")
-        max_depth = selected.max_delegation_depth or self.config.capability.default_delegation_depth
-        if parent_cap.delegation_depth >= max_depth:
+        parent_max_depth = self._capability_max_delegation_depth(parent_cap)
+        if parent_cap.delegation_depth >= parent_max_depth:
             raise CapabilityDenied("delegation depth exhausted")
+        if selected.max_delegation_depth is not None and selected.max_delegation_depth > parent_max_depth:
+            raise CapabilityDenied("delegated capability cannot increase parent delegation depth")
+        child_max_depth = selected.max_delegation_depth if selected.max_delegation_depth is not None else parent_max_depth
+        if selected.delegable and parent_cap.delegation_depth + 1 >= child_max_depth:
+            raise CapabilityDenied("delegated capability cannot be delegable after depth exhaustion")
         self._require_constraint_attenuation(parent_cap, selected)
+
+    def _initial_max_delegation_depth(self, selected: CapabilitySpec) -> int | None:
+        if selected.max_delegation_depth is not None:
+            return int(selected.max_delegation_depth)
+        if selected.delegable:
+            return self.config.capability.default_delegation_depth
+        return None
+
+    def _delegated_max_delegation_depth(self, parent_cap: Capability, selected: CapabilitySpec) -> int:
+        parent_max_depth = self._capability_max_delegation_depth(parent_cap)
+        return int(selected.max_delegation_depth) if selected.max_delegation_depth is not None else parent_max_depth
+
+    def _capability_max_delegation_depth(self, cap: Capability) -> int:
+        if cap.max_delegation_depth is not None:
+            return int(cap.max_delegation_depth)
+        return self.config.capability.default_delegation_depth
 
     def _matching_capabilities(
         self,
@@ -743,58 +878,99 @@ class CapabilityManager:
         return matches
 
     def _resource_matches(self, granted: str, requested: str) -> bool:
-        try:
-            pattern = self.parse_resource_pattern(granted)
-            request = self.parse_resource_pattern(requested, requested=True)
-        except CapabilityDenied:
-            return False
-        if pattern.scope == ResourceScope.GLOBAL:
-            return True
-        if pattern.kind != request.kind:
-            return False
-        if pattern.scope == ResourceScope.EXACT:
-            return pattern.raw == request.raw
-        if pattern.scope == ResourceScope.PREFIX:
-            if not pattern.body:
-                return request.raw.startswith(f"{pattern.kind}:")
-            return request.raw.startswith(f"{pattern.kind}:{pattern.body}:") or request.raw == f"{pattern.kind}:{pattern.body}"
-        if pattern.scope == ResourceScope.SUBTREE:
-            body = request.body
-            return body == pattern.body or body.startswith(f"{pattern.body}/")
-        return False
+        return self.resources.matches(granted, requested)
 
     def _resource_covers(self, granted: str, requested_pattern: str) -> bool:
-        if granted == requested_pattern:
-            return True
-        try:
-            requested = self.parse_resource_pattern(requested_pattern)
-        except CapabilityDenied:
-            return False
-        if requested.scope in {ResourceScope.PREFIX, ResourceScope.SUBTREE}:
-            return self._resource_matches(granted, requested.raw)
-        return self._resource_matches(granted, requested_pattern)
+        return self.resources.covers(granted, requested_pattern)
 
     def _coerce_spec(self, spec: CapabilitySpec | dict[str, Any]) -> CapabilitySpec:
         if isinstance(spec, CapabilitySpec):
-            return spec
-        if not isinstance(spec, dict):
+            data = {
+                "resource": spec.resource,
+                "rights": list(spec.rights),
+                "effect": spec.effect,
+                "rules": list(spec.rules),
+                "lease": spec.lease,
+                "delegation": spec.delegation,
+                "constraints": dict(spec.constraints),
+                "metadata": dict(spec.metadata),
+                "expires_at": spec.expires_at,
+                "uses_remaining": spec.uses_remaining,
+                "delegable": spec.delegable,
+                "revocable": spec.revocable,
+                "max_delegation_depth": spec.max_delegation_depth,
+            }
+        elif isinstance(spec, dict):
+            data = dict(spec)
+        else:
             raise ValidationError("capability spec must be a mapping")
-        effect = spec.get("effect", CapabilityEffect.ALLOW)
-        policy = spec.get("policy")
-        uses_remaining = spec.get("uses_remaining")
+
+        constraints = dict(data.get("constraints") or {})
+        effect = data.get("effect", CapabilityEffect.ALLOW)
+        policy = data.get("policy")
+        if policy is None:
+            policy = data.get(self.POLICY_KEY)
+        if policy is None:
+            policy = constraints.pop(self.POLICY_KEY, None)
+        else:
+            constraints.pop(self.POLICY_KEY, None)
+        uses_remaining = data.get("uses_remaining")
+        expires_at = data.get("expires_at")
         if policy is not None:
             effect, uses_remaining = self._effect_from_policy(str(policy))
+        lease = data.get("lease")
+        if lease is not None:
+            selected_lease = self._coerce_lease(lease)
+            expires_at = selected_lease.expires_at
+            uses_remaining = selected_lease.uses_remaining
+        delegation = self._coerce_delegation(data.get("delegation"))
+        rules = data.get("rules") or []
+        if rules:
+            constraints[AUTHORITY_RULES_KEY] = [self.rule_codec.to_json(rule) for rule in list(rules)]
         return CapabilitySpec(
-            resource=str(spec["resource"]),
-            rights=self._normalize_rights(spec.get("rights", [CapabilityRight.READ.value])),
+            resource=str(data["resource"]),
+            rights=self._normalize_rights(data.get("rights", [CapabilityRight.READ.value])),
             effect=CapabilityEffect(effect),
-            constraints=dict(spec.get("constraints") or {}),
-            metadata=dict(spec.get("metadata") or {}),
-            expires_at=spec.get("expires_at"),
+            rules=[self.rule_codec.coerce(rule) for rule in list(rules)],
+            lease=CapabilityLease(expires_at=expires_at, uses_remaining=uses_remaining),
+            delegation=delegation,
+            constraints=constraints,
+            metadata=dict(data.get("metadata") or {}),
+            expires_at=expires_at,
             uses_remaining=uses_remaining,
-            delegable=bool(spec.get("delegable", False)),
-            revocable=bool(spec.get("revocable", True)),
-            max_delegation_depth=spec.get("max_delegation_depth"),
+            delegable=delegation.delegable if delegation is not None else bool(data.get("delegable", False)),
+            revocable=delegation.revocable if delegation is not None else bool(data.get("revocable", True)),
+            max_delegation_depth=delegation.max_delegation_depth if delegation is not None else data.get("max_delegation_depth"),
+        )
+
+    def _coerce_lease(self, value: CapabilityLease | dict[str, Any]) -> CapabilityLease:
+        if isinstance(value, CapabilityLease):
+            return value
+        if not isinstance(value, dict):
+            raise ValidationError("capability lease must be a mapping")
+        uses_remaining = value.get("uses_remaining")
+        if uses_remaining is not None:
+            uses_remaining = int(uses_remaining)
+        expires_at = value.get("expires_at")
+        return CapabilityLease(
+            expires_at=str(expires_at) if expires_at is not None else None,
+            uses_remaining=uses_remaining,
+        )
+
+    def _coerce_delegation(self, value: DelegationPolicy | dict[str, Any] | None) -> DelegationPolicy | None:
+        if value is None:
+            return None
+        if isinstance(value, DelegationPolicy):
+            return value
+        if not isinstance(value, dict):
+            raise ValidationError("capability delegation policy must be a mapping")
+        max_depth = value.get("max_delegation_depth")
+        if max_depth is not None and int(max_depth) < 0:
+            raise ValidationError("max_delegation_depth must be >= 0")
+        return DelegationPolicy(
+            delegable=bool(value.get("delegable", False)),
+            revocable=bool(value.get("revocable", True)),
+            max_delegation_depth=int(max_depth) if max_depth is not None else None,
         )
 
     def _normalize_rights(self, rights: Iterable[str | CapabilityRight]) -> set[str]:
@@ -809,10 +985,7 @@ class CapabilityManager:
         return normalized
 
     def _canonical_resource(self, resource: str) -> str:
-        raw = str(resource).strip().replace("\\", "/")
-        while "//" in raw:
-            raw = raw.replace("//", "/")
-        return raw.rstrip("/") if raw.endswith("/") and not raw.endswith(":/") else raw
+        return self.resources.canonical(resource)
 
     def _effect_from_policy_constraint(self, constraints: dict[str, Any]) -> tuple[CapabilityEffect, int | None]:
         return self._effect_from_policy(str(constraints.get(self.POLICY_KEY, self.ALWAYS_ALLOW)))
@@ -828,6 +1001,12 @@ class CapabilityManager:
             return CapabilityEffect.ALLOW, 1
         raise ValueError(f"unknown permission policy: {policy}")
 
+    def _coerce_risk(self, value: str | AuthorityRisk) -> AuthorityRisk:
+        try:
+            return AuthorityRisk(str(value))
+        except ValueError as exc:
+            raise ValidationError(f"unknown authority risk: {value}") from exc
+
     def _validate_constraints(self, constraints: dict[str, Any]) -> None:
         try:
             size = len(json.dumps(constraints, ensure_ascii=False, sort_keys=True).encode("utf-8"))
@@ -835,6 +1014,8 @@ class CapabilityManager:
             raise ValidationError("capability constraints must be JSON-serializable") from exc
         if size > self.config.capability.max_constraints_bytes:
             raise ValidationError("capability constraints exceed configured byte limit")
+        if AUTHORITY_RULES_KEY in constraints:
+            self.rule_codec.coerce_many(constraints[AUTHORITY_RULES_KEY])
 
     def _evaluate_constraints(self, cap: Capability, context: dict[str, Any]) -> dict[str, Any]:
         results: dict[str, Any] = {}
@@ -842,8 +1023,164 @@ class CapabilityManager:
             if key not in self._KNOWN_CONSTRAINT_KEYS:
                 results[key] = {"ok": False, "reason": "unknown constraint key"}
                 continue
+            if key == AUTHORITY_RULES_KEY:
+                try:
+                    rules = self.rule_codec.coerce_many(value)
+                except ValidationError as exc:
+                    results[key] = {"ok": False, "reason": str(exc)}
+                    continue
+                results[key] = self._evaluate_authority_rules(rules, context)
+                continue
             results[key] = {"ok": True, "value": value}
         return results
+
+    def _constraint_effect(self, constraint_results: dict[str, Any]) -> CapabilityEffect | None:
+        effects = {
+            str(result.get("effect"))
+            for result in constraint_results.values()
+            if result.get("effect") is not None
+        }
+        if CapabilityEffect.DENY.value in effects:
+            return CapabilityEffect.DENY
+        if CapabilityEffect.ASK.value in effects:
+            return CapabilityEffect.ASK
+        if CapabilityEffect.ALLOW.value in effects:
+            return CapabilityEffect.ALLOW
+        return None
+
+    def _evaluate_authority_rules(self, rules: list[Any], context: dict[str, Any]) -> dict[str, Any]:
+        operation = str(context.get("authority_operation") or context.get("operation") or "")
+        if not operation:
+            return {"ok": False, "reason": "authority rule requires operation context"}
+        matched = [rule for rule in rules if rule.operation == operation and self._authority_rule_matches(rule, context)]
+        if not matched:
+            return {
+                "ok": False,
+                "reason": "no authority rule matched operation context",
+                "operation": operation,
+                "rule_ids": [rule.rule_id for rule in rules],
+            }
+        deny = next((rule for rule in matched if rule.effect == CapabilityEffect.DENY), None)
+        if deny is not None:
+            return {
+                "ok": False,
+                "effect": CapabilityEffect.DENY.value,
+                "rule_id": deny.rule_id,
+                "risk": deny.risk.value,
+                "operation": operation,
+                "reason": "authority rule denied operation",
+            }
+        ask = next((rule for rule in matched if rule.effect == CapabilityEffect.ASK), None)
+        if ask is not None:
+            return {
+                "ok": True,
+                "effect": CapabilityEffect.ASK.value,
+                "rule_id": ask.rule_id,
+                "risk": ask.risk.value,
+                "operation": operation,
+            }
+        allow = matched[0]
+        return {
+            "ok": True,
+            "effect": CapabilityEffect.ALLOW.value,
+            "rule_id": allow.rule_id,
+            "risk": allow.risk.value,
+            "operation": operation,
+        }
+
+    def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
+        conditions = dict(rule.conditions or {})
+        allowed_conditions = {
+            "argv",
+            "argv_sha256",
+            "match",
+            "regex_token",
+            "cwd",
+            "path",
+            "resource",
+            "right",
+            "endpoint_id",
+            "method_id",
+            "params_sha256",
+            "content_sha256",
+            "timeout_s",
+            "timeout_max_s",
+            "network",
+            "filesystem_intent",
+            "operation",
+            "authority_operation",
+            "recursive",
+            "missing_ok",
+            "overwrite",
+            "parents",
+            "exist_ok",
+        }
+        if any(key not in allowed_conditions for key in conditions):
+            return False
+        if "operation" in conditions and str(context.get("operation")) != str(conditions["operation"]):
+            return False
+        if "authority_operation" in conditions and str(context.get("authority_operation")) != str(conditions["authority_operation"]):
+            return False
+        if "argv" in conditions and not self._argv_condition_matches(conditions, context):
+            return False
+        regex = conditions.get("regex_token")
+        if isinstance(regex, str):
+            import re
+
+            try:
+                pattern = re.compile(regex)
+            except re.error:
+                return False
+            argv = context.get("argv")
+            if not isinstance(argv, list) or not any(pattern.fullmatch(str(token)) for token in argv):
+                return False
+        for key in [
+            "argv_sha256",
+            "cwd",
+            "path",
+            "resource",
+            "right",
+            "endpoint_id",
+            "method_id",
+            "params_sha256",
+            "content_sha256",
+            "network",
+            "filesystem_intent",
+            "recursive",
+            "missing_ok",
+            "overwrite",
+            "parents",
+            "exist_ok",
+        ]:
+            if key in conditions and context.get(key) != conditions[key]:
+                return False
+        if "timeout_s" in conditions:
+            try:
+                if float(context.get("timeout_s")) != float(conditions["timeout_s"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if "timeout_max_s" in conditions:
+            try:
+                if float(context.get("timeout_s")) > float(conditions["timeout_max_s"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _argv_condition_matches(self, conditions: dict[str, Any], context: dict[str, Any]) -> bool:
+        expected = conditions.get("argv")
+        actual = context.get("argv")
+        if not isinstance(expected, list) or not all(isinstance(item, str) for item in expected):
+            return False
+        if not isinstance(actual, list) or not all(isinstance(item, str) for item in actual):
+            return False
+        match = str(conditions.get("match", "exact"))
+        if match == "exact":
+            return actual == expected
+        if match == "prefix":
+            return len(actual) >= len(expected) and actual[: len(expected)] == expected
+        return False
 
     def _require_constraint_attenuation(self, parent_cap: Capability, spec: CapabilitySpec) -> None:
         for key, value in parent_cap.constraints.items():
@@ -924,6 +1261,9 @@ class CapabilityManager:
         return {"preview": text[:limit], "truncated": True}
 
     def _capability_json(self, cap: Capability) -> dict[str, Any]:
+        rules = []
+        if AUTHORITY_RULES_KEY in cap.constraints:
+            rules = [self.rule_codec.to_json(rule) for rule in self.rule_codec.coerce_many(cap.constraints[AUTHORITY_RULES_KEY])]
         return {
             "cap_id": cap.cap_id,
             "subject": cap.subject,
@@ -934,12 +1274,21 @@ class CapabilityManager:
             "issuer_cap_id": cap.issuer_cap_id,
             "parent_cap_id": cap.parent_cap_id,
             "delegation_depth": cap.delegation_depth,
+            "max_delegation_depth": cap.max_delegation_depth,
             "issued_at": cap.issued_at,
             "expires_at": cap.expires_at,
             "uses_remaining": cap.uses_remaining,
             "status": cap.status.value,
             "delegable": cap.delegable,
             "revocable": cap.revocable,
+            "lease": {"expires_at": cap.expires_at, "uses_remaining": cap.uses_remaining},
+            "delegation": {
+                "delegable": cap.delegable,
+                "revocable": cap.revocable,
+                "depth": cap.delegation_depth,
+                "max_depth": cap.max_delegation_depth,
+            },
+            "rules": rules,
             "constraints": cap.constraints,
             "metadata": cap.metadata,
         }

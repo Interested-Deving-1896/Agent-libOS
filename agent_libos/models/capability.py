@@ -32,6 +32,14 @@ class CapabilityStatus(StrEnum):
     DISABLED = "disabled"
 
 
+class AuthorityRisk(StrEnum):
+    HARMLESS = "harmless"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    DESTRUCTIVE = "destructive"
+
+
 class ResourceScope(StrEnum):
     EXACT = "exact"
     SUBTREE = "subtree"
@@ -59,10 +67,48 @@ class OperationContext:
 
 
 @dataclass(frozen=True)
+class AuthorityRule:
+    """Deterministic rule attached to an authority grant or runtime profile."""
+
+    rule_id: str
+    operation: str
+    effect: CapabilityEffect
+    risk: AuthorityRisk
+    conditions: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class CapabilityLease:
+    expires_at: str | None = None
+    uses_remaining: int | None = None
+
+
+@dataclass(frozen=True)
+class DelegationPolicy:
+    delegable: bool = False
+    revocable: bool = True
+    max_delegation_depth: int | None = None
+
+
+@dataclass(frozen=True)
+class SandboxProfile:
+    operation: str
+    resource: str
+    effect: CapabilityEffect
+    risk: AuthorityRisk
+    rule_id: str | None = None
+    restrictions: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class CapabilitySpec:
     resource: str
     rights: set[str]
     effect: CapabilityEffect = CapabilityEffect.ALLOW
+    rules: list[AuthorityRule | dict[str, Any]] = field(default_factory=list)
+    lease: CapabilityLease | dict[str, Any] | None = None
+    delegation: DelegationPolicy | dict[str, Any] | None = None
     constraints: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     expires_at: str | None = None
@@ -115,6 +161,7 @@ class Capability:
     issuer_cap_id: CapabilityID | None = None
     parent_cap_id: CapabilityID | None = None
     delegation_depth: int = 0
+    max_delegation_depth: int | None = None
     uses_remaining: int | None = None
     status: CapabilityStatus = CapabilityStatus.ACTIVE
     metadata: dict[str, Any] = field(default_factory=dict)

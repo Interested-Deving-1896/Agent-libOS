@@ -161,6 +161,7 @@ class SQLiteStore:
                   issuer_cap_id TEXT,
                   parent_cap_id TEXT,
                   delegation_depth INTEGER NOT NULL,
+                  max_delegation_depth INTEGER,
                   uses_remaining INTEGER,
                   status TEXT NOT NULL,
                   metadata_json TEXT NOT NULL
@@ -377,6 +378,7 @@ class SQLiteStore:
             )
             self._ensure_object_namespace_schema()
             self._ensure_process_schema()
+            self._ensure_capability_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_checkpoint_schema()
@@ -659,10 +661,10 @@ class SQLiteStore:
             INSERT INTO capabilities (
                 cap_id, subject, resource, rights_json, constraints_json,
                 issued_by, issued_at, expires_at, delegable, revocable, effect,
-                issuer_cap_id, parent_cap_id, delegation_depth, uses_remaining,
-                status, metadata_json
+                issuer_cap_id, parent_cap_id, delegation_depth, max_delegation_depth,
+                uses_remaining, status, metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cap.cap_id,
@@ -679,6 +681,7 @@ class SQLiteStore:
                 cap.issuer_cap_id,
                 cap.parent_cap_id,
                 cap.delegation_depth,
+                cap.max_delegation_depth,
                 cap.uses_remaining,
                 cap.status.value,
                 dumps(cap.metadata),
@@ -692,8 +695,8 @@ class SQLiteStore:
                SET subject = ?, resource = ?, rights_json = ?, constraints_json = ?,
                    issued_by = ?, issued_at = ?, expires_at = ?, delegable = ?,
                    revocable = ?, effect = ?, issuer_cap_id = ?, parent_cap_id = ?,
-                   delegation_depth = ?, uses_remaining = ?, status = ?,
-                   metadata_json = ?
+                   delegation_depth = ?, max_delegation_depth = ?, uses_remaining = ?,
+                   status = ?, metadata_json = ?
              WHERE cap_id = ?
             """,
             (
@@ -710,6 +713,7 @@ class SQLiteStore:
                 cap.issuer_cap_id,
                 cap.parent_cap_id,
                 cap.delegation_depth,
+                cap.max_delegation_depth,
                 cap.uses_remaining,
                 cap.status.value,
                 dumps(cap.metadata),
@@ -1451,6 +1455,11 @@ class SQLiteStore:
         if "working_directory" not in columns:
             self.conn.execute("ALTER TABLE processes ADD COLUMN working_directory TEXT NOT NULL DEFAULT '.'")
 
+    def _ensure_capability_schema(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
+        if "max_delegation_depth" not in columns:
+            self.conn.execute("ALTER TABLE capabilities ADD COLUMN max_delegation_depth INTEGER")
+
     def _ensure_llm_call_schema(self) -> None:
         self.conn.execute(
             """
@@ -1841,6 +1850,11 @@ class SQLiteStore:
             issuer_cap_id=row["issuer_cap_id"] if "issuer_cap_id" in keys else None,
             parent_cap_id=row["parent_cap_id"] if "parent_cap_id" in keys else None,
             delegation_depth=int(row["delegation_depth"]) if "delegation_depth" in keys else 0,
+            max_delegation_depth=(
+                int(row["max_delegation_depth"])
+                if "max_delegation_depth" in keys and row["max_delegation_depth"] is not None
+                else None
+            ),
             uses_remaining=row["uses_remaining"] if "uses_remaining" in keys else None,
             status=(
                 CapabilityStatus(row["status"])

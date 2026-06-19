@@ -41,7 +41,7 @@ The implementation currently includes:
 - Human queue integration for ordinary questions and per-use approval.
 - Process-private Object Memory namespaces by default, with explicit shared
   namespaces available through capabilities.
-- Structured Capability v2 authority for filesystem, shell, clock, human,
+- Structured Capability authority for filesystem, shell, clock, human,
   process, image, checkpoint, skill, and Object Memory primitives, including
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.

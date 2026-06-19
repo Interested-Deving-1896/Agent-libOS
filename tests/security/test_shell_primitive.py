@@ -1,13 +1,27 @@
 from __future__ import annotations
+import agent_libos.substrate.local as local_substrate
 import pytest
 import tempfile
 from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
+from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
-from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus
+from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate
+
+SHELL_INJECTION_PAYLOADS = [
+    "safe$(printf${IFS}__INJECTED__)",
+    "safe`printf${IFS}__INJECTED__`",
+    "safe;printf${IFS}__INJECTED__",
+    "safe;{printf,__INJECTED__}",
+    "safe;p''rintf${IFS}__INJECTED__",
+    "safe\nprintf${IFS}__INJECTED__",
+    "badhost||printf${IFS}__INJECTED__",
+    "safe;printf${IFS}__INJECTED__${IFS}#",
+    "<(printf${IFS}__INJECTED__)",
+]
 
 class TestShellPrimitive:
     def setup_method(self) -> None:
@@ -48,6 +62,101 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_human_shell_approval_is_bound_to_exact_argv(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='argv-bound shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['git', 'show', '--stat'])
+            runtime.human.drain_terminal_queue(auto_approve=True)
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['git', 'push'])
+            assert provider.calls == []
+            allowed = runtime.shell.run(pid, ['git', 'show', '--stat'])
+            assert allowed.stdout == 'ok\n'
+            assert provider.calls == [(['git', 'show', '--stat'], runtime.config.tools.shell_timeout_s)]
+        finally:
+            runtime.close()
+
+    def test_git_diff_with_output_requires_approval(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='diff output')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['git', 'diff', '--output=patch.diff'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['rule_id'] != 'shell.low.git'
+        finally:
+            runtime.close()
+
+    def test_high_risk_network_command_requires_approval_with_rule_profile(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='network shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['curl', 'https://example.test'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['risk'] == 'high'
+            assert context['rule_id'] == 'shell.network.default'
+            assert context['sandbox_profile']['operation'] == 'shell.run'
+            assert context['sandbox_profile']['restrictions']['network']
+        finally:
+            runtime.close()
+
+    def test_destructive_command_is_denied_even_with_always_allow_policy(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='destructive shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(pid, ['rm', '-rf', 'agent_outputs'])
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_medium_project_code_execution_requires_approval(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='pytest shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['pytest'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['risk'] == 'medium'
+            assert context['rule_id'] == 'shell.medium.pytest'
+        finally:
+            runtime.close()
+
+    def test_allowlist_policy_asks_for_shell_syntax_payloads_in_auto_allow_argv(self) -> None:
+        for payload in SHELL_INJECTION_PAYLOADS:
+            runtime, provider = self._runtime_with_fake_shell()
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='injection payload shell')
+                runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+                with pytest.raises(HumanApprovalRequired):
+                    runtime.shell.run(pid, ['python', '-m', 'compileall', payload])
+                context = runtime.human.pending()[0].payload['context']
+                assert context['rule_id'] == 'shell.syntax.default'
+                assert context['risk'] == 'high'
+                assert provider.calls == []
+            finally:
+                runtime.close()
+
+    def test_always_allow_policy_passes_shell_syntax_payload_as_literal_argv(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            payload = 'safe$(printf${IFS}__INJECTED__)'
+            pid = runtime.process.spawn(image='review-agent:v0', goal='explicit broad shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+            result = runtime.shell.run(pid, ['python', '-m', 'compileall', payload])
+            assert result.stdout == 'ok\n'
+            assert provider.calls == [(['python', '-m', 'compileall', payload], runtime.config.tools.shell_timeout_s)]
+        finally:
+            runtime.close()
+
     def test_always_deny_shell_policy_overrides_exact_command_grant(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:
@@ -69,7 +178,7 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
-    def test_shell_authorization_uses_capability_v2_resource_matching(self) -> None:
+    def test_shell_authorization_uses_capability_resource_matching(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='typed shell matching')
@@ -78,7 +187,27 @@ class TestShellPrimitive:
                 runtime.shell.run(pid, ['git', 'status'])
             runtime.capability.grant(pid, 'shell:git:*', [CapabilityRight.EXECUTE], issued_by='test')
             result = runtime.shell.run(pid, ['git', 'status'])
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(pid, ['git', 'push'])
             assert result.stdout == 'ok\n'
+            assert provider.calls == [(['git', 'status'], runtime.config.tools.shell_timeout_s)]
+        finally:
+            runtime.close()
+
+    def test_request_permission_shell_command_class_is_rule_constrained(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='request git shell')
+            request = runtime.tools.call(pid, 'request_permission', {'resource': 'shell:git', 'rights': ['execute'], 'reason': 'inspect git state'})
+            pending = runtime.human.pending()[0]
+            rules = pending.payload['requested_permission']['constraints']['authority_rules']
+            runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
+            allowed = runtime.shell.run(pid, ['git', 'status'])
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(pid, ['git', 'push', 'origin'])
+            assert request.ok
+            assert any(rule['rule_id'] == 'shell.git.deny.push' for rule in rules)
+            assert allowed.stdout == 'ok\n'
             assert provider.calls == [(['git', 'status'], runtime.config.tools.shell_timeout_s)]
         finally:
             runtime.close()
@@ -199,6 +328,83 @@ class TestShellMatcher:
                 runtime.shell.run(pid, ['tool', 'safe', '--extra'])
         finally:
             runtime.close()
+
+    def test_custom_allow_rule_with_shell_syntax_payload_requires_approval(self) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                rules=(
+                    AuthorityRule(
+                        rule_id='custom.tool.inspect',
+                        operation='shell.run',
+                        effect=CapabilityEffect.ALLOW,
+                        risk=AuthorityRisk.LOW,
+                        conditions={'argv': ['tool', 'inspect'], 'match': 'prefix'},
+                    ),
+                ),
+                whitelist=(),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='custom allow syntax')
+            runtime.shell.grant_policy(pid, config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['tool', 'inspect', 'safe$(printf${IFS}__INJECTED__)'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['rule_id'] == 'shell.syntax.default'
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_custom_allow_rule_cannot_override_script_interpreter_risk(self) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                rules=(
+                    AuthorityRule(
+                        rule_id='custom.bash.allow',
+                        operation='shell.run',
+                        effect=CapabilityEffect.ALLOW,
+                        risk=AuthorityRisk.LOW,
+                        conditions={'argv': ['bash'], 'match': 'prefix'},
+                    ),
+                ),
+                whitelist=(),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='custom bash allow')
+            runtime.shell.grant_policy(pid, config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['bash', '-c', 'printf __INJECTED__'])
+            context = runtime.human.pending()[0].payload['context']
+            assert context['rule_id'] == 'shell.interpreter.default'
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_local_shell_provider_uses_argv_without_shell_interpreter(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        captured: dict[str, Any] = {}
+
+        class Completed:
+            returncode = 0
+            stdout = 'ok\n'
+            stderr = ''
+
+        def fake_run(argv: list[str], **kwargs: Any) -> Completed:
+            captured['argv'] = argv
+            captured['kwargs'] = kwargs
+            return Completed()
+
+        monkeypatch.setattr(local_substrate.subprocess, 'run', fake_run)
+        provider = local_substrate.LocalShellProvider(tmp_path)
+        result = provider.run(['echo', 'safe$(printf${IFS}__INJECTED__)'])
+
+        assert result.stdout == 'ok\n'
+        assert captured['argv'] == ['echo', 'safe$(printf${IFS}__INJECTED__)']
+        assert 'shell' not in captured['kwargs'] or captured['kwargs']['shell'] is False
 
     def _runtime_with_config(self, config: AgentLibOSConfig) -> tuple[Runtime, 'FakeShellProvider']:
         temp_dir = tempfile.TemporaryDirectory()

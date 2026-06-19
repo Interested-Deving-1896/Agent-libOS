@@ -40,7 +40,7 @@ substrate for capability-controlled self-evolution.
    capability-controlled primitives.
 
 2. Implementation.
-   The current prototype implements the model in Python with Capability v2,
+   The current prototype implements the model in Python with Capability,
    Resource Provider Substrate, SQLite persistence, audit/events, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
    image registry/exec/commit primitives, standard `SKILL.md` packages, JSON-RPC over

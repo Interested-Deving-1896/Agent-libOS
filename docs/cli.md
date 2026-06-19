@@ -242,7 +242,7 @@ uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <
 uv run agent-libos --db .agent_libos.sqlite capabilities revoke <capability_id> --reason "no longer needed"
 ```
 
-Capability records are structured v2 authority statements: typed resource
+Capability records are structured authority statements: typed resource
 pattern, rights, `allow`/`deny`/`ask` effect, issuer lineage, delegation depth,
 status, expiry, use count, constraints, and metadata. One-shot approval is
 represented as `effect=allow` with `uses_remaining=1`.

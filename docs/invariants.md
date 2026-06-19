@@ -22,7 +22,7 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   protected resource authority.
 - `primitive-checks-before-effects`: primitives enforce capability, policy,
   approval, and validation before side effects.
-- `capability-v2-matching-and-delegation`: typed matching, deny dominance,
+- `capability-matching-and-delegation`: typed matching, deny dominance,
   one-shot grants, revocation, and delegation attenuation.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority.
@@ -32,6 +32,11 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   resume, consume one-shot grants, and route through primitives.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
   sandboxed, process-local, and syscall-mediated.
+- `command-risk-rules-are-deterministic`: command risk rules separate
+  harmless, risky, and destructive shell operations without model judgment.
+- `sandbox-profile-derived-from-capability-decision`: primitive sandbox
+  profiles are derived from the same capability decision that authorizes the
+  operation.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
   prompt context without granting resources.
 - `checkpoint-restore-and-fork-are-scoped`: checkpoint restore/fork are scoped,

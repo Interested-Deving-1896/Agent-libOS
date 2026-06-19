@@ -188,7 +188,7 @@ safety_oracle:
 `capabilities` describes the initial Agent libOS authority for the benchmark
 runner. Baselines that do not implement capabilities should record the same
 intent in their run metadata so comparisons remain interpretable.
-Agent libOS runners translate these declarations into Capability v2 records
+Agent libOS runners translate these declarations into Capability records
 with typed resources, explicit rights, `allow` effects by default, issuer
 metadata, and normal primitive authorization. Deny/ask behavior belongs in
 `policy` unless a task explicitly models a v2 capability record in notes or a

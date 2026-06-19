@@ -11,7 +11,7 @@ from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
-class TestCapabilityV2Manager:
+class TestCapabilityManager:
 
     def test_typed_resource_matching_rejects_prefix_collision(self) -> None:
         runtime = Runtime.open('local')
@@ -54,18 +54,173 @@ class TestCapabilityV2Manager:
         finally:
             runtime.close()
 
-    def test_permission_policy_constraint_is_converted_not_evaluated_as_runtime_policy(self) -> None:
+    def test_structured_rules_lease_and_delegation_are_canonicalized(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='structured capability spec')
+            cap = runtime.capability.issue(
+                'test',
+                pid,
+                {
+                    'resource': 'shell:git',
+                    'rights': ['execute'],
+                    'rules': [
+                        {
+                            'rule_id': 'test.git.status',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'harmless',
+                            'conditions': {'argv': ['git', 'status'], 'match': 'exact'},
+                        }
+                    ],
+                    'lease': {'uses_remaining': 1},
+                    'delegation': {'delegable': True, 'revocable': False},
+                    'metadata': {'purpose': 'structured spec'},
+                },
+                require_authority=False,
+            )
+            inspected = runtime.capability.inspect(cap.cap_id)
+            assert inspected['rules'][0]['rule_id'] == 'test.git.status'
+            assert inspected['rules'][0]['risk'] == 'harmless'
+            assert inspected['constraints']['authority_rules'][0]['effect'] == 'allow'
+            assert inspected['lease']['uses_remaining'] == 1
+            assert inspected['delegation']['delegable']
+            assert not inspected['delegation']['revocable']
+            assert runtime.capability.permission_policy(pid, 'shell:git', CapabilityRight.EXECUTE) == runtime.capability.MISSING
+            assert runtime.capability.permission_policy(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'status']},
+            ) == runtime.capability.ALLOW_ONCE
+        finally:
+            runtime.close()
+
+    def test_permission_policy_aliases_are_converted_to_effect_and_lease(self) -> None:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='policy conversion')
             converted = runtime.capability.grant(pid, 'object:converted-policy', [CapabilityRight.READ], issued_by='test', constraints={runtime.capability.POLICY_KEY: runtime.capability.ALWAYS_DENY})
-            injected = runtime.capability.issue_trusted(pid, 'object:injected-policy', [CapabilityRight.READ], issued_by='test', constraints={runtime.capability.POLICY_KEY: runtime.capability.ALWAYS_ALLOW})
+            one_shot = runtime.capability.issue_trusted(pid, 'object:one-shot-policy', [CapabilityRight.READ], issued_by='test', constraints={runtime.capability.POLICY_KEY: runtime.capability.ALLOW_ONCE})
             converted_decision = runtime.capability.authorize(pid, 'object:converted-policy', CapabilityRight.READ)
-            injected_decision = runtime.capability.authorize(pid, 'object:injected-policy', CapabilityRight.READ)
+            one_shot_decision = runtime.capability.authorize(pid, 'object:one-shot-policy', CapabilityRight.READ)
             assert converted.effect == CapabilityEffect.DENY
             assert not converted_decision.allowed
-            assert not injected_decision.allowed
-            assert not injected_decision.constraint_results[runtime.capability.POLICY_KEY]['ok']
+            assert runtime.capability.POLICY_KEY not in runtime.capability.inspect(one_shot.cap_id)['constraints']
+            assert one_shot_decision.allowed
+            assert one_shot_decision.consume_capability_id == one_shot.cap_id
+        finally:
+            runtime.close()
+
+    def test_authority_rules_are_enforced_against_operation_context(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='rule constrained shell')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.git.status.only',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'harmless',
+                            'conditions': {'argv': ['git', 'status'], 'match': 'exact'},
+                        }
+                    ]
+                },
+            )
+            allowed = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'status']},
+            )
+            denied = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push']},
+            )
+            assert allowed.allowed
+            assert not denied.allowed
+            assert 'constraints rejected' in denied.reason
+        finally:
+            runtime.close()
+
+    def test_scoped_deny_rule_only_denies_matching_operation_context(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='scoped deny shell')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.git.any',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'low',
+                            'conditions': {'argv': ['git'], 'match': 'prefix'},
+                        }
+                    ]
+                },
+            )
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.git.push.deny',
+                            'operation': 'shell.run',
+                            'effect': 'deny',
+                            'risk': 'high',
+                            'conditions': {'argv': ['git', 'push'], 'match': 'prefix'},
+                        }
+                    ]
+                },
+            )
+            allowed = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'status']},
+            )
+            denied = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push', 'origin']},
+            )
+            assert allowed.allowed
+            assert not denied.allowed
+            assert denied.effect == CapabilityEffect.DENY
+            assert denied.constraint_results['authority_rules']['rule_id'] == 'test.git.push.deny'
+        finally:
+            runtime.close()
+
+    def test_one_shot_grant_authority_is_consumed_after_successful_issue(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            issuer = runtime.process.spawn(image='base-agent:v0', goal='issuer')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            grant_cap = runtime.capability.grant_once(issuer, 'object:alpha', [CapabilityRight.GRANT], issued_by='test')
+            issued = runtime.capability.issue(issuer, subject, CapabilitySpec(resource='object:alpha', rights={CapabilityRight.READ.value}))
+            assert runtime.capability.check(subject, 'object:alpha', CapabilityRight.READ)
+            assert issued.issuer_cap_id == grant_cap.cap_id
+            assert runtime.capability.inspect(grant_cap.cap_id)['status'] == 'revoked'
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(issuer, subject, CapabilitySpec(resource='object:alpha', rights={CapabilityRight.WRITE.value}))
         finally:
             runtime.close()
 
@@ -122,6 +277,32 @@ class TestCapabilityV2Manager:
         finally:
             runtime.close()
 
+    def test_delegation_cannot_increase_parent_max_depth(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            child = runtime.spawn_child_process(parent, 'child')
+            runtime.capability.issue(
+                'test',
+                parent,
+                {
+                    'resource': 'object:limited',
+                    'rights': ['read'],
+                    'delegation': {'delegable': True, 'max_delegation_depth': 1},
+                },
+                require_authority=False,
+            )
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.delegate(
+                    parent,
+                    child,
+                    CapabilitySpec(resource='object:limited', rights={CapabilityRight.READ.value}, max_delegation_depth=10),
+                )
+            delegated = runtime.capability.delegate(parent, child, CapabilitySpec(resource='object:limited', rights={CapabilityRight.READ.value}))
+            assert delegated.max_delegation_depth == 1
+        finally:
+            runtime.close()
+
     def test_revoke_requires_holder_issuer_or_revoke_authority(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -148,7 +329,7 @@ class TestCapabilityV2Manager:
         finally:
             runtime.close()
 
-class TestCapabilityV2RuntimeInterface:
+class TestCapabilityRuntimeInterface:
 
     def test_default_images_expose_only_low_risk_capability_tools(self) -> None:
         runtime = Runtime.open('local')

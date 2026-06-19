@@ -8,7 +8,7 @@ budgets.
 The paper frames this process model as the substrate for self-evolving agents:
 a process can change visible tools, activate Skills, register process-local JIT
 tools, register or exec AgentImages, fork children, and fork from checkpoints,
-while resource authority remains separate in Capability v2.
+while resource authority remains separate in Capability.
 
 ## Process Lifecycle
 
@@ -96,7 +96,11 @@ results = await runtime.arun_until_idle(max_quanta=1, process_human_queue=False)
 Human interaction is modeled as runtime objects, not raw prompt text.
 
 - `ask_human` creates a blocking question.
-- `request_permission` creates a policy or approval request.
+- `request_permission` creates a scoped policy request with canonical resource,
+  risk, resource scope, lease shape, and constraints shown to the human. Model
+  requests cannot ask for broad high-risk grants such as `shell:*` execute or
+  root/global filesystem write such as `filesystem:/:*`; workspace write remains
+  a human-approvable scope.
 - `human_output` writes through the HumanObject primitive and provider.
 - Per-use approvals can create one-shot capabilities that are consumed after
   one successful primitive call.

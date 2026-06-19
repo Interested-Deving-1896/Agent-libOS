@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from agent_libos.capability.profiles import SandboxProfileBuilder
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import SandboxError
 from agent_libos.models import ValidationResult
@@ -114,6 +115,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         self.max_stdout_bytes = max_stdout_bytes
         self.max_stderr_bytes = max_stderr_bytes
         self.jsr_allowlist = tuple(jsr_allowlist)
+        self.profile_builder = SandboxProfileBuilder()
 
     def static_check(self, source_code: str) -> ValidationResult:
         errors: list[str] = []
@@ -212,6 +214,7 @@ class DenoTypescriptSandbox(SandboxBackend):
             "language": "typescript",
             "imports": self._extract_imports(source_code),
             "jsr_allowlist": list(self.jsr_allowlist),
+            "sandbox_profile": self._profile_json(self.profile_builder.deno_jit()),
         }
         try:
             metadata["deno_version"] = self.deno_version()
@@ -407,6 +410,16 @@ class DenoTypescriptSandbox(SandboxBackend):
                 f"Deno executable not found: {candidate!r}. Install Deno or configure tools.deno_executable."
             )
         return resolved
+
+    def _profile_json(self, profile: Any) -> dict[str, Any]:
+        return {
+            "operation": profile.operation,
+            "resource": profile.resource,
+            "effect": profile.effect.value,
+            "risk": profile.risk.value,
+            "rule_id": profile.rule_id,
+            "restrictions": dict(profile.restrictions),
+        }
 
     def _runner_source(self) -> str:
         return textwrap.dedent(

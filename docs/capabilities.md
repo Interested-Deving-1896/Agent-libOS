@@ -10,7 +10,7 @@ without implicitly changing what resources they can affect.
 
 ## Capability Record
 
-Capability v2 records are structured authority statements:
+Capability records are structured authority statements:
 
 - `subject`: process or runtime actor that holds the authority.
 - `resource`: canonical typed resource pattern.
@@ -20,7 +20,7 @@ Capability v2 records are structured authority statements:
 - `issuer_cap_id` and `parent_cap_id`: lineage for grant/delegation decisions.
 - `delegation_depth`: attenuation depth from a parent capability.
 - `issued_at`, `expires_at`, `uses_remaining`, and `status`.
-- `constraints` and `metadata`.
+- `rules`, `lease`, `delegation`, `constraints`, and `metadata`.
 
 One-shot authority is not encoded as a policy string. It is an `allow`
 capability with `uses_remaining=1`; successful primitive use consumes it and
@@ -120,9 +120,25 @@ Unknown constraint keys fail closed. Primitive-specific evaluators can define
 new constraint keys, but the default manager does not silently ignore unknown
 policy language.
 
+## Authority Rules And Profiles
+
+Capabilities can carry deterministic `AuthorityRule` entries. A rule has:
+
+- `operation`, such as `filesystem.read`, `shell.run`, `jsonrpc.call`, or
+  `deno.syscall`;
+- `effect`: `allow`, `ask`, or `deny`;
+- `risk`: `harmless`, `low`, `medium`, `high`, or `destructive`;
+- structured `conditions`, such as argv tokens, match mode, path/cwd intent,
+  network intent, and filesystem intent.
+
+Rules are not LLM judgments. They are local, deterministic policy facts. Unknown
+rule shapes or unknown constraint keys fail closed. The primitive converts the
+final capability decision into a sandbox profile and records that profile in
+approval context, audit, and external-effect metadata where applicable.
+
 ## Issue, Delegate, Revoke
 
-All authority mutation goes through explicit v2 operations:
+All authority mutation goes through explicit operations:
 
 - `issue(actor, subject, spec)`: `actor` must be trusted, or hold covering
   `grant` or `admin` authority for the target resource.
@@ -153,13 +169,23 @@ Human-facing policy names are still used at prompts and CLI boundaries:
 - `ask_each_time` maps to `effect=ask`.
 - `allow_once` maps to `effect=allow, uses_remaining=1`.
 
+Model-facing `request_permission` is not a raw grant API. Before a request enters
+the human queue, the runtime canonicalizes the resource, normalizes rights,
+classifies risk, records resource scope, attaches any deterministic constraints,
+and shows the selected lease shape. Ordinary model requests cannot ask for broad
+high-risk authority such as `shell:*` execute or root/global filesystem write
+such as `filesystem:/:*` or `filesystem:*`. Workspace-level write
+(`filesystem:workspace:*`) can be approved by the human. Admin CLI and bootstrap
+paths can still issue broader policy explicitly, with audit.
+
 When `ask_each_time` applies, the primitive creates a human approval request and
 waits inside the operation. The caller eventually receives either the final
 payload or a final denial error; there is no exposed pending/retry syscall
 protocol.
 
 Approval context includes path, resource, overwrite risk, byte count, SHA-256,
-target state, argv, and escaped previews when available.
+target state, argv, risk, rule id, sandbox profile, and escaped previews when
+available.
 
 ## Tool, Skill, And JIT Boundary
 
@@ -253,21 +279,49 @@ command chaining must be requested explicitly through an interpreter executable
 such as `bash`, `sh`, `cmd`, or `powershell`, where policy matching can inspect
 the interpreter token.
 
-The built-in shell policy levels are:
+Shell command risk is classified by argv-token rules before the provider runs:
+
+- `harmless`: read-only status/version/inspection commands such as
+  `git status --short` or `python --version`.
+- `low`: read-only project inspection such as `git diff`, pytest collection, or
+  `python -m compileall`.
+- `medium`: project code execution such as `pytest`, `npm test`, or
+  `uv run ...`.
+- `high`: package managers, network-capable tools, script interpreters, service
+  startup, and other commands likely to change host state or cross a boundary.
+- `destructive`: delete/move/permission/system-control operations. These are
+  denied by the built-in rule set even under broad shell policy.
+
+The built-in shell policy levels then decide how to handle the classified rule:
 
 - `always_deny`: reject every shell command.
-- `allowlist_auto_else_ask`: allow configured safe argv rules, ask otherwise.
-- `blocklist_ask_else_auto`: ask for configured risky argv rules, allow others.
-- `always_allow`: allow all commands. This is intentionally high risk.
+- `allowlist_auto_else_ask`: allow `allow` rules and ask for `ask` rules.
+- `blocklist_ask_else_auto`: use the same deterministic risk rules but is
+  intended for broader local operation.
+- `always_allow`: allow non-destructive commands while still reporting risk.
 
-Allow and block lists match tokenized argv rules, not arbitrary substrings.
-Bare executable names do not match path-qualified executables by accident.
+Rules match tokenized argv, not arbitrary substrings. Bare executable names do
+not match path-qualified executables by accident. The local provider executes
+the argv vector directly with `shell=False`; the primitive never rebuilds a shell
+command string from model input. As defense in depth, non-`always_allow`
+automatic allow rules downgrade to human approval when argv tokens contain shell
+metasyntax such as command substitution, backticks, separators, newlines,
+redirection/process substitution, brace expansion, or comments.
 Direct command capabilities such as `shell:git` or `shell:git:*` can allow a
-specific normalized executable. A bare `shell:* allow` capability is not treated
-as direct command authority; whole-shell authority must be represented as a
-policy capability carrying `shell_policy_level`, so the primitive can still
-apply the four-level shell policy semantics. Broad `deny` and `ask` records
-remain conservative constraints.
+specific normalized executable, but a bare direct command grant is intentionally
+limited: without `authority_rules`, it only covers argv that the deterministic
+classifier already marks `allow`. Medium/high shell side effects need explicit
+rules, per-use human approval, or a human/admin-issued shell policy. A bare
+`shell:* allow` capability is not treated as direct command authority;
+whole-shell authority must be represented as a policy capability carrying
+`shell_policy_level`, so the primitive can still apply the four-level shell
+policy semantics. Broad `deny` and `ask` records remain conservative
+constraints.
+
+Scoped denies are supported with `AuthorityRule` constraints. An unconstrained
+deny still dominates all matching grants; a constrained deny dominates only when
+its rule matches the current operation context, so policy can allow read-only
+`git` inspection while denying `git push`.
 
 Block-list checks also scan nested executable-looking argv tokens such as
 `bash`, `powershell`, `python`, or `curl`.

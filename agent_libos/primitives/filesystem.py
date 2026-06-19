@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.models import Capability, CapabilityRight, EventType
+from agent_libos.models import AuthorityRisk, Capability, CapabilityEffect, CapabilityRight, EventType
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
@@ -273,7 +274,7 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path is not a file: {relative}")
         if target_state.exists and not overwrite:
             raise FileExistsError(f"file already exists: {relative}")
-        consumed_once = self._require_write(
+        consume_capability_id = self._require_write(
             pid=pid,
             resource=resource,
             target=target,
@@ -321,12 +322,11 @@ class FilesystemAdapter:
                 audit_record=audit_record,
             )
         finally:
-            if consumed_once:
-                self.capabilities.consume_allow_once(
-                    subject=pid,
-                    resource=resource,
-                    right=CapabilityRight.WRITE,
+            if consume_capability_id is not None:
+                self.capabilities.consume_use(
+                    consume_capability_id,
                     used_by="filesystem",
+                    reason="one-time filesystem write permission consumed",
                 )
         return FileWriteResult(path=relative, bytes_written=bytes_written, created=created)
 
@@ -433,7 +433,7 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path is not a directory: {relative}")
         if target_state.exists and not exist_ok:
             raise FileExistsError(f"directory already exists: {relative}")
-        consumed_once = self._require_write_operation(
+        consume_capability_id = self._require_write_operation(
             pid=pid,
             resource=resource,
             target=target,
@@ -481,12 +481,11 @@ class FilesystemAdapter:
                 audit_record=audit_record,
             )
         finally:
-            if consumed_once:
-                self.capabilities.consume_allow_once(
-                    subject=pid,
-                    resource=resource,
-                    right=CapabilityRight.WRITE,
+            if consume_capability_id is not None:
+                self.capabilities.consume_use(
+                    consume_capability_id,
                     used_by="filesystem",
+                    reason="one-time filesystem write permission consumed",
                 )
         return DirectoryWriteResult(path=relative, created=created)
 
@@ -518,7 +517,7 @@ class FilesystemAdapter:
             raise NotFound(f"file does not exist: {relative}")
         if target_state.exists and target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
-        consumed_once = self._require_delete(
+        consume_capability_id = self._require_delete(
             pid=pid,
             resource=resource,
             target=target,
@@ -561,12 +560,11 @@ class FilesystemAdapter:
             )
             return DeleteResult(path=relative, kind="file", deleted=True)
         finally:
-            if consumed_once:
-                self.capabilities.consume_allow_once(
-                    subject=pid,
-                    resource=resource,
-                    right=CapabilityRight.DELETE,
+            if consume_capability_id is not None:
+                self.capabilities.consume_use(
+                    consume_capability_id,
                     used_by="filesystem",
+                    reason="one-time filesystem delete permission consumed",
                 )
 
     def delete_directory(
@@ -600,7 +598,7 @@ class FilesystemAdapter:
             raise NotFound(f"directory does not exist: {relative}")
         if target_state.exists and target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
-        consumed_once = self._require_delete(
+        consume_capability_id = self._require_delete(
             pid=pid,
             resource=resource,
             target=target,
@@ -653,12 +651,11 @@ class FilesystemAdapter:
             )
             return DeleteResult(path=relative, kind="directory", deleted=True, recursive=recursive)
         finally:
-            if consumed_once:
-                self.capabilities.consume_allow_once(
-                    subject=pid,
-                    resource=resource,
-                    right=CapabilityRight.DELETE,
+            if consume_capability_id is not None:
+                self.capabilities.consume_use(
+                    consume_capability_id,
                     used_by="filesystem",
+                    reason="one-time filesystem delete permission consumed",
                 )
 
     def grant_workspace(
@@ -879,7 +876,7 @@ class FilesystemAdapter:
         primitive: str,
         question: str,
         extra_context: dict[str, Any] | None = None,
-    ) -> bool:
+    ) -> str | None:
         operation_context = self._operation_context(
             pid=pid,
             resource=resource,
@@ -890,14 +887,12 @@ class FilesystemAdapter:
             right=CapabilityRight.WRITE.value,
             extra=extra_context or {},
         )
-        policy = self.capabilities.permission_policy(pid, resource, CapabilityRight.WRITE, operation_context)
-        if policy == CapabilityManager.ALWAYS_ALLOW:
-            return False
-        if policy == CapabilityManager.ALLOW_ONCE:
-            return True
-        if policy == CapabilityManager.ALWAYS_DENY:
+        decision = self.capabilities.authorize(pid, resource, CapabilityRight.WRITE, operation_context)
+        if decision.allowed:
+            return decision.consume_capability_id
+        if decision.policy == CapabilityManager.ALWAYS_DENY:
             raise CapabilityDenied(f"{pid} denied write on {resource}")
-        if policy == CapabilityManager.ASK_EACH_TIME:
+        if decision.policy == CapabilityManager.ASK_EACH_TIME:
             if self.human is None:
                 raise CapabilityDenied(f"{pid} requires human approval for write on {resource}")
             # This primitive has the concrete path, overwrite state, byte count,
@@ -912,6 +907,7 @@ class FilesystemAdapter:
                         "subject": pid,
                         "resource": resource,
                         "rights": [CapabilityRight.WRITE.value],
+                        "constraints": self._approval_constraints(operation_context, right=CapabilityRight.WRITE.value),
                     },
                     "context": {
                         **operation_context,
@@ -934,7 +930,7 @@ class FilesystemAdapter:
         operation: str,
         recursive: bool,
         missing_ok: bool,
-    ) -> bool:
+    ) -> str | None:
         operation_context = self._operation_context(
             pid=pid,
             resource=resource,
@@ -945,14 +941,12 @@ class FilesystemAdapter:
             right=CapabilityRight.DELETE.value,
             extra={"recursive": recursive, "missing_ok": missing_ok},
         )
-        policy = self.capabilities.permission_policy(pid, resource, CapabilityRight.DELETE, operation_context)
-        if policy == CapabilityManager.ALWAYS_ALLOW:
-            return False
-        if policy == CapabilityManager.ALLOW_ONCE:
-            return True
-        if policy == CapabilityManager.ALWAYS_DENY:
+        decision = self.capabilities.authorize(pid, resource, CapabilityRight.DELETE, operation_context)
+        if decision.allowed:
+            return decision.consume_capability_id
+        if decision.policy == CapabilityManager.ALWAYS_DENY:
             raise CapabilityDenied(f"{pid} denied delete on {resource}")
-        if policy == CapabilityManager.ASK_EACH_TIME:
+        if decision.policy == CapabilityManager.ASK_EACH_TIME:
             if self.human is None:
                 raise CapabilityDenied(f"{pid} requires human approval for delete on {resource}")
             request_id = self.human.query(
@@ -965,6 +959,7 @@ class FilesystemAdapter:
                         "subject": pid,
                         "resource": resource,
                         "rights": [CapabilityRight.DELETE.value],
+                        "constraints": self._approval_constraints(operation_context, right=CapabilityRight.DELETE.value),
                     },
                     "context": operation_context,
                 },
@@ -989,16 +984,25 @@ class FilesystemAdapter:
     ) -> dict[str, Any]:
         target_state = self._target_state(target)
         will_overwrite = bool(target_state["exists"] and target_state["kind"] == "file")
+        profile = self.capabilities.profiles.filesystem(
+            resource=resource,
+            right=right,
+            effect=CapabilityEffect.ASK,
+            risk=self._risk_for_filesystem_right(right),
+            path=relative,
+        )
         return {
             "adapter": "filesystem",
             "primitive": primitive,
             "operation": operation,
+            "authority_operation": f"filesystem.{right}",
             "pid": pid,
             "workspace_root": self.root,
             "path": relative,
             "absolute_path": target.display,
             "resource": resource,
             "right": right,
+            "sandbox_profile": self._profile_json(profile),
             "grant_scope": "one_time",
             "will_create": not target_state["exists"],
             "will_overwrite": will_overwrite,
@@ -1017,17 +1021,67 @@ class FilesystemAdapter:
         right: str,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        profile = self.capabilities.profiles.filesystem(
+            resource=resource,
+            right=right,
+            effect=CapabilityEffect.ALLOW,
+            risk=self._risk_for_filesystem_right(right),
+            path=relative,
+        )
         return {
             "adapter": "filesystem",
             "primitive": primitive,
             "operation": operation,
+            "authority_operation": f"filesystem.{right}",
             "pid": pid,
             "workspace_root": self.root,
             "path": relative,
             "resource": resource,
             "right": right,
+            "sandbox_profile": self._profile_json(profile),
             **(extra or {}),
         }
+
+    def _approval_constraints(self, context: dict[str, Any], *, right: str) -> dict[str, Any]:
+        condition_keys = [
+            "path",
+            "content_sha256",
+            "overwrite",
+            "parents",
+            "exist_ok",
+            "recursive",
+            "missing_ok",
+        ]
+        conditions = {key: context[key] for key in condition_keys if key in context}
+        return {
+            AUTHORITY_RULES_KEY: [
+                {
+                    "rule_id": f"filesystem.approval.{right}",
+                    "operation": f"filesystem.{right}",
+                    "effect": CapabilityEffect.ALLOW.value,
+                    "risk": self._risk_for_filesystem_right(right).value,
+                    "conditions": conditions,
+                    "description": "one-shot human approval for exact filesystem operation",
+                }
+            ]
+        }
+
+    def _profile_json(self, profile: Any) -> dict[str, Any]:
+        return {
+            "operation": profile.operation,
+            "resource": profile.resource,
+            "effect": profile.effect.value,
+            "risk": profile.risk.value,
+            "rule_id": profile.rule_id,
+            "restrictions": profile.restrictions,
+        }
+
+    def _risk_for_filesystem_right(self, right: str) -> AuthorityRisk:
+        if right == CapabilityRight.DELETE.value:
+            return AuthorityRisk.DESTRUCTIVE
+        if right == CapabilityRight.WRITE.value:
+            return AuthorityRisk.HIGH
+        return AuthorityRisk.LOW
 
     def _content_context(self, text: str, encoding: str) -> dict[str, Any]:
         encoded = text.encode(encoding)

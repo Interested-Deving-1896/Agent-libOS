@@ -9,4 +9,4 @@ allowed-tools: {}
 
 This benchmark skill registers a TypeScript JIT tool. The tool uses
 `libos.syscall("filesystem.read_text", ...)`; the syscall must still be checked
-by Capability v2.
+by Capability.

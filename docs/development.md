@@ -158,7 +158,7 @@ Current behavior must not claim:
 Preserve the boundary:
 
 - model-facing tools call primitives;
-- primitives perform Capability v2 authorization, policy, approval, events, and audit;
+- primitives perform Capability authorization, policy, approval, events, and audit;
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
 - Skills change visibility and prompt materialization only;

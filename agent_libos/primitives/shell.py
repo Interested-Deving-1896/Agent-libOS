@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import os
 import asyncio
+import hashlib
 import subprocess
 from dataclasses import dataclass
 from pathlib import PurePath
 from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY, ShellRuleEngine
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellPolicyLevel
-from agent_libos.models import Capability, CapabilityEffect, CapabilityRight, EventType
+from agent_libos.models import AuthorityRisk, AuthorityRule, Capability, CapabilityEffect, CapabilityRight, EventType, SandboxProfile
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -34,6 +36,11 @@ class ShellPolicyDecision:
     matched_rule: tuple[str, ...] | None = None
     high_risk: bool = False
     consume_once: bool = False
+    consume_capability_id: str | None = None
+    risk: AuthorityRisk = AuthorityRisk.MEDIUM
+    rule_id: str | None = None
+    rule_effect: CapabilityEffect = CapabilityEffect.ASK
+    sandbox_profile: SandboxProfile | None = None
 
 
 class ShellAdapter:
@@ -60,6 +67,7 @@ class ShellAdapter:
         self.events = events
         self.human = human
         self.provider = provider or LocalShellProvider(cwd or ".")
+        self.rule_engine = ShellRuleEngine(self._configured_rules())
 
     def run(
         self,
@@ -71,7 +79,8 @@ class ShellAdapter:
         checked = self._validate_argv(argv)
         selected_timeout = self._validate_timeout(timeout)
         resource = self.resource_for(checked)
-        decision = self._authorize(pid, checked, resource, timeout=selected_timeout)
+        selected_cwd = os.fspath(cwd) if cwd is not None else "."
+        decision = self._authorize(pid, checked, resource, timeout=selected_timeout, cwd=selected_cwd)
         if decision.ask_human:
             self._request_human_approval(pid, checked, resource, decision, timeout=selected_timeout, cwd=cwd)
         if not decision.allowed:
@@ -83,6 +92,10 @@ class ShellAdapter:
             "cwd": os.fspath(cwd) if cwd is not None else None,
             "policy_level": decision.policy_level,
             "high_risk": decision.high_risk,
+            "risk": decision.risk.value,
+            "rule_id": decision.rule_id,
+            "rule_effect": decision.rule_effect.value,
+            "sandbox_profile": self._profile_json(decision.sandbox_profile),
         }
         require_external_effect_classifier(self.provider, "run")
         try:
@@ -101,12 +114,12 @@ class ShellAdapter:
             raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
         finally:
             if decision.consume_once:
-                self.capabilities.consume_allow_once(
-                    subject=pid,
-                    resource=resource,
-                    right=CapabilityRight.EXECUTE,
-                    used_by="shell",
-                )
+                if decision.consume_capability_id is not None:
+                    self.capabilities.consume_use(
+                        decision.consume_capability_id,
+                        used_by="shell",
+                        reason="one-time shell permission consumed",
+                    )
         event = self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd)
         audit_record = self.audit.record(
             actor=pid,
@@ -119,6 +132,9 @@ class ShellAdapter:
                 "policy_reason": decision.reason,
                 "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
                 "high_risk": decision.high_risk,
+                "risk": decision.risk.value,
+                "rule_id": decision.rule_id,
+                "sandbox_profile": self._profile_json(decision.sandbox_profile),
                 "cwd": os.fspath(cwd) if cwd is not None else None,
                 "stdout_truncated": proc.stdout_truncated,
                 "stderr_truncated": proc.stderr_truncated,
@@ -175,8 +191,20 @@ class ShellAdapter:
         command = self._command_identity(argv[0])
         return f"shell:{command}"
 
-    def _authorize(self, pid: str, argv: list[str], resource: str, *, timeout: float) -> ShellPolicyDecision:
-        policy_caps = self._matching_shell_policy_caps(pid, resource)
+    def _authorize(self, pid: str, argv: list[str], resource: str, *, timeout: float, cwd: str) -> ShellPolicyDecision:
+        rule_match = self.rule_engine.classify(argv)
+        rule = rule_match.rule
+        profile = self.capabilities.profiles.shell(
+            resource=resource,
+            effect=rule.effect,
+            risk=rule.risk,
+            rule_id=rule.rule_id,
+            argv=argv,
+            timeout_s=timeout,
+            cwd=cwd,
+        )
+        operation_context = self._operation_context(pid, argv, resource, timeout=timeout, cwd=cwd, profile=profile)
+        policy_caps = self._matching_shell_policy_caps(pid, resource, operation_context)
         if any(
             cap.effect == CapabilityEffect.DENY
             or
@@ -188,58 +216,99 @@ class ShellAdapter:
                 ask_human=False,
                 reason="shell policy is always_deny",
                 policy_level=self.config.shell.always_deny_level,
+                matched_rule=rule_match.matched_argv,
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        if rule.effect == CapabilityEffect.DENY:
+            return ShellPolicyDecision(
+                allowed=False,
+                ask_human=False,
+                reason=rule.description or "shell rule denied command",
+                policy_level=None,
+                matched_rule=rule_match.matched_argv,
+                high_risk=True,
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
             )
 
-        explicit_decision = self._explicit_command_decision(pid, resource)
-        if explicit_decision == CapabilityManager.ALWAYS_DENY:
-            return ShellPolicyDecision(False, False, "explicit command capability denied command", explicit_decision)
-        if explicit_decision == CapabilityManager.ASK_EACH_TIME:
-            return ShellPolicyDecision(False, True, "explicit command capability requires approval", explicit_decision)
-        if explicit_decision in {CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALLOW_ONCE}:
+        explicit_decision = self._explicit_command_decision(pid, resource, operation_context)
+        explicit_policy = explicit_decision.policy
+        if explicit_policy == CapabilityManager.ALWAYS_DENY:
+            return ShellPolicyDecision(
+                False,
+                False,
+                "explicit command capability denied command",
+                explicit_policy,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        if explicit_policy == CapabilityManager.ASK_EACH_TIME:
+            return ShellPolicyDecision(
+                False,
+                True,
+                "explicit command capability requires approval",
+                explicit_policy,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        if explicit_policy in {CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALLOW_ONCE}:
             return ShellPolicyDecision(
                 allowed=True,
                 ask_human=False,
                 reason="explicit command capability allowed command",
-                policy_level=explicit_decision,
-                consume_once=explicit_decision == CapabilityManager.ALLOW_ONCE,
+                policy_level=explicit_policy,
+                consume_once=explicit_decision.consume_capability_id is not None,
+                consume_capability_id=explicit_decision.consume_capability_id,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
             )
 
         if not policy_caps:
             raise CapabilityDenied(f"{pid} lacks shell execute policy for {resource}")
 
         level = self._selected_policy_level(policy_caps)
-        whitelist_match = self._first_matching_rule(argv, self.config.shell.whitelist, allow_bare_only=True)
-        blacklist_match = self._first_matching_blacklist_rule(argv)
-
-        if level == self.config.shell.allowlist_auto_else_ask_level:
-            if whitelist_match is not None:
+        if level in {self.config.shell.allowlist_auto_else_ask_level, self.config.shell.blocklist_ask_else_auto_level}:
+            if rule.effect == CapabilityEffect.ALLOW:
                 return ShellPolicyDecision(
                     allowed=True,
                     ask_human=False,
-                    reason="command matched shell whitelist",
+                    reason=rule.description or "shell rule allowed command",
                     policy_level=level,
-                    matched_rule=whitelist_match.argv,
+                    matched_rule=rule_match.matched_argv,
+                    high_risk=self._is_high_risk(rule.risk),
+                    risk=rule.risk,
+                    rule_id=rule.rule_id,
+                    rule_effect=rule.effect,
+                    sandbox_profile=profile,
                 )
             return ShellPolicyDecision(
                 allowed=False,
                 ask_human=True,
-                reason="command did not match shell whitelist",
+                reason=rule.description or "shell rule requires approval",
                 policy_level=level,
-            )
-        if level == self.config.shell.blocklist_ask_else_auto_level:
-            if blacklist_match is not None:
-                return ShellPolicyDecision(
-                    allowed=False,
-                    ask_human=True,
-                    reason="command matched shell blacklist",
-                    policy_level=level,
-                    matched_rule=blacklist_match.argv,
-                )
-            return ShellPolicyDecision(
-                allowed=True,
-                ask_human=False,
-                reason="command did not match shell blacklist",
-                policy_level=level,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
             )
         if level == self.config.shell.always_allow_level:
             return ShellPolicyDecision(
@@ -247,9 +316,25 @@ class ShellAdapter:
                 ask_human=False,
                 reason="shell policy is always_allow",
                 policy_level=level,
-                high_risk=True,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
             )
-        return ShellPolicyDecision(False, False, f"unsupported shell policy level: {level}", level)
+        return ShellPolicyDecision(
+            False,
+            False,
+            f"unsupported shell policy level: {level}",
+            level,
+            matched_rule=rule_match.matched_argv,
+            high_risk=self._is_high_risk(rule.risk),
+            risk=rule.risk,
+            rule_id=rule.rule_id,
+            rule_effect=rule.effect,
+            sandbox_profile=profile,
+        )
 
     def _request_human_approval(
         self,
@@ -273,6 +358,7 @@ class ShellAdapter:
                     "subject": pid,
                     "resource": resource,
                     "rights": [CapabilityRight.EXECUTE.value],
+                    "constraints": self._approval_constraints(argv, decision, timeout=timeout, cwd=os.fspath(cwd) if cwd is not None else "."),
                 },
                 "context": {
                     "adapter": "shell",
@@ -291,6 +377,10 @@ class ShellAdapter:
                     "policy_reason": decision.reason,
                     "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
                     "high_risk": decision.high_risk,
+                    "risk": decision.risk.value,
+                    "rule_id": decision.rule_id,
+                    "rule_effect": decision.rule_effect.value,
+                    "sandbox_profile": self._profile_json(decision.sandbox_profile),
                 },
             },
             blocking=True,
@@ -323,11 +413,115 @@ class ShellAdapter:
                 "returncode": proc.returncode,
                 "policy_level": decision.policy_level,
                 "high_risk": decision.high_risk,
+                "risk": decision.risk.value,
+                "rule_id": decision.rule_id,
                 "cwd": os.fspath(cwd) if cwd is not None else None,
             },
         )
 
-    def _matching_shell_policy_caps(self, pid: str, resource: str) -> list[Capability]:
+    def _configured_rules(self) -> list[AuthorityRule]:
+        rules: list[AuthorityRule] = list(self.config.shell.rules)
+        for rule in self.config.shell.whitelist:
+            rules.append(
+                AuthorityRule(
+                    rule_id=f"shell.config.allow.{'.'.join(rule.argv)}",
+                    operation="shell.run",
+                    effect=CapabilityEffect.ALLOW,
+                    risk=AuthorityRisk.HARMLESS,
+                    conditions={"argv": list(rule.argv), "match": rule.match},
+                    description=rule.description or "configured harmless shell allow rule",
+                )
+            )
+        for rule in self.config.shell.blacklist:
+            rules.append(
+                AuthorityRule(
+                    rule_id=f"shell.config.ask.{'.'.join(rule.argv)}",
+                    operation="shell.run",
+                    effect=CapabilityEffect.ASK,
+                    risk=AuthorityRisk.HIGH,
+                    conditions={"argv": list(rule.argv), "match": rule.match},
+                    description=rule.description or "configured high-risk shell ask rule",
+                )
+            )
+        return rules
+
+    def _is_high_risk(self, risk: AuthorityRisk) -> bool:
+        return risk in {AuthorityRisk.HIGH, AuthorityRisk.DESTRUCTIVE}
+
+    def _profile_json(self, profile: SandboxProfile | None) -> dict[str, Any] | None:
+        if profile is None:
+            return None
+        return {
+            "operation": profile.operation,
+            "resource": profile.resource,
+            "effect": profile.effect.value,
+            "risk": profile.risk.value,
+            "rule_id": profile.rule_id,
+            "restrictions": profile.restrictions,
+        }
+
+    def _operation_context(
+        self,
+        pid: str,
+        argv: list[str],
+        resource: str,
+        *,
+        timeout: float,
+        cwd: str,
+        profile: SandboxProfile,
+    ) -> dict[str, Any]:
+        argv_json = "\0".join(argv)
+        profile_json = self._profile_json(profile)
+        return {
+            "adapter": "shell",
+            "primitive": "runtime.shell.run",
+            "operation": "shell.run",
+            "authority_operation": "shell.run",
+            "pid": pid,
+            "argv": list(argv),
+            "argv_sha256": hashlib.sha256(argv_json.encode("utf-8")).hexdigest(),
+            "command": argv[0],
+            "resource": resource,
+            "right": CapabilityRight.EXECUTE.value,
+            "cwd": cwd,
+            "timeout_s": timeout,
+            "risk": profile.risk.value,
+            "rule_id": profile.rule_id,
+            "rule_effect": profile.effect.value,
+            "sandbox_profile": profile_json,
+            "network": bool(profile_json and profile_json["restrictions"].get("network")),
+            "filesystem_intent": profile_json["restrictions"].get("filesystem_intent") if profile_json else None,
+        }
+
+    def _approval_constraints(
+        self,
+        argv: list[str],
+        decision: ShellPolicyDecision,
+        *,
+        timeout: float,
+        cwd: str,
+    ) -> dict[str, Any]:
+        argv_json = "\0".join(argv)
+        return {
+            AUTHORITY_RULES_KEY: [
+                {
+                    "rule_id": f"shell.approval.{decision.rule_id or 'exact'}",
+                    "operation": "shell.run",
+                    "effect": CapabilityEffect.ALLOW.value,
+                    "risk": decision.risk.value,
+                    "conditions": {
+                        "argv": list(argv),
+                        "match": "exact",
+                        "argv_sha256": hashlib.sha256(argv_json.encode("utf-8")).hexdigest(),
+                        "cwd": cwd,
+                        "timeout_s": timeout,
+                    },
+                    "description": "one-shot human approval for exact shell argv",
+                }
+            ]
+        }
+
+    def _matching_shell_policy_caps(self, pid: str, resource: str, context: dict[str, Any]) -> list[Capability]:
         caps = [
             cap
             for cap in self.capabilities.matching_capabilities(
@@ -338,15 +532,21 @@ class ShellAdapter:
             )
             if self.config.shell.policy_capability_key in cap.constraints
         ]
+        caps = [
+            cap
+            for cap in caps
+            if cap.effect == CapabilityEffect.DENY
+            or self.capabilities.constraints_satisfied(cap, context)
+        ]
         caps.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
         return caps
 
-    def _explicit_command_decision(self, pid: str, resource: str) -> str:
+    def _explicit_command_decision(self, pid: str, resource: str, context: dict[str, Any]) -> Any:
         """Classify direct `shell:<command>` authority separate from policy caps.
 
         A shell policy capability decides how whitelist/blacklist rules are
         applied. A direct command capability is narrower authority granted by
-        human approval or bootstrap. Both are Capability v2 records and both
+        human approval or bootstrap. Both are canonical Capability records and both
         use the central resource matcher; they are split only so a broad
         `shell:*` policy does not bypass shell-specific token checks.
         """
@@ -369,19 +569,27 @@ class ShellAdapter:
             for cap in caps
             if cap.resource != self.config.shell.policy_resource or cap.effect != CapabilityEffect.ALLOW
         ]
+        caps = [
+            cap
+            for cap in caps
+            if self._direct_shell_capability_applies_to_rule(cap, context)
+        ]
         if not caps:
-            return CapabilityManager.MISSING
+            return self.capabilities.authorize_matching_capabilities(pid, resource, CapabilityRight.EXECUTE, [], context)
         caps.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
-        deny = next((cap for cap in caps if cap.effect == CapabilityEffect.DENY), None)
-        if deny is not None:
-            return CapabilityManager.ALWAYS_DENY
-        ask = next((cap for cap in caps if cap.effect == CapabilityEffect.ASK), None)
-        if ask is not None:
-            return CapabilityManager.ASK_EACH_TIME
-        cap = caps[0]
-        if cap.uses_remaining is not None:
-            return CapabilityManager.ALLOW_ONCE
-        return CapabilityManager.ALWAYS_ALLOW
+        return self.capabilities.authorize_matching_capabilities(pid, resource, CapabilityRight.EXECUTE, caps, context)
+
+    def _direct_shell_capability_applies_to_rule(self, cap: Capability, context: dict[str, Any]) -> bool:
+        if cap.effect != CapabilityEffect.ALLOW:
+            return True
+        if AUTHORITY_RULES_KEY in cap.constraints:
+            return True
+        # Bare `shell:<command>` grants are command-family hints, not permission
+        # to run every subcommand. Without AuthorityRule constraints they only
+        # cover argv that the deterministic classifier already considers
+        # harmless/low-risk allow; medium/high commands need an explicit rule or
+        # a shell policy approved by the human.
+        return context.get("rule_effect") == CapabilityEffect.ALLOW.value
 
     def _selected_policy_level(self, caps: list[Capability]) -> str:
         return self._normalize_policy_level(caps[0].constraints[self.config.shell.policy_capability_key])

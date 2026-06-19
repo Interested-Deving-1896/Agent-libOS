@@ -54,6 +54,57 @@ class TestPermissionPolicy:
         assert not request.ok
         assert self.runtime.human.pending() == []
 
+    def test_request_permission_prompt_includes_risk_scope_lease_and_constraints(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request explained permission')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        pending = self.runtime.human.pending()[0]
+        context = pending.payload['context']
+        assert request.ok
+        assert context['canonical_resource'] == resource
+        assert context['resource_scope'] == 'exact'
+        assert context['risk'] == 'high'
+        assert context['lease']['choices'] == [
+            CapabilityManager.ALWAYS_ALLOW,
+            CapabilityManager.ASK_EACH_TIME,
+            CapabilityManager.ALWAYS_DENY,
+        ]
+        assert context['constraints'] == {}
+        assert pending.payload['requested_permission']['constraints'] == {}
+
+    def test_request_permission_rejects_broad_shell_execute_before_human_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request broad shell')
+        request = self.runtime.tools.call(pid, 'request_permission', {'resource': 'shell:*', 'rights': ['execute'], 'reason': 'run commands'})
+        assert not request.ok
+        assert self.runtime.human.pending() == []
+
+    def test_request_permission_can_approve_workspace_write(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request workspace write')
+        request = self.runtime.tools.call(
+            pid,
+            'request_permission',
+            {'resource': self.runtime.filesystem.workspace_resource(), 'rights': ['write'], 'reason': 'edit workspace'},
+        )
+        pending = self.runtime.human.pending()[0]
+        context = pending.payload['context']
+        processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
+        assert request.ok
+        assert context['canonical_resource'] == 'filesystem:workspace:*'
+        assert context['resource_scope'] == 'prefix'
+        assert processed[0].status == HumanRequestStatus.APPROVED
+        assert self.runtime.capability.permission_policy(pid, self.runtime.filesystem.resource_for(self._path()), CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
+
+    def test_request_permission_rejects_root_filesystem_write_before_human_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request root write')
+        request = self.runtime.tools.call(
+            pid,
+            'request_permission',
+            {'resource': 'filesystem:/:*', 'rights': ['write'], 'reason': 'edit host root'},
+        )
+        assert not request.ok
+        assert self.runtime.human.pending() == []
+
     def test_ask_each_time_prompts_from_filesystem_primitive_and_consumes_one_time_grant(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask every write')
         path = self._path()

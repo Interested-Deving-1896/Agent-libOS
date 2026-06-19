@@ -1046,7 +1046,7 @@ def _show_pending_interactive_human_request(runtime: Runtime, human: str, state:
     if state.get("shown_request_id") == request.request_id:
         return
     state["shown_request_id"] = request.request_id
-    question = str(request.payload.get("question") or request.payload)
+    question = runtime.human.format_terminal_request(request)
     request_type = str(request.payload.get("type") or "approval")
     if request_type == "permission_request":
         suffix = "Reply a=always allow, d=always deny, e=ask each time."

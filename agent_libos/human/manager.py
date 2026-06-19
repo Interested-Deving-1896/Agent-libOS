@@ -5,8 +5,9 @@ import builtins
 from typing import TYPE_CHECKING, Any
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import CapabilityRight, ProcessMessage, ProcessMessageKind
+from agent_libos.models import AuthorityRisk, CapabilityEffect, CapabilityRight, ProcessMessage, ProcessMessageKind
 from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
@@ -105,21 +106,148 @@ class HumanObjectManager:
         reason: str,
         blocking: bool = True,
     ) -> str:
+        request = self._permission_request_payload(pid, resource, rights, reason)
         return self.query(
             pid=pid,
             human=human,
-            request={
-                "type": "permission_request",
-                "question": f"Set permission policy for {resource} rights={rights}: {reason}",
-                "requested_permission": {
-                    "subject": pid,
-                    "resource": resource,
-                    "rights": rights,
-                },
-                "context": {"reason": reason},
-            },
+            request=request,
             blocking=blocking,
         )
+
+    def _permission_request_payload(self, pid: str, resource: str, rights: list[str], reason: str) -> dict[str, Any]:
+        pattern = self.capabilities.parse_resource_pattern(resource)
+        try:
+            normalized_rights = [CapabilityRight(str(right)).value for right in rights]
+        except ValueError as exc:
+            raise ValidationError(f"unknown capability right: {exc}") from exc
+        if not normalized_rights:
+            raise ValidationError("permission request must include at least one right")
+        self._reject_broad_model_permission_request(pattern.raw, pattern.kind, pattern.body, pattern.scope.value, normalized_rights)
+        constraints = self._permission_constraints(pattern.kind, pattern.body, normalized_rights)
+        risk = self._permission_risk(pattern.kind, normalized_rights, constraints)
+        lease = {
+            "type": "human_selected_policy",
+            "choices": [
+                CapabilityManager.ALWAYS_ALLOW,
+                CapabilityManager.ASK_EACH_TIME,
+                CapabilityManager.ALWAYS_DENY,
+            ],
+            "default_if_unanswered": CapabilityManager.ALWAYS_DENY,
+            "expires_at": None,
+            "uses_remaining": None,
+        }
+        context = {
+            "reason": reason,
+            "risk": risk.value,
+            "resource": resource,
+            "canonical_resource": pattern.raw,
+            "resource_kind": pattern.kind,
+            "resource_scope": pattern.scope.value,
+            "resource_body": pattern.body,
+            "rights": normalized_rights,
+            "lease": lease,
+            "constraints": constraints,
+            "request_origin": "model",
+        }
+        return {
+            "type": "permission_request",
+            "question": f"Set permission policy for {pattern.raw} rights={normalized_rights}: {reason}",
+            "requested_permission": {
+                "subject": pid,
+                "resource": pattern.raw,
+                "rights": normalized_rights,
+                "constraints": constraints,
+            },
+            "context": context,
+        }
+
+    def _reject_broad_model_permission_request(
+        self,
+        resource: str,
+        kind: str,
+        body: str,
+        scope: str,
+        rights: list[str],
+    ) -> None:
+        rights_set = set(rights)
+        if kind == "shell" and CapabilityRight.EXECUTE.value in rights_set:
+            if resource == self.config.shell.policy_resource or (scope == "prefix" and not body):
+                raise ValidationError(
+                    "model permission requests cannot ask for broad shell execute authority; request a concrete command class instead"
+                )
+        if kind == "filesystem" and rights_set & {CapabilityRight.WRITE.value, CapabilityRight.DELETE.value}:
+            if resource == "filesystem:*" or body in {"", "/"}:
+                raise ValidationError(
+                    "model permission requests cannot ask for root/global filesystem write/delete authority; request a workspace, concrete file, or directory subtree"
+                )
+
+    def _permission_constraints(self, kind: str, body: str, rights: list[str]) -> dict[str, Any]:
+        if kind != "shell" or CapabilityRight.EXECUTE.value not in set(rights):
+            return {}
+        command = body.split(":", 1)[0].strip().casefold()
+        if command == "git":
+            return {AUTHORITY_RULES_KEY: self._git_read_only_authority_rules()}
+        raise ValidationError(
+            f"model permission requests for shell:{command} must be approved through an exact per-use shell operation"
+        )
+
+    def _permission_risk(self, kind: str, rights: list[str], constraints: dict[str, Any]) -> AuthorityRisk:
+        rights_set = set(rights)
+        if CapabilityRight.DELETE.value in rights_set:
+            return AuthorityRisk.DESTRUCTIVE
+        if kind == "shell" and CapabilityRight.EXECUTE.value in rights_set:
+            return AuthorityRisk.LOW if constraints else AuthorityRisk.HIGH
+        if CapabilityRight.WRITE.value in rights_set or CapabilityRight.EXECUTE.value in rights_set:
+            return AuthorityRisk.HIGH
+        return AuthorityRisk.LOW
+
+    def _git_read_only_authority_rules(self) -> list[dict[str, Any]]:
+        rules: list[dict[str, Any]] = []
+        for subcommand in [
+            "push",
+            "clean",
+            "reset",
+            "checkout",
+            "switch",
+            "restore",
+            "commit",
+            "merge",
+            "rebase",
+            "tag",
+            "remote",
+            "fetch",
+            "pull",
+            "clone",
+        ]:
+            rules.append(
+                {
+                    "rule_id": f"shell.git.deny.{subcommand}",
+                    "operation": "shell.run",
+                    "effect": CapabilityEffect.DENY.value,
+                    "risk": AuthorityRisk.HIGH.value,
+                    "conditions": {"argv": ["git", subcommand], "match": "prefix"},
+                    "description": f"deny git {subcommand} from read-only git command authority",
+                }
+            )
+        for argv in [
+            ["git", "status"],
+            ["git", "status", "--short"],
+            ["git", "branch", "--show-current"],
+            ["git", "rev-parse", "--show-toplevel"],
+            ["git", "diff"],
+            ["git", "diff", "--stat"],
+        ]:
+            rules.append(
+                {
+                    "rule_id": f"shell.git.allow.{'.'.join(argv[1:])}",
+                    "operation": "shell.run",
+                    "effect": CapabilityEffect.ALLOW.value,
+                    "risk": AuthorityRisk.LOW.value,
+                    "conditions": {"argv": argv, "match": "exact"},
+                    "description": "allow read-only git inspection command",
+                }
+            )
+        return rules
 
     def ask(
         self,
@@ -579,8 +707,13 @@ class HumanObjectManager:
             "ask_each_time": CapabilityManager.ASK_EACH_TIME,
         }.get(answer, CapabilityManager.ALWAYS_DENY)
 
+    def format_terminal_request(self, request: HumanRequest) -> str:
+        return self._terminal_question(request)
+
     def _terminal_question(self, request: HumanRequest) -> str:
         question = str(request.payload.get("question") or request.payload)
+        if request.payload.get("type") == "permission_request":
+            return self._permission_terminal_question(request, question)
         if request.payload.get("type") == "question":
             context = request.payload.get("context")
             if not isinstance(context, dict) or not context:
@@ -624,9 +757,18 @@ class HumanObjectManager:
             ("policy reason", "policy_reason"),
             ("matched rule", "matched_rule"),
             ("high risk", "high_risk"),
+            ("risk", "risk"),
+            ("rule id", "rule_id"),
+            ("rule effect", "rule_effect"),
         ]:
             if key in context:
                 lines.append(f"- {label}: {context[key]}")
+        profile = context.get("sandbox_profile")
+        if isinstance(profile, dict):
+            lines.append("- sandbox profile:")
+            for key in ["operation", "resource", "effect", "risk", "rule_id"]:
+                if key in profile:
+                    lines.append(f"  - {key}: {profile[key]}")
         target = context.get("target")
         if isinstance(target, dict):
             lines.append("- target:")
@@ -642,6 +784,61 @@ class HumanObjectManager:
             truncated = bool(context.get("content_preview_truncated"))
             lines.append(f"- content preview{' (truncated)' if truncated else ''}:")
             lines.append(self._indent_block(preview))
+        lines.append(question)
+        return "\n".join(lines)
+
+    def _permission_terminal_question(self, request: HumanRequest, question: str) -> str:
+        context = request.payload.get("context")
+        permission = request.payload.get("requested_permission")
+        if not isinstance(context, dict):
+            return question
+        lines = ["Permission request details:"]
+        for label, key in [
+            ("process", "pid"),
+            ("reason", "reason"),
+            ("risk", "risk"),
+            ("requested resource", "resource"),
+            ("canonical resource", "canonical_resource"),
+            ("resource kind", "resource_kind"),
+            ("resource scope", "resource_scope"),
+            ("resource body", "resource_body"),
+            ("rights", "rights"),
+            ("origin", "request_origin"),
+        ]:
+            value = request.pid if key == "pid" else context.get(key)
+            if value is not None:
+                lines.append(f"- {label}: {value}")
+        lease = context.get("lease")
+        if isinstance(lease, dict):
+            lines.append("- lease:")
+            for key in ["type", "choices", "default_if_unanswered", "expires_at", "uses_remaining"]:
+                if key in lease:
+                    lines.append(f"  - {key}: {lease[key]}")
+        constraints = context.get("constraints")
+        if isinstance(constraints, dict):
+            lines.append("- constraints:")
+            rules = constraints.get(AUTHORITY_RULES_KEY)
+            if isinstance(rules, list) and rules:
+                lines.append("  - authority_rules:")
+                for rule in rules:
+                    if not isinstance(rule, dict):
+                        continue
+                    lines.append(
+                        "    - "
+                        f"{rule.get('rule_id')} "
+                        f"effect={rule.get('effect')} "
+                        f"risk={rule.get('risk')} "
+                        f"conditions={rule.get('conditions')}"
+                    )
+            elif constraints:
+                for key in sorted(constraints):
+                    lines.append(f"  - {key}: {constraints[key]}")
+            else:
+                lines.append("  - <none>")
+        if isinstance(permission, dict):
+            lines.append("- requested policy target:")
+            lines.append(f"  - resource: {permission.get('resource')}")
+            lines.append(f"  - rights: {permission.get('rights')}")
         lines.append(question)
         return "\n".join(lines)
 

@@ -19,19 +19,25 @@
       "node_ids": [
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_primitive_enforces_read_limits_without_tool_schema",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
-        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt"
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_shell_execute_before_human_prompt",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_root_filesystem_write_before_human_prompt"
       ],
       "benchmark_attack_classes": ["forbidden_file_write", "forbidden_file_delete"]
     },
     {
-      "id": "capability-v2-matching-and-delegation",
-      "title": "Capability v2 matching, denial, revocation, one-shot use, and delegation stay typed and attenuated.",
+      "id": "capability-matching-and-delegation",
+      "title": "Capability matching, denial, revocation, one-shot use, and delegation stay typed and attenuated.",
       "lane": "security",
       "node_ids": [
-        "tests/security/test_capability_v2.py::TestCapabilityV2Manager::test_typed_resource_matching_rejects_prefix_collision",
-        "tests/security/test_capability_v2.py::TestCapabilityV2Manager::test_deny_dominates_matching_allow",
-        "tests/security/test_capability_v2.py::TestCapabilityV2Manager::test_delegate_can_only_attenuate_delegable_parent_capability",
-        "tests/security/test_capability_v2.py::TestCapabilityV2RuntimeInterface::test_capability_syscalls_do_not_bypass_authority"
+        "tests/security/test_capability.py::TestCapabilityManager::test_typed_resource_matching_rejects_prefix_collision",
+        "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_matching_allow",
+        "tests/security/test_capability.py::TestCapabilityManager::test_authority_rules_are_enforced_against_operation_context",
+        "tests/security/test_capability.py::TestCapabilityManager::test_scoped_deny_rule_only_denies_matching_operation_context",
+        "tests/security/test_capability.py::TestCapabilityManager::test_one_shot_grant_authority_is_consumed_after_successful_issue",
+        "tests/security/test_capability.py::TestCapabilityManager::test_delegate_can_only_attenuate_delegable_parent_capability",
+        "tests/security/test_capability.py::TestCapabilityManager::test_delegation_cannot_increase_parent_max_depth",
+        "tests/security/test_capability.py::TestCapabilityRuntimeInterface::test_capability_syscalls_do_not_bypass_authority"
       ],
       "benchmark_attack_classes": []
     },
@@ -67,6 +73,8 @@
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_llm_pending_per_use_approval_does_not_return_action_until_decision",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_async_runtime_resumes_human_question_with_answer",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_one_time_human_output_capability_is_consumed_after_delivery",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_human_shell_approval_is_bound_to_exact_argv",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_human_jsonrpc_approval_is_bound_to_params_hash",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_runtime_human_primitive_uses_injected_provider"
       ],
       "benchmark_attack_classes": []
@@ -78,19 +86,48 @@
       "node_ids": [
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_bare_shell_wildcard_allow_does_not_bypass_shell_policy",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args",
+        "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_with_shell_syntax_payload_requires_approval",
+        "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_uses_argv_without_shell_interpreter",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name"
       ],
       "benchmark_attack_classes": ["shell_policy_bypass", "self_evolution_jit"]
     },
     {
+      "id": "command-risk-rules-are-deterministic",
+      "title": "Command risk rules deterministically separate harmless, risky, and destructive shell operations.",
+      "lane": "security",
+      "node_ids": [
+        "tests/unit/test_capability_rules.py::TestShellRuleEngine::test_classifies_default_shell_risk_levels",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_git_diff_with_output_requires_approval",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_high_risk_network_command_requires_approval_with_rule_profile",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_allowlist_policy_asks_for_shell_syntax_payloads_in_auto_allow_argv",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_request_permission_shell_command_class_is_rule_constrained",
+        "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_cannot_override_script_interpreter_risk",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_destructive_command_is_denied_even_with_always_allow_policy",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_medium_project_code_execution_requires_approval"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "sandbox-profile-derived-from-capability-decision",
+      "title": "Sandbox profiles are derived from the primitive capability decision and audited with the operation.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_high_risk_network_command_requires_approval_with_rule_profile",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_unsafe_typescript",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_requires_method_capability_and_records_http_effect"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "skill-activation-does-not-grant-authority",
       "title": "Skill registration and activation alter visibility and prompt context without granting resource authority.",
       "lane": "self-evolution",
       "node_ids": [
-        "tests/self_evolution/test_skills_dynamic_loading.py::TestSkillDynamicLoading::test_loaded_existing_tool_visibility_does_not_grant_resource_authority",
-        "tests/self_evolution/test_skills_dynamic_loading.py::TestSkillDynamicLoading::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once",
-        "tests/self_evolution/test_skills_dynamic_loading.py::TestSkillDynamicLoading::test_skill_syscalls_use_primitive_capabilities_not_tool_table",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_existing_tool_visibility_does_not_grant_resource_authority",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_skill_syscalls_use_primitive_capabilities_not_tool_table",
         "tests/self_evolution/test_swe_agent_skill.py::TestSWEAgentSkill::test_swe_agent_skill_registers_and_loads_without_granting_resource_authority"
       ],
       "benchmark_attack_classes": ["self_evolution_skill"]
@@ -100,10 +137,10 @@
       "title": "Checkpoint restore and fork are capability-controlled, scoped, and append-only outside reconstructable state.",
       "lane": "self-evolution",
       "node_ids": [
-        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_restore_preserves_append_only_history_and_reports_external_effects",
-        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
-        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
-        "tests/self_evolution/test_checkpoint_manager.py::TestCheckpointManager::test_fork_from_checkpoint_normalizes_waiting_process_state"
+        "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_preserves_append_only_history_and_reports_external_effects",
+        "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_normalizes_waiting_process_state"
       ],
       "benchmark_attack_classes": ["self_evolution_checkpoint"]
     },

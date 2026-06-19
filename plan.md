@@ -63,7 +63,7 @@ prototype:
 
 - `AgentProcess` lifecycle: spawn, fork, exec, wait, signal, pause, resume,
   exit, process-local cwd, and message queues.
-- Capability v2: typed resource matching, deny/ask/allow effects, issue,
+- Capability: typed resource matching, deny/ask/allow effects, issue,
   delegate, revoke, one-shot consumption, attenuation, and audit lineage.
 - Primitive boundary: filesystem, shell, clock, human, process, image,
   checkpoint, Object Memory, Skill, JIT syscall, and JSON-RPC calls go through
@@ -106,7 +106,7 @@ The paper should present four contributions.
    messages, human I/O, checkpoints, and capability-controlled primitives.
 
 2. Implementation:
-   A Python runtime substrate with Resource Provider Substrate, Capability v2,
+   A Python runtime substrate with Resource Provider Substrate, Capability,
    ToolBroker, standard Skills, Deno/TypeScript syscall-only JIT tools,
    JSON-RPC remote resources, scoped checkpoints, persistent LLM accounting,
    and audit/event persistence.
@@ -217,7 +217,7 @@ Self-evolution may increase expressiveness but must not increase authority.
 Tests and checks:
 
 - Skill activation changes prompt/tool visibility, not capabilities.
-- JIT tools cannot bypass Deno sandbox, syscall broker, or Capability v2.
+- JIT tools cannot bypass Deno sandbox, syscall broker, or Capability.
 - Image registration and `exec` can change prompts/default tools/default
   Skills, but cannot grant target-image required capabilities.
 - Child processes receive only attenuated delegated capabilities.

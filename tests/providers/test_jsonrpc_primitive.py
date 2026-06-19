@@ -3,16 +3,16 @@ import pytest
 import contextlib
 import io
 import json
-import os
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+from pytest import MonkeyPatch
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models import CapabilityRight
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
@@ -29,11 +29,10 @@ class TestJsonRpcPrimitive:
         finally:
             runtime.close()
 
-    def test_call_requires_method_capability_and_records_http_effect(self) -> None:
+    def test_call_requires_method_capability_and_records_http_effect(self, monkeypatch: MonkeyPatch) -> None:
         with _jsonrpc_server() as server:
             runtime = Runtime.open('local')
-            old_token = os.environ.get('AGENT_LIBOS_JSONRPC_TEST_TOKEN')
-            os.environ['AGENT_LIBOS_JSONRPC_TEST_TOKEN'] = 'secret-token'
+            monkeypatch.setenv('AGENT_LIBOS_JSONRPC_TEST_TOKEN', 'secret-token')
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='remote call')
                 runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('demo', server.url), actor='cli', require_capability=False)
@@ -53,10 +52,6 @@ class TestJsonRpcPrimitive:
                 assert not effect.state_mutation
                 assert effect.information_flow
             finally:
-                if old_token is None:
-                    os.environ.pop('AGENT_LIBOS_JSONRPC_TEST_TOKEN', None)
-                else:
-                    os.environ['AGENT_LIBOS_JSONRPC_TEST_TOKEN'] = old_token
                 runtime.close()
 
     def test_jsonrpc_errors_and_http_failures_are_structured_results(self) -> None:
@@ -79,10 +74,10 @@ class TestJsonRpcPrimitive:
             finally:
                 runtime.close()
 
-    def test_missing_header_env_fails_before_http_attempt_and_one_shot_consumption(self) -> None:
+    def test_missing_header_env_fails_before_http_attempt_and_one_shot_consumption(self, monkeypatch: MonkeyPatch) -> None:
         with _jsonrpc_server() as server:
             runtime = Runtime.open('local')
-            old_token = os.environ.pop('AGENT_LIBOS_JSONRPC_TEST_TOKEN', None)
+            monkeypatch.delenv('AGENT_LIBOS_JSONRPC_TEST_TOKEN', raising=False)
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='missing env')
                 runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('needs-token', server.url), actor='cli', require_capability=False)
@@ -92,8 +87,31 @@ class TestJsonRpcPrimitive:
                 assert server.requests == []
                 assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
             finally:
-                if old_token is not None:
-                    os.environ['AGENT_LIBOS_JSONRPC_TEST_TOKEN'] = old_token
+                runtime.close()
+
+    def test_human_jsonrpc_approval_is_bound_to_params_hash(self) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc approval')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('approval', server.url, with_header=False), actor='cli', require_capability=False)
+                runtime.capability.set_permission_policy(
+                    pid,
+                    'jsonrpc:approval:echo',
+                    [CapabilityRight.READ],
+                    runtime.capability.ASK_EACH_TIME,
+                    issued_by='test',
+                )
+                with pytest.raises(HumanApprovalRequired):
+                    runtime.jsonrpc.call(pid, 'approval', 'echo', {'x': 1})
+                runtime.human.drain_terminal_queue(auto_approve=True)
+                with pytest.raises(HumanApprovalRequired):
+                    runtime.jsonrpc.call(pid, 'approval', 'echo', {'x': 2})
+                assert server.requests == []
+                result = runtime.jsonrpc.call(pid, 'approval', 'echo', {'x': 1})
+                assert result.ok
+                assert len(server.requests) == 1
+            finally:
                 runtime.close()
 
     def test_effectful_provider_without_classifier_fails_closed(self) -> None:
@@ -145,30 +163,23 @@ class TestJsonRpcPrimitive:
             finally:
                 runtime.close()
 
-    def test_cli_register_list_inspect_and_call(self) -> None:
+    def test_cli_register_list_inspect_and_call(self, monkeypatch: MonkeyPatch) -> None:
         with _jsonrpc_server() as server, tempfile.TemporaryDirectory() as temp_dir:
-            old_token = os.environ.get('AGENT_LIBOS_JSONRPC_TEST_TOKEN')
-            os.environ['AGENT_LIBOS_JSONRPC_TEST_TOKEN'] = 'cli-token'
-            try:
-                db = str(Path(temp_dir) / 'runtime.sqlite')
-                manifest = Path(temp_dir) / 'endpoint.yaml'
-                manifest.write_text(_manifest('cli-demo', server.url), encoding='utf-8')
-                spawned = _run_cli_json(['--db', db, 'spawn', '--goal', 'cli jsonrpc'])
-                registered = _run_cli_json(['--db', db, 'jsonrpc', 'register', str(manifest)])
-                listed = _run_cli_json(['--db', db, 'jsonrpc', 'list'])
-                inspected = _run_cli_json(['--db', db, 'jsonrpc', 'inspect', 'cli-demo'])
-                _run_cli_json(['--db', db, 'capabilities', 'grant', spawned['pid'], 'jsonrpc:cli-demo:echo', '--rights', 'read'])
-                called = _run_cli_json(['--db', db, 'jsonrpc', 'call', spawned['pid'], 'cli-demo', 'echo', '--params-json', '{"q": "ok"}'])
-                assert registered['endpoint_id'] == 'cli-demo'
-                assert listed[0]['endpoint_id'] == 'cli-demo'
-                assert listed[0]['url'] is None
-                assert inspected['url'] == server.url
-                assert called['ok']
-            finally:
-                if old_token is None:
-                    os.environ.pop('AGENT_LIBOS_JSONRPC_TEST_TOKEN', None)
-                else:
-                    os.environ['AGENT_LIBOS_JSONRPC_TEST_TOKEN'] = old_token
+            monkeypatch.setenv('AGENT_LIBOS_JSONRPC_TEST_TOKEN', 'cli-token')
+            db = str(Path(temp_dir) / 'runtime.sqlite')
+            manifest = Path(temp_dir) / 'endpoint.yaml'
+            manifest.write_text(_manifest('cli-demo', server.url), encoding='utf-8')
+            spawned = _run_cli_json(['--db', db, 'spawn', '--goal', 'cli jsonrpc'])
+            registered = _run_cli_json(['--db', db, 'jsonrpc', 'register', str(manifest)])
+            listed = _run_cli_json(['--db', db, 'jsonrpc', 'list'])
+            inspected = _run_cli_json(['--db', db, 'jsonrpc', 'inspect', 'cli-demo'])
+            _run_cli_json(['--db', db, 'capabilities', 'grant', spawned['pid'], 'jsonrpc:cli-demo:echo', '--rights', 'read'])
+            called = _run_cli_json(['--db', db, 'jsonrpc', 'call', spawned['pid'], 'cli-demo', 'echo', '--params-json', '{"q": "ok"}'])
+            assert registered['endpoint_id'] == 'cli-demo'
+            assert listed[0]['endpoint_id'] == 'cli-demo'
+            assert listed[0]['url'] is None
+            assert inspected['url'] == server.url
+            assert called['ok']
 
     def _run(self, awaitable: Any) -> Any:
         import asyncio

@@ -3,7 +3,6 @@ import pytest
 import http.client
 import json
 import threading
-import time
 import urllib.request
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
@@ -193,16 +192,16 @@ class TestGuiServer:
         _first_status, first = self.request('POST', '/api/processes', {'goal': 'first', 'auto_run': False})
         _second_status, second = self.request('POST', '/api/processes', {'goal': 'second', 'auto_run': False})
         seen: list[str] = []
+        seen_event = threading.Event()
 
         async def fake_quantum(pid: str) -> dict[str, str]:
             seen.append(pid)
             self.server.service.runtime.process.pause(pid, 'fake quantum completed')
+            seen_event.set()
             return {'pid': pid}
         self.server.service.runtime.arun_process_once = fake_quantum
         status, body = self.request('POST', f"/api/processes/{second['pid']}/run", {'max_quanta': 1})
-        deadline = time.time() + 2.0
-        while not seen and time.time() < deadline:
-            time.sleep(0.01)
+        assert seen_event.wait(timeout=2.0)
         assert status == 200
         assert body['reason'] == f"run:{second['pid']}"
         assert seen == [second['pid']]

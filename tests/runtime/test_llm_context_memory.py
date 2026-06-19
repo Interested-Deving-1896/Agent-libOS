@@ -3,11 +3,11 @@ import pytest
 import json
 import tempfile
 from types import SimpleNamespace
-from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
 from agent_libos.models import ObjectRight
+from tests.support.fakes import RecordingActionClient
 
 class TestLLMContextMemory:
 
@@ -120,21 +120,6 @@ class TestLLMContextMemory:
                 assert persisted[0].reasoning == {'summary': 'selected process_exit'}
             finally:
                 reopened.close()
-
-class RecordingActionClient:
-
-    def __init__(self, actions: list[dict[str, Any]]):
-        self.actions = list(actions)
-        self.user_prompts: list[str] = []
-        self.tool_batches: list[list[dict[str, Any]]] = []
-
-    def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
-        self.user_prompts.append(str(messages[-1]['content']))
-        self.tool_batches.append(tools)
-        action = self.actions.pop(0)
-        name = str(action['action'])
-        args = {key: value for key, value in action.items() if key != 'action'}
-        return LLMCompletion(content='', tool_calls=[{'id': f'context_{len(self.user_prompts)}', 'name': name, 'arguments': json.dumps(args)}])
 
 class MetadataActionClient:
 

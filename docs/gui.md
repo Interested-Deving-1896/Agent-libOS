@@ -35,7 +35,7 @@ Python GUI server
 ```
 
 The GUI server is not a new security boundary. It is a local control surface
-over the same primitives, Capability v2 checks, human approval flow, events,
+over the same primitives, Capability checks, human approval flow, events,
 and audit records used by the CLI. Its Python entrypoint lives under
 `agent_libos.api.gui` with the CLI because both are host-facing API surfaces.
 

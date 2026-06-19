@@ -10,10 +10,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.models import (
     AuditRecord,
+    CapabilityEffect,
     CapabilityRight,
     Event,
     EventType,
@@ -199,10 +201,17 @@ class JsonRpcPrimitive:
         request_id = new_id("jrpc")
         operation_context = self._operation_context(pid, spec, method, params, request_id=request_id)
         decision = self._authorize_call(pid, resource, method.right, operation_context)
+        profile = self.capabilities.profiles.jsonrpc(
+            resource=resource,
+            effect=decision.effect or CapabilityEffect.DENY,
+            endpoint_id=endpoint_id,
+            method_id=method_id,
+        )
         operation_context.update(
             {
                 "capability_ids": list(decision.matched_capability_ids),
                 "selected_capability_id": decision.selected_capability_id,
+                "sandbox_profile": self._profile_json(profile),
             }
         )
         self._require_header_environment(spec)
@@ -273,6 +282,13 @@ class JsonRpcPrimitive:
         if decision.policy == CapabilityManager.ASK_EACH_TIME:
             if self.human is None:
                 raise CapabilityDenied(f"{pid} requires human approval for JSON-RPC call on {resource}")
+            profile = self.capabilities.profiles.jsonrpc(
+                resource=resource,
+                effect=CapabilityEffect.ASK,
+                endpoint_id=str(context["endpoint_id"]),
+                method_id=str(context["method_id"]),
+            )
+            approval_context = {**context, "sandbox_profile": self._profile_json(profile)}
             request_id = self.human.query(
                 pid=pid,
                 human=self.config.runtime.default_human,
@@ -283,8 +299,9 @@ class JsonRpcPrimitive:
                         "subject": pid,
                         "resource": resource,
                         "rights": [right],
+                        "constraints": self._approval_constraints(context),
                     },
-                    "context": context,
+                    "context": approval_context,
                 },
                 blocking=True,
             )
@@ -448,6 +465,7 @@ class JsonRpcPrimitive:
                 "request_id": result.request_id,
                 "params_sha256": operation_context["params_sha256"],
                 "params_preview": operation_context["params_preview"],
+                "sandbox_profile": operation_context.get("sandbox_profile"),
                 "status": result.status.value,
                 "ok": result.ok,
                 "http_status": result.http_status,
@@ -499,7 +517,8 @@ class JsonRpcPrimitive:
         return {
             "pid": pid,
             "primitive": "runtime.jsonrpc.call",
-            "operation": "call",
+            "operation": "jsonrpc.call",
+            "authority_operation": "jsonrpc.call",
             "endpoint_id": endpoint.endpoint_id,
             "method_id": method.method_id,
             "rpc_method": method.rpc_method,
@@ -507,6 +526,24 @@ class JsonRpcPrimitive:
             "request_id": request_id,
             "params_sha256": hashlib.sha256(params_json.encode("utf-8")).hexdigest(),
             "params_preview": self._preview(params_json),
+        }
+
+    def _approval_constraints(self, context: dict[str, Any]) -> dict[str, Any]:
+        return {
+            AUTHORITY_RULES_KEY: [
+                {
+                    "rule_id": f"jsonrpc.approval.{context['endpoint_id']}.{context['method_id']}",
+                    "operation": "jsonrpc.call",
+                    "effect": CapabilityEffect.ALLOW.value,
+                    "risk": "high",
+                    "conditions": {
+                        "endpoint_id": context["endpoint_id"],
+                        "method_id": context["method_id"],
+                        "params_sha256": context["params_sha256"],
+                    },
+                    "description": "one-shot human approval for exact JSON-RPC call payload",
+                }
+            ]
         }
 
     def _effect_context(
@@ -755,6 +792,16 @@ class JsonRpcPrimitive:
         if selected == ExternalEffectRollbackClass.IRREVERSIBLE:
             return ExternalEffectRollbackStatus.NOT_SUPPORTED.value
         return ExternalEffectRollbackStatus.NOT_REQUIRED.value
+
+    def _profile_json(self, profile: Any) -> dict[str, Any]:
+        return {
+            "operation": profile.operation,
+            "resource": profile.resource,
+            "effect": profile.effect.value,
+            "risk": profile.risk.value,
+            "rule_id": profile.rule_id,
+            "restrictions": dict(profile.restrictions),
+        }
 
     def _preview(self, text: str) -> str:
         limit = self.config.jsonrpc.audit_preview_chars

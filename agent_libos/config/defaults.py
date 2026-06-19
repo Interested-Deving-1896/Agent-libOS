@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from agent_libos.models.capability import AuthorityRule
+
 ShellPolicyLevel = Literal[
     "always_deny",
     "allowlist_auto_else_ask",
@@ -168,6 +170,7 @@ class ShellDefaults:
     max_stderr_chars: int = 32_000
     stdout_hard_limit_chars: int = 200_000
     stderr_hard_limit_chars: int = 200_000
+    rules: tuple[AuthorityRule, ...] = ()
     whitelist: tuple[ShellCommandRule, ...] = (
         ShellCommandRule(("git", "status")),
         ShellCommandRule(("git", "status", "--short")),

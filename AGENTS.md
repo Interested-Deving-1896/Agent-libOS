@@ -36,7 +36,7 @@ Use Python 3.11+ with 4-space indentation, type hints for public interfaces, and
 dataclasses or Pydantic models for structured data. Keep runtime defaults in
 `agent_libos.config.DEFAULT_CONFIG`; do not scatter magic numbers. Preserve the
 core boundary: tools and Skills affect visibility, while primitives enforce
-Capability v2, human approval, provider policy, events, and audit. TypeScript in
+Capability, human approval, provider policy, events, and audit. TypeScript in
 `gui/` should use strict component and API types.
 
 ## Testing Guidelines
