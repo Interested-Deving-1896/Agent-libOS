@@ -16,6 +16,7 @@ from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.context_memory import LLMContextMemory
 from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
+from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.models import (
@@ -47,6 +48,7 @@ class LLMProcessExecutor:
         self._pending_wait_actions: dict[str, dict[str, Any]] = {}
         self._pending_message_actions: dict[str, dict[str, Any]] = {}
         self.context_memory = LLMContextMemory(runtime)
+        self._load_pending_actions()
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -257,6 +259,14 @@ class LLMProcessExecutor:
             "content_preview": content_preview,
             "tool_call_count": tool_call_count,
         }
+        self._persist_pending_action(
+            pid,
+            wait_type="human",
+            request_id=request_id,
+            action=action,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+        )
         self.runtime.audit.record(
             actor=pid,
             action="llm.action_waiting_human",
@@ -285,6 +295,14 @@ class LLMProcessExecutor:
             "content_preview": content_preview,
             "tool_call_count": tool_call_count,
         }
+        self._persist_pending_action(
+            pid,
+            wait_type="child",
+            child_pid=child_pid,
+            action=action,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+        )
         self.runtime.audit.record(
             actor=pid,
             action="llm.action_waiting_child",
@@ -313,6 +331,14 @@ class LLMProcessExecutor:
             "content_preview": content_preview,
             "tool_call_count": tool_call_count,
         }
+        self._persist_pending_action(
+            pid,
+            wait_type="message",
+            filters=filters,
+            action=action,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+        )
         self.runtime.audit.record(
             actor=pid,
             action="llm.action_waiting_message",
@@ -358,6 +384,16 @@ class LLMProcessExecutor:
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
                 )
+            except ProcessWaitRequired as exc:
+                return self._wait_for_child_action(
+                    pid=pid,
+                    action=action,
+                    child_pid=exc.child_pid,
+                    message=str(exc),
+                    content_preview=str(pending.get("content_preview", "")),
+                    tool_call_count=int(pending.get("tool_call_count", 0)),
+                )
+            self._clear_pending_action(pid)
             return self._completed_action_result(
                 pid=pid,
                 action=action,
@@ -372,6 +408,7 @@ class LLMProcessExecutor:
         # as a runtime crash, so the process can explain or choose another path.
         self._emit_pending_action_rejected(pid, action, request_id, error)
         result = {"ok": False, "tool_id": None, "result_oid": None, "payload": None, "error": error}
+        self._clear_pending_action(pid)
         return self._completed_action_result(
             pid=pid,
             action=action,
@@ -419,6 +456,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
             )
+        self._clear_pending_action(pid)
         return self._completed_action_result(
             pid=pid,
             action=action,
@@ -473,6 +511,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
             )
+        self._clear_pending_action(pid)
         completed = self._completed_action_result(
             pid=pid,
             action=action,
@@ -628,6 +667,7 @@ class LLMProcessExecutor:
         try:
             completion = await self._complete_action(messages, tools)
         except Exception as exc:
+            self._charge_llm_attempt(pid, source="llm.error", context={"error_type": type(exc).__name__})
             self.runtime.store.insert_llm_call(
                 LLMCallRecord(
                     call_id=call_id,
@@ -635,8 +675,15 @@ class LLMProcessExecutor:
                     image_id=process.image_id if process is not None else None,
                     purpose="action_selection",
                     status="error",
-                    messages=messages,
-                    tools=tools,
+                    **observable_llm_call_fields(
+                        messages=messages,
+                        tools=tools,
+                        response_content="",
+                        tool_calls=[],
+                        reasoning=None,
+                        raw_response=None,
+                        config=self.config,
+                    ),
                     request_options=request_options,
                     error=str(exc),
                     created_at=created_at,
@@ -644,6 +691,16 @@ class LLMProcessExecutor:
                 )
             )
             raise
+        self._charge_llm_attempt(pid, source="llm.completion", context={"usage": dict(getattr(completion, "usage", {}) or {})})
+        observable_fields = observable_llm_call_fields(
+            messages=messages,
+            tools=tools,
+            response_content=str(getattr(completion, "content", "")),
+            tool_calls=list(getattr(completion, "tool_calls", []) or []),
+            reasoning=getattr(completion, "reasoning", None),
+            raw_response=getattr(completion, "raw", None),
+            config=self.config,
+        )
         self.runtime.store.insert_llm_call(
             LLMCallRecord(
                 call_id=call_id,
@@ -655,14 +712,15 @@ class LLMProcessExecutor:
                 model=getattr(completion, "model", None),
                 request_id=getattr(completion, "request_id", None),
                 response_id=getattr(completion, "response_id", None),
-                messages=messages,
-                tools=tools,
+                messages=observable_fields["messages"],
+                tools=observable_fields["tools"],
                 request_options=request_options,
-                response_content=str(getattr(completion, "content", "")),
-                tool_calls=list(getattr(completion, "tool_calls", []) or []),
-                reasoning=getattr(completion, "reasoning", None),
+                response_content=observable_fields["response_content"],
+                tool_calls=observable_fields["tool_calls"],
+                reasoning=observable_fields["reasoning"],
                 usage=dict(getattr(completion, "usage", {}) or {}),
-                raw_response=getattr(completion, "raw", None),
+                raw_response=observable_fields["raw_response"],
+                observability=observable_fields["observability"],
                 created_at=created_at,
                 completed_at=utc_now(),
             )
@@ -681,6 +739,19 @@ class LLMProcessExecutor:
             context={"purpose": "action_selection"},
         )
 
+    def _charge_llm_attempt(self, pid: str, *, source: str, context: dict[str, Any] | None = None) -> None:
+        resources = getattr(self.runtime, "resources", None)
+        if resources is None:
+            return
+        resources.charge(
+            pid,
+            ResourceUsage(llm_calls=1),
+            source=source,
+            context=context or {},
+            allow_overage=True,
+            kill_on_exceed=True,
+        )
+
     def _charge_llm_completion(self, pid: str, completion: Any) -> None:
         resources = getattr(self.runtime, "resources", None)
         if resources is None:
@@ -691,7 +762,7 @@ class LLMProcessExecutor:
         if has_token_limit and not any(key in usage for key in token_keys):
             resources.charge(
                 pid,
-                ResourceUsage(llm_calls=1),
+                ResourceUsage(),
                 source="llm.completion",
                 context={"usage_missing": True},
                 allow_overage=False,
@@ -706,7 +777,6 @@ class LLMProcessExecutor:
         resources.charge(
             pid,
             ResourceUsage(
-                llm_calls=1,
                 llm_prompt_tokens=prompt_tokens,
                 llm_completion_tokens=completion_tokens,
                 llm_total_tokens=total_tokens,
@@ -833,3 +903,52 @@ class LLMProcessExecutor:
             process.memory_view.roots.append(handle)
         process.updated_at = utc_now()
         self.runtime.store.update_process(process)
+
+    def _persist_pending_action(
+        self,
+        pid: str,
+        *,
+        wait_type: str,
+        action: dict[str, Any],
+        content_preview: str,
+        tool_call_count: int,
+        request_id: str | None = None,
+        child_pid: str | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> None:
+        # Pending actions are durable process state. They are consumed only after
+        # the blocked primitive can be resumed, preserving the original model
+        # decision across runtime restarts and human approval latency.
+        self.runtime.store.upsert_llm_pending_action(
+            pid,
+            {
+                "wait_type": wait_type,
+                "request_id": request_id,
+                "child_pid": child_pid,
+                "filters": dict(filters or {}),
+                "action": dict(action),
+                "content_preview": content_preview,
+                "tool_call_count": tool_call_count,
+                "status": "pending",
+            },
+        )
+
+    def _clear_pending_action(self, pid: str) -> None:
+        self.runtime.store.complete_llm_pending_action(pid)
+
+    def _load_pending_actions(self) -> None:
+        for pending in self.runtime.store.list_llm_pending_actions(status="pending"):
+            pid = str(pending["pid"])
+            wait_type = str(pending["wait_type"])
+            action = dict(pending.get("action") or {})
+            common = {
+                "action": action,
+                "content_preview": str(pending.get("content_preview") or ""),
+                "tool_call_count": int(pending.get("tool_call_count") or 0),
+            }
+            if wait_type == "human" and pending.get("request_id"):
+                self._pending_human_actions[pid] = {**common, "request_id": str(pending["request_id"])}
+            elif wait_type == "child" and pending.get("child_pid"):
+                self._pending_wait_actions[pid] = {**common, "child_pid": str(pending["child_pid"])}
+            elif wait_type == "message":
+                self._pending_message_actions[pid] = {**common, "filters": dict(pending.get("filters") or {})}

@@ -119,7 +119,10 @@ Leaving the budget blank runs until the process/runtime becomes idle; entering a
 number bounds that run. Automatic runs after spawn/message/exec may advance all
 runnable processes, but `POST /api/processes/{pid}/run` is intentionally scoped
 to that pid. Real LLM calls are still persisted in `llm_calls`, so the GUI can
-show token usage and errors.
+show token usage, errors, and bounded prompt/output observability metadata
+without exposing raw prompt or provider payloads by default.
+If the host runtime is configured with `llm.persist_full_io=True`, the same
+`llm_calls` API returns full stored LLM inputs and outputs.
 
 Process snapshots include `resource_budget`, `resource_usage`, and
 `resource_remaining` so the GUI can show quota state without treating it as a

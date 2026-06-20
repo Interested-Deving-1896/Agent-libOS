@@ -2,6 +2,7 @@ from __future__ import annotations
 import pytest
 import asyncio
 import tempfile
+import json
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from scripts.human_llm_chat import CHAT_PROCESS_GOAL, EchoResponder, ModelResponder, run_chat
@@ -37,8 +38,9 @@ class TestHumanLLMChatScript:
                 assert len(calls) == 1
                 assert calls[0].response_content == 'model reply'
                 assert calls[0].usage['total_tokens'] == 6
-                assert calls[0].reasoning == {'summary': 'fake text response'}
-                assert calls[0].messages[-1]['content'] == 'hello'
+                assert calls[0].reasoning['sha256']
+                assert calls[0].messages['sha256']
+                assert 'hello' not in json.dumps(calls[0].__dict__, sort_keys=True)
             finally:
                 runtime.close()
 

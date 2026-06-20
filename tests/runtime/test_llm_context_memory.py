@@ -2,11 +2,13 @@ from __future__ import annotations
 import pytest
 import json
 import tempfile
+from dataclasses import replace
 from types import SimpleNamespace
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
-from agent_libos.models import ObjectRight, ProcessStatus
+from agent_libos.models import CapabilityRight, ObjectPatch, ObjectRight, ObjectType, ProcessStatus, ViewMode
 from tests.support.fakes import RecordingActionClient
 
 class TestLLMContextMemory:
@@ -67,6 +69,36 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_llm_context_appends_updated_object_version(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+                {'action': 'process_exit', 'payload': {'done': True}},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='track object updates')
+            handle = runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.OBSERVATION,
+                payload={'value': 'old-object-token'},
+                immutable=False,
+                name='changing-observation',
+            )
+            process = runtime.process.get(pid)
+            process.memory_view = runtime.memory.create_view(pid, [handle], mode=ViewMode.READ_ONLY)
+            runtime.store.update_process(process)
+
+            runtime.run_next_process_once()
+            runtime.memory.update_object(pid, handle, ObjectPatch(payload={'value': 'new-object-token'}))
+            runtime.run_next_process_once()
+
+            first, second = runtime.llm.client.user_prompts
+            assert 'old-object-token' in first
+            assert 'new-object-token' in second
+            assert second.startswith(first)
+        finally:
+            runtime.close()
+
     def test_llm_executor_fails_closed_when_process_image_is_missing(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -103,7 +135,7 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
-    def test_llm_call_records_persist_prompt_output_usage_and_reasoning(self) -> None:
+    def test_llm_call_records_persist_sanitized_prompt_output_usage_and_reasoning(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
             runtime = Runtime.open(db)
@@ -123,11 +155,15 @@ class TestLLMContextMemory:
                 assert call.response_id == 'resp_123'
                 assert call.response_content == 'visible assistant text'
                 assert call.usage['total_tokens'] == 17
-                assert call.reasoning == {'summary': 'selected process_exit'}
-                assert call.raw_response['id'] == 'raw_resp'
-                assert call.tool_calls[0]['name'] == 'process_exit'
-                assert 'persist llm calls' in call.messages[1]['content']
-                assert any((tool['function']['name'] == 'process_exit' for tool in call.tools))
+                assert call.messages['sha256']
+                assert call.tools['sha256']
+                assert call.tool_calls['sha256']
+                assert call.raw_response['sha256']
+                assert call.reasoning['sha256']
+                assert call.observability['response_content']['sha256']
+                serialized = json.dumps(call.__dict__, sort_keys=True)
+                assert 'persist llm calls' not in serialized
+                assert '"payload": {"done": true}' not in serialized
             finally:
                 runtime.close()
             reopened = Runtime.open(db)
@@ -135,7 +171,76 @@ class TestLLMContextMemory:
                 persisted = reopened.store.list_llm_calls()
                 assert len(persisted) == 1
                 assert persisted[0].usage['prompt_tokens'] == 13
-                assert persisted[0].reasoning == {'summary': 'selected process_exit'}
+                assert persisted[0].observability['messages']['bytes'] > 0
+            finally:
+                reopened.close()
+
+    def test_llm_call_records_can_persist_full_io_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, persist_full_io=True))
+            runtime = Runtime.open(db, config=config)
+            try:
+                runtime.llm.client = MetadataActionClient()
+                pid = runtime.process.spawn(image='base-agent:v0', goal='persist full llm calls')
+
+                runtime.run_next_process_once()
+                call = runtime.store.list_llm_calls(pid)[0]
+
+                assert call.messages[1]['content']
+                assert 'persist full llm calls' in call.messages[1]['content']
+                assert any((tool['function']['name'] == 'process_exit' for tool in call.tools))
+                assert call.response_content == 'visible assistant text'
+                assert call.tool_calls[0]['name'] == 'process_exit'
+                assert call.tool_calls[0]['arguments'] == json.dumps({'payload': {'done': True}})
+                assert call.reasoning == {'summary': 'selected process_exit'}
+                assert call.raw_response['id'] == 'raw_resp'
+                assert call.observability['messages']['sha256']
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db, config=config)
+            try:
+                persisted = reopened.store.list_llm_calls(pid)[0]
+                assert 'persist full llm calls' in persisted.messages[1]['content']
+                assert persisted.raw_response['provider'] == 'fake'
+            finally:
+                reopened.close()
+
+    def test_pending_human_llm_action_survives_runtime_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            path = 'agent_outputs/pending_llm_action_reopen.txt'
+            runtime = Runtime.open(db)
+            try:
+                runtime.llm.client = RecordingActionClient([
+                    {'action': 'write_text_file', 'path': path, 'content': 'persisted approval action'},
+                ])
+                pid = runtime.process.spawn(image='review-agent:v0', goal='write after approval')
+                runtime.capability.set_permission_policy(
+                    subject=pid,
+                    resource=runtime.filesystem.resource_for(path),
+                    rights=[CapabilityRight.WRITE],
+                    policy='ask_each_time',
+                    issued_by='test',
+                )
+                waiting = runtime.run_next_process_once()
+                assert waiting['waiting_human']
+                assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'human'
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db)
+            try:
+                reopened.llm.client = ExplodingClient()
+                reopened.human.drain_terminal_queue(auto_approve=True)
+                resumed = reopened.run_next_process_once()
+
+                assert resumed['resumed_after_human']
+                assert resumed['action']['action'] == 'write_text_file'
+                assert resumed['result']['ok']
+                assert (reopened.workspace_root / path).read_text(encoding='utf-8') == 'persisted approval action'
+                assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
             finally:
                 reopened.close()
 

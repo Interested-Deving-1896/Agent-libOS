@@ -17,14 +17,15 @@ class LLMCallRecord:
     model: str | None = None
     request_id: str | None = None
     response_id: str | None = None
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    tools: list[dict[str, Any]] = field(default_factory=list)
+    messages: Any = field(default_factory=dict)
+    tools: Any = field(default_factory=dict)
     request_options: dict[str, Any] = field(default_factory=dict)
     response_content: str = ""
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: Any = field(default_factory=dict)
     reasoning: Any | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     raw_response: Any | None = None
+    observability: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     created_at: str = ""
     completed_at: str | None = None

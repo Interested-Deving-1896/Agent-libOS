@@ -175,6 +175,7 @@ class LLMContextMemory:
             ],
             "captured": {
                 "object_oids": [],
+                "objects": {},
                 "event_ids": [],
                 "capability_signature": None,
                 "tool_signature": _tool_signature(tools),
@@ -244,9 +245,15 @@ class LLMContextMemory:
             captured["event_ids"] = sorted(captured_events | {event.event_id for event in new_events})
             changed = True
 
-        captured_oids = set(captured.get("object_oids", []))
-        new_oids = [oid for oid in source_context.object_refs if oid not in captured_oids]
-        if new_oids:
+        captured_objects = _captured_object_signatures(captured)
+        changed_oids: list[str] = []
+        next_captured_objects = dict(captured_objects)
+        for oid in source_context.object_refs:
+            signature = self._object_signature(oid)
+            if captured_objects.get(oid) != signature:
+                changed_oids.append(oid)
+            next_captured_objects[oid] = signature
+        if changed_oids:
             entries.append(
                 {
                     "kind": "memory_delta",
@@ -254,10 +261,11 @@ class LLMContextMemory:
                     "policy": source_context.policy_used,
                     "token_estimate": source_context.token_count,
                     "omitted_objects": list(source_context.omitted_objects),
-                    "objects": [self._object_entry(oid) for oid in new_oids],
+                    "objects": [self._object_entry(oid) for oid in changed_oids],
                 }
             )
-            captured["object_oids"] = sorted(captured_oids | set(new_oids))
+            captured["objects"] = dict(sorted(next_captured_objects.items()))
+            captured["object_oids"] = sorted(next_captured_objects)
             changed = True
 
         if source_context.omitted_objects:
@@ -282,6 +290,12 @@ class LLMContextMemory:
             "summary": obj.metadata.summary,
             "payload": obj.payload,
         }
+
+    def _object_signature(self, oid: str) -> dict[str, Any]:
+        obj = self.runtime.store.get_object(oid)
+        if obj is None:
+            return {"missing": True}
+        return {"version": obj.version, "updated_at": obj.updated_at}
 
     def _payload(self, obj: AgentObject) -> dict[str, Any]:
         if not isinstance(obj.payload, dict) or obj.payload.get("kind") != "llm_context":
@@ -385,6 +399,13 @@ def _capability_policy(cap: Capability) -> str:
     if cap.effect.value == "ask":
         return "ask_each_time"
     return cap.effect.value
+
+
+def _captured_object_signatures(captured: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    objects = captured.get("objects")
+    if isinstance(objects, dict):
+        return {str(oid): dict(signature) for oid, signature in objects.items() if isinstance(signature, dict)}
+    return {str(oid): {"legacy_captured": True} for oid in captured.get("object_oids", [])}
 
 
 def _stable_json(value: Any) -> str:

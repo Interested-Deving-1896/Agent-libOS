@@ -84,9 +84,13 @@ uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
 uv run agent-libos --db .agent_libos.sqlite llm-calls --limit 20
 ```
 
-Records include prompt messages, visible tools, output, tool calls, provider
-ids, model/API mode, token usage when available, reasoning fields when exposed,
-raw response JSON, and errors.
+Records include provider ids, model/API mode, token usage when available, and
+bounded observability envelopes for prompts, visible tools, output, tool calls,
+reasoning, and raw responses. The envelopes contain preview, byte count, hash,
+and truncation metadata; raw prompt and provider payloads are not persisted by
+default.
+Set `config.llm.persist_full_io=True` only when the operator explicitly wants
+complete LLM input/output persistence in SQLite for debugging or forensics.
 
 ## Process Resources
 

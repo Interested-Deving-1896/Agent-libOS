@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
+from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.models import AgentImage, LLMCallRecord, ProcessStatus, ResourceBudget
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import to_jsonable
@@ -227,6 +228,15 @@ class ModelResponder:
     ) -> None:
         if self._runtime is None:
             return
+        observable_fields = observable_llm_call_fields(
+            messages=messages,
+            tools=[],
+            response_content=completion.content if completion else "",
+            tool_calls=completion.tool_calls if completion else [],
+            reasoning=completion.reasoning if completion else None,
+            raw_response=completion.raw if completion else None,
+            config=self._runtime.config,
+        )
         self._runtime.store.insert_llm_call(
             LLMCallRecord(
                 call_id=call_id,
@@ -238,18 +248,19 @@ class ModelResponder:
                 model=completion.model if completion else self.client.model,
                 request_id=completion.request_id if completion else None,
                 response_id=completion.response_id if completion else None,
-                messages=messages,
-                tools=[],
+                messages=observable_fields["messages"],
+                tools=observable_fields["tools"],
                 request_options={
                     "json_mode": False,
                     "client_class": type(self.client).__name__,
                     "real_llm_client": True,
                 },
-                response_content=completion.content if completion else "",
-                tool_calls=completion.tool_calls if completion else [],
-                reasoning=completion.reasoning if completion else None,
+                response_content=observable_fields["response_content"],
+                tool_calls=observable_fields["tool_calls"],
+                reasoning=observable_fields["reasoning"],
                 usage=completion.usage if completion else {},
-                raw_response=completion.raw if completion else None,
+                raw_response=observable_fields["raw_response"],
+                observability=observable_fields["observability"],
                 error=error,
                 created_at=created_at,
                 completed_at=utc_now(),

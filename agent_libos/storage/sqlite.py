@@ -7,6 +7,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.models import (
     AgentObject,
@@ -52,6 +54,8 @@ from agent_libos.models import (
 )
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillPackage, SkillResource
 from agent_libos.utils.serde import dumps, loads
+
+_LLM_DEFAULTS = DEFAULT_CONFIG.llm
 
 
 class SQLiteStore:
@@ -248,6 +252,7 @@ class SQLiteStore:
                   reasoning_json TEXT,
                   usage_json TEXT NOT NULL,
                   raw_response_json TEXT,
+                  observability_json TEXT NOT NULL DEFAULT '{}',
                   error TEXT,
                   created_at TEXT NOT NULL,
                   completed_at TEXT
@@ -261,6 +266,20 @@ class SQLiteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_llm_calls_response_id
                   ON llm_calls(response_id);
+
+                CREATE TABLE IF NOT EXISTS llm_pending_actions (
+                  pid TEXT PRIMARY KEY,
+                  wait_type TEXT NOT NULL,
+                  request_id TEXT,
+                  child_pid TEXT,
+                  filters_json TEXT NOT NULL,
+                  action_json TEXT NOT NULL,
+                  content_preview TEXT NOT NULL,
+                  tool_call_count INTEGER NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS process_messages (
                   message_id TEXT PRIMARY KEY,
@@ -901,8 +920,8 @@ class SQLiteStore:
             INSERT INTO llm_calls (
                 call_id, pid, image_id, purpose, status, api, model, request_id, response_id,
                 messages_json, tools_json, request_options_json, response_content, tool_calls_json,
-                reasoning_json, usage_json, raw_response_json, error, created_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reasoning_json, usage_json, raw_response_json, observability_json, error, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.call_id,
@@ -922,6 +941,7 @@ class SQLiteStore:
                 dumps(record.reasoning) if record.reasoning is not None else None,
                 dumps(record.usage),
                 dumps(record.raw_response) if record.raw_response is not None else None,
+                dumps(record.observability),
                 record.error,
                 record.created_at,
                 record.completed_at,
@@ -929,16 +949,68 @@ class SQLiteStore:
         )
 
     def list_llm_calls(self, pid: str | None = None, limit: int | None = None) -> list[LLMCallRecord]:
+        selected_limit = self._llm_call_limit(limit)
         params: list[Any] = []
         sql = "SELECT * FROM llm_calls"
         if pid is not None:
             sql += " WHERE pid = ?"
             params.append(pid)
         sql += " ORDER BY created_at, call_id"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
+        sql += " LIMIT ?"
+        params.append(selected_limit)
         return [self._row_to_llm_call(row) for row in self._query(sql, params)]
+
+    def upsert_llm_pending_action(self, pid: str, pending: dict[str, Any]) -> None:
+        now = utc_now()
+        created_at = str(pending.get("created_at") or now)
+        self._execute(
+            """
+            INSERT INTO llm_pending_actions (
+                pid, wait_type, request_id, child_pid, filters_json, action_json,
+                content_preview, tool_call_count, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pid) DO UPDATE SET
+                wait_type = excluded.wait_type,
+                request_id = excluded.request_id,
+                child_pid = excluded.child_pid,
+                filters_json = excluded.filters_json,
+                action_json = excluded.action_json,
+                content_preview = excluded.content_preview,
+                tool_call_count = excluded.tool_call_count,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (
+                pid,
+                str(pending["wait_type"]),
+                pending.get("request_id"),
+                pending.get("child_pid"),
+                dumps(pending.get("filters") or {}),
+                dumps(pending.get("action") or {}),
+                str(pending.get("content_preview") or ""),
+                int(pending.get("tool_call_count") or 0),
+                str(pending.get("status") or "pending"),
+                created_at,
+                now,
+            ),
+        )
+
+    def get_llm_pending_action(self, pid: str) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM llm_pending_actions WHERE pid = ?", (pid,))
+        return self._row_to_llm_pending_action(rows[0]) if rows else None
+
+    def list_llm_pending_actions(self, *, status: str | None = "pending") -> list[dict[str, Any]]:
+        if status is None:
+            rows = self._query("SELECT * FROM llm_pending_actions ORDER BY updated_at, pid")
+        else:
+            rows = self._query("SELECT * FROM llm_pending_actions WHERE status = ? ORDER BY updated_at, pid", (status,))
+        return [self._row_to_llm_pending_action(row) for row in rows]
+
+    def complete_llm_pending_action(self, pid: str) -> None:
+        self._execute(
+            "UPDATE llm_pending_actions SET status = ?, updated_at = ? WHERE pid = ?",
+            ("completed", utc_now(), pid),
+        )
 
     def insert_process_message(self, message: ProcessMessage) -> None:
         self._execute(
@@ -1519,6 +1591,7 @@ class SQLiteStore:
               reasoning_json TEXT,
               usage_json TEXT NOT NULL,
               raw_response_json TEXT,
+              observability_json TEXT NOT NULL DEFAULT '{}',
               error TEXT,
               created_at TEXT NOT NULL,
               completed_at TEXT
@@ -1528,6 +1601,26 @@ class SQLiteStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_pid_created ON llm_calls(pid, created_at)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_request_id ON llm_calls(request_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_response_id ON llm_calls(response_id)")
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(llm_calls)")}
+        if "observability_json" not in columns:
+            self.conn.execute("ALTER TABLE llm_calls ADD COLUMN observability_json TEXT NOT NULL DEFAULT '{}'")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_pending_actions (
+              pid TEXT PRIMARY KEY,
+              wait_type TEXT NOT NULL,
+              request_id TEXT,
+              child_pid TEXT,
+              filters_json TEXT NOT NULL,
+              action_json TEXT NOT NULL,
+              content_preview TEXT NOT NULL,
+              tool_call_count INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
 
     def _ensure_process_message_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(process_messages)")}
@@ -1980,10 +2073,34 @@ class SQLiteStore:
             reasoning=loads(row["reasoning_json"]) if row["reasoning_json"] else None,
             usage=loads(row["usage_json"], {}),
             raw_response=loads(row["raw_response_json"]) if row["raw_response_json"] else None,
+            observability=loads(row["observability_json"], {}),
             error=row["error"],
             created_at=row["created_at"],
             completed_at=row["completed_at"],
         )
+
+    def _row_to_llm_pending_action(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "pid": row["pid"],
+            "wait_type": row["wait_type"],
+            "request_id": row["request_id"],
+            "child_pid": row["child_pid"],
+            "filters": loads(row["filters_json"], {}),
+            "action": loads(row["action_json"], {}),
+            "content_preview": row["content_preview"],
+            "tool_call_count": row["tool_call_count"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _llm_call_limit(self, limit: int | None) -> int:
+        selected = _LLM_DEFAULTS.call_record_list_limit if limit is None else int(limit)
+        if selected <= 0:
+            raise ValidationError("llm call limit must be positive")
+        if selected > _LLM_DEFAULTS.call_record_hard_limit:
+            raise ValidationError(f"llm call limit exceeds hard cap {_LLM_DEFAULTS.call_record_hard_limit}")
+        return selected
 
     def _row_to_process_message(self, row: sqlite3.Row) -> ProcessMessage:
         return ProcessMessage(

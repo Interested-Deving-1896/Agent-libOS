@@ -593,6 +593,7 @@ class Runtime:
             "objects",
             "object_links",
             "capabilities",
+            "llm_pending_actions",
             "tools",
             "tool_candidates",
             "skills",

@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import LibOSError
@@ -45,26 +46,58 @@ class LLMClient:
     store: bool = _LLM_DEFAULTS.store
     reasoning_effort: str | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
+    allow_custom_base_url: bool = False
     _client: Any | None = field(default=None, init=False, repr=False)
     _async_client: Any | None = field(default=None, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        self._validate_base_url_policy()
+
     @classmethod
-    def from_env(cls, env_path: str | Path = ".env") -> "LLMClient":
-        load_dotenv(env_path)
-        api_mode = os.getenv("OPENAI_API_MODE", "auto").strip().lower()
+    def from_env(
+        cls,
+        env_path: str | Path | None = None,
+        *,
+        allow_custom_base_url: bool | None = None,
+    ) -> "LLMClient":
+        env = dict(os.environ)
+        if env_path is not None:
+            for key, value in read_dotenv(env_path).items():
+                env.setdefault(key, value)
+        api_mode = env.get("OPENAI_API_MODE", "auto").strip().lower()
         if api_mode not in _API_MODES:
             raise LLMError(f"OPENAI_API_MODE must be one of {sorted(_API_MODES)}, got {api_mode!r}")
-        return cls(
-            base_url=os.getenv("OPENAI_BASE_URL"),
-            model=os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"),
-            api_key=os.getenv("OPENAI_API_KEY"),
-            timeout=_float_env("OPENAI_TIMEOUT", default=_LLM_DEFAULTS.timeout_s),
-            max_retries=_int_env("OPENAI_MAX_RETRIES", default=_LLM_DEFAULTS.max_retries),
-            api_mode=api_mode,  # type: ignore[arg-type]
-            store=_bool_env("OPENAI_STORE", default=_LLM_DEFAULTS.store),
-            reasoning_effort=_optional_env("OPENAI_REASONING_EFFORT"),
-            verbosity=_verbosity_env("OPENAI_VERBOSITY"),
+        selected_allow_custom_base_url = (
+            _bool_env_from(env, "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", default=False)
+            if allow_custom_base_url is None
+            else allow_custom_base_url
         )
+        return cls(
+            base_url=env.get("OPENAI_BASE_URL"),
+            model=env.get("OPENAI_LANGUAGE_MODEL") or env.get("OPENAI_MODEL"),
+            api_key=env.get("OPENAI_API_KEY"),
+            timeout=_float_env_from(env, "OPENAI_TIMEOUT", default=_LLM_DEFAULTS.timeout_s),
+            max_retries=_int_env_from(env, "OPENAI_MAX_RETRIES", default=_LLM_DEFAULTS.max_retries),
+            api_mode=api_mode,  # type: ignore[arg-type]
+            store=_bool_env_from(env, "OPENAI_STORE", default=_LLM_DEFAULTS.store),
+            reasoning_effort=_optional_env_from(env, "OPENAI_REASONING_EFFORT"),
+            verbosity=_verbosity_env_from(env, "OPENAI_VERBOSITY"),
+            allow_custom_base_url=selected_allow_custom_base_url,
+        )
+
+    def close(self) -> None:
+        for attr in ("_client", "_async_client"):
+            client = getattr(self, attr)
+            if client is None:
+                continue
+            close = getattr(client, "close", None) or getattr(client, "aclose", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    _run_sync(result)
+            setattr(self, attr, None)
+
+    shutdown = close
 
     def complete(
         self,
@@ -275,6 +308,7 @@ class LLMClient:
         return self._async_client
 
     def _client_kwargs(self) -> dict[str, Any]:
+        self._validate_base_url_policy()
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
         if not (self.api_key or os.getenv("OPENAI_API_KEY")):
@@ -379,8 +413,7 @@ class LLMClient:
             retry["max_completion_tokens"] = retry.pop("max_tokens")
             return retry
         if "max_output_tokens" in message and "max_output_tokens" in retry and api == "responses":
-            retry.pop("max_output_tokens", None)
-            return retry
+            return None
         for key in ("parallel_tool_calls", "response_format", "temperature", "store", "reasoning", "reasoning_effort"):
             if key in message and key in retry:
                 retry.pop(key, None)
@@ -468,6 +501,13 @@ class LLMClient:
         if self.api_mode == "chat":
             return False
         return self.base_url is None or _is_openai_base_url(self.base_url)
+
+    def _validate_base_url_policy(self) -> None:
+        if self.base_url and not _is_openai_base_url(self.base_url) and not self.allow_custom_base_url:
+            raise LLMError(
+                "OPENAI_BASE_URL points to a custom endpoint; pass allow_custom_base_url=True "
+                "or set AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1 in the host environment"
+            )
 
     def _text_config(self, json_mode: bool) -> dict[str, Any]:
         config: dict[str, Any] = {}
@@ -607,8 +647,11 @@ def _should_fallback_to_chat(exc: Exception) -> bool:
 
 
 def _is_openai_base_url(base_url: str) -> bool:
-    normalized = base_url.lower().rstrip("/")
-    return normalized in {"https://api.openai.com/v1", "https://api.openai.com"} or "api.openai.com" in normalized
+    parsed = urlparse(base_url)
+    if parsed.scheme and parsed.scheme != "https":
+        return False
+    host = parsed.hostname if parsed.scheme else urlparse(f"https://{base_url}").hostname
+    return host == "api.openai.com"
 
 
 def _messages_contain_json_instruction(messages: list[dict[str, Any]]) -> bool:
@@ -690,14 +733,22 @@ def _bool_env_value(value: str) -> bool:
 
 
 def _bool_env(name: str, default: bool) -> bool:
-    value = os.getenv(name)
+    return _bool_env_from(os.environ, name, default=default)
+
+
+def _bool_env_from(env: dict[str, str], name: str, default: bool) -> bool:
+    value = env.get(name)
     if value is None or not value.strip():
         return default
     return _bool_env_value(value)
 
 
 def _float_env(name: str, default: float) -> float:
-    value = os.getenv(name)
+    return _float_env_from(os.environ, name, default=default)
+
+
+def _float_env_from(env: dict[str, str], name: str, default: float) -> float:
+    value = env.get(name)
     if value is None or not value.strip():
         return default
     try:
@@ -707,7 +758,11 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _int_env(name: str, default: int) -> int:
-    value = os.getenv(name)
+    return _int_env_from(os.environ, name, default=default)
+
+
+def _int_env_from(env: dict[str, str], name: str, default: int) -> int:
+    value = env.get(name)
     if value is None or not value.strip():
         return default
     try:
@@ -717,14 +772,22 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _optional_env(name: str) -> str | None:
-    value = os.getenv(name)
+    return _optional_env_from(os.environ, name)
+
+
+def _optional_env_from(env: dict[str, str], name: str) -> str | None:
+    value = env.get(name)
     if value is None or not value.strip():
         return None
     return value.strip()
 
 
 def _verbosity_env(name: str) -> Literal["low", "medium", "high"] | None:
-    value = _optional_env(name)
+    return _verbosity_env_from(os.environ, name)
+
+
+def _verbosity_env_from(env: dict[str, str], name: str) -> Literal["low", "medium", "high"] | None:
+    value = _optional_env_from(env, name)
     if value is None:
         return None
     normalized = value.lower()
@@ -743,10 +806,11 @@ def _run_sync(awaitable: Any) -> Any:
     raise RuntimeError("Cannot use sync LLMClient APIs inside a running event loop. Use async APIs instead.")
 
 
-def load_dotenv(path: str | Path = ".env") -> None:
+def read_dotenv(path: str | Path) -> dict[str, str]:
     env_path = Path(path)
     if not env_path.exists():
-        return
+        return {}
+    values: dict[str, str] = {}
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -756,5 +820,11 @@ def load_dotenv(path: str | Path = ".env") -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key:
+            values[key] = value
+    return values
+
+
+def load_dotenv(path: str | Path = ".env") -> None:
+    for key, value in read_dotenv(path).items():
+        os.environ.setdefault(key, value)

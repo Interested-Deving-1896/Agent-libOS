@@ -84,6 +84,7 @@ class TestSkillIntegration:
                 assert 'skill-instruction-token' in runtime.llm.client.user_prompts[0]
                 persisted = runtime.store.list_llm_calls(pid)
                 assert len(persisted) == 1
-                assert 'skill-instruction-token' in persisted[0].messages[1]['content']
+                assert persisted[0].messages['sha256']
+                assert 'skill-instruction-token' not in str(persisted[0].messages)
             finally:
                 runtime.close()

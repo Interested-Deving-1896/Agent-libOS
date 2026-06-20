@@ -176,8 +176,10 @@ SQLite stores durable runtime metadata and append-only records:
 - checkpoints and checkpoint payload snapshots,
 - provider-decided external effect records,
 - events and audit records,
-- LLM call records with prompt, visible tools, output, tool calls, usage,
-  reasoning metadata, raw response, and errors.
+- LLM call records with provider ids, model/API mode, usage, errors, and
+  bounded observability envelopes for prompt, visible tools, output, tool
+  calls, reasoning metadata, and raw response. Full LLM input/output
+  persistence is an explicit `llm.persist_full_io` opt-in.
 
 Object payloads are not ordinary durable object rows. They live in runtime
 memory. Checkpoint payloads are the explicit durable snapshot exception.

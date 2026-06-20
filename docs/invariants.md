@@ -45,6 +45,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   and budgets rather than dangerous API regex blacklists.
 - `tool-policy-cannot-self-grant-authority`: ToolPolicy declarations cannot
   grant execution, resource authority, or confirmation.
+- `llm-call-records-are-bounded-and-redacted`: LLM call persistence stores
+  bounded preview, size, hash, and truncation metadata instead of raw prompts,
+  tool arguments, reasoning, or provider responses.
 - `resource-budgets-are-hierarchical`: resource usage is charged to the acting
   process and its parent chain, and visibility/capability mechanisms cannot
   mint additional budget.

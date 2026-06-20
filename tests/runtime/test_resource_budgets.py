@@ -94,6 +94,30 @@ class TestResourceBudgets:
         finally:
             runtime.close()
 
+    def test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.llm.client = FailingClient()
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="provider fails with secret-token",
+                resource_budget=ResourceBudget(max_llm_calls=1),
+            )
+
+            result = runtime.run_next_process_once()
+            process = runtime.process.get(pid)
+            calls = runtime.store.list_llm_calls(pid)
+
+            assert not result["ok"]
+            assert process.status == ProcessStatus.FAILED
+            assert process.resource_usage.llm_calls == 1
+            assert len(calls) == 1
+            assert calls[0].status == "error"
+            assert calls[0].messages["sha256"]
+            assert "secret-token" not in json.dumps(calls[0].__dict__, sort_keys=True)
+        finally:
+            runtime.close()
+
 
 class UsageClient:
     def __init__(self, total_tokens: int | None) -> None:
@@ -117,3 +141,8 @@ class UsageClient:
             model="test-model",
             usage=usage,
         )
+
+
+class FailingClient:
+    def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        raise RuntimeError("provider unavailable")

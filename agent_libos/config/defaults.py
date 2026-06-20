@@ -120,6 +120,10 @@ class LLMDefaults:
     action_repair_attempts: int = 2
     content_preview_chars: int = 500
     tool_arguments_preview_chars: int = 500
+    call_record_preview_chars: int = 1_000
+    call_record_list_limit: int = 100
+    call_record_hard_limit: int = 1_000
+    persist_full_io: bool = False
     json_instruction: str = "You must respond with a valid JSON object."
     fallback_status_codes: tuple[int, ...] = (404, 405)
 

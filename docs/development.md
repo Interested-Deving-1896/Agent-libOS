@@ -71,12 +71,14 @@ uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 
 Real LLM paths are opt-in because tokens are valuable.
 
-Configure `.env`:
+Configure the host environment, or pass an explicit env file to scripts that
+offer one. The runtime LLM client does not implicitly read a workspace `.env`.
 
 ```bash
 OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
 OPENAI_LANGUAGE_MODEL=your-model
 OPENAI_API_KEY=...
+AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
 ```
 
 Useful optional variables:
@@ -88,6 +90,10 @@ Useful optional variables:
 - `OPENAI_REASONING_EFFORT`
 - `OPENAI_VERBOSITY`
 - provider-specific `OPENAI_ENABLE_THINKING`
+
+`OPENAI_BASE_URL` is optional for the OpenAI API. Custom OpenAI-compatible
+endpoints require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1` or an explicit
+`allow_custom_base_url=True` client construction.
 
 Run a script smoke:
 
@@ -102,8 +108,15 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 ```
 
 Every runtime LLM action-selection call must persist an `llm_calls` row with
-prompt, visible tools, output, tool calls, usage, reasoning metadata when
-available, raw response, and errors.
+provider ids, model/API mode, usage, errors, and bounded observability envelopes
+for prompt, visible tools, output, tool calls, reasoning metadata, and raw
+responses. Full prompt and raw provider payloads are intentionally not persisted
+by default.
+
+Set `config.llm.persist_full_io=True` to opt into full prompt, visible tool
+schema, model output, tool call, reasoning, and raw response persistence. This
+is intended for explicit local debugging or forensic runs because it can store
+user data, object memory excerpts, and provider payloads in SQLite.
 
 ## Configuration Defaults
 

@@ -215,7 +215,16 @@ class CheckpointManager:
             self._require_checkpoint_or_process_read(actor, checkpoint)
         current = self._build_current_state_for_diff(snapshot)
         tables: dict[str, Any] = {}
-        for table in ["processes", "objects", "capabilities", "process_messages", "tool_candidates", "skills", "jsonrpc_endpoints"]:
+        for table in [
+            "processes",
+            "objects",
+            "capabilities",
+            "process_messages",
+            "llm_pending_actions",
+            "tool_candidates",
+            "skills",
+            "jsonrpc_endpoints",
+        ]:
             before = self._index_rows(table, snapshot["rows"].get(table, []))
             after = self._index_rows(table, current.get(table, []))
             added = sorted(set(after) - set(before))
@@ -408,6 +417,7 @@ class CheckpointManager:
             "object_links": self._link_rows_for_objects(object_oids),
             "capabilities": capability_rows,
             "process_messages": self._message_rows_for_recipients(subtree_pids),
+            "llm_pending_actions": self._rows_by_ids("llm_pending_actions", "pid", subtree_pids),
             "skills": self._skill_rows_for_processes(process_rows),
             "skill_trust": self._skill_trust_rows_for_processes(process_rows),
             "tools": self._tool_rows_for_processes(process_rows),
@@ -463,6 +473,7 @@ class CheckpointManager:
                 self.store.forget_object_payload(oid)
             self._delete_rows_by_ids(cur, "object_namespaces", "namespace", namespace_names)
             self._delete_non_checkpoint_capabilities(cur, current_pids)
+            self._delete_rows_by_ids(cur, "llm_pending_actions", "pid", current_pids)
             self._delete_rows_by_ids(cur, "tool_candidates", "pid", current_pids)
             self._delete_rows_by_ids(cur, "processes", "pid", current_pids)
             for row in rows.get("object_namespaces", []):
@@ -497,6 +508,8 @@ class CheckpointManager:
                 self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("process_messages", []):
                 self._upsert_row(cur, "process_messages", row, "message_id")
+            for row in rows.get("llm_pending_actions", []):
+                self._upsert_row(cur, "llm_pending_actions", row, "pid")
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
 
@@ -538,6 +551,7 @@ class CheckpointManager:
             for row in rows.get("process_messages", [])
             if row["recipient_pid"] in pid_map
         ]
+        rows["llm_pending_actions"] = []
         rows["tool_candidates"] = [
             self._remap_tool_candidate_row(row, pid_map)
             for row in rows.get("tool_candidates", [])
@@ -656,7 +670,7 @@ class CheckpointManager:
                 item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
                 self._insert_row(cur, "objects", item)
                 self.store.set_object_payload(item["oid"], deepcopy(remapped["object_payloads"][item["oid"]]))
-            for table in ["object_links", "capabilities", "process_messages", "tool_candidates"]:
+            for table in ["object_links", "capabilities", "process_messages", "llm_pending_actions", "tool_candidates"]:
                 for row in rows.get(table, []):
                     self._insert_row(cur, table, row)
             for row in rows.get("skills", []):
@@ -1048,6 +1062,7 @@ class CheckpointManager:
             "objects": self._rows_by_ids("objects", "oid", object_oids),
             "capabilities": self._capability_rows_for_subjects(pids),
             "process_messages": self._message_rows_for_recipients(pids),
+            "llm_pending_actions": self._rows_by_ids("llm_pending_actions", "pid", pids),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", pids),
             "skills": self._skill_rows_for_processes(process_rows),
             "jsonrpc_endpoints": self._rows_by_ids(
@@ -1063,6 +1078,7 @@ class CheckpointManager:
             "objects": "oid",
             "capabilities": "cap_id",
             "process_messages": "message_id",
+            "llm_pending_actions": "pid",
             "tool_candidates": "candidate_id",
             "skills": "skill_id",
             "jsonrpc_endpoints": "endpoint_id",
