@@ -1,11 +1,22 @@
 from __future__ import annotations
+import json
 import pytest
 import tempfile
 from pathlib import Path
+from typing import Any
 from agent_libos import AgentImage, Runtime
-from agent_libos.models import CapabilityRight, EventType, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    EventType,
+    JIT_MULTIPLEXER_TOOL_NAME,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    ProcessStatus,
+    ResourceBudget,
+    ValidationResult,
+)
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
+from tests.support.fakes import FakeDenoSandbox
 
 class TestImageRegistration:
 
@@ -52,6 +63,57 @@ class TestImageRegistration:
         try:
             with pytest.raises(ValidationError):
                 runtime.register_image({'image_id': 'bad-right-image:v0', 'name': 'bad-right-image', 'required_capabilities': [{'resource': 'filesystem:workspace:*', 'rights': ['*']}]}, actor='cli')
+        finally:
+            runtime.close()
+
+    def test_register_image_rejects_unknown_jit_tool_exposure(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(ValidationError, match='unknown jit_tool_exposure'):
+                runtime.register_image(
+                    {'image_id': 'bad-jit-exposure:v0', 'name': 'bad-jit-exposure', 'jit_tool_exposure': 'ambient'},
+                    actor='cli',
+                )
+        finally:
+            runtime.close()
+
+    def test_multiplexed_image_rejects_reserved_default_tool(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(ValidationError, match=JIT_MULTIPLEXER_TOOL_NAME):
+                runtime.register_image(
+                    AgentImage(
+                        image_id='reserved-jit-protocol:v0',
+                        name='reserved-jit-protocol',
+                        jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
+                        default_tools=[JIT_MULTIPLEXER_TOOL_NAME],
+                    ),
+                    actor='cli',
+                )
+        finally:
+            runtime.close()
+
+    def test_register_image_rejects_oversized_manifest_fields(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(ValidationError, match='system_prompt exceeds'):
+                runtime.register_image(
+                    AgentImage(
+                        image_id='huge-prompt:v0',
+                        name='huge-prompt',
+                        system_prompt='x' * (runtime.config.image.prompt_max_chars + 1),
+                    ),
+                    actor='cli',
+                )
+            with pytest.raises(ValidationError, match='metadata exceeds'):
+                runtime.register_image(
+                    AgentImage(
+                        image_id='huge-metadata:v0',
+                        name='huge-metadata',
+                        metadata={'blob': 'x' * runtime.config.image.structured_field_hard_limit_bytes},
+                    ),
+                    actor='cli',
+                )
         finally:
             runtime.close()
 
@@ -139,6 +201,7 @@ class TestImageRegistration:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 result = runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 assert result.image.metadata['package_jit_tools'] == ['package_count']
@@ -151,10 +214,101 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_image_package_jit_boot_validation_uses_broker_resource_limits_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            sandbox = RecordingLimitFakeDenoSandbox()
+            runtime.tools.sandbox = sandbox
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                runtime.process.spawn(
+                    image='package-agent:v0',
+                    goal='limited package jit',
+                    resource_budget=ResourceBudget(
+                        max_subprocess_wall_seconds=5.0,
+                        max_subprocess_cpu_seconds=5.0,
+                        max_subprocess_memory_bytes=1_000_000,
+                    ),
+                )
+
+                assert sandbox.run_tests_calls == 1
+                assert sandbox.last_limits is not None
+                assert sandbox.last_return_metrics is True
+            finally:
+                runtime.close()
+
+    def test_image_package_multiplexed_jit_exposure_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = FakeDenoSandbox()
+            try:
+                result = runtime.image_registry.register_from_package_path(
+                    Path(temp_dir) / 'package-agent',
+                    actor='cli',
+                )
+                image = runtime.get_image('package-agent:v0')
+                pid = runtime.process.spawn(image='package-agent:v0', goal='multiplexed package')
+                schema_names = {schema['function']['name'] for schema in runtime.tools.openai_tool_schemas(pid)}
+
+                assert result.image.jit_tool_exposure == JIT_TOOL_EXPOSURE_MULTIPLEXED
+                assert image.jit_tool_exposure == JIT_TOOL_EXPOSURE_MULTIPLEXED
+                assert runtime.image_registry.inspect('package-agent:v0')['image']['jit_tool_exposure'] == JIT_TOOL_EXPOSURE_MULTIPLEXED
+                assert JIT_MULTIPLEXER_TOOL_NAME in schema_names
+                assert 'package_count' not in schema_names
+            finally:
+                runtime.close()
+
+    def test_multiplexed_image_package_rejects_jit_multiplexer_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                jit_name=JIT_MULTIPLEXER_TOOL_NAME,
+                jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match=JIT_MULTIPLEXER_TOOL_NAME):
+                    runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+            finally:
+                runtime.close()
+
+    def test_image_package_rejects_provider_invalid_jit_name_and_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root, with_jit=True, jit_name='bad name')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='OpenAI tool name syntax'):
+                    runtime.image_registry.register_from_package_path(root, actor='cli')
+            finally:
+                runtime.close()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root, with_jit=True)
+            jit_path = root / 'tools' / 'jit-tools.json'
+            jit_tools = json.loads(jit_path.read_text(encoding='utf-8'))
+            jit_tools[0]['input_schema'] = {'type': 'definitely-not-a-json-schema-type'}
+            jit_path.write_text(json.dumps(jit_tools), encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='valid JSON schema'):
+                    runtime.image_registry.register_from_package_path(root, actor='cli')
+            finally:
+                runtime.close()
+
     def test_image_package_jit_tool_name_does_not_become_global_default_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 owner = runtime.process.spawn(image='package-agent:v0', goal='owner')
@@ -207,6 +361,7 @@ class TestImageRegistration:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
@@ -277,6 +432,49 @@ workspace:
             finally:
                 runtime.close()
 
+    def test_image_package_rejects_secret_or_cache_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root)
+            root.joinpath('.env').write_text('TOKEN=secret\n', encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='secret material'):
+                    runtime.image_registry.register_from_package_path(root, actor='cli')
+            finally:
+                runtime.close()
+
+    def test_image_package_rejects_undeclared_root_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root)
+            root.joinpath('notes.txt').write_text('not part of the image contract\n', encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='undeclared files'):
+                    runtime.image_registry.register_from_package_path(root, actor='cli')
+            finally:
+                runtime.close()
+
+    def test_image_package_rejects_windows_unsafe_paths_from_file_payloads(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            files = {
+                'IMAGE.yaml': """
+image_id: unsafe-package:v0
+name: unsafe-package
+prompt: prompt.md
+workspace:
+  source: workspace
+""".lstrip(),
+                'prompt.md': 'Prompt\n',
+                'workspace/a:stream.txt': 'unsafe\n',
+            }
+            with pytest.raises(ValidationError, match='Windows-unsafe'):
+                runtime.image_registry.register_from_package_files(files, actor='cli')
+        finally:
+            runtime.close()
+
 
 def _write_image_package(
     root: Path,
@@ -285,6 +483,7 @@ def _write_image_package(
     with_jit: bool = False,
     jit_name: str = 'package_count',
     prompt_mode: str | None = None,
+    jit_tool_exposure: str | None = None,
 ) -> Path:
     root.mkdir(parents=True)
     grants = """
@@ -295,12 +494,13 @@ def _write_image_package(
 """.rstrip() if workspace_grants else "  grants: []"
     jit_line = "\njit_tools: tools/jit-tools.json" if with_jit else ""
     prompt_mode_line = f"prompt_mode: {prompt_mode}\n" if prompt_mode else ""
+    jit_tool_exposure_line = f"jit_tool_exposure: {jit_tool_exposure}\n" if jit_tool_exposure else ""
     root.joinpath('IMAGE.yaml').write_text(f"""
 image_id: package-agent:v0
 name: package-agent
 version: v0
 prompt: prompt.md
-{prompt_mode_line}default_tools:
+{prompt_mode_line}{jit_tool_exposure_line}default_tools:
   - human_output
   - read_memory_object
 context_policy: evidence_first
@@ -328,3 +528,25 @@ workspace:
             encoding='utf-8',
         )
     return root
+
+
+class RecordingLimitFakeDenoSandbox(FakeDenoSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.run_tests_calls = 0
+        self.last_limits: SubprocessLimits | None = None
+        self.last_return_metrics = False
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        self.run_tests_calls += 1
+        self.last_limits = limits
+        self.last_return_metrics = return_metrics
+        return super().run_tests(source_code, tests, timeout, limits=limits, return_metrics=return_metrics)

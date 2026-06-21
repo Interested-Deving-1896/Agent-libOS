@@ -58,16 +58,27 @@ runtime paths such as JIT syscalls may still call primitives directly through
 their syscall session without exposing the corresponding builtin tool to the
 model.
 
+`jit_tool_exposure` controls how JIT tools appear to the LLM. `direct` exposes
+each visible JIT as its own OpenAI tool. `multiplexed` exposes one stable
+`run_jit_tool` protocol tool and maps it back to the real process-local JIT
+before execution. Multiplexed mode hides individual JIT names from runtime
+tool sections and event context; image prompts remain responsible for listing
+any JIT catalog the model should know.
+
 A checkpoint-commit image remaps baked Object Memory, process-local JIT tools,
-loaded Skill records, and cwd into the new process. It does not package or
-restore filesystem, shell, JSON-RPC, human, network, or provider side effects.
+loaded Skill package snapshots, and cwd into the new process. It does not package or
+restore filesystem, shell, JSON-RPC endpoints, global Skill trust, human,
+network, or provider side effects.
 
 An image-package boot materializes the package `workspace/` seed into a private
 per-process directory under `agent_outputs/image_workspaces/`, sets the process
 cwd from the package manifest, and grants only the manifest-declared
 `workspace.grants` for that private copy. Package JIT tools live under
 `tools/jit-tools.json` and `tools/scripts/*.ts`; they are registered as
-process-local ephemeral tools and are not copied into the workspace.
+process-local ephemeral tools and are not copied into the workspace. Package
+artifacts persist only declared package content: `IMAGE.yaml`, the referenced
+prompt, declared `workspace/` content, referenced `tools/` JIT files, and
+`resources/`. Cache, VCS, likely secret, and platform-unsafe paths are rejected.
 
 ## Working Directory
 

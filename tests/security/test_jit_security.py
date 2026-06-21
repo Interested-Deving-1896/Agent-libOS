@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.models import CapabilityRight, ProcessStatus, ResourceBudget, ValidationResult
+from agent_libos.models import (
+    AgentImage,
+    CapabilityRight,
+    JIT_MULTIPLEXER_TOOL_NAME,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    ProcessStatus,
+    ResourceBudget,
+    ValidationResult,
+)
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
@@ -72,6 +80,83 @@ class TestJitSecurity:
         assert second_call.payload == {'count': 5}
         assert 'local_count_chars' in self._schema_names(first)
         assert 'local_count_chars' in self._schema_names(second)
+
+    def test_multiplexed_jit_schema_uses_single_protocol_tool(self) -> None:
+        pid = self._spawn_multiplexed_process()
+        self._register_count_tool(pid, 'count_chars')
+
+        schema_names = self._schema_names(pid)
+        model_names = {row['name'] for row in self.runtime.tools.model_visible_tools(pid)}
+        real_names = {row['name'] for row in self.runtime.tools.visible_tools(pid)}
+
+        assert JIT_MULTIPLEXER_TOOL_NAME in schema_names
+        assert 'count_chars' not in schema_names
+        assert JIT_MULTIPLEXER_TOOL_NAME in model_names
+        assert 'count_chars' not in model_names
+        assert 'count_chars' in real_names
+
+    def test_multiplexed_jit_schema_omits_protocol_tool_without_visible_jit(self) -> None:
+        pid = self._spawn_multiplexed_process()
+
+        assert JIT_MULTIPLEXER_TOOL_NAME not in self._schema_names(pid)
+        assert JIT_MULTIPLEXER_TOOL_NAME not in {row['name'] for row in self.runtime.tools.model_visible_tools(pid)}
+
+    def test_multiplexer_cannot_dispatch_static_or_other_process_tool(self) -> None:
+        owner = self._spawn_multiplexed_process()
+        other = self._spawn_multiplexed_process()
+        self._register_count_tool(owner, 'owner_count')
+
+        with pytest.raises(ValueError, match='only dispatch process-local JIT tools'):
+            self.runtime.tools.normalize_model_action(
+                owner,
+                {'action': JIT_MULTIPLEXER_TOOL_NAME, 'tool_name': 'process_exit', 'arguments': {}},
+            )
+        with pytest.raises(ValueError, match='not in process tool table'):
+            self.runtime.tools.normalize_model_action(
+                other,
+                {'action': JIT_MULTIPLEXER_TOOL_NAME, 'tool_name': 'owner_count', 'arguments': {'text': 'x'}},
+            )
+
+    def test_multiplexed_jit_rejects_reserved_protocol_tool_name(self) -> None:
+        pid = self._spawn_multiplexed_process()
+
+        with pytest.raises(ValidationError, match=JIT_MULTIPLEXER_TOOL_NAME):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': JIT_MULTIPLEXER_TOOL_NAME,
+                    'description': 'Try to shadow the JIT multiplexer.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+    def test_jit_proposal_rejects_provider_invalid_name_and_schema(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bad jit spec')
+
+        with pytest.raises(ValidationError, match='OpenAI tool name syntax'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'bad name with spaces',
+                    'description': 'Invalid provider-facing tool name.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+        with pytest.raises(ValidationError, match='valid JSON schema'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'bad_schema',
+                    'description': 'Invalid provider-facing schema.',
+                    'input_schema': {'type': 'definitely-not-a-json-schema-type'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
 
     def test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -317,6 +402,20 @@ class TestJitSecurity:
         candidate = self.runtime.tools.propose(pid, {'name': name, 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }', tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
         assert self.runtime.tools.validate(candidate).ok
         return self.runtime.tools.register(pid, candidate)
+
+    def _spawn_multiplexed_process(self) -> str:
+        image_id = 'multiplexed-toolmaker:v0'
+        if image_id not in self.runtime.images:
+            self.runtime.register_image(
+                AgentImage(
+                    image_id=image_id,
+                    name='multiplexed-toolmaker',
+                    default_tools=['process_exit'],
+                    jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
+                ),
+                actor='test',
+            )
+        return self.runtime.process.spawn(image=image_id, goal='multiplexed jit')
 
 
 class NoLimitValidationSandbox(SandboxBackend):

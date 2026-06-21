@@ -37,6 +37,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
   profiles are derived from the same capability decision that authorizes the
   operation.
+- `audit-query-windows-retain-latest-records`: limited audit queries select the
+  latest matching records before returning them chronologically, and process
+  audit views filter before applying their limit.
 - `tool-observability-redacts-sensitive-payloads`: tool audit/event
   observability stores bounded preview, hash, size, and truncation metadata
   instead of raw sensitive args or results.

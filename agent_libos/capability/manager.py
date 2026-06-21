@@ -565,8 +565,9 @@ class CapabilityManager:
         )
         return updated
 
-    def assert_handle(self, subject: str, handle: ObjectHandle, right: str | CapabilityRight) -> None:
+    def authorize_handle(self, subject: str, handle: ObjectHandle, right: str | CapabilityRight) -> CapabilityDecision:
         requested = str(right)
+        resource = f"object:{handle.oid}"
         if requested not in handle.rights:
             raise CapabilityDenied(f"object handle lacks {requested}: {handle.oid}")
         cap = self.store.get_capability(handle.capability_id)
@@ -574,7 +575,21 @@ class CapabilityManager:
             raise CapabilityDenied(f"invalid object capability: {handle.capability_id}")
         if cap.subject != subject:
             raise CapabilityDenied(f"capability subject mismatch: {cap.subject} != {subject}")
-        decision = self.authorize(subject, f"object:{handle.oid}", requested)
+        if cap.resource != resource:
+            raise CapabilityDenied(f"object handle resource mismatch: {cap.resource} != {resource}")
+        if requested not in cap.rights:
+            raise CapabilityDenied(f"object capability lacks {requested}: {handle.oid}")
+        global_decision = self.authorize(subject, resource, requested)
+        if not global_decision.allowed:
+            return global_decision
+        # A handle is authority only through the capability it names. A separate
+        # broad grant may make the same operation legal, but it must not make a
+        # forged or stale handle valid for Object Memory APIs.
+        return self.authorize_matching_capabilities(subject, resource, requested, [cap])
+
+    def assert_handle(self, subject: str, handle: ObjectHandle, right: str | CapabilityRight) -> None:
+        requested = str(right)
+        decision = self.authorize_handle(subject, handle, requested)
         if not decision.allowed:
             raise CapabilityDenied(f"capability lacks {requested}: {handle.oid}")
         if decision.consume_capability_id is not None:

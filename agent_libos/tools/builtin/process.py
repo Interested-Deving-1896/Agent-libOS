@@ -262,10 +262,11 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         result_handle: ObjectHandle | None = None
         if args.result_oid:
-            result_handle = runtime.capability.handle_for_object(
+            result_handle = runtime.memory.handle_for_oid(
                 ctx.pid,
                 args.result_oid,
-                {"read", "materialize", "link", "diff"},
+                required_rights={ObjectRight.READ.value},
+                optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
                 issued_by="process_exit_tool",
             )
         elif args.payload is not None:
@@ -431,12 +432,12 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             if oid in visible:
                 roots.append(visible[oid])
                 continue
-            runtime.capability.require(pid, f"object:{oid}", ObjectRight.READ)
             roots.append(
-                runtime.capability.handle_for_object(
+                runtime.memory.handle_for_oid(
                     pid,
                     oid,
-                    {"read", "materialize", "diff"},
+                    required_rights={ObjectRight.READ.value},
+                    optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.DIFF.value},
                     issued_by="fork_child_process_tool",
                 )
             )

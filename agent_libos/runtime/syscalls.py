@@ -858,10 +858,11 @@ class LibOSSyscallSession:
 
     def _result_handle_for_exit(self, args: dict[str, Any], tool_result: ObjectHandle | None) -> ObjectHandle | None:
         if args.get("result_oid"):
-            return self.runtime.capability.handle_for_object(
+            return self.runtime.memory.handle_for_oid(
                 self.pid,
                 str(args["result_oid"]),
-                {"read", "materialize", "link", "diff"},
+                required_rights={ObjectRight.READ.value},
+                optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
                 issued_by="jit.process_exit",
             )
         if "payload" in args:
@@ -886,12 +887,12 @@ class LibOSSyscallSession:
             if oid_text in visible:
                 roots.append(visible[oid_text])
                 continue
-            self.runtime.capability.require(self.pid, f"object:{oid_text}", ObjectRight.READ)
             roots.append(
-                self.runtime.capability.handle_for_object(
+                self.runtime.memory.handle_for_oid(
                     self.pid,
                     oid_text,
-                    {"read", "materialize", "diff"},
+                    required_rights={ObjectRight.READ.value},
+                    optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.DIFF.value},
                     issued_by="jit.syscall.fork",
                 )
             )

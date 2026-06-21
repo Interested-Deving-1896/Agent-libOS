@@ -78,14 +78,18 @@ The registry rejects:
 - non-HTTP(S) schemes,
 - non-local plain HTTP,
 - private, link-local, reserved, multicast, or metadata-service IP targets,
+- DNS results that resolve a non-local endpoint to loopback, private,
+  link-local, reserved, multicast, or other non-public addresses,
 - unsafe endpoint or method ids,
 - literal secret header values,
+- header prefixes outside the approved auth-scheme prefixes and any non-empty
+  header suffix,
 - forbidden request headers such as `Host` or `Content-Length`.
 
 Headers are environment-backed. The registry stores the environment variable
-name and optional prefix/suffix, never the resolved secret value. Missing
-environment variables fail before the HTTP attempt and before one-shot remote
-method authority is consumed.
+name and a small approved prefix such as `Bearer `, never the resolved secret
+value. Missing environment variables and runtime DNS policy failures happen
+before the HTTP attempt and before one-shot remote method authority is consumed.
 
 The default provider does not follow HTTP redirects. Redirects are treated as
 HTTP failures so a registered endpoint cannot silently move a call to a new
@@ -130,6 +134,10 @@ The runtime stores an append-only `external_effects` row with provider
 `external_effects_since_checkpoint` and `external_effect_summary`. v1 does not
 perform remote rollback or compensation.
 
+Audit and external-effect metadata store bounded, redacted observations of
+`params` with size and hash. Raw params are sent to the registered provider but
+are not persisted in audit or provider-effect context.
+
 ## CLI
 
 Register and inspect endpoints:
@@ -157,6 +165,10 @@ uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
 `jsonrpc_endpoint:*` or exact endpoint capabilities. Method calls always run as
 the target pid and are authorized by that pid's method capability.
 
+Replacing an existing endpoint requires endpoint `admin` when an actor pid is
+used. A replace invalidates existing exact method grants for that endpoint so
+old authority cannot silently point at a new URL or wire method.
+
 ## Tools And Syscalls
 
 LLM-facing tools:
@@ -180,6 +192,8 @@ or raw wire methods.
 Endpoint specs are stored in SQLite as registry rows. Resolved header secret
 values are not persisted.
 
-Checkpoint snapshots include JSON-RPC endpoint definitions referenced by the
-restored process subtree capabilities. Restore and fork upsert those endpoint
-definitions without deleting unrelated registry state.
+Checkpoint snapshots preserve process capabilities that reference JSON-RPC
+resources, but they do not copy or restore endpoint registry rows. Restore and
+fork therefore fail closed if the current runtime does not have a matching
+registered endpoint; a host operator must register provider configuration
+explicitly.

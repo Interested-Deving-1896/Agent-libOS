@@ -285,6 +285,8 @@ class ImageDefaults:
     id_max_chars: int = 128
     name_max_chars: int = 128
     version_max_chars: int = 64
+    manifest_hard_limit_bytes: int = 1_048_576
+    structured_field_hard_limit_bytes: int = 262_144
     max_default_tools: int = 128
     max_required_capabilities: int = 64
     package_manifest_name: str = "IMAGE.yaml"

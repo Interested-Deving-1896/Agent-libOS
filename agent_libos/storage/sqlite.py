@@ -189,6 +189,18 @@ class SQLiteStore:
                   parent_record_id TEXT
                 );
 
+                CREATE INDEX IF NOT EXISTS idx_audit_records_created
+                  ON audit_records(timestamp, record_id);
+
+                CREATE INDEX IF NOT EXISTS idx_audit_records_actor_created
+                  ON audit_records(actor, timestamp, record_id);
+
+                CREATE INDEX IF NOT EXISTS idx_audit_records_target_created
+                  ON audit_records(target, timestamp, record_id);
+
+                CREATE INDEX IF NOT EXISTS idx_audit_records_correlation_created
+                  ON audit_records(correlation_id, timestamp, record_id);
+
                 CREATE TABLE IF NOT EXISTS external_effects (
                   effect_id TEXT PRIMARY KEY,
                   record_id TEXT,
@@ -376,6 +388,7 @@ class SQLiteStore:
                   tests_json TEXT NOT NULL,
                   requested_capabilities_json TEXT NOT NULL,
                   status TEXT NOT NULL,
+                  registered_tool_id TEXT,
                   validation_json TEXT,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
@@ -402,11 +415,13 @@ class SQLiteStore:
             self._ensure_object_namespace_schema()
             self._ensure_process_schema()
             self._ensure_capability_schema()
+            self._ensure_audit_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_checkpoint_schema()
             self._ensure_external_effect_schema()
             self._ensure_skill_schema()
+            self._ensure_tool_candidate_schema()
             self._ensure_jsonrpc_endpoint_schema()
             self._ensure_runtime_module_schema()
             self.conn.commit()
@@ -800,13 +815,39 @@ class SQLiteStore:
             ),
         )
 
-    def list_audit(self, limit: int | None = None) -> list[AuditRecord]:
-        sql = "SELECT * FROM audit_records ORDER BY timestamp"
-        params: tuple[Any, ...] = ()
-        if limit is not None:
-            sql += " LIMIT ?"
-            params = (limit,)
-        return [self._row_to_audit(row) for row in self._query(sql, params)]
+    def list_audit(
+        self,
+        limit: int | None = None,
+        *,
+        actor: str | None = None,
+        target: str | None = None,
+        match_any: bool = False,
+    ) -> list[AuditRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if actor is not None:
+            clauses.append("actor = ?")
+            params.append(actor)
+        if target is not None:
+            clauses.append("target = ?")
+            params.append(target)
+        joiner = " OR " if match_any and len(clauses) > 1 else " AND "
+        where = f" WHERE {joiner.join(clauses)}" if clauses else ""
+        order = "ORDER BY timestamp, rowid"
+        if limit is None:
+            return [self._row_to_audit(row) for row in self._query(f"SELECT * FROM audit_records{where} {order}", params)]
+        selected_limit = int(limit)
+        if selected_limit <= 0:
+            return []
+        # Limited audit reads are used by the GUI and API list views. Select the
+        # newest window first, then return it chronologically so append streams
+        # do not lose recent records once the table is larger than the window.
+        limited = (
+            f"SELECT audit_records.*, rowid AS _audit_rowid FROM audit_records{where} "
+            "ORDER BY timestamp DESC, rowid DESC LIMIT ?"
+        )
+        rows = self._query(f"SELECT * FROM ({limited}) ORDER BY timestamp, _audit_rowid", [*params, selected_limit])
+        return [self._row_to_audit(row) for row in rows]
 
     def insert_external_effect(self, record: ExternalEffectRecord) -> None:
         self._execute(
@@ -1146,7 +1187,13 @@ class SQLiteStore:
 
     def insert_tool_candidate(self, candidate: ToolCandidate) -> None:
         self._execute(
-            "INSERT INTO tool_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO tool_candidates (
+                candidate_id, pid, spec_json, source_code, tests_json,
+                requested_capabilities_json, status, registered_tool_id,
+                validation_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 candidate.candidate_id,
                 candidate.pid,
@@ -1155,6 +1202,7 @@ class SQLiteStore:
                 dumps(candidate.tests),
                 dumps(candidate.requested_capabilities),
                 candidate.status.value,
+                candidate.registered_tool_id,
                 dumps(candidate.validation) if candidate.validation is not None else None,
                 candidate.created_at,
                 candidate.updated_at,
@@ -1166,8 +1214,8 @@ class SQLiteStore:
             """
             UPDATE tool_candidates
                SET pid = ?, spec_json = ?, source_code = ?, tests_json = ?,
-                   requested_capabilities_json = ?, status = ?, validation_json = ?,
-                   created_at = ?, updated_at = ?
+                   requested_capabilities_json = ?, status = ?, registered_tool_id = ?,
+                   validation_json = ?, created_at = ?, updated_at = ?
              WHERE candidate_id = ?
             """,
             (
@@ -1177,6 +1225,7 @@ class SQLiteStore:
                 dumps(candidate.tests),
                 dumps(candidate.requested_capabilities),
                 candidate.status.value,
+                candidate.registered_tool_id,
                 dumps(candidate.validation) if candidate.validation is not None else None,
                 candidate.created_at,
                 candidate.updated_at,
@@ -1570,6 +1619,20 @@ class SQLiteStore:
         if "max_delegation_depth" not in columns:
             self.conn.execute("ALTER TABLE capabilities ADD COLUMN max_delegation_depth INTEGER")
 
+    def _ensure_audit_schema(self) -> None:
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_records_created ON audit_records(timestamp, record_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_records_actor_created ON audit_records(actor, timestamp, record_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_records_target_created ON audit_records(target, timestamp, record_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_records_correlation_created ON audit_records(correlation_id, timestamp, record_id)"
+        )
+
     def _ensure_llm_call_schema(self) -> None:
         self.conn.execute(
             """
@@ -1710,6 +1773,11 @@ class SQLiteStore:
             );
             """
         )
+
+    def _ensure_tool_candidate_schema(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(tool_candidates)")}
+        if "registered_tool_id" not in columns:
+            self.conn.execute("ALTER TABLE tool_candidates ADD COLUMN registered_tool_id TEXT")
 
     def _ensure_jsonrpc_endpoint_schema(self) -> None:
         self.conn.execute(
@@ -2132,6 +2200,7 @@ class SQLiteStore:
             validation=loads(row["validation_json"]) if row["validation_json"] else None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            registered_tool_id=row["registered_tool_id"] if "registered_tool_id" in row.keys() else None,
         )
 
     def _skill_row_metadata(self, row: sqlite3.Row) -> dict[str, Any]:

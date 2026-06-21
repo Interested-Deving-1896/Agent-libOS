@@ -17,7 +17,6 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - JIT candidates and registered process-local JIT tools,
 - Skill registry rows needed by loaded Skills,
 - loaded Skill records,
-- JSON-RPC endpoint definitions referenced by subtree capabilities,
 - mailbox delivery state,
 - image definitions needed by the subtree,
 - checkpoint-derived image artifacts needed by those image definitions,
@@ -42,8 +41,8 @@ Restore itself appends new audit and event records.
 
 Restore and fork require the current Python runtime to have already loaded the
 same startup Runtime Module ids and source hashes captured in the checkpoint.
-Checkpoint restore does not import Python modules, change module trust, or roll
-back the host module environment.
+Checkpoint restore does not import Python modules, change module trust, restore
+global Skill trust rows, or roll back the host module environment.
 
 External filesystem, shell, image, JSON-RPC remote calls, and provider effects
 are not rolled back. Providers classify their own effects as:
@@ -134,8 +133,9 @@ If irreversible provider effects exist after the checkpoint, restore still
 continues by default. The irreversible effects stay in append-only history and
 in the restore report.
 
-JSON-RPC endpoint registry rows captured by the snapshot are restored by
-upsert. Restore and fork do not delete unrelated endpoint registry state.
+JSON-RPC endpoint registry rows are host provider configuration and are not
+captured or restored. Restored capabilities that reference a missing endpoint
+fail closed until a host operator registers that endpoint explicitly.
 
 ## Commit To Image
 
@@ -152,10 +152,12 @@ The v1 commit captures only the checkpoint owner root process:
 
 It does not copy the real filesystem, shell state, remote JSON-RPC state, human
 UI output, network effects, resource budgets/usage, or any other provider-side
-state. Provider effects remain append-only `external_effects` records. Resource
-limits for a process booted from the committed image must come from the caller
-that starts that process. Use an image package `workspace/` seed when an image
-needs filesystem content at boot time.
+state. It also does not restore JSON-RPC endpoint registrations or global Skill
+trust rows; those are host registry decisions, not image state. Provider effects
+remain append-only `external_effects` records. Resource limits for a process
+booted from the committed image must come from the caller that starts that
+process. Use an image package `workspace/` seed when an image needs filesystem
+content at boot time.
 
 External capabilities in the checkpoint are converted into image
 `required_capabilities` declarations. They are not restored as live authority

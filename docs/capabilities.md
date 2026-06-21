@@ -270,7 +270,9 @@ The required right comes from the endpoint method spec: `read`, `write`, or
 `execute`. Granting `jsonrpc_endpoint:* read` allows endpoint discovery, not
 method invocation. Granting `jsonrpc:demo-weather:forecast read` allows that
 specific remote method, subject to primitive validation, human approval,
-provider classification, audit, and external-effect recording.
+runtime DNS policy, provider classification, audit, and external-effect
+recording. Agent-facing inspect paths do not expose endpoint URLs or header
+prefix/suffix values; those are host registry details.
 
 ## Filesystem Authority
 

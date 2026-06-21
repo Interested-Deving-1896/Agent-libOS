@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
+from jsonschema.validators import validator_for as jsonschema_validator_for
+
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
@@ -16,21 +19,61 @@ from agent_libos.models import (
     Capability,
     CapabilityRight,
     EventType,
+    JIT_MULTIPLEXER_TOOL_NAME,
+    JIT_TOOL_EXPOSURE_DIRECT,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    JIT_TOOL_EXPOSURES,
+    OPENAI_TOOL_NAME_MAX_CHARS,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODES,
     ToolHandle,
     ToolSpec,
+    is_openai_tool_name,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.skills.schema import JitToolSpec
 from agent_libos.storage import SQLiteStore
+from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _IMAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
+_WINDOWS_FORBIDDEN_PATH_CHARS = set('<>:"|?*')
+_WINDOWS_RESERVED_PATH_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+_SENSITIVE_PACKAGE_FILENAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+_SENSITIVE_PACKAGE_SUFFIXES = (".pem", ".p12", ".pfx", ".key")
+_CACHE_PACKAGE_SEGMENTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "node_modules",
+}
 _PACKAGE_BOOT_KIND = "image_package"
 _CHECKPOINT_BOOT_KIND = "checkpoint_commit"
 
@@ -51,6 +94,7 @@ class ImageRegistryPrimitive:
         "version",
         "system_prompt",
         "prompt_mode",
+        "jit_tool_exposure",
         "planner",
         "action_schema",
         "default_skills",
@@ -213,6 +257,7 @@ class ImageRegistryPrimitive:
             version=image.version,
             system_prompt=image.system_prompt,
             prompt_mode=image.prompt_mode,
+            jit_tool_exposure=image.jit_tool_exposure,
             planner=dict(image.planner),
             action_schema=dict(image.action_schema),
             default_skills=list(image.default_skills),
@@ -274,6 +319,7 @@ class ImageRegistryPrimitive:
                 "files": artifact.get("counts", {}).get("files", 0),
                 "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
                 "jit_tools": len(artifact.get("jit_tools", [])),
+                "jit_tool_exposure": image.jit_tool_exposure,
                 "replaced": result.replaced,
             },
         )
@@ -285,6 +331,8 @@ class ImageRegistryPrimitive:
             "name": image.name,
             "version": image.version,
             "package_sha256": artifact["package_sha256"],
+            "prompt_mode": image.prompt_mode,
+            "jit_tool_exposure": image.jit_tool_exposure,
             "default_tools": list(image.default_tools),
             "default_skills": list(image.default_skills),
             "jit_tools": [tool["name"] for tool in artifact.get("jit_tools", [])],
@@ -491,18 +539,32 @@ class ImageRegistryPrimitive:
             raise ValidationError(f"image package prompt exceeds prompt_max_chars={self.config.image.prompt_max_chars}")
         jit_tools = self._load_package_jit_tools(files, image_data.get("jit_tools"))
         jit_names = {tool.name for tool in jit_tools}
+        jit_tool_exposure = (
+            self._optional_string(image_data.get("jit_tool_exposure"), "jit_tool_exposure")
+            or JIT_TOOL_EXPOSURE_DIRECT
+        )
+        if jit_tool_exposure == JIT_TOOL_EXPOSURE_MULTIPLEXED and JIT_MULTIPLEXER_TOOL_NAME in jit_names:
+            raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
         default_tools = [
             tool for tool in self._string_list(image_data.get("default_tools"), "default_tools")
             if tool not in jit_names
         ]
         workspace = self._coerce_package_workspace(image_data.get("workspace"))
         self._validate_package_workspace_paths(files, workspace)
+        self._validate_package_artifact_scope(
+            files,
+            manifest_path=manifest_name,
+            prompt_path=prompt_path,
+            workspace=workspace,
+            jit_tools_path=image_data.get("jit_tools"),
+        )
         image = AgentImage(
             image_id=self._require_string(image_data["image_id"], "image_id"),
             name=self._require_string(image_data["name"], "name"),
             version=self._optional_string(image_data.get("version"), "version") or "v0",
             system_prompt=prompt,
             prompt_mode=self._optional_string(image_data.get("prompt_mode"), "prompt_mode") or PROMPT_MODE_IMAGE_ONLY,
+            jit_tool_exposure=jit_tool_exposure,
             planner=self._mapping(image_data.get("planner"), "planner"),
             action_schema=self._mapping(image_data.get("action_schema"), "action_schema"),
             default_skills=self._string_list(image_data.get("default_skills"), "default_skills"),
@@ -548,6 +610,7 @@ class ImageRegistryPrimitive:
             "version",
             "prompt",
             "prompt_mode",
+            "jit_tool_exposure",
             "planner",
             "action_schema",
             "default_skills",
@@ -644,14 +707,22 @@ class ImageRegistryPrimitive:
             if not isinstance(item, dict):
                 raise ValidationError("jit_tools[].tests entries must be mappings")
             tests.append(dict(item))
+        if len(tests) > self.config.tools.jit_tests_max_count:
+            raise ValidationError(f"image package JIT tests exceed jit_tests_max_count={self.config.tools.jit_tests_max_count}")
+        for index, test in enumerate(tests, start=1):
+            ensure_json_size(test, self.config.tools.jit_test_case_max_bytes, f"image package JIT test {index}")
         name = self._require_string(value.get("name"), "jit_tools[].name")
-        self._validate_identifier(name, "jit_tools[].name", self.config.skills.id_max_chars)
+        self._validate_openai_tool_name(name, "jit_tools[].name")
+        input_schema = self._mapping(value.get("input_schema"), "jit_tools[].input_schema")
+        output_schema = self._mapping(value.get("output_schema"), "jit_tools[].output_schema")
+        self._validate_json_schema(input_schema or {"type": "object"}, "jit_tools[].input_schema")
+        self._validate_json_schema(output_schema or {"type": "object"}, "jit_tools[].output_schema")
         return JitToolSpec(
             name=name,
             description=self._require_string(value.get("description"), "jit_tools[].description"),
             source_path=source_path,
-            input_schema=self._mapping(value.get("input_schema"), "jit_tools[].input_schema"),
-            output_schema=self._mapping(value.get("output_schema"), "jit_tools[].output_schema"),
+            input_schema=input_schema,
+            output_schema=output_schema,
             tests=tests,
             metadata=self._mapping(value.get("metadata"), "jit_tools[].metadata"),
         )
@@ -737,6 +808,36 @@ class ImageRegistryPrimitive:
         if working_directory_path in file_paths:
             raise ValidationError("workspace.working_directory must point to a directory, not a file")
 
+    def _validate_package_artifact_scope(
+        self,
+        files: dict[str, bytes],
+        *,
+        manifest_path: str,
+        prompt_path: str,
+        workspace: dict[str, Any],
+        jit_tools_path: Any,
+    ) -> None:
+        """Keep image artifacts limited to package-declared content.
+
+        Registration reads a directory tree to discover the manifest and its
+        referenced files, but artifact persistence should not silently capture
+        unrelated local files such as notes, caches, or secrets that happened to
+        be placed next to IMAGE.yaml.
+        """
+        roots = [self.config.image.package_resources_dir]
+        if workspace.get("source"):
+            roots.append(str(workspace["source"]))
+        if jit_tools_path is not None:
+            roots.append(self.config.image.package_tools_dir)
+        allowed_files = {manifest_path, prompt_path}
+        unexpected = [
+            path
+            for path in sorted(files)
+            if path not in allowed_files and not any(self._is_under_package_path(path, root) for root in roots)
+        ]
+        if unexpected:
+            raise ValidationError(f"image package contains undeclared files: {unexpected[:5]}")
+
     def _package_file_record(self, path: str, content: bytes) -> dict[str, Any]:
         sha = hashlib.sha256(content).hexdigest()
         record: dict[str, Any] = {
@@ -784,7 +885,10 @@ class ImageRegistryPrimitive:
             if part == "..":
                 raise ValidationError(f"image package path escapes package root: {path!r}")
             parts.append(part)
-        return "/".join(parts) or "."
+        normalized = "/".join(parts) or "."
+        if normalized != ".":
+            self._validate_package_path_safety(normalized, original=path)
+        return normalized
 
     def _validate_package_relative_path(self, path: str) -> None:
         normalized = self._normalize_package_reference(path)
@@ -794,6 +898,21 @@ class ImageRegistryPrimitive:
             raise ValidationError("image package file path cannot be package root")
         if any(ord(char) < 32 for char in normalized):
             raise ValidationError(f"image package path contains control characters: {path!r}")
+
+    def _validate_package_path_safety(self, normalized: str, *, original: str) -> None:
+        for part in normalized.split("/"):
+            lower = part.lower()
+            stem = part.split(".", 1)[0].upper()
+            if any(char in _WINDOWS_FORBIDDEN_PATH_CHARS for char in part):
+                raise ValidationError(f"image package path contains a Windows-unsafe character: {original!r}")
+            if part.endswith((" ", ".")):
+                raise ValidationError(f"image package path contains a Windows-unsafe segment: {original!r}")
+            if stem in _WINDOWS_RESERVED_PATH_NAMES:
+                raise ValidationError(f"image package path uses a reserved Windows device name: {original!r}")
+            if lower in _CACHE_PACKAGE_SEGMENTS:
+                raise ValidationError(f"image package must not include cache or VCS paths: {original!r}")
+            if lower in _SENSITIVE_PACKAGE_FILENAMES or lower.endswith(_SENSITIVE_PACKAGE_SUFFIXES):
+                raise ValidationError(f"image package must not include likely secret material: {original!r}")
 
     def _join_relative(self, base: str, path: str) -> str:
         normalized_base = self._normalize_package_reference(base)
@@ -926,6 +1045,7 @@ class ImageRegistryPrimitive:
             version=version,
             system_prompt=source_image.system_prompt if source_image is not None else "",
             prompt_mode=source_image.prompt_mode if source_image is not None else PROMPT_MODE_IMAGE_ONLY,
+            jit_tool_exposure=source_image.jit_tool_exposure if source_image is not None else JIT_TOOL_EXPOSURE_DIRECT,
             planner=dict(source_image.planner) if source_image is not None else {},
             action_schema=dict(source_image.action_schema) if source_image is not None else {},
             default_skills=list(artifact.get("default_skills", [])),
@@ -1022,6 +1142,8 @@ class ImageRegistryPrimitive:
             version=self._optional_string(image.get("version"), "version") or "v0",
             system_prompt=self._optional_text(image.get("system_prompt"), "system_prompt") or "",
             prompt_mode=self._optional_string(image.get("prompt_mode"), "prompt_mode") or PROMPT_MODE_IMAGE_ONLY,
+            jit_tool_exposure=self._optional_string(image.get("jit_tool_exposure"), "jit_tool_exposure")
+            or JIT_TOOL_EXPOSURE_DIRECT,
             planner=self._mapping(image.get("planner"), "planner"),
             action_schema=self._mapping(image.get("action_schema"), "action_schema"),
             default_skills=self._string_list(image.get("default_skills"), "default_skills"),
@@ -1040,6 +1162,21 @@ class ImageRegistryPrimitive:
         self._validate_string_length(image.version, "version", self.config.image.version_max_chars)
         if image.prompt_mode not in PROMPT_MODES:
             raise ValidationError(f"unknown prompt_mode: {image.prompt_mode}")
+        if image.jit_tool_exposure not in JIT_TOOL_EXPOSURES:
+            raise ValidationError(f"unknown jit_tool_exposure: {image.jit_tool_exposure}")
+        if image.jit_tool_exposure == JIT_TOOL_EXPOSURE_MULTIPLEXED and JIT_MULTIPLEXER_TOOL_NAME in image.default_tools:
+            raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
+        if len(image.system_prompt) > self.config.image.prompt_max_chars:
+            raise ValidationError(f"system_prompt exceeds prompt_max_chars={self.config.image.prompt_max_chars}")
+        self._validate_mapping_size(image.planner, "planner")
+        self._validate_mapping_size(image.action_schema, "action_schema")
+        self._validate_mapping_size(image.metadata, "metadata")
+        self._validate_mapping_size(image.boot, "boot")
+        manifest_bytes = len(dumps(self._image_to_dict(image)).encode("utf-8"))
+        if manifest_bytes > self.config.image.manifest_hard_limit_bytes:
+            raise ValidationError(
+                f"AgentImage manifest exceeds manifest_hard_limit_bytes={self.config.image.manifest_hard_limit_bytes}"
+            )
         if len(image.default_tools) > self.config.image.max_default_tools:
             raise ValidationError(f"default_tools exceeds max_default_tools={self.config.image.max_default_tools}")
         if len(image.default_skills) > self.config.skills.max_tools:
@@ -1068,6 +1205,21 @@ class ImageRegistryPrimitive:
         if not _IMAGE_ID_PATTERN.match(value):
             raise ValidationError(f"{field} contains unsupported characters: {value!r}")
 
+    def _validate_openai_tool_name(self, value: str, field: str) -> None:
+        self._validate_string_length(value, field, OPENAI_TOOL_NAME_MAX_CHARS)
+        if not is_openai_tool_name(value):
+            raise ValidationError(
+                f"{field} must match OpenAI tool name syntax [A-Za-z0-9_-]{{1,{OPENAI_TOOL_NAME_MAX_CHARS}}}: {value!r}"
+            )
+
+    def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
+        if not isinstance(schema, dict):
+            raise ValidationError(f"{field} must be a JSON schema object")
+        try:
+            jsonschema_validator_for(schema).check_schema(schema)
+        except JsonSchemaSchemaError as exc:
+            raise ValidationError(f"{field} is not a valid JSON schema: {exc.message}") from exc
+
     def _validate_string_length(self, value: str, field: str, max_chars: int) -> None:
         if not isinstance(value, str) or not value:
             raise ValidationError(f"{field} must be a non-empty string")
@@ -1075,6 +1227,14 @@ class ImageRegistryPrimitive:
             raise ValidationError(f"{field} exceeds max length {max_chars}")
         if any(ord(char) < 32 for char in value):
             raise ValidationError(f"{field} contains control characters")
+
+    def _validate_mapping_size(self, value: dict[str, Any], field: str) -> None:
+        size = len(dumps(value).encode("utf-8"))
+        if size > self.config.image.structured_field_hard_limit_bytes:
+            raise ValidationError(
+                f"{field} exceeds structured_field_hard_limit_bytes="
+                f"{self.config.image.structured_field_hard_limit_bytes}"
+            )
 
     def _require_string(self, value: Any, field: str) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -1230,7 +1390,6 @@ class ImageRegistryPrimitive:
                 ],
                 "capabilities": internal_capabilities,
                 "skills": snapshot.get("rows", {}).get("skills", []),
-                "skill_trust": snapshot.get("rows", {}).get("skill_trust", []),
                 "tools": [
                     row for row in snapshot.get("rows", {}).get("tools", [])
                     if row["tool_id"] in visible_tool_ids
@@ -1239,7 +1398,6 @@ class ImageRegistryPrimitive:
                     row for row in snapshot.get("rows", {}).get("tool_candidates", [])
                     if row["pid"] == source_pid
                 ],
-                "jsonrpc_endpoints": snapshot.get("rows", {}).get("jsonrpc_endpoints", []),
             },
             "object_oids": sorted(object_oids),
             "namespaces": sorted(namespace_names),
@@ -1365,6 +1523,7 @@ class ImageRegistryPrimitive:
             "version": image.version,
             "system_prompt": image.system_prompt,
             "prompt_mode": image.prompt_mode,
+            "jit_tool_exposure": image.jit_tool_exposure,
             "planner": image.planner,
             "action_schema": image.action_schema,
             "default_skills": list(image.default_skills),
@@ -1384,6 +1543,7 @@ class ImageRegistryPrimitive:
             "version": image.version,
             "boot_kind": (image.boot or {}).get("kind", "fresh"),
             "prompt_mode": image.prompt_mode,
+            "jit_tool_exposure": image.jit_tool_exposure,
             "default_tools": list(image.default_tools),
             "default_skills": list(image.default_skills),
             "required_capabilities_count": len(image.required_capabilities),

@@ -76,6 +76,9 @@ from agent_libos.models.process import (
     AgentImage,
     AgentProcess,
     ForkMode,
+    JIT_TOOL_EXPOSURE_DIRECT,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    JIT_TOOL_EXPOSURES,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
@@ -87,12 +90,16 @@ from agent_libos.models.process import (
     ResourceUsage,
 )
 from agent_libos.models.tools import (
+    JIT_MULTIPLEXER_TOOL_NAME,
+    OPENAI_TOOL_NAME_MAX_CHARS,
+    OPENAI_TOOL_NAME_PATTERN,
     ToolCallResult,
     ToolCandidate,
     ToolCandidateStatus,
     ToolHandle,
     ToolSpec,
     ValidationResult,
+    is_openai_tool_name,
 )
 
 __all__ = [
@@ -132,6 +139,13 @@ __all__ = [
     "JsonRpcHeaderSpec",
     "JsonRpcMethodSpec",
     "JsonRpcTransportResult",
+    "JIT_TOOL_EXPOSURE_DIRECT",
+    "JIT_TOOL_EXPOSURE_MULTIPLEXED",
+    "JIT_TOOL_EXPOSURES",
+    "JIT_MULTIPLEXER_TOOL_NAME",
+    "OPENAI_TOOL_NAME_MAX_CHARS",
+    "OPENAI_TOOL_NAME_PATTERN",
+    "is_openai_tool_name",
     "LLMCallRecord",
     "MaterializedContext",
     "MemoryView",

@@ -63,8 +63,40 @@ The manual lifecycle is:
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
 
+Registered JIT tools are process-local but persistent: when a runtime reopens an
+existing SQLite store, it reloads executable TypeScript sources only for JIT
+tool ids still referenced by a process tool table. Stale ephemeral tool
+references with no recoverable registered source are removed from the process
+tool table fail-closed instead of being shown to the model as broken tools.
+
 Skill activation uses the same validation and registration path for bundled JIT
 tools declared in package metadata and stored as `scripts/*.ts` resources.
+Image package boot uses that same ToolBroker validation path before package JIT
+tools become visible in the new process.
+
+## LLM Exposure Strategy
+
+Images use `jit_tool_exposure: direct` by default. In direct mode, every visible
+process-local JIT tool is exposed to the model as its own OpenAI function tool.
+
+Images may opt into `jit_tool_exposure: multiplexed`. In multiplexed mode,
+static tools are still exposed normally, but all visible JIT tools are routed
+through one stable OpenAI function named `run_jit_tool`:
+
+```json
+{"tool_name":"jit_tool_name","arguments":{}}
+```
+
+The runtime maps that protocol call back to the real process-local JIT tool,
+validates `arguments` against the JIT tool's stored `input_schema`, and then
+uses the normal ToolBroker, Deno sandbox, resource, capability, event, and audit
+paths. `run_jit_tool` is not a real process tool and cannot be called through
+`runtime.tools.call`.
+
+Multiplexed mode does not inject a JIT catalog into prompt or context. The
+image or loaded Skill instructions must describe the valid JIT names and
+argument shapes. The name `run_jit_tool` is reserved for multiplexed images and
+cannot be used as a real default tool or JIT tool in that mode.
 
 ## TypeScript Entry Point
 

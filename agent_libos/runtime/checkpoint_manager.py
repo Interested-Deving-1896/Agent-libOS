@@ -223,7 +223,6 @@ class CheckpointManager:
             "llm_pending_actions",
             "tool_candidates",
             "skills",
-            "jsonrpc_endpoints",
         ]:
             before = self._index_rows(table, snapshot["rows"].get(table, []))
             after = self._index_rows(table, current.get(table, []))
@@ -419,10 +418,8 @@ class CheckpointManager:
             "process_messages": self._message_rows_for_recipients(subtree_pids),
             "llm_pending_actions": self._rows_by_ids("llm_pending_actions", "pid", subtree_pids),
             "skills": self._skill_rows_for_processes(process_rows),
-            "skill_trust": self._skill_trust_rows_for_processes(process_rows),
             "tools": self._tool_rows_for_processes(process_rows),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", subtree_pids),
-            "jsonrpc_endpoints": self._jsonrpc_endpoint_rows_for_capabilities(capability_rows),
         }
         object_payloads = self._object_payload_snapshot(object_oids)
         return {
@@ -495,17 +492,10 @@ class CheckpointManager:
                 self._insert_row(cur, "tool_candidates", row)
             for row in rows.get("skills", []):
                 self._upsert_row(cur, "skills", row, "skill_id")
-            for row in rows.get("skill_trust", []):
-                self._upsert_row(cur, "skill_trust", row, "trust_id")
             for row in rows.get("tools", []):
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
                     self._insert_row(cur, "tools", row)
-            # Endpoint registry is global provider configuration. Restore only
-            # upserts definitions referenced by restored capabilities; it never
-            # deletes unrelated endpoints registered after the checkpoint.
-            for row in rows.get("jsonrpc_endpoints", []):
-                self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("process_messages", []):
                 self._upsert_row(cur, "process_messages", row, "message_id")
             for row in rows.get("llm_pending_actions", []):
@@ -675,16 +665,10 @@ class CheckpointManager:
                     self._insert_row(cur, table, row)
             for row in rows.get("skills", []):
                 self._upsert_row(cur, "skills", row, "skill_id")
-            for row in rows.get("skill_trust", []):
-                self._upsert_row(cur, "skill_trust", row, "trust_id")
             for row in rows.get("tools", []):
                 exists = cur.execute("SELECT 1 FROM tools WHERE tool_id = ?", (row["tool_id"],)).fetchone()
                 if exists is None:
                     self._insert_row(cur, "tools", row)
-            # Forked subtrees need endpoint definitions for their remapped
-            # JSON-RPC capabilities, but the registry remains shared config.
-            for row in rows.get("jsonrpc_endpoints", []):
-                self._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
 
@@ -813,30 +797,6 @@ class CheckpointManager:
         rows = self._rows_by_ids("capabilities", "subject", pids)
         return [row for row in rows if not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)]
 
-    def _jsonrpc_endpoint_rows_for_capabilities(self, capability_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        # Snapshot endpoint specs by authority edge, not by process-local state.
-        # This keeps checkpoint payloads small and prevents restore from acting
-        # like a global endpoint-registry rollback.
-        endpoint_ids: set[str] = set()
-        include_all = False
-        for row in capability_rows:
-            resource = str(row.get("resource") or "")
-            if resource in {"jsonrpc:*", "jsonrpc_endpoint:*"}:
-                include_all = True
-                continue
-            if resource.startswith("jsonrpc_endpoint:"):
-                endpoint_id = resource.split(":", 1)[1]
-                if endpoint_id and endpoint_id != "*":
-                    endpoint_ids.add(endpoint_id)
-                continue
-            if resource.startswith("jsonrpc:"):
-                parts = resource.split(":")
-                if len(parts) >= 2 and parts[1] and parts[1] != "*":
-                    endpoint_ids.add(parts[1])
-        if include_all:
-            return self.store.select_table_rows("jsonrpc_endpoints", order_by="endpoint_id")
-        return self._rows_by_ids("jsonrpc_endpoints", "endpoint_id", sorted(endpoint_ids))
-
     def _message_rows_for_recipients(self, pids: list[str]) -> list[dict[str, Any]]:
         return self._rows_by_ids("process_messages", "recipient_pid", pids)
 
@@ -850,23 +810,6 @@ class CheckpointManager:
     def _skill_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         skill_ids = self._loaded_skill_ids(process_rows)
         return self._rows_by_ids("skills", "skill_id", sorted(skill_ids))
-
-    def _skill_trust_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        skill_rows = self._skill_rows_for_processes(process_rows)
-        pairs = {(row["source_type"], row["source"], row["package_sha256"]) for row in skill_rows if row.get("source")}
-        if not pairs:
-            return []
-        rows: list[dict[str, Any]] = []
-        for source_type, source, package_sha256 in sorted(pairs):
-            rows.extend(
-                self.store.select_table_rows(
-                    "skill_trust",
-                    "source_type = ? AND source = ? AND package_sha256 = ?",
-                    [source_type, source, package_sha256],
-                    order_by="created_at",
-                )
-            )
-        return rows
 
     def _loaded_skill_ids(self, process_rows: list[dict[str, Any]]) -> set[str]:
         skill_ids: set[str] = set()
@@ -981,8 +924,8 @@ class CheckpointManager:
                 scope=row["scope"],
             )
             handles[tool_id] = handle
-            if names is not None:
-                names.setdefault(handle.name, tool_id)
+            if names is not None and names.get(handle.name) == tool_id:
+                names.pop(handle.name, None)
 
     def _external_effects_since(
         self,
@@ -1065,11 +1008,6 @@ class CheckpointManager:
             "llm_pending_actions": self._rows_by_ids("llm_pending_actions", "pid", pids),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", pids),
             "skills": self._skill_rows_for_processes(process_rows),
-            "jsonrpc_endpoints": self._rows_by_ids(
-                "jsonrpc_endpoints",
-                "endpoint_id",
-                [row["endpoint_id"] for row in snapshot.get("rows", {}).get("jsonrpc_endpoints", [])],
-            ),
         }
 
     def _index_rows(self, table: str, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1081,7 +1019,6 @@ class CheckpointManager:
             "llm_pending_actions": "pid",
             "tool_candidates": "candidate_id",
             "skills": "skill_id",
-            "jsonrpc_endpoints": "endpoint_id",
         }
         key = key_by_table[table]
         return {str(row[key]): row for row in rows}

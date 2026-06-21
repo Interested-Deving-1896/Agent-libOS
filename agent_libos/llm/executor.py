@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import replace
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -24,6 +25,7 @@ from agent_libos.models import (
     HumanRequestStatus,
     LLMCallRecord,
     ObjectHandle,
+    ObjectRight,
     ProcessMessageKind,
     ProcessStatus,
     ResourceUsage,
@@ -91,17 +93,31 @@ class LLMProcessExecutor:
             policy=image.context_policy,
             budget_tokens=process.resource_budget.max_materialized_tokens,
         )
-        events = self.runtime.events.list(target=pid)
+        events = [
+            replace(
+                event,
+                source=self.runtime.tools.redact_model_context(pid, event.source),
+                payload=self.runtime.tools.redact_model_context(pid, event.payload),
+                correlation_id=self.runtime.tools.redact_model_context(pid, event.correlation_id),
+                causality=self.runtime.tools.redact_model_context(pid, event.causality),
+            )
+            for event in self.runtime.events.list(target=pid)
+        ]
         capabilities = self.runtime.capability.capabilities_for(pid)
         # The prompt-visible tool list must match the process tool table. The
         # broker still owns the real execute check, but showing extra tools
         # teaches the model to choose actions the process cannot call.
-        tools = self.runtime.tools.visible_tools(pid)
+        tools = self.runtime.tools.model_visible_tools(pid)
+        prompt_process = replace(
+            process,
+            tool_table=self.runtime.tools.model_tool_table(pid),
+            loaded_skills=self.runtime.tools.model_loaded_skills(pid),
+        )
         skills = self.runtime.skills.prompt_context(pid)
         context = self.context_memory.prepare(
             pid=pid,
             image=image,
-            process=process,
+            process=prompt_process,
             source_context=source_context,
             events=events,
             capabilities=capabilities,
@@ -112,7 +128,7 @@ class LLMProcessExecutor:
             {
                 "role": "user",
                 "content": build_user_prompt(
-                    process=process,
+                    process=prompt_process,
                     context=context,
                     events=events,
                     capabilities=capabilities,
@@ -584,7 +600,10 @@ class LLMProcessExecutor:
                 max_attempts=selected_max_attempts,
             )
             try:
-                action = self._completion_to_action(completion.content, completion.tool_calls)
+                action = self.runtime.tools.normalize_model_action(
+                    pid,
+                    self._completion_to_action(completion.content, completion.tool_calls),
+                )
                 self._validate_dispatchable_action(pid, action)
                 return completion, action
             except ValueError as exc:
@@ -610,7 +629,7 @@ class LLMProcessExecutor:
                         "content": (
                             "The previous model response could not be dispatched: "
                             f"{exc}. Choose exactly one available OpenAI tool call by its function name. "
-                            f"Available tool names: {sorted(self.runtime.process.get(pid).tool_table)}"
+                            f"Available tool names: {self.runtime.tools.model_tool_names(pid)}"
                         ),
                     },
                 ]
@@ -888,10 +907,11 @@ class LLMProcessExecutor:
             for handle in process.memory_view.roots:
                 if handle.oid == oid:
                     return handle
-        return self.runtime.capability.handle_for_object(
+        return self.runtime.memory.handle_for_oid(
             pid,
             oid,
-            {"read", "materialize", "link", "diff"},
+            required_rights={ObjectRight.READ.value},
+            optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
             issued_by="llm.executor",
         )
 

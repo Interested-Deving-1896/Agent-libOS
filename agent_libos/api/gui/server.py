@@ -489,7 +489,14 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and route == ["llm-calls"]:
             return to_jsonable(service.runtime.store.list_llm_calls(pid=pid, limit=_query_int(query, "limit")))
         if method == "GET" and route == ["audit"]:
-            return [item for item in to_jsonable(service.runtime.audit.trace(limit=_query_int(query, "limit"))) if item.get("actor") == pid or item.get("target") == f"process:{pid}"]
+            return to_jsonable(
+                service.runtime.audit.trace(
+                    limit=_query_int(query, "limit"),
+                    actor=pid,
+                    target=f"process:{pid}",
+                    match_any=True,
+                )
+            )
         if method == "GET" and route == ["events"]:
             return to_jsonable(service.runtime.events.list(target=pid))
         if method == "GET" and route == ["capabilities"]:
@@ -647,10 +654,27 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return result
         if method == "POST" and len(route) == 2 and route[1] in {"activate", "unload"}:
             body = self._read_body()
+            self._require_confirmed(
+                f"skill.{route[1]}",
+                body,
+                {"pid": body.get("pid"), "skill_id": route[0], "admin_mode": body.get("actor") is None},
+            )
+            require_capability = body.get("actor") is not None
+            actor = str(body.get("actor") or "gui")
             if route[1] == "activate":
-                result = service.runtime.skills.activate_skill(str(body["pid"]), route[0], actor=str(body.get("actor") or body["pid"]), require_capability=False)
+                result = service.runtime.skills.activate_skill(
+                    str(body["pid"]),
+                    route[0],
+                    actor=actor,
+                    require_capability=require_capability,
+                )
             else:
-                result = service.runtime.skills.unload_skill(str(body["pid"]), route[0], actor=str(body.get("actor") or body["pid"]), require_capability=False)
+                result = service.runtime.skills.unload_skill(
+                    str(body["pid"]),
+                    route[0],
+                    actor=actor,
+                    require_capability=require_capability,
+                )
             service.publish_runtime_changes(f"skill.{route[1]}")
             return result
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown skills endpoint")

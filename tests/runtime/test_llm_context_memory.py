@@ -3,13 +3,28 @@ import pytest
 import json
 import tempfile
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
-from agent_libos.models import CapabilityRight, ObjectPatch, ObjectRight, ObjectType, ProcessStatus, ViewMode
-from tests.support.fakes import RecordingActionClient
+from agent_libos.models import (
+    AgentImage,
+    CapabilityRight,
+    EventType,
+    JIT_MULTIPLEXER_TOOL_NAME,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    ObjectPatch,
+    ObjectRight,
+    ObjectType,
+    PROMPT_MODE_LIBOS_DEFAULT,
+    ProcessStatus,
+    ViewMode,
+)
+from tests.support.fakes import FakeDenoSandbox, RecordingActionClient
+from tests.support.skills import write_skill_package
 
 class TestLLMContextMemory:
 
@@ -68,6 +83,144 @@ class TestLLMContextMemory:
             assert 'read_text_file' not in runtime.llm.client.user_prompts[0]
         finally:
             runtime.close()
+
+    def test_multiplexed_jit_tool_call_dispatches_real_jit_tool(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.tools.sandbox = FakeDenoSandbox()
+            _register_multiplexed_image(runtime)
+            pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='count with a JIT tool')
+            _register_count_tool(runtime, pid, 'count_chars')
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': JIT_MULTIPLEXER_TOOL_NAME,
+                    'tool_name': 'count_chars',
+                    'arguments': {'text': 'hello'},
+                }
+            ])
+
+            result = runtime.run_next_process_once()
+            tool_names = {tool['function']['name'] for tool in runtime.llm.client.tool_batches[0]}
+
+            assert result['ok'], result
+            assert result['action']['action'] == 'count_chars'
+            assert result['result']['payload'] == {'count': 5}
+            assert JIT_MULTIPLEXER_TOOL_NAME in tool_names
+            assert 'count_chars' not in tool_names
+        finally:
+            runtime.close()
+
+    def test_multiplexed_jit_direct_name_and_bad_args_are_repairable(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=3))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.tools.sandbox = FakeDenoSandbox()
+            _register_multiplexed_image(runtime)
+            pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='repair bad JIT action')
+            _register_count_tool(
+                runtime,
+                pid,
+                'strict_count',
+                input_schema={
+                    'type': 'object',
+                    'properties': {'text': {'type': 'string'}},
+                    'required': ['text'],
+                    'additionalProperties': False,
+                },
+            )
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'strict_count', 'text': 'hello'},
+                {
+                    'action': JIT_MULTIPLEXER_TOOL_NAME,
+                    'tool_name': 'strict_count',
+                    'arguments': {'extra': 'rejected'},
+                },
+                {'action': 'process_exit', 'payload': {'done': True}},
+            ])
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok'], result
+            assert result['action']['action'] == 'process_exit'
+            repairs = [record for record in runtime.audit.trace() if record.action == 'llm.action_repair_requested']
+            assert any('strict_count' in str(record.decision) for record in repairs)
+            assert any('Additional properties' in str(record.decision) for record in repairs)
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'strict_count'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_multiplexed_prompt_context_hides_jit_catalog(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.tools.sandbox = FakeDenoSandbox()
+            _register_multiplexed_image(runtime, prompt_mode=PROMPT_MODE_LIBOS_DEFAULT)
+            pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='hide catalog')
+            _register_count_tool(runtime, pid, 'secret_count')
+            runtime.events.emit(
+                EventType.TOOL_COMPLETED,
+                source='tool:secret_count',
+                target=pid,
+                payload={'secret_count': {'action': 'secret_count'}},
+            )
+            runtime.llm.client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+
+            runtime.run_next_process_once()
+
+            prompt = runtime.llm.client.user_prompts[0]
+            tool_names = {tool['function']['name'] for tool in runtime.llm.client.tool_batches[0]}
+            assert JIT_MULTIPLEXER_TOOL_NAME in prompt
+            assert 'secret_count' not in prompt
+            assert JIT_MULTIPLEXER_TOOL_NAME in tool_names
+            assert 'secret_count' not in tool_names
+            assert JIT_MULTIPLEXER_TOOL_NAME in runtime.tools.model_tool_names(pid)
+            assert 'secret_count' not in runtime.tools.model_tool_names(pid)
+        finally:
+            runtime.close()
+
+    def test_multiplexed_prompt_context_hides_skill_jit_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'secret-jit-skill',
+                jit_tools=[
+                    {
+                        'name': 'skill_secret_count',
+                        'description': 'Count text characters.',
+                        'source_path': 'scripts/skill_secret_count.ts',
+                        'input_schema': {'type': 'object'},
+                        'output_schema': {'type': 'object'},
+                        'tests': [{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
+                    }
+                ],
+                scripts={
+                    'scripts/skill_secret_count.ts': (
+                        'export function run(args, libos) { /* fake:count_chars */ return {}; }\n'
+                    )
+                },
+                body='Use this skill without relying on an automatic JIT catalog.\n',
+            )
+            runtime = Runtime.open('local')
+            try:
+                runtime.tools.sandbox = FakeDenoSandbox()
+                _register_multiplexed_image(runtime, prompt_mode=PROMPT_MODE_LIBOS_DEFAULT)
+                pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='hide skill catalog')
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                runtime.capability.grant(pid, 'skill:secret-jit-skill', [CapabilityRight.EXECUTE], issued_by='test')
+                runtime.skills.activate_skill(pid, 'secret-jit-skill', actor=pid)
+                runtime.llm.client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+
+                runtime.run_next_process_once()
+
+                prompt = runtime.llm.client.user_prompts[0]
+                assert JIT_MULTIPLEXER_TOOL_NAME in prompt
+                assert 'skill_secret_count' not in prompt
+                assert 'tool_secret' not in prompt
+                assert 'secret-jit-skill' in prompt
+            finally:
+                runtime.close()
 
     def test_llm_context_appends_updated_object_version(self) -> None:
         runtime = Runtime.open('local')
@@ -243,6 +396,47 @@ class TestLLMContextMemory:
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
             finally:
                 reopened.close()
+
+def _register_multiplexed_image(
+    runtime: Runtime,
+    *,
+    prompt_mode: str | None = None,
+) -> None:
+    runtime.register_image(
+        AgentImage(
+            image_id='multiplexed-jit:v0',
+            name='multiplexed-jit',
+            system_prompt='Use run_jit_tool for JIT tools.',
+            prompt_mode=prompt_mode or 'image_only',
+            default_tools=['process_exit'],
+            jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
+        ),
+        actor='test',
+    )
+
+
+def _register_count_tool(
+    runtime: Runtime,
+    pid: str,
+    name: str,
+    *,
+    input_schema: dict[str, Any] | None = None,
+) -> None:
+    candidate = runtime.tools.propose(
+        pid,
+        {
+            'name': name,
+            'description': 'Count characters in text.',
+            'input_schema': input_schema
+            or {'type': 'object', 'properties': {'text': {'type': 'string'}}},
+            'output_schema': {'type': 'object'},
+        },
+        source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }',
+        tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
+    )
+    assert runtime.tools.validate(candidate).ok
+    runtime.tools.register(pid, candidate)
+
 
 class MetadataActionClient:
 

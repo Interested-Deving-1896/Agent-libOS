@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,6 +21,7 @@ from agent_libos.models import (
     CapabilityRight,
     Event,
     EventType,
+    ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
     JsonRpcCallResult,
@@ -40,6 +42,7 @@ from agent_libos.runtime.external_effects import (
 )
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import JsonRpcProvider
+from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
@@ -51,6 +54,8 @@ _FORBIDDEN_HEADERS = {"connection", "content-length", "host", "transfer-encoding
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _FORBIDDEN_JSONRPC_HOSTS = {"metadata.google.internal"}
 _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, CapabilityRight.EXECUTE.value}
+_ALLOWED_HEADER_PREFIXES = {"", "Bearer ", "Token ", "Basic "}
+_ALLOWED_HEADER_SUFFIXES = {""}
 
 
 class JsonRpcPrimitive:
@@ -97,9 +102,12 @@ class JsonRpcPrimitive:
         if existing is not None and not replace:
             raise ValidationError(f"JSON-RPC endpoint already exists: {spec.endpoint_id}")
         if require_capability:
-            self.capabilities.require(actor, self.endpoint_resource(spec.endpoint_id), CapabilityRight.WRITE)
+            required_right = CapabilityRight.ADMIN if existing is not None else CapabilityRight.WRITE
+            self.capabilities.require(actor, self.endpoint_resource(spec.endpoint_id), required_right)
         now = utc_now()
         self.store.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
+        if existing is not None:
+            self._disable_replaced_endpoint_method_capabilities(spec.endpoint_id, actor=actor)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=actor,
@@ -155,7 +163,7 @@ class JsonRpcPrimitive:
             self.capabilities.require(actor, self.config.jsonrpc.registry_resource, CapabilityRight.READ)
         selected_limit = self.config.jsonrpc.list_limit if limit is None else limit
         return [
-            self._endpoint_to_json(spec, metadata, include_url=False)
+            self._endpoint_to_json(spec, metadata, include_sensitive_fields=False)
             for spec, metadata in self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit)
         ]
 
@@ -165,11 +173,12 @@ class JsonRpcPrimitive:
         *,
         actor: str | None = None,
         require_capability: bool = True,
+        include_sensitive_fields: bool = False,
     ) -> dict[str, Any]:
         spec, metadata = self._load_endpoint(endpoint_id)
         if require_capability and actor is not None:
             self.capabilities.require(actor, self.endpoint_resource(endpoint_id), CapabilityRight.READ)
-        return self._endpoint_to_json(spec, metadata, include_url=not require_capability)
+        return self._endpoint_to_json(spec, metadata, include_sensitive_fields=include_sensitive_fields)
 
     def unregister_endpoint(
         self,
@@ -231,7 +240,8 @@ class JsonRpcPrimitive:
         )
         effect_context = self._effect_context(spec, method, operation_context, request_bytes=len(request_body))
         require_external_effect_classifier(self.provider, "call")
-        classify_external_effect(self.provider, "call", effect_context, {"preflight": True})
+        preflight_classification = classify_external_effect(self.provider, "call", effect_context, {"preflight": True})
+        self._validate_runtime_resolution(spec)
         attempted = False
         try:
             attempted = True
@@ -255,7 +265,15 @@ class JsonRpcPrimitive:
             result = self._call_result_from_transport(spec, method, request_id, transport)
             event = self._emit_call_event(pid, resource, result, method)
             audit_record = self._record_call_audit(pid, resource, result, method, operation_context)
-            self._record_external_effect(pid, resource, effect_context, result, event, audit_record)
+            self._record_external_effect(
+                pid,
+                resource,
+                effect_context,
+                result,
+                event,
+                audit_record,
+                preflight_classification=preflight_classification,
+            )
             self._charge_resource_usage(
                 pid,
                 ResourceUsage(jsonrpc_request_bytes=len(request_body), jsonrpc_response_bytes=result.response_bytes),
@@ -370,7 +388,7 @@ class JsonRpcPrimitive:
                 JsonRpcCallStatus.HTTP_ERROR,
                 transport,
                 "HTTP status was not successful",
-                extra={"body_preview": self._decode_preview(transport.body)},
+                extra={"body_observation": self._body_observation(transport.body)},
             )
         try:
             envelope = json.loads(transport.body.decode("utf-8"))
@@ -488,6 +506,7 @@ class JsonRpcPrimitive:
                 "request_id": result.request_id,
                 "params_sha256": operation_context["params_sha256"],
                 "params_preview": operation_context["params_preview"],
+                "params_observation": operation_context["params_observation"],
                 "sandbox_profile": operation_context.get("sandbox_profile"),
                 "status": result.status.value,
                 "ok": result.ok,
@@ -506,6 +525,8 @@ class JsonRpcPrimitive:
         result: JsonRpcCallResult,
         event: Event,
         audit_record: AuditRecord,
+        *,
+        preflight_classification: ExternalEffectClassification,
     ) -> None:
         result_payload = {
             "status": result.status.value,
@@ -514,7 +535,23 @@ class JsonRpcPrimitive:
             "response_bytes": result.response_bytes,
             "duration_s": result.duration_s,
         }
-        classification = classify_external_effect(self.provider, "call", context, result_payload)
+        try:
+            classification = classify_external_effect(self.provider, "call", context, result_payload)
+        except Exception as exc:
+            # The provider effect has already happened at this point. If the
+            # post-call classifier fails, record a conservative irreversible
+            # effect instead of losing the append-only external-effect row.
+            classification = ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+                rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+                state_mutation=True,
+                information_flow=True,
+                metadata={
+                    **dict(preflight_classification.metadata),
+                    "classification_error": f"{type(exc).__name__}: {exc}",
+                    "classification_fallback": "post_call_failure",
+                },
+            )
         record_external_effect(
             self.store,
             pid=pid,
@@ -568,6 +605,10 @@ class JsonRpcPrimitive:
         request_id: str,
     ) -> dict[str, Any]:
         params_json = dumps(params)
+        params_observation = sanitize_for_observability(
+            {"params": params},
+            preview_chars=self.config.jsonrpc.audit_preview_chars,
+        )
         return {
             "pid": pid,
             "primitive": "runtime.jsonrpc.call",
@@ -579,7 +620,8 @@ class JsonRpcPrimitive:
             "right": method.right,
             "request_id": request_id,
             "params_sha256": hashlib.sha256(params_json.encode("utf-8")).hexdigest(),
-            "params_preview": self._preview(params_json),
+            "params_preview": params_observation["preview"],
+            "params_observation": params_observation,
         }
 
     def _approval_constraints(self, context: dict[str, Any]) -> dict[str, Any]:
@@ -758,6 +800,10 @@ class JsonRpcPrimitive:
             raise ValidationError(f"JSON-RPC {field} contains a newline")
         if field == "header env" and not _ENV_PATTERN.match(value):
             raise ValidationError(f"JSON-RPC header env is not a valid environment variable name: {value!r}")
+        if field == "header prefix" and value not in _ALLOWED_HEADER_PREFIXES:
+            raise ValidationError("JSON-RPC header prefix must be empty or an approved auth scheme")
+        if field == "header suffix" and value not in _ALLOWED_HEADER_SUFFIXES:
+            raise ValidationError("JSON-RPC header suffix must be empty")
 
     def _require_header_environment(self, endpoint: JsonRpcEndpointSpec) -> None:
         missing = sorted(spec.env for spec in endpoint.headers.values() if os.environ.get(spec.env) is None)
@@ -784,8 +830,36 @@ class JsonRpcPrimitive:
             address = ipaddress.ip_address(host.strip("[]"))
         except ValueError:
             return
+        self._validate_remote_address(address, allow_loopback=True)
+
+    def _validate_runtime_resolution(self, endpoint: JsonRpcEndpointSpec) -> None:
+        parsed = urlsplit(endpoint.url)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        if not host:
+            raise ValidationError("JSON-RPC endpoint URL host is empty")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValidationError(f"JSON-RPC endpoint host could not be resolved: {host}") from exc
+        if not addresses:
+            raise ValidationError(f"JSON-RPC endpoint host resolved no addresses: {host}")
+        allow_loopback = host in _LOCAL_HTTP_HOSTS
+        for item in addresses:
+            raw_address = str(item[4][0]).split("%", 1)[0]
+            try:
+                address = ipaddress.ip_address(raw_address)
+            except ValueError as exc:
+                raise ValidationError(f"JSON-RPC endpoint resolved invalid address: {raw_address}") from exc
+            self._validate_remote_address(address, allow_loopback=allow_loopback)
+
+    def _validate_remote_address(self, address: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> None:
         if address.is_loopback:
-            return
+            if allow_loopback:
+                return
+            raise ValidationError("JSON-RPC endpoint resolved to loopback address")
+        if not address.is_global:
+            raise ValidationError("JSON-RPC endpoint resolved to non-public address")
         if (
             address.is_private
             or address.is_link_local
@@ -794,6 +868,18 @@ class JsonRpcPrimitive:
             or address.is_unspecified
         ):
             raise ValidationError("JSON-RPC endpoint IP address is not allowed")
+
+    def _disable_replaced_endpoint_method_capabilities(self, endpoint_id: str, *, actor: str) -> None:
+        prefix = f"jsonrpc:{endpoint_id}:"
+        for cap in self.store.list_capabilities():
+            if not cap.active or cap.revoked:
+                continue
+            if cap.resource == f"jsonrpc:{endpoint_id}:*" or cap.resource.startswith(prefix):
+                self.capabilities.disable_subject_capability(
+                    cap.cap_id,
+                    actor=actor,
+                    reason="JSON-RPC endpoint spec replaced; method authority must be reissued",
+                )
 
     def _validate_identifier(self, value: str, field: str, max_chars: int) -> None:
         if len(value) > max_chars or not _ID_PATTERN.match(value):
@@ -827,14 +913,21 @@ class JsonRpcPrimitive:
         endpoint: JsonRpcEndpointSpec,
         metadata: dict[str, Any],
         *,
-        include_url: bool,
+        include_sensitive_fields: bool,
     ) -> dict[str, Any]:
         return {
             "schema_version": endpoint.schema_version,
             "endpoint_id": endpoint.endpoint_id,
-            "url": endpoint.url if include_url else None,
+            "url": endpoint.url if include_sensitive_fields else None,
             "headers": {
-                name: {"env": spec.env, "prefix": spec.prefix, "suffix": spec.suffix, "value": "<redacted>"}
+                name: {
+                    "env": spec.env,
+                    "prefix": spec.prefix if include_sensitive_fields else None,
+                    "suffix": spec.suffix if include_sensitive_fields else None,
+                    "prefix_configured": bool(spec.prefix),
+                    "suffix_configured": bool(spec.suffix),
+                    "value": "<redacted>",
+                }
                 for name, spec in endpoint.headers.items()
             },
             "methods": [
@@ -880,5 +973,8 @@ class JsonRpcPrimitive:
         limit = self.config.jsonrpc.audit_preview_chars
         return text if len(text) <= limit else f"{text[:limit]}..."
 
-    def _decode_preview(self, value: bytes) -> str:
-        return self._preview(value.decode("utf-8", errors="replace"))
+    def _body_observation(self, value: bytes) -> dict[str, Any]:
+        return sanitize_for_observability(
+            {"body": value.decode("utf-8", errors="replace")},
+            preview_chars=self.config.jsonrpc.audit_preview_chars,
+        )

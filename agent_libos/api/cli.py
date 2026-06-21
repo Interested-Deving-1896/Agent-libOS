@@ -19,6 +19,7 @@ from agent_libos.models import (
     MemoryViewSpec,
     ObjectHandle,
     ObjectMetadata,
+    ObjectRight,
     ObjectType,
     ProcessMessage,
     ProcessMessageKind,
@@ -258,10 +259,11 @@ def _run_exit_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, A
         raise SystemExit("exit accepts at most one of --payload or --result-oid")
     result_handle: ObjectHandle | None = None
     if args.result_oid is not None:
-        result_handle = runtime.capability.handle_for_object(
+        result_handle = runtime.memory.handle_for_oid(
             args.pid,
             args.result_oid,
-            {"read", "materialize", "link", "diff"},
+            required_rights={ObjectRight.READ.value},
+            optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
             issued_by="cli.exit",
         )
     elif args.payload is not None:
@@ -871,6 +873,7 @@ def _run_jsonrpc_command(runtime: Runtime, args: argparse.Namespace) -> dict[str
             args.endpoint_id,
             actor=actor if require_capability else None,
             require_capability=require_capability,
+            include_sensitive_fields=not require_capability,
         )
     if command == "call":
         params = _parse_json_value(args.params_json) if args.params_json is not None else None

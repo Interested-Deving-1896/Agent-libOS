@@ -116,6 +116,41 @@ class TestGuiServer:
             assert frame_lines[1] == 'event: snapshot'
             assert frame_lines[2].startswith('data: ')
 
+    def test_snapshot_audit_window_contains_latest_records(self) -> None:
+        for index in range(205):
+            self.server.service.runtime.audit.record(
+                actor='test',
+                action=f'audit.window.{index}',
+                target='process:audit-window',
+            )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+        actions = [record['action'] for record in snapshot['audit']]
+
+        assert status == 200
+        assert 'audit.window.204' in actions
+        assert 'audit.window.0' not in actions
+
+    def test_process_audit_filters_before_limit(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'audit target', 'auto_run': False})
+        pid = spawned['pid']
+        self.server.service.runtime.audit.record(
+            actor=pid,
+            action='process.audit.target',
+            target=f'process:{pid}',
+        )
+        for index in range(205):
+            self.server.service.runtime.audit.record(
+                actor='noise',
+                action=f'process.audit.noise.{index}',
+                target='process:noise',
+            )
+
+        status, records = self.request('GET', f'/api/processes/{pid}/audit?limit=1')
+
+        assert status == 200
+        assert [record['action'] for record in records] == ['process.audit.target']
+
     def test_high_risk_exec_requires_confirmation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'goal', 'auto_run': False})
         pid = spawned['pid']

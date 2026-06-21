@@ -128,6 +128,92 @@ class TestSkillPackageLoading:
             finally:
                 runtime.close()
 
+    def test_loaded_skill_uses_activation_snapshot_after_registry_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(
+                root,
+                'snapshot-skill',
+                allowed_tools=['echo'],
+                extra_resources={'references/guide.md': 'original-resource-token\n'},
+                body='# snapshot-skill\n\nUse original-instruction-token.\n',
+            )
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='snapshot skill')
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                runtime.capability.grant(pid, 'skill:snapshot-skill', [CapabilityRight.EXECUTE], issued_by='test')
+                runtime.skills.activate_skill(pid, 'snapshot-skill', actor=pid)
+
+                write_skill_package(
+                    root,
+                    'snapshot-skill',
+                    allowed_tools=['human_output'],
+                    extra_resources={'references/guide.md': 'replaced-resource-token\n'},
+                    body='# snapshot-skill\n\nUse replaced-instruction-token.\n',
+                )
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', replace=True, require_capability=False)
+
+                context = runtime.skills.prompt_context(pid)[0]
+                resource = runtime.skills.read_skill_resource(pid, 'snapshot-skill', 'references/guide.md')
+
+                assert 'original-instruction-token' in context['instructions']
+                assert 'replaced-instruction-token' not in context['instructions']
+                assert context['allowed_tools'] == ['echo']
+                assert resource['content'].replace('\r\n', '\n') == 'original-resource-token\n'
+            finally:
+                runtime.close()
+
+    def test_checkpoint_restore_and_fork_do_not_resurrect_global_skill_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            global_dir = root / 'global'
+            skill_dir = write_skill_package(global_dir, 'trust-checkpoint-skill', allowed_tools=['echo'])
+            config = AgentLibOSConfig(skills=replace(SkillDefaults(), global_dirs=(str(global_dir),)))
+            runtime = Runtime.open('local', config=config)
+            try:
+                trust = runtime.skills.global_package_info(skill_dir)
+                runtime.skills.trust_skill_source(
+                    actor='cli',
+                    source_type='global',
+                    source=trust['source'],
+                    package_sha256=trust['package_sha256'],
+                    require_capability=False,
+                )
+                runtime.skills.register_global_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                pid = runtime.process.spawn(image='base-agent:v0', goal='checkpoint trust')
+                runtime.capability.grant(pid, 'skill:trust-checkpoint-skill', [CapabilityRight.EXECUTE], issued_by='test')
+                runtime.skills.activate_skill(pid, 'trust-checkpoint-skill', actor=pid)
+                checkpoint_id = runtime.checkpoint.create(pid, 'trusted skill loaded', actor=pid)
+
+                runtime.skills.untrust_skill_source(
+                    actor='cli',
+                    source_type='global',
+                    source=trust['source'],
+                    package_sha256=trust['package_sha256'],
+                    require_capability=False,
+                )
+                assert not runtime.store.is_skill_trusted(
+                    source_type='global',
+                    source=trust['source'],
+                    package_sha256=trust['package_sha256'],
+                )
+
+                runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+                assert not runtime.store.is_skill_trusted(
+                    source_type='global',
+                    source=trust['source'],
+                    package_sha256=trust['package_sha256'],
+                )
+                runtime.checkpoint.fork_from_checkpoint('cli', checkpoint_id, require_capability=False)
+                assert not runtime.store.is_skill_trusted(
+                    source_type='global',
+                    source=trust['source'],
+                    package_sha256=trust['package_sha256'],
+                )
+            finally:
+                runtime.close()
+
     def test_cross_process_skill_activate_requires_target_process_admin(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(Path(temp_dir), 'cross-load-skill', allowed_tools=['echo'])

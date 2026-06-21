@@ -16,8 +16,19 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.memory.object_memory import ObjectMemoryManager
-from agent_libos.models import AgentImage, CapabilityRight, EventType, ObjectHandle, ProcessStatus, ResourceUsage, ToolHandle, ToolSpec
-from agent_libos.models.exceptions import NotFound
+from agent_libos.models import (
+    AgentImage,
+    CapabilityRight,
+    EventType,
+    ObjectHandle,
+    ProcessStatus,
+    ResourceUsage,
+    ToolCandidate,
+    ToolCandidateStatus,
+    ToolHandle,
+    ToolSpec,
+)
+from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
@@ -177,6 +188,7 @@ class Runtime:
             trusted_sha256=trusted_module_sha256,
         )
         self.image_registry.load_persisted_images()
+        self._rehydrate_registered_jit_tools()
         self.modules.run_startup_hooks()
         self._closed = False
         self._shutdown_reason: str | None = None
@@ -206,6 +218,81 @@ class Runtime:
         except Exception:
             store.close()
             raise
+
+    def _rehydrate_registered_jit_tools(self) -> None:
+        """Restore process-local JIT implementations after a normal runtime reopen.
+
+        SQLite persists process tool tables and tool rows, while the executable
+        TypeScript sources live in ToolBroker's in-memory sandbox table. A
+        registered JIT is valid only when a process table still references its
+        tool id; orphan candidates remain inert and stale references are pruned
+        fail-closed so the model is not shown a tool that cannot run.
+        """
+
+        ephemeral_tool_rows = {
+            str(row["tool_id"]): row
+            for row in self.store.list_tools()
+            if bool(row.get("ephemeral"))
+        }
+        if not ephemeral_tool_rows:
+            return
+
+        candidate_rows = self.store.select_table_rows(
+            "tool_candidates",
+            "status = ?",
+            [ToolCandidateStatus.REGISTERED.value],
+            order_by="updated_at, candidate_id",
+        )
+        candidates_by_tool_id: dict[str, dict[str, Any]] = {}
+        fallback_by_owner_name: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in candidate_rows:
+            spec = loads(row.get("spec_json"), {})
+            name = str(spec.get("name") or "")
+            registered_tool_id = str(row.get("registered_tool_id") or "")
+            if registered_tool_id:
+                candidates_by_tool_id[registered_tool_id] = row
+            elif name:
+                # Best-effort recovery for pre-registered_tool_id rows. New
+                # rows use the exact id binding above to avoid name reuse bugs.
+                fallback_by_owner_name[(str(row["pid"]), name)] = row
+
+        restored: list[dict[str, str]] = []
+        pruned: list[dict[str, str]] = []
+        for process in self.store.list_processes():
+            changed = False
+            for name, raw_tool_id in list(process.tool_table.items()):
+                tool_id = str(raw_tool_id)
+                row = ephemeral_tool_rows.get(tool_id)
+                if row is None:
+                    continue
+                if tool_id in self.tools._tools:
+                    continue
+                candidate = candidates_by_tool_id.get(tool_id) or fallback_by_owner_name.get((process.pid, str(name)))
+                source = str(candidate.get("source_code") or "") if candidate is not None else ""
+                if candidate is None or not source or str(row.get("name") or "") != str(name):
+                    process.tool_table.pop(name, None)
+                    changed = True
+                    pruned.append({"pid": process.pid, "tool_id": tool_id, "name": str(name)})
+                    continue
+                self.tools._jit_sources[tool_id] = source
+                self.tools._handles[tool_id] = ToolHandle(
+                    tool_id=tool_id,
+                    name=str(name),
+                    capability_id=None,
+                    scope=str(row.get("scope") or "ephemeral_process"),
+                )
+                restored.append({"pid": process.pid, "tool_id": tool_id, "name": str(name)})
+            if changed:
+                process.updated_at = utc_now()
+                self.store.update_process(process)
+
+        if restored or pruned:
+            self.audit.record(
+                actor="runtime",
+                action="runtime.jit.rehydrate",
+                target="tool:jits",
+                decision={"restored": restored, "pruned_stale": pruned},
+            )
 
     def shutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:
         """Shut down this host Runtime instance.
@@ -524,12 +611,8 @@ class Runtime:
         try:
             self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
         except Exception as exc:
-            self.audit.record(
-                actor="runtime",
-                action="image.default_skill_configure_failed",
-                target=f"process:{pid}",
-                decision={"image": image_id, "error": str(exc)},
-            )
+            self._fail_process_image_boot(pid, image_id, exc, phase="image.default_skills")
+            raise
         if process is not None:
             self.checkpoint.grant_process_defaults(pid, issued_by=f"image:{image_id}")
         if process is not None and process.parent_pid is not None:
@@ -794,6 +877,7 @@ class Runtime:
     def _register_image_package_jit_tools(self, pid: str, image: AgentImage, artifact: dict[str, Any]) -> list[str]:
         process = self.process.get(pid)
         registered: list[str] = []
+        prepared: list[tuple[str, str]] = []
         for item in artifact.get("jit_tools", []):
             name = str(item.get("name") or "")
             if not name:
@@ -816,16 +900,30 @@ class Runtime:
                     **dict(item.get("metadata") or {}),
                 },
             )
-            tool_id = new_id("tool")
-            handle = ToolHandle(tool_id=tool_id, name=name, capability_id=None, scope="ephemeral_process")
-            self.tools._jit_sources[tool_id] = str(item.get("source") or "")
-            self.tools._handles[tool_id] = handle
-            self.store.insert_tool(handle, spec, registered_by=f"image.package:{image.image_id}", created_at=utc_now(), ephemeral=True)
-            process.tool_table[name] = tool_id
-            registered.append(name)
+            candidate_id = self.tools.propose(
+                pid,
+                spec,
+                source_code=str(item.get("source") or ""),
+                tests=[dict(test) for test in item.get("tests", [])],
+            )
+            validation = self.tools.validate(candidate_id, pid=pid)
+            if not validation.ok:
+                raise ValidationError(f"image package JIT tool {name} failed validation: {'; '.join(validation.errors)}")
+            prepared.append((name, candidate_id))
+        handles: dict[str, ToolHandle] = {}
+        try:
+            for name, candidate_id in prepared:
+                handle = self.tools.register(pid, candidate_id, approver=f"image.package:{image.image_id}")
+                handles[name] = handle
+                registered.append(name)
+        except Exception:
+            self._remove_registered_image_package_jit_tools(pid, handles)
+            raise
         if registered:
-            process.updated_at = utc_now()
-            self.store.update_process(process)
+            current_process = self.store.get_process(pid)
+            if current_process is not None:
+                current_process.updated_at = utc_now()
+                self.store.update_process(current_process)
             self.audit.record(
                 actor=f"image:{image.image_id}",
                 action="image.package_jit.register",
@@ -833,6 +931,20 @@ class Runtime:
                 decision={"tools": sorted(registered)},
             )
         return sorted(registered)
+
+    def _remove_registered_image_package_jit_tools(self, pid: str, handles: dict[str, ToolHandle]) -> None:
+        if not handles:
+            return
+        process = self.store.get_process(pid)
+        if process is not None:
+            for name, handle in handles.items():
+                if process.tool_table.get(name) == handle.tool_id:
+                    process.tool_table.pop(name, None)
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+        for handle in handles.values():
+            getattr(self.tools, "_jit_sources", {}).pop(handle.tool_id, None)
+            getattr(self.tools, "_handles", {}).pop(handle.tool_id, None)
 
     def _load_image_artifact(self, image: AgentImage, *, expected_kind: str | None = None) -> dict[str, Any]:
         artifact_id = str(image.boot.get("artifact_id") or "")
@@ -1026,10 +1138,10 @@ class Runtime:
             cur = self.store.conn.cursor()
             for row in rows.get("skills", []):
                 self.checkpoint._upsert_row(cur, "skills", row, "skill_id")
-            for row in rows.get("skill_trust", []):
-                self.checkpoint._upsert_row(cur, "skill_trust", row, "trust_id")
-            for row in rows.get("jsonrpc_endpoints", []):
-                self.checkpoint._upsert_row(cur, "jsonrpc_endpoints", row, "endpoint_id")
+            # Checkpoint-derived images restore only internal process runtime
+            # state. External/provider registries and global trust decisions are
+            # host state, so even legacy artifacts carrying those rows must not
+            # resurrect them during image boot.
             self.store.conn.commit()
 
     def _restore_committed_tool_table(self, pid: str, artifact: dict[str, Any]) -> dict[str, str]:
@@ -1046,10 +1158,25 @@ class Runtime:
                 old_to_new[old_tool_id] = new_tool_id
                 spec = ToolSpec(**loads(row["spec_json"], {}))
                 handle = ToolHandle(tool_id=new_tool_id, name=row["name"], capability_id=None, scope=row["scope"])
+                now = utc_now()
                 self.tools._jit_sources[new_tool_id] = jit_sources[old_tool_id]
                 self.tools._handles[new_tool_id] = handle
-                self.tools._tool_ids_by_name.setdefault(handle.name, new_tool_id)
-                self.store.insert_tool(handle, spec, registered_by=f"image.commit:{pid}", created_at=utc_now(), ephemeral=True)
+                self.store.insert_tool(handle, spec, registered_by=f"image.commit:{pid}", created_at=now, ephemeral=True)
+                self.store.insert_tool_candidate(
+                    ToolCandidate(
+                        candidate_id=new_id("tcand"),
+                        pid=pid,
+                        spec=spec,
+                        source_code=jit_sources[old_tool_id],
+                        tests=[],
+                        requested_capabilities=[],
+                        status=ToolCandidateStatus.REGISTERED,
+                        validation={"ok": True, "source": "image.commit"},
+                        created_at=now,
+                        updated_at=now,
+                        registered_tool_id=new_tool_id,
+                    )
+                )
                 table[name] = new_tool_id
                 continue
             handle = self.tools.resolve(name)

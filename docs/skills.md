@@ -63,8 +63,10 @@ relative files.
 
 Discovery returns catalog fields such as `name`, `description`, source, package
 hash, and high-level tool/action names. Activation materializes the full
-`SKILL.md` body into the process prompt. Bundled resources are read explicitly
-with `read_skill_resource` and only from the registered package snapshot.
+`SKILL.md` body into the process prompt and records the exact package snapshot
+on the process. Bundled resources are read explicitly with `read_skill_resource`
+from that activation snapshot, so later registry replacement affects only new
+activations.
 
 This prevents a Skill from keeping ambient read authority to the workspace path
 where it was registered.
@@ -91,8 +93,10 @@ entry references a `scripts/*.ts` source file:
 ]
 ```
 
-JIT sources are snapshotted at registration, validated through the Deno
-sandbox, and can only access libOS through `libos.syscall()`.
+JIT sources are snapshotted at registration. At activation, bundled JIT tools
+are validated and registered through the same ToolBroker path as proposed JIT
+tools, including sandbox resource limits and metrics. They can only access libOS
+through `libos.syscall()`.
 
 `actions.json` and `required-capabilities.json` are advisory prompt metadata.
 They do not create capabilities.
@@ -130,8 +134,8 @@ capabilities.
 
 `activate_skill` is atomic. The runtime validates the package, existing tool
 references, duplicate tool/JIT names, TypeScript source limits, Deno static
-checks and tests, and static tool shadowing before it modifies the process tool
-table or loaded Skill metadata.
+checks and tests through ToolBroker, and static tool shadowing before it
+modifies the process tool table or loaded Skill metadata.
 
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill. It does not revoke capabilities, delete audit history, delete JIT
@@ -139,7 +143,8 @@ candidate records, or roll back external side effects.
 
 ## Process Semantics
 
-- Image `default_skills` activate at spawn and exec time.
+- Image `default_skills` activate at spawn and exec time; failure fails image
+  boot instead of starting with a partial default Skill set.
 - Fork inherits activated Skills and corresponding tool visibility.
 - Spawn-child starts without parent-activated Skills.
 - Exec resets activated Skills to the target image defaults.

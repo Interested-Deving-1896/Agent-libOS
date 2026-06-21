@@ -185,6 +185,12 @@ Object payloads are not ordinary durable object rows. They live in runtime
 memory. Checkpoint payloads are the explicit durable snapshot exception.
 
 Audit and events are append-only. Checkpoint restore must not delete them.
+Limited audit views select the latest matching records first and return that
+window in chronological order, so GUI snapshots and per-process audit pages keep
+showing new records as the log grows. Shell execution records an intent audit
+record immediately before crossing into the shell provider; the result, timeout,
+or resource-limit audit record uses the intent record as its parent and
+correlation id.
 
 ## Module Map
 

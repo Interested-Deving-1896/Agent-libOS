@@ -10,6 +10,9 @@ from agent_libos import AgentImage, Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.prompt import build_system_prompt
 from agent_libos.models import (
+    JIT_TOOL_EXPOSURE_DIRECT,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    JIT_TOOL_EXPOSURES,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
@@ -18,6 +21,12 @@ from agent_libos.models.exceptions import ValidationError
 
 
 class TestLLMPromptModes:
+
+    def test_agent_image_jit_tool_exposure_defaults_to_direct(self) -> None:
+        image = AgentImage(image_id="default-jit-exposure:v0", name="default-jit-exposure")
+
+        assert image.jit_tool_exposure == JIT_TOOL_EXPOSURE_DIRECT
+        assert JIT_TOOL_EXPOSURES == {JIT_TOOL_EXPOSURE_DIRECT, JIT_TOOL_EXPOSURE_MULTIPLEXED}
 
     def test_image_only_system_prompt_is_exact_image_prompt(self) -> None:
         image = AgentImage(

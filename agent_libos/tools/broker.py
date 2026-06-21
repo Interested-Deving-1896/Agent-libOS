@@ -8,6 +8,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
+from jsonschema import validate as jsonschema_validate
+from jsonschema.validators import validator_for as jsonschema_validator_for
+
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ResourceLimitExceeded, ValidationError
@@ -16,6 +21,9 @@ from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     EventType,
+    JIT_MULTIPLEXER_TOOL_NAME,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    OPENAI_TOOL_NAME_MAX_CHARS,
     ObjectMetadata,
     ObjectType,
     ProcessStatus,
@@ -26,6 +34,7 @@ from agent_libos.models import (
     ToolHandle,
     ToolSpec,
     ValidationResult,
+    is_openai_tool_name,
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -35,9 +44,40 @@ from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, Subpr
 from agent_libos.tools.base import BaseAgentTool, ToolContext
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult
+from agent_libos.utils.serde import dumps
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+
+_JIT_MULTIPLEXER_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool_name": {
+            "type": "string",
+            "description": "Name of a visible process-local JIT tool to execute.",
+        },
+        "arguments": {
+            "type": "object",
+            "description": "Arguments for the selected JIT tool.",
+            "additionalProperties": True,
+        },
+    },
+    "required": ["tool_name", "arguments"],
+    "additionalProperties": False,
+}
+# This spec is only an LLM protocol surface. It is never inserted into a
+# process tool table, so direct runtime calls still resolve to real tools only.
+_JIT_MULTIPLEXER_SPEC = ToolSpec(
+    name=JIT_MULTIPLEXER_TOOL_NAME,
+    description=(
+        "Execute one visible process-local Deno/TypeScript JIT tool by name. "
+        "The image prompt must describe available JIT tool names and argument shapes."
+    ),
+    input_schema=_JIT_MULTIPLEXER_INPUT_SCHEMA,
+    output_schema={"type": "object"},
+    policy={"side_effects": True, "idempotent": False},
+    tags=["jit", "tool", "multiplexer", "protocol"],
+)
 
 
 class ToolBroker:
@@ -164,6 +204,9 @@ class ToolBroker:
         requested_capabilities: builtins.list[dict[str, Any]] | None = None,
     ) -> str:
         tool_spec = spec if isinstance(spec, ToolSpec) else ToolSpec(**spec)
+        self._validate_jit_tool_spec(tool_spec)
+        if self._jit_exposure_for_process(pid) == JIT_TOOL_EXPOSURE_MULTIPLEXED and tool_spec.name == JIT_MULTIPLEXER_TOOL_NAME:
+            raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
         self._validate_jit_source_and_tests(source_code, tests or [])
         now = utc_now()
         candidate = ToolCandidate(
@@ -301,6 +344,7 @@ class ToolBroker:
         # referenceable tool.
         self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
         candidate.status = ToolCandidateStatus.REGISTERED
+        candidate.registered_tool_id = tool_id
         candidate.updated_at = utc_now()
         self.store.update_tool_candidate(candidate)
         process.tool_table[candidate.spec.name] = tool_id
@@ -713,6 +757,29 @@ class ToolBroker:
         for index, test in enumerate(tests, start=1):
             ensure_json_size(test, self.config.tools.jit_test_case_max_bytes, f"JIT test {index}")
 
+    def _validate_jit_tool_spec(self, spec: ToolSpec) -> None:
+        # JIT names become OpenAI function names in direct mode and catalog keys
+        # in multiplexed mode, so reject names that the model/provider protocol
+        # cannot address exactly.
+        if not is_openai_tool_name(spec.name):
+            raise ValidationError(
+                f"JIT tool name must match OpenAI tool name syntax "
+                f"[A-Za-z0-9_-]{{1,{OPENAI_TOOL_NAME_MAX_CHARS}}}: {spec.name!r}"
+            )
+        if not isinstance(spec.description, str) or not spec.description.strip():
+            raise ValidationError("JIT tool description must be a non-empty string")
+        self._validate_json_schema(spec.input_schema or {"type": "object"}, "input_schema")
+        self._validate_json_schema(spec.output_schema or {"type": "object"}, "output_schema")
+
+    def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
+        if not isinstance(schema, dict):
+            raise ValidationError(f"JIT tool {field} must be a JSON schema object")
+        ensure_json_size(schema, self.config.tools.jit_test_case_max_bytes, f"JIT tool {field}")
+        try:
+            jsonschema_validator_for(schema).check_schema(schema)
+        except JsonSchemaSchemaError as exc:
+            raise ValidationError(f"JIT tool {field} is not a valid JSON schema: {exc.message}") from exc
+
     def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
         if self.resources is None:
             return None
@@ -913,14 +980,66 @@ class ToolBroker:
         visible_ids = self._visible_tool_ids(pid)
         return [row for row in self.store.list_tools() if row["tool_id"] in visible_ids]
 
+    def model_visible_tools(self, pid: str) -> builtins.list[dict[str, Any]]:
+        rows = self.visible_tools(pid)
+        if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
+            return rows
+        static_rows = [row for row in rows if str(row.get("tool_id")) not in self._jit_sources]
+        if any(str(row.get("tool_id")) in self._jit_sources for row in rows):
+            static_rows.append(self._jit_multiplexer_row())
+        return static_rows
+
+    def model_tool_names(self, pid: str) -> builtins.list[str]:
+        names = [str(row.get("name") or "") for row in self.model_visible_tools(pid)]
+        return sorted(name for name in names if name)
+
+    def model_tool_table(self, pid: str) -> dict[str, str]:
+        return {
+            str(row["name"]): str(row["tool_id"])
+            for row in self.model_visible_tools(pid)
+            if row.get("name") and row.get("tool_id")
+        }
+
+    def model_loaded_skills(self, pid: str) -> dict[str, Any]:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        hidden = self._hidden_jit_tool_names(pid)
+        if not hidden:
+            return dict(process.loaded_skills)
+        model_loaded: dict[str, Any] = {}
+        for skill_id, loaded in process.loaded_skills.items():
+            if not isinstance(loaded, dict):
+                model_loaded[skill_id] = self._redact_hidden_jit_names(loaded, hidden)
+                continue
+            entry = self._redact_hidden_jit_names(dict(loaded), hidden)
+            entry["jit_tool_ids"] = {}
+            if isinstance(entry.get("tool_names"), list):
+                entry["tool_names"] = [
+                    name for name in entry["tool_names"]
+                    if name != "<multiplexed_jit_tool>"
+                ]
+            model_loaded[skill_id] = entry
+        return model_loaded
+
+    def redact_model_context(self, pid: str, value: Any) -> Any:
+        hidden = self._hidden_jit_tool_names(pid)
+        if not hidden:
+            return value
+        return self._redact_hidden_jit_names(value, hidden)
+
     def openai_tool_schemas(self, pid: str | None = None) -> builtins.list[dict[str, Any]]:
         tool_ids = self._visible_tool_ids(pid) if pid is not None else set(self._tools)
+        multiplex_jit = pid is not None and self._jit_exposure_for_process(pid) == JIT_TOOL_EXPOSURE_MULTIPLEXED
+        has_visible_jit = any(tool_id in self._jit_sources for tool_id in tool_ids)
         schemas: builtins.list[dict[str, Any]] = []
-        for tool_id in tool_ids:
+        for tool_id in sorted(tool_ids, key=self._tool_sort_key):
             if tool_id in self._tools:
                 schemas.append(self._tools[tool_id].to_openai_chat_tool())
                 continue
             if tool_id not in self._jit_sources:
+                continue
+            if multiplex_jit:
                 continue
             spec = self.store.get_tool_spec(tool_id)
             if spec is None:
@@ -935,7 +1054,129 @@ class ToolBroker:
                     },
                 }
             )
+        if multiplex_jit and has_visible_jit:
+            schemas.append(self._jit_multiplexer_openai_schema())
         return schemas
+
+    def normalize_model_action(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
+        name = str(action.get("action") or "").strip()
+        if name == JIT_MULTIPLEXER_TOOL_NAME:
+            if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
+                raise ValueError(f"{JIT_MULTIPLEXER_TOOL_NAME} is not available for this image")
+            return self._normalize_multiplexed_jit_action(pid, action)
+        if self._jit_exposure_for_process(pid) == JIT_TOOL_EXPOSURE_MULTIPLEXED and self._is_visible_jit_name(pid, name):
+            raise ValueError(f"JIT tool {name!r} must be called through {JIT_MULTIPLEXER_TOOL_NAME}")
+        return action
+
+    def _normalize_multiplexed_jit_action(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
+        tool_name = str(action.get("tool_name") or "").strip()
+        if not tool_name:
+            raise ValueError(f"{JIT_MULTIPLEXER_TOOL_NAME} requires a non-empty tool_name")
+        arguments = action.get("arguments")
+        if not isinstance(arguments, dict):
+            raise ValueError(f"{JIT_MULTIPLEXER_TOOL_NAME}.arguments must be an object")
+        try:
+            handle = self.resolve(tool_name, pid=pid)
+        except NotFound as exc:
+            raise ValueError(f"JIT tool is not available in this process: {tool_name}") from exc
+        if handle.tool_id not in self._jit_sources:
+            raise ValueError(f"{JIT_MULTIPLEXER_TOOL_NAME} can only dispatch process-local JIT tools: {tool_name}")
+        if not self._process_has_tool(pid, handle):
+            raise ValueError(f"JIT tool is not in process tool table: {tool_name}")
+        self._validate_jit_arguments(handle, arguments)
+        return {**arguments, "action": tool_name}
+
+    def _validate_jit_arguments(self, handle: ToolHandle, arguments: dict[str, Any]) -> None:
+        spec = self.store.get_tool_spec(handle.tool_id)
+        schema = spec.input_schema if spec is not None and spec.input_schema else {"type": "object"}
+        try:
+            jsonschema_validate(instance=arguments, schema=schema)
+        except JsonSchemaValidationError as exc:
+            path = ".".join(str(part) for part in exc.path)
+            location = f" at {path}" if path else ""
+            raise ValueError(f"arguments for JIT tool {handle.name!r} do not match input_schema{location}: {exc.message}") from exc
+        except JsonSchemaSchemaError as exc:
+            raise ValueError(f"JIT tool {handle.name!r} has invalid input_schema: {exc.message}") from exc
+
+    def _is_visible_jit_name(self, pid: str, name: str) -> bool:
+        if not name:
+            return False
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        tool_id = process.tool_table.get(name)
+        return tool_id in self._jit_sources if tool_id is not None else False
+
+    def _hidden_jit_tool_names(self, pid: str) -> set[str]:
+        if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
+            return set()
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        return {
+            name
+            for name, tool_id in process.tool_table.items()
+            if tool_id in self._jit_sources
+        }
+
+    def _redact_hidden_jit_names(self, value: Any, hidden: set[str]) -> Any:
+        if isinstance(value, str):
+            redacted = value
+            for name in hidden:
+                redacted = redacted.replace(name, "<multiplexed_jit_tool>")
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_hidden_jit_names(item, hidden) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_hidden_jit_names(item, hidden) for item in value)
+        if isinstance(value, dict):
+            return {
+                self._redact_hidden_jit_names(key, hidden): self._redact_hidden_jit_names(item, hidden)
+                for key, item in value.items()
+            }
+        return value
+
+    def _jit_exposure_for_process(self, pid: str | None) -> str:
+        if pid is None:
+            return ""
+        runtime = getattr(self, "runtime", None)
+        if runtime is None:
+            return ""
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        image = getattr(runtime, "images", {}).get(process.image_id)
+        return str(getattr(image, "jit_tool_exposure", "") or "")
+
+    def _jit_multiplexer_row(self) -> dict[str, Any]:
+        return {
+            "tool_id": f"protocol:{JIT_MULTIPLEXER_TOOL_NAME}",
+            "name": JIT_MULTIPLEXER_TOOL_NAME,
+            "spec_json": dumps(_JIT_MULTIPLEXER_SPEC),
+            "scope": "llm_protocol",
+            "registered_by": "runtime",
+            "created_at": "",
+            "ephemeral": 1,
+        }
+
+    def _jit_multiplexer_openai_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": _JIT_MULTIPLEXER_SPEC.name,
+                "description": _JIT_MULTIPLEXER_SPEC.description,
+                "parameters": _JIT_MULTIPLEXER_SPEC.input_schema,
+            },
+        }
+
+    def _tool_sort_key(self, tool_id: str) -> tuple[str, str]:
+        handle = self._handles.get(tool_id)
+        if handle is not None:
+            return (handle.name, tool_id)
+        spec = self.store.get_tool_spec(tool_id)
+        if spec is not None:
+            return (spec.name, tool_id)
+        return (tool_id, tool_id)
 
     def _context(self, pid: str, handle: ToolHandle, call_id: str) -> ToolContext:
         return ToolContext(

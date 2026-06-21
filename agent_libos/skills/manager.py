@@ -9,9 +9,20 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
+from jsonschema.validators import validator_for as jsonschema_validator_for
+
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import CapabilityRight, EventType, ToolCandidateStatus
+from agent_libos.models import (
+    CapabilityRight,
+    EventType,
+    JIT_MULTIPLEXER_TOOL_NAME,
+    JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    OPENAI_TOOL_NAME_MAX_CHARS,
+    ToolCandidateStatus,
+    is_openai_tool_name,
+)
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -298,29 +309,33 @@ class SkillManager:
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
+        include_jit_catalog = not self._process_uses_multiplexed_jit(process)
         result: list[dict[str, Any]] = []
         for skill_id, loaded in process.loaded_skills.items():
-            found = self.store.get_skill(skill_id)
-            if found is None:
-                result.append({"skill_id": skill_id, "missing": True, "loaded": loaded})
+            try:
+                skill = self._skill_for_loaded_record(skill_id, loaded)
+            except ValidationError as exc:
+                entry = {"skill_id": skill_id, "invalid_snapshot": True, "error": str(exc)}
+                if include_jit_catalog:
+                    entry["loaded"] = loaded
+                result.append(entry)
                 continue
-            skill, _metadata = found
-            result.append(
-                {
-                    "skill_id": skill.skill_id,
-                    "name": skill.name,
-                    "version": skill.version,
-                    "description": skill.description,
-                    "instructions": self._prompt_instructions(skill),
-                    "allowed_tools": list(skill.allowed_tools),
-                    "actions": [asdict(action) for action in skill.actions],
-                    "jit_tools": [self._jit_summary(tool) for tool in skill.jit_tools],
-                    "required_capabilities": list(skill.required_capabilities),
-                    "resources": [self._resource_summary(resource) for resource in skill.resources],
-                    "metadata": dict(skill.metadata),
-                    "loaded": loaded,
-                }
-            )
+            entry = {
+                "skill_id": skill.skill_id,
+                "name": skill.name,
+                "version": skill.version,
+                "description": skill.description,
+                "instructions": self._prompt_instructions(skill),
+                "allowed_tools": list(skill.allowed_tools),
+                "actions": [asdict(action) for action in skill.actions],
+                "jit_tools": [self._jit_summary(tool) for tool in skill.jit_tools] if include_jit_catalog else [],
+                "required_capabilities": list(skill.required_capabilities),
+                "resources": self._prompt_resource_summaries(skill, include_jit_catalog=include_jit_catalog),
+                "metadata": dict(skill.metadata),
+            }
+            if include_jit_catalog:
+                entry["loaded"] = loaded
+            result.append(entry)
         return result
 
     def activate_skill(
@@ -339,7 +354,7 @@ class SkillManager:
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
-        self._validate_loadable(skill, process.tool_table)
+        self._validate_loadable(pid, skill, process.tool_table)
         existing_handles = self._resolve_existing_tools(skill.allowed_tools)
         jit_handles = self._register_jit_tools(pid, skill)
         tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
@@ -357,6 +372,7 @@ class SkillManager:
             tool_ids=tool_ids,
             jit_tool_ids=jit_tool_ids,
             instructions_hash=self._hash_text(skill.instructions),
+            package_snapshot=self._skill_snapshot(skill),
         )
         process.tool_table = updated_table
         process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
@@ -451,9 +467,13 @@ class SkillManager:
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
-        if require_loaded and skill_id not in process.loaded_skills:
-            raise CapabilityDenied(f"skill is not loaded in process {pid}: {skill_id}")
-        skill, _metadata = self._get_skill(skill_id)
+        loaded = process.loaded_skills.get(skill_id)
+        if require_loaded:
+            if loaded is None:
+                raise CapabilityDenied(f"skill is not loaded in process {pid}: {skill_id}")
+            skill = self._skill_for_loaded_record(skill_id, loaded)
+        else:
+            skill, _metadata = self._get_skill(skill_id)
         normalized = self._normalize_relative_resource_path(path)
         selected = next((resource for resource in skill.resources if resource.path == normalized), None)
         if selected is None:
@@ -885,26 +905,28 @@ class SkillManager:
         if total_bytes > defaults.package_max_bytes:
             raise ValidationError(f"skill package exceeds package_max_bytes={defaults.package_max_bytes}")
         for tool in skill.jit_tools:
-            self._validate_tool_identifier(tool.name, "jit_tools[].name", defaults.id_max_chars)
+            self._validate_jit_tool_name(tool.name, "jit_tools[].name")
             self._validate_jit_script_path(tool.source_path)
             if len(tool.source) > defaults.max_jit_source_chars:
                 raise ValidationError(f"JIT source for {tool.name} exceeds max_jit_source_chars={defaults.max_jit_source_chars}")
         for spec in skill.required_capabilities:
             self._validate_capability_spec(spec)
 
-    def _validate_loadable(self, skill: SkillPackage, process_tool_table: dict[str, str]) -> None:
+    def _validate_loadable(self, pid: str, skill: SkillPackage, process_tool_table: dict[str, str]) -> None:
         runtime = self._runtime()
         static_names = {row["name"] for row in runtime.tools.list() if not bool(row.get("ephemeral"))}
+        process = runtime.process.get(pid)
+        image = runtime.images.get(process.image_id) if process is not None else None
+        multiplexed_jit = getattr(image, "jit_tool_exposure", None) == JIT_TOOL_EXPOSURE_MULTIPLEXED
         for name in skill.allowed_tools:
             runtime.tools.resolve(name)
         for tool in skill.jit_tools:
+            if multiplexed_jit and tool.name == JIT_MULTIPLEXER_TOOL_NAME:
+                raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
             if tool.name in process_tool_table:
                 raise ValidationError(f"process already has a tool named: {tool.name}")
             if tool.name in static_names:
                 raise ValidationError(f"JIT skill tool cannot shadow static tool: {tool.name}")
-            result = runtime.tools.sandbox.run_tests(tool.source, tool.tests)
-            if not result.ok or result.errors:
-                raise ValidationError(f"JIT skill tool {tool.name} failed validation: {'; '.join(result.errors)}")
 
     def _resolve_existing_tools(self, names: list[str]) -> dict[str, Any]:
         runtime = self._runtime()
@@ -912,7 +934,7 @@ class SkillManager:
 
     def _register_jit_tools(self, pid: str, skill: SkillPackage) -> dict[str, Any]:
         runtime = self._runtime()
-        handles: dict[str, Any] = {}
+        prepared: list[tuple[JitToolSpec, str]] = []
         for jit in skill.jit_tools:
             candidate_id = runtime.tools.propose(
                 pid,
@@ -934,8 +956,33 @@ class SkillManager:
                 raise NotFound(f"tool candidate not found after validation: {candidate_id}")
             candidate.status = ToolCandidateStatus.VALIDATED
             runtime.store.update_tool_candidate(candidate)
-            handles[jit.name] = runtime.tools.register(pid, candidate_id, approver=f"skill:{skill.skill_id}")
+            prepared.append((jit, candidate_id))
+        handles: dict[str, Any] = {}
+        try:
+            for jit, candidate_id in prepared:
+                handles[jit.name] = runtime.tools.register(pid, candidate_id, approver=f"skill:{skill.skill_id}")
+        except Exception:
+            self._remove_registered_jit_tools(pid, handles)
+            raise
         return handles
+
+    def _remove_registered_jit_tools(self, pid: str, handles: dict[str, Any]) -> None:
+        if not handles:
+            return
+        runtime = self._runtime()
+        process = runtime.store.get_process(pid)
+        if process is not None:
+            for name, handle in handles.items():
+                if process.tool_table.get(name) == handle.tool_id:
+                    process.tool_table.pop(name, None)
+            process.updated_at = utc_now()
+            runtime.store.update_process(process)
+        for handle in handles.values():
+            getattr(runtime.tools, "_jit_sources", {}).pop(handle.tool_id, None)
+            getattr(runtime.tools, "_handles", {}).pop(handle.tool_id, None)
+            names = getattr(runtime.tools, "_tool_ids_by_name", None)
+            if names is not None and names.get(handle.name) == handle.tool_id:
+                names.pop(handle.name, None)
 
     def _require_skill_right(self, actor: str, skill_id: str, right: CapabilityRight) -> None:
         self._require_skill_rights(actor, skill_id, [right])
@@ -1001,6 +1048,61 @@ class SkillManager:
             raise NotFound(f"skill not found: {skill_id}")
         return found
 
+    def _skill_snapshot(self, skill: SkillPackage) -> dict[str, Any]:
+        return dict(to_jsonable(skill))
+
+    def _skill_for_loaded_record(self, skill_id: str, loaded: Any) -> SkillPackage:
+        if not isinstance(loaded, dict) or "package_snapshot" not in loaded:
+            # Legacy in-memory rows did not carry package snapshots. New
+            # activations always do, which prevents registry replacement from
+            # mutating already loaded prompt/resources.
+            skill, _metadata = self._get_skill(skill_id)
+            return skill
+        snapshot = loaded.get("package_snapshot")
+        if not isinstance(snapshot, dict):
+            raise ValidationError(f"loaded skill snapshot must be an object: {skill_id}")
+        skill = self._package_from_snapshot(snapshot, context=f"loaded skill {skill_id}")
+        if skill.skill_id != skill_id:
+            raise ValidationError(f"loaded skill snapshot id mismatch: {skill.skill_id} != {skill_id}")
+        expected_sha = str(loaded.get("package_sha256") or "")
+        if expected_sha and skill.package_sha256 != expected_sha:
+            raise ValidationError(
+                f"loaded skill snapshot hash mismatch for {skill_id}: {skill.package_sha256} != {expected_sha}"
+            )
+        return skill
+
+    def _package_from_snapshot(self, data: dict[str, Any], *, context: str) -> SkillPackage:
+        try:
+            package = SkillPackage(
+                schema_version=int(data.get("schema_version", self.config.skills.schema_version)),
+                skill_id=str(data["skill_id"]),
+                name=str(data["name"]),
+                description=str(data.get("description", "")),
+                instructions=str(data.get("instructions", "")),
+                version=str(data.get("version", "v0")),
+                license=str(data.get("license", "")),
+                compatibility=str(data.get("compatibility", "")),
+                metadata={str(key): str(value) for key, value in self._mapping(data.get("metadata"), "metadata").items()},
+                allowed_tools=self._string_list(data.get("allowed_tools"), "allowed_tools"),
+                actions=[ActionSchema(**dict(item)) for item in self._list(data.get("actions"), "actions")],
+                jit_tools=[JitToolSpec(**dict(item)) for item in self._list(data.get("jit_tools"), "jit_tools")],
+                required_capabilities=[
+                    dict(item) for item in self._list(data.get("required_capabilities"), "required_capabilities")
+                ],
+                resources=[SkillResource(**dict(item)) for item in self._list(data.get("resources"), "resources")],
+                package_sha256=str(data.get("package_sha256", "")),
+                diagnostics=self._string_list(data.get("diagnostics"), "diagnostics"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError(f"invalid {context} package snapshot: {exc}") from exc
+        actual_sha = self._package_hash(package)
+        if package.package_sha256 and package.package_sha256 != actual_sha:
+            raise ValidationError(f"invalid {context} package snapshot hash")
+        if not package.package_sha256:
+            package = self._replace_package_hash(package, actual_sha)
+        self._validate_package(package)
+        return package
+
     def _skill_summary(self, skill: SkillPackage, metadata: dict[str, Any]) -> dict[str, Any]:
         return {
             "skill_id": skill.skill_id,
@@ -1036,6 +1138,17 @@ class SkillManager:
             "size_bytes": resource.size_bytes,
             "sha256": resource.sha256,
         }
+
+    def _prompt_resource_summaries(self, skill: SkillPackage, *, include_jit_catalog: bool) -> list[dict[str, Any]]:
+        if include_jit_catalog:
+            return [self._resource_summary(resource) for resource in skill.resources]
+        hidden_paths = {"references/agent-libos/jit-tools.json"}
+        hidden_paths.update(tool.source_path for tool in skill.jit_tools)
+        return [
+            self._resource_summary(resource)
+            for resource in skill.resources
+            if resource.path not in hidden_paths
+        ]
 
     def _prompt_instructions(self, skill: SkillPackage) -> str:
         return skill.instructions[: self.config.skills.max_prompt_instruction_chars]
@@ -1091,12 +1204,18 @@ class SkillManager:
             if not isinstance(item, dict):
                 raise ValidationError("jit_tools[].tests entries must be mappings")
             tests.append(dict(item))
+        name = self._require_string(value.get("name"), "jit_tools[].name")
+        self._validate_jit_tool_name(name, "jit_tools[].name")
+        input_schema = self._mapping(value.get("input_schema"), "jit_tools[].input_schema")
+        output_schema = self._mapping(value.get("output_schema"), "jit_tools[].output_schema")
+        self._validate_json_schema(input_schema or {"type": "object"}, "jit_tools[].input_schema")
+        self._validate_json_schema(output_schema or {"type": "object"}, "jit_tools[].output_schema")
         return JitToolSpec(
-            name=self._require_string(value.get("name"), "jit_tools[].name"),
+            name=name,
             description=self._require_string(value.get("description"), "jit_tools[].description"),
             source_path=source_path,
-            input_schema=self._mapping(value.get("input_schema"), "jit_tools[].input_schema"),
-            output_schema=self._mapping(value.get("output_schema"), "jit_tools[].output_schema"),
+            input_schema=input_schema,
+            output_schema=output_schema,
             tests=tests,
             metadata=self._mapping(value.get("metadata"), "jit_tools[].metadata"),
         )
@@ -1355,8 +1474,30 @@ class SkillManager:
         if not _TOOL_NAME_PATTERN.match(value):
             raise ValidationError(f"{field} contains unsupported characters: {value!r}")
 
+    def _validate_jit_tool_name(self, value: str, field: str) -> None:
+        self._validate_string_length(value, field, OPENAI_TOOL_NAME_MAX_CHARS)
+        if not is_openai_tool_name(value):
+            raise ValidationError(
+                f"{field} must match OpenAI tool name syntax [A-Za-z0-9_-]{{1,{OPENAI_TOOL_NAME_MAX_CHARS}}}: {value!r}"
+            )
+
+    def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
+        if not isinstance(schema, dict):
+            raise ValidationError(f"{field} must be a JSON schema object")
+        try:
+            jsonschema_validator_for(schema).check_schema(schema)
+        except JsonSchemaSchemaError as exc:
+            raise ValidationError(f"{field} is not a valid JSON schema: {exc.message}") from exc
+
     def _validate_string_length(self, value: str, field: str, max_chars: int) -> None:
         if len(value) > max_chars:
             raise ValidationError(f"{field} exceeds max length {max_chars}")
         if any(ord(char) < 32 for char in value):
             raise ValidationError(f"{field} contains control characters")
+
+    def _process_uses_multiplexed_jit(self, process: Any) -> bool:
+        runtime = self.runtime
+        if runtime is None:
+            return False
+        image = getattr(runtime, "images", {}).get(process.image_id)
+        return getattr(image, "jit_tool_exposure", None) == JIT_TOOL_EXPOSURE_MULTIPLEXED

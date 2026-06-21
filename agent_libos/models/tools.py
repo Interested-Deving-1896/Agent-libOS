@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 from agent_libos.models.base import CapabilityID, PID, ToolID, StrEnum
 from agent_libos.models.memory import ObjectHandle
+
+JIT_MULTIPLEXER_TOOL_NAME = "run_jit_tool"
+OPENAI_TOOL_NAME_MAX_CHARS = 64
+OPENAI_TOOL_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+_OPENAI_TOOL_NAME_RE = re.compile(OPENAI_TOOL_NAME_PATTERN)
+
+
+def is_openai_tool_name(value: str) -> bool:
+    return bool(_OPENAI_TOOL_NAME_RE.fullmatch(value))
 
 
 class ToolCandidateStatus(StrEnum):
@@ -40,6 +50,7 @@ class ToolCandidate:
     validation: dict[str, Any] | None
     created_at: str
     updated_at: str
+    registered_tool_id: ToolID | None = None
 
 
 @dataclass(frozen=True)

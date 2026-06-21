@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -313,6 +313,43 @@ class ObjectMemoryManager:
         )
         return handle
 
+    def handle_for_oid(
+        self,
+        pid: str,
+        oid: str,
+        *,
+        required_rights: Iterable[str | ObjectRight] | None = None,
+        optional_rights: Iterable[str | ObjectRight] | None = None,
+        issued_by: str = "memory.oid",
+    ) -> ObjectHandle:
+        if self.store.get_object(oid) is None:
+            raise NotFound(f"object not found: {oid}")
+        required = {str(right) for right in (required_rights or {ObjectRight.READ.value})}
+        optional = {str(right) for right in (optional_rights or set())} - required
+        rights, decisions = self._authorized_object_rights(
+            pid,
+            oid,
+            required_rights=required,
+            optional_rights=optional,
+        )
+        handle = self.capabilities.handle_for_object(
+            pid,
+            oid,
+            rights,
+            issued_by=issued_by,
+            uses_remaining=1 if self._has_one_time_decision(decisions) else None,
+        )
+        self._consume_one_time_decisions(decisions)
+        self.audit.record(
+            actor=pid,
+            action="memory.handle_for_oid",
+            target=f"object:{oid}",
+            output_refs=[oid],
+            capability_refs=[handle.capability_id],
+            decision={"rights": sorted(rights)},
+        )
+        return handle
+
     def update_object(self, pid: str, handle: ObjectHandle, patch: ObjectPatch) -> ObjectHandle:
         self.capabilities.assert_handle(pid, handle, ObjectRight.WRITE)
         current = self.store.get_object(handle.oid)
@@ -415,18 +452,25 @@ class ObjectMemoryManager:
                 continue
             if query.text and query.text.lower() not in self._search_text(obj).lower():
                 continue
-            decision = self.capabilities.authorize(pid, f"object:{obj.oid}", ObjectRight.READ)
-            if not decision.allowed:
+            decisions: list[Any]
+            rights: set[str]
+            try:
+                rights, decisions = self._authorized_object_rights(
+                    pid,
+                    obj.oid,
+                    required_rights={ObjectRight.READ.value},
+                    optional_rights=set(),
+                )
+            except CapabilityDenied:
                 continue
-            rights = {"read", "materialize", "link", "diff"}
             handle = self.capabilities.handle_for_object(
                 pid,
                 obj.oid,
                 rights,
                 issued_by="memory.query",
-                uses_remaining=1 if decision.consume_capability_id is not None else None,
+                uses_remaining=1 if self._has_one_time_decision(decisions) else None,
             )
-            self._consume_one_time_decision(decision)
+            self._consume_one_time_decisions(decisions)
             results.append(handle)
             if len(results) >= query.limit:
                 break
@@ -481,20 +525,17 @@ class ObjectMemoryManager:
             source_roots = []
         child_roots: list[ObjectHandle] = []
         for handle in source_roots:
-            self.capabilities.assert_handle(parent_pid, handle, ObjectRight.READ)
-            rights = spec.rights
-            if rights is None:
-                rights = {"read", "materialize", "diff"}
-                if spec.mode in {ViewMode.MUTABLE, ViewMode.COPY_ON_WRITE} and "write" in handle.rights:
-                    rights.add("write")
+            rights, decisions = self._fork_child_rights(parent_pid, handle, spec)
             child_roots.append(
                 self.capabilities.handle_for_object(
                     child_pid,
                     handle.oid,
                     rights,
                     issued_by=f"process:{parent_pid}:fork",
+                    uses_remaining=1 if self._has_one_time_decision(decisions) else None,
                 )
             )
+            self._consume_one_time_decisions(decisions)
         view = MemoryView(
             view_id=new_id("view"),
             owner_pid=child_pid,
@@ -523,8 +564,10 @@ class ObjectMemoryManager:
     ) -> MergeResult:
         policy = policy or MergePolicy()
         merged: list[str] = []
+        merged_handles: list[ObjectHandle] = []
         skipped: list[str] = []
         candidate_oids = {handle.oid for handle in child_view.roots}
+        child_handles = {handle.oid: handle for handle in child_view.roots}
         if policy.include_child_created:
             candidate_oids.update(
                 obj.oid for obj in self.store.list_objects() if obj.created_by == child_view.owner_pid
@@ -534,12 +577,34 @@ class ObjectMemoryManager:
             if obj is None:
                 skipped.append(oid)
                 continue
-            self.capabilities.handle_for_object(
+            try:
+                if oid in child_handles:
+                    rights, decisions = self._authorized_handle_rights(
+                        child_view.owner_pid,
+                        child_handles[oid],
+                        required_rights={ObjectRight.READ.value},
+                        optional_rights={str(right) for right in policy.grant_rights} - {ObjectRight.READ.value},
+                        require_all=False,
+                    )
+                else:
+                    rights, decisions = self._authorized_object_rights(
+                        child_view.owner_pid,
+                        oid,
+                        required_rights={ObjectRight.READ.value},
+                        optional_rights={str(right) for right in policy.grant_rights} - {ObjectRight.READ.value},
+                    )
+            except CapabilityDenied:
+                skipped.append(oid)
+                continue
+            handle = self.capabilities.handle_for_object(
                 parent_pid,
                 oid,
-                policy.grant_rights,
+                rights,
                 issued_by=f"memory.merge:{child_view.owner_pid}",
+                uses_remaining=1 if self._has_one_time_decision(decisions) else None,
             )
+            self._consume_one_time_decisions(decisions)
+            merged_handles.append(handle)
             merged.append(oid)
         self.audit.record(
             actor=parent_pid,
@@ -549,7 +614,7 @@ class ObjectMemoryManager:
             output_refs=merged,
             decision={"merged": len(merged), "skipped": skipped},
         )
-        return MergeResult(merged_oids=merged, skipped_oids=skipped)
+        return MergeResult(merged_oids=merged, skipped_oids=skipped, merged_handles=merged_handles)
 
     def snapshot_view(self, pid: str, view: MemoryView) -> str:
         snapshot_id = new_id("snap")
@@ -667,6 +732,112 @@ class ObjectMemoryManager:
             decision.consume_capability_id,
             used_by="object_memory",
             reason="one-time object memory permission consumed",
+        )
+
+    def _consume_one_time_decisions(self, decisions: Iterable[Any]) -> None:
+        consumed: set[str] = set()
+        for decision in decisions:
+            cap_id = decision.consume_capability_id
+            if cap_id is None or cap_id in consumed:
+                continue
+            consumed.add(cap_id)
+            self._consume_one_time_decision(decision)
+
+    def _has_one_time_decision(self, decisions: Iterable[Any]) -> bool:
+        return any(decision.consume_capability_id is not None for decision in decisions)
+
+    def _authorized_object_rights(
+        self,
+        pid: str,
+        oid: str,
+        *,
+        required_rights: Iterable[str | ObjectRight],
+        optional_rights: Iterable[str | ObjectRight] = (),
+    ) -> tuple[set[str], list[Any]]:
+        rights: set[str] = set()
+        decisions: list[Any] = []
+        resource = f"object:{oid}"
+        for right in sorted({str(item) for item in required_rights}):
+            decision = self.capabilities.authorize(pid, resource, right)
+            if not decision.allowed:
+                raise CapabilityDenied(decision.reason)
+            rights.add(right)
+            decisions.append(decision)
+        for right in sorted({str(item) for item in optional_rights} - rights):
+            decision = self.capabilities.authorize(pid, resource, right)
+            if decision.allowed:
+                rights.add(right)
+                decisions.append(decision)
+        if not rights:
+            raise CapabilityDenied(f"{pid} lacks object rights on {oid}")
+        return rights, decisions
+
+    def _authorized_handle_rights(
+        self,
+        pid: str,
+        handle: ObjectHandle,
+        *,
+        required_rights: Iterable[str | ObjectRight],
+        optional_rights: Iterable[str | ObjectRight] = (),
+        require_all: bool = True,
+    ) -> tuple[set[str], list[Any]]:
+        rights: set[str] = set()
+        decisions: list[Any] = []
+        for right in sorted({str(item) for item in required_rights}):
+            decision = self.capabilities.authorize_handle(pid, handle, right)
+            if not decision.allowed:
+                raise CapabilityDenied(decision.reason)
+            rights.add(right)
+            decisions.append(decision)
+        for right in sorted({str(item) for item in optional_rights} - rights):
+            if right not in handle.rights:
+                if require_all:
+                    raise CapabilityDenied(f"object handle lacks {right}: {handle.oid}")
+                continue
+            decision = self.capabilities.authorize_handle(pid, handle, right)
+            if decision.allowed:
+                rights.add(right)
+                decisions.append(decision)
+            elif require_all:
+                raise CapabilityDenied(decision.reason)
+        if not rights:
+            raise CapabilityDenied(f"{pid} lacks object handle rights on {handle.oid}")
+        return rights, decisions
+
+    def _fork_child_rights(
+        self,
+        parent_pid: str,
+        handle: ObjectHandle,
+        spec: MemoryViewSpec,
+    ) -> tuple[set[str], list[Any]]:
+        if spec.rights is not None:
+            requested = {str(right) for right in spec.rights}
+            requested.add(ObjectRight.READ.value)
+            missing = requested - {str(right) for right in handle.rights}
+            if missing:
+                raise CapabilityDenied(
+                    f"forked MemoryView cannot grant rights absent from parent handle: {sorted(missing)}"
+                )
+            return self._authorized_handle_rights(
+                parent_pid,
+                handle,
+                required_rights=requested,
+                optional_rights=set(),
+                require_all=True,
+            )
+
+        optional = {ObjectRight.MATERIALIZE.value, ObjectRight.DIFF.value}
+        if spec.mode in {ViewMode.MUTABLE, ViewMode.COPY_ON_WRITE}:
+            optional.add(ObjectRight.WRITE.value)
+        # Forking is attenuation, not capability minting: optional rights are
+        # inherited only when the parent handle itself and current policy allow
+        # them. A read-only root therefore remains read-only in the child.
+        return self._authorized_handle_rights(
+            parent_pid,
+            handle,
+            required_rights={ObjectRight.READ.value},
+            optional_rights=optional,
+            require_all=False,
         )
 
     def _render_object(self, obj: AgentObject) -> str:

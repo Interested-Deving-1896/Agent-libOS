@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 from agent_libos import Runtime
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.models import CapabilityRight, ObjectPatch, ObjectQuery, ObjectType
+from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectHandle, ObjectPatch, ObjectQuery, ObjectType
 
 class TestObjectMemoryName:
 
@@ -190,6 +190,65 @@ class TestObjectMemoryName:
         results = self.runtime.memory.query_objects(other, ObjectQuery(name='claim.capability', namespace=owner_namespace))
         assert len(results) == 1
         assert results[0].oid == handle.oid
+
+    def test_query_with_read_only_authority_does_not_grant_materialize_or_link(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query materialize')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='reader query materialize')
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'query must not materialize this'},
+            name='query.secret',
+        )
+        owner_namespace = self.runtime.memory.resolve_namespace(owner)
+        self.runtime.capability.grant(subject=reader, resource=f'object_namespace:{owner_namespace}', rights=['read'], issued_by='test')
+        self.runtime.capability.grant(subject=reader, resource=f'object:{handle.oid}', rights=[CapabilityRight.READ], issued_by='test')
+
+        results = self.runtime.memory.query_objects(reader, ObjectQuery(name='query.secret', namespace=owner_namespace))
+
+        assert len(results) == 1
+        assert results[0].rights == {'read'}
+        view = self.runtime.memory.create_view(reader, results)
+        context = self.runtime.memory.materialize_context(reader, view)
+        assert handle.oid in context.omitted_objects
+        assert 'query must not materialize this' not in context.text
+
+    def test_fork_view_explicit_rights_cannot_exceed_parent_handle(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner fork rights')
+        parent = self.runtime.process.spawn(image='base-agent:v0', goal='parent fork rights')
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'read only'},
+            name='fork.secret',
+        )
+        owner_namespace = self.runtime.memory.resolve_namespace(owner)
+        self.runtime.capability.grant(subject=parent, resource=f'object_namespace:{owner_namespace}', rights=['read'], issued_by='test')
+        self.runtime.capability.grant(subject=parent, resource=f'object:{handle.oid}', rights=[CapabilityRight.READ], issued_by='test')
+        read_only = self.runtime.memory.handle_for_name(
+            parent,
+            'fork.secret',
+            rights=['read'],
+            namespace=owner_namespace,
+        )
+        parent_view = self.runtime.memory.create_view(parent, [read_only])
+
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.fork_view(
+                parent,
+                'pid_fake_child',
+                parent_view,
+                MemoryViewSpec(roots=[read_only], rights={'read', 'materialize'}),
+            )
+
+    def test_object_handle_capability_cannot_be_retargeted_to_another_oid(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='retarget handle')
+        first = self.runtime.memory.create_object(pid=pid, object_type=ObjectType.EVIDENCE, payload={'first': True}, name='first')
+        second = self.runtime.memory.create_object(pid=pid, object_type=ObjectType.EVIDENCE, payload={'second': True}, name='second')
+        forged = ObjectHandle(oid=second.oid, rights=set(first.rights), capability_id=first.capability_id)
+
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(pid, forged)
 
     def test_mutable_object_can_be_renamed_with_unique_name(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='rename')

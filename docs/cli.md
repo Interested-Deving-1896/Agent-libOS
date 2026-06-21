@@ -197,6 +197,7 @@ image_id: review-agent:v0
 name: review-agent
 prompt: prompt.md
 prompt_mode: image_only
+jit_tool_exposure: direct
 default_tools:
   - read_memory_object
   - human_output
@@ -217,6 +218,12 @@ package content and are not copied into the materialized workspace.
 `prompt_mode` is optional and defaults to `image_only` for custom packages.
 Use `minimal_runtime` for factual runtime state sections, or `libos_default`
 only when the image intentionally wants the native Agent libOS planner prompt.
+
+`jit_tool_exposure` is optional and defaults to `direct`. Use `multiplexed`
+when the image wants one stable OpenAI tool schema named `run_jit_tool` for all
+JIT tools. Multiplexed packages must describe their JIT catalog in their own
+prompt or Skill instructions; the runtime does not inject the individual JIT
+names or schemas into prompt context.
 
 `default_tools` is exact. The runtime does not add `process_exit`,
 `create_memory_object`, or any other builtin automatically. List every

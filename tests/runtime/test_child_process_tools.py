@@ -5,7 +5,7 @@ import json
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, ProcessStatus, ResourceBudget
+from agent_libos.models import CapabilityRight, ObjectType, ProcessStatus, ResourceBudget
 from agent_libos.models.exceptions import NotFound, ProcessError, ProcessWaitRequired
 from scripts.llm_context_probe import last_tool_result, static_prefix
 
@@ -207,6 +207,55 @@ class TestChildProcessTool:
             assert parent_view is not None
             assert parent_view is not None
             assert result_oid in [handle.oid for handle in parent_view.roots]
+        finally:
+            runtime.close()
+
+    def test_fork_root_oids_do_not_upgrade_read_only_objects_to_materialize(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+            parent = runtime.process.spawn(image='base-agent:v0', goal='fork read-only root')
+            secret = runtime.memory.create_object(
+                pid=owner,
+                object_type=ObjectType.EVIDENCE,
+                payload={'secret': 'child must not materialize this'},
+                name='read.only.secret',
+            )
+            runtime.capability.grant(parent, f'object:{secret.oid}', [CapabilityRight.READ], issued_by='test')
+
+            forked = runtime.tools.call(
+                parent,
+                'fork_child_process',
+                {'goal': 'child', 'include_parent_roots': False, 'root_oids': [secret.oid]},
+            )
+
+            assert forked.ok, forked.error
+            child = runtime.process.get(forked.payload['child_pid'])
+            root = next(handle for handle in child.memory_view.roots if handle.oid == secret.oid)
+            assert root.rights == {'read'}
+            context = runtime.memory.materialize_context(child.pid, child.memory_view)
+            assert secret.oid in context.omitted_objects
+            assert 'child must not materialize this' not in context.text
+        finally:
+            runtime.close()
+
+    def test_process_exit_result_oid_requires_object_read_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+            process = runtime.process.spawn(image='base-agent:v0', goal='try unauthorized result oid')
+            secret = runtime.memory.create_object(
+                pid=owner,
+                object_type=ObjectType.EVIDENCE,
+                payload={'secret': 'not a result'},
+                name='private.result',
+            )
+
+            exited = runtime.tools.call(process, 'process_exit', {'result_oid': secret.oid})
+
+            assert not exited.ok
+            assert 'lacks read' in (exited.error or '')
+            assert runtime.process.get(process).status == ProcessStatus.RUNNABLE
         finally:
             runtime.close()
 

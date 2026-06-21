@@ -68,6 +68,30 @@ class TestObjectFileTool:
         assert written.ok
         assert (self.runtime.workspace_root / target).read_text(encoding='utf-8') == 'capability checked'
 
+    def test_file_object_token_estimate_limits_prompt_materialization(self) -> None:
+        sentinel = f'FILE_OBJECT_BUDGET_SENTINEL_{uuid4().hex}'
+        source = f'agent_outputs/object_budget_source_{uuid4().hex}.txt'
+        object_name = f'budget.object.{uuid4().hex}'
+        source_path = self.runtime.workspace_root / source
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text((sentinel + ' ') * 200, encoding='utf-8')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='import file with real token estimate')
+        self.runtime.filesystem.grant_path(pid, source, [CapabilityRight.READ], issued_by='test')
+
+        created = self.runtime.tools.call(pid, 'create_object_from_file', {'name': object_name, 'path': source})
+
+        assert created.ok, created.error
+        oid = created.payload['oid']
+        obj = self.runtime.store.get_object(oid)
+        assert obj is not None
+        assert obj.metadata.token_estimate is not None
+        assert obj.metadata.token_estimate > 1
+        handle = self.runtime.memory.handle_for_name(pid, object_name, rights=['read', 'materialize'])
+        view = self.runtime.memory.create_view(pid, [handle])
+        context = self.runtime.memory.materialize_context(pid, view, budget_tokens=1)
+        assert oid in context.omitted_objects
+        assert sentinel not in context.text
+
 class GuardedActionClient:
 
     def __init__(self, actions: list[dict[str, object]], forbidden_text: str):

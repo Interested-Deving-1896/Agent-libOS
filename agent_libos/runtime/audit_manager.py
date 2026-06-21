@@ -39,6 +39,12 @@ class AuditManager:
         self.store.insert_audit(record)
         return record
 
-    def trace(self, limit: int | None = None) -> list[AuditRecord]:
-        return self.store.list_audit(limit=limit)
-
+    def trace(
+        self,
+        limit: int | None = None,
+        *,
+        actor: str | None = None,
+        target: str | None = None,
+        match_any: bool = False,
+    ) -> list[AuditRecord]:
+        return self.store.list_audit(limit=limit, actor=actor, target=target, match_any=match_any)

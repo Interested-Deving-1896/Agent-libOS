@@ -112,6 +112,15 @@ class ShellAdapter:
         }
         limits = self._subprocess_limits(pid)
         require_external_effect_classifier(self.provider, "run")
+        intent_record = self._record_run_intent(
+            pid,
+            resource,
+            checked,
+            decision,
+            timeout=selected_timeout,
+            cwd=cwd,
+        )
+        correlation_id = intent_record.record_id
         try:
             proc = self._provider_run(checked, timeout=selected_timeout, cwd=cwd, limits=limits)
             proc = self._bounded_result(proc)
@@ -138,6 +147,8 @@ class ShellAdapter:
                     "cwd": os.fspath(cwd) if cwd is not None else None,
                     "metrics": self._metrics_json(exc.metrics),
                 },
+                correlation_id=correlation_id,
+                parent_record_id=intent_record.record_id,
             )
             if charge_error is not None:
                 raise charge_error from exc
@@ -148,6 +159,8 @@ class ShellAdapter:
                 action="primitive.shell.timeout",
                 target=resource,
                 decision={"argv": checked, "timeout_s": selected_timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
+                correlation_id=correlation_id,
+                parent_record_id=intent_record.record_id,
             )
             raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
         except SubprocessLimitExceeded as exc:
@@ -181,8 +194,25 @@ class ShellAdapter:
                     "metrics": self._metrics_json(metrics),
                     "reason": reason,
                 },
+                correlation_id=correlation_id,
+                parent_record_id=intent_record.record_id,
             )
             raise (charge_error or ResourceLimitExceeded(reason)) from exc
+        except Exception as exc:
+            self.audit.record(
+                actor=pid,
+                action="primitive.shell.failed",
+                target=resource,
+                decision={
+                    "argv": checked,
+                    "cwd": os.fspath(cwd) if cwd is not None else None,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                correlation_id=correlation_id,
+                parent_record_id=intent_record.record_id,
+            )
+            raise
         finally:
             if decision.consume_once:
                 if decision.consume_capability_id is not None:
@@ -191,7 +221,7 @@ class ShellAdapter:
                         used_by="shell",
                         reason="one-time shell permission consumed",
                     )
-        event = self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd)
+        event = self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd, correlation_id=correlation_id)
         audit_record = self.audit.record(
             actor=pid,
             action="primitive.shell.run",
@@ -211,6 +241,8 @@ class ShellAdapter:
                 "stdout_truncated": proc.stdout_truncated,
                 "stderr_truncated": proc.stderr_truncated,
             },
+            correlation_id=correlation_id,
+            parent_record_id=intent_record.record_id,
         )
         classification = classify_external_effect(
             self.provider,
@@ -470,6 +502,34 @@ class ShellAdapter:
             message=f"{pid} is waiting for per-use human approval to run {resource}",
         )
 
+    def _record_run_intent(
+        self,
+        pid: str,
+        resource: str,
+        argv: list[str],
+        decision: ShellPolicyDecision,
+        *,
+        timeout: float,
+        cwd: str | os.PathLike[str] | None,
+    ) -> Any:
+        return self.audit.record(
+            actor=pid,
+            action="primitive.shell.intent",
+            target=resource,
+            decision={
+                "argv": argv,
+                "timeout_s": timeout,
+                "policy_level": decision.policy_level,
+                "policy_reason": decision.reason,
+                "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
+                "high_risk": decision.high_risk,
+                "risk": decision.risk.value,
+                "rule_id": decision.rule_id,
+                "sandbox_profile": self._profile_json(decision.sandbox_profile),
+                "cwd": os.fspath(cwd) if cwd is not None else None,
+            },
+        )
+
     def _emit_run_event(
         self,
         pid: str,
@@ -479,6 +539,7 @@ class ShellAdapter:
         decision: ShellPolicyDecision,
         *,
         cwd: str | os.PathLike[str] | None,
+        correlation_id: str | None,
     ) -> Any:
         if self.events is None:
             return None
@@ -497,6 +558,8 @@ class ShellAdapter:
                 "rule_id": decision.rule_id,
                 "cwd": os.fspath(cwd) if cwd is not None else None,
             },
+            correlation_id=correlation_id,
+            causality={"audit_parent_record_id": correlation_id} if correlation_id else {},
         )
 
     def _configured_rules(self) -> list[AuthorityRule]:

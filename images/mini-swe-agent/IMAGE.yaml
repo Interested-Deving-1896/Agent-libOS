@@ -3,6 +3,7 @@ name: mini-swe-agent
 version: v0
 prompt: prompt.md
 prompt_mode: image_only
+jit_tool_exposure: direct
 context_policy: recency_first
 safety_profile: mini-swe-agent
 jit_tools: tools/jit-tools.json

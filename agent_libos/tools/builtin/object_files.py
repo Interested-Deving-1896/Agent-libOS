@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import ObjectMetadata, ObjectType
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.utils.ids import estimate_tokens
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -112,7 +113,7 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
                 title=args.name,
                 tags=["file_object", "workspace_file"],
                 mime_type="text/plain",
-                token_estimate=0,
+                token_estimate=estimate_tokens(payload),
             ),
             immutable=True,
             name=args.name,

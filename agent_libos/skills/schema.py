@@ -76,3 +76,4 @@ class LoadedSkill:
     tool_ids: dict[str, str]
     jit_tool_ids: dict[str, str]
     instructions_hash: str
+    package_snapshot: dict[str, Any] = field(default_factory=dict)

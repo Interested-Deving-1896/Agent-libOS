@@ -192,6 +192,7 @@ class MergePolicy:
 class MergeResult:
     merged_oids: list[OID]
     skipped_oids: list[OID]
+    merged_handles: list[ObjectHandle] = field(default_factory=list)
 
 
 @dataclass

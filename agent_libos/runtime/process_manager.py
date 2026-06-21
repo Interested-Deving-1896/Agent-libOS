@@ -450,13 +450,7 @@ class ProcessManager:
             return MergeResult(merged_oids=[], skipped_oids=[])
         result = self.memory.merge_view(pid, child_proc.memory_view, policy=policy)
         parent = self._get(pid)
-        for oid in result.merged_oids:
-            handle = self.capabilities.handle_for_object(
-                pid,
-                oid,
-                {"read", "materialize", "link", "diff"},
-                issued_by=f"process.merge_child_memory:{child}",
-            )
+        for handle in result.merged_handles:
             self._add_handle_to_process_view(parent, handle)
         self.audit.record(
             actor=pid,

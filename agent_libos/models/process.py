@@ -105,6 +105,15 @@ PROMPT_MODES = frozenset(
     }
 )
 
+JIT_TOOL_EXPOSURE_DIRECT = "direct"
+JIT_TOOL_EXPOSURE_MULTIPLEXED = "multiplexed"
+JIT_TOOL_EXPOSURES = frozenset(
+    {
+        JIT_TOOL_EXPOSURE_DIRECT,
+        JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    }
+)
+
 
 @dataclass(frozen=True)
 class AgentImage:
@@ -113,6 +122,7 @@ class AgentImage:
     version: str = "v0"
     system_prompt: str = ""
     prompt_mode: str = PROMPT_MODE_IMAGE_ONLY
+    jit_tool_exposure: str = JIT_TOOL_EXPOSURE_DIRECT
     planner: dict[str, Any] = field(default_factory=dict)
     action_schema: dict[str, Any] = field(default_factory=dict)
     default_skills: list[str] = field(default_factory=list)

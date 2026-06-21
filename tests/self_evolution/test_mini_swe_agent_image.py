@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight
+from agent_libos.models import CapabilityRight, JIT_TOOL_EXPOSURE_DIRECT
+from tests.support.fakes import FakeDenoSandbox
 
 
 PACKAGE_ROOT = Path("images/mini-swe-agent")
@@ -22,6 +23,7 @@ class TestMiniSWEAgentImage:
             assert validation["image_id"] == "mini-swe-agent:v0"
             assert image.image_id == "mini-swe-agent:v0"
             assert image.prompt_mode == "image_only"
+            assert image.jit_tool_exposure == JIT_TOOL_EXPOSURE_DIRECT
             assert image.default_tools == []
             assert image.metadata["package_jit_tools"] == ["bash"]
             assert image.boot["kind"] == "image_package"
@@ -30,6 +32,7 @@ class TestMiniSWEAgentImage:
 
     def test_spawn_exposes_only_package_bash_and_keeps_caller_workspace(self) -> None:
         runtime = Runtime.open("local")
+        runtime.tools.sandbox = FakeDenoSandbox()
         try:
             runtime.image_registry.register_from_package_path(PACKAGE_ROOT, actor="test")
             pid = runtime.process.spawn(image="mini-swe-agent:v0", goal="fix a bug")
@@ -44,6 +47,7 @@ class TestMiniSWEAgentImage:
 
     def test_declared_capabilities_are_advisory_not_bootstrap_grants(self) -> None:
         runtime = Runtime.open("local")
+        runtime.tools.sandbox = FakeDenoSandbox()
         try:
             runtime.image_registry.register_from_package_path(PACKAGE_ROOT, actor="test")
             pid = runtime.process.spawn(image="mini-swe-agent:v0", goal="fix a bug")

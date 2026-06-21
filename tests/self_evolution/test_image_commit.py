@@ -8,8 +8,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage
-from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage, ToolCandidateStatus
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from tests.support.fakes import FakeDenoSandbox
+from tests.support.skills import write_skill_package
 
 class TestImageCommit:
 
@@ -87,6 +89,145 @@ class TestImageCommit:
             assert process.resource_budget.max_llm_total_tokens == 30
             assert process.resource_usage.tool_calls == 0
             assert process.resource_usage.llm_total_tokens == 0
+
+    def test_committed_jit_tool_remains_process_local(self) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='toolmaker-agent:v0', goal='jit source')
+            tool_source = 'export function run(args, libos) { return { value: args.value }; }'
+            candidate_id = runtime.tools.propose(
+                source,
+                {
+                    'name': 'committed_echo_value',
+                    'description': 'Echo a value.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code=tool_source,
+            )
+            candidate = runtime.store.get_tool_candidate(candidate_id)
+            assert candidate is not None
+            candidate.status = ToolCandidateStatus.VALIDATED
+            candidate.validation = {'ok': True, 'language': 'typescript'}
+            runtime.store.update_tool_candidate(candidate)
+            runtime.tools.register(source, candidate_id)
+            checkpoint_id = runtime.checkpoint.create(source, 'jit ready', actor=source)
+            runtime.image_registry.grant_register(source, 'jit-commit:v0', issued_by='test')
+            runtime.image_registry.commit_from_checkpoint(
+                actor=source,
+                checkpoint_id=checkpoint_id,
+                image_id='jit-commit:v0',
+                name='jit-commit',
+            )
+
+            booted = runtime.process.spawn(image='jit-commit:v0', goal='boot jit')
+            other = runtime.process.spawn(image='toolmaker-agent:v0', goal='unrelated')
+
+            assert 'committed_echo_value' in runtime.process.get(booted).tool_table
+            assert 'committed_echo_value' not in runtime.process.get(other).tool_table
+            with pytest.raises(NotFound):
+                runtime.tools.resolve('committed_echo_value')
+            other_call = runtime.tools.call(other, 'committed_echo_value', {'value': 'x'})
+            assert not other_call.ok
+            assert 'not in process tool table' in (other_call.error or '')
+
+    def test_committed_jit_tool_source_survives_runtime_reopen(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            db_path = Path(temp_dir) / 'runtime.sqlite'
+            runtime = Runtime.open(db_path)
+            try:
+                source = runtime.process.spawn(image='toolmaker-agent:v0', goal='jit source')
+                tool_source = 'export function run(args, libos) { /* fake:count_chars */ return {}; }\n'
+                candidate_id = runtime.tools.propose(
+                    source,
+                    {
+                        'name': 'committed_persistent_count',
+                        'description': 'Count text characters.',
+                        'input_schema': {'type': 'object'},
+                        'output_schema': {'type': 'object'},
+                    },
+                    source_code=tool_source,
+                )
+                candidate = runtime.store.get_tool_candidate(candidate_id)
+                assert candidate is not None
+                candidate.status = ToolCandidateStatus.VALIDATED
+                candidate.validation = {'ok': True, 'language': 'typescript'}
+                runtime.store.update_tool_candidate(candidate)
+                runtime.tools.register(source, candidate_id)
+                checkpoint_id = runtime.checkpoint.create(source, 'jit ready', actor=source)
+                runtime.image_registry.grant_register(source, 'jit-commit-reopen:v0', issued_by='test')
+                runtime.image_registry.commit_from_checkpoint(
+                    actor=source,
+                    checkpoint_id=checkpoint_id,
+                    image_id='jit-commit-reopen:v0',
+                    name='jit-commit-reopen',
+                )
+                booted = runtime.process.spawn(image='jit-commit-reopen:v0', goal='boot jit')
+                tool_id = runtime.process.get(booted).tool_table['committed_persistent_count']
+            finally:
+                runtime.shutdown(actor='test', reason='test complete')
+
+            reopened = Runtime.open(db_path)
+            try:
+                reopened.tools.sandbox = FakeDenoSandbox()
+                assert reopened.tools.resolve('committed_persistent_count', pid=booted).tool_id == tool_id
+                result = reopened.tools.call(booted, 'committed_persistent_count', {'text': 'hello'})
+                assert result.ok, result.error
+                assert result.payload == {'count': 5}
+            finally:
+                reopened.shutdown(actor='test', reason='test complete')
+
+    def test_committed_image_does_not_package_external_registry_or_skill_trust(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            with _runtime() as runtime:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='external registries')
+                runtime.jsonrpc.register_endpoint(
+                    {
+                        'schema_version': 1,
+                        'endpoint_id': 'demo-endpoint',
+                        'url': 'https://example.com/rpc',
+                        'headers': {},
+                        'methods': [
+                            {
+                                'method_id': 'read_status',
+                                'rpc_method': 'status.read',
+                                'right': 'read',
+                                'rollback_class': 'no_rollback_required',
+                                'state_mutation': False,
+                                'information_flow': True,
+                            }
+                        ],
+                    },
+                    actor='cli',
+                    require_capability=False,
+                )
+                runtime.capability.grant(pid, 'jsonrpc_endpoint:demo-endpoint', [CapabilityRight.READ], issued_by='test')
+
+                skill_dir = write_skill_package(Path(temp_dir), 'trusted-image-skill', allowed_tools=['human_output'])
+                skill = runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                runtime.skills.trust_skill_source(
+                    actor='cli',
+                    source_type=skill['source_type'],
+                    source=skill['source'],
+                    package_sha256=skill['package_sha256'],
+                    require_capability=False,
+                )
+                runtime.capability.grant(pid, 'skill:trusted-image-skill', [CapabilityRight.EXECUTE], issued_by='test')
+                runtime.skills.activate_skill(pid, 'trusted-image-skill', actor=pid)
+
+                checkpoint_id = runtime.checkpoint.create(pid, 'before image commit', actor=pid)
+                runtime.image_registry.grant_register(pid, 'registry-free:v0', issued_by='test')
+                result = runtime.image_registry.commit_from_checkpoint(
+                    actor=pid,
+                    checkpoint_id=checkpoint_id,
+                    image_id='registry-free:v0',
+                    name='registry-free',
+                )
+
+                found = runtime.store.get_image_artifact(result.image.boot['artifact_id'])
+                assert found is not None
+                artifact, _metadata = found
+                assert 'jsonrpc_endpoints' not in artifact['rows']
+                assert 'skill_trust' not in artifact['rows']
 
     def test_duplicate_commit_requires_replace(self) -> None:
         with _runtime() as runtime:

@@ -31,6 +31,39 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_shell_run_records_intent_and_links_result_audit(self) -> None:
+        runtime, _provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='audit shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+
+            runtime.shell.run(pid, ['git', 'status', '--short'], timeout=2.0)
+
+            records = runtime.audit.trace()
+            intent = next(record for record in records if record.action == 'primitive.shell.intent')
+            result = next(record for record in records if record.action == 'primitive.shell.run')
+            event = next(event for event in runtime.events.list(target='shell:git') if event.payload.get('operation') == 'run')
+            assert result.parent_record_id == intent.record_id
+            assert result.correlation_id == intent.record_id
+            assert event.correlation_id == intent.record_id
+            assert intent.decision['sandbox_profile']['operation'] == 'shell.run'
+        finally:
+            runtime.close()
+
+    def test_denied_shell_command_does_not_record_execution_intent(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='denied shell audit')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(pid, ['rm', '-rf', 'agent_outputs'])
+
+            assert provider.calls == []
+            assert 'primitive.shell.intent' not in self._audit_actions(runtime)
+        finally:
+            runtime.close()
+
     def test_unlisted_command_requires_approval_and_consumes_once(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
