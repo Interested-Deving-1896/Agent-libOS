@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+import math
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, CheckpointID, EventID, OID, PID, StrEnum
 from agent_libos.models.memory import MemoryView, ObjectHandle
-
-_PROCESS_DEFAULTS = DEFAULT_CONFIG.process
 
 
 class ProcessStatus(StrEnum):
@@ -41,20 +40,30 @@ class ProcessSignal(StrEnum):
 
 @dataclass
 class ResourceBudget:
-    max_tool_calls: int | None = _PROCESS_DEFAULTS.max_tool_calls
-    max_child_processes: int | None = _PROCESS_DEFAULTS.max_child_processes
-    max_runtime_seconds: int | None = _PROCESS_DEFAULTS.max_runtime_seconds
-    max_context_materialization_tokens: int = _PROCESS_DEFAULTS.max_context_materialization_tokens
-    max_context_materialization_total_tokens: int | None = _PROCESS_DEFAULTS.max_context_materialization_total_tokens
-    max_llm_calls: int | None = _PROCESS_DEFAULTS.max_llm_calls
-    max_llm_total_tokens: int | None = _PROCESS_DEFAULTS.max_llm_total_tokens
-    max_subprocess_wall_seconds: float | None = _PROCESS_DEFAULTS.max_subprocess_wall_seconds
-    max_subprocess_cpu_seconds: float | None = _PROCESS_DEFAULTS.max_subprocess_cpu_seconds
-    max_subprocess_memory_bytes: int | None = _PROCESS_DEFAULTS.max_subprocess_memory_bytes
-    max_external_read_bytes: int | None = _PROCESS_DEFAULTS.max_external_read_bytes
-    max_external_write_bytes: int | None = _PROCESS_DEFAULTS.max_external_write_bytes
-    max_jsonrpc_bytes: int | None = _PROCESS_DEFAULTS.max_jsonrpc_bytes
-    max_deno_syscalls: int | None = _PROCESS_DEFAULTS.max_deno_syscalls
+    max_tool_calls: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_tool_calls)
+    max_child_processes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_child_processes)
+    max_runtime_seconds: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_runtime_seconds)
+    max_context_materialization_tokens: int = field(
+        default_factory=lambda: DEFAULT_CONFIG.process.max_context_materialization_tokens
+    )
+    max_context_materialization_total_tokens: int | None = field(
+        default_factory=lambda: DEFAULT_CONFIG.process.max_context_materialization_total_tokens
+    )
+    max_llm_calls: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_llm_calls)
+    max_llm_total_tokens: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_llm_total_tokens)
+    max_subprocess_wall_seconds: float | None = field(
+        default_factory=lambda: DEFAULT_CONFIG.process.max_subprocess_wall_seconds
+    )
+    max_subprocess_cpu_seconds: float | None = field(
+        default_factory=lambda: DEFAULT_CONFIG.process.max_subprocess_cpu_seconds
+    )
+    max_subprocess_memory_bytes: int | None = field(
+        default_factory=lambda: DEFAULT_CONFIG.process.max_subprocess_memory_bytes
+    )
+    max_external_read_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_external_read_bytes)
+    max_external_write_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_external_write_bytes)
+    max_jsonrpc_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_jsonrpc_bytes)
+    max_deno_syscalls: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_deno_syscalls)
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -105,6 +114,8 @@ def _validate_resource_number(name: str, value: Any, *, allow_none: bool) -> Non
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be numeric")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be finite")
     if value < 0:
         raise ValueError(f"{name} cannot be negative")
 

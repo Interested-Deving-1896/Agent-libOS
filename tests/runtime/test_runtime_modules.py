@@ -5,9 +5,13 @@ import contextlib
 import hashlib
 import io
 import json
+import sys
 import tempfile
+import types
+from dataclasses import replace
 from pathlib import Path
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
@@ -81,6 +85,46 @@ class TestRuntimeModule:
             finally:
                 runtime.close()
 
+    def test_import_string_entrypoint_executes_current_source_not_cached_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root, entrypoint='test_module:register_module', marker='old')
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            try:
+                pid = runtime.process.spawn(image='module-agent:v0', goal='old module')
+                assert runtime.tools.call(pid, 'module_echo', {'text': 'hello'}).payload['marker'] == 'old'
+            finally:
+                runtime.close()
+
+            manifest, source_sha = _write_module(root, entrypoint='test_module:register_module', marker='new')
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            try:
+                pid = runtime.process.spawn(image='module-agent:v0', goal='new module')
+                assert runtime.tools.call(pid, 'module_echo', {'text': 'hello'}).payload['marker'] == 'new'
+            finally:
+                runtime.close()
+
+    def test_import_string_entrypoint_restores_existing_sys_modules_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root, entrypoint='test_module:register_module')
+            previous = sys.modules.get('test_module')
+            sentinel = types.ModuleType('test_module')
+            sentinel.marker = 'original'
+            sys.modules['test_module'] = sentinel
+            try:
+                runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+                try:
+                    assert 'test-module:v0' in [module['module_id'] for module in runtime.modules.list_modules()]
+                    assert sys.modules['test_module'] is sentinel
+                finally:
+                    runtime.close()
+            finally:
+                if previous is None:
+                    sys.modules.pop('test_module', None)
+                else:
+                    sys.modules['test_module'] = previous
+
     def test_source_hash_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -89,6 +133,17 @@ class TestRuntimeModule:
             manifest.write_text(text, encoding='utf-8')
             with pytest.raises(ValidationError):
                 Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+
+    def test_module_source_size_limit_fails_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            config = replace(
+                DEFAULT_CONFIG,
+                modules=replace(DEFAULT_CONFIG.modules, source_max_bytes=32),
+            )
+            with pytest.raises(ValidationError, match='source_max_bytes'):
+                Runtime.open(config=config, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
 
     def test_failed_module_does_not_leave_partial_tool_registration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -105,6 +160,26 @@ class TestRuntimeModule:
             finally:
                 runtime.close()
 
+    def test_apply_failure_rolls_back_registered_tool_and_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            runtime = Runtime.open()
+            original_register = runtime.image_registry.register
+            try:
+                def fail_register(*args, **kwargs):
+                    raise RuntimeError('image register exploded')
+
+                runtime.image_registry.register = fail_register
+                with pytest.raises(RuntimeError, match='image register exploded'):
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
+                assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
+                assert 'module-agent:v0' not in runtime.images
+                assert runtime.modules.inspect_module('test-module:v0')['status'] == 'failed'
+            finally:
+                runtime.image_registry.register = original_register
+                runtime.close()
+
     def test_invalid_module_image_does_not_leave_partial_tool_registration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -115,6 +190,39 @@ class TestRuntimeModule:
                     runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
                 with pytest.raises(NotFound):
                     runtime.tools.resolve('module_echo')
+            finally:
+                runtime.close()
+
+    def test_startup_hook_failure_rolls_back_external_module_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            manifest, source_sha = _write_module(root, failing_startup_hook=True)
+            with pytest.raises(RuntimeError, match='startup hook failed'):
+                Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+
+            runtime = Runtime.open(db)
+            try:
+                failed = runtime.modules.inspect_module('test-module:v0')
+                assert failed['status'] == 'failed'
+                assert 'startup hook failed' in failed['error']
+                assert 'module-agent:v0' not in runtime.images
+                assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
+                assert runtime.syscalls.get('module.ping') is None
+            finally:
+                runtime.close()
+
+    def test_duplicate_module_id_does_not_overwrite_loaded_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            try:
+                with pytest.raises(ValidationError, match='already loaded'):
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
+                loaded = runtime.modules.inspect_module('test-module:v0')
+                assert loaded['status'] == 'loaded'
+                assert loaded['source_sha256'] == source_sha
             finally:
                 runtime.close()
 
@@ -149,14 +257,15 @@ class TestRuntimeModule:
             spawned = _run_cli_json(['--db', str(db), '--module-manifest', str(manifest), '--trusted-module', trust, 'spawn', '--image', 'module-agent:v0', '--goal', 'cli module'])
             assert spawned['image'] == 'module-agent:v0'
 
-def _write_module(root: Path, *, expose_read_tool: bool=False, invalid_registration: bool=False, invalid_image: bool=False, provider_hook: bool=False, entrypoint: str='./test_module.py:register_module') -> tuple[Path, str]:
+def _write_module(root: Path, *, expose_read_tool: bool=False, invalid_registration: bool=False, invalid_image: bool=False, provider_hook: bool=False, failing_startup_hook: bool=False, entrypoint: str='./test_module.py:register_module', marker: str='module') -> tuple[Path, str]:
     source = root / 'test_module.py'
     default_tools = ['module_echo', 'read_text_file'] if expose_read_tool else ['module_echo']
     if invalid_image:
         default_tools.append('missing_module_tool')
     provider_hook_code = '\ndef mark_provider(runtime):\n    runtime.audit.record(actor="module:test-module:v0", action="test.provider_hook", target="runtime")\n'.rstrip() if provider_hook else ''
     provider_hook_registration = "ctx.register_provider_hook('test_hook', mark_provider)" if provider_hook else ''
-    source.write_text(f"""\nfrom pydantic import BaseModel\n\nfrom agent_libos.models import AgentImage\nfrom agent_libos.tools.base import SyncAgentTool, ToolContext\n\n\nclass EchoArgs(BaseModel):\n    text: str\n\n\nclass ModuleEchoTool(SyncAgentTool[EchoArgs]):\n    name = "module_echo"\n    description = "Echo text through a startup module."\n    args_schema = EchoArgs\n\n    def run(self, args: EchoArgs, ctx: ToolContext):\n        return {{"echo": args.text, "pid": ctx.pid}}\n\n\ndef module_ping(session, args):\n    return {{"pid": session.pid, "value": args.get("value")}}\n\n\ndef mark_startup(runtime):\n    runtime.audit.record(actor="module:test-module:v0", action="test.startup_hook", target="runtime")\n\n\n{provider_hook_code}\n\n\ndef register_module(ctx):\n    ctx.register_tool(ModuleEchoTool())\n    {("ctx.register_syscall('undeclared.syscall', module_ping)" if invalid_registration else "ctx.register_syscall('module.ping', module_ping)")}\n    ctx.register_image(AgentImage(\n        image_id="module-agent:v0",\n        name="module-agent",\n        default_tools={default_tools!r},\n    ))\n    {provider_hook_registration}\n    ctx.add_startup_hook(mark_startup)\n""".lstrip(), encoding='utf-8')
+    startup_hook_body = "raise RuntimeError('startup hook failed')" if failing_startup_hook else 'runtime.audit.record(actor="module:test-module:v0", action="test.startup_hook", target="runtime")'
+    source.write_text(f"""\nfrom pydantic import BaseModel\n\nfrom agent_libos.models import AgentImage\nfrom agent_libos.tools.base import SyncAgentTool, ToolContext\n\n\nclass EchoArgs(BaseModel):\n    text: str\n\n\nclass ModuleEchoTool(SyncAgentTool[EchoArgs]):\n    name = "module_echo"\n    description = "Echo text through a startup module."\n    args_schema = EchoArgs\n\n    def run(self, args: EchoArgs, ctx: ToolContext):\n        return {{"echo": args.text, "pid": ctx.pid, "marker": {marker!r}}}\n\n\ndef module_ping(session, args):\n    return {{"pid": session.pid, "value": args.get("value")}}\n\n\ndef mark_startup(runtime):\n    {startup_hook_body}\n\n\n{provider_hook_code}\n\n\ndef register_module(ctx):\n    ctx.register_tool(ModuleEchoTool())\n    {("ctx.register_syscall('undeclared.syscall', module_ping)" if invalid_registration else "ctx.register_syscall('module.ping', module_ping)")}\n    ctx.register_image(AgentImage(\n        image_id="module-agent:v0",\n        name="module-agent",\n        default_tools={default_tools!r},\n    ))\n    {provider_hook_registration}\n    ctx.add_startup_hook(mark_startup)\n""".lstrip(), encoding='utf-8')
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     syscalls = '[]\n' if invalid_registration else "['module.ping']\n"
     manifest = root / 'module.yaml'

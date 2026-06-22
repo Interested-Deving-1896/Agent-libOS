@@ -50,6 +50,39 @@ class TestObjectMemoryName:
 
         assert self.runtime.store.object_payload(handle.oid) == {'value': 'original'}
 
+    def test_object_payload_is_copied_across_store_boundaries(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='payload alias boundary')
+        payload = {'entries': [{'value': 1}]}
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.ARTIFACT,
+            payload=payload,
+            name='alias.boundary',
+        )
+
+        payload['entries'][0]['value'] = 2
+        assert self.runtime.memory.get_object(pid, handle).payload == {'entries': [{'value': 1}]}
+
+        obj = self.runtime.memory.get_object(pid, handle)
+        obj.payload['entries'][0]['value'] = 3
+        assert self.runtime.memory.get_object(pid, handle).payload == {'entries': [{'value': 1}]}
+
+        raw_payload = self.runtime.store.object_payload(handle.oid)
+        raw_payload['entries'][0]['value'] = 4
+        assert self.runtime.memory.get_object(pid, handle).payload == {'entries': [{'value': 1}]}
+
+        mutable = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.ARTIFACT,
+            payload={'entries': []},
+            name='alias.update',
+            immutable=False,
+        )
+        update_payload = {'entries': [{'value': 5}]}
+        self.runtime.memory.update_object(pid, mutable, ObjectPatch(payload=update_payload))
+        update_payload['entries'][0]['value'] = 6
+        assert self.runtime.memory.get_object(pid, mutable).payload == {'entries': [{'value': 5}]}
+
     def test_object_memory_payload_limits_reject_create_update_and_append_without_partial_write(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory limits')
         oversized_payload = {'blob': 'x' * self.runtime.config.tools.memory_payload_hard_limit_bytes}

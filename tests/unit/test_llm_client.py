@@ -3,6 +3,7 @@ import pytest
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from agent_libos.config import AgentLibOSConfig, LLMDefaults
 from agent_libos.llm.client import LLMClient, LLMError
 
 class TestLLMClient:
@@ -92,6 +93,43 @@ class TestLLMClient:
 
         assert client.model == 'host-model'
         assert client.base_url is None
+
+    def test_from_env_and_requests_use_configured_llm_defaults(self, monkeypatch) -> None:
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                temperature=0.7,
+                max_tokens=123,
+                timeout_s=9.0,
+                max_retries=4,
+                api_mode='chat',
+                store=True,
+                json_instruction='Return valid JSON.',
+            )
+        )
+        monkeypatch.setenv('OPENAI_API_KEY', 'host-key')
+        monkeypatch.setenv('OPENAI_MODEL', 'host-model')
+        monkeypatch.delenv('OPENAI_API_MODE', raising=False)
+        chat_completion = SimpleNamespace(
+            id='chatcmpl_config',
+            model='host-model',
+            choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content='{"ok":true}', tool_calls=[]))],
+        )
+        fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(chat_completion)))
+
+        client = LLMClient.from_env(config=config)
+        client._async_client = fake
+        content = asyncio.run(client.acomplete([{'role': 'user', 'content': 'answer'}], json_mode=True))
+
+        payload = fake.chat.completions.payloads[0]
+        assert client.timeout == 9.0
+        assert client.max_retries == 4
+        assert client.api_mode == 'chat'
+        assert client.store is True
+        assert content == '{"ok":true}'
+        assert payload['temperature'] == 0.7
+        assert payload['max_completion_tokens'] == 123
+        assert payload['store'] is True
+        assert payload['messages'][0]['content'] == 'Return valid JSON.'
 
     def test_from_env_explicit_custom_base_url_requires_allowance(self, tmp_path, monkeypatch) -> None:
         env_file = tmp_path / 'llm.env'

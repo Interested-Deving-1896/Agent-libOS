@@ -246,10 +246,12 @@ class LibOSSyscallSession:
             decision={"restored_status": ProcessStatus.RUNNABLE.value},
         )
 
-    async def _resolve_human_request(self, request_id: str) -> None:
+    async def _resolve_human_request(self, request_id: str, *, allow_rejected: bool = False) -> None:
         while True:
             request = self.runtime.human.get(request_id)
             if request.status == HumanRequestStatus.APPROVED:
+                return
+            if allow_rejected and request.status == HumanRequestStatus.REJECTED:
                 return
             if request.status != HumanRequestStatus.PENDING:
                 raise CapabilityDenied(f"human request was not approved: {request_id} status={request.status.value}")
@@ -673,7 +675,7 @@ class LibOSSyscallSession:
         return {"request_id": request_id, "answer": answer, "status": "answered"}
 
     async def _permission_request_result(self, request_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        await self._resolve_human_request(request_id)
+        await self._resolve_human_request(request_id, allow_rejected=True)
         request = self.runtime.human.get(request_id)
         return {
             "request_id": request_id,

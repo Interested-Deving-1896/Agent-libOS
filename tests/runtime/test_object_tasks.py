@@ -282,6 +282,37 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_request_permission_resumes_after_human_decision(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="permission task")
+            owner = _owner(runtime, pid)
+            runtime.capability.grant(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test", delegable=True)
+            resource = "filesystem:workspace:agent_outputs/object_task_permission.txt"
+
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "request_permission",
+                {"resource": resource, "rights": [CapabilityRight.WRITE.value], "reason": "write artifact"},
+                inherit_capabilities=[
+                    {"resource": "human:owner", "rights": [CapabilityRight.WRITE.value]},
+                ],
+            )
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert waiting.status == ObjectTaskStatus.WAITING_HUMAN
+            assert waiting.wait["request_id"] == runtime.human.pending()[0].request_id
+
+            runtime.human.drain_terminal_queue(auto_policy=runtime.capability.ALWAYS_ALLOW)
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            payload = runtime.store.get_object(str(completed.result_oid)).payload
+            assert payload["result"]["status"] == "approved"
+            assert any(record.action == "object_task.human_resume" for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
     def test_object_task_owner_watch_update_resumes_waiting_runner(self) -> None:
         runtime = Runtime.open("local")
         try:

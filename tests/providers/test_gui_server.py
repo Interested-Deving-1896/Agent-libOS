@@ -2,11 +2,17 @@ from __future__ import annotations
 import pytest
 import http.client
 import json
+import tempfile
 import threading
 import urllib.request
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
-from agent_libos.models import ObjectMetadata, ObjectType
+from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
+from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType
+from agent_libos.runtime.runtime import Runtime
+from tests.support.skills import write_skill_package
 
 class TestGuiServer:
 
@@ -87,6 +93,12 @@ class TestGuiServer:
         assert 'images' in snapshot
         assert any((image['image_id'] == 'base-agent:v0' for image in snapshot['images']))
 
+    def test_encoded_route_segments_are_decoded(self) -> None:
+        status, inspected = self.request('GET', '/api/images/base-agent%3Av0')
+
+        assert status == 200
+        assert inspected['image']['image_id'] == 'base-agent:v0'
+
     def test_cors_is_limited_to_local_gui_origins(self) -> None:
         status, headers, _body = self.request_raw(
             'OPTIONS',
@@ -100,6 +112,14 @@ class TestGuiServer:
             'OPTIONS',
             '/api/health',
             extra_headers={'Origin': 'https://example.test'},
+        )
+        assert status == 204
+        assert 'access-control-allow-origin' not in headers
+
+        status, headers, _body = self.request_raw(
+            'OPTIONS',
+            '/api/health',
+            extra_headers={'Origin': 'null'},
         )
         assert status == 204
         assert 'access-control-allow-origin' not in headers
@@ -368,6 +388,82 @@ class TestGuiServer:
         assert status == 400
         assert 'owner watch kind' in body['error']['message']
 
+    def test_object_task_wait_uses_bounded_timeout(self) -> None:
+        seen: list[float | None] = []
+
+        def fake_wait(task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> dict[str, object]:
+            seen.append(timeout)
+            return {'task_id': task_id, 'actor_pid': actor_pid, 'timeout': timeout, 'status': 'running'}
+
+        self.server.service.runtime.object_tasks.wait = fake_wait  # type: ignore[method-assign]
+
+        status, body = self.request('POST', '/api/object-tasks/task-1/wait', {'pid': 'pid-1'})
+        assert status == 200
+        assert body['timeout'] == DEFAULT_CONFIG.gui.object_task_wait_default_timeout_s
+        assert seen == [DEFAULT_CONFIG.gui.object_task_wait_default_timeout_s]
+
+        status, body = self.request('POST', '/api/object-tasks/task-1/wait', {'timeout_s': 'nan'})
+        assert status == 400
+        assert 'finite' in body['error']['message']
+
+        status, body = self.request(
+            'POST',
+            '/api/object-tasks/task-1/wait',
+            {'timeout_s': DEFAULT_CONFIG.gui.object_task_wait_max_timeout_s + 1},
+        )
+        assert status == 400
+        assert 'at most' in body['error']['message']
+
+    def test_injected_runtime_config_controls_spawn_and_wait_defaults(self) -> None:
+        config = AgentLibOSConfig(
+            runtime=RuntimeDefaults(default_image_id='gui-base:v0', coding_image_id='gui-coding:v0'),
+            gui=replace(DEFAULT_CONFIG.gui, object_task_wait_default_timeout_s=0.25, object_task_wait_max_timeout_s=0.5),
+        )
+        runtime = Runtime.open(config=config)
+        server = create_gui_http_server(runtime=runtime, port=0, token='custom-token', auto_run=False)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        seen: list[float | None] = []
+
+        def fake_wait(task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> dict[str, object]:
+            seen.append(timeout)
+            return {'task_id': task_id, 'actor_pid': actor_pid, 'timeout': timeout, 'status': 'running'}
+
+        server.service.runtime.object_tasks.wait = fake_wait  # type: ignore[method-assign]
+        thread.start()
+        try:
+            status, spawned = _request_to_server(server, 'POST', '/api/processes', {'goal': 'custom', 'auto_run': False}, token='custom-token')
+            assert status == 200
+            assert spawned['process']['image_id'] == 'gui-base:v0'
+
+            status, body = _request_to_server(server, 'POST', '/api/object-tasks/task-1/wait', {'pid': spawned['pid']}, token='custom-token')
+            assert status == 200
+            assert body['timeout'] == 0.25
+            assert seen == [0.25]
+
+            status, body = _request_to_server(server, 'POST', '/api/object-tasks/task-1/wait', {'timeout_s': 0.75}, token='custom-token')
+            assert status == 400
+            assert '0.5 seconds' in body['error']['message']
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.service.shutdown()
+            server.server_close()
+
+    def test_injected_runtime_config_controls_request_body_limit(self) -> None:
+        runtime = Runtime.open(config=AgentLibOSConfig(gui=GuiDefaults(request_body_max_bytes=8)))
+        server = create_gui_http_server(runtime=runtime, port=0, token='custom-token', auto_run=False)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, body = _request_to_server(server, 'POST', '/api/scheduler/auto', {'enabled': True}, token='custom-token')
+            assert status == 413
+            assert '8 bytes' in body['error']['message']
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.service.shutdown()
+            server.server_close()
+
     def test_jsonrpc_register_rejects_host_file_path(self) -> None:
         status, body = self.request('POST', '/api/jsonrpc/register', {'path': 'secrets.yaml', 'confirmed': True})
         assert status == 400
@@ -377,6 +473,86 @@ class TestGuiServer:
         status, body = self.request('POST', '/api/jsonrpc/register', {'confirmed': True})
         assert status == 400
         assert 'manifest_text' in body['error']['message']
+
+    def test_jsonrpc_register_actor_mode_requires_endpoint_write_capability(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'jsonrpc actor', 'auto_run': False})
+        pid = spawned['pid']
+        manifest = _gui_jsonrpc_manifest('gui-actor-jsonrpc')
+
+        status, denied = self.request(
+            'POST',
+            '/api/jsonrpc/register',
+            {'manifest_text': manifest, 'actor': pid, 'confirmed': True},
+        )
+
+        assert status == 403
+        assert 'jsonrpc_endpoint:gui-actor-jsonrpc' in denied['error']['message']
+
+        self.server.service.runtime.capability.grant(
+            pid,
+            'jsonrpc_endpoint:gui-actor-jsonrpc',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        status, registered = self.request(
+            'POST',
+            '/api/jsonrpc/register',
+            {'manifest_text': manifest, 'actor': pid, 'confirmed': True},
+        )
+
+        assert status == 200
+        assert registered['endpoint_id'] == 'gui-actor-jsonrpc'
+
+    def test_skill_register_actor_mode_requires_skill_write_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(Path(temp_dir), 'gui-actor-skill', allowed_tools=['echo'])
+            _status, spawned = self.request('POST', '/api/processes', {'goal': 'skill actor', 'auto_run': False})
+            pid = spawned['pid']
+
+            status, denied = self.request(
+                'POST',
+                '/api/skills/register',
+                {'path': str(skill_dir), 'actor': pid, 'confirmed': True},
+            )
+
+            assert status == 409
+            assert denied['error']['type'] == 'HumanApprovalRequired'
+            assert denied['error']['request_id']
+
+            self.server.service.runtime.capability.grant(
+                pid,
+                'skill:gui-actor-skill',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            status, registered = self.request(
+                'POST',
+                '/api/skills/register',
+                {'path': str(skill_dir), 'actor': pid, 'confirmed': True},
+            )
+
+            assert status == 200
+            assert registered['skill_id'] == 'gui-actor-skill'
+
+    def test_human_request_respond_rejects_non_pending_request(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='gui human conflict')
+        request_id = runtime.human.ask(pid, 'Approve once?', blocking=True)
+        status, approved = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'yes', 'auto_run': False},
+        )
+        status_again, conflict = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'again', 'auto_run': False},
+        )
+
+        assert status == 200
+        assert approved['request']['status'] == 'approved'
+        assert status_again == 409
+        assert 'not pending' in conflict['error']['message']
 
     def test_invalid_max_quanta_is_rejected(self) -> None:
         status, body = self.request('POST', '/api/processes', {'goal': 'goal', 'max_quanta': 0})
@@ -400,6 +576,29 @@ class TestGuiServer:
         self.server.service.shutdown()
 
 
+def _request_to_server(
+    server: Any,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    token: str,
+) -> tuple[int, Any]:
+    host, port = server.server_address
+    conn = http.client.HTTPConnection(host, port, timeout=10)
+    headers = {'Authorization': f'Bearer {token}'}
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    conn.request(method, path, body=payload, headers=headers)
+    response = conn.getresponse()
+    data = response.read()
+    conn.close()
+    decoded = json.loads(data.decode('utf-8')) if data else None
+    return response.status, decoded
+
+
 def _gui_image_package_files() -> dict[str, str]:
     return {
         "IMAGE.yaml": """
@@ -412,3 +611,18 @@ default_tools:
 """.lstrip(),
         "prompt.md": "Registered from GUI package files.\n",
     }
+
+
+def _gui_jsonrpc_manifest(endpoint_id: str) -> str:
+    return f"""
+schema_version: 1
+endpoint_id: {endpoint_id}
+url: https://api.example.test/jsonrpc
+methods:
+  - method_id: echo
+    rpc_method: echo
+    right: read
+    rollback_class: no_rollback_required
+    state_mutation: false
+    information_flow: true
+""".lstrip()

@@ -6,7 +6,7 @@ from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import EventType
-from agent_libos.models.exceptions import NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.context import ModuleContext, StartupHook
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource
@@ -25,6 +25,9 @@ class RuntimeModuleRegistry:
         self._provider_hooks: list[tuple[str, str, StartupHook]] = []
         self._startup_hooks: list[tuple[str, str, StartupHook]] = []
         self._loaded_modules: dict[str, dict[str, Any]] = {}
+        self._applied_contexts: dict[str, ModuleContext] = {}
+        self._applied_sources: dict[str, ModuleSource] = {}
+        self._startup_hooks_ran = False
 
     def load_core_module(self) -> dict[str, Any]:
         from agent_libos.modules.core import register_module
@@ -87,7 +90,14 @@ class RuntimeModuleRegistry:
             trusted_sha256=tuple(trusted_sha256 or ()),
         )
         try:
-            source, entrypoint = loader.load(manifest_path)
+            source = loader.resolve(manifest_path)
+            if not loader.is_trusted(source.manifest.module_id, source.source_sha256):
+                raise CapabilityDenied(
+                    "startup module is not trusted: "
+                    f"{source.manifest.module_id}:{source.source_sha256}"
+                )
+            self._require_module_id_available(source.manifest.module_id, source.source_sha256)
+            entrypoint = loader.import_entrypoint(source)
             return self._load_from_entrypoint(source, entrypoint, enforce_provides=True)
         except Exception as exc:
             self._record_failed_manifest(manifest_path, exc)
@@ -129,79 +139,111 @@ class RuntimeModuleRegistry:
         return [dict(item) for item in sorted(self._loaded_modules.values(), key=lambda value: value["module_id"])]
 
     def run_startup_hooks(self) -> None:
+        if self._startup_hooks_ran:
+            return
         for module_id, hook_name, hook in list(self._provider_hooks):
-            result = hook(self.runtime)
-            if inspect.isawaitable(result):
-                raise ValidationError(f"provider hook must be synchronous before runtime start: {module_id}:{hook_name}")
-            self.runtime.audit.record(
-                actor=f"module:{module_id}",
-                action="module.provider_hook",
-                target=f"module:{module_id}:{hook_name}",
-                decision={"hook": hook_name},
-            )
+            try:
+                result = hook(self.runtime)
+                if inspect.isawaitable(result):
+                    raise ValidationError(f"provider hook must be synchronous before runtime start: {module_id}:{hook_name}")
+                self.runtime.audit.record(
+                    actor=f"module:{module_id}",
+                    action="module.provider_hook",
+                    target=f"module:{module_id}:{hook_name}",
+                    decision={"hook": hook_name},
+                )
+            except Exception as exc:
+                self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
+                raise
         for module_id, hook_name, hook in list(self._startup_hooks):
-            result = hook(self.runtime)
-            if inspect.isawaitable(result):
-                raise ValidationError(f"startup hook must be synchronous before runtime start: {module_id}:{hook_name}")
-            self.runtime.audit.record(
-                actor=f"module:{module_id}",
-                action="module.startup_hook",
-                target=f"module:{module_id}:{hook_name}",
-                decision={"hook": hook_name},
-            )
+            try:
+                result = hook(self.runtime)
+                if inspect.isawaitable(result):
+                    raise ValidationError(f"startup hook must be synchronous before runtime start: {module_id}:{hook_name}")
+                self.runtime.audit.record(
+                    actor=f"module:{module_id}",
+                    action="module.startup_hook",
+                    target=f"module:{module_id}:{hook_name}",
+                    decision={"hook": hook_name},
+                )
+            except Exception as exc:
+                self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
+                raise
+        self._startup_hooks_ran = True
 
     def _load_from_entrypoint(self, source: ModuleSource, entrypoint: Any, *, enforce_provides: bool) -> dict[str, Any]:
         ctx = ModuleContext(self.runtime, source.manifest, enforce_provides=enforce_provides)
-        result = entrypoint(ctx)
-        if inspect.isawaitable(result):
-            raise ValidationError(f"module entrypoint must be synchronous: {source.manifest.module_id}")
-        self._preflight_context(ctx)
-        self._apply_context(ctx)
-        now = utc_now()
-        summary = ctx.registered_summary()
-        self.runtime.store.upsert_runtime_module(
-            module_id=source.manifest.module_id,
-            name=source.manifest.name,
-            version=source.manifest.version,
-            entrypoint=source.manifest.entrypoint,
-            manifest_path=source.manifest_path,
-            manifest_sha256=source.manifest_sha256,
-            source_path=source.source_path,
-            source_sha256=source.source_sha256,
-            status="loaded",
-            loaded_at=now,
-            registered=summary,
-            error=None,
-            metadata=source.manifest.metadata,
-        )
-        self._loaded_modules[source.manifest.module_id] = {
-            "module_id": source.manifest.module_id,
-            "name": source.manifest.name,
-            "version": source.manifest.version,
-            "manifest_sha256": source.manifest_sha256,
-            "source_sha256": source.source_sha256,
-            "entrypoint": source.manifest.entrypoint,
-            "registered": summary,
-        }
-        self.runtime.events.emit(
-            EventType.MODULE_LOADED,
-            source="runtime",
-            target=f"module:{source.manifest.module_id}",
-            payload={"module_id": source.manifest.module_id, "registered": summary},
-        )
-        self.runtime.audit.record(
-            actor="runtime",
-            action="module.load",
-            target=f"module:{source.manifest.module_id}",
-            decision={
+        try:
+            result = entrypoint(ctx)
+            if inspect.isawaitable(result):
+                raise ValidationError(f"module entrypoint must be synchronous: {source.manifest.module_id}")
+            self._preflight_context(ctx)
+            self._apply_context(ctx)
+            now = utc_now()
+            summary = ctx.registered_summary()
+            self.runtime.store.upsert_runtime_module(
+                module_id=source.manifest.module_id,
+                name=source.manifest.name,
+                version=source.manifest.version,
+                entrypoint=source.manifest.entrypoint,
+                manifest_path=source.manifest_path,
+                manifest_sha256=source.manifest_sha256,
+                source_path=source.source_path,
+                source_sha256=source.source_sha256,
+                status="loaded",
+                loaded_at=now,
+                registered=summary,
+                error=None,
+                metadata=source.manifest.metadata,
+            )
+            self._loaded_modules[source.manifest.module_id] = {
                 "module_id": source.manifest.module_id,
+                "name": source.manifest.name,
                 "version": source.manifest.version,
                 "manifest_sha256": source.manifest_sha256,
                 "source_sha256": source.source_sha256,
+                "entrypoint": source.manifest.entrypoint,
                 "registered": summary,
-            },
+            }
+            self._applied_contexts[source.manifest.module_id] = ctx
+            self._applied_sources[source.manifest.module_id] = source
+            self.runtime.events.emit(
+                EventType.MODULE_LOADED,
+                source="runtime",
+                target=f"module:{source.manifest.module_id}",
+                payload={"module_id": source.manifest.module_id, "registered": summary},
+            )
+            self.runtime.audit.record(
+                actor="runtime",
+                action="module.load",
+                target=f"module:{source.manifest.module_id}",
+                decision={
+                    "module_id": source.manifest.module_id,
+                    "version": source.manifest.version,
+                    "manifest_sha256": source.manifest_sha256,
+                    "source_sha256": source.source_sha256,
+                    "registered": summary,
+                },
+            )
+            return self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
+        except Exception:
+            self._rollback_context(ctx)
+            self._loaded_modules.pop(source.manifest.module_id, None)
+            self._applied_contexts.pop(source.manifest.module_id, None)
+            self._applied_sources.pop(source.manifest.module_id, None)
+            raise
+
+    def _require_module_id_available(self, module_id: str, source_sha256: str) -> None:
+        loaded = self._loaded_modules.get(module_id)
+        if loaded is None:
+            return
+        loaded_sha = loaded.get("source_sha256")
+        if loaded_sha == source_sha256:
+            raise ValidationError(f"startup module already loaded: {module_id}:{source_sha256}")
+        raise ValidationError(
+            "startup module id already loaded with a different source hash: "
+            f"{module_id}: loaded={loaded_sha}, requested={source_sha256}"
         )
-        return self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
 
     def _preflight_context(self, ctx: ModuleContext) -> None:
         pending_tools = {tool.spec().name for tool in ctx.tools}
@@ -272,6 +314,65 @@ class RuntimeModuleRegistry:
         for name, hook in ctx.startup_hooks.items():
             self._startup_hooks.append((ctx.module_id, name, hook))
 
+    def _rollback_external_modules_after_hook_failure(self, failed_module_id: str, exc: Exception, *, hook_name: str) -> None:
+        module_ids = [
+            module_id
+            for module_id in reversed(list(self._applied_contexts))
+            if not self._is_internal_module(module_id)
+        ]
+        for module_id in module_ids:
+            source = self._applied_sources.get(module_id)
+            ctx = self._applied_contexts.get(module_id)
+            registered = ctx.registered_summary() if ctx is not None else {}
+            self._rollback_module(module_id)
+            if source is None:
+                continue
+            if module_id == failed_module_id:
+                failure = exc
+            else:
+                failure = ValidationError(
+                    f"startup module rolled back because {failed_module_id}:{hook_name} failed"
+                )
+            self._record_failed_source(source, failure, registered=registered)
+
+    def _rollback_module(self, module_id: str) -> None:
+        ctx = self._applied_contexts.get(module_id)
+        if ctx is not None:
+            self._rollback_context(ctx)
+        self._loaded_modules.pop(module_id, None)
+        self._applied_contexts.pop(module_id, None)
+        self._applied_sources.pop(module_id, None)
+
+    def _rollback_context(self, ctx: ModuleContext) -> None:
+        self._provider_hooks = [item for item in self._provider_hooks if item[0] != ctx.module_id]
+        self._startup_hooks = [item for item in self._startup_hooks if item[0] != ctx.module_id]
+        for kind, hooks in list(ctx.provider_hooks.items()):
+            hook_ids = {id(hook) for hook in hooks}
+            remaining = [hook for hook in self.runtime.provider_hooks.get(kind, []) if id(hook) not in hook_ids]
+            if remaining:
+                self.runtime.provider_hooks[kind] = remaining
+            else:
+                self.runtime.provider_hooks.pop(kind, None)
+        for name in reversed(list(ctx.syscalls)):
+            self.runtime.syscalls.unregister(name, registered_by=ctx.actor)
+        for image in reversed(ctx.images):
+            stored = self.runtime.store.get_image(image.image_id)
+            registered_by = stored[1].get("registered_by") if stored is not None else None
+            if registered_by == ctx.actor or (stored is None and self.runtime.images.get(image.image_id) == image):
+                self.runtime.images.pop(image.image_id, None)
+                self.runtime.store.delete_image(image.image_id, registered_by=ctx.actor)
+        for tool in reversed(ctx.tools):
+            self.runtime.tools.unregister_tool(tool.spec().name, registered_by=ctx.actor)
+        self.runtime.audit.record(
+            actor="runtime",
+            action="module.rollback",
+            target=f"module:{ctx.module_id}",
+            decision={"registered": ctx.registered_summary()},
+        )
+
+    def _is_internal_module(self, module_id: str) -> bool:
+        return module_id == "agent-libos-core:v0"
+
     def _record_failed_manifest(self, manifest_path: str | Path, exc: Exception) -> None:
         path = str(manifest_path)
         module_id = f"failed:{Path(path).name}"
@@ -293,6 +394,19 @@ class RuntimeModuleRegistry:
             source_path = ""
             source_sha256 = ""
             metadata = {}
+        if module_id in self._loaded_modules:
+            self.runtime.audit.record(
+                actor="runtime",
+                action="module.load_failed",
+                target=f"module:{module_id}",
+                decision={
+                    "manifest_path": path,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "preserved_loaded": True,
+                },
+            )
+            return
         self.runtime.store.upsert_runtime_module(
             module_id=module_id,
             name=name,
@@ -313,4 +427,37 @@ class RuntimeModuleRegistry:
             action="module.load_failed",
             target=f"module:{module_id}",
             decision={"manifest_path": path, "error": str(exc), "error_type": type(exc).__name__},
+        )
+
+    def _record_failed_source(
+        self,
+        source: ModuleSource,
+        exc: Exception,
+        *,
+        registered: dict[str, Any] | None = None,
+    ) -> None:
+        self.runtime.store.upsert_runtime_module(
+            module_id=source.manifest.module_id,
+            name=source.manifest.name,
+            version=source.manifest.version,
+            entrypoint=source.manifest.entrypoint,
+            manifest_path=source.manifest_path,
+            manifest_sha256=source.manifest_sha256,
+            source_path=source.source_path,
+            source_sha256=source.source_sha256,
+            status="failed",
+            loaded_at=None,
+            registered=registered or {},
+            error=str(exc),
+            metadata=source.manifest.metadata,
+        )
+        self.runtime.audit.record(
+            actor="runtime",
+            action="module.load_failed",
+            target=f"module:{source.manifest.module_id}",
+            decision={
+                "manifest_path": source.manifest_path,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
         )

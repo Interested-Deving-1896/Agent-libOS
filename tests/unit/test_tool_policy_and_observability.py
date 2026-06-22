@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
 from agent_libos.tools.builtin.object_tasks import StartObjectTaskTool, WatchObjectTaskOwnerTool
+from agent_libos.tools.builtin.permission import RequestPermissionTool
 from agent_libos.tools.observability import sanitize_for_observability
 
 
@@ -62,6 +63,12 @@ class TestToolPolicyAndObservability:
 
         assert spec.policy["side_effects"] is True
         assert set(spec.side_effects) == {"object.write", "process.message"}
+
+    def test_request_permission_declares_human_and_capability_side_effects(self) -> None:
+        spec = RequestPermissionTool().spec()
+
+        assert spec.policy["side_effects"] is True
+        assert set(spec.side_effects) == {"capability.write", "human.ask"}
 
     def test_observability_sanitizes_sensitive_fields_with_stable_hash(self) -> None:
         secret = "SECRET_TOKEN_SHOULD_NOT_APPEAR"

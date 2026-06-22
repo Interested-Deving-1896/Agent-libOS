@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -20,6 +21,8 @@ LANE_PATHS = {
 }
 PYTHON_LANES = tuple(LANE_PATHS)
 DEFAULT_MAX_LANE_SECONDS = 300.0
+DEFAULT_WORKERS = "1"
+XDIST_DISTS = ("loadfile", "loadscope", "load", "worksteal")
 
 
 @dataclass(frozen=True)
@@ -46,7 +49,21 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_LANE_SECONDS,
         help="duration budget for individual lanes; ignored by --lane all",
     )
+    parser.add_argument(
+        "-n",
+        "--workers",
+        type=_worker_count,
+        default=DEFAULT_WORKERS,
+        help="number of pytest-xdist workers for Python lanes; use 1 to run serially, or auto/logical",
+    )
+    parser.add_argument(
+        "--dist",
+        choices=XDIST_DISTS,
+        default="loadfile",
+        help="pytest-xdist scheduling strategy used when --workers is greater than 1",
+    )
     args = parser.parse_args(argv)
+    _validate_args(parser, args)
 
     commands = _commands_for(args)
     for command in commands:
@@ -67,17 +84,25 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
     if args.lane == "all":
         return [
             Command(
-                "pytest all deterministic lanes",
+                f"pytest all deterministic lanes{_worker_suffix(args)}",
                 _pytest_args(("tests",), args),
                 env=_pytest_env(args),
                 enforce_duration=False,
             )
         ]
-    return [Command(f"pytest {args.lane}", _pytest_args(LANE_PATHS[args.lane], args), env=_pytest_env(args))]
+    return [
+        Command(
+            f"pytest {args.lane}{_worker_suffix(args)}",
+            _pytest_args(LANE_PATHS[args.lane], args),
+            env=_pytest_env(args),
+        )
+    ]
 
 
 def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
     command = [sys.executable, "-m", "pytest", *paths]
+    if _workers_enabled(args):
+        command.extend(["-n", args.workers, "--dist", args.dist])
     marker_filters: list[str] = []
     if args.run_real_deno:
         command.append("--run-real-deno")
@@ -90,6 +115,36 @@ def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
     if marker_filters:
         command.extend(["-m", " and ".join(marker_filters)])
     return command
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.lane == "gui" and _workers_enabled(args):
+        parser.error("--workers only applies to pytest lanes; run the gui lane separately")
+    if _workers_enabled(args) and importlib.util.find_spec("xdist") is None:
+        parser.error("pytest-xdist is required for --workers; run `uv sync --all-groups` first")
+
+
+def _worker_count(value: str) -> str:
+    text = str(value).strip().lower()
+    if text in {"auto", "logical"}:
+        return text
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("workers must be a positive integer, auto, or logical") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("workers must be >= 1")
+    return str(count)
+
+
+def _workers_enabled(args: argparse.Namespace) -> bool:
+    return str(args.workers) != DEFAULT_WORKERS
+
+
+def _worker_suffix(args: argparse.Namespace) -> str:
+    if not _workers_enabled(args):
+        return ""
+    return f" ({args.workers} workers, dist={args.dist})"
 
 
 def _pytest_env(args: argparse.Namespace) -> dict[str, str] | None:

@@ -165,8 +165,9 @@ caps.
 Human interaction is modeled as runtime objects, not raw prompt text.
 
 - `ask_human` creates a blocking question.
-- `request_permission` creates a scoped policy request with canonical resource,
-  risk, resource scope, lease shape, and constraints shown to the human. Model
+- `request_permission` requires human write authority, creates a blocking scoped
+  policy request with canonical resource, risk, resource scope, lease shape, and
+  constraints shown to the human, then returns the final policy decision. Model
   requests cannot ask for broad high-risk grants such as `shell:*` execute or
   root/global filesystem write such as `filesystem:/:*`; workspace write remains
   a human-approvable scope.
@@ -174,10 +175,13 @@ Human interaction is modeled as runtime objects, not raw prompt text.
 - Per-use approvals can create one-shot capabilities that are consumed after
   one successful primitive call.
 
-If a primitive blocks on human approval, the process enters `waiting_human`.
-The runtime can process human terminal messages, update the request, wake the
-process, and resume the original operation. Rejection returns a normal failure
-to the process instead of crashing the runtime.
+If a primitive or human tool blocks on human approval, the process enters
+`waiting_human`. Human requests are terminally decided once: only pending
+requests can be approved or rejected. The runtime can process human terminal
+messages, update the request, wake the process, and resume the original
+operation. Rejection returns a normal failure to the process instead of crashing
+the runtime, except `request_permission` rejection returns a structured
+`rejected` decision after installing the selected deny policy.
 
 ## Process Messages And IPC
 

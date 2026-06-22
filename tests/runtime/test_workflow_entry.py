@@ -75,6 +75,28 @@ class TestWorkflowEntry:
         finally:
             runtime.close()
 
+    def test_workflow_request_permission_waits_instead_of_exiting_with_pending_request(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            result = runtime.run_workflow(
+                "request_permission",
+                {
+                    "resource": "filesystem:workspace:*",
+                    "rights": ["write"],
+                    "reason": "edit workspace",
+                },
+            )
+
+            assert not result.ok
+            assert result.waiting_human
+            assert result.request_id is not None
+            process = runtime.process.get(result.pid)
+            assert process.status == ProcessStatus.WAITING_HUMAN
+            assert process.status_message == f"waiting for human request {result.request_id}"
+            assert runtime.human.pending()[0].request_id == result.request_id
+        finally:
+            runtime.close()
+
     def test_workflow_does_not_auto_exit_process_exec_tool(self) -> None:
         runtime = Runtime.open("local")
         try:

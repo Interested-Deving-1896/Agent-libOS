@@ -2,10 +2,11 @@ from __future__ import annotations
 import pytest
 import hashlib
 import json
+from dataclasses import replace
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.models.exceptions import HumanApprovalRequired
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ValidationError
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
 
@@ -21,12 +22,16 @@ class TestPermissionPolicy:
 
     def test_request_permission_tool_can_set_always_allow_policy(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request write')
+        self._grant_human(pid)
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
-        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
         processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
+        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
         allowed = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'allowed'})
         assert request.ok
+        assert request.payload['status'] == HumanRequestStatus.APPROVED.value
         assert processed[0].status == HumanRequestStatus.APPROVED
         assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
@@ -35,11 +40,16 @@ class TestPermissionPolicy:
 
     def test_request_permission_tool_can_set_always_deny_policy_and_resume_process(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request denied write')
+        self._grant_human(pid)
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
-        self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
         processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_DENY)
+        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
         denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'denied'})
+        assert request.ok
+        assert request.payload['status'] == HumanRequestStatus.REJECTED.value
         assert processed[0].status == HumanRequestStatus.REJECTED
         assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_DENY
@@ -49,6 +59,7 @@ class TestPermissionPolicy:
 
     def test_request_permission_tool_rejects_unknown_right_before_human_prompt(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request invalid right')
+        self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['*'], 'reason': 'invalid broad right'})
         assert not request.ok
@@ -56,12 +67,13 @@ class TestPermissionPolicy:
 
     def test_request_permission_prompt_includes_risk_scope_lease_and_constraints(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request explained permission')
+        self._grant_human(pid)
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
-        request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
         pending = self.runtime.human.pending()[0]
         context = pending.payload['context']
-        assert request.ok
         assert context['canonical_resource'] == resource
         assert context['resource_scope'] == 'exact'
         assert context['risk'] == 'high'
@@ -75,28 +87,101 @@ class TestPermissionPolicy:
 
     def test_request_permission_rejects_broad_shell_execute_before_human_prompt(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request broad shell')
+        self._grant_human(pid)
         request = self.runtime.tools.call(pid, 'request_permission', {'resource': 'shell:*', 'rights': ['execute'], 'reason': 'run commands'})
         assert not request.ok
         assert self.runtime.human.pending() == []
 
     def test_request_permission_can_approve_workspace_write(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request workspace write')
+        self._grant_human(pid)
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(
+                pid,
+                'request_permission',
+                {'resource': self.runtime.filesystem.workspace_resource(), 'rights': ['write'], 'reason': 'edit workspace'},
+            )
+        pending = self.runtime.human.pending()[0]
+        context = pending.payload['context']
+        processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
         request = self.runtime.tools.call(
             pid,
             'request_permission',
             {'resource': self.runtime.filesystem.workspace_resource(), 'rights': ['write'], 'reason': 'edit workspace'},
         )
-        pending = self.runtime.human.pending()[0]
-        context = pending.payload['context']
-        processed = self.runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
         assert request.ok
         assert context['canonical_resource'] == 'filesystem:workspace:*'
         assert context['resource_scope'] == 'prefix'
         assert processed[0].status == HumanRequestStatus.APPROVED
         assert self.runtime.capability.permission_policy(pid, self.runtime.filesystem.resource_for(self._path()), CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
 
+    def test_request_permission_requires_human_write_authority(self) -> None:
+        image = self.runtime.get_image('base-agent:v0')
+        self.runtime.register_image(
+            replace(
+                image,
+                image_id="no-human-permission-agent:v0",
+                name="no-human-permission-agent",
+                required_capabilities=[],
+            ),
+            actor="test",
+        )
+        pid = self.runtime.process.spawn(image='no-human-permission-agent:v0', goal='request without human authority')
+        resource = self.runtime.filesystem.resource_for(self._path())
+
+        denied = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write'})
+
+        assert not denied.ok
+        assert 'lacks write on human:owner' in (denied.error or '')
+        assert self.runtime.human.pending() == []
+
+    def test_cancelled_human_request_cannot_be_approved_later(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='cancelled approval')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(
+            subject=pid,
+            resource=resource,
+            rights=[CapabilityRight.WRITE],
+            policy=CapabilityManager.ASK_EACH_TIME,
+            issued_by='test',
+        )
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'secret'})
+        request = self.runtime.human.pending()[0]
+        request.status = HumanRequestStatus.CANCELLED
+        request.decision = {"cancelled_by": "test"}
+        self.runtime.store.update_human_request(request)
+
+        with pytest.raises(ValidationError, match="not pending"):
+            self.runtime.human.approve(request.request_id)
+
+        assert not self.runtime.capability.check(pid, resource, CapabilityRight.WRITE)
+        assert not (self.runtime.workspace_root / path).exists()
+
+    def test_waiting_process_cannot_be_advanced_by_direct_tool_call(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='waiting direct call')
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(
+            subject=pid,
+            resource=resource,
+            rights=[CapabilityRight.WRITE],
+            policy=CapabilityManager.ASK_EACH_TIME,
+            issued_by='test',
+        )
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'first'})
+
+        blocked = self.runtime.tools.call(pid, 'get_working_directory', {})
+
+        assert not blocked.ok
+        assert 'not runnable' in (blocked.error or '')
+        assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+
     def test_request_permission_rejects_root_filesystem_write_before_human_prompt(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request root write')
+        self._grant_human(pid)
         request = self.runtime.tools.call(
             pid,
             'request_permission',
@@ -229,8 +314,63 @@ class TestPermissionPolicy:
         assert resumed['result']['ok']
         assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'approved after waiting'
 
+    def test_llm_request_permission_rejected_policy_resumes_with_structured_result(self) -> None:
+        path = self._path()
+        resource = self.runtime.filesystem.resource_for(path)
+        client = FakeActionClient([
+            {'action': 'request_permission', 'resource': resource, 'rights': ['write'], 'reason': 'edit file'}
+        ])
+        self.runtime.llm.client = client
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request deny policy')
+        self._grant_human(pid)
+
+        results = self.runtime.run_until_idle(
+            max_quanta=2,
+            human_auto_policy=CapabilityManager.ALWAYS_DENY,
+        )
+
+        resumed = next(result for result in results if isinstance(result, dict) and result.get('resumed_after_human'))
+        assert client.calls == 1
+        assert resumed['result']['ok']
+        assert resumed['result']['payload']['status'] == HumanRequestStatus.REJECTED.value
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_DENY
+
+    def test_human_resume_request_id_does_not_leak_into_unrelated_tool_call(self) -> None:
+        pid_1 = self.runtime.process.spawn(image='review-agent:v0', goal='first permission request')
+        self._grant_human(pid_1)
+        resource_1 = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(
+                pid_1,
+                'request_permission',
+                {'resource': resource_1, 'rights': ['write'], 'reason': 'first'},
+            )
+        request_1 = self.runtime.human.pending()[0]
+        self.runtime.human.approve(request_1.request_id)
+
+        pid_2 = self.runtime.process.spawn(image='review-agent:v0', goal='second permission request')
+        self._grant_human(pid_2)
+        resource_2 = self.runtime.filesystem.resource_for(self._path())
+        setattr(self.runtime, '_current_human_resume_request_id', request_1.request_id)
+        try:
+            with pytest.raises(HumanResponseRequired):
+                self.runtime.tools.call(
+                    pid_2,
+                    'request_permission',
+                    {'resource': resource_2, 'rights': ['write'], 'reason': 'second'},
+                )
+        finally:
+            delattr(self.runtime, '_current_human_resume_request_id')
+
+        pending = [request for request in self.runtime.human.pending() if request.pid == pid_2]
+        assert len(pending) == 1
+        assert pending[0].request_id != request_1.request_id
+
     def _path(self) -> str:
         return f'agent_outputs/permission_policy_{uuid4().hex}.txt'
+
+    def _grant_human(self, pid: str) -> None:
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
 
     def _event_types(self, pid: str) -> list[str]:
         return [event.type.value for event in self.runtime.events.list(target=pid)]

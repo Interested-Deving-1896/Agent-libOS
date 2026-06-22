@@ -14,6 +14,11 @@ Modules are part of the host trusted computing base:
 - The `(module_id, source_sha256)` pair must be trusted by config or CLI.
 - Loading a module never grants filesystem, shell, Object Memory, human,
   process, checkpoint, Skill, image, or JSON-RPC capabilities to a process.
+- Import-string entrypoints are resolved to a concrete source file, then loaded
+  fresh under the module import lock so a previous `sys.modules` entry cannot
+  satisfy a newer trusted hash.
+- Module source files are hashed with a configured size limit
+  (`AgentLibOSConfig.modules.source_max_bytes`) before import.
 
 Use Skills when the model needs workflow instructions, tool visibility, or JIT
 tool candidates at runtime. Use Runtime Modules when the system owner wants to
@@ -60,7 +65,11 @@ def register_module(ctx):
 
 The module context buffers registrations first. The registry verifies that the
 module registered only declared resources, checks name collisions, then applies
-the registrations before the runtime is returned to the caller.
+the registrations before the runtime is returned to the caller. If registration
+or startup hooks fail, external module registrations are rolled back from the
+runtime registries and the module row is recorded as failed. Hook code may still
+perform arbitrary trusted host-side effects, so hooks should be kept small and
+idempotent.
 
 ## Registration Surfaces
 
@@ -110,7 +119,9 @@ sets `AgentLibOSConfig.modules.manifest_paths` and trusted hashes.
 
 The `runtime_modules` table records loaded and failed modules, source hashes,
 entrypoints, and registration summaries. This is audit and reproducibility
-metadata, not a dynamic loading authority for processes.
+metadata, not a dynamic loading authority for processes. A `module_id` can be
+loaded only once per `Runtime`; duplicate load attempts are rejected without
+overwriting an already loaded row.
 
 Checkpoint snapshots record the currently loaded module summaries. Restore and
 fork fail if the current Python runtime has not loaded the same required module

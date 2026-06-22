@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.models import AuthorityRisk, Capability, CapabilityEffect, CapabilityRight, EventType, ResourceUsage
 from agent_libos.runtime.audit_manager import AuditManager
@@ -91,7 +91,9 @@ class FilesystemAdapter:
         human: Any | None = None,
         provider: FilesystemProvider | None = None,
         resources: Any | None = None,
+        config: AgentLibOSConfig | None = None,
     ):
+        self.config = config or DEFAULT_CONFIG
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
@@ -116,7 +118,7 @@ class FilesystemAdapter:
         max_bytes = self._bounded_positive_int(
             max_bytes,
             label="max_bytes",
-            hard_limit=_TOOL_DEFAULTS.filesystem_read_hard_limit_bytes,
+            hard_limit=self.config.tools.filesystem_read_hard_limit_bytes,
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
@@ -197,7 +199,7 @@ class FilesystemAdapter:
         max_bytes = self._bounded_positive_int(
             max_bytes,
             label="max_bytes",
-            hard_limit=_TOOL_DEFAULTS.filesystem_read_hard_limit_bytes,
+            hard_limit=self.config.tools.filesystem_read_hard_limit_bytes,
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
@@ -382,7 +384,7 @@ class FilesystemAdapter:
         limit = self._bounded_positive_int(
             limit,
             label="limit",
-            hard_limit=_TOOL_DEFAULTS.directory_entry_hard_limit,
+            hard_limit=self.config.tools.directory_entry_hard_limit,
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
@@ -1001,7 +1003,7 @@ class FilesystemAdapter:
             # and preview needed for a safe per-use human decision.
             request_id = self.human.query(
                 pid=pid,
-                human=_RUNTIME_DEFAULTS.default_human,
+                    human=self.config.runtime.default_human,
                 request={
                     "type": "external_operation_approval",
                     "question": question,
@@ -1053,7 +1055,7 @@ class FilesystemAdapter:
                 raise CapabilityDenied(f"{pid} requires human approval for delete on {resource}")
             request_id = self.human.query(
                 pid=pid,
-                human=_RUNTIME_DEFAULTS.default_human,
+                    human=self.config.runtime.default_human,
                 request={
                     "type": "external_operation_approval",
                     "question": f"Allow this process to delete {relative}?",
@@ -1196,11 +1198,12 @@ class FilesystemAdapter:
             "content_preview_truncated": preview_truncated,
         }
 
-    def _preview_text(self, text: str, limit: int = _TOOL_DEFAULTS.approval_preview_chars) -> tuple[str, bool]:
-        preview = text[:limit]
+    def _preview_text(self, text: str, limit: int | None = None) -> tuple[str, bool]:
+        selected_limit = self.config.tools.approval_preview_chars if limit is None else limit
+        preview = text[:selected_limit]
         # repr() prevents newlines or prompt-like text from masquerading as
         # separate approval instructions in the human terminal prompt.
-        return repr(preview), len(text) > limit
+        return repr(preview), len(text) > selected_limit
 
     def _decode_text_prefix(self, data: bytes, encoding: str, *, truncated: bool) -> str:
         try:

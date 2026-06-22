@@ -48,6 +48,7 @@ from agent_libos.utils.serde import dumps
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+_TOOL_CALLABLE_PROCESS_STATUSES = {ProcessStatus.RUNNABLE, ProcessStatus.RUNNING}
 
 _JIT_MULTIPLEXER_INPUT_SCHEMA = {
     "type": "object",
@@ -125,7 +126,7 @@ class ToolBroker:
         scope: str = "static",
         ephemeral: bool = False,
     ) -> ToolHandle:
-        spec = tool.spec()
+        spec = tool.spec(config=self.config)
         if spec.name in self._tool_ids_by_name:
             raise ValueError(f"tool already registered: {spec.name}")
         tool_id = new_id("tool") if ephemeral else _stable_static_tool_id(
@@ -155,6 +156,27 @@ class ToolBroker:
             },
         )
         return handle
+
+    def unregister_tool(self, tool: ToolHandle | str, *, registered_by: str | None = None) -> bool:
+        handle = self._handle_for_unregistration(tool)
+        if handle is None:
+            return False
+        row = next((item for item in self.store.list_tools() if item["tool_id"] == handle.tool_id), None)
+        if registered_by is not None and row is not None and row.get("registered_by") != registered_by:
+            return False
+        self._tools.pop(handle.tool_id, None)
+        self._jit_sources.pop(handle.tool_id, None)
+        self._handles.pop(handle.tool_id, None)
+        if self._tool_ids_by_name.get(handle.name) == handle.tool_id:
+            self._tool_ids_by_name.pop(handle.name, None)
+        self.store.delete_tool(handle.tool_id, registered_by=registered_by)
+        self.audit.record(
+            actor=registered_by or "tool_broker",
+            action="tool.unregister",
+            target=f"tool:{handle.tool_id}",
+            decision={"name": handle.name},
+        )
+        return True
 
     def configure_process_tools(
         self,
@@ -371,24 +393,38 @@ class ToolBroker:
         )
         return handle
 
-    def call(self, pid: str, tool: ToolHandle | str, args: dict[str, Any]) -> ToolCallResult:
+    def call(
+        self,
+        pid: str,
+        tool: ToolHandle | str,
+        args: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> ToolCallResult:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.acall(pid, tool, args))
+            return asyncio.run(self.acall(pid, tool, args, context_metadata=context_metadata))
         raise RuntimeError("Cannot call ToolBroker.call() inside a running event loop. Use await acall(...).")
 
-    async def acall(self, pid: str, tool: ToolHandle | str, args: dict[str, Any]) -> ToolCallResult:
+    async def acall(
+        self,
+        pid: str,
+        tool: ToolHandle | str,
+        args: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> ToolCallResult:
         handle = self.resolve(tool, pid=pid)
         resource = f"tool:{handle.tool_id}"
-        terminal_error = self._terminal_process_error(pid)
-        if terminal_error is not None:
+        process_status_error = self._process_status_error(pid)
+        if process_status_error is not None:
             call_id = new_id("tcall")
             self.events.emit(
                 EventType.TOOL_FAILED,
                 source=resource,
                 target=pid,
-                payload={"call_id": call_id, "error": terminal_error, "policy_decision": "deny"},
+                payload={"call_id": call_id, "error": process_status_error, "policy_decision": "deny"},
             )
             self.audit.record(
                 actor=pid,
@@ -398,11 +434,18 @@ class ToolBroker:
                     "ok": False,
                     "tool": handle.name,
                     "policy_decision": "deny",
-                    "policy_reason": "terminal_process",
-                    "error": terminal_error,
+                    "policy_reason": "process_not_tool_callable",
+                    "error": process_status_error,
                 },
             )
-            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=terminal_error)
+            return ToolCallResult(
+                call_id=call_id,
+                tool_id=handle.tool_id,
+                result_handle=None,
+                payload=None,
+                ok=False,
+                error=process_status_error,
+            )
         if not self._process_has_tool(pid, handle):
             # The process tool table gates only LLM-facing tool visibility.
             # Host resources are checked by the primitive each tool calls into.
@@ -460,7 +503,10 @@ class ToolBroker:
         try:
             jit_session: LibOSSyscallSession | None = None
             if handle.tool_id in self._tools:
-                tool_result = await self._tools[handle.tool_id].ainvoke(args, self._context(pid, handle, call_id))
+                tool_result = await self._tools[handle.tool_id].ainvoke(
+                    args,
+                    self._context(pid, handle, call_id, metadata=context_metadata),
+                )
                 if not tool_result.ok:
                     error_message = tool_result.error.message if tool_result.error else tool_result.content
                     self.events.emit(
@@ -1101,7 +1147,7 @@ class ToolBroker:
         schemas: builtins.list[dict[str, Any]] = []
         for tool_id in sorted(tool_ids, key=self._tool_sort_key):
             if tool_id in self._tools:
-                schemas.append(self._tools[tool_id].to_openai_chat_tool())
+                schemas.append(self._tools[tool_id].to_openai_chat_tool(config=self.config))
                 continue
             if tool_id not in self._jit_sources:
                 continue
@@ -1262,17 +1308,27 @@ class ToolBroker:
             return (spec.name, tool_id)
         return (tool_id, tool_id)
 
-    def _context(self, pid: str, handle: ToolHandle, call_id: str) -> ToolContext:
+    def _context(
+        self,
+        pid: str,
+        handle: ToolHandle,
+        call_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> ToolContext:
+        runtime = getattr(self, "runtime", None)
+        selected_metadata = {
+            "tool_id": handle.tool_id,
+            "tool_name": handle.name,
+        }
+        selected_metadata.update(dict(metadata or {}))
         return ToolContext(
             trace_id=call_id,
             call_id=call_id,
             pid=pid,
             workspace_id=str(self.workspace_root),
-            runtime=getattr(self, "runtime", None),
-            metadata={
-                "tool_id": handle.tool_id,
-                "tool_name": handle.name,
-            },
+            runtime=runtime,
+            metadata=selected_metadata,
         )
 
     def _get_candidate(self, candidate_id: str) -> ToolCandidate:
@@ -1299,12 +1355,24 @@ class ToolBroker:
             raise NotFound(f"process not found: {pid}")
         return process.tool_table.get(handle.name) == handle.tool_id
 
-    def _terminal_process_error(self, pid: str) -> str | None:
+    def _handle_for_unregistration(self, tool: ToolHandle | str) -> ToolHandle | None:
+        if isinstance(tool, ToolHandle):
+            return tool
+        if tool in self._handles:
+            return self._handles[tool]
+        tool_id = self._tool_ids_by_name.get(str(tool))
+        if tool_id is not None:
+            return self._handles.get(tool_id)
+        return None
+
+    def _process_status_error(self, pid: str) -> str | None:
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         if process.status in _TERMINAL_PROCESS_STATUSES:
             return f"cannot call tools for terminal process {pid}: {process.status.value}"
+        if process.status not in _TOOL_CALLABLE_PROCESS_STATUSES:
+            return f"cannot call tools for process {pid}: status={process.status.value} is not runnable"
         return None
 
     def _visible_tool_ids(self, pid: str) -> set[str]:

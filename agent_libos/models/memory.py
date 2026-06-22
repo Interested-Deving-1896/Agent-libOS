@@ -6,8 +6,6 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, MemoryViewID, NamespaceID, OID, PID, SnapshotID, StrEnum
 
-_MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
-
 
 class _UnsetPayload:
     def __repr__(self) -> str:
@@ -87,8 +85,8 @@ class ObjectMetadata:
     token_estimate: int | None = None
     embedding_refs: list[str] = field(default_factory=list)
     indexes: list[str] = field(default_factory=list)
-    sensitivity: str = _MEMORY_DEFAULTS.metadata_sensitivity
-    retention_policy: str = _MEMORY_DEFAULTS.metadata_retention_policy
+    sensitivity: str = field(default_factory=lambda: DEFAULT_CONFIG.memory.metadata_sensitivity)
+    retention_policy: str = field(default_factory=lambda: DEFAULT_CONFIG.memory.metadata_retention_policy)
 
 
 @dataclass
@@ -145,7 +143,7 @@ class ObjectQuery:
     type: ObjectType | str | None = None
     tags: list[str] = field(default_factory=list)
     text: str | None = None
-    limit: int = _MEMORY_DEFAULTS.query_limit
+    limit: int = field(default_factory=lambda: DEFAULT_CONFIG.memory.query_limit)
     name: str | None = None
     namespace: NamespaceID | None = None
 

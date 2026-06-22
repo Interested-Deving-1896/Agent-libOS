@@ -940,13 +940,16 @@ class ImageRegistryPrimitive:
             # Persisted images may depend on startup modules that are not loaded
             # in this Runtime.open() invocation. Keep the manifest inspectable
             # and defer concrete tool resolution to spawn/exec.
-            self._validate_image(image, validate_tools=False)
+            self._validate_persisted_image(image)
             self.images[image.image_id] = image
 
     def list_images(self) -> list[dict[str, Any]]:
         if self.store is None:
             return [self._image_summary(image, {}) for image in sorted(self.images.values(), key=lambda item: item.image_id)]
-        return [self._image_summary(image, metadata) for image, metadata in self.store.list_images()]
+        return [
+            self._image_summary(self._validate_persisted_image(image), metadata)
+            for image, metadata in self.store.list_images()
+        ]
 
     def inspect(self, image_id: str) -> dict[str, Any]:
         image = self.images.get(image_id)
@@ -955,6 +958,7 @@ class ImageRegistryPrimitive:
             persisted = self.store.get_image(image_id)
             if persisted is not None:
                 image, metadata = persisted
+                image = self._validate_persisted_image(image)
         if image is None:
             raise NotFound(f"agent image not found: {image_id}")
         artifact = None
@@ -985,6 +989,13 @@ class ImageRegistryPrimitive:
             "registry": metadata,
             "artifact": artifact,
         }
+
+    def _validate_persisted_image(self, image: AgentImage) -> AgentImage:
+        # Persisted images can outlive code upgrades or manual DB repairs. Keep
+        # startup/module tool resolution deferred, but fail closed on malformed
+        # model fields before the image reaches spawn or prompt selection.
+        self._validate_image(image, validate_tools=False)
+        return image
 
     def commit_from_checkpoint(
         self,

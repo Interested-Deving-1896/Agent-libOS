@@ -7,7 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.models import (
@@ -30,6 +30,7 @@ from agent_libos.models import (
     JsonRpcEndpointSpec,
     JsonRpcHeaderSpec,
     JsonRpcMethodSpec,
+    JIT_TOOL_EXPOSURES,
     LLMCallRecord,
     MemoryView,
     ObjectFilter,
@@ -44,6 +45,7 @@ from agent_libos.models import (
     ObjectTaskStatus,
     ObjectType,
     ProcessStatus,
+    PROMPT_MODES,
     ProcessMessage,
     ProcessMessageKind,
     ProcessMessageStatus,
@@ -61,7 +63,21 @@ from agent_libos.models import (
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillPackage, SkillResource
 from agent_libos.utils.serde import dumps, loads
 
-_LLM_DEFAULTS = DEFAULT_CONFIG.llm
+
+@contextmanager
+def _persisted_model_decode(label: str):
+    try:
+        yield
+    except ValidationError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError(f"invalid persisted {label}: {exc}") from exc
+
+
+def _persisted_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be boolean")
+    return value
 
 
 class SQLiteStore:
@@ -73,7 +89,8 @@ class SQLiteStore:
 
     SYSTEM_NAMESPACE = "system"
 
-    def __init__(self, path: str | Path = ":memory:"):
+    def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
+        self.config = config or DEFAULT_CONFIG
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -266,6 +283,15 @@ class SQLiteStore:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_human_requests_pid_created
+                  ON human_requests(pid, created_at, request_id);
+
+                CREATE INDEX IF NOT EXISTS idx_human_requests_human_status_created
+                  ON human_requests(human, status, created_at, request_id);
+
+                CREATE INDEX IF NOT EXISTS idx_human_requests_status_created
+                  ON human_requests(status, created_at, request_id);
 
                 CREATE TABLE IF NOT EXISTS llm_calls (
                   call_id TEXT PRIMARY KEY,
@@ -510,7 +536,7 @@ class SQLiteStore:
 
     def insert_object(self, obj: AgentObject) -> None:
         with self.transaction(include_object_payloads=True) as cur:
-            self._object_payloads[obj.oid] = obj.payload
+            self._object_payloads[obj.oid] = deepcopy(obj.payload)
             cur.execute(
                 """
                 INSERT INTO objects (
@@ -537,7 +563,7 @@ class SQLiteStore:
 
     def update_object(self, obj: AgentObject) -> None:
         with self.transaction(include_object_payloads=True) as cur:
-            self._object_payloads[obj.oid] = obj.payload
+            self._object_payloads[obj.oid] = deepcopy(obj.payload)
             cur.execute(
                 """
                 UPDATE objects
@@ -831,10 +857,10 @@ class SQLiteStore:
         self._execute(f"DELETE FROM {table} WHERE {where_sql}", params)
 
     def object_payload(self, oid: str) -> Any:
-        return self._object_payloads[oid]
+        return deepcopy(self._object_payloads[oid])
 
     def set_object_payload(self, oid: str, payload: Any) -> None:
-        self._object_payloads[oid] = payload
+        self._object_payloads[oid] = deepcopy(payload)
 
     def forget_object_payload(self, oid: str) -> None:
         self._object_payloads.pop(oid, None)
@@ -1090,14 +1116,33 @@ class SQLiteStore:
         rows = self._query("SELECT * FROM human_requests WHERE request_id = ?", (request_id,))
         return self._row_to_human_request(rows[0]) if rows else None
 
-    def list_human_requests(self, pid: str | None = None) -> list[HumanRequest]:
-        if pid is None:
-            rows = self._query("SELECT * FROM human_requests ORDER BY created_at")
-        else:
-            rows = self._query(
-                "SELECT * FROM human_requests WHERE pid = ? ORDER BY created_at",
-                (pid,),
-            )
+    def list_human_requests(
+        self,
+        pid: str | None = None,
+        *,
+        human: str | None = None,
+        status: HumanRequestStatus | str | None = None,
+        limit: int | None = None,
+    ) -> list[HumanRequest]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if pid is not None:
+            clauses.append("pid = ?")
+            params.append(pid)
+        if human is not None:
+            clauses.append("human = ?")
+            params.append(human)
+        if status is not None:
+            selected_status = status.value if isinstance(status, HumanRequestStatus) else str(status)
+            clauses.append("status = ?")
+            params.append(selected_status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM human_requests{where} ORDER BY created_at, request_id"
+        if limit is not None:
+            selected_limit = max(0, int(limit))
+            sql += " LIMIT ?"
+            params.append(selected_limit)
+        rows = self._query(sql, params)
         return [self._row_to_human_request(row) for row in rows]
 
     def insert_llm_call(self, record: LLMCallRecord) -> None:
@@ -1441,6 +1486,12 @@ class SQLiteStore:
             ),
         )
 
+    def delete_tool(self, tool_id: str, *, registered_by: str | None = None) -> None:
+        if registered_by is None:
+            self._execute("DELETE FROM tools WHERE tool_id = ?", (tool_id,))
+            return
+        self._execute("DELETE FROM tools WHERE tool_id = ? AND registered_by = ?", (tool_id, registered_by))
+
     def get_tool_spec(self, tool_id: str) -> ToolSpec | None:
         rows = self._query("SELECT * FROM tools WHERE tool_id = ?", (tool_id,))
         if not rows:
@@ -1696,6 +1747,12 @@ class SQLiteStore:
             (self._dict_to_agent_image(loads(row["manifest_json"], {})), self._image_row_metadata(row))
             for row in self._query("SELECT * FROM images ORDER BY image_id")
         ]
+
+    def delete_image(self, image_id: str, *, registered_by: str | None = None) -> None:
+        if registered_by is None:
+            self._execute("DELETE FROM images WHERE image_id = ?", (image_id,))
+            return
+        self._execute("DELETE FROM images WHERE image_id = ? AND registered_by = ?", (image_id, registered_by))
 
     def insert_image_artifact(
         self,
@@ -2331,28 +2388,38 @@ class SQLiteStore:
         }
 
     def _dict_to_agent_image(self, data: dict[str, Any]) -> AgentImage:
-        item = dict(data)
-        item.setdefault("boot", {"kind": "fresh"})
-        return AgentImage(**item)
+        with _persisted_model_decode(f"agent image {data.get('image_id', '<unknown>') if isinstance(data, dict) else '<unknown>'}"):
+            item = dict(data)
+            item.setdefault("boot", {"kind": "fresh"})
+            image = AgentImage(**item)
+            if image.prompt_mode not in PROMPT_MODES:
+                raise ValidationError(f"invalid persisted agent image {image.image_id}: unknown prompt_mode {image.prompt_mode}")
+            if image.jit_tool_exposure not in JIT_TOOL_EXPOSURES:
+                raise ValidationError(
+                    f"invalid persisted agent image {image.image_id}: "
+                    f"unknown jit_tool_exposure {image.jit_tool_exposure}"
+                )
+            return image
 
     def _row_to_object(self, row: sqlite3.Row) -> AgentObject:
-        metadata = ObjectMetadata(**loads(row["metadata_json"], {}))
-        provenance = Provenance(**loads(row["provenance_json"], {}))
-        return AgentObject(
-            oid=row["oid"],
-            namespace=row["namespace"],
-            name=row["name"],
-            type=ObjectType(row["type"]),
-            schema_version=row["schema_version"],
-            payload=self._object_payloads[row["oid"]],
-            metadata=metadata,
-            provenance=provenance,
-            version=row["version"],
-            immutable=bool(row["immutable"]),
-            created_by=row["created_by"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
+        with _persisted_model_decode(f"object {row['oid']}"):
+            metadata = ObjectMetadata(**loads(row["metadata_json"], {}))
+            provenance = Provenance(**loads(row["provenance_json"], {}))
+            return AgentObject(
+                oid=row["oid"],
+                namespace=row["namespace"],
+                name=row["name"],
+                type=ObjectType(row["type"]),
+                schema_version=row["schema_version"],
+                payload=deepcopy(self._object_payloads[row["oid"]]),
+                metadata=metadata,
+                provenance=provenance,
+                version=row["version"],
+                immutable=bool(row["immutable"]),
+                created_by=row["created_by"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
 
     def _row_to_namespace(self, row: sqlite3.Row) -> ObjectNamespace:
         return ObjectNamespace(
@@ -2365,36 +2432,40 @@ class SQLiteStore:
         )
 
     def _row_to_link(self, row: sqlite3.Row) -> ObjectLink:
-        return ObjectLink(
-            link_id=row["id"],
-            src=row["src_oid"],
-            relation=RelationType(row["relation"]),
-            dst=row["dst_oid"],
-            metadata=loads(row["metadata_json"], {}),
-            created_by=row["created_by"],
-            created_at=row["created_at"],
-        )
+        with _persisted_model_decode(f"object link {row['id']}"):
+            return ObjectLink(
+                link_id=row["id"],
+                src=row["src_oid"],
+                relation=RelationType(row["relation"]),
+                dst=row["dst_oid"],
+                metadata=loads(row["metadata_json"], {}),
+                created_by=row["created_by"],
+                created_at=row["created_at"],
+            )
 
     def _row_to_process(self, row: sqlite3.Row) -> AgentProcess:
-        return AgentProcess(
-            pid=row["pid"],
-            parent_pid=row["parent_pid"],
-            image_id=row["image_id"],
-            status=ProcessStatus(row["status"]),
-            goal_oid=row["goal_oid"],
-            memory_view=self._dict_to_view(loads(row["memory_view_json"])) if row["memory_view_json"] else None,
-            capabilities=loads(row["capabilities_json"], []),
-            loaded_skills=loads(row["loaded_skills_json"], {}),
-            tool_table=loads(row["tool_table_json"], {}),
-            event_cursor=row["event_cursor"],
-            checkpoint_head=row["checkpoint_head"],
-            resource_budget=ResourceBudget(**loads(row["resource_budget_json"], {})),
-            resource_usage=ResourceUsage(**loads(row["resource_usage_json"] if "resource_usage_json" in row.keys() else None, {})),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            working_directory=row["working_directory"] if "working_directory" in row.keys() else ".",
-            status_message=row["status_message"],
-        )
+        with _persisted_model_decode(f"process {row['pid']}"):
+            return AgentProcess(
+                pid=row["pid"],
+                parent_pid=row["parent_pid"],
+                image_id=row["image_id"],
+                status=ProcessStatus(row["status"]),
+                goal_oid=row["goal_oid"],
+                memory_view=self._dict_to_view(loads(row["memory_view_json"])) if row["memory_view_json"] else None,
+                capabilities=loads(row["capabilities_json"], []),
+                loaded_skills=loads(row["loaded_skills_json"], {}),
+                tool_table=loads(row["tool_table_json"], {}),
+                event_cursor=row["event_cursor"],
+                checkpoint_head=row["checkpoint_head"],
+                resource_budget=ResourceBudget(**loads(row["resource_budget_json"], {})),
+                resource_usage=ResourceUsage(
+                    **loads(row["resource_usage_json"] if "resource_usage_json" in row.keys() else None, {})
+                ),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                working_directory=row["working_directory"] if "working_directory" in row.keys() else ".",
+                status_message=row["status_message"],
+            )
 
     def _row_to_resource_reservation(self, row: sqlite3.Row) -> ResourceReservation:
         return ResourceReservation(
@@ -2406,48 +2477,50 @@ class SQLiteStore:
         )
 
     def _row_to_event(self, row: sqlite3.Row) -> Event:
-        return Event(
-            event_id=row["event_id"],
-            type=EventType(row["type"]),
-            source=row["source"],
-            target=row["target"],
-            payload=loads(row["payload_json"], {}),
-            priority=EventPriority(row["priority"]),
-            created_at=row["created_at"],
-            correlation_id=row["correlation_id"],
-            causality=loads(row["causality_json"], {}),
-        )
+        with _persisted_model_decode(f"event {row['event_id']}"):
+            return Event(
+                event_id=row["event_id"],
+                type=EventType(row["type"]),
+                source=row["source"],
+                target=row["target"],
+                payload=loads(row["payload_json"], {}),
+                priority=EventPriority(row["priority"]),
+                created_at=row["created_at"],
+                correlation_id=row["correlation_id"],
+                causality=loads(row["causality_json"], {}),
+            )
 
     def _row_to_capability(self, row: sqlite3.Row) -> Capability:
-        keys = set(row.keys())
-        return Capability(
-            cap_id=row["cap_id"],
-            subject=row["subject"],
-            resource=row["resource"],
-            rights=set(loads(row["rights_json"], [])),
-            constraints=loads(row["constraints_json"], {}),
-            issued_by=row["issued_by"],
-            issued_at=row["issued_at"],
-            expires_at=row["expires_at"],
-            delegable=bool(row["delegable"]),
-            revocable=bool(row["revocable"]),
-            effect=CapabilityEffect(row["effect"]) if "effect" in keys else CapabilityEffect.ALLOW,
-            issuer_cap_id=row["issuer_cap_id"] if "issuer_cap_id" in keys else None,
-            parent_cap_id=row["parent_cap_id"] if "parent_cap_id" in keys else None,
-            delegation_depth=int(row["delegation_depth"]) if "delegation_depth" in keys else 0,
-            max_delegation_depth=(
-                int(row["max_delegation_depth"])
-                if "max_delegation_depth" in keys and row["max_delegation_depth"] is not None
-                else None
-            ),
-            uses_remaining=row["uses_remaining"] if "uses_remaining" in keys else None,
-            status=(
-                CapabilityStatus(row["status"])
-                if "status" in keys
-                else (CapabilityStatus.REVOKED if bool(row["revoked"]) else CapabilityStatus.ACTIVE)
-            ),
-            metadata=loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
-        )
+        with _persisted_model_decode(f"capability {row['cap_id']}"):
+            keys = set(row.keys())
+            return Capability(
+                cap_id=row["cap_id"],
+                subject=row["subject"],
+                resource=row["resource"],
+                rights=set(loads(row["rights_json"], [])),
+                constraints=loads(row["constraints_json"], {}),
+                issued_by=row["issued_by"],
+                issued_at=row["issued_at"],
+                expires_at=row["expires_at"],
+                delegable=bool(row["delegable"]),
+                revocable=bool(row["revocable"]),
+                effect=CapabilityEffect(row["effect"]) if "effect" in keys else CapabilityEffect.ALLOW,
+                issuer_cap_id=row["issuer_cap_id"] if "issuer_cap_id" in keys else None,
+                parent_cap_id=row["parent_cap_id"] if "parent_cap_id" in keys else None,
+                delegation_depth=int(row["delegation_depth"]) if "delegation_depth" in keys else 0,
+                max_delegation_depth=(
+                    int(row["max_delegation_depth"])
+                    if "max_delegation_depth" in keys and row["max_delegation_depth"] is not None
+                    else None
+                ),
+                uses_remaining=row["uses_remaining"] if "uses_remaining" in keys else None,
+                status=(
+                    CapabilityStatus(row["status"])
+                    if "status" in keys
+                    else (CapabilityStatus.REVOKED if bool(row["revoked"]) else CapabilityStatus.ACTIVE)
+                ),
+                metadata=loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
+            )
 
     def _row_to_audit(self, row: sqlite3.Row) -> AuditRecord:
         return AuditRecord(
@@ -2465,21 +2538,22 @@ class SQLiteStore:
         )
 
     def _row_to_external_effect(self, row: sqlite3.Row) -> ExternalEffectRecord:
-        return ExternalEffectRecord(
-            effect_id=row["effect_id"],
-            record_id=row["record_id"],
-            event_id=row["event_id"],
-            pid=row["pid"],
-            provider=row["provider"],
-            operation=row["operation"],
-            target=row["target"],
-            rollback_class=ExternalEffectRollbackClass(row["rollback_class"]),
-            rollback_status=ExternalEffectRollbackStatus(row["rollback_status"]),
-            state_mutation=bool(row["state_mutation"]),
-            information_flow=bool(row["information_flow"]),
-            provider_metadata=loads(row["provider_metadata_json"], {}),
-            created_at=row["created_at"],
-        )
+        with _persisted_model_decode(f"external effect {row['effect_id']}"):
+            return ExternalEffectRecord(
+                effect_id=row["effect_id"],
+                record_id=row["record_id"],
+                event_id=row["event_id"],
+                pid=row["pid"],
+                provider=row["provider"],
+                operation=row["operation"],
+                target=row["target"],
+                rollback_class=ExternalEffectRollbackClass(row["rollback_class"]),
+                rollback_status=ExternalEffectRollbackStatus(row["rollback_status"]),
+                state_mutation=bool(row["state_mutation"]),
+                information_flow=bool(row["information_flow"]),
+                provider_metadata=loads(row["provider_metadata_json"], {}),
+                created_at=row["created_at"],
+            )
 
     def _row_to_checkpoint(self, row: sqlite3.Row) -> Checkpoint:
         keys = set(row.keys())
@@ -2494,17 +2568,18 @@ class SQLiteStore:
         )
 
     def _row_to_human_request(self, row: sqlite3.Row) -> HumanRequest:
-        return HumanRequest(
-            request_id=row["request_id"],
-            pid=row["pid"],
-            human=row["human"],
-            payload=loads(row["payload_json"], {}),
-            status=HumanRequestStatus(row["status"]),
-            decision=loads(row["decision_json"]) if row["decision_json"] else None,
-            blocking=bool(row["blocking"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
+        with _persisted_model_decode(f"human request {row['request_id']}"):
+            return HumanRequest(
+                request_id=row["request_id"],
+                pid=row["pid"],
+                human=row["human"],
+                payload=loads(row["payload_json"], {}),
+                status=HumanRequestStatus(row["status"]),
+                decision=loads(row["decision_json"]) if row["decision_json"] else None,
+                blocking=bool(row["blocking"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
 
     def _row_to_llm_call(self, row: sqlite3.Row) -> LLMCallRecord:
         return LLMCallRecord(
@@ -2547,71 +2622,74 @@ class SQLiteStore:
         }
 
     def _row_to_object_task(self, row: sqlite3.Row) -> ObjectTask:
-        raw_notification = loads(row["notification_json"], {})
-        if isinstance(raw_notification.get("status"), str):
-            raw_notification["status"] = ObjectTaskNotificationStatus(raw_notification["status"])
-        notification = ObjectTaskNotification(**raw_notification)
-        raw_owner_watch = loads(row["owner_watch_json"], {})
-        owner_watch = ObjectTaskOwnerWatch(**raw_owner_watch)
-        return ObjectTask(
-            task_id=row["task_id"],
-            owner_oid=row["owner_oid"],
-            creator_pid=row["creator_pid"],
-            runner_pid=row["runner_pid"],
-            tool=row["tool"],
-            tool_id=row["tool_id"],
-            status=ObjectTaskStatus(row["status"]),
-            notification=notification,
-            owner_watch=owner_watch,
-            result_oid=row["result_oid"],
-            error=row["error"],
-            wait=loads(row["wait_json"], {}),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            started_at=row["started_at"],
-            completed_at=row["completed_at"],
-        )
+        with _persisted_model_decode(f"object task {row['task_id']}"):
+            raw_notification = loads(row["notification_json"], {})
+            if isinstance(raw_notification.get("status"), str):
+                raw_notification["status"] = ObjectTaskNotificationStatus(raw_notification["status"])
+            notification = ObjectTaskNotification(**raw_notification)
+            raw_owner_watch = loads(row["owner_watch_json"], {})
+            owner_watch = ObjectTaskOwnerWatch(**raw_owner_watch)
+            return ObjectTask(
+                task_id=row["task_id"],
+                owner_oid=row["owner_oid"],
+                creator_pid=row["creator_pid"],
+                runner_pid=row["runner_pid"],
+                tool=row["tool"],
+                tool_id=row["tool_id"],
+                status=ObjectTaskStatus(row["status"]),
+                notification=notification,
+                owner_watch=owner_watch,
+                result_oid=row["result_oid"],
+                error=row["error"],
+                wait=loads(row["wait_json"], {}),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+            )
 
     def _llm_call_limit(self, limit: int | None) -> int:
-        selected = _LLM_DEFAULTS.call_record_list_limit if limit is None else int(limit)
+        selected = self.config.llm.call_record_list_limit if limit is None else int(limit)
         if selected <= 0:
             raise ValidationError("llm call limit must be positive")
-        if selected > _LLM_DEFAULTS.call_record_hard_limit:
-            raise ValidationError(f"llm call limit exceeds hard cap {_LLM_DEFAULTS.call_record_hard_limit}")
+        if selected > self.config.llm.call_record_hard_limit:
+            raise ValidationError(f"llm call limit exceeds hard cap {self.config.llm.call_record_hard_limit}")
         return selected
 
     def _row_to_process_message(self, row: sqlite3.Row) -> ProcessMessage:
-        return ProcessMessage(
-            message_id=row["message_id"],
-            sender=row["sender"],
-            recipient_pid=row["recipient_pid"],
-            kind=ProcessMessageKind(row["kind"]),
-            channel=row["channel"] if "channel" in row.keys() else "default",
-            correlation_id=row["correlation_id"] if "correlation_id" in row.keys() else None,
-            reply_to=row["reply_to"] if "reply_to" in row.keys() else None,
-            subject=row["subject"],
-            body=row["body"],
-            payload=loads(row["payload_json"], {}),
-            status=ProcessMessageStatus(row["status"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            acked_at=row["acked_at"],
-        )
+        with _persisted_model_decode(f"process message {row['message_id']}"):
+            return ProcessMessage(
+                message_id=row["message_id"],
+                sender=row["sender"],
+                recipient_pid=row["recipient_pid"],
+                kind=ProcessMessageKind(row["kind"]),
+                channel=row["channel"] if "channel" in row.keys() else "default",
+                correlation_id=row["correlation_id"] if "correlation_id" in row.keys() else None,
+                reply_to=row["reply_to"] if "reply_to" in row.keys() else None,
+                subject=row["subject"],
+                body=row["body"],
+                payload=loads(row["payload_json"], {}),
+                status=ProcessMessageStatus(row["status"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                acked_at=row["acked_at"],
+            )
 
     def _row_to_tool_candidate(self, row: sqlite3.Row) -> ToolCandidate:
-        return ToolCandidate(
-            candidate_id=row["candidate_id"],
-            pid=row["pid"],
-            spec=self._dict_to_tool_spec(loads(row["spec_json"], {})),
-            source_code=row["source_code"],
-            tests=loads(row["tests_json"], []),
-            requested_capabilities=loads(row["requested_capabilities_json"], []),
-            status=ToolCandidateStatus(row["status"]),
-            validation=loads(row["validation_json"]) if row["validation_json"] else None,
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            registered_tool_id=row["registered_tool_id"] if "registered_tool_id" in row.keys() else None,
-        )
+        with _persisted_model_decode(f"tool candidate {row['candidate_id']}"):
+            return ToolCandidate(
+                candidate_id=row["candidate_id"],
+                pid=row["pid"],
+                spec=self._dict_to_tool_spec(loads(row["spec_json"], {})),
+                source_code=row["source_code"],
+                tests=loads(row["tests_json"], []),
+                requested_capabilities=loads(row["requested_capabilities_json"], []),
+                status=ToolCandidateStatus(row["status"]),
+                validation=loads(row["validation_json"]) if row["validation_json"] else None,
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                registered_tool_id=row["registered_tool_id"] if "registered_tool_id" in row.keys() else None,
+            )
 
     def _skill_row_metadata(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -2631,37 +2709,40 @@ class SQLiteStore:
         }
 
     def _dict_to_jsonrpc_endpoint(self, data: dict[str, Any]) -> JsonRpcEndpointSpec:
-        return JsonRpcEndpointSpec(
-            schema_version=int(data.get("schema_version", 1)),
-            endpoint_id=data["endpoint_id"],
-            url=data["url"],
-            headers={
-                str(name): JsonRpcHeaderSpec(
-                    env=str(value["env"]),
-                    prefix=str(value.get("prefix", "")),
-                    suffix=str(value.get("suffix", "")),
-                )
-                for name, value in dict(data.get("headers") or {}).items()
-            },
-            methods=[
-                JsonRpcMethodSpec(
-                    method_id=item["method_id"],
-                    rpc_method=item["rpc_method"],
-                    right=item["right"],
-                    rollback_class=item["rollback_class"],
-                    rollback_status=item.get("rollback_status"),
-                    state_mutation=bool(item["state_mutation"]),
-                    information_flow=bool(item["information_flow"]),
-                    params_schema=dict(item.get("params_schema") or {}),
-                    metadata=dict(item.get("metadata") or {}),
-                )
-                for item in list(data.get("methods") or [])
-            ],
-            timeout_s=float(data["timeout_s"]),
-            max_request_bytes=int(data["max_request_bytes"]),
-            max_response_bytes=int(data["max_response_bytes"]),
-            metadata=dict(data.get("metadata") or {}),
-        )
+        with _persisted_model_decode(
+            f"JSON-RPC endpoint {data.get('endpoint_id', '<unknown>') if isinstance(data, dict) else '<unknown>'}"
+        ):
+            return JsonRpcEndpointSpec(
+                schema_version=int(data.get("schema_version", 1)),
+                endpoint_id=data["endpoint_id"],
+                url=data["url"],
+                headers={
+                    str(name): JsonRpcHeaderSpec(
+                        env=str(value["env"]),
+                        prefix=str(value.get("prefix", "")),
+                        suffix=str(value.get("suffix", "")),
+                    )
+                    for name, value in dict(data.get("headers") or {}).items()
+                },
+                methods=[
+                    JsonRpcMethodSpec(
+                        method_id=item["method_id"],
+                        rpc_method=item["rpc_method"],
+                        right=item["right"],
+                        rollback_class=item["rollback_class"],
+                        rollback_status=item.get("rollback_status"),
+                        state_mutation=_persisted_bool(item["state_mutation"], "state_mutation"),
+                        information_flow=_persisted_bool(item["information_flow"], "information_flow"),
+                        params_schema=dict(item.get("params_schema") or {}),
+                        metadata=dict(item.get("metadata") or {}),
+                    )
+                    for item in list(data.get("methods") or [])
+                ],
+                timeout_s=float(data["timeout_s"]),
+                max_request_bytes=int(data["max_request_bytes"]),
+                max_response_bytes=int(data["max_response_bytes"]),
+                metadata=dict(data.get("metadata") or {}),
+            )
 
     def _dict_to_skill_package(self, data: dict[str, Any]) -> SkillPackage:
         return SkillPackage(

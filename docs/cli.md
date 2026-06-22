@@ -135,8 +135,10 @@ message-receive replay semantics, currently `receive_process_messages`.
 Running synchronous side-effect tools are not force-cancelled because Python
 cannot safely stop their worker thread after side effects may have started. A
 one-shot CLI invocation cannot keep detached in-memory tasks alive after the
-CLI Runtime shuts down; long-running ObjectTask supervision is intended for a
-live Runtime such as the GUI server or an embedded host process.
+CLI Runtime shuts down, so `object-task start` requires `--wait`. Long-running
+ObjectTask supervision is intended for a live Runtime such as the GUI server or
+an embedded host process; use `object-task list|get|wait|cancel|watch-owner` to
+inspect or control tasks owned by such a live runtime.
 
 ## LLM Calls
 

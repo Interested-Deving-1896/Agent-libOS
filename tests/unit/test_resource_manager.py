@@ -6,10 +6,28 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage
-from agent_libos.models.exceptions import ResourceLimitExceeded
+from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 
 
 class TestResourceManager:
+    def test_resource_models_reject_non_finite_numbers(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            ResourceBudget(max_tool_calls=float("inf"))
+        with pytest.raises(ValueError, match="finite"):
+            ResourceUsage(tool_calls=float("nan"))
+
+    def test_resource_manager_rejects_mutated_non_finite_usage(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="finite resource usage")
+            usage = ResourceUsage(tool_calls=1)
+            usage.tool_calls = float("nan")
+
+            with pytest.raises(ValidationError, match="finite"):
+                runtime.resources.charge(pid, usage, source="test")
+        finally:
+            runtime.close()
+
     def test_hierarchical_charge_updates_child_and_parent_usage(self) -> None:
         runtime = Runtime.open("local")
         try:

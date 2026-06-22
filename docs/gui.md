@@ -34,10 +34,17 @@ Python GUI server
   -> never grants capability by GUI visibility
 ```
 
-The GUI server is not a new security boundary. It is a local control surface
-over the same primitives, Capability checks, human approval flow, events,
-and audit records used by the CLI. Its Python entrypoint lives under
+The GUI server is not a new security boundary. It is a local admin control
+surface over the same primitives, Capability checks, human approval flow,
+events, and audit records used by the CLI. Its Python entrypoint lives under
 `agent_libos.api.gui` with the CLI because both are host-facing API surfaces.
+Only a bearer token holder on the same machine can use it; CORS is limited to
+loopback HTTP(S) browser origins and does not accept `Origin: null`.
+
+For endpoints that accept an optional `actor`, omitting `actor` runs in GUI
+admin mode. Supplying `actor` opts into process-authority mode and requires
+that process to hold the capability needed by the underlying primitive, keeping
+audit attribution aligned with the capability decision.
 
 Closing the GUI server calls `Runtime.shutdown()`, which shuts down the host
 control surface and closes the owned runtime resources, including the SQLite
@@ -174,8 +181,10 @@ Important endpoints:
   `POST /api/object-tasks/{task_id}/cancel|wait|watch-owner`
   (`POST /api/object-tasks/start` accepts `owner_watch`, `watch_events`,
   `watch_channel`, and `watch_kind` for owner-change runner messages; the
-  `watch-owner` endpoint updates the same fields for an active task.)
-- `POST /api/human-requests/{request_id}/respond`
+  `watch-owner` endpoint updates the same fields for an active task. Wait
+  requests are bounded by the GUI object-task wait timeout defaults.)
+- `POST /api/human-requests/{request_id}/respond` approves or rejects only
+  pending requests; terminal or cancelled requests return a conflict.
 - `GET/POST /api/checkpoints`, `/api/skills`, `/api/capabilities`,
   `/api/images`, `/api/jsonrpc`, and `/api/modules`
 

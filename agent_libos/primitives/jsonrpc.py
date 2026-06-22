@@ -162,10 +162,11 @@ class JsonRpcPrimitive:
         if require_capability and actor is not None:
             self.capabilities.require(actor, self.config.jsonrpc.registry_resource, CapabilityRight.READ)
         selected_limit = self.config.jsonrpc.list_limit if limit is None else limit
-        return [
-            self._endpoint_to_json(spec, metadata, include_sensitive_fields=False)
-            for spec, metadata in self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit)
-        ]
+        endpoints: list[dict[str, Any]] = []
+        for spec, metadata in self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit):
+            self._validate_endpoint(spec)
+            endpoints.append(self._endpoint_to_json(spec, metadata, include_sensitive_fields=False))
+        return endpoints
 
     def inspect_endpoint(
         self,
@@ -906,7 +907,9 @@ class JsonRpcPrimitive:
         found = self.store.get_jsonrpc_endpoint(endpoint_id)
         if found is None:
             raise NotFound(f"JSON-RPC endpoint not found: {endpoint_id}")
-        return found
+        spec, metadata = found
+        self._validate_endpoint(spec)
+        return spec, metadata
 
     def _endpoint_to_json(
         self,

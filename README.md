@@ -123,8 +123,17 @@ Run tests:
 ```bash
 uv run python scripts/test_matrix.py --lane unit
 uv run python scripts/test_matrix.py --lane security
+uv run python scripts/test_matrix.py --lane runtime --workers 4
 uv run python scripts/check_test_invariants.py
 ```
+
+Python test lanes run serially by default for easy failure diagnosis. Add
+`--workers N` (or `--workers auto`) to use pytest-xdist parallel workers for
+`unit`, `runtime`, `security`, `self-evolution`, `providers`, `benchmark`, or
+`all`. The GUI lane builds shared frontend artifacts and should be run
+separately. Pytest removes files created under ignored `agent_outputs/` at the
+end of a test session; use `--keep-agent-outputs` when debugging generated
+files.
 
 Run the deterministic local demo:
 
@@ -318,21 +327,25 @@ Run the standard local checks:
 ```bash
 uv sync --frozen --all-groups
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
-uv run python scripts/test_matrix.py --lane all
+uv run python scripts/test_matrix.py --lane all --workers 4
 uv run python scripts/check_test_invariants.py
 uv run python scripts/test_matrix.py --lane gui
 git diff --check
 ```
 
-Deno is optional for the Python unit suite. Install `deno` or set
-`agent_libos.config.DEFAULT_CONFIG.tools.deno_executable` if you want to
-validate and run real Deno/TypeScript JIT tools.
+Use `uv run python scripts/clean_agent_outputs.py` to dry-run cleanup of
+already accumulated local outputs, and add `--yes` to delete them.
+
+Deno is optional for the Python unit suite. Install `deno` or pass a runtime
+config built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))` if
+you want to validate and run real Deno/TypeScript JIT tools from another binary.
 
 Runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`, including
 scheduler quanta, process budgets, image ids, workspace namespace, tool limits,
 filesystem/Object Memory size limits, Deno sandbox limits, JSR import
 allowlists, shell policy lists, launcher presets, Skill defaults, and
-checkpoint defaults.
+checkpoint defaults. `AgentLibOSConfig` is validated at construction time, so
+invalid or inverted bounds fail before a Runtime starts.
 
 Add runtime dependencies with `uv add <package>` and development dependencies
 with `uv add --dev <package>`. Commit both `pyproject.toml` and `uv.lock` after

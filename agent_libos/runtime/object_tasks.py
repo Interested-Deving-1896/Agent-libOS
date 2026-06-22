@@ -12,6 +12,7 @@ from agent_libos.models import (
     CapabilitySpec,
     EventPriority,
     EventType,
+    HumanRequestStatus,
     ObjectHandle,
     ObjectRight,
     ObjectTask,
@@ -290,6 +291,12 @@ class ObjectTaskManager:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         while True:
             task = self.get(task_id, actor_pid=actor_pid)
+            if (
+                task.status == ObjectTaskStatus.WAITING_HUMAN
+                and not self._has_active_future(task.task_id)
+                and self._schedule_waiting_human_resume(task)
+            ):
+                continue
             if task.status in _TERMINAL_STATUSES or (
                 task.status in {
                     ObjectTaskStatus.WAITING_HUMAN,
@@ -355,12 +362,18 @@ class ObjectTaskManager:
         task = self._get(task_id)
         with self._lock:
             args = dict(self._pending_args.get(task_id, {}))
+        context_metadata = self._context_metadata_for_resume(task)
         try:
             task = self._mark_running(task)
             if task.status != ObjectTaskStatus.RUNNING:
                 return
             self._set_runner_status(str(task.runner_pid), ProcessStatus.RUNNING, "object task running")
-            result = await self.runtime.tools.acall(str(task.runner_pid), task.tool, args)
+            result = await self.runtime.tools.acall(
+                str(task.runner_pid),
+                task.tool,
+                args,
+                context_metadata=context_metadata,
+            )
             latest_process = self.runtime.process.get(str(task.runner_pid))
             latest_task = self.runtime.store.get_object_task(task_id)
             if latest_task is None or latest_task.status in _TERMINAL_STATUSES:
@@ -579,6 +592,61 @@ class ObjectTaskManager:
                 decision={"status": latest.status.value, "filters": latest.wait.get("filters")},
             )
             self._schedule_task_locked(task_id)
+
+    def _schedule_waiting_human_resume(self, task: ObjectTask) -> bool:
+        request_id = str(task.wait.get("request_id") or "")
+        if not request_id:
+            self._mark_failed(task.task_id, "object task waiting_human state is missing request_id")
+            self._cleanup_task_state(task.task_id)
+            return True
+        try:
+            request = self.runtime.human.get(request_id)
+        except Exception as exc:
+            self._mark_failed(task.task_id, str(exc))
+            self._cleanup_task_state(task.task_id)
+            return True
+        if request.status == HumanRequestStatus.PENDING:
+            return False
+        if request.status == HumanRequestStatus.APPROVED or (
+            task.tool == "request_permission" and request.status == HumanRequestStatus.REJECTED
+        ):
+            with self._lock:
+                latest = self.runtime.store.get_object_task(task.task_id)
+                if latest is None or latest.status != ObjectTaskStatus.WAITING_HUMAN:
+                    return False
+                future = self._futures.get(task.task_id)
+                if future is not None and not future.done():
+                    return False
+                if task.task_id not in self._pending_args:
+                    self.runtime.audit.record(
+                        actor="object_task",
+                        action="object_task.human_resume_missing_pending",
+                        target=f"object_task:{task.task_id}",
+                        decision={"request_id": request_id, "status": request.status.value},
+                    )
+                    return False
+                self.runtime.audit.record(
+                    actor="object_task",
+                    action="object_task.human_resume",
+                    target=f"object_task:{task.task_id}",
+                    decision={"request_id": request_id, "status": request.status.value},
+                )
+                self._schedule_task_locked(task.task_id)
+            return True
+        self._mark_failed(
+            task.task_id,
+            f"human request was not approved: {request_id} status={request.status.value}",
+        )
+        self._cleanup_task_state(task.task_id)
+        return True
+
+    def _context_metadata_for_resume(self, task: ObjectTask) -> dict[str, Any]:
+        if task.status != ObjectTaskStatus.WAITING_HUMAN:
+            return {}
+        request_id = task.wait.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return {}
+        return {"human_resume_request_id": request_id}
 
     def _can_resume_waiting_message(self, task: ObjectTask) -> bool:
         return task.tool in _MESSAGE_REPLAY_SAFE_TOOLS

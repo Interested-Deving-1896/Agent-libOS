@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+import math
 from typing import Any
 
 from agent_libos.models import AgentProcess, EventPriority, EventType, ProcessStatus, ResourceBudget, ResourceReservation, ResourceUsage
@@ -575,6 +576,8 @@ class ResourceManager:
             value = getattr(usage, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValidationError(f"resource usage {name} must be numeric")
+            if not math.isfinite(float(value)):
+                raise ValidationError(f"resource usage {name} must be finite")
             if value < 0:
                 raise ValidationError(f"resource usage {name} cannot be negative")
 

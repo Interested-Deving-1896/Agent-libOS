@@ -8,14 +8,13 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults
 from agent_libos.models.exceptions import LibOSError
 from agent_libos.utils.serde import to_jsonable
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _API_MODES = {"auto", "responses", "chat"}
-_LLM_DEFAULTS = DEFAULT_CONFIG.llm
 
 
 class LLMError(LibOSError):
@@ -40,17 +39,22 @@ class LLMClient:
     base_url: str | None = None
     model: str | None = None
     api_key: str | None = None
-    timeout: float = _LLM_DEFAULTS.timeout_s
-    max_retries: int = _LLM_DEFAULTS.max_retries
-    api_mode: Literal["auto", "responses", "chat"] = _LLM_DEFAULTS.api_mode
-    store: bool = _LLM_DEFAULTS.store
+    timeout: float | None = None
+    max_retries: int | None = None
+    api_mode: Literal["auto", "responses", "chat"] | None = None
+    store: bool | None = None
     reasoning_effort: str | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
     allow_custom_base_url: bool = False
+    defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
     _client: Any | None = field(default=None, init=False, repr=False)
     _async_client: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self.timeout = self.defaults.timeout_s if self.timeout is None else self.timeout
+        self.max_retries = self.defaults.max_retries if self.max_retries is None else self.max_retries
+        self.api_mode = self.defaults.api_mode if self.api_mode is None else self.api_mode
+        self.store = self.defaults.store if self.store is None else self.store
         self._validate_base_url_policy()
 
     @classmethod
@@ -58,13 +62,15 @@ class LLMClient:
         cls,
         env_path: str | Path | None = None,
         *,
+        config: AgentLibOSConfig | LLMDefaults | None = None,
         allow_custom_base_url: bool | None = None,
     ) -> "LLMClient":
+        defaults = _llm_defaults(config)
         env = dict(os.environ)
         if env_path is not None:
             for key, value in read_dotenv(env_path).items():
                 env.setdefault(key, value)
-        api_mode = env.get("OPENAI_API_MODE", "auto").strip().lower()
+        api_mode = env.get("OPENAI_API_MODE", defaults.api_mode).strip().lower()
         if api_mode not in _API_MODES:
             raise LLMError(f"OPENAI_API_MODE must be one of {sorted(_API_MODES)}, got {api_mode!r}")
         selected_allow_custom_base_url = (
@@ -76,13 +82,14 @@ class LLMClient:
             base_url=env.get("OPENAI_BASE_URL"),
             model=env.get("OPENAI_LANGUAGE_MODEL") or env.get("OPENAI_MODEL"),
             api_key=env.get("OPENAI_API_KEY"),
-            timeout=_float_env_from(env, "OPENAI_TIMEOUT", default=_LLM_DEFAULTS.timeout_s),
-            max_retries=_int_env_from(env, "OPENAI_MAX_RETRIES", default=_LLM_DEFAULTS.max_retries),
+            timeout=_float_env_from(env, "OPENAI_TIMEOUT", default=defaults.timeout_s),
+            max_retries=_int_env_from(env, "OPENAI_MAX_RETRIES", default=defaults.max_retries),
             api_mode=api_mode,  # type: ignore[arg-type]
-            store=_bool_env_from(env, "OPENAI_STORE", default=_LLM_DEFAULTS.store),
+            store=_bool_env_from(env, "OPENAI_STORE", default=defaults.store),
             reasoning_effort=_optional_env_from(env, "OPENAI_REASONING_EFFORT"),
             verbosity=_verbosity_env_from(env, "OPENAI_VERBOSITY"),
             allow_custom_base_url=selected_allow_custom_base_url,
+            defaults=defaults,
         )
 
     def close(self) -> None:
@@ -102,8 +109,8 @@ class LLMClient:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        temperature: float = _LLM_DEFAULTS.temperature,
-        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         json_mode: bool = True,
     ) -> str:
         return self.complete_with_metadata(
@@ -116,8 +123,8 @@ class LLMClient:
     def complete_with_metadata(
         self,
         messages: list[dict[str, Any]],
-        temperature: float = _LLM_DEFAULTS.temperature,
-        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         json_mode: bool = True,
     ) -> LLMCompletion:
         return _run_sync(
@@ -132,8 +139,8 @@ class LLMClient:
     async def acomplete(
         self,
         messages: list[dict[str, Any]],
-        temperature: float = _LLM_DEFAULTS.temperature,
-        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         json_mode: bool = True,
     ) -> str:
         return (
@@ -148,15 +155,15 @@ class LLMClient:
     async def acomplete_with_metadata(
         self,
         messages: list[dict[str, Any]],
-        temperature: float = _LLM_DEFAULTS.temperature,
-        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         json_mode: bool = True,
     ) -> LLMCompletion:
         selected_messages = self._messages_with_json_instruction(messages) if json_mode else messages
         completion = await self._complete_without_tools(
             messages=selected_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            temperature=self._temperature(temperature),
+            max_tokens=self._max_tokens(max_tokens),
             json_mode=json_mode,
         )
         if not completion.content:
@@ -167,8 +174,8 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        temperature: float = _LLM_DEFAULTS.temperature,
-        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_action(
@@ -183,16 +190,18 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        temperature: float = _LLM_DEFAULTS.temperature,
-        max_tokens: int = _LLM_DEFAULTS.max_tokens,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> LLMCompletion:
+        selected_temperature = self._temperature(temperature)
+        selected_max_tokens = self._max_tokens(max_tokens)
         if self._use_responses_api():
             try:
-                return await self._responses_complete_action(messages, tools, temperature, max_tokens)
+                return await self._responses_complete_action(messages, tools, selected_temperature, selected_max_tokens)
             except LLMError as exc:
-                if self.api_mode != "auto" or not _should_fallback_to_chat(exc.__cause__ or exc):
+                if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
-        return await self._chat_complete_action(messages, tools, temperature, max_tokens)
+        return await self._chat_complete_action(messages, tools, selected_temperature, selected_max_tokens)
 
     async def _complete_without_tools(
         self,
@@ -205,7 +214,7 @@ class LLMClient:
             try:
                 return await self._responses_complete(messages, temperature, max_tokens, json_mode)
             except LLMError as exc:
-                if self.api_mode != "auto" or not _should_fallback_to_chat(exc.__cause__ or exc):
+                if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
         return await self._chat_complete(messages, temperature, max_tokens, json_mode)
 
@@ -382,7 +391,7 @@ class LLMClient:
     async def _call_with_compatibility(self, create: Any, payload: dict[str, Any], api: str) -> Any:
         request = dict(payload)
         last_error: Exception | None = None
-        for _attempt in range(_LLM_DEFAULTS.compatibility_retry_attempts):
+        for _attempt in range(self.defaults.compatibility_retry_attempts):
             try:
                 return await create(**request)
             except Exception as exc:
@@ -532,6 +541,28 @@ class LLMClient:
             return False
         return True
 
+    def _temperature(self, value: float | None) -> float:
+        return self.defaults.temperature if value is None else value
+
+    def _max_tokens(self, value: int | None) -> int:
+        return self.defaults.max_tokens if value is None else value
+
+    def _should_fallback_to_chat(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        message = str(exc).lower()
+        if status_code in self.defaults.fallback_status_codes:
+            return True
+        return any(
+            fragment in message
+            for fragment in (
+                "responses",
+                "unknown url",
+                "unsupported endpoint",
+                "not found",
+                "invalid endpoint",
+            )
+        )
+
     @staticmethod
     def _with_enable_thinking(payload: dict[str, Any], enabled: bool) -> dict[str, Any]:
         retry = dict(payload)
@@ -565,12 +596,11 @@ class LLMClient:
             return "".join(_content_part_text(part) for part in content)
         return str(content)
 
-    @staticmethod
-    def _messages_with_json_instruction(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _messages_with_json_instruction(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if _messages_contain_json_instruction(messages):
             return messages
         new_messages = [dict(message) for message in messages]
-        json_instruction = _LLM_DEFAULTS.json_instruction
+        json_instruction = self.defaults.json_instruction
         for msg in new_messages:
             if msg.get("role") in {"system", "developer"}:
                 msg["content"] = str(msg.get("content", "")) + f" {json_instruction}"
@@ -602,6 +632,14 @@ def _responses_tools_from_chat_tools(tools: list[dict[str, Any]]) -> list[dict[s
     return converted
 
 
+def _llm_defaults(config: AgentLibOSConfig | LLMDefaults | None) -> LLMDefaults:
+    if config is None:
+        return DEFAULT_CONFIG.llm
+    if isinstance(config, LLMDefaults):
+        return config
+    return config.llm
+
+
 def _messages_to_responses_parts(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -628,22 +666,6 @@ def _is_openai_sdk_error(exc: Exception) -> bool:
         return False
     return isinstance(exc, OpenAIError)
 
-
-def _should_fallback_to_chat(exc: Exception) -> bool:
-    status_code = getattr(exc, "status_code", None)
-    message = str(exc).lower()
-    if status_code in _LLM_DEFAULTS.fallback_status_codes:
-        return True
-    return any(
-        fragment in message
-        for fragment in (
-            "responses",
-            "unknown url",
-            "unsupported endpoint",
-            "not found",
-            "invalid endpoint",
-        )
-    )
 
 
 def _is_openai_base_url(base_url: str) -> bool:

@@ -167,6 +167,34 @@ class TestCLIBuiltinCommand:
         assert result['owner_watch']['events'] == ['updated']
         assert result['result_oid'] is not None
 
+    def test_cli_object_task_start_requires_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+            cli_main([
+                'object-task',
+                'start',
+                '--pid',
+                'pid-1',
+                '--owner-oid',
+                'oid-1',
+                'get_working_directory',
+            ])
+
+        assert 'requires --wait' in str(raised.value)
+
+    def test_cli_object_task_wait_rejects_non_finite_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+            cli_main(['object-task', 'wait', 'task-1', '--timeout', 'nan'])
+
+        assert '--timeout must be a finite non-negative number' in str(raised.value)
+
     def test_cli_object_task_watch_owner_updates_existing_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')
         pid = runtime.process.spawn(image='base-agent:v0', goal='object task watch cli')

@@ -65,7 +65,7 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
         result = runtime.human.output(
             pid=ctx.pid,
             message=args.message,
-            human=_RUNTIME_DEFAULTS.default_human,
+            human=runtime.config.runtime.default_human,
             channel=args.channel,
         )
         return HumanOutputResult(**result)

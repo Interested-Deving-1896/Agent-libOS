@@ -42,7 +42,7 @@ class LLMProcessExecutor:
     def __init__(self, runtime: "Runtime", client: LLMClient | None = None, config: AgentLibOSConfig | None = None):
         self.runtime = runtime
         self.config = config or DEFAULT_CONFIG
-        self.client = client or LLMClient.from_env()
+        self.client = client or LLMClient.from_env(config=self.config)
         # Pending actions are held outside Object Memory because the process has
         # not received a tool result yet. The action is retried after the human
         # queue records a decision, without asking the model for a new action.
@@ -388,11 +388,18 @@ class LLMProcessExecutor:
 
         action = dict(pending["action"])
         self._pending_human_actions.pop(pid, None)
-        if request.status == HumanRequestStatus.APPROVED:
-            # Re-dispatch the exact same action. This preserves the original
-            # model decision and prevents hidden progress before approval.
+        if request.status == HumanRequestStatus.APPROVED or (
+            self._action_name(action) == "request_permission" and request.status == HumanRequestStatus.REJECTED
+        ):
+            # Re-dispatch the exact same action. The resume request id is scoped
+            # to this single tool call, so concurrent tool calls cannot observe
+            # another process' human decision.
             try:
-                result = await self.adispatch(pid, action)
+                result = await self.adispatch(
+                    pid,
+                    action,
+                    context_metadata={"human_resume_request_id": request_id},
+                )
             except HumanApprovalRequired as exc:
                 return self._wait_for_human_action(
                     pid=pid,
@@ -444,6 +451,9 @@ class LLMProcessExecutor:
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_human=True,
         )
+
+    def _action_name(self, action: dict[str, Any]) -> str:
+        return str(action.get("action") or action.get("tool") or action.get("name") or "")
 
     async def _resume_pending_wait_action(self, pid: str) -> dict[str, Any]:
         pending = self._pending_wait_actions[pid]
@@ -829,19 +839,32 @@ class LLMProcessExecutor:
         return 0
 
     async def _complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        kwargs = {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens}
         if hasattr(self.client, "acomplete_action"):
-            result = self.client.acomplete_action(messages, tools)
+            result = (
+                self.client.acomplete_action(messages, tools, **kwargs)
+                if isinstance(self.client, LLMClient)
+                else self.client.acomplete_action(messages, tools)
+            )
             if inspect.isawaitable(result):
                 return await result
             return result
+        if isinstance(self.client, LLMClient):
+            return await asyncio.to_thread(self.client.complete_action, messages, tools, **kwargs)
         return await asyncio.to_thread(self.client.complete_action, messages, tools)
 
-    def dispatch(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
+    def dispatch(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
         if notice := self._pre_tool_interrupt_notice(pid, name):
             return notice
-        result = self.runtime.tools.call(pid, name, args)
+        result = self.runtime.tools.call(pid, name, args, context_metadata=context_metadata)
         if result.result_handle is not None:
             self._add_to_view(pid, result.result_handle)
         post_tool_notice = self._notify_normal_messages(pid)
@@ -854,12 +877,18 @@ class LLMProcessExecutor:
             "message_notice": post_tool_notice,
         }
 
-    async def adispatch(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
+    async def adispatch(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
         if notice := self._pre_tool_interrupt_notice(pid, name):
             return notice
-        result = await self.runtime.tools.acall(pid, name, args)
+        result = await self.runtime.tools.acall(pid, name, args, context_metadata=context_metadata)
         if result.result_handle is not None:
             self._add_to_view(pid, result.result_handle)
         post_tool_notice = self._notify_normal_messages(pid)

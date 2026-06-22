@@ -175,14 +175,16 @@ Human-facing policy names are still used at prompts and CLI boundaries:
 - `ask_each_time` maps to `effect=ask`.
 - `allow_once` maps to `effect=allow, uses_remaining=1`.
 
-Model-facing `request_permission` is not a raw grant API. Before a request enters
-the human queue, the runtime canonicalizes the resource, normalizes rights,
-classifies risk, records resource scope, attaches any deterministic constraints,
-and shows the selected lease shape. Ordinary model requests cannot ask for broad
-high-risk authority such as `shell:*` execute or root/global filesystem write
-such as `filesystem:/:*` or `filesystem:*`. Workspace-level write
-(`filesystem:workspace:*`) can be approved by the human. Admin CLI and bootstrap
-paths can still issue broader policy explicitly, with audit.
+Model-facing `request_permission` is not a raw grant API. It first requires the
+caller to hold `human:<name>` write authority, then creates a blocking human
+request. Before a request enters the human queue, the runtime canonicalizes the
+resource, normalizes rights, classifies risk, records resource scope, attaches
+any deterministic constraints, and shows the selected lease shape. Ordinary
+model requests cannot ask for broad high-risk authority such as `shell:*`
+execute or root/global filesystem write such as `filesystem:/:*` or
+`filesystem:*`. Workspace-level write (`filesystem:workspace:*`) can be approved
+by the human. Admin CLI and bootstrap paths can still issue broader policy
+explicitly, with audit.
 
 When `ask_each_time` applies, the primitive creates a human approval request and
 waits inside the operation. The caller eventually receives either the final

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.machinery
 import importlib.util
 import json
 import re
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
@@ -19,6 +21,14 @@ from agent_libos.utils.yaml_loader import load_yaml_mapping
 _MODULE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
 _SYSCALL_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 _HEX_SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+_IMPORT_LOCK = threading.RLock()
+_MISSING_MODULE = object()
+
+
+class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
+    def get_code(self, fullname: str) -> Any:
+        source_bytes = self.get_data(self.path)
+        return self.source_to_code(source_bytes, self.path)
 
 
 class ModuleLoader:
@@ -134,11 +144,15 @@ class ModuleLoader:
 
     def import_entrypoint(self, source: ModuleSource) -> Any:
         module_ref, object_name = self._split_entrypoint(source.manifest.entrypoint)
-        if self._is_path_ref(module_ref):
-            module = self._import_file(Path(source.source_path), source.manifest.module_id)
-        else:
-            with self._temporary_sys_path(Path(source.manifest_path).parent):
-                module = importlib.import_module(module_ref)
+        with _IMPORT_LOCK:
+            if self._is_path_ref(module_ref):
+                module = self._import_file(Path(source.source_path), source.manifest.module_id, source.source_sha256)
+            else:
+                module = self._import_string_fresh(
+                    module_ref,
+                    Path(source.manifest_path).parent,
+                    Path(source.source_path),
+                )
         self._verify_imported_module_source(module, source)
         entrypoint = getattr(module, object_name, None)
         if not callable(entrypoint):
@@ -213,8 +227,8 @@ class ModuleLoader:
             source = (manifest_path.parent / module_ref).resolve()
             self._require_under(source, manifest_path.parent.resolve())
         else:
-            with self._temporary_sys_path(manifest_path.parent):
-                spec = importlib.util.find_spec(module_ref)
+            with _IMPORT_LOCK:
+                spec = self._find_spec_fresh(module_ref, manifest_path.parent)
             if spec is None or spec.origin is None:
                 raise NotFound(f"module entrypoint import not found: {module_ref}")
             source = Path(spec.origin).resolve()
@@ -241,15 +255,57 @@ class ModuleLoader:
         except ValueError as exc:
             raise ValidationError(f"module entrypoint path escapes manifest directory: {path}") from exc
 
-    def _import_file(self, path: Path, module_id: str) -> ModuleType:
-        module_name = f"_agent_libos_module_{hashlib.sha256((module_id + str(path)).encode('utf-8')).hexdigest()}"
-        spec = importlib.util.spec_from_file_location(module_name, path)
+    def _import_file(self, path: Path, module_id: str, source_sha256: str) -> ModuleType:
+        module_name = (
+            "_agent_libos_module_"
+            f"{hashlib.sha256((module_id + str(path) + source_sha256).encode('utf-8')).hexdigest()}"
+        )
+        return self._exec_source_module(module_name, path)
+
+    def _exec_source_module(self, module_name: str, path: Path) -> ModuleType:
+        loader = _FreshSourceLoader(module_name, str(path))
+        spec = importlib.util.spec_from_file_location(module_name, path, loader=loader)
         if spec is None or spec.loader is None:
             raise ValidationError(f"cannot import module entrypoint source: {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         return module
+
+    def _import_string_fresh(self, module_ref: str, manifest_dir: Path, source_path: Path) -> ModuleType:
+        names = self._module_prefixes(module_ref)
+        previous = {name: sys.modules.pop(name, _MISSING_MODULE) for name in names}
+        importlib.invalidate_caches()
+        try:
+            with self._temporary_sys_path(manifest_dir):
+                parent_name = module_ref.rpartition(".")[0]
+                if parent_name:
+                    importlib.import_module(parent_name)
+                return self._exec_source_module(module_ref, source_path)
+        finally:
+            for name in reversed(names):
+                sys.modules.pop(name, None)
+                old = previous[name]
+                if old is not _MISSING_MODULE:
+                    sys.modules[name] = old
+
+    def _find_spec_fresh(self, module_ref: str, manifest_dir: Path) -> Any:
+        names = self._module_prefixes(module_ref)
+        previous = {name: sys.modules.pop(name, _MISSING_MODULE) for name in names}
+        importlib.invalidate_caches()
+        try:
+            with self._temporary_sys_path(manifest_dir):
+                return importlib.util.find_spec(module_ref)
+        finally:
+            for name in reversed(names):
+                sys.modules.pop(name, None)
+                old = previous[name]
+                if old is not _MISSING_MODULE:
+                    sys.modules[name] = old
+
+    def _module_prefixes(self, module_ref: str) -> list[str]:
+        parts = [part for part in module_ref.split(".") if part]
+        return [".".join(parts[:index]) for index in range(1, len(parts) + 1)]
 
     def _verify_imported_module_source(self, module: ModuleType, source: ModuleSource) -> None:
         module_file = getattr(module, "__file__", None)
@@ -322,7 +378,17 @@ class ModuleLoader:
         return value.lower()
 
     def _sha256_file(self, path: Path) -> str:
-        return self._sha256_bytes(path.read_bytes())
+        size = path.stat().st_size
+        if size > self.config.modules.source_max_bytes:
+            raise ValidationError(
+                "module source exceeded "
+                f"source_max_bytes={self.config.modules.source_max_bytes}"
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _sha256_bytes(self, value: bytes) -> str:
         return hashlib.sha256(value).hexdigest()

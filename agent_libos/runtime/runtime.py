@@ -50,9 +50,6 @@ from agent_libos.tools.broker import ToolBroker
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
 
-_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
-
-
 class Runtime:
     """Composition root for Agent libOS.
 
@@ -79,6 +76,7 @@ class Runtime:
         )
         self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
         self.store = store
+        self.store.config = self.config
         self.audit = AuditManager(store)
         self.events = EventBus(store)
         self.resources = ResourceManager(store, self.audit, self.events)
@@ -116,6 +114,7 @@ class Runtime:
             human=self.human,
             provider=self.substrate.filesystem,
             resources=self.resources,
+            config=self.config,
         )
         self.shell = ShellAdapter(
             self.capability,
@@ -210,7 +209,7 @@ class Runtime:
     @classmethod
     def open(
         cls,
-        target: str | Path = _RUNTIME_DEFAULTS.local_store_target,
+        target: str | Path | None = None,
         substrate: ResourceProviderSubstrate | None = None,
         config: AgentLibOSConfig | None = None,
         module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
@@ -218,8 +217,9 @@ class Runtime:
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> "Runtime":
         selected_config = config or DEFAULT_CONFIG
-        store_target = ":memory:" if str(target) == selected_config.runtime.local_store_target else str(target)
-        store = SQLiteStore(store_target)
+        selected_target = selected_config.runtime.local_store_target if target is None else target
+        store_target = ":memory:" if str(selected_target) == selected_config.runtime.local_store_target else str(selected_target)
+        store = SQLiteStore(store_target, config=selected_config)
         try:
             return cls(
                 store,

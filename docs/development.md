@@ -17,9 +17,9 @@ Use frozen dependency resolution for artifact and CI-style checks:
 uv sync --frozen --all-groups
 ```
 
-Deno is optional for the default Python test suite. Install `deno` or configure
-`agent_libos.config.DEFAULT_CONFIG.tools.deno_executable` to validate and run
-real Deno/TypeScript JIT tools.
+Deno is optional for the default Python test suite. Install `deno` or pass a
+runtime config built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`
+to validate and run real Deno/TypeScript JIT tools from another binary.
 
 ## Standard Checks
 
@@ -38,6 +38,29 @@ Run all deterministic Python lanes:
 
 ```bash
 uv run python scripts/test_matrix.py --lane all
+```
+
+Use pytest-xdist workers for faster local Python feedback:
+
+```bash
+uv run python scripts/test_matrix.py --lane all --workers 4
+uv run python scripts/test_matrix.py --lane runtime --workers auto
+```
+
+`--workers` applies only to Python lanes. The default is serial execution, and
+the conservative parallel scheduler is `--dist loadfile`; use `--dist load` for
+finer-grained balancing when investigating local speed. Run the `gui` lane
+separately because it writes shared frontend build artifacts.
+
+Pytest cleans files created under the ignored `agent_outputs/` directory at the
+end of each test session, while preserving anything that existed before the
+session started. Use `--keep-agent-outputs` or set
+`AGENT_LIBOS_KEEP_AGENT_OUTPUTS=1` when debugging generated files. To inspect or
+clean already accumulated local output, run:
+
+```bash
+uv run python scripts/clean_agent_outputs.py
+uv run python scripts/clean_agent_outputs.py --yes
 ```
 
 Run a specific pytest lane with one of `unit`, `runtime`, `security`,
@@ -121,6 +144,8 @@ user data, object memory excerpts, and provider payloads in SQLite.
 ## Configuration Defaults
 
 Non-secret runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`.
+`AgentLibOSConfig` uses Pydantic dataclass validation and fails fast when
+numeric limits are negative, non-finite, inverted, or otherwise unsafe.
 
 Current default groups include:
 

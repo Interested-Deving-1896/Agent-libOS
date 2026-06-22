@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
+import math
 from typing import Literal
 
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass
+
 from agent_libos.models.capability import AuthorityRule
+
+_PYDANTIC_CONFIG = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
 ShellPolicyLevel = Literal[
     "always_deny",
@@ -13,14 +19,14 @@ ShellPolicyLevel = Literal[
 ]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ShellCommandRule:
     argv: tuple[str, ...]
     match: Literal["exact", "prefix"] = "exact"
     description: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class RuntimeDefaults:
     local_store_target: str = "local"
     runtime_db_filename: str = ".agent_libos.sqlite"
@@ -41,7 +47,7 @@ class RuntimeDefaults:
         return f"human:{self.default_human}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class GuiDefaults:
     """Local desktop console defaults.
 
@@ -54,9 +60,11 @@ class GuiDefaults:
     request_body_max_bytes: int = 1_048_576
     scheduler_shutdown_join_timeout_s: float = 2.0
     http_shutdown_delay_s: float = 0.2
+    object_task_wait_default_timeout_s: float = 30.0
+    object_task_wait_max_timeout_s: float = 300.0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class CapabilityDefaults:
     default_delegation_depth: int = 4
     max_rights_per_capability: int = 16
@@ -80,13 +88,13 @@ class CapabilityDefaults:
     trusted_issuer_prefixes: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class SchedulerDefaults:
     max_quanta: int | None = None
     poll_interval_s: float = 0.01
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ProcessDefaults:
     max_tool_calls: int = 256
     max_child_processes: int = 16
@@ -109,7 +117,7 @@ class ProcessDefaults:
     fork_min_child_processes: int = 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMDefaults:
     temperature: float = 0.2
     max_tokens: int = 65_536
@@ -129,7 +137,7 @@ class LLMDefaults:
     fallback_status_codes: tuple[int, ...] = (404, 405)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ToolDefaults:
     version: str = "1.0.0"
     default_timeout_s: float = 30.0
@@ -152,6 +160,9 @@ class ToolDefaults:
     message_read_limit: int = 100
     message_read_hard_limit: int = 1_000
     message_filter_ids_hard_limit: int = 1_000
+    human_request_payload_max_bytes: int = 131_072
+    human_output_max_chars: int = 32_000
+    human_request_list_limit: int = 1_000
     object_file_max_bytes: int = 1_048_576
     object_file_hard_limit_bytes: int = 10_485_760
     shell_timeout_s: float = 30.0
@@ -183,7 +194,7 @@ class ToolDefaults:
         return self.max_sleep_seconds + self.sleep_timeout_grace_s
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ShellDefaults:
     policy_capability_key: str = "shell_policy_level"
     policy_resource: str = "shell:*"
@@ -261,7 +272,7 @@ class ShellDefaults:
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class JsonRpcDefaults:
     registry_resource: str = "jsonrpc_endpoint:*"
     endpoint_id_max_chars: int = 96
@@ -280,7 +291,7 @@ class JsonRpcDefaults:
     audit_preview_chars: int = 512
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ImageDefaults:
     registry_resource: str = "image:*"
     id_max_chars: int = 128
@@ -305,7 +316,7 @@ class ImageDefaults:
     max_workspace_grants: int = 64
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ImageCommitDefaults:
     artifact_version: int = 1
     artifact_hard_limit_bytes: int = 16_777_216
@@ -316,7 +327,7 @@ class ImageCommitDefaults:
     metadata_preview_chars: int = 512
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ObjectMemoryDefaults:
     object_schema_version: str = "1"
     materialize_budget_tokens: int = 8_000
@@ -327,7 +338,7 @@ class ObjectMemoryDefaults:
     process_namespace_prefix: str = "process"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ObjectTaskDefaults:
     max_running_global: int = 16
     max_running_per_object: int = 4
@@ -337,7 +348,7 @@ class ObjectTaskDefaults:
     shutdown_join_timeout_s: float = 2.0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMContextDefaults:
     policy: str = "llm_context_object"
     schema_version: int = 1
@@ -345,7 +356,7 @@ class LLMContextDefaults:
     recent_event_limit: int = 20
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class CheckpointDefaults:
     snapshot_version: int = 1
     list_limit: int = 100
@@ -355,7 +366,7 @@ class CheckpointDefaults:
     auto_high_risk_checkpoint: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class SkillDefaults:
     schema_version: int = 1
     registry_resource: str = "skill:*"
@@ -391,7 +402,7 @@ class SkillDefaults:
         return self.skill_md_hard_limit_bytes
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ModuleDefaults:
     schema_version: int = 1
     manifest_paths: tuple[str, ...] = ()
@@ -399,6 +410,7 @@ class ModuleDefaults:
     trusted_sha256: tuple[str, ...] = ()
     manifest_max_bytes: int = 262_144
     manifest_hard_limit_bytes: int = 1_048_576
+    source_max_bytes: int = 1_048_576
     load_policy: Literal["fail", "warn"] = "fail"
     discover_limit: int = 100
     id_max_chars: int = 128
@@ -412,7 +424,7 @@ class ModuleDefaults:
     max_declared_startup_hooks: int = 64
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LauncherDefaults:
     permission_presets: tuple[str, ...] = ("read-only", "edit", "full")
     default_permission_preset: str = "edit"
@@ -421,7 +433,7 @@ class LauncherDefaults:
     full_preset: str = "full"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ScriptDefaults:
     ask_file_max_bytes: int = 65_536
     ask_file_max_quanta: int = 6
@@ -442,7 +454,7 @@ class ScriptDefaults:
     chat_quanta_overhead: int = 8
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class AgentLibOSConfig:
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
     gui: GuiDefaults = field(default_factory=GuiDefaults)
@@ -463,6 +475,408 @@ class AgentLibOSConfig:
     modules: ModuleDefaults = field(default_factory=ModuleDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)
     scripts: ScriptDefaults = field(default_factory=ScriptDefaults)
+
+    def __post_init__(self) -> None:
+        _validate_config(self)
+
+
+def _validate_config(config: AgentLibOSConfig) -> None:
+    runtime = config.runtime
+    for name in (
+        "local_store_target",
+        "runtime_db_filename",
+        "workspace_namespace",
+        "default_image_id",
+        "coding_image_id",
+        "default_human",
+        "terminal_channel",
+    ):
+        _require_non_empty(name, getattr(runtime, name))
+    _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
+    _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
+
+    gui = config.gui
+    _positive("gui.event_buffer_limit", gui.event_buffer_limit)
+    _positive("gui.request_body_max_bytes", gui.request_body_max_bytes)
+    _nonnegative("gui.scheduler_shutdown_join_timeout_s", gui.scheduler_shutdown_join_timeout_s)
+    _nonnegative("gui.http_shutdown_delay_s", gui.http_shutdown_delay_s)
+    _nonnegative("gui.object_task_wait_default_timeout_s", gui.object_task_wait_default_timeout_s)
+    _nonnegative("gui.object_task_wait_max_timeout_s", gui.object_task_wait_max_timeout_s)
+    _require_at_least(
+        "gui.object_task_wait_max_timeout_s",
+        gui.object_task_wait_max_timeout_s,
+        "gui.object_task_wait_default_timeout_s",
+        gui.object_task_wait_default_timeout_s,
+    )
+
+    capability = config.capability
+    _positive("capability.default_delegation_depth", capability.default_delegation_depth)
+    _positive("capability.max_rights_per_capability", capability.max_rights_per_capability)
+    _nonnegative("capability.max_constraints_bytes", capability.max_constraints_bytes)
+    _positive("capability.list_limit", capability.list_limit)
+    _nonnegative("capability.decision_explain_preview_chars", capability.decision_explain_preview_chars)
+    _require_non_empty_items("capability.trusted_issuers", capability.trusted_issuers)
+    _require_non_empty_items("capability.trusted_issuer_prefixes", capability.trusted_issuer_prefixes)
+
+    scheduler = config.scheduler
+    _positive_optional("scheduler.max_quanta", scheduler.max_quanta)
+    _positive("scheduler.poll_interval_s", scheduler.poll_interval_s)
+
+    process = config.process
+    _nonnegative_optional_fields(
+        "process",
+        process,
+        (
+            "max_tool_calls",
+            "max_child_processes",
+            "max_runtime_seconds",
+            "max_context_materialization_total_tokens",
+            "max_llm_calls",
+            "max_llm_total_tokens",
+            "max_subprocess_wall_seconds",
+            "max_subprocess_cpu_seconds",
+            "max_subprocess_memory_bytes",
+            "max_external_read_bytes",
+            "max_external_write_bytes",
+            "max_jsonrpc_bytes",
+            "max_deno_syscalls",
+        ),
+    )
+    _positive("process.max_context_materialization_tokens", process.max_context_materialization_tokens)
+    _require_non_empty("process.default_goal_text", process.default_goal_text)
+    _require_non_empty("process.default_working_directory", process.default_working_directory)
+    _positive("process.fork_budget_divisor", process.fork_budget_divisor)
+    _nonnegative("process.fork_min_tool_calls", process.fork_min_tool_calls)
+    _nonnegative("process.fork_min_child_processes", process.fork_min_child_processes)
+
+    llm = config.llm
+    _nonnegative("llm.temperature", llm.temperature)
+    _positive("llm.max_tokens", llm.max_tokens)
+    _positive("llm.timeout_s", llm.timeout_s)
+    _nonnegative("llm.max_retries", llm.max_retries)
+    _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)
+    _positive("llm.action_repair_attempts", llm.action_repair_attempts)
+    _nonnegative("llm.content_preview_chars", llm.content_preview_chars)
+    _nonnegative("llm.tool_arguments_preview_chars", llm.tool_arguments_preview_chars)
+    _nonnegative("llm.call_record_preview_chars", llm.call_record_preview_chars)
+    _positive("llm.call_record_list_limit", llm.call_record_list_limit)
+    _positive("llm.call_record_hard_limit", llm.call_record_hard_limit)
+    _require_at_least("llm.call_record_hard_limit", llm.call_record_hard_limit, "llm.call_record_list_limit", llm.call_record_list_limit)
+    _require_non_empty("llm.json_instruction", llm.json_instruction)
+    _require_status_codes("llm.fallback_status_codes", llm.fallback_status_codes)
+
+    tools = config.tools
+    _require_non_empty("tools.version", tools.version)
+    for name in (
+        "default_timeout_s",
+        "standard_timeout_s",
+        "interactive_timeout_s",
+        "shell_timeout_s",
+        "sandbox_timeout_s",
+        "jit_validation_timeout_s",
+        "deno_timeout_s",
+        "sleep_timeout_grace_s",
+    ):
+        _positive(f"tools.{name}", getattr(tools, name))
+    _nonnegative_fields(
+        "tools",
+        tools,
+        (
+            "tool_observability_preview_chars",
+            "max_sleep_seconds",
+        ),
+    )
+    for name in (
+        "tool_result_payload_hard_limit_bytes",
+        "filesystem_read_max_bytes",
+        "filesystem_read_hard_limit_bytes",
+        "directory_entry_limit",
+        "directory_entry_hard_limit",
+        "memory_payload_chars",
+        "memory_payload_hard_limit_chars",
+        "memory_payload_hard_limit_bytes",
+        "memory_append_entry_max_bytes",
+        "message_subject_max_chars",
+        "message_body_max_chars",
+        "message_payload_max_bytes",
+        "message_read_limit",
+        "message_read_hard_limit",
+        "message_filter_ids_hard_limit",
+        "human_request_payload_max_bytes",
+        "human_output_max_chars",
+        "human_request_list_limit",
+        "object_file_max_bytes",
+        "object_file_hard_limit_bytes",
+        "jit_source_max_chars",
+        "jit_tests_max_count",
+        "jit_test_case_max_bytes",
+        "deno_max_rpc_calls",
+        "deno_max_stdout_bytes",
+        "deno_max_stderr_bytes",
+        "static_tool_id_digest_chars",
+        "approval_preview_chars",
+    ):
+        _positive(f"tools.{name}", getattr(tools, name))
+    _require_non_empty("tools.default_text_encoding", tools.default_text_encoding)
+    _require_non_empty("tools.deno_executable", tools.deno_executable)
+    _require_non_empty("tools.clock_timezone", tools.clock_timezone)
+    _require_non_empty_items("tools.deno_jsr_allowlist", tools.deno_jsr_allowlist)
+    _require_at_least("tools.filesystem_read_hard_limit_bytes", tools.filesystem_read_hard_limit_bytes, "tools.filesystem_read_max_bytes", tools.filesystem_read_max_bytes)
+    _require_at_least("tools.directory_entry_hard_limit", tools.directory_entry_hard_limit, "tools.directory_entry_limit", tools.directory_entry_limit)
+    _require_at_least("tools.memory_payload_hard_limit_chars", tools.memory_payload_hard_limit_chars, "tools.memory_payload_chars", tools.memory_payload_chars)
+    _require_at_least("tools.message_read_hard_limit", tools.message_read_hard_limit, "tools.message_read_limit", tools.message_read_limit)
+    _require_at_least("tools.object_file_hard_limit_bytes", tools.object_file_hard_limit_bytes, "tools.object_file_max_bytes", tools.object_file_max_bytes)
+
+    shell = config.shell
+    _require_non_empty("shell.policy_capability_key", shell.policy_capability_key)
+    _require_non_empty("shell.policy_resource", shell.policy_resource)
+    _positive("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s)
+    for name in ("max_stdout_chars", "max_stderr_chars", "stdout_hard_limit_chars", "stderr_hard_limit_chars"):
+        _nonnegative(f"shell.{name}", getattr(shell, name))
+    _require_at_least("shell.stdout_hard_limit_chars", shell.stdout_hard_limit_chars, "shell.max_stdout_chars", shell.max_stdout_chars)
+    _require_at_least("shell.stderr_hard_limit_chars", shell.stderr_hard_limit_chars, "shell.max_stderr_chars", shell.max_stderr_chars)
+    _require_at_least("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s, "tools.shell_timeout_s", tools.shell_timeout_s)
+
+    jsonrpc = config.jsonrpc
+    for name in (
+        "registry_resource",
+        "endpoint_id_max_chars",
+        "method_id_max_chars",
+        "rpc_method_max_chars",
+        "header_name_max_chars",
+        "header_value_max_chars",
+        "manifest_max_bytes",
+        "timeout_s",
+        "timeout_hard_limit_s",
+        "max_request_bytes",
+        "max_response_bytes",
+        "max_request_hard_limit_bytes",
+        "max_response_hard_limit_bytes",
+        "list_limit",
+        "audit_preview_chars",
+    ):
+        _positive_or_non_empty(f"jsonrpc.{name}", getattr(jsonrpc, name))
+    _require_at_least("jsonrpc.timeout_hard_limit_s", jsonrpc.timeout_hard_limit_s, "jsonrpc.timeout_s", jsonrpc.timeout_s)
+    _require_at_least("jsonrpc.max_request_hard_limit_bytes", jsonrpc.max_request_hard_limit_bytes, "jsonrpc.max_request_bytes", jsonrpc.max_request_bytes)
+    _require_at_least("jsonrpc.max_response_hard_limit_bytes", jsonrpc.max_response_hard_limit_bytes, "jsonrpc.max_response_bytes", jsonrpc.max_response_bytes)
+
+    image = config.image
+    for name in (
+        "registry_resource",
+        "id_max_chars",
+        "name_max_chars",
+        "version_max_chars",
+        "manifest_hard_limit_bytes",
+        "structured_field_hard_limit_bytes",
+        "max_default_tools",
+        "max_required_capabilities",
+        "package_manifest_name",
+        "package_workspace_dir",
+        "package_tools_dir",
+        "package_resources_dir",
+        "materialized_workspace_root",
+        "package_manifest_max_bytes",
+        "package_manifest_hard_limit_bytes",
+        "package_file_max_bytes",
+        "package_max_bytes",
+        "package_max_files",
+        "prompt_max_chars",
+        "max_package_jit_tools",
+        "max_workspace_grants",
+    ):
+        _positive_or_non_empty(f"image.{name}", getattr(image, name))
+    _require_at_least("image.package_manifest_hard_limit_bytes", image.package_manifest_hard_limit_bytes, "image.package_manifest_max_bytes", image.package_manifest_max_bytes)
+    _require_at_least("image.package_max_bytes", image.package_max_bytes, "image.package_file_max_bytes", image.package_file_max_bytes)
+
+    image_commit = config.image_commit
+    for name in ("artifact_version", "artifact_hard_limit_bytes", "payload_capture_limit_bytes", "max_required_capabilities", "max_committed_tools", "max_committed_jit_sources", "metadata_preview_chars"):
+        _positive(f"image_commit.{name}", getattr(image_commit, name))
+    _require_at_least("image_commit.artifact_hard_limit_bytes", image_commit.artifact_hard_limit_bytes, "image_commit.payload_capture_limit_bytes", image_commit.payload_capture_limit_bytes)
+
+    memory = config.memory
+    _require_non_empty("memory.object_schema_version", memory.object_schema_version)
+    _positive("memory.materialize_budget_tokens", memory.materialize_budget_tokens)
+    _positive("memory.query_limit", memory.query_limit)
+    for name in ("context_policy", "metadata_sensitivity", "metadata_retention_policy", "process_namespace_prefix"):
+        _require_non_empty(f"memory.{name}", getattr(memory, name))
+
+    object_tasks = config.object_tasks
+    _positive("object_tasks.max_running_global", object_tasks.max_running_global)
+    _positive("object_tasks.max_running_per_object", object_tasks.max_running_per_object)
+    _require_at_least("object_tasks.max_running_global", object_tasks.max_running_global, "object_tasks.max_running_per_object", object_tasks.max_running_per_object)
+    _require_non_empty("object_tasks.notification_channel", object_tasks.notification_channel)
+    _require_non_empty("object_tasks.owner_watch_channel", object_tasks.owner_watch_channel)
+    _require_owner_watch_events(object_tasks.owner_watch_events)
+    _nonnegative("object_tasks.shutdown_join_timeout_s", object_tasks.shutdown_join_timeout_s)
+
+    llm_context = config.llm_context
+    _positive("llm_context.schema_version", llm_context.schema_version)
+    _positive("llm_context.recent_event_limit", llm_context.recent_event_limit)
+    for name in ("policy", "object_name_prefix"):
+        _require_non_empty(f"llm_context.{name}", getattr(llm_context, name))
+
+    checkpoint = config.checkpoint
+    for name in ("snapshot_version", "list_limit", "payload_capture_limit_bytes", "snapshot_hard_limit_bytes", "diff_preview_items"):
+        _positive(f"checkpoint.{name}", getattr(checkpoint, name))
+    _require_at_least("checkpoint.snapshot_hard_limit_bytes", checkpoint.snapshot_hard_limit_bytes, "checkpoint.payload_capture_limit_bytes", checkpoint.payload_capture_limit_bytes)
+
+    skills = config.skills
+    for name in (
+        "schema_version",
+        "registry_resource",
+        "trust_resource",
+        "skill_md_max_bytes",
+        "skill_md_hard_limit_bytes",
+        "resource_read_max_bytes",
+        "package_max_bytes",
+        "max_package_files",
+        "max_prompt_instruction_chars",
+        "max_jit_source_chars",
+        "discover_limit",
+        "id_max_chars",
+        "name_max_chars",
+        "description_max_chars",
+        "version_max_chars",
+        "max_tools",
+        "max_actions",
+        "max_jit_tools",
+        "max_required_capabilities",
+    ):
+        _positive_or_non_empty(f"skills.{name}", getattr(skills, name))
+    _require_non_empty_items("skills.global_dirs", skills.global_dirs)
+    _require_non_empty_items("skills.workspace_dirs", skills.workspace_dirs)
+    _require_non_empty_items("skills.resource_dirs", skills.resource_dirs)
+    _require_at_least("skills.skill_md_hard_limit_bytes", skills.skill_md_hard_limit_bytes, "skills.skill_md_max_bytes", skills.skill_md_max_bytes)
+    _require_at_least("skills.package_max_bytes", skills.package_max_bytes, "skills.resource_read_max_bytes", skills.resource_read_max_bytes)
+
+    modules = config.modules
+    for name in (
+        "schema_version",
+        "manifest_max_bytes",
+        "manifest_hard_limit_bytes",
+        "source_max_bytes",
+        "discover_limit",
+        "id_max_chars",
+        "name_max_chars",
+        "version_max_chars",
+        "entrypoint_max_chars",
+        "max_declared_tools",
+        "max_declared_images",
+        "max_declared_syscalls",
+        "max_declared_provider_hooks",
+        "max_declared_startup_hooks",
+    ):
+        _positive(f"modules.{name}", getattr(modules, name))
+    _require_non_empty_items("modules.manifest_paths", modules.manifest_paths)
+    _require_non_empty_items("modules.trusted_modules", modules.trusted_modules)
+    _require_non_empty_items("modules.trusted_sha256", modules.trusted_sha256)
+    _require_at_least("modules.manifest_hard_limit_bytes", modules.manifest_hard_limit_bytes, "modules.manifest_max_bytes", modules.manifest_max_bytes)
+
+    launcher = config.launcher
+    _require_non_empty_items("launcher.permission_presets", launcher.permission_presets)
+    for name in ("default_permission_preset", "read_only_preset", "edit_preset", "full_preset"):
+        _require_non_empty(f"launcher.{name}", getattr(launcher, name))
+    if launcher.default_permission_preset not in launcher.permission_presets:
+        raise ValueError("launcher.default_permission_preset must be in launcher.permission_presets")
+
+    scripts = config.scripts
+    for name in (
+        "ask_file_max_bytes",
+        "ask_file_max_quanta",
+        "document_summary_max_bytes",
+        "document_summary_max_read_bytes",
+        "document_summary_max_quanta",
+        "document_context_min_tokens",
+        "document_context_slack_tokens",
+        "document_context_max_tokens",
+        "object_copy_max_quanta",
+        "llm_write_smoke_max_quanta",
+        "clock_demo_iterations",
+        "clock_demo_interval_s",
+        "chat_max_turns",
+        "chat_context_tokens",
+        "chat_quanta_per_turn",
+        "chat_quanta_overhead",
+    ):
+        _positive(f"scripts.{name}", getattr(scripts, name))
+    _require_non_empty("scripts.clock_demo_timezone", scripts.clock_demo_timezone)
+    _require_at_least("scripts.document_summary_max_read_bytes", scripts.document_summary_max_read_bytes, "scripts.document_summary_max_bytes", scripts.document_summary_max_bytes)
+    _require_at_least("scripts.document_context_max_tokens", scripts.document_context_max_tokens, "scripts.document_context_min_tokens", scripts.document_context_min_tokens)
+
+
+def _positive_or_non_empty(name: str, value: object) -> None:
+    if isinstance(value, str):
+        _require_non_empty(name, value)
+    else:
+        _positive(name, value)
+
+
+def _nonnegative_fields(prefix: str, obj: object, names: tuple[str, ...]) -> None:
+    for name in names:
+        _nonnegative(f"{prefix}.{name}", getattr(obj, name))
+
+
+def _nonnegative_optional_fields(prefix: str, obj: object, names: tuple[str, ...]) -> None:
+    for name in names:
+        _nonnegative_optional(f"{prefix}.{name}", getattr(obj, name))
+
+
+def _positive(name: str, value: object) -> None:
+    _require_number(name, value)
+    if value <= 0:  # type: ignore[operator]
+        raise ValueError(f"{name} must be > 0")
+
+
+def _positive_optional(name: str, value: object | None) -> None:
+    if value is None:
+        return
+    _positive(name, value)
+
+
+def _nonnegative(name: str, value: object) -> None:
+    _require_number(name, value)
+    if value < 0:  # type: ignore[operator]
+        raise ValueError(f"{name} must be >= 0")
+
+
+def _nonnegative_optional(name: str, value: object | None) -> None:
+    if value is None:
+        return
+    _nonnegative(name, value)
+
+
+def _require_number(name: str, value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be a finite number")
+
+
+def _require_non_empty(name: str, value: object) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+def _require_non_empty_items(name: str, values: tuple[str, ...]) -> None:
+    for index, value in enumerate(values):
+        _require_non_empty(f"{name}[{index}]", value)
+
+
+def _require_at_least(max_name: str, max_value: int | float, min_name: str, min_value: int | float) -> None:
+    if max_value < min_value:
+        raise ValueError(f"{max_name} must be >= {min_name}")
+
+
+def _require_status_codes(name: str, values: tuple[int, ...]) -> None:
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 100 or value > 599:
+            raise ValueError(f"{name}[{index}] must be an HTTP status code")
+
+
+def _require_owner_watch_events(values: tuple[str, ...]) -> None:
+    allowed = {"updated", "linked"}
+    _require_non_empty_items("object_tasks.owner_watch_events", values)
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise ValueError(f"object_tasks.owner_watch_events contains unsupported events: {unknown}")
 
 
 DEFAULT_CONFIG = AgentLibOSConfig()

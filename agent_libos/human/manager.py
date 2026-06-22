@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import hashlib
 from typing import TYPE_CHECKING, Any
 
 from agent_libos.capability.manager import CapabilityManager
@@ -26,9 +27,48 @@ from agent_libos.runtime.external_effects import (
 )
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import HumanProvider
+from agent_libos.utils.serde import dumps, to_jsonable
 
 if TYPE_CHECKING:
     from agent_libos.runtime.message_manager import ProcessMessageManager
+
+_SENSITIVE_HUMAN_AUDIT_KEYS = frozenset({"answer", "context", "decision", "message", "payload", "question", "reason"})
+
+
+def _json_size_bytes(value: Any) -> int:
+    return len(dumps(to_jsonable(value)).encode("utf-8"))
+
+
+def _ensure_json_size(value: Any, limit_bytes: int, label: str) -> int:
+    size = _json_size_bytes(value)
+    if size > limit_bytes:
+        raise ValidationError(f"{label} exceeds {limit_bytes} bytes (got {size})")
+    return size
+
+
+def _sanitize_human_observability(value: Any, *, preview_chars: int = 256) -> dict[str, Any]:
+    jsonable = to_jsonable(value)
+    redacted = _redact_human_value(jsonable)
+    encoded = dumps(jsonable).encode("utf-8")
+    preview = dumps(redacted)
+    return {
+        "preview": preview[: max(0, preview_chars)],
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "truncated": len(preview) > max(0, preview_chars),
+        "redacted": redacted != jsonable,
+    }
+
+
+def _redact_human_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>" if str(key).lower() in _SENSITIVE_HUMAN_AUDIT_KEYS else _redact_human_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_human_value(item) for item in value]
+    return value
 
 
 class HumanObjectManager:
@@ -61,6 +101,7 @@ class HumanObjectManager:
         request: dict[str, Any],
         blocking: bool = True,
     ) -> str:
+        _ensure_json_size(request, self.config.tools.human_request_payload_max_bytes, "human request payload")
         now = utc_now()
         human_request = HumanRequest(
             request_id=new_id("hreq"),
@@ -93,7 +134,11 @@ class HumanObjectManager:
             actor=pid,
             action="human.query",
             target=f"human:{human}",
-            decision={"request_id": human_request.request_id, "blocking": blocking, "request": request},
+            decision={
+                "request_id": human_request.request_id,
+                "blocking": blocking,
+                "request": _sanitize_human_observability(request),
+            },
         )
         return human_request.request_id
 
@@ -106,13 +151,17 @@ class HumanObjectManager:
         reason: str,
         blocking: bool = True,
     ) -> str:
+        selected_human = human or self.config.runtime.default_human
+        decision = self.capabilities.require(pid, f"human:{selected_human}", CapabilityRight.WRITE)
         request = self._permission_request_payload(pid, resource, rights, reason)
-        return self.query(
+        request_id = self.query(
             pid=pid,
-            human=human,
+            human=selected_human,
             request=request,
             blocking=blocking,
         )
+        self._consume_one_time_decision(decision, used_by="human")
+        return request_id
 
     def _permission_request_payload(self, pid: str, resource: str, rights: list[str], reason: str) -> dict[str, Any]:
         pattern = self.capabilities.parse_resource_pattern(resource)
@@ -400,6 +449,10 @@ class HumanObjectManager:
         selected_channel = channel or self.config.runtime.terminal_channel
         if selected_channel != self.config.runtime.terminal_channel:
             selected_channel = self.config.runtime.terminal_channel
+        if len(message) > self.config.tools.human_output_max_chars:
+            raise ValidationError(
+                f"human output message exceeds max characters={self.config.tools.human_output_max_chars}"
+            )
         resource = f"human:{selected_human}"
         decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
         request = HumanRequest(
@@ -430,13 +483,14 @@ class HumanObjectManager:
         return request
 
     def list(self, pid: str | None = None) -> builtins.list[HumanRequest]:
-        return self.store.list_human_requests(pid=pid)
+        return self.store.list_human_requests(pid=pid, limit=self.config.tools.human_request_list_limit)
 
     def pending(self, human: str | None = None) -> builtins.list[HumanRequest]:
-        requests = [request for request in self.store.list_human_requests() if request.status == HumanRequestStatus.PENDING]
-        if human is not None:
-            requests = [request for request in requests if request.human == human]
-        return requests
+        return self.store.list_human_requests(
+            human=human,
+            status=HumanRequestStatus.PENDING,
+            limit=self.config.tools.human_request_list_limit,
+        )
 
     def process_next_terminal(
         self,
@@ -547,90 +601,22 @@ class HumanObjectManager:
         request = self.store.get_human_request(request_id)
         if request is None:
             raise NotFound(f"human request not found: {request_id}")
-        request.status = status
-        request.decision = decision
-        request.updated_at = utc_now()
-        self.store.update_human_request(request)
+        if request.status != HumanRequestStatus.PENDING:
+            raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
+        self._validate_decision_side_effects(request, status, decision)
+        self._apply_decision_side_effects(request, status, decision, responder)
         permission_related = False
         permission_spec = request.payload.get("requested_permission")
         if isinstance(permission_spec, dict):
             permission_related = True
-            resource = permission_spec.get("resource")
-            if not isinstance(resource, str):
-                raise ValueError("requested permission must include a string resource")
-            subject = permission_spec.get("subject", request.pid)
-            if not isinstance(subject, str):
-                subject = request.pid
-            rights = permission_spec.get("rights", ["execute"])
-            if not isinstance(rights, list):
-                rights = ["execute"]
-            policy = str(
-                decision.get(
-                    "policy",
-                    CapabilityManager.ALWAYS_ALLOW if status == HumanRequestStatus.APPROVED else CapabilityManager.ALWAYS_DENY,
-                )
-            )
-            if policy not in {
-                CapabilityManager.ALWAYS_ALLOW,
-                CapabilityManager.ALWAYS_DENY,
-                CapabilityManager.ASK_EACH_TIME,
-            }:
-                raise ValueError(f"unknown permission policy: {policy}")
-            constraints = permission_spec.get("constraints")
-            self.capabilities.set_permission_policy(
-                subject=subject,
-                resource=resource,
-                rights=rights,
-                policy=policy,
-                issued_by=responder,
-                constraints=constraints if isinstance(constraints, dict) else None,
-            )
 
         once_spec = request.payload.get("requested_once_capability")
         if isinstance(once_spec, dict):
             permission_related = True
-            if status == HumanRequestStatus.APPROVED:
-                resource = once_spec.get("resource")
-                if not isinstance(resource, str):
-                    raise ValueError("requested one-time capability must include a string resource")
-                subject = once_spec.get("subject", request.pid)
-                if not isinstance(subject, str):
-                    subject = request.pid
-                rights = once_spec.get("rights", ["execute"])
-                if not isinstance(rights, list):
-                    rights = ["execute"]
-                constraints = once_spec.get("constraints")
-                self.capabilities.grant_once(
-                    subject=subject,
-                    resource=resource,
-                    rights=rights,
-                    issued_by=responder,
-                    constraints=constraints if isinstance(constraints, dict) else None,
-                )
-
-        if status == HumanRequestStatus.APPROVED:
-            cap_spec = request.payload.get("requested_capability")
-            if isinstance(cap_spec, dict):
-                resource = cap_spec.get("resource")
-                if not isinstance(resource, str):
-                    raise ValueError("requested capability must include a string resource")
-                subject = cap_spec.get("subject", request.pid)
-                if not isinstance(subject, str):
-                    subject = request.pid
-                rights = cap_spec.get("rights", ["execute"])
-                if not isinstance(rights, list):
-                    rights = ["execute"]
-                constraints = cap_spec.get("constraints")
-                expires_at = cap_spec.get("expires_at")
-                self.capabilities.grant(
-                    subject=subject,
-                    resource=resource,
-                    rights=rights,
-                    issued_by=responder,
-                    constraints=constraints if isinstance(constraints, dict) else None,
-                    expires_at=expires_at if isinstance(expires_at, str) else None,
-                    delegable=bool(cap_spec.get("delegable", False)),
-                )
+        request.status = status
+        request.decision = decision
+        request.updated_at = utc_now()
+        self.store.update_human_request(request)
         process = self.store.get_process(request.pid)
         if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
             # Permission denials still wake the process so it can observe the
@@ -648,15 +634,141 @@ class HumanObjectManager:
             EventType.HUMAN_RESPONSE,
             source=responder,
             target=request.pid,
-            payload={"request_id": request_id, "status": status.value, "decision": decision},
+            payload={"request_id": request_id, "status": status.value, "decision": _sanitize_human_observability(decision)},
         )
         self.audit.record(
             actor=responder,
             action="human.response",
             target=f"human_request:{request_id}",
-            decision={"status": status.value, "decision": decision},
+            decision={"status": status.value, "decision": _sanitize_human_observability(decision)},
         )
         return request
+
+    def _validate_decision_side_effects(
+        self,
+        request: HumanRequest,
+        status: HumanRequestStatus,
+        decision: dict[str, Any],
+    ) -> None:
+        permission_spec = request.payload.get("requested_permission")
+        if isinstance(permission_spec, dict):
+            self._permission_decision_spec(permission_spec, request.pid, status, decision)
+        once_spec = request.payload.get("requested_once_capability")
+        if isinstance(once_spec, dict) and status == HumanRequestStatus.APPROVED:
+            self._capability_request_spec(once_spec, request.pid, label="requested one-time capability")
+        cap_spec = request.payload.get("requested_capability")
+        if isinstance(cap_spec, dict) and status == HumanRequestStatus.APPROVED:
+            self._capability_request_spec(cap_spec, request.pid, label="requested capability")
+
+    def _apply_decision_side_effects(
+        self,
+        request: HumanRequest,
+        status: HumanRequestStatus,
+        decision: dict[str, Any],
+        responder: str,
+    ) -> None:
+        permission_spec = request.payload.get("requested_permission")
+        if isinstance(permission_spec, dict):
+            subject, resource, rights, constraints, policy = self._permission_decision_spec(
+                permission_spec,
+                request.pid,
+                status,
+                decision,
+            )
+            self.capabilities.set_permission_policy(
+                subject=subject,
+                resource=resource,
+                rights=rights,
+                policy=policy,
+                issued_by=responder,
+                constraints=constraints,
+            )
+
+        once_spec = request.payload.get("requested_once_capability")
+        if isinstance(once_spec, dict) and status == HumanRequestStatus.APPROVED:
+            subject, resource, rights, constraints, _expires_at, _delegable = self._capability_request_spec(
+                once_spec,
+                request.pid,
+                label="requested one-time capability",
+            )
+            self.capabilities.grant_once(
+                subject=subject,
+                resource=resource,
+                rights=rights,
+                issued_by=responder,
+                constraints=constraints,
+            )
+
+        cap_spec = request.payload.get("requested_capability")
+        if isinstance(cap_spec, dict) and status == HumanRequestStatus.APPROVED:
+            subject, resource, rights, constraints, expires_at, delegable = self._capability_request_spec(
+                cap_spec,
+                request.pid,
+                label="requested capability",
+            )
+            self.capabilities.grant(
+                subject=subject,
+                resource=resource,
+                rights=rights,
+                issued_by=responder,
+                constraints=constraints,
+                expires_at=expires_at,
+                delegable=delegable,
+            )
+
+    def _permission_decision_spec(
+        self,
+        spec: dict[str, Any],
+        default_subject: str,
+        status: HumanRequestStatus,
+        decision: dict[str, Any],
+    ) -> tuple[str, str, list[str], dict[str, Any] | None, str]:
+        subject, resource, rights, constraints, _expires_at, _delegable = self._capability_request_spec(
+            spec,
+            default_subject,
+            label="requested permission",
+        )
+        policy = str(
+            decision.get(
+                "policy",
+                CapabilityManager.ALWAYS_ALLOW if status == HumanRequestStatus.APPROVED else CapabilityManager.ALWAYS_DENY,
+            )
+        )
+        if policy not in {
+            CapabilityManager.ALWAYS_ALLOW,
+            CapabilityManager.ALWAYS_DENY,
+            CapabilityManager.ASK_EACH_TIME,
+        }:
+            raise ValidationError(f"unknown permission policy: {policy}")
+        return subject, resource, rights, constraints, policy
+
+    def _capability_request_spec(
+        self,
+        spec: dict[str, Any],
+        default_subject: str,
+        *,
+        label: str,
+    ) -> tuple[str, str, list[str], dict[str, Any] | None, str | None, bool]:
+        resource = spec.get("resource")
+        if not isinstance(resource, str):
+            raise ValidationError(f"{label} must include a string resource")
+        subject = spec.get("subject", default_subject)
+        if not isinstance(subject, str):
+            subject = default_subject
+        rights = spec.get("rights", ["execute"])
+        if not isinstance(rights, list):
+            rights = ["execute"]
+        normalized_rights = [str(right) for right in rights]
+        constraints = spec.get("constraints")
+        expires_at = spec.get("expires_at")
+        return (
+            subject,
+            resource,
+            normalized_rights,
+            constraints if isinstance(constraints, dict) else None,
+            expires_at if isinstance(expires_at, str) else None,
+            bool(spec.get("delegable", False)),
+        )
 
     def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
         if decision.consume_capability_id is None:

@@ -33,9 +33,6 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
 
-_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
-
-
 class ProcessManager:
     """Process lifecycle primitive."""
 
@@ -65,7 +62,7 @@ class ProcessManager:
 
     def spawn(
         self,
-        image: str = _RUNTIME_DEFAULTS.default_image_id,
+        image: str | None = None,
         goal: dict[str, Any] | str | ObjectHandle | None = None,
         capabilities: builtins.list[dict[str, Any]] | None = None,
         resource_budget: ResourceBudget | None = None,
@@ -73,11 +70,12 @@ class ProcessManager:
     ) -> str:
         now = utc_now()
         pid = new_id("pid")
+        selected_image = image or self.config.runtime.default_image_id
         cwd = self._normalize_working_directory(working_directory or self.config.process.default_working_directory)
         process = AgentProcess(
             pid=pid,
             parent_pid=None,
-            image_id=image,
+            image_id=selected_image,
             status=ProcessStatus.CREATED,
             goal_oid=None,
             memory_view=None,
@@ -108,16 +106,16 @@ class ProcessManager:
             EventType.PROCESS_CREATED,
             source="runtime",
             target=pid,
-            payload={"pid": pid, "image": image, "goal_oid": goal_handle.oid, "working_directory": cwd},
+            payload={"pid": pid, "image": selected_image, "goal_oid": goal_handle.oid, "working_directory": cwd},
         )
         self.audit.record(
             actor="runtime",
             action="process.spawn",
             target=f"process:{pid}",
             output_refs=[goal_handle.oid],
-            decision={"image": image, "working_directory": cwd},
+            decision={"image": selected_image, "working_directory": cwd},
         )
-        self._run_after_spawn_hooks(pid, image)
+        self._run_after_spawn_hooks(pid, selected_image)
         return pid
 
     def fork(

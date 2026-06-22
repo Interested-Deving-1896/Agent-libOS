@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from scripts.agent_outputs import cleanup_agent_outputs, snapshot_agent_outputs
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 LANE_DIRS = {
@@ -31,6 +32,29 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run tests that spend real LLM/provider calls",
     )
+    parser.addoption(
+        "--keep-agent-outputs",
+        action="store_true",
+        default=False,
+        help="preserve files written under agent_outputs during this pytest run",
+    )
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    config = session.config
+    if _skip_agent_outputs_cleanup(config):
+        return
+    root = Path(config.rootpath) / "agent_outputs"
+    config._agent_outputs_baseline = snapshot_agent_outputs(root)  # type: ignore[attr-defined]
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    config = session.config
+    if _skip_agent_outputs_cleanup(config):
+        return
+    root = Path(config.rootpath) / "agent_outputs"
+    baseline = getattr(config, "_agent_outputs_baseline", set())
+    cleanup_agent_outputs(root, baseline=set(baseline))
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -53,6 +77,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 item.add_marker(pytest.mark.skip(reason="real LLM tests require --run-real-llm"))
             elif not _has_real_llm_environment():
                 item.add_marker(pytest.mark.skip(reason="real LLM environment is not configured"))
+
+
+def _skip_agent_outputs_cleanup(config: pytest.Config) -> bool:
+    if getattr(config, "workerinput", None) is not None:
+        return True
+    if bool(config.getoption("--keep-agent-outputs", default=False)):
+        return True
+    if os.getenv("AGENT_LIBOS_KEEP_AGENT_OUTPUTS"):
+        return True
+    return False
 
 
 def _mark_lane(root: Path, item: pytest.Item) -> None:

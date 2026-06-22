@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 import threading
 from collections import Counter
@@ -78,7 +79,7 @@ def main(argv: list[str] | None = None) -> None:
     object_task_parser = sub.add_parser("object-task", help="Start, inspect, wait for, or cancel Object tasks")
     _add_object_task_parser_args(object_task_parser)
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
-    spawn_parser.add_argument("--image", default=_RUNTIME_DEFAULTS.default_image_id)
+    spawn_parser.add_argument("--image")
     spawn_parser.add_argument("--goal", required=True)
     cd_parser = sub.add_parser("cd", help="Set an AgentProcess working directory")
     cd_parser.add_argument("pid")
@@ -116,7 +117,7 @@ def main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget; omitted runs until idle.")
     run_parser.add_argument("--interactive", action="store_true", help="Read human input while running and post it as process messages.")
     run_parser.add_argument("--pid", help="Default target process for interactive human messages.")
-    run_parser.add_argument("--human", default=_RUNTIME_DEFAULTS.default_human, help="Human actor name for interactive messages.")
+    run_parser.add_argument("--human", help="Human actor name for interactive messages.")
     run_parser.add_argument("--message-channel", default="human", help="Process-message channel for interactive human input.")
     message_parser = sub.add_parser("message", help="Send a human process message")
     _add_message_parser_args(message_parser)
@@ -168,7 +169,7 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_run_object_task_command(runtime, args))
         elif args.command == "spawn":
             pid = runtime.process.spawn(image=args.image, goal=args.goal)
-            _print_json({"pid": pid, "image": args.image, "goal": args.goal})
+            _print_json({"pid": pid, "image": runtime.process.get(pid).image_id, "goal": args.goal})
         elif args.command == "cd":
             _print_json(_run_cd_command(runtime, args))
         elif args.command == "exec":
@@ -325,6 +326,10 @@ def _add_object_task_parser_args(parser: argparse.ArgumentParser) -> None:
 def _run_object_task_command(runtime: Runtime, args: argparse.Namespace) -> Any:
     command = args.object_task_command
     if command == "start":
+        if not args.wait:
+            raise SystemExit(
+                "object-task start requires --wait in the one-shot CLI; use the GUI server or an embedded Runtime for detached ObjectTask supervision"
+            )
         owner = _object_task_owner_handle(runtime, args.pid, args.owner_oid, args.owner_name, args.namespace)
         task = runtime.object_tasks.start(
             args.pid,
@@ -337,8 +342,7 @@ def _run_object_task_command(runtime: Runtime, args: argparse.Namespace) -> Any:
             grant_result_to_notify=args.grant_result_to_notify,
             owner_watch=_object_task_owner_watch_args(args),
         )
-        if args.wait:
-            task = runtime.object_tasks.wait(task.task_id, actor_pid=args.pid, timeout=args.timeout)
+        task = runtime.object_tasks.wait(task.task_id, actor_pid=args.pid, timeout=_finite_timeout_or_none(args.timeout, "--timeout"))
         return to_jsonable(task)
     if command == "get":
         return to_jsonable(runtime.object_tasks.get(args.task_id, actor_pid=args.pid))
@@ -354,7 +358,7 @@ def _run_object_task_command(runtime: Runtime, args: argparse.Namespace) -> Any:
     if command == "cancel":
         return to_jsonable(runtime.object_tasks.cancel(args.task_id, actor_pid=args.pid, reason=args.reason))
     if command == "wait":
-        return to_jsonable(runtime.object_tasks.wait(args.task_id, actor_pid=args.pid, timeout=args.timeout))
+        return to_jsonable(runtime.object_tasks.wait(args.task_id, actor_pid=args.pid, timeout=_finite_timeout_or_none(args.timeout, "--timeout")))
     if command == "watch-owner":
         events = _parse_csv_values(args.watch_events)
         return to_jsonable(
@@ -413,6 +417,15 @@ def _parse_csv_values(values: list[str]) -> list[str]:
             item = item.strip()
             if item:
                 parsed.append(item)
+    return parsed
+
+
+def _finite_timeout_or_none(value: float | None, label: str) -> float | None:
+    if value is None:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise SystemExit(f"{label} must be a finite non-negative number")
     return parsed
 
 
@@ -538,7 +551,7 @@ async def _run_interactive_command(runtime: Runtime, args: argparse.Namespace) -
     posted: list[dict[str, Any]] = []
     state = {"pid": target_pid, "shown_request_id": ""}
     remaining: int | None = args.max_quanta
-    selected_human = args.human or _RUNTIME_DEFAULTS.default_human
+    selected_human = args.human or runtime.config.runtime.default_human
     try:
         while remaining is None or remaining > 0:
             command = _drain_interactive_queue(runtime, queue, state, selected_human, args.message_channel, posted)
@@ -648,7 +661,7 @@ def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: b
     if include_kind:
         parser.add_argument("--kind", choices=[kind.value for kind in ProcessMessageKind], default=ProcessMessageKind.NORMAL.value)
         parser.add_argument("--interrupt", action="store_true", help="Shortcut for --kind interrupt.")
-    parser.add_argument("--human", default=_RUNTIME_DEFAULTS.default_human, help="Human actor name.")
+    parser.add_argument("--human", help="Human actor name.")
     parser.add_argument("--channel", default="human", help="Process-message channel.")
     parser.add_argument("--subject", help="Short message subject.")
     parser.add_argument("--correlation-id", help="Optional conversation/request correlation id.")
@@ -1427,9 +1440,10 @@ def _process_cli_summary(process: Any) -> dict[str, Any]:
 
 
 def run_demo(runtime: Runtime) -> dict[str, Any]:
+    runtime_defaults = runtime.config.runtime
     tool_sequence: list[dict[str, Any]] = []
     root = runtime.process.spawn(
-        image=_RUNTIME_DEFAULTS.coding_image_id,
+        image=runtime_defaults.coding_image_id,
         goal={"text": "Fix failing tests in this repository"},
     )
     log = """
@@ -1510,7 +1524,7 @@ export function run(args, libos) {
     filesystem_resource = runtime.filesystem.resource_for(DEMO_PATCH_PREVIEW_PATH)
     approval_request = runtime.human.query(
         pid=root,
-        human=_RUNTIME_DEFAULTS.default_human,
+        human=runtime_defaults.default_human,
         request={
             "type": "approval",
             "question": f"Grant workspace write capability for {DEMO_PATCH_PREVIEW_PATH}?",
@@ -1564,7 +1578,7 @@ export function run(args, libos) {
         "authorization": {
             "filesystem_write_approval_request": approval_request,
             "filesystem_write_resource": filesystem_resource,
-            "filesystem_write_granted_by": _RUNTIME_DEFAULTS.default_human_actor,
+            "filesystem_write_granted_by": runtime_defaults.default_human_actor,
             "filesystem_write_denied_before_grant": {
                 "ok": denied_without_filesystem.ok,
                 "error": denied_without_filesystem.error,

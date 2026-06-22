@@ -8,7 +8,7 @@ from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
 from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ValidationError
 from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate
 
 class TestShellPrimitive:
@@ -247,14 +247,18 @@ class TestShellPrimitive:
         runtime, provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='request git shell')
-            request = runtime.tools.call(pid, 'request_permission', {'resource': 'shell:git', 'rights': ['execute'], 'reason': 'inspect git state'})
+            runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+            with pytest.raises(HumanResponseRequired):
+                runtime.tools.call(pid, 'request_permission', {'resource': 'shell:git', 'rights': ['execute'], 'reason': 'inspect git state'})
             pending = runtime.human.pending()[0]
             rules = pending.payload['requested_permission']['constraints']['authority_rules']
             runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
+            request = runtime.tools.call(pid, 'request_permission', {'resource': 'shell:git', 'rights': ['execute'], 'reason': 'inspect git state'})
             allowed = runtime.shell.run(pid, ['git', 'status'])
             with pytest.raises(CapabilityDenied):
                 runtime.shell.run(pid, ['git', 'push', 'origin'])
             assert request.ok
+            assert request.payload['status'] == 'approved'
             assert any(rule['rule_id'] == 'shell.git.deny.push' for rule in rules)
             assert allowed.stdout == 'ok\n'
             assert provider.calls == [(['git', 'status'], runtime.config.tools.shell_timeout_s)]

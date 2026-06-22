@@ -53,6 +53,22 @@ class SyscallRouter:
         )
         return registered
 
+    def unregister(self, name: str, *, registered_by: str | None = None) -> bool:
+        normalized = name.strip()
+        registered = self._handlers.get(normalized)
+        if registered is None:
+            return False
+        if registered_by is not None and registered.registered_by != registered_by:
+            return False
+        self._handlers.pop(normalized, None)
+        self.audit.record(
+            actor=registered_by or "runtime",
+            action="syscall.unregister",
+            target=f"syscall:{normalized}",
+            decision={"name": normalized},
+        )
+        return True
+
     def get(self, name: str) -> RegisteredSyscall | None:
         return self._handlers.get(name.strip())
 

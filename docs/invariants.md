@@ -33,7 +33,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
   remains mergeable, then is adopted or released by the parent lifecycle.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
-  resume, consume one-shot grants, and route through primitives.
+  resume, consume one-shot grants, are decided exactly once from pending state,
+  and route through primitives.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
   sandboxed, process-local, and syscall-mediated.
 - `command-risk-rules-are-deterministic`: command risk rules separate
@@ -73,14 +74,20 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
   CPU, and RSS limits are enforced by providers and audited on exceedance.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
-  prompt context without granting resources.
+  prompt context without granting resources; API actor mode must still honor
+  skill capability or human-approval gates.
+- `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
+  trust to the current source hash, reject duplicate module ids, bound source
+  hashing, and roll back failed registrations so persisted module status stays
+  aligned with loaded runtime state.
 - `checkpoint-restore-and-fork-are-scoped`: checkpoint restore/fork are scoped,
   capability-controlled, and append-only outside reconstructable state.
 - `image-self-evolution-requires-image-authority`: image registration, package
   boot, exec, and checkpoint commit require image authority and do not bake
   external authority.
-- `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC calls use
-  registered endpoint/method authority and classified provider effects.
+- `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC endpoint
+  registration and calls use registered endpoint/method authority and
+  classified provider effects.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
   remain deterministic and token-free by default.
 
