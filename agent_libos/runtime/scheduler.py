@@ -70,8 +70,8 @@ class AsyncProcessScheduler:
         effective_max_quanta = max_quanta
         unblock_quanta_used = 0
         unblock_quanta_limit = max(1, max_quanta or 0) if max_quanta is not None else None
-        drain_polls_used = 0
-        drain_poll_limit = max(1, int(0.5 / max(self.poll_interval_s, 0.001))) if max_quanta is not None else None
+        drain_deadline: float | None = None
+        drain_window_s = 0.5 if max_quanta is not None else None
         quanta_lock = asyncio.Lock()
 
         async def reserve_quantum() -> bool:
@@ -124,6 +124,7 @@ class AsyncProcessScheduler:
                 pid = self._pid_for_task(tasks, task)
                 if pid is not None:
                     tasks.pop(pid, None)
+                drain_deadline = None
                 try:
                     results.extend(task.result())
                 except asyncio.CancelledError:
@@ -146,6 +147,7 @@ class AsyncProcessScheduler:
                     # limited dependency quanta so the waiter can be unblocked.
                     unblock_quanta_used += 1
                     effective_max_quanta = (effective_max_quanta or 0) + 1
+                    drain_deadline = None
                     self.audit.record(
                         actor="scheduler",
                         action="scheduler.unblock_quantum_reserved",
@@ -159,12 +161,19 @@ class AsyncProcessScheduler:
                     )
                     continue
                 if (
-                    drain_poll_limit is not None
-                    and drain_polls_used < drain_poll_limit
+                    drain_window_s is not None
                     and self._has_running_pending_task(tasks)
                 ):
-                    drain_polls_used += 1
-                    continue
+                    # Use a real wall-clock deadline instead of converting the
+                    # window to poll counts. On Windows the event-loop timer
+                    # granularity can be much larger than poll_interval_s, so a
+                    # count-based drain can wait several seconds even when the
+                    # scheduler promised a bounded run.
+                    now = time.perf_counter()
+                    if drain_deadline is None:
+                        drain_deadline = now + drain_window_s
+                    if now < drain_deadline:
+                        continue
                 await self._cancel_pending_tasks(tasks, results, reason="max_quanta_exhausted")
                 break
 

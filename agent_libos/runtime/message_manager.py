@@ -218,6 +218,10 @@ class ProcessMessageManager:
         )
         if messages or not block:
             return messages
+        if message_ids == []:
+            raise ValidationError("blocking process message receive requires a non-empty message id filter")
+        if limit == 0:
+            raise ValidationError("blocking process message receive requires a positive limit")
         process = self._require_process(pid)
         process.status = ProcessStatus.WAITING_EVENT
         process.status_message = self._wait_status_message(filters)
@@ -246,7 +250,12 @@ class ProcessMessageManager:
         correlation_id: str | None = None,
         reply_to: str | None = None,
     ) -> list[ProcessMessage]:
+        if message_ids is not None and not message_ids:
+            return []
         selected_ids = set(message_ids or [])
+        # Explicit message ids already define the bounded ack set. Pass that
+        # size down as the query limit so large read windows are not truncated
+        # by the default message_read_limit before the id filter is applied.
         messages = self.list(
             pid,
             include_acked=False,
@@ -255,6 +264,8 @@ class ProcessMessageManager:
             channel=channel,
             correlation_id=correlation_id,
             reply_to=reply_to,
+            message_ids=list(selected_ids) if selected_ids else None,
+            limit=len(selected_ids) if selected_ids else None,
         )
         if selected_ids:
             messages = [message for message in messages if message.message_id in selected_ids]

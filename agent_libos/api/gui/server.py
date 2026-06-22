@@ -1100,7 +1100,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             raise GuiServerError(HTTPStatus.BAD_REQUEST, "invalid Content-Length header")
         request_body_max_bytes = self.server.service.runtime.config.gui.request_body_max_bytes
         if length > request_body_max_bytes:
-            if length <= request_body_max_bytes * 2:
+            # Drain small rejected bodies so clients get the 413 JSON response
+            # instead of a TCP reset. Very large bodies are still closed early
+            # to keep the GUI facade from becoming an unbounded discard sink.
+            reject_drain_limit = max(request_body_max_bytes * 2, 64 * 1024)
+            if length <= reject_drain_limit:
                 self.rfile.read(length)
             else:
                 self.close_connection = True

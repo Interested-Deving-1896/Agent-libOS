@@ -126,6 +126,58 @@ class TestProcessMessage:
         finally:
             runtime.close()
 
+    def test_read_process_messages_acks_entire_requested_window(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='ack many messages')
+            count = runtime.config.tools.message_read_limit + 5
+            for index in range(count):
+                runtime.messages.post(sender='test', recipient_pid=pid, subject=f'msg-{index}')
+
+            result = runtime.tools.call(pid, 'read_process_messages', {'limit': count})
+
+            assert result.ok, result.error
+            assert len(result.payload['messages']) == count
+            assert len(result.payload['acked_message_ids']) == count
+            assert runtime.messages.unread(pid) == []
+        finally:
+            runtime.close()
+
+    def test_blocking_receive_rejects_zero_limit(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='zero limit receive')
+
+            with pytest.raises(ValidationError):
+                runtime.messages.receive(pid, block=True, limit=0)
+
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_ack_with_empty_message_id_filter_acks_nothing(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='empty id ack')
+            runtime.messages.post(sender='test', recipient_pid=pid, subject='keep unread')
+
+            assert runtime.messages.ack(pid, []) == []
+            assert len(runtime.messages.unread(pid)) == 1
+        finally:
+            runtime.close()
+
+    def test_blocking_receive_rejects_empty_message_id_filter(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='empty id receive')
+
+            with pytest.raises(ValidationError):
+                runtime.messages.receive(pid, block=True, message_ids=[])
+
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
     def test_receive_process_messages_blocks_until_matching_message_then_resumes(self) -> None:
         client = PlannedActionClient([{'action': 'receive_process_messages', 'channel': 'control', 'correlation_id': 'job-1'}])
         runtime = Runtime.open('local')

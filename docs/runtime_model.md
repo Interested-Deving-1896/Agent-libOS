@@ -200,7 +200,11 @@ Processes can send messages to themselves, their parent, or direct children.
 Receivers use `read_process_messages` for non-blocking reads or
 `receive_process_messages` to block until matching unread messages arrive.
 Filters can match kind, sender, channel, correlation id, reply target, and exact
-message ids.
+message ids. An explicit empty message-id filter matches no messages; it never
+means "all messages." Read limits bound both returned messages and
+acknowledgement; a blocking receive must use a positive limit and a non-empty
+explicit id filter because zero-size receive windows cannot ever produce a
+message.
 
 Interrupt messages preempt before non-message tool calls until read. Normal
 messages notify after a tool call and do not block the current action.
