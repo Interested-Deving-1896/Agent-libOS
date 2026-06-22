@@ -91,7 +91,8 @@ class ProcessDefaults:
     max_tool_calls: int = 256
     max_child_processes: int = 16
     max_runtime_seconds: int | None = None
-    max_materialized_tokens: int = 65_536
+    max_context_materialization_tokens: int = 65_536
+    max_context_materialization_total_tokens: int | None = None
     max_llm_calls: int | None = None
     max_llm_total_tokens: int | None = None
     max_subprocess_wall_seconds: float | None = None

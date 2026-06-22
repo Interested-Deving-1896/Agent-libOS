@@ -61,9 +61,23 @@
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_same_bare_name_is_isolated_between_process_namespaces",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_name_lookup_does_not_bypass_object_capability",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_namespace_write_and_list_rights_are_enforced",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_read_grant_is_consumed_after_successful_lookup",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_write_grant_is_consumed_after_successful_create",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_read_write_grant_allows_single_append_operation",
         "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_copy_file_via_named_object_without_materializing_content_to_process"
       ],
       "benchmark_attack_classes": ["object_namespace_leakage"]
+    },
+    {
+      "id": "object-memory-materialization-budget-is-authoritative",
+      "title": "Object Memory materialization uses current payload token estimates.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_append_refreshes_token_estimate_for_materialization_budget",
+        "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_file_object_token_estimate_limits_prompt_materialization"
+      ],
+      "benchmark_attack_classes": []
     },
     {
       "id": "human-approval-is-blocking-and-audited",
@@ -169,6 +183,23 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "workflow-entry-uses-toolbroker-authority",
+      "title": "Direct workflow entrypoints run tools through process tool tables, ToolBroker, and normal lifecycle semantics.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_default_workflow_runs_visible_tool_and_exits_with_result_object",
+        "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_workflow_can_use_explicit_image_tool_table",
+        "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_unknown_workflow_tool_returns_failed_result",
+        "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_workflow_waiting_for_human_returns_request_without_auto_exit",
+        "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_workflow_does_not_auto_exit_process_exec_tool",
+        "tests/security/test_external_boundaries.py::TestExternalBoundary::test_workflow_run_cannot_bypass_image_tool_table",
+        "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_workflow_run_prints_result_and_persists_exited_process",
+        "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_workflow_run_failure_exits_nonzero_after_printing_json",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_workflow_run_endpoint_returns_result_and_snapshot_process"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "llm-call-records-are-bounded-and-redacted",
       "title": "LLM call persistence stores bounded preview, size, and hash rather than raw prompt, tool arguments, or provider responses.",
       "lane": "runtime",
@@ -250,6 +281,7 @@
       "node_ids": [
         "tests/unit/test_resource_manager.py::TestResourceManager::test_hierarchical_charge_updates_child_and_parent_usage",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_child_budget_cannot_exceed_parent_remaining_budget",
+        "tests/unit/test_resource_manager.py::TestResourceManager::test_child_count_budget_denial_leaves_no_partial_child",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_jsonrpc_remaining_budget_counts_request_and_response_together",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_child_process_creation_is_hierarchical_usage",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_parent_budget_exceedance_kills_parent_subtree",

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from copy import deepcopy
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -16,7 +15,6 @@ from agent_libos.models import (
     MergePolicy,
     ObjectHandle,
     ObjectMetadata,
-    ObjectPatch,
     ObjectRight,
     ObjectType,
     ProcessMessageKind,
@@ -33,7 +31,7 @@ from agent_libos.models.exceptions import (
     ProcessWaitRequired,
     ValidationError,
 )
-from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
+from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 
@@ -148,6 +146,19 @@ class LibOSSyscallSession:
         )
         try:
             result = await self._with_blocking(lambda: self._dispatch(normalized, args))
+        except asyncio.CancelledError:
+            preserve_wait = (asyncio.current_task().get_name() if asyncio.current_task() else "").startswith(
+                "agent-process:"
+            )
+            if not preserve_wait:
+                self._cleanup_interrupted_wait(normalized)
+            self.runtime.audit.record(
+                actor=self.pid,
+                action="syscall.cancelled",
+                target=normalized,
+                decision={"wait_state_preserved": preserve_wait},
+            )
+            raise
         except BaseException:
             self._cleanup_interrupted_wait(normalized)
             raise
@@ -609,38 +620,20 @@ class LibOSSyscallSession:
         return {"oid": handle.oid, "namespace": obj.namespace, "name": obj.name, "type": obj.type.value}
 
     def _memory_append_object(self, args: dict[str, Any]) -> Any:
-        handle = self.runtime.memory.handle_for_name(
+        updated, list_field, length = self.runtime.memory.append_object_by_name(
             self.pid,
             str(args["name"]),
-            rights=["read", "write"],
-            issued_by="jit.syscall",
+            args.get("entry"),
+            str(args.get("list_field", "entries")),
             namespace=args.get("namespace"),
+            issued_by="jit.syscall",
         )
-        obj = self.runtime.memory.get_object(self.pid, handle)
-        ensure_json_size(args.get("entry"), self.config.tools.memory_append_entry_max_bytes, "memory append entry")
-        payload = deepcopy(obj.payload)
-        list_field = str(args.get("list_field", "entries"))
-        if isinstance(payload, dict):
-            values = payload.setdefault(list_field, [])
-            if not isinstance(values, list):
-                raise ValidationError("target object list_field is not a list")
-            values.append(args.get("entry"))
-            length = len(values)
-        elif isinstance(payload, list):
-            payload.append(args.get("entry"))
-            list_field = ""
-            length = len(payload)
-        else:
-            raise ValidationError("target object payload is not appendable")
-        ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, "memory payload")
-        self.runtime.memory.update_object(self.pid, handle, ObjectPatch(payload=payload))
-        updated = self.runtime.memory.get_object(self.pid, handle)
         return {
             "oid": updated.oid,
             "namespace": updated.namespace,
             "name": updated.name,
             "version": updated.version,
-            "list_field": list_field or None,
+            "list_field": list_field,
             "length": length,
         }
 

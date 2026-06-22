@@ -28,6 +28,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   imply broader authority.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
   namespaces do not bypass object capabilities.
+- `object-memory-materialization-budget-is-authoritative`: Object Memory
+  context materialization uses current payload token estimates.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, consume one-shot grants, and route through primitives.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
@@ -48,6 +50,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   and budgets rather than dangerous API regex blacklists.
 - `tool-policy-cannot-self-grant-authority`: ToolPolicy declarations cannot
   grant execution, resource authority, or confirmation.
+- `workflow-entry-uses-toolbroker-authority`: user-facing workflow entrypoints
+  run tools through process tool tables, ToolBroker, result objects, and normal
+  wait/exit/exec lifecycle semantics.
 - `llm-call-records-are-bounded-and-redacted`: LLM call persistence stores
   bounded preview, size, hash, and truncation metadata instead of raw prompts,
   tool arguments, reasoning, or provider responses.

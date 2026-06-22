@@ -5,7 +5,7 @@ import tempfile
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.models import ResourceBudget, ResourceUsage
+from agent_libos.models import ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage
 from agent_libos.models.exceptions import ResourceLimitExceeded
 
 
@@ -88,6 +88,120 @@ class TestResourceManager:
                     goal="oversized child",
                     resource_budget=ResourceBudget(max_tool_calls=2),
                 )
+        finally:
+            runtime.close()
+
+    def test_child_budget_reservations_prevent_sibling_overcommit(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="parent",
+                resource_budget=ResourceBudget(max_tool_calls=5, max_child_processes=None),
+            )
+            child = runtime.process.spawn_child(
+                parent,
+                goal="child",
+                resource_budget=ResourceBudget(max_tool_calls=3, max_child_processes=None),
+            )
+
+            assert runtime.resources.remaining_budget(parent).max_tool_calls == 2
+            with pytest.raises(ResourceLimitExceeded):
+                runtime.process.spawn_child(
+                    parent,
+                    goal="oversized sibling",
+                    resource_budget=ResourceBudget(max_tool_calls=3, max_child_processes=None),
+                )
+
+            runtime.resources.charge(child, ResourceUsage(tool_calls=2), source="test")
+            assert runtime.resources.remaining_budget(parent).max_tool_calls == 2
+            runtime.process.spawn_child(
+                parent,
+                goal="sibling",
+                resource_budget=ResourceBudget(max_tool_calls=2, max_child_processes=None),
+            )
+        finally:
+            runtime.close()
+
+    def test_child_exit_releases_unused_reserved_budget(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="parent",
+                resource_budget=ResourceBudget(max_tool_calls=3, max_child_processes=None),
+            )
+            child = runtime.process.spawn_child(
+                parent,
+                goal="child",
+                resource_budget=ResourceBudget(max_tool_calls=3, max_child_processes=None),
+            )
+            with pytest.raises(ResourceLimitExceeded):
+                runtime.process.spawn_child(
+                    parent,
+                    goal="blocked",
+                    resource_budget=ResourceBudget(max_tool_calls=1, max_child_processes=None),
+                )
+
+            runtime.process.exit(child)
+            runtime.process.spawn_child(
+                parent,
+                goal="after release",
+                resource_budget=ResourceBudget(max_tool_calls=3, max_child_processes=None),
+            )
+        finally:
+            runtime.close()
+
+    def test_child_count_budget_denial_leaves_no_partial_child(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="parent",
+                resource_budget=ResourceBudget(max_child_processes=0),
+            )
+
+            with pytest.raises(ResourceLimitExceeded):
+                runtime.process.spawn_child(parent, goal="blocked child")
+
+            assert runtime.process.list_children(parent) == []
+            assert runtime.process.get(parent).resource_usage.child_processes == 0
+            assert runtime.store.list_resource_reservations(parent_pid=parent) == []
+        finally:
+            runtime.close()
+
+    def test_context_materialization_total_tokens_are_cumulative(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="context budget",
+                resource_budget=ResourceBudget(
+                    max_context_materialization_tokens=10,
+                    max_context_materialization_total_tokens=5,
+                ),
+            )
+            first = runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.OBSERVATION,
+                payload={"text": "first"},
+                metadata=ObjectMetadata(token_estimate=3),
+            )
+            second = runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.OBSERVATION,
+                payload={"text": "second"},
+                metadata=ObjectMetadata(token_estimate=3),
+            )
+
+            context = runtime.memory.materialize_context(pid, runtime.memory.create_view(pid, [first]))
+            assert context.token_count == 3
+            assert runtime.process.get(pid).resource_usage.context_materialized_tokens == 3
+
+            exhausted = runtime.memory.materialize_context(pid, runtime.memory.create_view(pid, [second]))
+            assert exhausted.token_count == 0
+            assert second.oid in exhausted.omitted_objects
+            assert runtime.process.get(pid).resource_usage.context_materialized_tokens == 3
         finally:
             runtime.close()
 

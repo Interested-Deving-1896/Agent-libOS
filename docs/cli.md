@@ -34,6 +34,7 @@ llm-calls     print persisted LLM call records
 processes     print process table
 resources     print process resource budget, usage, and remaining budget
 tools         print registered tools
+workflow      run a user-facing workflow tool directly
 spawn         spawn a process
 cd            set a process working directory
 exec          replace a process image and goal
@@ -62,6 +63,7 @@ uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite resources <pid>
 uv run agent-libos --db .agent_libos.sqlite audit
 uv run agent-libos --db .agent_libos.sqlite tools
+uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
 
 `run` uses the high-level async supervisor, so human terminal messages are
@@ -74,6 +76,30 @@ Manual queue processing remains available:
 ```bash
 uv run agent-libos --db .agent_libos.sqlite human
 ```
+
+## Workflow Run
+
+`workflow run` is a direct user entrypoint for tools. It spawns a fresh
+AgentProcess from the selected image, calls one visible tool through the normal
+ToolBroker path, and returns the tool result JSON. It does not run the LLM
+scheduler and it does not bypass the image's process tool table, primitive
+capability checks, resource budgets, human approval, result-object persistence,
+events, or audit.
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite \
+  workflow run get_working_directory
+
+uv run agent-libos --db .agent_libos.sqlite \
+  workflow run parse_pytest_log \
+  --image coding-agent:v0 \
+  --args-json '{"log":"FAILED tests/example.py::test_case"}'
+```
+
+By default the process goal is `workflow:<tool>`, so tool arguments are not
+copied into the goal object. Use `--goal` only when the workflow process needs a
+human-readable label. `ok:false` is still printed as JSON and exits the CLI with
+status code 1.
 
 ## LLM Calls
 
@@ -373,6 +399,10 @@ uv run python scripts/async_clock_interleave_smoke.py --iterations 3 --interval 
 uv run python scripts/ask_file_then_show.py --auto-answer README.md
 uv run python scripts/human_llm_chat.py --mock --auto-message hello --auto-message /exit
 ```
+
+`run_coding_agent.py` loads `.env` from the Agent libOS checkout before it
+mounts the target workspace. The target workspace's `.env` is not read
+implicitly; use `--env-file` for an explicit alternate credential file.
 
 On Windows PowerShell, use backslashes when convenient:
 

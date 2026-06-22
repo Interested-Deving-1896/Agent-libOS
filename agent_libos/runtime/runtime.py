@@ -27,8 +27,10 @@ from agent_libos.models import (
     ToolCandidateStatus,
     ToolHandle,
     ToolSpec,
+    ViewMode,
+    WorkflowRunResult,
 )
-from agent_libos.models.exceptions import NotFound, ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ValidationError
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
@@ -82,7 +84,14 @@ class Runtime:
         self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
         self.provider_hooks: dict[str, list[Any]] = {}
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
-        self.memory = ObjectMemoryManager(store, self.capability, self.audit, self.events, config=self.config)
+        self.memory = ObjectMemoryManager(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            config=self.config,
+            resources=self.resources,
+        )
         self.human = HumanObjectManager(
             store,
             self.capability,
@@ -458,6 +467,238 @@ class Runtime:
             max_quanta=selected_quanta,
         )
 
+    def run_workflow(
+        self,
+        tool: str,
+        args: dict[str, Any] | None = None,
+        *,
+        image: str | None = None,
+        goal: dict[str, Any] | str | None = None,
+        working_directory: str | None = None,
+    ) -> WorkflowRunResult:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.arun_workflow(
+                    tool,
+                    args,
+                    image=image,
+                    goal=goal,
+                    working_directory=working_directory,
+                )
+            )
+        raise RuntimeError("Cannot call run_workflow() inside a running event loop. Use await arun_workflow(...).")
+
+    async def arun_workflow(
+        self,
+        tool: str,
+        args: dict[str, Any] | None = None,
+        *,
+        image: str | None = None,
+        goal: dict[str, Any] | str | None = None,
+        working_directory: str | None = None,
+    ) -> WorkflowRunResult:
+        tool_name = str(tool).strip()
+        if not tool_name:
+            raise ValidationError("workflow tool name is required")
+        if args is None:
+            tool_args: dict[str, Any] = {}
+        elif isinstance(args, dict):
+            tool_args = dict(args)
+        else:
+            raise ValidationError("workflow args must be a JSON object")
+
+        selected_image = image or self.config.runtime.default_image_id
+        pid = self.process.spawn(
+            image=selected_image,
+            goal=goal if goal is not None else f"workflow:{tool_name}",
+            working_directory=working_directory,
+        )
+        initial = self.process.get(pid)
+        initial_image = initial.image_id
+        initial_goal_oid = initial.goal_oid
+        try:
+            result = await self.tools.acall(pid, tool_name, tool_args)
+        except HumanApprovalRequired as exc:
+            workflow_result = self._workflow_wait_result(
+                pid,
+                selected_image,
+                tool_name,
+                error=str(exc),
+                waiting_human=True,
+                request_id=exc.request_id,
+            )
+            self._record_workflow_run(workflow_result)
+            return workflow_result
+        except ProcessWaitRequired as exc:
+            workflow_result = self._workflow_wait_result(
+                pid,
+                selected_image,
+                tool_name,
+                error=str(exc),
+                waiting_process=True,
+                child_pid=exc.child_pid,
+            )
+            self._record_workflow_run(workflow_result)
+            return workflow_result
+        except ProcessMessageWaitRequired as exc:
+            workflow_result = self._workflow_wait_result(
+                pid,
+                selected_image,
+                tool_name,
+                error=str(exc),
+                waiting_message=True,
+                filters=exc.filters,
+            )
+            self._record_workflow_run(workflow_result)
+            return workflow_result
+        except Exception as exc:
+            error = str(exc)
+            if not self._workflow_tool_controlled_lifecycle(pid, initial_image=initial_image, initial_goal_oid=initial_goal_oid):
+                self.process.exit(pid, failed=True, message=error or f"workflow failed: {tool_name}")
+            workflow_result = self._workflow_failure_result(pid, selected_image, tool_name, error=error)
+            self._record_workflow_run(workflow_result)
+            return workflow_result
+
+        if result.result_handle is not None:
+            self._add_handle_to_process_view(pid, result.result_handle)
+        if not self._workflow_tool_controlled_lifecycle(pid, initial_image=initial_image, initial_goal_oid=initial_goal_oid):
+            if result.ok:
+                self.process.exit(
+                    pid,
+                    result=result.result_handle,
+                    message=None if result.result_handle is not None else f"workflow completed: {tool_name}",
+                )
+            else:
+                self.process.exit(pid, failed=True, message=result.error or f"workflow failed: {tool_name}")
+        workflow_result = self._workflow_result_from_tool_call(pid, selected_image, tool_name, result)
+        self._record_workflow_run(workflow_result)
+        return workflow_result
+
+    def _workflow_wait_result(
+        self,
+        pid: str,
+        image: str,
+        tool: str,
+        *,
+        error: str,
+        waiting_human: bool = False,
+        request_id: str | None = None,
+        waiting_process: bool = False,
+        child_pid: str | None = None,
+        waiting_message: bool = False,
+        filters: dict[str, Any] | None = None,
+    ) -> WorkflowRunResult:
+        process = self.process.get(pid)
+        return WorkflowRunResult(
+            pid=pid,
+            image=image,
+            tool=tool,
+            ok=False,
+            status=process.status.value,
+            tool_id=self._workflow_resolve_tool_id(pid, tool),
+            error=error,
+            waiting_human=waiting_human,
+            request_id=request_id,
+            waiting_process=waiting_process,
+            child_pid=child_pid,
+            waiting_message=waiting_message,
+            filters=dict(filters or {}) if filters is not None else None,
+        )
+
+    def _workflow_result_from_tool_call(
+        self,
+        pid: str,
+        image: str,
+        tool: str,
+        result: Any,
+    ) -> WorkflowRunResult:
+        process = self.process.get(pid)
+        return WorkflowRunResult(
+            pid=pid,
+            image=image,
+            tool=tool,
+            ok=bool(result.ok),
+            status=process.status.value,
+            call_id=result.call_id,
+            tool_id=result.tool_id,
+            result_oid=result.result_handle.oid if result.result_handle is not None else None,
+            payload=result.payload,
+            error=result.error,
+        )
+
+    def _workflow_failure_result(self, pid: str, image: str, tool: str, *, error: str) -> WorkflowRunResult:
+        process = self.process.get(pid)
+        return WorkflowRunResult(
+            pid=pid,
+            image=image,
+            tool=tool,
+            ok=False,
+            status=process.status.value,
+            tool_id=self._workflow_resolve_tool_id(pid, tool),
+            error=error,
+        )
+
+    def _workflow_resolve_tool_id(self, pid: str, tool: str) -> str | None:
+        try:
+            return self.tools.resolve(tool, pid=pid).tool_id
+        except Exception:
+            return None
+
+    def _workflow_tool_controlled_lifecycle(
+        self,
+        pid: str,
+        *,
+        initial_image: str,
+        initial_goal_oid: str | None,
+    ) -> bool:
+        process = self.process.get(pid)
+        if process.status in self.process.TERMINAL_STATUSES:
+            return True
+        if process.image_id != initial_image or process.goal_oid != initial_goal_oid:
+            return True
+        return any(
+            record.actor == pid and record.action == "process.exec" and record.target == f"process:{pid}"
+            for record in self.audit.trace(actor=pid, target=f"process:{pid}")
+        )
+
+    def _add_handle_to_process_view(self, pid: str, handle: ObjectHandle) -> None:
+        process = self.process.get(pid)
+        if process.memory_view is None:
+            process.memory_view = self.memory.create_view(pid, [handle], mode=ViewMode.READ_ONLY)
+        elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
+            process.memory_view.roots.append(handle)
+        process.updated_at = utc_now()
+        self.store.update_process(process)
+
+    def _record_workflow_run(self, result: WorkflowRunResult) -> None:
+        decision = {
+            "tool": result.tool,
+            "image": result.image,
+            "ok": result.ok,
+            "status": result.status,
+            "call_id": result.call_id,
+            "tool_id": result.tool_id,
+            "result_oid": result.result_oid,
+            "waiting_human": result.waiting_human,
+            "waiting_process": result.waiting_process,
+            "waiting_message": result.waiting_message,
+        }
+        if result.request_id is not None:
+            decision["request_id"] = result.request_id
+        if result.child_pid is not None:
+            decision["child_pid"] = result.child_pid
+        if result.filters is not None:
+            decision["filters"] = result.filters
+        self.audit.record(
+            actor="workflow",
+            action="workflow.run",
+            target=f"process:{result.pid}",
+            output_refs=[result.result_oid] if result.result_oid is not None else [],
+            decision=decision,
+        )
+
     def register_image(self, image: AgentImage | dict[str, Any], *, actor: str = "runtime", replace: bool = False) -> None:
         self.image_registry.register(image, actor=actor, replace=replace)
 
@@ -513,7 +754,7 @@ class Runtime:
     ) -> Any:
         selected_image = self._require_image(image)
         self._preflight_process_image_boot(selected_image)
-        previous_state = self._snapshot_process_exec_state()
+        previous_state = self._snapshot_process_exec_state(pid)
         self.process.exec(
             pid,
             image,
@@ -669,40 +910,141 @@ class Runtime:
         elif boot_kind == "image_package":
             self._load_image_artifact(image, expected_kind="image_package")
 
-    def _snapshot_process_exec_state(self) -> dict[str, Any]:
-        tables = [
-            "processes",
+    def _snapshot_process_exec_state(self, pid: str) -> dict[str, Any]:
+        process_rows = self.store.select_table_rows("processes", "pid = ?", (pid,))
+        if not process_rows:
+            raise NotFound(f"process not found: {pid}")
+        object_rows = self.store.select_table_rows("objects", "created_by = ?", (pid,), order_by="oid")
+        object_oids = [str(row["oid"]) for row in object_rows]
+        namespace_rows = self.store.select_table_rows(
             "object_namespaces",
-            "objects",
-            "object_links",
-            "capabilities",
-            "llm_pending_actions",
-            "tools",
-            "tool_candidates",
-            "skills",
-            "skill_trust",
-            "jsonrpc_endpoints",
-        ]
+            "created_by = ? OR namespace = ?",
+            (pid, self.memory.process_namespace(pid)),
+            order_by="namespace",
+        )
+        tool_ids = set(loads(process_rows[0].get("tool_table_json"), {}).values())
         return {
-            "tables": {table: self.store.select_table_rows(table) for table in tables},
-            "object_payloads": deepcopy(self.store._object_payloads),
-            "tool_handles": deepcopy(getattr(self.tools, "_handles", {})),
-            "tool_ids_by_name": deepcopy(getattr(self.tools, "_tool_ids_by_name", {})),
-            "jit_sources": deepcopy(getattr(self.tools, "_jit_sources", {})),
+            "pid": pid,
+            "object_oids": object_oids,
+            "namespace_names": [str(row["namespace"]) for row in namespace_rows],
+            "tables": {
+                "processes": process_rows,
+                "object_namespaces": namespace_rows,
+                "objects": object_rows,
+                "object_links": self._exec_object_link_rows(object_oids),
+                "capabilities": self.store.select_table_rows("capabilities", "subject = ?", (pid,), order_by="cap_id"),
+                "llm_pending_actions": self.store.select_table_rows("llm_pending_actions", "pid = ?", (pid,)),
+                "tool_candidates": self.store.select_table_rows("tool_candidates", "pid = ?", (pid,), order_by="candidate_id"),
+                "process_resource_reservations": self.store.select_table_rows(
+                    "process_resource_reservations",
+                    "parent_pid = ? OR child_pid = ?",
+                    (pid, pid),
+                    order_by="parent_pid, child_pid",
+                ),
+            },
+            "object_payloads": {
+                oid: deepcopy(self.store._object_payloads[oid])
+                for oid in object_oids
+                if oid in self.store._object_payloads
+            },
+            "tool_ids": tool_ids,
+            "tool_handles": {
+                tool_id: deepcopy(getattr(self.tools, "_handles", {}).get(tool_id))
+                for tool_id in tool_ids
+                if tool_id in getattr(self.tools, "_handles", {})
+            },
+            "jit_sources": {
+                tool_id: deepcopy(getattr(self.tools, "_jit_sources", {}).get(tool_id))
+                for tool_id in tool_ids
+                if tool_id in getattr(self.tools, "_jit_sources", {})
+            },
         }
 
     def _restore_process_exec_state(self, state: dict[str, Any]) -> None:
+        pid = state["pid"]
         tables = state["tables"]
+        current_process = self.store.get_process(pid)
+        current_object_rows = self.store.select_table_rows("objects", "created_by = ?", (pid,), order_by="oid")
+        current_object_oids = [str(row["oid"]) for row in current_object_rows]
+        object_oids = sorted(set(state["object_oids"]) | set(current_object_oids))
+        namespace_names = sorted(
+            set(state["namespace_names"])
+            | {
+                str(row["namespace"])
+                for row in self.store.select_table_rows(
+                    "object_namespaces",
+                    "created_by = ? OR namespace = ?",
+                    (pid, self.memory.process_namespace(pid)),
+                    order_by="namespace",
+                )
+            }
+        )
+        current_tool_ids = set(current_process.tool_table.values()) if current_process is not None else set()
+        stale_tool_ids = current_tool_ids - set(state["tool_ids"])
         with self.store.transaction(include_object_payloads=True) as cur:
-            for table in reversed(list(tables)):
-                cur.execute(f"DELETE FROM {table}")
-            for table, rows in tables.items():
-                for row in rows:
+            if object_oids:
+                placeholders = ", ".join("?" for _ in object_oids)
+                cur.execute(
+                    f"DELETE FROM object_links WHERE src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
+                    [*object_oids, *object_oids],
+                )
+                cur.execute(f"DELETE FROM objects WHERE oid IN ({placeholders})", object_oids)
+                for oid in object_oids:
+                    self.store.forget_object_payload(oid)
+            if namespace_names:
+                placeholders = ", ".join("?" for _ in namespace_names)
+                cur.execute(f"DELETE FROM object_namespaces WHERE namespace IN ({placeholders})", namespace_names)
+            cur.execute("DELETE FROM capabilities WHERE subject = ?", (pid,))
+            cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
+            cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
+            cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
+            cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
+            for row in tables["object_namespaces"]:
+                self.checkpoint._insert_row(cur, "object_namespaces", row)
+            for row in tables["objects"]:
+                item = dict(row)
+                item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
+                self.checkpoint._insert_row(cur, "objects", item)
+                oid = str(item["oid"])
+                if oid in state["object_payloads"]:
+                    self.store.set_object_payload(oid, deepcopy(state["object_payloads"][oid]))
+            for table in [
+                "object_links",
+                "capabilities",
+                "llm_pending_actions",
+                "tool_candidates",
+                "process_resource_reservations",
+                "processes",
+            ]:
+                for row in tables[table]:
                     self.checkpoint._insert_row(cur, table, row)
-            self.store._object_payloads = deepcopy(state["object_payloads"])
-        self.tools._handles = deepcopy(state["tool_handles"])
-        self.tools._tool_ids_by_name = deepcopy(state["tool_ids_by_name"])
-        self.tools._jit_sources = deepcopy(state["jit_sources"])
+        for tool_id in stale_tool_ids:
+            if not self._tool_id_used_by_other_process(tool_id, pid):
+                getattr(self.tools, "_handles", {}).pop(tool_id, None)
+                getattr(self.tools, "_jit_sources", {}).pop(tool_id, None)
+        for tool_id, handle in state["tool_handles"].items():
+            self.tools._handles[tool_id] = deepcopy(handle)
+        for tool_id, source in state["jit_sources"].items():
+            self.tools._jit_sources[tool_id] = deepcopy(source)
+
+    def _exec_object_link_rows(self, object_oids: list[str]) -> list[dict[str, Any]]:
+        if not object_oids:
+            return []
+        placeholders = ", ".join("?" for _ in object_oids)
+        return self.store.select_table_rows(
+            "object_links",
+            f"src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
+            [*object_oids, *object_oids],
+            order_by="id",
+        )
+
+    def _tool_id_used_by_other_process(self, tool_id: str, pid: str) -> bool:
+        for process in self.store.list_processes():
+            if process.pid == pid:
+                continue
+            if tool_id in process.tool_table.values():
+                return True
+        return False
 
     def _fail_process_image_boot(self, pid: str, image_id: str, exc: Exception, *, phase: str) -> None:
         process = self.store.get_process(pid)

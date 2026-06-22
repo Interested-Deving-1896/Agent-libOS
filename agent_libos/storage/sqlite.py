@@ -45,6 +45,7 @@ from agent_libos.models import (
     Provenance,
     RelationType,
     ResourceBudget,
+    ResourceReservation,
     ResourceUsage,
     ToolCandidate,
     ToolCandidateStatus,
@@ -141,6 +142,21 @@ class SQLiteStore:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS process_resource_reservations (
+                  parent_pid TEXT NOT NULL,
+                  child_pid TEXT NOT NULL,
+                  reservation_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY(parent_pid, child_pid)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_resource_reservations_parent
+                  ON process_resource_reservations(parent_pid, child_pid);
+
+                CREATE INDEX IF NOT EXISTS idx_resource_reservations_child
+                  ON process_resource_reservations(child_pid, parent_pid);
 
                 CREATE TABLE IF NOT EXISTS events (
                   event_id TEXT PRIMARY KEY,
@@ -414,6 +430,7 @@ class SQLiteStore:
             )
             self._ensure_object_namespace_schema()
             self._ensure_process_schema()
+            self._ensure_resource_reservation_schema()
             self._ensure_capability_schema()
             self._ensure_audit_schema()
             self._ensure_llm_call_schema()
@@ -458,57 +475,59 @@ class SQLiteStore:
                 self.conn.commit()
 
     def insert_object(self, obj: AgentObject) -> None:
-        self._object_payloads[obj.oid] = obj.payload
-        self._execute(
-            """
-            INSERT INTO objects (
-                oid, namespace, name, type, schema_version, payload_json, metadata_json,
-                provenance_json, version, immutable, created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                obj.oid,
-                obj.namespace,
-                obj.name,
-                obj.type.value,
-                obj.schema_version,
-                dumps(self._memory_payload_marker(present=True)),
-                dumps(obj.metadata),
-                dumps(obj.provenance),
-                obj.version,
-                int(obj.immutable),
-                obj.created_by,
-                obj.created_at,
-                obj.updated_at,
-            ),
-        )
+        with self.transaction(include_object_payloads=True) as cur:
+            self._object_payloads[obj.oid] = obj.payload
+            cur.execute(
+                """
+                INSERT INTO objects (
+                    oid, namespace, name, type, schema_version, payload_json, metadata_json,
+                    provenance_json, version, immutable, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    obj.oid,
+                    obj.namespace,
+                    obj.name,
+                    obj.type.value,
+                    obj.schema_version,
+                    dumps(self._memory_payload_marker(present=True)),
+                    dumps(obj.metadata),
+                    dumps(obj.provenance),
+                    obj.version,
+                    int(obj.immutable),
+                    obj.created_by,
+                    obj.created_at,
+                    obj.updated_at,
+                ),
+            )
 
     def update_object(self, obj: AgentObject) -> None:
-        self._object_payloads[obj.oid] = obj.payload
-        self._execute(
-            """
-            UPDATE objects
-               SET namespace = ?, name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
-                   provenance_json = ?, version = ?, immutable = ?, created_by = ?,
-                   created_at = ?, updated_at = ?
-             WHERE oid = ?
-            """,
-            (
-                obj.namespace,
-                obj.name,
-                obj.type.value,
-                obj.schema_version,
-                dumps(self._memory_payload_marker(present=True)),
-                dumps(obj.metadata),
-                dumps(obj.provenance),
-                obj.version,
-                int(obj.immutable),
-                obj.created_by,
-                obj.created_at,
-                obj.updated_at,
-                obj.oid,
-            ),
-        )
+        with self.transaction(include_object_payloads=True) as cur:
+            self._object_payloads[obj.oid] = obj.payload
+            cur.execute(
+                """
+                UPDATE objects
+                   SET namespace = ?, name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
+                       provenance_json = ?, version = ?, immutable = ?, created_by = ?,
+                       created_at = ?, updated_at = ?
+                 WHERE oid = ?
+                """,
+                (
+                    obj.namespace,
+                    obj.name,
+                    obj.type.value,
+                    obj.schema_version,
+                    dumps(self._memory_payload_marker(present=True)),
+                    dumps(obj.metadata),
+                    dumps(obj.provenance),
+                    obj.version,
+                    int(obj.immutable),
+                    obj.created_by,
+                    obj.created_at,
+                    obj.updated_at,
+                    obj.oid,
+                ),
+            )
 
     def get_object(self, oid: str) -> AgentObject | None:
         rows = self._query("SELECT * FROM objects WHERE oid = ?", (oid,))
@@ -543,10 +562,19 @@ class SQLiteStore:
         rows = self._query("SELECT oid FROM objects WHERE created_by = ? ORDER BY created_at", (created_by,))
         return [str(row["oid"]) for row in rows]
 
+    def list_objects_created_by(self, created_by: str) -> list[AgentObject]:
+        rows = self._query("SELECT * FROM objects WHERE created_by = ? ORDER BY created_at, oid", (created_by,))
+        return [
+            self._row_to_object(row)
+            for row in rows
+            if row["oid"] in self._object_payloads
+        ]
+
     def delete_object(self, oid: str) -> None:
-        self._object_payloads.pop(oid, None)
-        self._execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
-        self._execute("DELETE FROM objects WHERE oid = ?", (oid,))
+        with self.transaction(include_object_payloads=True) as cur:
+            self._object_payloads.pop(oid, None)
+            cur.execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
+            cur.execute("DELETE FROM objects WHERE oid = ?", (oid,))
 
     def insert_namespace(self, namespace: ObjectNamespace) -> None:
         self._execute(
@@ -581,6 +609,13 @@ class SQLiteStore:
                 "SELECT * FROM object_namespaces WHERE parent_namespace = ? ORDER BY namespace",
                 (parent_namespace,),
             )
+        return [self._row_to_namespace(row) for row in rows]
+
+    def list_namespaces_created_by(self, created_by: str) -> list[ObjectNamespace]:
+        rows = self._query(
+            "SELECT * FROM object_namespaces WHERE created_by = ? ORDER BY namespace",
+            (created_by,),
+        )
         return [self._row_to_namespace(row) for row in rows]
 
     def insert_link(self, link: ObjectLink) -> None:
@@ -657,6 +692,79 @@ class SQLiteStore:
 
     def list_processes(self) -> list[AgentProcess]:
         return [self._row_to_process(row) for row in self._query("SELECT * FROM processes")]
+
+    def list_processes_by_status(self, status: ProcessStatus | str) -> list[AgentProcess]:
+        selected = ProcessStatus(status).value
+        rows = self._query(
+            "SELECT * FROM processes WHERE status = ? ORDER BY created_at, pid",
+            (selected,),
+        )
+        return [self._row_to_process(row) for row in rows]
+
+    def list_child_processes(self, parent_pid: str) -> list[AgentProcess]:
+        rows = self._query(
+            "SELECT * FROM processes WHERE parent_pid = ? ORDER BY created_at, pid",
+            (parent_pid,),
+        )
+        return [self._row_to_process(row) for row in rows]
+
+    def upsert_resource_reservation(self, reservation: ResourceReservation) -> None:
+        self._execute(
+            """
+            INSERT INTO process_resource_reservations (
+                parent_pid, child_pid, reservation_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(parent_pid, child_pid) DO UPDATE SET
+                reservation_json = excluded.reservation_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                reservation.parent_pid,
+                reservation.child_pid,
+                dumps(reservation.reserved),
+                reservation.created_at,
+                reservation.updated_at,
+            ),
+        )
+
+    def get_resource_reservation(self, parent_pid: str, child_pid: str) -> ResourceReservation | None:
+        rows = self._query(
+            "SELECT * FROM process_resource_reservations WHERE parent_pid = ? AND child_pid = ?",
+            (parent_pid, child_pid),
+        )
+        return self._row_to_resource_reservation(rows[0]) if rows else None
+
+    def list_resource_reservations(
+        self,
+        *,
+        parent_pid: str | None = None,
+        child_pid: str | None = None,
+    ) -> list[ResourceReservation]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if parent_pid is not None:
+            clauses.append("parent_pid = ?")
+            params.append(parent_pid)
+        if child_pid is not None:
+            clauses.append("child_pid = ?")
+            params.append(child_pid)
+        sql = "SELECT * FROM process_resource_reservations"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY parent_pid, child_pid"
+        return [self._row_to_resource_reservation(row) for row in self._query(sql, params)]
+
+    def delete_resource_reservation(self, parent_pid: str, child_pid: str) -> None:
+        self._execute(
+            "DELETE FROM process_resource_reservations WHERE parent_pid = ? AND child_pid = ?",
+            (parent_pid, child_pid),
+        )
+
+    def delete_resource_reservations_for_process(self, pid: str) -> None:
+        self._execute(
+            "DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?",
+            (pid, pid),
+        )
 
     def select_table_rows(
         self,
@@ -1176,6 +1284,23 @@ class SQLiteStore:
             ),
         )
 
+    def update_tool(self, handle: ToolHandle, spec: ToolSpec, registered_by: str, ephemeral: bool) -> None:
+        self._execute(
+            """
+            UPDATE tools
+               SET name = ?, spec_json = ?, scope = ?, registered_by = ?, ephemeral = ?
+             WHERE tool_id = ?
+            """,
+            (
+                handle.name,
+                dumps(spec),
+                handle.scope,
+                registered_by,
+                int(ephemeral),
+                handle.tool_id,
+            ),
+        )
+
     def get_tool_spec(self, tool_id: str) -> ToolSpec | None:
         rows = self._query("SELECT * FROM tools WHERE tool_id = ?", (tool_id,))
         if not rows:
@@ -1613,6 +1738,38 @@ class SQLiteStore:
             self.conn.execute("ALTER TABLE processes ADD COLUMN working_directory TEXT NOT NULL DEFAULT '.'")
         if "resource_usage_json" not in columns:
             self.conn.execute("ALTER TABLE processes ADD COLUMN resource_usage_json TEXT NOT NULL DEFAULT '{}'")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processes_status_created ON processes(status, created_at, pid)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processes_parent_created ON processes(parent_pid, created_at, pid)"
+        )
+
+    def _ensure_resource_reservation_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS process_resource_reservations (
+              parent_pid TEXT NOT NULL,
+              child_pid TEXT NOT NULL,
+              reservation_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(parent_pid, child_pid)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_resource_reservations_parent
+              ON process_resource_reservations(parent_pid, child_pid)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_resource_reservations_child
+              ON process_resource_reservations(child_pid, parent_pid)
+            """
+        )
 
     def _ensure_capability_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
@@ -1835,6 +1992,13 @@ class SQLiteStore:
             self.conn.execute("UPDATE objects SET name = oid WHERE name IS NULL OR name = ''")
         self.conn.execute("DROP INDEX IF EXISTS idx_objects_name")
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_namespace_name ON objects(namespace, name)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_created_by ON objects(created_by, created_at, oid)")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_object_namespaces_created_by ON object_namespaces(created_by, namespace)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_object_namespaces_parent ON object_namespaces(parent_namespace, namespace)"
+        )
         now = utc_now()
         self.conn.execute(
             """
@@ -2019,6 +2183,15 @@ class SQLiteStore:
             updated_at=row["updated_at"],
             working_directory=row["working_directory"] if "working_directory" in row.keys() else ".",
             status_message=row["status_message"],
+        )
+
+    def _row_to_resource_reservation(self, row: sqlite3.Row) -> ResourceReservation:
+        return ResourceReservation(
+            parent_pid=row["parent_pid"],
+            child_pid=row["child_pid"],
+            reserved={key: float(value) for key, value in loads(row["reservation_json"], {}).items()},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
     def _row_to_event(self, row: sqlite3.Row) -> Event:

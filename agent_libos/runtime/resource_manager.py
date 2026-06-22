@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Any
 
-from agent_libos.models import AgentProcess, EventPriority, EventType, ProcessStatus, ResourceBudget, ResourceUsage
+from agent_libos.models import AgentProcess, EventPriority, EventType, ProcessStatus, ResourceBudget, ResourceReservation, ResourceUsage
 from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
@@ -24,6 +24,7 @@ _BUDGET_USAGE_MAP: dict[str, tuple[str, ...]] = {
     "max_tool_calls": ("tool_calls",),
     "max_child_processes": ("child_processes",),
     "max_runtime_seconds": ("runtime_seconds",),
+    "max_context_materialization_total_tokens": ("context_materialized_tokens",),
     "max_llm_calls": ("llm_calls",),
     "max_llm_total_tokens": ("llm_total_tokens",),
     "max_subprocess_wall_seconds": ("subprocess_wall_seconds",),
@@ -34,6 +35,8 @@ _BUDGET_USAGE_MAP: dict[str, tuple[str, ...]] = {
     "max_jsonrpc_bytes": ("jsonrpc_request_bytes", "jsonrpc_response_bytes"),
     "max_deno_syscalls": ("deno_syscalls",),
 }
+
+_NON_RESERVABLE_BUDGET_FIELDS = {"max_subprocess_memory_bytes", "max_child_processes"}
 
 
 class ResourceManager:
@@ -62,26 +65,7 @@ class ResourceManager:
         if self._is_zero(usage):
             return
         with self.store._lock:
-            relevant_fields = self._nonzero_fields(usage)
-            for process in self._process_chain(pid):
-                candidate = self._merge_usage(process.resource_usage, usage)
-                exceeded = self._first_exceeded(process.resource_budget, candidate, relevant_fields=relevant_fields)
-                if exceeded is None:
-                    continue
-                message = self._limit_message(process.pid, exceeded)
-                self.audit.record(
-                    actor=pid,
-                    action="resource.preflight_denied",
-                    target=f"process:{process.pid}",
-                    decision={
-                        "source": source,
-                        "context": context or {},
-                        "requested_usage": to_jsonable(usage),
-                        "limit": exceeded,
-                        "message": message,
-                    },
-                )
-                raise ResourceLimitExceeded(message)
+            self._preflight_locked(pid, usage, source=source, context=context)
 
     def charge(
         self,
@@ -102,12 +86,17 @@ class ResourceManager:
             if not allow_overage:
                 self._preflight_locked(pid, delta, source=source, context=context)
             exceeded_after_charge: tuple[AgentProcess, dict[str, Any]] | None = None
-            for process in chain:
+            for index, process in enumerate(chain):
                 latest = self._get(process.pid)
                 latest.resource_usage = self._merge_usage(latest.resource_usage, delta)
                 latest.updated_at = utc_now()
                 self.store.update_process(latest)
-                exceeded = self._first_exceeded(latest.resource_budget, latest.resource_usage, relevant_fields=relevant_fields)
+                if index > 0:
+                    self._consume_reservation_locked(latest.pid, chain[index - 1].pid, delta, relevant_fields)
+                exceeded = self._first_exceeded_effective(
+                    latest,
+                    relevant_fields=relevant_fields,
+                )
                 if exceeded is not None and exceeded_after_charge is None:
                     exceeded_after_charge = (latest, exceeded)
             self.events.emit(
@@ -152,6 +141,7 @@ class ResourceManager:
                 process.status_message = reason
                 process.updated_at = utc_now()
                 self.store.update_process(process)
+                self.store.delete_resource_reservations_for_process(process.pid)
                 killed.append(process.pid)
             for killed_pid in killed:
                 self._wake_parent_waiting_on_child(killed_pid)
@@ -224,14 +214,26 @@ class ResourceManager:
         reserve = reserved_usage or ResourceUsage()
         self._coerce_usage(reserve)
         with self.store._lock:
-            parent = self._get(parent_pid)
+            if not self._is_zero(reserve):
+                self._preflight_locked(
+                    parent_pid,
+                    reserve,
+                    source="resource.validate_child_budget",
+                    context={"child_budget": to_jsonable(child_budget)},
+                )
+            parent_window = self.context_materialization_window_limit(parent_pid)
+            if child_budget.max_context_materialization_tokens > parent_window:
+                raise ResourceLimitExceeded(
+                    "child budget max_context_materialization_tokens="
+                    f"{child_budget.max_context_materialization_tokens} exceeds parent limit {parent_window}"
+                )
             for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
                 requested = getattr(child_budget, budget_field)
                 if requested is None:
                     continue
-                if budget_field in {"max_subprocess_memory_bytes", "max_child_processes"}:
-                    limit = getattr(parent.resource_budget, budget_field)
-                    if limit is not None and requested > limit:
+                if budget_field in _NON_RESERVABLE_BUDGET_FIELDS:
+                    limit = self.peak_limit(parent_pid, budget_field)
+                    if limit is not None and float(requested) > float(limit):
                         raise ResourceLimitExceeded(
                             f"child budget {budget_field}={requested} exceeds parent limit {limit}"
                         )
@@ -251,8 +253,9 @@ class ResourceManager:
 
     def remaining_budget(self, pid: str) -> ResourceBudget:
         with self.store._lock:
-            process = self._get(pid)
-            values: dict[str, Any] = {"max_materialized_tokens": process.resource_budget.max_materialized_tokens}
+            values: dict[str, Any] = {
+                "max_context_materialization_tokens": self.context_materialization_window_limit(pid),
+            }
             for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
                 if budget_field == "max_subprocess_memory_bytes":
                     values[budget_field] = self.peak_limit(pid, budget_field)
@@ -263,6 +266,58 @@ class ResourceManager:
                 else:
                     values[budget_field] = int(remaining) if remaining.is_integer() else remaining
             return ResourceBudget(**values)
+
+    def reserve_child_budget(self, parent_pid: str, child_pid: str, child_budget: ResourceBudget) -> None:
+        with self.store._lock:
+            self.validate_child_budget(parent_pid, child_budget, reserved_usage=ResourceUsage(child_processes=1))
+            reserved = self._reservation_from_budget(child_budget)
+            if not reserved:
+                return
+            now = utc_now()
+            self.store.upsert_resource_reservation(
+                ResourceReservation(
+                    parent_pid=parent_pid,
+                    child_pid=child_pid,
+                    reserved=reserved,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            self.audit.record(
+                actor=parent_pid,
+                action="resource.reserve_child_budget",
+                target=f"process:{child_pid}",
+                decision={"reserved": reserved},
+            )
+
+    def release_process_reservations(self, pid: str) -> None:
+        with self.store._lock:
+            reservations = self.store.list_resource_reservations(child_pid=pid)
+            reservations.extend(self.store.list_resource_reservations(parent_pid=pid))
+            self.store.delete_resource_reservations_for_process(pid)
+            if reservations:
+                self.audit.record(
+                    actor="resource_manager",
+                    action="resource.release_process_reservations",
+                    target=f"process:{pid}",
+                    decision={
+                        "reservations": [
+                            {
+                                "parent_pid": item.parent_pid,
+                                "child_pid": item.child_pid,
+                                "reserved": item.reserved,
+                            }
+                            for item in reservations
+                        ]
+                    },
+                )
+
+    def context_materialization_window_limit(self, pid: str) -> int:
+        selected: int | None = None
+        for process in self._process_chain(pid):
+            value = int(process.resource_budget.max_context_materialization_tokens)
+            selected = value if selected is None else min(selected, value)
+        return selected if selected is not None else 0
 
     def _get(self, pid: str) -> AgentProcess:
         process = self.store.get_process(pid)
@@ -279,9 +334,17 @@ class ResourceManager:
         context: dict[str, Any] | None,
     ) -> None:
         relevant_fields = self._nonzero_fields(usage)
-        for process in self._process_chain(pid):
+        chain = self._process_chain(pid)
+        for index, process in enumerate(chain):
             candidate = self._merge_usage(process.resource_usage, usage)
-            exceeded = self._first_exceeded(process.resource_budget, candidate, relevant_fields=relevant_fields)
+            consuming_child_pid = chain[index - 1].pid if index > 0 else None
+            exceeded = self._first_exceeded_effective(
+                process,
+                usage=candidate,
+                relevant_fields=relevant_fields,
+                consuming_child_pid=consuming_child_pid,
+                consuming_usage=usage,
+            )
             if exceeded is None:
                 continue
             message = self._limit_message(process.pid, exceeded)
@@ -318,6 +381,8 @@ class ResourceManager:
                 else process.resource_usage
             )
             value = sum(float(getattr(usage, usage_field)) for usage_field in usage_fields)
+            if budget_field not in _NON_RESERVABLE_BUDGET_FIELDS:
+                value += self._reserved_budget_value_locked(process.pid, budget_field)
             process_remaining = max(0.0, float(limit) - value)
             remaining = process_remaining if remaining is None else min(remaining, process_remaining)
         return remaining
@@ -332,17 +397,97 @@ class ResourceManager:
             current = self._get(current.parent_pid)
 
     def _descendant_tree(self, pid: str) -> list[AgentProcess]:
-        processes = self.store.list_processes()
-        by_parent: dict[str | None, list[AgentProcess]] = {}
-        for process in processes:
-            by_parent.setdefault(process.parent_pid, []).append(process)
         selected: list[AgentProcess] = []
         stack = [self._get(pid)]
         while stack:
             process = stack.pop()
             selected.append(process)
-            stack.extend(by_parent.get(process.pid, []))
+            stack.extend(self.store.list_child_processes(process.pid))
         return selected
+
+    def _reservation_from_budget(self, budget: ResourceBudget) -> dict[str, float]:
+        reserved: dict[str, float] = {}
+        for budget_field in _BUDGET_USAGE_MAP:
+            if budget_field in _NON_RESERVABLE_BUDGET_FIELDS:
+                continue
+            value = getattr(budget, budget_field)
+            if value is None:
+                continue
+            reserved[budget_field] = float(value)
+        return reserved
+
+    def _consume_reservation_locked(
+        self,
+        parent_pid: str,
+        child_pid: str,
+        usage: ResourceUsage,
+        relevant_fields: set[str],
+    ) -> None:
+        reservation = self.store.get_resource_reservation(parent_pid, child_pid)
+        if reservation is None:
+            return
+        changed = False
+        remaining = dict(reservation.reserved)
+        for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
+            if budget_field in _NON_RESERVABLE_BUDGET_FIELDS:
+                continue
+            if not (set(usage_fields) & relevant_fields):
+                continue
+            current = float(remaining.get(budget_field, 0.0))
+            if current <= 0:
+                continue
+            consumed = min(current, self._usage_value(usage, budget_field, usage_fields))
+            if consumed <= 0:
+                continue
+            next_value = current - consumed
+            if next_value <= 0:
+                remaining.pop(budget_field, None)
+            else:
+                remaining[budget_field] = next_value
+            changed = True
+        if not changed:
+            return
+        if remaining:
+            self.store.upsert_resource_reservation(
+                ResourceReservation(
+                    parent_pid=parent_pid,
+                    child_pid=child_pid,
+                    reserved=remaining,
+                    created_at=reservation.created_at,
+                    updated_at=utc_now(),
+                )
+            )
+        else:
+            self.store.delete_resource_reservation(parent_pid, child_pid)
+
+    def _reserved_budget_value_locked(
+        self,
+        parent_pid: str,
+        budget_field: str,
+        *,
+        consuming_child_pid: str | None = None,
+        consuming_usage: ResourceUsage | None = None,
+    ) -> float:
+        total = 0.0
+        usage_fields = _BUDGET_USAGE_MAP[budget_field]
+        for reservation in self.store.list_resource_reservations(parent_pid=parent_pid):
+            value = float(reservation.reserved.get(budget_field, 0.0))
+            if value <= 0:
+                continue
+            if consuming_child_pid == reservation.child_pid and consuming_usage is not None:
+                value = max(0.0, value - self._usage_value(consuming_usage, budget_field, usage_fields))
+            total += value
+        return total
+
+    def _usage_value(
+        self,
+        usage: ResourceUsage,
+        budget_field: str,
+        usage_fields: tuple[str, ...],
+    ) -> float:
+        if budget_field == "max_subprocess_memory_bytes":
+            return float(getattr(usage, "subprocess_peak_memory_bytes"))
+        return sum(float(getattr(usage, usage_field)) for usage_field in usage_fields)
 
     def _coerce_usage(self, usage: ResourceUsage | dict[str, Any]) -> ResourceUsage:
         if isinstance(usage, ResourceUsage):
@@ -387,6 +532,34 @@ class ResourceManager:
                 value = getattr(usage, "subprocess_peak_memory_bytes")
             else:
                 value = sum(getattr(usage, usage_field) for usage_field in usage_fields)
+            if float(value) > float(limit):
+                return {"budget": budget_field, "usage": list(usage_fields), "value": value, "limit": limit}
+        return None
+
+    def _first_exceeded_effective(
+        self,
+        process: AgentProcess,
+        *,
+        usage: ResourceUsage | None = None,
+        relevant_fields: set[str] | None = None,
+        consuming_child_pid: str | None = None,
+        consuming_usage: ResourceUsage | None = None,
+    ) -> dict[str, Any] | None:
+        selected_usage = usage or process.resource_usage
+        for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
+            if relevant_fields is not None and not (set(usage_fields) & relevant_fields):
+                continue
+            limit = getattr(process.resource_budget, budget_field)
+            if limit is None:
+                continue
+            value = self._usage_value(selected_usage, budget_field, usage_fields)
+            if budget_field not in _NON_RESERVABLE_BUDGET_FIELDS:
+                value += self._reserved_budget_value_locked(
+                    process.pid,
+                    budget_field,
+                    consuming_child_pid=consuming_child_pid,
+                    consuming_usage=consuming_usage,
+                )
             if float(value) > float(limit):
                 return {"budget": budget_field, "usage": list(usage_fields), "value": value, "limit": limit}
         return None

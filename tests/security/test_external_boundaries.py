@@ -2,7 +2,7 @@ from __future__ import annotations
 import pytest
 from uuid import uuid4
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, ForkMode, HumanRequestStatus
+from agent_libos.models import CapabilityRight, ForkMode, HumanRequestStatus, ProcessStatus
 
 class TestExternalBoundary:
 
@@ -85,6 +85,18 @@ class TestExternalBoundary:
         assert not denied.ok
         assert 'not in process tool table' in (denied.error or '')
         assert 'human.query' not in self._audit_actions()
+
+    def test_workflow_run_cannot_bypass_image_tool_table(self) -> None:
+        result = self.runtime.run_workflow('parse_pytest_log', {'log': 'FAILED tests/x.py::test_y'})
+
+        assert not result.ok
+        assert result.status == ProcessStatus.FAILED.value
+        assert 'not in process tool table' in (result.error or '')
+        process = self.runtime.process.get(result.pid)
+        assert process.image_id == self.runtime.config.runtime.default_image_id
+        assert process.status == ProcessStatus.FAILED
+        assert 'workflow.run' in self._audit_actions()
+        assert 'primitive.filesystem.read_text' not in self._audit_actions()
 
     def test_path_escape_is_denied_by_filesystem_primitive(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='escape workspace')

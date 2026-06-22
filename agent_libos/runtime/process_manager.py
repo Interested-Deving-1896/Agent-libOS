@@ -140,69 +140,74 @@ class ProcessManager:
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
         selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
-        self._charge_child_creation(parent)
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
         now = utc_now()
         child_pid = new_id("pid")
-        child = AgentProcess(
-            pid=child_pid,
-            parent_pid=parent,
-            image_id=image or parent_proc.image_id,
-            status=ProcessStatus.CREATED,
-            goal_oid=None,
-            memory_view=None,
-            capabilities=[],
-            loaded_skills=dict(parent_proc.loaded_skills),
-            tool_table={},
-            event_cursor=None,
-            checkpoint_head=None,
-            resource_budget=selected_budget,
-            resource_usage=ResourceUsage(),
-            created_at=now,
-            updated_at=now,
-            working_directory=cwd,
-        )
-        self.store.insert_process(child)
-        self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
-        goal_handle = self._ensure_goal(child_pid, goal)
-        source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
-        if isinstance(memory_view, MemoryView):
-            source_view = memory_view
-            spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
-        else:
-            spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
-        # Forking attenuates memory handles by default. The child can see only
-        # roots selected by the parent and only the rights granted into its view.
-        child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
-        child_view.roots.append(goal_handle)
-        child.goal_oid = goal_handle.oid
-        child.memory_view = child_view
-        child.status = ProcessStatus.RUNNABLE
-        child.updated_at = utc_now()
-        self.store.update_process(child)
-        self._grant_specs(child_pid, capabilities or [], issued_by=f"process.fork:{parent}")
-        self._inherit_capability_specs(
-            parent_pid=parent,
-            child_pid=child_pid,
-            specs=inherit_specs,
-            issued_by=f"process.fork:{parent}",
-        )
-        self.events.emit(
-            EventType.PROCESS_FORKED,
-            source=parent,
-            target=child_pid,
-            payload={"parent": parent, "child": child_pid, "mode": fork_mode.value, "working_directory": cwd},
-        )
-        self.audit.record(
-            actor=parent,
-            action="process.fork",
-            target=f"process:{child_pid}",
-            input_refs=[parent_proc.goal_oid] if parent_proc.goal_oid else [],
-            output_refs=[goal_handle.oid],
-            decision={"mode": fork_mode.value, "image": child.image_id, "working_directory": child.working_directory},
-        )
-        self._run_after_spawn_hooks(child_pid, child.image_id)
-        return child_pid
+        self._reserve_child_budget(parent, child_pid, selected_budget)
+        try:
+            child = AgentProcess(
+                pid=child_pid,
+                parent_pid=parent,
+                image_id=image or parent_proc.image_id,
+                status=ProcessStatus.CREATED,
+                goal_oid=None,
+                memory_view=None,
+                capabilities=[],
+                loaded_skills=dict(parent_proc.loaded_skills),
+                tool_table={},
+                event_cursor=None,
+                checkpoint_head=None,
+                resource_budget=selected_budget,
+                resource_usage=ResourceUsage(),
+                created_at=now,
+                updated_at=now,
+                working_directory=cwd,
+            )
+            self.store.insert_process(child)
+            self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
+            goal_handle = self._ensure_goal(child_pid, goal)
+            source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
+            if isinstance(memory_view, MemoryView):
+                source_view = memory_view
+                spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
+            else:
+                spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
+            # Forking attenuates memory handles by default. The child can see only
+            # roots selected by the parent and only the rights granted into its view.
+            child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
+            child_view.roots.append(goal_handle)
+            child.goal_oid = goal_handle.oid
+            child.memory_view = child_view
+            child.status = ProcessStatus.RUNNABLE
+            child.updated_at = utc_now()
+            self.store.update_process(child)
+            self._grant_specs(child_pid, capabilities or [], issued_by=f"process.fork:{parent}")
+            self._inherit_capability_specs(
+                parent_pid=parent,
+                child_pid=child_pid,
+                specs=inherit_specs,
+                issued_by=f"process.fork:{parent}",
+            )
+            self._charge_child_creation(parent)
+            self.events.emit(
+                EventType.PROCESS_FORKED,
+                source=parent,
+                target=child_pid,
+                payload={"parent": parent, "child": child_pid, "mode": fork_mode.value, "working_directory": cwd},
+            )
+            self.audit.record(
+                actor=parent,
+                action="process.fork",
+                target=f"process:{child_pid}",
+                input_refs=[parent_proc.goal_oid] if parent_proc.goal_oid else [],
+                output_refs=[goal_handle.oid],
+                decision={"mode": fork_mode.value, "image": child.image_id, "working_directory": child.working_directory},
+            )
+            self._run_after_spawn_hooks(child_pid, child.image_id)
+            return child_pid
+        except Exception:
+            self._release_child_budget(child_pid)
+            raise
 
     def spawn_child(
         self,
@@ -221,66 +226,71 @@ class ProcessManager:
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
         selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
-        self._charge_child_creation(parent)
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
         now = utc_now()
         child_pid = new_id("pid")
-        child = AgentProcess(
-            pid=child_pid,
-            parent_pid=parent,
-            image_id=image or parent_proc.image_id,
-            status=ProcessStatus.CREATED,
-            goal_oid=None,
-            memory_view=None,
-            capabilities=[],
-            loaded_skills={},
-            tool_table={},
-            event_cursor=None,
-            checkpoint_head=None,
-            resource_budget=selected_budget,
-            resource_usage=ResourceUsage(),
-            created_at=now,
-            updated_at=now,
-            working_directory=cwd,
-        )
-        self.store.insert_process(child)
-        self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
-        goal_handle = self._ensure_goal(child_pid, goal)
-        # Unlike fork(), spawn_child() starts from a fresh address-space-like
-        # Object Memory view rooted only at the child goal.
-        child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
-        child.goal_oid = goal_handle.oid
-        child.status = ProcessStatus.RUNNABLE
-        child.updated_at = utc_now()
-        self.store.update_process(child)
-        self._grant_specs(child_pid, capabilities or [], issued_by=f"process.spawn_child:{parent}")
-        self._inherit_capability_specs(
-            parent_pid=parent,
-            child_pid=child_pid,
-            specs=inherit_specs,
-            issued_by=f"process.spawn_child:{parent}",
-        )
-        self.events.emit(
-            EventType.PROCESS_CREATED,
-            source=parent,
-            target=child_pid,
-            payload={
-                "parent": parent,
-                "child": child_pid,
-                "image": child.image_id,
-                "goal_oid": goal_handle.oid,
-                "working_directory": child.working_directory,
-            },
-        )
-        self.audit.record(
-            actor=parent,
-            action="process.spawn_child",
-            target=f"process:{child_pid}",
-            output_refs=[goal_handle.oid],
-            decision={"image": child.image_id, "working_directory": child.working_directory},
-        )
-        self._run_after_spawn_hooks(child_pid, child.image_id)
-        return child_pid
+        self._reserve_child_budget(parent, child_pid, selected_budget)
+        try:
+            child = AgentProcess(
+                pid=child_pid,
+                parent_pid=parent,
+                image_id=image or parent_proc.image_id,
+                status=ProcessStatus.CREATED,
+                goal_oid=None,
+                memory_view=None,
+                capabilities=[],
+                loaded_skills={},
+                tool_table={},
+                event_cursor=None,
+                checkpoint_head=None,
+                resource_budget=selected_budget,
+                resource_usage=ResourceUsage(),
+                created_at=now,
+                updated_at=now,
+                working_directory=cwd,
+            )
+            self.store.insert_process(child)
+            self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
+            goal_handle = self._ensure_goal(child_pid, goal)
+            # Unlike fork(), spawn_child() starts from a fresh address-space-like
+            # Object Memory view rooted only at the child goal.
+            child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
+            child.goal_oid = goal_handle.oid
+            child.status = ProcessStatus.RUNNABLE
+            child.updated_at = utc_now()
+            self.store.update_process(child)
+            self._grant_specs(child_pid, capabilities or [], issued_by=f"process.spawn_child:{parent}")
+            self._inherit_capability_specs(
+                parent_pid=parent,
+                child_pid=child_pid,
+                specs=inherit_specs,
+                issued_by=f"process.spawn_child:{parent}",
+            )
+            self._charge_child_creation(parent)
+            self.events.emit(
+                EventType.PROCESS_CREATED,
+                source=parent,
+                target=child_pid,
+                payload={
+                    "parent": parent,
+                    "child": child_pid,
+                    "image": child.image_id,
+                    "goal_oid": goal_handle.oid,
+                    "working_directory": child.working_directory,
+                },
+            )
+            self.audit.record(
+                actor=parent,
+                action="process.spawn_child",
+                target=f"process:{child_pid}",
+                output_refs=[goal_handle.oid],
+                decision={"image": child.image_id, "working_directory": child.working_directory},
+            )
+            self._run_after_spawn_hooks(child_pid, child.image_id)
+            return child_pid
+        except Exception:
+            self._release_child_budget(child_pid)
+            raise
 
     def exec(
         self,
@@ -404,10 +414,9 @@ class ProcessManager:
 
     def list_children(self, pid: str, include_terminal: bool = True) -> builtins.list[AgentProcess]:
         self._get(pid)
-        children = [process for process in self.store.list_processes() if process.parent_pid == pid]
+        children = self.store.list_child_processes(pid)
         if not include_terminal:
             children = [process for process in children if process.status not in self.TERMINAL_STATUSES]
-        children.sort(key=lambda process: process.created_at)
         self.audit.record(
             actor=pid,
             action="process.list_children",
@@ -488,6 +497,8 @@ class ProcessManager:
         proc.status_message = payload.get("reason")
         proc.updated_at = utc_now()
         self.store.update_process(proc)
+        if proc.status in self.TERMINAL_STATUSES:
+            self._release_child_budget(proc.pid)
         self.events.emit(
             EventType.PROCESS_SIGNAL,
             source=actor,
@@ -516,6 +527,7 @@ class ProcessManager:
         process.status_message = f"result_oid:{result.oid}" if result is not None else message
         process.updated_at = utc_now()
         self.store.update_process(process)
+        self._release_child_budget(pid)
         self.events.emit(
             EventType.PROCESS_EXITED,
             source=pid,
@@ -552,7 +564,8 @@ class ProcessManager:
             max_tool_calls=defaults.max_tool_calls,
             max_child_processes=defaults.max_child_processes,
             max_runtime_seconds=defaults.max_runtime_seconds,
-            max_materialized_tokens=defaults.max_materialized_tokens,
+            max_context_materialization_tokens=defaults.max_context_materialization_tokens,
+            max_context_materialization_total_tokens=defaults.max_context_materialization_total_tokens,
             max_llm_calls=defaults.max_llm_calls,
             max_llm_total_tokens=defaults.max_llm_total_tokens,
             max_subprocess_wall_seconds=defaults.max_subprocess_wall_seconds,
@@ -583,7 +596,7 @@ class ProcessManager:
         return "/".join(parts) if parts else "."
 
     def _child_resource_budget(self, parent: AgentProcess) -> ResourceBudget:
-        budget = parent.resource_budget
+        budget = self.resources.remaining_budget(parent.pid) if self.resources is not None else parent.resource_budget
         divisor = self.config.process.fork_budget_divisor
         return ResourceBudget(
             max_tool_calls=self._attenuate_int(budget.max_tool_calls, divisor, self.config.process.fork_min_tool_calls),
@@ -593,7 +606,12 @@ class ProcessManager:
                 self.config.process.fork_min_child_processes,
             ),
             max_runtime_seconds=self._attenuate_float(budget.max_runtime_seconds, divisor),
-            max_materialized_tokens=budget.max_materialized_tokens,
+            max_context_materialization_tokens=budget.max_context_materialization_tokens,
+            max_context_materialization_total_tokens=self._attenuate_int(
+                budget.max_context_materialization_total_tokens,
+                divisor,
+                0,
+            ),
             max_llm_calls=self._attenuate_int(budget.max_llm_calls, divisor, 0),
             max_llm_total_tokens=self._attenuate_int(budget.max_llm_total_tokens, divisor, 0),
             max_subprocess_wall_seconds=self._attenuate_float(budget.max_subprocess_wall_seconds, divisor),
@@ -614,6 +632,16 @@ class ProcessManager:
         if self.resources is not None:
             self.resources.validate_child_budget(parent.pid, selected, reserved_usage=ResourceUsage(child_processes=1))
         return selected
+
+    def _reserve_child_budget(self, parent_pid: str, child_pid: str, budget: ResourceBudget) -> None:
+        if self.resources is None:
+            return
+        self.resources.reserve_child_budget(parent_pid, child_pid, budget)
+
+    def _release_child_budget(self, pid: str) -> None:
+        if self.resources is None:
+            return
+        self.resources.release_process_reservations(pid)
 
     def _charge_child_creation(self, parent_pid: str) -> None:
         if self.resources is None:
@@ -730,7 +758,7 @@ class ProcessManager:
             return
         if parent.resource_budget.max_child_processes is None:
             return
-        child_count = len([process for process in self.store.list_processes() if process.parent_pid == parent.pid])
+        child_count = len(self.store.list_child_processes(parent.pid))
         if child_count >= parent.resource_budget.max_child_processes:
             raise ProcessError(
                 f"process {parent.pid} exhausted child process budget: "

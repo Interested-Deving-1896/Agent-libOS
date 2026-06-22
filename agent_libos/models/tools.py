@@ -78,3 +78,23 @@ class ToolCallResult:
     payload: Any
     ok: bool
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowRunResult:
+    pid: PID
+    image: str
+    tool: str
+    ok: bool
+    status: str
+    call_id: str | None = None
+    tool_id: ToolID | None = None
+    result_oid: str | None = None
+    payload: Any = None
+    error: str | None = None
+    waiting_human: bool = False
+    request_id: str | None = None
+    waiting_process: bool = False
+    child_pid: PID | None = None
+    waiting_message: bool = False
+    filters: dict[str, Any] | None = None

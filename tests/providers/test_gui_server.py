@@ -245,6 +245,19 @@ class TestGuiServer:
         assert not any((record.target == f"process:{first['pid']}" and record.action == 'scheduler.run_quantum' for record in records))
         assert any((record.target == f"process:{second['pid']}" and record.action == 'scheduler.run_quantum' for record in records))
 
+    def test_workflow_run_endpoint_returns_result_and_snapshot_process(self) -> None:
+        status, result = self.request('POST', '/api/workflows/run', {'tool': 'get_working_directory', 'args': {}})
+
+        assert status == 200
+        assert result['ok'] is True
+        assert result['tool'] == 'get_working_directory'
+        assert result['status'] == 'exited'
+        assert result['result_oid'] is not None
+        status, snapshot = self.request('GET', '/api/snapshot')
+        assert status == 200
+        processes = {process['pid']: process for process in snapshot['processes']}
+        assert processes[result['pid']]['status'] == 'exited'
+
     def test_jsonrpc_register_rejects_host_file_path(self) -> None:
         status, body = self.request('POST', '/api/jsonrpc/register', {'path': 'secrets.yaml', 'confirmed': True})
         assert status == 400

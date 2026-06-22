@@ -90,7 +90,7 @@ async def amain(args: argparse.Namespace) -> None:
                 language=args.language,
                 max_bytes=args.max_bytes,
             ),
-            resource_budget=ResourceBudget(max_materialized_tokens=_context_budget(args.max_bytes)),
+            resource_budget=ResourceBudget(max_context_materialization_tokens=_context_budget(args.max_bytes)),
         )
         permission_policy = args.permission_policy
         if permission_policy is None and args.auto_approve:

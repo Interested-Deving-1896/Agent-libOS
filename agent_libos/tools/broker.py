@@ -141,6 +141,8 @@ class ToolBroker:
             raise ValueError(f"tool id collision: {tool_id}")
         if existing is None:
             self.store.insert_tool(handle, spec, registered_by=registered_by, created_at=utc_now(), ephemeral=ephemeral)
+        else:
+            self.store.update_tool(handle, spec, registered_by=registered_by, ephemeral=ephemeral)
         self.audit.record(
             actor=registered_by,
             action="tool.register",
@@ -493,6 +495,7 @@ class ToolBroker:
                 runtime = getattr(self, "runtime", None)
                 if runtime is None:
                     raise RuntimeError("Runtime is unavailable for Deno JIT syscall execution.")
+                self._validate_jit_arguments(handle, args)
                 jit_session = LibOSSyscallSession(runtime, pid, config=self.config)
                 deno_result = await self._run_sandbox_source(
                     self._jit_sources[handle.tool_id],
@@ -510,6 +513,7 @@ class ToolBroker:
                     )
                 else:
                     payload = deno_result
+                self._validate_jit_output(handle, payload)
                 result_payload = {"tool_id": handle.tool_id, "tool_name": handle.name, "result": payload}
             else:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
@@ -578,6 +582,27 @@ class ToolBroker:
                 },
             )
             raise
+        except ValueError as exc:
+            error = str(exc)
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={"call_id": call_id, "error": error, "policy_decision": "validation_error"},
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "validation_error",
+                    "error": error,
+                    "tool_wall_seconds": self._elapsed(started_at),
+                },
+            )
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
         except Exception as exc:
             self.events.emit(
                 EventType.TOOL_FAILED,
@@ -622,7 +647,7 @@ class ToolBroker:
                     "tool": handle.name,
                     "policy_decision": "validation_error",
                     "error": error,
-                    "result": sanitize_for_observability(result_payload),
+                    "result": self._oversize_result_observation(),
                     "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
@@ -635,6 +660,38 @@ class ToolBroker:
             metadata=ObjectMetadata(title=f"Tool result: {handle.name}", tags=["tool_result", handle.name]),
             immutable=True,
         )
+        if jit_session is not None:
+            try:
+                await jit_session.apply_deferred_lifecycle(result_handle)
+            except Exception as exc:
+                self.store.delete_object(result_handle.oid)
+                error = str(exc)
+                self.events.emit(
+                    EventType.TOOL_FAILED,
+                    source=resource,
+                    target=pid,
+                    payload={"call_id": call_id, "error": error, "policy_decision": "lifecycle_error"},
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="tool.call",
+                    target=resource,
+                    decision={
+                        "ok": False,
+                        "tool": handle.name,
+                        "policy_decision": "lifecycle_error",
+                        "error": sanitize_for_observability(error),
+                        "tool_wall_seconds": self._elapsed(started_at),
+                    },
+                )
+                return ToolCallResult(
+                    call_id=call_id,
+                    tool_id=handle.tool_id,
+                    result_handle=None,
+                    payload=None,
+                    ok=False,
+                    error=error,
+                )
         self.events.emit(
             EventType.TOOL_COMPLETED,
             source=resource,
@@ -653,8 +710,6 @@ class ToolBroker:
                 "tool_wall_seconds": self._elapsed(started_at),
             },
         )
-        if jit_session is not None:
-            await jit_session.apply_deferred_lifecycle(result_handle)
         return ToolCallResult(
             call_id=call_id,
             tool_id=handle.tool_id,
@@ -1066,6 +1121,10 @@ class ToolBroker:
             return self._normalize_multiplexed_jit_action(pid, action)
         if self._jit_exposure_for_process(pid) == JIT_TOOL_EXPOSURE_MULTIPLEXED and self._is_visible_jit_name(pid, name):
             raise ValueError(f"JIT tool {name!r} must be called through {JIT_MULTIPLEXER_TOOL_NAME}")
+        if self._is_visible_jit_name(pid, name):
+            handle = self.resolve(name, pid=pid)
+            args = {key: value for key, value in action.items() if key != "action"}
+            self._validate_jit_arguments(handle, args)
         return action
 
     def _normalize_multiplexed_jit_action(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
@@ -1097,6 +1156,20 @@ class ToolBroker:
             raise ValueError(f"arguments for JIT tool {handle.name!r} do not match input_schema{location}: {exc.message}") from exc
         except JsonSchemaSchemaError as exc:
             raise ValueError(f"JIT tool {handle.name!r} has invalid input_schema: {exc.message}") from exc
+
+    def _validate_jit_output(self, handle: ToolHandle, value: Any) -> None:
+        spec = self.store.get_tool_spec(handle.tool_id)
+        schema = spec.output_schema if spec is not None and spec.output_schema else {}
+        if not schema:
+            return
+        try:
+            jsonschema_validate(instance=value, schema=schema)
+        except JsonSchemaValidationError as exc:
+            path = ".".join(str(part) for part in exc.path)
+            location = f" at {path}" if path else ""
+            raise ValueError(f"output for JIT tool {handle.name!r} does not match output_schema{location}: {exc.message}") from exc
+        except JsonSchemaSchemaError as exc:
+            raise ValueError(f"JIT tool {handle.name!r} has invalid output_schema: {exc.message}") from exc
 
     def _is_visible_jit_name(self, pid: str, name: str) -> bool:
         if not name:
@@ -1228,6 +1301,13 @@ class ToolBroker:
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return set(process.tool_table.values())
+
+    def _oversize_result_observation(self) -> dict[str, Any]:
+        return {
+            "redacted": True,
+            "truncated": True,
+            "preview": "[tool result omitted after size-limit failure]",
+        }
 
 
 def _stable_static_tool_id(name: str, digest_chars: int = _TOOL_DEFAULTS.static_tool_id_digest_chars) -> str:

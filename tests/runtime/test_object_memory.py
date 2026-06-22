@@ -33,6 +33,22 @@ class TestObjectMemoryName:
         with pytest.raises(ValidationError):
             self.runtime.memory.create_object(pid=pid, object_type=ObjectType.OBSERVATION, payload={'value': 2}, name='duplicate.name')
 
+    def test_object_payload_rolls_back_when_sql_insert_fails(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='atomic object insert')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'value': 'original'},
+            name='atomic.insert',
+        )
+        original = self.runtime.store.get_object(handle.oid)
+        duplicate = original.__class__(**{**original.__dict__, 'payload': {'value': 'bad'}})
+
+        with pytest.raises(sqlite3.IntegrityError):
+            self.runtime.store.insert_object(duplicate)
+
+        assert self.runtime.store.object_payload(handle.oid) == {'value': 'original'}
+
     def test_object_memory_payload_limits_reject_create_update_and_append_without_partial_write(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory limits')
         oversized_payload = {'blob': 'x' * self.runtime.config.tools.memory_payload_hard_limit_bytes}
@@ -60,6 +76,59 @@ class TestObjectMemoryName:
         assert not appended.ok
         assert 'memory append entry exceeds' in (appended.error or '')
         assert self.runtime.memory.get_object(pid, handle).payload == {'entries': []}
+
+    def test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget(self) -> None:
+        sentinel = 'UPDATED_MEMORY_BUDGET_SENTINEL'
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory budget update')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='budget.update',
+            immutable=False,
+        )
+        original = self.runtime.memory.get_object(pid, handle)
+
+        self.runtime.memory.update_object(
+            pid,
+            handle,
+            ObjectPatch(payload={'entries': [(sentinel + ' ') * 200]}),
+        )
+
+        updated = self.runtime.memory.get_object(pid, handle)
+        assert updated.metadata.token_estimate is not None
+        assert original.metadata.token_estimate is not None
+        assert updated.metadata.token_estimate > original.metadata.token_estimate
+        view = self.runtime.memory.create_view(pid, [handle])
+        context = self.runtime.memory.materialize_context(pid, view, budget_tokens=4)
+        assert handle.oid in context.omitted_objects
+        assert sentinel not in context.text
+
+    def test_append_refreshes_token_estimate_for_materialization_budget(self) -> None:
+        sentinel = 'APPENDED_MEMORY_BUDGET_SENTINEL'
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory budget append')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='budget.append',
+            immutable=False,
+        )
+
+        appended = self.runtime.tools.call(
+            pid,
+            'append_memory_object',
+            {'name': 'budget.append', 'entry': {'text': (sentinel + ' ') * 200}},
+        )
+
+        assert appended.ok, appended.error
+        updated = self.runtime.memory.get_object(pid, handle)
+        assert updated.metadata.token_estimate is not None
+        assert updated.metadata.token_estimate > 4
+        view = self.runtime.memory.create_view(pid, [handle])
+        context = self.runtime.memory.materialize_context(pid, view, budget_tokens=4)
+        assert handle.oid in context.omitted_objects
+        assert sentinel not in context.text
 
     @pytest.mark.parametrize('name', ('project/note', 'project\\note', '.', '..'))
     def test_object_name_cannot_contain_namespace_separators(self, name: str) -> None:
@@ -102,6 +171,10 @@ class TestObjectMemoryName:
             self.runtime.memory.create_object(pid=other, object_type=ObjectType.EVIDENCE, payload={'write': 'denied'}, name='evidence', namespace='private')
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object_by_name(other, 'evidence', namespace='private')
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object_by_name(other, 'missing', namespace='private')
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.handle_for_name(other, 'missing', namespace='private')
         self.runtime.capability.grant(subject=other, resource=f'object:{handle.oid}', rights=[CapabilityRight.READ], issued_by='test')
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object_by_name(other, 'evidence', namespace='private')
@@ -112,6 +185,90 @@ class TestObjectMemoryName:
         listing = self.runtime.memory.list_namespace(other, 'private')
         assert obj.payload == {'secret': 'namespaced'}
         assert [obj.name for obj in listing['objects']] == ['evidence']
+
+    def test_one_time_namespace_read_grant_is_consumed_after_successful_lookup(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace read owner')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='namespace read once')
+        namespace = 'shared-read-once'
+        self.runtime.memory.create_namespace(owner, namespace)
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'single directory lookup'},
+            name='evidence',
+            namespace=namespace,
+        )
+        self.runtime.capability.grant(
+            subject=reader,
+            resource=f'object:{handle.oid}',
+            rights=[CapabilityRight.READ],
+            issued_by='test',
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object_namespace:{namespace}',
+            ['read'],
+            issued_by='test',
+        )
+
+        with pytest.raises(NotFound):
+            self.runtime.memory.get_object_by_name(reader, 'missing', namespace=namespace)
+        assert self.runtime.store.get_capability(namespace_cap.cap_id).active
+
+        obj = self.runtime.memory.get_object_by_name(reader, 'evidence', namespace=namespace)
+
+        assert obj.oid == handle.oid
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object_by_name(reader, 'evidence', namespace=namespace)
+
+    def test_one_time_namespace_write_grant_is_consumed_after_successful_create(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace write owner')
+        writer = self.runtime.process.spawn(image='base-agent:v0', goal='namespace write once')
+        namespace = 'shared-write-once'
+        self.runtime.memory.create_namespace(owner, namespace)
+        self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.OBSERVATION,
+            payload={'owned': True},
+            name='existing',
+            namespace=namespace,
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            writer,
+            f'object_namespace:{namespace}',
+            ['write'],
+            issued_by='test',
+        )
+
+        with pytest.raises(ValidationError):
+            self.runtime.memory.create_object(
+                pid=writer,
+                object_type=ObjectType.OBSERVATION,
+                payload={'duplicate': True},
+                name='existing',
+                namespace=namespace,
+            )
+        assert self.runtime.store.get_capability(namespace_cap.cap_id).active
+
+        created = self.runtime.memory.create_object(
+            pid=writer,
+            object_type=ObjectType.OBSERVATION,
+            payload={'created': 1},
+            name='first',
+            namespace=namespace,
+        )
+
+        assert created.oid
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.create_object(
+                pid=writer,
+                object_type=ObjectType.OBSERVATION,
+                payload={'created': 2},
+                name='second',
+                namespace=namespace,
+            )
 
     def test_mutable_object_can_move_between_namespaces_when_target_name_is_unique(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='move namespace')
@@ -177,6 +334,33 @@ class TestObjectMemoryName:
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object(handle_reader, one_shot_handle)
 
+    def test_one_time_read_write_grant_allows_single_append_operation(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='one-shot append')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='one.shot.append',
+            immutable=False,
+        )
+        for cap in self.runtime.capability.capabilities_for(pid):
+            if cap.resource == f'object:{handle.oid}':
+                self.runtime.capability.revoke(cap.cap_id, revoked_by='test', require_authority=False)
+        source_cap = self.runtime.capability.grant_once(
+            pid,
+            f'object:{handle.oid}',
+            [CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by='test',
+        )
+
+        appended = self.runtime.tools.call(pid, 'append_memory_object', {'name': 'one.shot.append', 'entry': {'x': 1}})
+
+        assert appended.ok, appended.error
+        assert not self.runtime.store.get_capability(source_cap.cap_id).active
+        assert self.runtime.store.get_object(handle.oid).payload == {'entries': [{'x': 1}]}
+        second = self.runtime.tools.call(pid, 'append_memory_object', {'name': 'one.shot.append', 'entry': {'x': 2}})
+        assert not second.ok
+
     def test_query_by_name_only_returns_accessible_objects(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query')
         other = self.runtime.process.spawn(image='base-agent:v0', goal='other query')
@@ -212,6 +396,21 @@ class TestObjectMemoryName:
         context = self.runtime.memory.materialize_context(reader, view)
         assert handle.oid in context.omitted_objects
         assert 'query must not materialize this' not in context.text
+
+    @pytest.mark.parametrize('limit', (0, -1))
+    def test_query_limit_is_validated_before_scan(self, limit: int) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='query limits')
+        self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.EVIDENCE,
+            payload={'visible': True},
+            name=f'limit.{limit}',
+        )
+
+        with pytest.raises(ValidationError):
+            self.runtime.memory.query_objects(pid, ObjectQuery(limit=limit))
+        with pytest.raises(ValidationError):
+            self.runtime.memory.query_objects(pid, ObjectQuery(limit=self.runtime.config.memory.query_limit + 1))
 
     def test_fork_view_explicit_rights_cannot_exceed_parent_handle(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner fork rights')

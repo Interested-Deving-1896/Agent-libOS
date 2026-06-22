@@ -128,9 +128,9 @@ results = await runtime.arun_until_idle(max_quanta=1, process_human_queue=False)
 
 Resource limits are runtime constraints, not Capabilities. A process may have a
 `ResourceBudget` covering tool calls, child processes, runtime seconds, LLM
-calls and tokens, subprocess wall/CPU/RSS usage, external filesystem bytes,
-JSON-RPC bytes, and Deno syscalls. Observed consumption is stored as
-`ResourceUsage` on the process row.
+calls and tokens, context materialization tokens, subprocess wall/CPU/RSS usage,
+external filesystem bytes, JSON-RPC bytes, and Deno syscalls. Observed
+consumption is stored as `ResourceUsage` on the process row.
 
 Every charge applies to the acting process and its parent chain, so a parent can
 bound an entire child tree. Fork and spawn may request a child budget, but it
@@ -144,6 +144,11 @@ LLM token usage is charged after provider completion using provider-reported
 usage. If a token budget exists and the provider does not return billable usage,
 the LLM action fails closed. When an LLM completion pushes usage over budget,
 the call record is retained but model-selected tools are not dispatched.
+Context materialization has both a per-call cap
+(`max_context_materialization_tokens`) and a separate cumulative budget
+(`max_context_materialization_total_tokens`). The cumulative context token
+budget is charged when Object Memory materializes prompt context and is
+accounted independently from provider-reported LLM tokens.
 
 Shell and Deno subprocesses are run through provider-level monitors. The
 default local provider uses cross-platform process-tree sampling to enforce wall

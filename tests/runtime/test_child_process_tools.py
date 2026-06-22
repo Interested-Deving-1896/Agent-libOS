@@ -166,28 +166,35 @@ class TestChildProcessTool:
         try:
             runtime.register_image(
                 {
-                    'image_id': 'missing-package:v0',
-                    'name': 'missing-package',
-                    'boot': {
-                        'kind': 'image_package',
-                        'artifact_id': 'missing-artifact',
-                        'artifact_sha256': 'missing-sha',
-                    },
+                    'image_id': 'failing-exec:v0',
+                    'name': 'failing-exec',
                 },
                 actor='cli',
             )
             pid = runtime.process.spawn(image='base-agent:v0', goal='stay on base')
+            other = runtime.process.spawn(image='base-agent:v0', goal='unrelated')
             before = runtime.process.get(pid)
             before_tools = dict(before.tool_table)
+            original_configure_skills = runtime._configure_process_skills_for_image
 
-            with pytest.raises(NotFound):
-                runtime.exec_process(pid, 'missing-package:v0', goal='should not apply')
+            def fail_after_unrelated_mutation(target_pid: str, image_id: str, assigned_by: str) -> None:
+                other_process = runtime.process.get(other)
+                other_process.status_message = 'must survive scoped rollback'
+                runtime.store.update_process(other_process)
+                raise RuntimeError('skill boot failed')
+
+            runtime._configure_process_skills_for_image = fail_after_unrelated_mutation
+
+            with pytest.raises(RuntimeError):
+                runtime.exec_process(pid, 'failing-exec:v0', goal='should not apply')
 
             after = runtime.process.get(pid)
             assert after.status == ProcessStatus.RUNNABLE
             assert after.image_id == 'base-agent:v0'
             assert after.goal_oid == before.goal_oid
             assert after.tool_table == before_tools
+            assert runtime.process.get(other).status_message == 'must survive scoped rollback'
+            runtime._configure_process_skills_for_image = original_configure_skills
         finally:
             runtime.close()
 

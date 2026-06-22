@@ -1,4 +1,4 @@
-import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, RuntimeSnapshot, SseMessage } from "./types";
+import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
 
 type JsonBody = Record<string, unknown>;
 export type OptionalQuanta = number | null;
@@ -86,6 +86,28 @@ export class LibOSClient {
 
   async run(pid: string, maxQuanta: OptionalQuanta) {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/run`, withOptionalQuanta({}, maxQuanta));
+  }
+
+  async runWorkflow({
+    tool,
+    args = {},
+    image,
+    goal,
+    workingDirectory
+  }: {
+    tool: string;
+    args?: Record<string, unknown>;
+    image?: string;
+    goal?: string;
+    workingDirectory?: string;
+  }) {
+    return this.request<WorkflowRunResult>("POST", "/api/workflows/run", {
+      tool,
+      args,
+      ...(image ? { image } : {}),
+      ...(goal ? { goal } : {}),
+      ...(workingDirectory ? { working_directory: workingDirectory } : {})
+    });
   }
 
   async step(pid: string) {

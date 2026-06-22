@@ -105,6 +105,25 @@ export type ToolSummary = {
   ephemeral: boolean;
 };
 
+export type WorkflowRunResult = {
+  pid: string;
+  image: string;
+  tool: string;
+  ok: boolean;
+  status: string;
+  call_id: string | null;
+  tool_id: string | null;
+  result_oid: string | null;
+  payload: unknown;
+  error: string | null;
+  waiting_human: boolean;
+  request_id: string | null;
+  waiting_process: boolean;
+  child_pid: string | null;
+  waiting_message: boolean;
+  filters: Record<string, unknown> | null;
+};
+
 export type ImageSummary = {
   image_id: string;
   name: string;

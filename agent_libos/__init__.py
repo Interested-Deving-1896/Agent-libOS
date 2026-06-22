@@ -26,6 +26,7 @@ from agent_libos.models import (
     ToolSpec,
     ValidationResult,
     ViewMode,
+    WorkflowRunResult,
 )
 from agent_libos.runtime.runtime import Runtime
 
@@ -61,6 +62,7 @@ __all__ = [
     "ToolSpec",
     "ValidationResult",
     "ViewMode",
+    "WorkflowRunResult",
 ]
 
 __version__ = "0.1.0"

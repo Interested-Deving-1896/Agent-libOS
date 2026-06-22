@@ -31,6 +31,22 @@ The current built-in tool surface includes tools for:
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
 
+## Workflow Entry Point
+
+A workflow is a tool that a user runs directly. `Runtime.run_workflow()` and
+`uv run agent-libos workflow run <tool>` spawn a fresh AgentProcess, call one
+tool through ToolBroker, and return the normal tool result JSON. The entrypoint
+does not run the LLM scheduler and does not create a second authority model:
+the selected image's process tool table still controls visibility, while
+primitives enforce capabilities, approval, budgets, events, and audit.
+
+Successful workflow calls append the tool result object to the workflow
+process view and exit the process with that result. Failed calls mark the
+process failed. Blocking human, child-process, or process-message waits are
+returned as explicit waiting results so the caller can resume through the
+normal runtime mechanisms. If the tool itself performs `process.exit` or
+`process.exec`, the workflow runner leaves that lifecycle decision intact.
+
 ## Writing Python Tools
 
 Python tools should not directly access host resources. Use this pattern:

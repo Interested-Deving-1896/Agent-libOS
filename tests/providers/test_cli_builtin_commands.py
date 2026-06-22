@@ -95,6 +95,44 @@ class TestCLIBuiltinCommand:
             finally:
                 runtime.close()
 
+    def test_cli_workflow_run_prints_result_and_persists_exited_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            with _temporary_cwd(root):
+                result = _run_cli_json(['--db', str(db), 'workflow', 'run', 'get_working_directory'])
+            runtime = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
+            try:
+                assert result['ok'] is True
+                assert result['tool'] == 'get_working_directory'
+                assert result['status'] == ProcessStatus.EXITED.value
+                assert result['result_oid'] is not None
+                assert runtime.process.get(str(result['pid'])).status == ProcessStatus.EXITED
+            finally:
+                runtime.close()
+
+    def test_cli_workflow_run_failure_exits_nonzero_after_printing_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            with _temporary_cwd(root):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+                    cli_main([
+                        '--db',
+                        str(db),
+                        'workflow',
+                        'run',
+                        'parse_pytest_log',
+                        '--args-json',
+                        '{"log": "FAILED tests/x.py::test_y"}',
+                    ])
+            assert raised.value.code == 1
+            result = json.loads(stdout.getvalue())
+            assert result['ok'] is False
+            assert result['status'] == ProcessStatus.FAILED.value
+            assert 'not in process tool table' in result['error']
+
 @contextlib.contextmanager
 def _temporary_cwd(path: Path):
     previous = Path.cwd()

@@ -17,8 +17,8 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
-from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
+from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult, SyscallHandler
 from agent_libos.utils.serde import dumps
 from tests.support.fakes import FakeDenoSandbox, NoSyscallDenoSandbox
 
@@ -235,6 +235,89 @@ class TestJitSecurity:
         assert result.payload == {'returned_after_exec_syscall': True}
         assert process.image_id == 'base-agent:v0'
         assert process.status == ProcessStatus.RUNNABLE
+
+    def test_deno_jit_deferred_exec_failure_does_not_persist_success_result(self) -> None:
+        self.runtime.tools.sandbox = DeferredBadExecSandbox()
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bad deferred exec')
+        candidate = self.runtime.tools.propose(
+            pid,
+            {'name': 'bad_deferred_exec', 'description': 'Bad deferred exec.', 'input_schema': {'type': 'object'}},
+            source_code='export async function run(args, libos) { return {}; }',
+        )
+        assert self.runtime.tools.validate(candidate).ok
+        self.runtime.tools.register(pid, candidate)
+
+        result = self.runtime.tools.call(pid, 'bad_deferred_exec', {})
+
+        assert not result.ok
+        assert result.result_handle is None
+        assert 'agent image not found' in (result.error or '')
+        assert [obj for obj in self.runtime.store.list_objects() if obj.type.value == 'tool_result'] == []
+        tool_audits = [
+            record
+            for record in self.runtime.audit.trace()
+            if record.action == 'tool.call' and record.decision.get('tool') == 'bad_deferred_exec'
+        ]
+        assert tool_audits[-1].decision['policy_decision'] == 'lifecycle_error'
+        assert not any(record.decision.get('ok') is True for record in tool_audits)
+
+    def test_direct_deno_jit_call_validates_input_schema(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='strict direct jit')
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'strict_direct_count',
+                'description': 'Strict count.',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {'text': {'type': 'string'}},
+                    'required': ['text'],
+                    'additionalProperties': False,
+                },
+                'output_schema': {'type': 'object'},
+            },
+            source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }',
+            tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
+        )
+        assert self.runtime.tools.validate(candidate).ok
+        self.runtime.tools.register(pid, candidate)
+
+        missing = self.runtime.tools.call(pid, 'strict_direct_count', {})
+        extra = self.runtime.tools.call(pid, 'strict_direct_count', {'text': 'abc', 'extra': True})
+
+        assert not missing.ok
+        assert 'do not match input_schema' in (missing.error or '')
+        assert not extra.ok
+        assert 'Additional properties are not allowed' in (extra.error or '')
+        with pytest.raises(ValueError, match='do not match input_schema'):
+            self.runtime.tools.normalize_model_action(pid, {'action': 'strict_direct_count'})
+
+    def test_deno_jit_call_validates_output_schema(self) -> None:
+        self.runtime.tools.sandbox = BadOutputSandbox()
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bad output jit')
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'bad_output_jit',
+                'description': 'Bad output.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {
+                    'type': 'object',
+                    'properties': {'count': {'type': 'integer'}},
+                    'required': ['count'],
+                    'additionalProperties': False,
+                },
+            },
+            source_code='export function run(args, libos) { return {}; }',
+        )
+        self.runtime.tools.register(pid, candidate)
+
+        result = self.runtime.tools.call(pid, 'bad_output_jit', {})
+
+        assert not result.ok
+        assert result.result_handle is None
+        assert 'output_schema' in (result.error or '')
+        assert [obj for obj in self.runtime.store.list_objects() if obj.type.value == 'tool_result'] == []
 
     def test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
@@ -457,5 +540,89 @@ class RecordingValidationSandbox(SandboxBackend):
                 "peak_memory_bytes": 1024,
                 "killed": False,
                 "limit_kind": None,
+            }
+        return ValidationResult(ok=True, metadata=metadata)
+
+
+class DeferredBadExecSandbox(SandboxBackend):
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        *,
+        pid: str | None = None,
+        syscall_handler: SyscallHandler | None = None,
+        timeout: float | None = None,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> Any:
+        assert syscall_handler is not None
+        await syscall_handler('process.exec', {'image': 'missing-image:v0', 'goal': 'bad exec'})
+        value = {'returned': True}
+        if return_metrics:
+            return SandboxExecutionResult(value=value, metrics=CommandMetrics(wall_seconds=0.001))
+        return value
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        metadata = {}
+        if return_metrics:
+            metadata['metrics'] = {
+                'wall_seconds': 0.001,
+                'cpu_seconds': 0.0,
+                'peak_memory_bytes': 0,
+                'killed': False,
+                'limit_kind': None,
+            }
+        return ValidationResult(ok=True, metadata=metadata)
+
+
+class BadOutputSandbox(SandboxBackend):
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        *,
+        pid: str | None = None,
+        syscall_handler: SyscallHandler | None = None,
+        timeout: float | None = None,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> Any:
+        value = {'count': 'not-an-integer', 'extra': True}
+        if return_metrics:
+            return SandboxExecutionResult(value=value, metrics=CommandMetrics(wall_seconds=0.001))
+        return value
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        metadata = {}
+        if return_metrics:
+            metadata['metrics'] = {
+                'wall_seconds': 0.001,
+                'cpu_seconds': 0.0,
+                'peak_memory_bytes': 0,
+                'killed': False,
+                'limit_kind': None,
             }
         return ValidationResult(ok=True, metadata=metadata)

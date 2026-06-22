@@ -91,7 +91,7 @@ class LLMProcessExecutor:
             pid,
             source_view,
             policy=image.context_policy,
-            budget_tokens=process.resource_budget.max_materialized_tokens,
+            budget_tokens=process.resource_budget.max_context_materialization_tokens,
         )
         events = [
             replace(

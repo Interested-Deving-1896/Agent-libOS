@@ -136,6 +136,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
     tags: ClassVar[list[str]] = []
     metadata: ClassVar[dict[str, Any]] = {}
     expose_internal_errors: ClassVar[bool] = False
+    enforce_timeout: ClassVar[bool] = True
 
     def spec(self) -> ToolSpec:
         self._validate_contract()
@@ -197,7 +198,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
             )
 
         try:
-            if self.policy.timeout_s is None:
+            if self.policy.timeout_s is None or not self.enforce_timeout:
                 raw_result = await self.execute(args, ctx)
             else:
                 raw_result = await asyncio.wait_for(self.execute(args, ctx), timeout=self.policy.timeout_s)
@@ -209,6 +210,13 @@ class BaseAgentTool(ABC, Generic[InputT]):
                 code=ToolErrorCode.TIMEOUT,
                 message=f"Tool `{self.name}` timed out.",
                 retryable=True,
+                metadata=self._base_metadata(ctx, started_at),
+            )
+        except PydanticValidationError as exc:
+            return ToolResult.failure(
+                code=ToolErrorCode.VALIDATION_ERROR,
+                message=f"Invalid output for tool `{self.name}`.",
+                details={"errors": exc.errors()},
                 metadata=self._base_metadata(ctx, started_at),
             )
         except ToolExecutionError as exc:
@@ -282,7 +290,16 @@ class BaseAgentTool(ABC, Generic[InputT]):
 
     def _normalize_result(self, raw_result: Any) -> ToolResult:
         if isinstance(raw_result, ToolResult):
+            if raw_result.ok and self.output_schema is not None and raw_result.data is not None:
+                validated = self.output_schema.model_validate(raw_result.data)
+                raw_result.data = validated.model_dump()
+                raw_result.content = validated.model_dump_json()
             return raw_result
+        if self.output_schema is not None:
+            validated = self.output_schema.model_validate(
+                raw_result.model_dump() if isinstance(raw_result, BaseModel) else raw_result
+            )
+            return ToolResult.success(content=validated.model_dump_json(), data=validated.model_dump())
         if isinstance(raw_result, BaseModel):
             return ToolResult.success(content=raw_result.model_dump_json(), data=raw_result.model_dump())
         if isinstance(raw_result, (dict, list)):
@@ -318,6 +335,12 @@ class BaseAgentTool(ABC, Generic[InputT]):
 
 
 class SyncAgentTool(BaseAgentTool[InputT], ABC):
+    # Python threads cannot be killed safely after asyncio.wait_for() times out.
+    # Sync tools therefore rely on their underlying primitive/provider for hard
+    # deadlines instead of returning while a background thread may still mutate
+    # runtime state.
+    enforce_timeout: ClassVar[bool] = False
+
     async def execute(self, args: InputT, ctx: ToolContext) -> Any:
         return await asyncio.to_thread(self.run, args, ctx)
 

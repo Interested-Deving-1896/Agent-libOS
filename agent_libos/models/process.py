@@ -44,7 +44,8 @@ class ResourceBudget:
     max_tool_calls: int | None = _PROCESS_DEFAULTS.max_tool_calls
     max_child_processes: int | None = _PROCESS_DEFAULTS.max_child_processes
     max_runtime_seconds: int | None = _PROCESS_DEFAULTS.max_runtime_seconds
-    max_materialized_tokens: int = _PROCESS_DEFAULTS.max_materialized_tokens
+    max_context_materialization_tokens: int = _PROCESS_DEFAULTS.max_context_materialization_tokens
+    max_context_materialization_total_tokens: int | None = _PROCESS_DEFAULTS.max_context_materialization_total_tokens
     max_llm_calls: int | None = _PROCESS_DEFAULTS.max_llm_calls
     max_llm_total_tokens: int | None = _PROCESS_DEFAULTS.max_llm_total_tokens
     max_subprocess_wall_seconds: float | None = _PROCESS_DEFAULTS.max_subprocess_wall_seconds
@@ -58,7 +59,7 @@ class ResourceBudget:
     def __post_init__(self) -> None:
         for item in fields(self):
             value = getattr(self, item.name)
-            allow_none = item.name != "max_materialized_tokens"
+            allow_none = item.name != "max_context_materialization_tokens"
             _validate_resource_number(item.name, value, allow_none=allow_none)
 
 
@@ -67,6 +68,7 @@ class ResourceUsage:
     runtime_seconds: float = 0.0
     tool_calls: int = 0
     child_processes: int = 0
+    context_materialized_tokens: int = 0
     llm_calls: int = 0
     llm_prompt_tokens: int = 0
     llm_completion_tokens: int = 0
@@ -83,6 +85,19 @@ class ResourceUsage:
     def __post_init__(self) -> None:
         for item in fields(self):
             _validate_resource_number(item.name, getattr(self, item.name), allow_none=False)
+
+
+@dataclass
+class ResourceReservation:
+    parent_pid: PID
+    child_pid: PID
+    reserved: dict[str, float]
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        for key, value in self.reserved.items():
+            _validate_resource_number(key, value, allow_none=False)
 
 
 def _validate_resource_number(name: str, value: Any, *, allow_none: bool) -> None:

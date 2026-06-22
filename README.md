@@ -55,6 +55,8 @@ The implementation currently includes:
   entrypoints before `Runtime.open()` returns. Modules can register tools,
   images, syscalls, provider hooks, and startup hooks, but do not grant process
   resource authority.
+- A direct workflow entrypoint for users to run one image-visible tool through
+  ToolBroker without invoking the LLM scheduler.
 - SQLite persistence for process/object metadata, capabilities, messages,
   human requests, LLM calls, events, audit records, tools, Skill/JIT metadata,
   and scoped checkpoints.
@@ -166,10 +168,16 @@ uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite resources <pid>
 uv run agent-libos --db .agent_libos.sqlite audit
+uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
 
 Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
 you want a bounded run.
+
+`workflow run <tool>` spawns a fresh process from the default image, calls one
+visible tool, persists the result object, and exits that process. Pass
+`--image <image_id>` to use another image's tool table. It does not bypass
+primitive capability checks, resource budgets, human approval, or audit.
 
 Every LLM action-selection call is persisted as an `llm_calls` row with prompt
 messages, visible tool schemas, model output, tool calls, token usage when
@@ -258,6 +266,10 @@ Launch a coding agent against another workspace:
 ```bash
 uv run python scripts/run_coding_agent.py --workspace /path/to/repo --goal "Implement the requested change"
 ```
+
+The launcher loads `.env` from this Agent libOS checkout before mounting the
+target workspace. It does not automatically read the target workspace's `.env`;
+pass `--env-file /path/to/env` when a run needs a different credential file.
 
 On Windows PowerShell:
 

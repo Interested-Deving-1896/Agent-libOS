@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import ObjectMetadata, ObjectPatch, ObjectType, ViewMode
+from agent_libos.models import ObjectMetadata, ObjectType, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
-from agent_libos.tools.observability import ensure_json_size
 
 _MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -263,40 +261,14 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        handle = runtime.memory.handle_for_name(
+        updated, list_field, length = runtime.memory.append_object_by_name(
             ctx.pid,
             args.name,
-            rights=["read", "write"],
-            issued_by="append_memory_object_tool",
+            args.entry,
+            args.list_field,
             namespace=args.namespace,
+            issued_by="append_memory_object_tool",
         )
-        obj = runtime.memory.get_object(ctx.pid, handle)
-        ensure_json_size(args.entry, _TOOL_DEFAULTS.memory_append_entry_max_bytes, "memory append entry")
-        payload = deepcopy(obj.payload)
-        if isinstance(payload, dict):
-            values = payload.setdefault(args.list_field, [])
-            if not isinstance(values, list):
-                raise ToolExecutionError(
-                    "Target payload field is not a list.",
-                    code=ToolErrorCode.VALIDATION_ERROR,
-                    details={"name": args.name, "list_field": args.list_field},
-                )
-            values.append(args.entry)
-            length = len(values)
-            list_field: str | None = args.list_field
-        elif isinstance(payload, list):
-            payload.append(args.entry)
-            length = len(payload)
-            list_field = None
-        else:
-            raise ToolExecutionError(
-                "Target object payload is not appendable.",
-                code=ToolErrorCode.VALIDATION_ERROR,
-                details={"name": args.name, "payload_type": type(payload).__name__},
-            )
-        ensure_json_size(payload, _TOOL_DEFAULTS.memory_payload_hard_limit_bytes, "memory payload")
-        runtime.memory.update_object(ctx.pid, handle, ObjectPatch(payload=payload))
-        updated = runtime.memory.get_object(ctx.pid, handle)
         return AppendMemoryObjectOutput(
             oid=updated.oid,
             namespace=updated.namespace,

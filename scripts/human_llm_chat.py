@@ -126,7 +126,7 @@ async def run_chat(
         pid = runtime.process.spawn(
             image=CHAT_IMAGE_ID,
             goal=CHAT_PROCESS_GOAL,
-            resource_budget=ResourceBudget(max_materialized_tokens=_SCRIPT_DEFAULTS.chat_context_tokens),
+            resource_budget=ResourceBudget(max_context_materialization_tokens=_SCRIPT_DEFAULTS.chat_context_tokens),
         )
         client.bind_runtime(runtime, pid)
         default_max_quanta = max_turns * _SCRIPT_DEFAULTS.chat_quanta_per_turn + _SCRIPT_DEFAULTS.chat_quanta_overhead

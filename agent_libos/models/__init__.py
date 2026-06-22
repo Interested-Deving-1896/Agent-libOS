@@ -87,6 +87,7 @@ from agent_libos.models.process import (
     ProcessSignal,
     ProcessStatus,
     ResourceBudget,
+    ResourceReservation,
     ResourceUsage,
 )
 from agent_libos.models.tools import (
@@ -99,6 +100,7 @@ from agent_libos.models.tools import (
     ToolHandle,
     ToolSpec,
     ValidationResult,
+    WorkflowRunResult,
     is_openai_tool_name,
 )
 
@@ -181,6 +183,7 @@ __all__ = [
     "Provenance",
     "RelationType",
     "ResourceBudget",
+    "ResourceReservation",
     "ResourceUsage",
     "ResourcePattern",
     "ResourceScope",
@@ -195,4 +198,5 @@ __all__ = [
     "ToolSpec",
     "ValidationResult",
     "ViewMode",
+    "WorkflowRunResult",
 ]

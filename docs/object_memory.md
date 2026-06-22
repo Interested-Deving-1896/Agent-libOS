@@ -69,6 +69,11 @@ A name is not itself authority. Resolution requires:
 This prevents a process from using a guessed object id or shared name to bypass
 capabilities.
 
+One-shot namespace grants are consumed only after a successful namespace
+operation. For example, an `allow_once` `object_namespace:<ns>` `read` grant can
+complete one named lookup or namespace listing, then later lookups must be
+authorized again. Failed validation or missing objects do not burn the grant.
+
 ## Memory Views
 
 Processes hold `MemoryView` objects that summarize which objects are visible as
@@ -99,6 +104,11 @@ Each process also has a mutable context object named `llm_context:<pid>`.
 
 The runtime appends new process facts and summaries to the end of that object so
 repeated prompt prefixes remain stable for prompt caching.
+
+Materialization budgets use each object's current `metadata.token_estimate`.
+Object creation, payload updates, file imports, and append-style writes refresh
+that estimate so enlarged payloads cannot slip into prompts under stale budget
+metadata.
 
 Current context materialization does not yet expose complete per-call metadata
 for every included, omitted, summarized, or truncated object. That remains a

@@ -219,6 +219,7 @@ class CheckpointManager:
             "processes",
             "objects",
             "capabilities",
+            "process_resource_reservations",
             "process_messages",
             "llm_pending_actions",
             "tool_candidates",
@@ -415,6 +416,7 @@ class CheckpointManager:
             "objects": self._rows_by_ids("objects", "oid", object_oids),
             "object_links": self._link_rows_for_objects(object_oids),
             "capabilities": capability_rows,
+            "process_resource_reservations": self._resource_reservation_rows_for_processes(subtree_pids),
             "process_messages": self._message_rows_for_recipients(subtree_pids),
             "llm_pending_actions": self._rows_by_ids("llm_pending_actions", "pid", subtree_pids),
             "skills": self._skill_rows_for_processes(process_rows),
@@ -470,6 +472,7 @@ class CheckpointManager:
                 self.store.forget_object_payload(oid)
             self._delete_rows_by_ids(cur, "object_namespaces", "namespace", namespace_names)
             self._delete_non_checkpoint_capabilities(cur, current_pids)
+            self._delete_resource_reservations(cur, current_pids)
             self._delete_rows_by_ids(cur, "llm_pending_actions", "pid", current_pids)
             self._delete_rows_by_ids(cur, "tool_candidates", "pid", current_pids)
             self._delete_rows_by_ids(cur, "processes", "pid", current_pids)
@@ -488,6 +491,8 @@ class CheckpointManager:
                 if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
                     continue
                 self._insert_row(cur, "capabilities", row)
+            for row in rows.get("process_resource_reservations", []):
+                self._insert_row(cur, "process_resource_reservations", row)
             for row in rows.get("tool_candidates", []):
                 self._insert_row(cur, "tool_candidates", row)
             for row in rows.get("skills", []):
@@ -535,6 +540,11 @@ class CheckpointManager:
             self._remap_capability_row(row, pid_map, object_map, namespace_map, capability_map)
             for row in rows.get("capabilities", [])
             if row["subject"] in pid_map and not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)
+        ]
+        rows["process_resource_reservations"] = [
+            self._remap_resource_reservation_row(row, pid_map)
+            for row in rows.get("process_resource_reservations", [])
+            if row["parent_pid"] in pid_map and row["child_pid"] in pid_map
         ]
         rows["process_messages"] = [
             self._remap_message_row(row, pid_map)
@@ -660,7 +670,14 @@ class CheckpointManager:
                 item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
                 self._insert_row(cur, "objects", item)
                 self.store.set_object_payload(item["oid"], deepcopy(remapped["object_payloads"][item["oid"]]))
-            for table in ["object_links", "capabilities", "process_messages", "llm_pending_actions", "tool_candidates"]:
+            for table in [
+                "object_links",
+                "capabilities",
+                "process_resource_reservations",
+                "process_messages",
+                "llm_pending_actions",
+                "tool_candidates",
+            ]:
                 for row in rows.get(table, []):
                     self._insert_row(cur, table, row)
             for row in rows.get("skills", []):
@@ -751,9 +768,9 @@ class CheckpointManager:
             for root in view.get("roots", []):
                 if isinstance(root, dict) and root.get("oid"):
                     oids.add(str(root["oid"]))
-        for row in self.store.select_table_rows("objects"):
-            if row["created_by"] in pids:
-                oids.add(row["oid"])
+        for pid in pids:
+            for obj in self.store.list_objects_created_by(pid):
+                oids.add(obj.oid)
         return sorted(oid for oid in oids if oid in self.store._object_payloads)
 
     def _current_scoped_object_oids(self, pids: list[str]) -> list[str]:
@@ -767,9 +784,13 @@ class CheckpointManager:
         }
         process_namespaces = {f"{self.config.memory.process_namespace_prefix}:{pid}" for pid in pids}
         namespaces |= process_namespaces
-        for row in self.store.select_table_rows("object_namespaces"):
-            if row["created_by"] in pids or row["namespace"] in namespaces:
-                namespaces.add(row["namespace"])
+        for pid in pids:
+            for namespace in self.store.list_namespaces_created_by(pid):
+                namespaces.add(namespace.namespace)
+        for namespace in list(namespaces):
+            found = self.store.get_namespace(namespace)
+            if found is not None:
+                namespaces.add(found.namespace)
         return sorted(namespaces)
 
     def _current_scoped_namespaces(self, pids: list[str]) -> list[str]:
@@ -799,6 +820,18 @@ class CheckpointManager:
 
     def _message_rows_for_recipients(self, pids: list[str]) -> list[dict[str, Any]]:
         return self._rows_by_ids("process_messages", "recipient_pid", pids)
+
+    def _resource_reservation_rows_for_processes(self, pids: list[str]) -> list[dict[str, Any]]:
+        selected = set(pids)
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        for pid in pids:
+            for row in self.store.select_table_rows("process_resource_reservations", "parent_pid = ?", (pid,)):
+                if row["child_pid"] in selected:
+                    rows[(row["parent_pid"], row["child_pid"])] = row
+            for row in self.store.select_table_rows("process_resource_reservations", "child_pid = ?", (pid,)):
+                if row["parent_pid"] in selected:
+                    rows[(row["parent_pid"], row["child_pid"])] = row
+        return [rows[key] for key in sorted(rows)]
 
     def _tool_rows_for_processes(self, process_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         tool_ids: set[str] = set()
@@ -1004,6 +1037,7 @@ class CheckpointManager:
             "processes": process_rows,
             "objects": self._rows_by_ids("objects", "oid", object_oids),
             "capabilities": self._capability_rows_for_subjects(pids),
+            "process_resource_reservations": self._resource_reservation_rows_for_processes(pids),
             "process_messages": self._message_rows_for_recipients(pids),
             "llm_pending_actions": self._rows_by_ids("llm_pending_actions", "pid", pids),
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", pids),
@@ -1015,12 +1049,15 @@ class CheckpointManager:
             "processes": "pid",
             "objects": "oid",
             "capabilities": "cap_id",
+            "process_resource_reservations": ("parent_pid", "child_pid"),
             "process_messages": "message_id",
             "llm_pending_actions": "pid",
             "tool_candidates": "candidate_id",
             "skills": "skill_id",
         }
         key = key_by_table[table]
+        if isinstance(key, tuple):
+            return {":".join(str(row[item]) for item in key): row for row in rows}
         return {str(row[key]): row for row in rows}
 
     def _snapshot_counts(self, snapshot: dict[str, Any]) -> dict[str, int]:
@@ -1049,6 +1086,19 @@ class CheckpointManager:
         cur.execute(
             f"DELETE FROM capabilities WHERE subject IN ({placeholders}) AND resource NOT LIKE 'checkpoint:%'",
             pids,
+        )
+
+    def _delete_resource_reservations(self, cur: Any, pids: list[str]) -> None:
+        if not pids:
+            return
+        placeholders = ", ".join("?" for _ in pids)
+        cur.execute(
+            f"""
+            DELETE FROM process_resource_reservations
+             WHERE parent_pid IN ({placeholders})
+                OR child_pid IN ({placeholders})
+            """,
+            [*pids, *pids],
         )
 
     def _insert_row(self, cur: Any, table: str, row: dict[str, Any]) -> None:
@@ -1189,6 +1239,15 @@ class CheckpointManager:
             item["resource"] = f"object_namespace:{namespace_map.get(namespace, namespace)}"
         item["issued_by"] = f"checkpoint.fork:{item['issued_by']}"
         item["issued_at"] = utc_now()
+        return item
+
+    def _remap_resource_reservation_row(self, row: dict[str, Any], pid_map: dict[str, str]) -> dict[str, Any]:
+        item = dict(row)
+        item["parent_pid"] = pid_map[item["parent_pid"]]
+        item["child_pid"] = pid_map[item["child_pid"]]
+        now = utc_now()
+        item["created_at"] = now
+        item["updated_at"] = now
         return item
 
     def _remap_message_row(self, row: dict[str, Any], pid_map: dict[str, str]) -> dict[str, Any]:

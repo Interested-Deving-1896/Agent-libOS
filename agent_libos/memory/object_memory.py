@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
+from reprlib import Repr
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
@@ -25,6 +27,7 @@ from agent_libos.models import (
     ObjectType,
     Provenance,
     RelationType,
+    ResourceUsage,
     ViewMode,
     AgentObject,
 )
@@ -44,12 +47,14 @@ class ObjectMemoryManager:
         audit: AuditManager,
         events: EventBus,
         config: AgentLibOSConfig | None = None,
+        resources: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.resources = resources
 
     def create_object(
         self,
@@ -68,14 +73,12 @@ class ObjectMemoryManager:
         oid = new_id("obj")
         object_namespace = self.resolve_namespace(pid, namespace)
         object_name = self._normalize_name(name or self._default_name(obj_type, oid))
+        namespace_decision = self._require_namespace_right(pid, object_namespace, "write")
         self._require_namespace_exists(object_namespace)
-        self._require_namespace_right(pid, object_namespace, "write")
         # Names are stable namespace directory entries, not authority. Reads by
         # name still resolve to an oid and pass through object capability checks.
         self._require_unique_name(object_name, object_namespace)
-        meta = metadata or ObjectMetadata(token_estimate=estimate_tokens(payload))
-        if meta.token_estimate is None:
-            meta.token_estimate = estimate_tokens(payload)
+        meta = self._metadata_for_payload(payload, metadata)
         obj = AgentObject(
             oid=oid,
             namespace=object_namespace,
@@ -123,6 +126,7 @@ class ObjectMemoryManager:
             capability_refs=[handle.capability_id],
             decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
         )
+        self._consume_one_time_decision(namespace_decision)
         return handle
 
     def process_namespace(self, pid: str) -> str:
@@ -173,9 +177,10 @@ class ObjectMemoryManager:
         if self.store.namespace_exists(namespace_name):
             raise ValidationError(f"Object Memory namespace already exists: {namespace_name}")
         parent = self._normalize_namespace(parent_namespace) if parent_namespace else self._parent_namespace(namespace_name)
+        parent_decision = None
         if parent is not None:
+            parent_decision = self._require_namespace_right(pid, parent, "write")
             self._require_namespace_exists(parent)
-            self._require_namespace_right(pid, parent, "write")
         now = utc_now()
         ns = ObjectNamespace(
             namespace=namespace_name,
@@ -198,26 +203,29 @@ class ObjectMemoryManager:
             target=self._namespace_resource(namespace_name),
             decision={"namespace": namespace_name, "parent_namespace": parent},
         )
+        if parent_decision is not None:
+            self._consume_one_time_decision(parent_decision)
         return ns
 
     def get_namespace(self, pid: str, namespace: str | None = None) -> ObjectNamespace:
         namespace_name = self.resolve_namespace(pid, namespace)
+        namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
         ns = self.store.get_namespace(namespace_name)
         if ns is None:
             raise NotFound(f"Object Memory namespace not found: {namespace_name}")
-        self._require_namespace_right(pid, namespace_name, "read")
         self.audit.record(
             actor=pid,
             action="memory.get_namespace",
             target=self._namespace_resource(namespace_name),
             decision={"namespace": namespace_name},
         )
+        self._consume_one_time_decision(namespace_decision)
         return ns
 
     def list_namespace(self, pid: str, namespace: str | None = None) -> dict[str, Any]:
         namespace_name = self.resolve_namespace(pid, namespace)
+        namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
         self._require_namespace_exists(namespace_name)
-        self._require_namespace_right(pid, namespace_name, "read")
         objects = [
             obj
             for obj in self.store.list_objects(namespace=namespace_name)
@@ -235,6 +243,7 @@ class ObjectMemoryManager:
             output_refs=[obj.oid for obj in objects],
             decision={"namespace": namespace_name, "objects": len(objects), "namespaces": len(child_namespaces)},
         )
+        self._consume_one_time_decision(namespace_decision)
         return {
             "namespace": namespace_name,
             "objects": objects,
@@ -258,11 +267,12 @@ class ObjectMemoryManager:
     def get_object_by_name(self, pid: str, name: str, namespace: str | None = None) -> AgentObject:
         object_namespace = self.resolve_namespace(pid, namespace)
         object_name = self._normalize_name(name)
+        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+        self._require_namespace_exists(object_namespace)
         obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
         if obj is None:
             raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
         # Name lookup never bypasses the object capability model.
-        self._require_namespace_right(pid, object_namespace, "read")
         decision = self.capabilities.require(pid, f"object:{obj.oid}", ObjectRight.READ)
         self.audit.record(
             actor=pid,
@@ -271,6 +281,7 @@ class ObjectMemoryManager:
             input_refs=[obj.oid],
             decision={"namespace": obj.namespace, "name": obj.name, "oid": obj.oid},
         )
+        self._consume_one_time_decision(namespace_decision)
         self._consume_one_time_decision(decision)
         return obj
 
@@ -284,12 +295,13 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         object_namespace = self.resolve_namespace(pid, namespace)
         object_name = self._normalize_name(name)
+        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+        self._require_namespace_exists(object_namespace)
         obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
         if obj is None:
             raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
         requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
         # A name can be resolved only into rights the process already has.
-        self._require_namespace_right(pid, object_namespace, "read")
         decisions = []
         for right in requested:
             decisions.append(self.capabilities.require(pid, f"object:{obj.oid}", right))
@@ -311,6 +323,7 @@ class ObjectMemoryManager:
             capability_refs=[handle.capability_id],
             decision={"namespace": obj.namespace, "name": obj.name, "rights": sorted(requested)},
         )
+        self._consume_one_time_decision(namespace_decision)
         return handle
 
     def handle_for_oid(
@@ -359,23 +372,33 @@ class ObjectMemoryManager:
             raise CapabilityDenied(f"immutable object cannot be updated: {handle.oid}")
         next_namespace = current.namespace
         next_name = current.name
+        namespace_decisions = []
         if patch.namespace is not None:
             next_namespace = self._normalize_namespace(patch.namespace)
+            namespace_decisions.append(self._require_namespace_right(pid, next_namespace, "write"))
             self._require_namespace_exists(next_namespace)
-            self._require_namespace_right(pid, next_namespace, "write")
         if patch.name is not None:
             next_name = self._normalize_name(patch.name)
         if next_namespace != current.namespace or next_name != current.name:
-            self._require_namespace_right(pid, current.namespace, "write")
+            namespace_decisions.append(self._require_namespace_right(pid, current.namespace, "write"))
             self._require_unique_name(next_name, next_namespace, except_oid=current.oid)
         if patch.payload is not None:
             self._validate_payload_size(patch.payload, "object payload")
+        next_payload = current.payload if patch.payload is None else patch.payload
+        if patch.metadata is None:
+            next_metadata = (
+                current.metadata
+                if patch.payload is None
+                else self._metadata_for_payload(next_payload, current.metadata, force_token_estimate=True)
+            )
+        else:
+            next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
         updated = replace(
             current,
             namespace=next_namespace,
             name=next_name,
-            payload=current.payload if patch.payload is None else patch.payload,
-            metadata=current.metadata if patch.metadata is None else patch.metadata,
+            payload=next_payload,
+            metadata=next_metadata,
             provenance=current.provenance if patch.provenance is None else patch.provenance,
             version=current.version + 1,
             updated_at=utc_now(),
@@ -402,7 +425,90 @@ class ObjectMemoryManager:
             capability_refs=[handle.capability_id],
             decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
         )
+        self._consume_one_time_decisions(namespace_decisions)
         return handle
+
+    def append_object_by_name(
+        self,
+        pid: str,
+        name: str,
+        entry: Any,
+        list_field: str = "entries",
+        namespace: str | None = None,
+        *,
+        issued_by: str = "memory.append",
+    ) -> tuple[AgentObject, str | None, int]:
+        object_namespace = self.resolve_namespace(pid, namespace)
+        object_name = self._normalize_name(name)
+        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+        self._require_namespace_exists(object_namespace)
+        obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
+        if obj is None:
+            raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+        rights, decisions = self._authorized_object_rights(
+            pid,
+            obj.oid,
+            required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+            optional_rights=set(),
+        )
+        if obj.immutable:
+            raise CapabilityDenied(f"immutable object cannot be updated: {obj.oid}")
+        ensure_json_size(entry, self.config.tools.memory_append_entry_max_bytes, "memory append entry")
+        payload = deepcopy(obj.payload)
+        if isinstance(payload, dict):
+            values = payload.setdefault(list_field, [])
+            if not isinstance(values, list):
+                raise ValidationError("target object list_field is not a list")
+            values.append(entry)
+            length = len(values)
+            output_list_field: str | None = list_field
+        elif isinstance(payload, list):
+            payload.append(entry)
+            length = len(payload)
+            output_list_field = None
+        else:
+            raise ValidationError("target object payload is not appendable")
+        self._validate_payload_size(payload, "memory payload")
+        updated = replace(
+            obj,
+            payload=payload,
+            metadata=self._metadata_for_payload(payload, obj.metadata, force_token_estimate=True),
+            version=obj.version + 1,
+            updated_at=utc_now(),
+        )
+        self.store.update_object(updated)
+        self._consume_one_time_decisions(decisions)
+        self.events.emit(
+            EventType.OBJECT_UPDATED,
+            source=pid,
+            target=pid,
+            payload={
+                "oid": updated.oid,
+                "namespace": updated.namespace,
+                "name": updated.name,
+                "qualified_name": self.qualified_name(updated),
+                "version": updated.version,
+            },
+        )
+        self.audit.record(
+            actor=pid,
+            action="memory.append_object",
+            target=f"object:{updated.oid}",
+            input_refs=[updated.oid],
+            output_refs=[updated.oid],
+            capability_refs=[
+                cap_id for cap_id in (decision.selected_capability_id for decision in decisions) if cap_id is not None
+            ],
+            decision={
+                "namespace": updated.namespace,
+                "name": updated.name,
+                "version": updated.version,
+                "rights": sorted(rights),
+                "issued_by": issued_by,
+            },
+        )
+        self._consume_one_time_decision(namespace_decision)
+        return updated, output_list_field, length
 
     def link_objects(
         self,
@@ -442,15 +548,22 @@ class ObjectMemoryManager:
     def query_objects(self, pid: str, query: ObjectQuery) -> list[ObjectHandle]:
         results: list[ObjectHandle] = []
         namespace = self.resolve_namespace(pid, query.namespace)
-        self._require_namespace_right(pid, namespace, "read")
-        for obj in self.store.list_objects(namespace=namespace):
-            if query.name is not None and obj.name != self._normalize_name(query.name):
-                continue
+        namespace_decision = self._require_namespace_right(pid, namespace, "read")
+        self._require_namespace_exists(namespace)
+        limit = self._validate_query_limit(query.limit)
+        if query.name is None:
+            candidates = self.store.list_objects(namespace=namespace)
+        else:
+            object_name = self._normalize_name(query.name)
+            obj = self.store.get_object_by_name(object_name, namespace=namespace)
+            candidates = [] if obj is None else [obj]
+        query_text = query.text.lower() if query.text else None
+        for obj in candidates:
             if query.type is not None and obj.type.value != str(query.type):
                 continue
             if query.tags and not set(query.tags).issubset(set(obj.metadata.tags)):
                 continue
-            if query.text and query.text.lower() not in self._search_text(obj).lower():
+            if query_text and query_text not in self._search_text(obj).lower():
                 continue
             decisions: list[Any]
             rights: set[str]
@@ -472,7 +585,7 @@ class ObjectMemoryManager:
             )
             self._consume_one_time_decisions(decisions)
             results.append(handle)
-            if len(results) >= query.limit:
+            if len(results) >= limit:
                 break
         self.audit.record(
             actor=pid,
@@ -481,6 +594,7 @@ class ObjectMemoryManager:
             output_refs=[handle.oid for handle in results],
             decision={"count": len(results), "namespace": namespace},
         )
+        self._consume_one_time_decision(namespace_decision)
         return results
 
     def create_view(
@@ -660,6 +774,16 @@ class ObjectMemoryManager:
     ) -> MaterializedContext:
         selected_policy = policy or self.config.memory.context_policy
         selected_budget = budget_tokens if budget_tokens is not None else self.config.memory.materialize_budget_tokens
+        resources = getattr(self, "resources", None)
+        if resources is not None:
+            selected_budget = min(selected_budget, resources.context_materialization_window_limit(pid))
+            remaining = resources.remaining_cumulative(
+                pid,
+                "max_context_materialization_total_tokens",
+                "context_materialized_tokens",
+            )
+            if remaining is not None:
+                selected_budget = min(selected_budget, max(0, int(remaining)))
         objects: list[AgentObject] = []
         omitted: list[str] = []
         for handle in view.roots:
@@ -698,9 +822,19 @@ class ObjectMemoryManager:
             output_refs=refs,
             decision={"tokens": total, "omitted": omitted, "policy": selected_policy},
         )
+        if resources is not None:
+            resources.charge(
+                pid,
+                ResourceUsage(context_materialized_tokens=total),
+                source="memory.materialize_context",
+                context={"view_id": view.view_id, "policy": selected_policy},
+                allow_overage=False,
+                kill_on_exceed=False,
+            )
         return context
 
     def _search_text(self, obj: AgentObject) -> str:
+        payload_preview = self._bounded_payload_repr(obj.payload)
         return " ".join(
             [
                 obj.namespace,
@@ -708,9 +842,21 @@ class ObjectMemoryManager:
                 obj.metadata.title or "",
                 obj.metadata.summary or "",
                 " ".join(obj.metadata.tags),
-                repr(obj.payload),
+                payload_preview,
             ]
         )
+
+    def _bounded_payload_repr(self, payload: Any) -> str:
+        renderer = Repr()
+        # Text search is a lightweight directory aid, not a full payload index.
+        # Keep representation bounded so a query cannot render every large
+        # Object Memory payload in the namespace.
+        renderer.maxstring = self.config.tools.memory_payload_chars
+        renderer.maxother = self.config.tools.memory_payload_chars
+        renderer.maxlist = 50
+        renderer.maxdict = 50
+        render = renderer.repr(payload)
+        return render[: self.config.tools.memory_payload_chars]
 
     def _sort_for_policy(self, objects: list[AgentObject], policy: str) -> list[AgentObject]:
         if policy == "recency_first":
@@ -897,8 +1043,11 @@ class ObjectMemoryManager:
         pid: str,
         namespace: str,
         right: str,
-    ) -> None:
-        self.capabilities.require(pid, self._namespace_resource(namespace), right)
+    ) -> Any:
+        # Namespace checks protect directory-style lookup and mutation. The
+        # caller consumes returned one-shot decisions only after the operation
+        # succeeds, so failed validation does not burn an approval.
+        return self.capabilities.require(pid, self._namespace_resource(namespace), right)
 
     def _can_read_namespace(self, pid: str, namespace: str) -> bool:
         return self.capabilities.check(
@@ -913,3 +1062,23 @@ class ObjectMemoryManager:
 
     def _validate_payload_size(self, payload: Any, label: str) -> None:
         ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, label)
+
+    def _validate_query_limit(self, limit: int) -> int:
+        selected = int(limit)
+        if selected < 1:
+            raise ValidationError("Object Memory query limit must be >= 1")
+        if selected > self.config.memory.query_limit:
+            raise ValidationError(f"Object Memory query limit must be <= {self.config.memory.query_limit}")
+        return selected
+
+    def _metadata_for_payload(
+        self,
+        payload: Any,
+        metadata: ObjectMetadata | None,
+        *,
+        force_token_estimate: bool = False,
+    ) -> ObjectMetadata:
+        meta = deepcopy(metadata) if metadata is not None else ObjectMetadata()
+        if force_token_estimate or meta.token_estimate is None:
+            meta.token_estimate = estimate_tokens(payload)
+        return meta

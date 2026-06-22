@@ -73,6 +73,8 @@ def main(argv: list[str] | None = None) -> None:
     resources_parser = sub.add_parser("resources", help="Print process resource budget and usage")
     resources_parser.add_argument("pid")
     sub.add_parser("tools", help="Print registered tools")
+    workflow_parser = sub.add_parser("workflow", help="Run a user-facing workflow tool directly")
+    _add_workflow_parser_args(workflow_parser)
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image", default=_RUNTIME_DEFAULTS.default_image_id)
     spawn_parser.add_argument("--goal", required=True)
@@ -155,6 +157,11 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_resource_summary(runtime, args.pid))
         elif args.command == "tools":
             _print_json(runtime.tools.list())
+        elif args.command == "workflow":
+            result = _run_workflow_command(runtime, args)
+            _print_json(to_jsonable(result))
+            if not result.ok:
+                raise SystemExit(1)
         elif args.command == "spawn":
             pid = runtime.process.spawn(image=args.image, goal=args.goal)
             _print_json({"pid": pid, "image": args.image, "goal": args.goal})
@@ -203,6 +210,28 @@ def _resource_summary(runtime: Runtime, pid: str) -> dict[str, Any]:
         "usage": to_jsonable(process.resource_usage),
         "remaining": to_jsonable(runtime.resources.remaining_budget(pid)),
     }
+
+
+def _add_workflow_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="workflow_command", required=True)
+    run_parser = sub.add_parser("run", help="Spawn a workflow process and call one visible tool")
+    run_parser.add_argument("tool", help="Tool/workflow name to run.")
+    run_parser.add_argument("--args-json", default="{}", help="JSON object passed as tool arguments.")
+    run_parser.add_argument("--image", help="AgentImage id to use; defaults to the runtime default image.")
+    run_parser.add_argument("--goal", help="Optional process goal; defaults to workflow:<tool>.")
+    run_parser.add_argument("--working-directory", help="Optional AgentProcess working directory.")
+
+
+def _run_workflow_command(runtime: Runtime, args: argparse.Namespace) -> Any:
+    if args.workflow_command != "run":
+        raise SystemExit(f"unknown workflow command: {args.workflow_command}")
+    return runtime.run_workflow(
+        args.tool,
+        _parse_json_mapping(args.args_json, "--args-json"),
+        image=args.image,
+        goal=args.goal,
+        working_directory=args.working_directory,
+    )
 
 
 def _run_cd_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:

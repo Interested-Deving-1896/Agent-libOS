@@ -36,14 +36,11 @@ class AsyncProcessScheduler:
         self.resources = resources
 
     def next_runnable(self) -> str | None:
-        runnable = [p for p in self.store.list_processes() if p.status == ProcessStatus.RUNNABLE]
-        runnable.sort(key=lambda proc: proc.created_at)
+        runnable = self.store.list_processes_by_status(ProcessStatus.RUNNABLE)
         return runnable[0].pid if runnable else None
 
     def runnable_pids(self) -> list[str]:
-        runnable = [p for p in self.store.list_processes() if p.status == ProcessStatus.RUNNABLE]
-        runnable.sort(key=lambda proc: proc.created_at)
-        return [proc.pid for proc in runnable]
+        return [proc.pid for proc in self.store.list_processes_by_status(ProcessStatus.RUNNABLE)]
 
     async def arun_once(self, quantum: Quantum) -> Any:
         pid = self.next_runnable()
@@ -58,13 +55,18 @@ class AsyncProcessScheduler:
         results: list[Any] = []
         tasks: dict[str, asyncio.Task[list[Any]]] = {}
         quanta_used = 0
+        effective_max_quanta = max_quanta
+        unblock_quanta_used = 0
+        unblock_quanta_limit = max(1, max_quanta or 0) if max_quanta is not None else None
+        drain_polls_used = 0
+        drain_poll_limit = max(1, int(0.5 / max(self.poll_interval_s, 0.001))) if max_quanta is not None else None
         quanta_lock = asyncio.Lock()
 
         async def reserve_quantum() -> bool:
             # The quantum budget is global across process tasks, not per process.
             nonlocal quanta_used
             async with quanta_lock:
-                if _budget_exhausted(quanta_used, max_quanta):
+                if _budget_exhausted(quanta_used, effective_max_quanta):
                     return False
                 quanta_used += 1
                 return True
@@ -93,7 +95,7 @@ class AsyncProcessScheduler:
             # Start one task per runnable pid. Each task keeps advancing its own
             # process until it blocks, exits, fails, or the shared budget is used.
             for pid in self.runnable_pids():
-                if _budget_exhausted(quanta_used, max_quanta):
+                if _budget_exhausted(quanta_used, effective_max_quanta):
                     break
                 if pid not in tasks:
                     tasks[pid] = asyncio.create_task(process_loop(pid), name=f"agent-process:{pid}")
@@ -110,15 +112,48 @@ class AsyncProcessScheduler:
                 pid = self._pid_for_task(tasks, task)
                 if pid is not None:
                     tasks.pop(pid, None)
-                results.extend(task.result())
-
-            if _budget_exhausted(quanta_used, max_quanta) and not done:
-                done_all, _pending = await asyncio.wait(tasks.values(), return_when=asyncio.ALL_COMPLETED)
-                for task in done_all:
-                    pid = self._pid_for_task(tasks, task)
-                    if pid is not None:
-                        tasks.pop(pid, None)
+                try:
                     results.extend(task.result())
+                except asyncio.CancelledError:
+                    if pid is not None:
+                        self._record_task_cancelled(pid, reason="cancelled")
+                except Exception as exc:
+                    if pid is not None:
+                        self._fail_process_task(pid, exc)
+                    results.append({"ok": False, "pid": pid, "error": str(exc)})
+
+            if _budget_exhausted(quanta_used, effective_max_quanta) and not done:
+                runnable_dependencies = [pid for pid in self.runnable_pids() if pid not in tasks]
+                if (
+                    runnable_dependencies
+                    and unblock_quanta_limit is not None
+                    and unblock_quanta_used < unblock_quanta_limit
+                ):
+                    # A bounded run may have spent its nominal budget inside a
+                    # parent quantum that is waiting for a child/message. Grant
+                    # limited dependency quanta so the waiter can be unblocked.
+                    unblock_quanta_used += 1
+                    effective_max_quanta = (effective_max_quanta or 0) + 1
+                    self.audit.record(
+                        actor="scheduler",
+                        action="scheduler.unblock_quantum_reserved",
+                        target="scheduler",
+                        decision={
+                            "quanta_used": quanta_used,
+                            "max_quanta": max_quanta,
+                            "unblock_quanta_used": unblock_quanta_used,
+                            "runnable_dependencies": runnable_dependencies,
+                        },
+                    )
+                    continue
+                if (
+                    drain_poll_limit is not None
+                    and drain_polls_used < drain_poll_limit
+                    and self._has_running_pending_task(tasks)
+                ):
+                    drain_polls_used += 1
+                    continue
+                await self._cancel_pending_tasks(tasks, results, reason="max_quanta_exhausted")
                 break
 
         return results
@@ -218,6 +253,44 @@ class AsyncProcessScheduler:
             target=f"process:{pid}",
             decision={"error": str(exc), "error_type": type(exc).__name__},
         )
+
+    async def _cancel_pending_tasks(
+        self,
+        tasks: dict[str, asyncio.Task[list[Any]]],
+        results: list[Any],
+        *,
+        reason: str,
+    ) -> None:
+        pending = list(tasks.items())
+        for _pid, task in pending:
+            task.cancel()
+        outcomes = await asyncio.gather(*(task for _pid, task in pending), return_exceptions=True)
+        for (pid, _task), outcome in zip(pending, outcomes):
+            tasks.pop(pid, None)
+            if isinstance(outcome, list):
+                results.extend(outcome)
+            elif isinstance(outcome, asyncio.CancelledError):
+                self._record_task_cancelled(pid, reason=reason)
+            elif isinstance(outcome, Exception):
+                self._fail_process_task(pid, outcome)
+                results.append({"ok": False, "pid": pid, "error": str(outcome)})
+            else:
+                results.append(outcome)
+
+    def _record_task_cancelled(self, pid: str, *, reason: str) -> None:
+        self.audit.record(
+            actor="scheduler",
+            action="scheduler.process_task_cancelled",
+            target=f"process:{pid}",
+            decision={"reason": reason},
+        )
+
+    def _has_running_pending_task(self, tasks: dict[str, asyncio.Task[list[Any]]]) -> bool:
+        for pid in tasks:
+            process = self.store.get_process(pid)
+            if process is not None and process.status == ProcessStatus.RUNNING:
+                return True
+        return False
 
     def _pid_for_task(self, tasks: dict[str, asyncio.Task[list[Any]]], task: asyncio.Task[list[Any]]) -> str | None:
         for pid, candidate in tasks.items():

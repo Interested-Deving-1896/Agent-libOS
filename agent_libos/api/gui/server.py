@@ -455,6 +455,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     reason=f"spawn:{pid}",
                 )
             return {"pid": pid, "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
+        if len(route) >= 1 and route[0] == "workflows":
+            return self._dispatch_workflows(method, route[1:])
         if route[:2] == ["scheduler", "auto"] and method == "POST":
             body = self._read_body()
             return service.scheduler.set_auto_run(bool(body.get("enabled", True)))
@@ -477,6 +479,27 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if len(route) >= 1 and route[0] == "modules":
             return self._dispatch_modules(method, route[1:])
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown endpoint")
+
+    def _dispatch_workflows(self, method: str, route: list[str]) -> Any:
+        service = self.server.service
+        if method == "POST" and route == ["run"]:
+            body = self._read_body()
+            tool = str(body.get("tool") or "").strip()
+            if not tool:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "workflow tool is required")
+            raw_args = body.get("args") if "args" in body else {}
+            if not isinstance(raw_args, dict):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "workflow args must be a JSON object")
+            result = service.runtime.run_workflow(
+                tool,
+                raw_args,
+                image=str(body["image"]) if body.get("image") is not None else None,
+                goal=body.get("goal"),
+                working_directory=str(body["working_directory"]) if body.get("working_directory") is not None else None,
+            )
+            service.publish_runtime_changes("workflow.run")
+            return to_jsonable(result)
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown workflows endpoint")
 
     def _dispatch_process(self, method: str, pid: str, route: list[str], query: dict[str, list[str]]) -> Any:
         service = self.server.service

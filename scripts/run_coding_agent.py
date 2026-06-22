@@ -169,8 +169,13 @@ def configure_coding_agent_permissions(
 
 
 def _load_env(args: argparse.Namespace) -> None:
-    env_path = Path(args.env_file).expanduser() if args.env_file else PROJECT_ROOT / ".env"
-    env_path = env_path.resolve()
+    if args.env_file:
+        env_path = Path(args.env_file).expanduser().resolve()
+    else:
+        # Keep the default anchored to the logical checkout root. On macOS,
+        # resolving temp/project paths can rewrite /var to /private/var, which
+        # is harmless for I/O but makes launcher provenance and tests brittle.
+        env_path = PROJECT_ROOT / ".env"
     if args.env_file and not env_path.exists():
         raise SystemExit(f"env file does not exist: {env_path}")
     if env_path.exists():
