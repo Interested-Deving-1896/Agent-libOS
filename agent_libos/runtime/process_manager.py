@@ -218,6 +218,7 @@ class ProcessManager:
         resource_budget: ResourceBudget | dict[str, Any] | None = None,
         image: str | None = None,
         working_directory: str | None = None,
+        initial_status: ProcessStatus | str = ProcessStatus.RUNNABLE,
     ) -> str:
         parent_proc = self._get(parent)
         if parent_proc.status in self.TERMINAL_STATUSES:
@@ -226,6 +227,9 @@ class ProcessManager:
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
         selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
+        selected_initial_status = ProcessStatus(initial_status)
+        if selected_initial_status in self.TERMINAL_STATUSES:
+            raise ProcessError(f"spawn_child initial_status cannot be terminal: {selected_initial_status.value}")
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
         now = utc_now()
         child_pid = new_id("pid")
@@ -256,7 +260,7 @@ class ProcessManager:
             # Object Memory view rooted only at the child goal.
             child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
             child.goal_oid = goal_handle.oid
-            child.status = ProcessStatus.RUNNABLE
+            child.status = selected_initial_status
             child.updated_at = utc_now()
             self.store.update_process(child)
             self._grant_specs(child_pid, capabilities or [], issued_by=f"process.spawn_child:{parent}")
@@ -277,6 +281,7 @@ class ProcessManager:
                     "image": child.image_id,
                     "goal_oid": goal_handle.oid,
                     "working_directory": child.working_directory,
+                    "status": child.status.value,
                 },
             )
             self.audit.record(
@@ -284,7 +289,7 @@ class ProcessManager:
                 action="process.spawn_child",
                 target=f"process:{child_pid}",
                 output_refs=[goal_handle.oid],
-                decision={"image": child.image_id, "working_directory": child.working_directory},
+                decision={"image": child.image_id, "working_directory": child.working_directory, "status": child.status.value},
             )
             self._run_after_spawn_hooks(child_pid, child.image_id)
             return child_pid
@@ -373,6 +378,7 @@ class ProcessManager:
         result_handle = None
         if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
             oid = child_proc.status_message.split(":", 1)[1]
+            self.memory.preserve_process_owned(child, {oid})
             result_handle = self.capabilities.handle_for_object(
                 pid,
                 oid,
@@ -461,12 +467,19 @@ class ProcessManager:
         parent = self._get(pid)
         for handle in result.merged_handles:
             self._add_handle_to_process_view(parent, handle)
+        adopted = self.memory.adopt_process_owned(child, pid, result.merged_oids)
+        released = self.memory.release_process_owned(child)
         self.audit.record(
             actor=pid,
             action="process.merge_child_memory",
             target=f"process:{child}",
             output_refs=result.merged_oids,
-            decision={"merged": len(result.merged_oids), "skipped": result.skipped_oids},
+            decision={
+                "merged": len(result.merged_oids),
+                "skipped": result.skipped_oids,
+                "adopted": adopted,
+                "released_child_owned": released,
+            },
         )
         return result
 
@@ -499,6 +512,7 @@ class ProcessManager:
         self.store.update_process(proc)
         if proc.status in self.TERMINAL_STATUSES:
             self._release_child_budget(proc.pid)
+            self._finalize_process_memory(proc, preserve_oids=set())
         self.events.emit(
             EventType.PROCESS_SIGNAL,
             source=actor,
@@ -541,10 +555,23 @@ class ProcessManager:
             output_refs=[result.oid] if result else [],
             decision={"status": process.status.value, "message": message},
         )
-        # Reclaim volatile Object Memory owned by this process after its final
-        # state has been recorded.
-        self.memory.release_process_owned(pid, preserve_oids={result.oid} if result is not None else set())
+        self._finalize_process_memory(process, preserve_oids={result.oid} if result is not None else set())
         self._wake_parent_waiting_on_child(process)
+
+    def _finalize_process_memory(self, process: AgentProcess, preserve_oids: set[str]) -> None:
+        self._release_terminal_child_memory(process.pid, preserve_oids=preserve_oids)
+        if process.parent_pid is None:
+            # Root process-owned memory is volatile and is reclaimed immediately.
+            # Child process memory is held until the parent can merge or discard
+            # it, so merge_child_memory remains meaningful after child exit.
+            self.memory.release_process_owned(process.pid, preserve_oids=preserve_oids)
+
+    def _release_terminal_child_memory(self, pid: str, preserve_oids: set[str]) -> None:
+        for child in self.store.list_processes():
+            if child.parent_pid != pid or child.status not in self.TERMINAL_STATUSES:
+                continue
+            self._release_terminal_child_memory(child.pid, preserve_oids=preserve_oids)
+            self.memory.release_process_owned(child.pid, preserve_oids=preserve_oids)
 
     def get(self, pid: str) -> AgentProcess:
         return self._get(pid)

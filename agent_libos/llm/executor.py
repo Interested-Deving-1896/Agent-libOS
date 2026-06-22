@@ -92,6 +92,7 @@ class LLMProcessExecutor:
             source_view,
             policy=image.context_policy,
             budget_tokens=process.resource_budget.max_context_materialization_tokens,
+            charge_resources=False,
         )
         events = [
             replace(
@@ -114,15 +115,25 @@ class LLMProcessExecutor:
             loaded_skills=self.runtime.tools.model_loaded_skills(pid),
         )
         skills = self.runtime.skills.prompt_context(pid)
-        context = self.context_memory.prepare(
-            pid=pid,
-            image=image,
-            process=prompt_process,
-            source_context=source_context,
-            events=events,
-            capabilities=capabilities,
-            tools=tools,
-        )
+        try:
+            context = self.context_memory.prepare(
+                pid=pid,
+                image=image,
+                process=prompt_process,
+                source_context=source_context,
+                events=events,
+                capabilities=capabilities,
+                tools=tools,
+            )
+        except ResourceLimitExceeded as exc:
+            self.runtime.resources.kill_if_exceeded(pid, reason=str(exc))
+            self.runtime.audit.record(
+                actor=pid,
+                action="llm.resource_limit_exceeded",
+                target=f"process:{pid}",
+                decision={"error": str(exc)},
+            )
+            return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
         messages = [
             {"role": "system", "content": build_system_prompt(image)},
             {

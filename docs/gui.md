@@ -169,6 +169,12 @@ Important endpoints:
 - `POST /api/processes`
 - `POST /api/processes/{pid}/run|step|pause|resume|signal|message|interrupt|cd|exec|exit`
 - `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`
+- `GET /api/object-tasks`, `POST /api/object-tasks/start`,
+  `GET /api/object-tasks/{task_id}`, and
+  `POST /api/object-tasks/{task_id}/cancel|wait|watch-owner`
+  (`POST /api/object-tasks/start` accepts `owner_watch`, `watch_events`,
+  `watch_channel`, and `watch_kind` for owner-change runner messages; the
+  `watch-owner` endpoint updates the same fields for an active task.)
 - `POST /api/human-requests/{request_id}/respond`
 - `GET/POST /api/checkpoints`, `/api/skills`, `/api/capabilities`,
   `/api/images`, `/api/jsonrpc`, and `/api/modules`

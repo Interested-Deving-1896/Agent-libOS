@@ -47,6 +47,30 @@ returned as explicit waiting results so the caller can resume through the
 normal runtime mechanisms. If the tool itself performs `process.exit` or
 `process.exec`, the workflow runner leaves that lifecycle decision intact.
 
+## Object Task Entry Point
+
+Object tasks let an AgentObject hold asynchronous tool work. `start_object_task`
+creates a host-managed runner child process, narrows that runner's process tool
+table to the requested visible tool, and calls the tool through ToolBroker. The
+runner is excluded from the LLM scheduler even if a message wakes it back to a
+`RUNNABLE` process status, and it does not grant external authority unless the
+creator explicitly delegates capabilities into the runner.
+
+Successful tasks create the usual tool result object and link the owner object
+to that result with `PRODUCED`. Notifications are ordinary process messages
+from `object_task:<task_id>` on the `object-task` channel by default, with
+`normal` or `interrupt` kind. The `result_oid` in a notification is only a
+reference; it is not an object capability.
+
+When `owner_watch` is enabled, Object Memory `updated` and outgoing `linked`
+events on the owner object are delivered to the runner process as ordinary
+process messages, on `object-task-owner` by default. The notice is produced by
+the Object Memory primitive after the change is committed and audited, includes
+only ids/version/link metadata, and may resume a task that is blocked in
+`receive_process_messages`; it does not run the LLM scheduler. Tools that block
+after non-trivial side effects are not automatically replayed on owner-watch
+messages unless they are explicitly known to be safe.
+
 ## Writing Python Tools
 
 Python tools should not directly access host resources. Use this pattern:

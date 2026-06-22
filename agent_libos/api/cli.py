@@ -75,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("tools", help="Print registered tools")
     workflow_parser = sub.add_parser("workflow", help="Run a user-facing workflow tool directly")
     _add_workflow_parser_args(workflow_parser)
+    object_task_parser = sub.add_parser("object-task", help="Start, inspect, wait for, or cancel Object tasks")
+    _add_object_task_parser_args(object_task_parser)
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image", default=_RUNTIME_DEFAULTS.default_image_id)
     spawn_parser.add_argument("--goal", required=True)
@@ -162,6 +164,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(to_jsonable(result))
             if not result.ok:
                 raise SystemExit(1)
+        elif args.command == "object-task":
+            _print_json(_run_object_task_command(runtime, args))
         elif args.command == "spawn":
             pid = runtime.process.spawn(image=args.image, goal=args.goal)
             _print_json({"pid": pid, "image": args.image, "goal": args.goal})
@@ -232,6 +236,184 @@ def _run_workflow_command(runtime: Runtime, args: argparse.Namespace) -> Any:
         goal=args.goal,
         working_directory=args.working_directory,
     )
+
+
+def _add_object_task_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="object_task_command", required=True)
+    start = sub.add_parser("start", help="Start an Object-bound tool task")
+    start.add_argument("--pid", required=True, help="Creator process id.")
+    owner = start.add_mutually_exclusive_group(required=True)
+    owner.add_argument("--owner-oid", help="Owner object id.")
+    owner.add_argument("--owner-name", help="Owner object name in the selected namespace.")
+    start.add_argument("--namespace", help="Namespace for --owner-name.")
+    start.add_argument("tool", help="Visible tool to run.")
+    start.add_argument("--args-json", default="{}", help="JSON object passed as tool arguments.")
+    start.add_argument("--notify-pid", help="Process to notify; defaults to --pid.")
+    start.add_argument(
+        "--notify-kind",
+        choices=[kind.value for kind in ProcessMessageKind],
+        default=ProcessMessageKind.NORMAL.value,
+    )
+    start.add_argument("--notify-channel", help="Process-message channel; defaults to object-task.")
+    start.add_argument(
+        "--watch-owner",
+        action="store_true",
+        help="Notify the runner process when the owner object is updated or linked.",
+    )
+    start.add_argument(
+        "--watch-events",
+        action="append",
+        default=[],
+        help="Owner events to watch, comma-separated or repeated. Defaults to updated,linked when --watch-owner is set.",
+    )
+    start.add_argument("--watch-channel", help="Runner message channel for owner-watch notices; defaults to object-task-owner.")
+    start.add_argument(
+        "--watch-kind",
+        choices=[kind.value for kind in ProcessMessageKind],
+        default=ProcessMessageKind.NORMAL.value,
+    )
+    start.add_argument(
+        "--grant-result-to-notify",
+        action="store_true",
+        help="Try to grant result read authority to notify pid; requires object grant authority.",
+    )
+    start.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait until the task reaches a terminal or explicit waiting state before printing.",
+    )
+    start.add_argument("--timeout", type=float, help="Optional wait timeout in seconds.")
+
+    get = sub.add_parser("get", help="Inspect an Object task")
+    get.add_argument("task_id")
+    get.add_argument("--pid", help="Actor process id for visibility checks.")
+
+    list_parser = sub.add_parser("list", help="List Object tasks")
+    list_parser.add_argument("--pid", help="Actor process id for visibility checks.")
+    list_parser.add_argument("--owner-oid", help="Filter by owner object id.")
+    list_parser.add_argument("--active", action="store_true", help="Only include non-terminal tasks.")
+    list_parser.add_argument("--limit", type=int)
+
+    cancel = sub.add_parser("cancel", help="Cancel an Object task")
+    cancel.add_argument("task_id")
+    cancel.add_argument("--pid", required=True, help="Actor process id.")
+    cancel.add_argument("--reason")
+
+    wait = sub.add_parser("wait", help="Wait for an Object task to finish or enter an explicit waiting state")
+    wait.add_argument("task_id")
+    wait.add_argument("--pid", help="Actor process id for visibility checks.")
+    wait.add_argument("--timeout", type=float)
+
+    watch = sub.add_parser("watch-owner", help="Enable, disable, or update owner-change notices for an Object task")
+    watch.add_argument("task_id")
+    watch.add_argument("--pid", required=True, help="Actor process id.")
+    watch.add_argument("--disable", action="store_true", help="Disable owner-change notices.")
+    watch.add_argument(
+        "--watch-events",
+        action="append",
+        default=[],
+        help="Owner events to watch, comma-separated or repeated.",
+    )
+    watch.add_argument("--watch-channel", help="Runner message channel for owner-watch notices.")
+    watch.add_argument(
+        "--watch-kind",
+        choices=[kind.value for kind in ProcessMessageKind],
+        default=None,
+    )
+
+
+def _run_object_task_command(runtime: Runtime, args: argparse.Namespace) -> Any:
+    command = args.object_task_command
+    if command == "start":
+        owner = _object_task_owner_handle(runtime, args.pid, args.owner_oid, args.owner_name, args.namespace)
+        task = runtime.object_tasks.start(
+            args.pid,
+            owner,
+            args.tool,
+            _parse_json_mapping(args.args_json, "--args-json"),
+            notify_pid=args.notify_pid,
+            notify_kind=args.notify_kind,
+            notify_channel=args.notify_channel,
+            grant_result_to_notify=args.grant_result_to_notify,
+            owner_watch=_object_task_owner_watch_args(args),
+        )
+        if args.wait:
+            task = runtime.object_tasks.wait(task.task_id, actor_pid=args.pid, timeout=args.timeout)
+        return to_jsonable(task)
+    if command == "get":
+        return to_jsonable(runtime.object_tasks.get(args.task_id, actor_pid=args.pid))
+    if command == "list":
+        return to_jsonable(
+            runtime.object_tasks.list(
+                actor_pid=args.pid,
+                owner_oid=args.owner_oid,
+                include_terminal=not args.active,
+                limit=args.limit,
+            )
+        )
+    if command == "cancel":
+        return to_jsonable(runtime.object_tasks.cancel(args.task_id, actor_pid=args.pid, reason=args.reason))
+    if command == "wait":
+        return to_jsonable(runtime.object_tasks.wait(args.task_id, actor_pid=args.pid, timeout=args.timeout))
+    if command == "watch-owner":
+        events = _parse_csv_values(args.watch_events)
+        return to_jsonable(
+            runtime.object_tasks.watch_owner(
+                args.task_id,
+                actor_pid=args.pid,
+                enabled=not args.disable,
+                events=events or None,
+                channel=args.watch_channel,
+                kind=args.watch_kind,
+            )
+        )
+    raise SystemExit(f"unknown object-task command: {command}")
+
+
+def _object_task_owner_handle(
+    runtime: Runtime,
+    pid: str,
+    owner_oid: str | None,
+    owner_name: str | None,
+    namespace: str | None,
+) -> ObjectHandle:
+    if owner_oid:
+        return runtime.memory.handle_for_oid(
+            pid,
+            owner_oid,
+            required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+        )
+    if owner_name:
+        return runtime.memory.handle_for_name(
+            pid,
+            owner_name,
+            rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+            namespace=namespace,
+        )
+    raise SystemExit("either --owner-oid or --owner-name is required")
+
+
+def _object_task_owner_watch_args(args: argparse.Namespace) -> dict[str, Any] | bool:
+    events = _parse_csv_values(args.watch_events)
+    enabled = bool(args.watch_owner or events or args.watch_channel or args.watch_kind != ProcessMessageKind.NORMAL.value)
+    if not enabled:
+        return False
+    selected: dict[str, Any] = {"enabled": True, "kind": args.watch_kind}
+    if events:
+        selected["events"] = events
+    if args.watch_channel:
+        selected["channel"] = args.watch_channel
+    return selected
+
+
+def _parse_csv_values(values: list[str]) -> list[str]:
+    parsed: list[str] = []
+    for value in values:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item:
+                parsed.append(item)
+    return parsed
 
 
 def _run_cd_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:

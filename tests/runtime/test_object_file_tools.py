@@ -1,10 +1,13 @@
 from __future__ import annotations
 import pytest
 import json
+from dataclasses import replace
 from uuid import uuid4
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.tools.observability import json_size_bytes
 
 class TestObjectFileTool:
 
@@ -91,6 +94,46 @@ class TestObjectFileTool:
         context = self.runtime.memory.materialize_context(pid, view, budget_tokens=1)
         assert oid in context.omitted_objects
         assert sentinel not in context.text
+
+    def test_create_object_from_file_enforces_memory_payload_limit_before_create_and_can_truncate(self) -> None:
+        self.runtime.close()
+        limit = 1_200
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                memory_payload_hard_limit_bytes=limit,
+                object_file_max_bytes=2_000,
+                object_file_hard_limit_bytes=2_000,
+            ),
+        )
+        self.runtime = Runtime.open('local', config=config)
+        source = f'agent_outputs/object_large_source_{uuid4().hex}.txt'
+        source_path = self.runtime.workspace_root / source
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text('x' * 1_500, encoding='utf-8')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='import bounded file')
+        self.runtime.filesystem.grant_path(pid, source, [CapabilityRight.READ], issued_by='test')
+
+        failed = self.runtime.tools.call(
+            pid,
+            'create_object_from_file',
+            {'name': 'large.no.truncate', 'path': source, 'max_bytes': 1_500},
+        )
+        truncated = self.runtime.tools.call(
+            pid,
+            'create_object_from_file',
+            {'name': 'large.truncated', 'path': source, 'max_bytes': 1_500, 'allow_truncated': True},
+        )
+
+        assert not failed.ok
+        assert 'payload limit' in (failed.error or '')
+        assert truncated.ok, truncated.error
+        assert truncated.payload['truncated'] is True
+        obj = self.runtime.store.get_object(truncated.payload['oid'])
+        assert obj.payload['truncated'] is True
+        assert len(obj.payload['content']) < 1_500
+        assert json_size_bytes(obj.payload) <= limit
 
 class GuardedActionClient:
 

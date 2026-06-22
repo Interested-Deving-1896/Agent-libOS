@@ -1,4 +1,4 @@
-import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
+import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
 
 type JsonBody = Record<string, unknown>;
 export type OptionalQuanta = number | null;
@@ -107,6 +107,111 @@ export class LibOSClient {
       ...(image ? { image } : {}),
       ...(goal ? { goal } : {}),
       ...(workingDirectory ? { working_directory: workingDirectory } : {})
+    });
+  }
+
+  async listObjectTasks(params: { pid?: string; ownerOid?: string; active?: boolean; limit?: number } = {}) {
+    const query = new URLSearchParams();
+    if (params.pid) query.set("pid", params.pid);
+    if (params.ownerOid) query.set("owner_oid", params.ownerOid);
+    if (params.active) query.set("active", "true");
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return this.request<ObjectTask[]>("GET", `/api/object-tasks${suffix}`);
+  }
+
+  async startObjectTask({
+    pid,
+    ownerOid,
+    ownerName,
+    namespace,
+    tool,
+    args = {},
+    notifyPid,
+    notifyKind,
+    notifyChannel,
+    inheritCapabilities = [],
+    grantResultToNotify = false,
+    ownerWatch = false,
+    watchEvents = [],
+    watchChannel,
+    watchKind
+  }: {
+    pid: string;
+    ownerOid?: string;
+    ownerName?: string;
+    namespace?: string;
+    tool: string;
+    args?: Record<string, unknown>;
+    notifyPid?: string;
+    notifyKind?: "normal" | "interrupt";
+    notifyChannel?: string;
+    inheritCapabilities?: Record<string, unknown>[];
+    grantResultToNotify?: boolean;
+    ownerWatch?: boolean;
+    watchEvents?: string[];
+    watchChannel?: string;
+    watchKind?: "normal" | "interrupt";
+  }) {
+    return this.request<ObjectTask>("POST", "/api/object-tasks/start", {
+      pid,
+      ...(ownerOid ? { owner_oid: ownerOid } : {}),
+      ...(ownerName ? { owner_name: ownerName } : {}),
+      ...(namespace ? { namespace } : {}),
+      tool,
+      args,
+      ...(notifyPid ? { notify_pid: notifyPid } : {}),
+      ...(notifyKind ? { notify_kind: notifyKind } : {}),
+      ...(notifyChannel ? { notify_channel: notifyChannel } : {}),
+      inherit_capabilities: inheritCapabilities,
+      grant_result_to_notify: grantResultToNotify,
+      owner_watch: ownerWatch,
+      ...(watchEvents.length ? { watch_events: watchEvents } : {}),
+      ...(watchChannel ? { watch_channel: watchChannel } : {}),
+      ...(watchKind ? { watch_kind: watchKind } : {})
+    });
+  }
+
+  async getObjectTask(taskId: string, pid?: string) {
+    const query = pid ? `?pid=${encodeURIComponent(pid)}` : "";
+    return this.request<ObjectTask>("GET", `/api/object-tasks/${encodeURIComponent(taskId)}${query}`);
+  }
+
+  async cancelObjectTask(taskId: string, pid: string, reason?: string) {
+    return this.request<ObjectTask>("POST", `/api/object-tasks/${encodeURIComponent(taskId)}/cancel`, {
+      pid,
+      ...(reason ? { reason } : {})
+    });
+  }
+
+  async waitObjectTask(taskId: string, pid?: string, timeoutS?: number) {
+    return this.request<ObjectTask>("POST", `/api/object-tasks/${encodeURIComponent(taskId)}/wait`, {
+      ...(pid ? { pid } : {}),
+      ...(timeoutS !== undefined ? { timeout_s: timeoutS } : {})
+    });
+  }
+
+  async watchObjectTaskOwner({
+    taskId,
+    pid,
+    enabled = true,
+    watchEvents,
+    watchChannel,
+    watchKind
+  }: {
+    taskId: string;
+    pid: string;
+    enabled?: boolean;
+    watchEvents?: string[];
+    watchChannel?: string;
+    watchKind?: "normal" | "interrupt";
+  }) {
+    return this.request<ObjectTask>("POST", `/api/object-tasks/${encodeURIComponent(taskId)}/watch-owner`, {
+      pid,
+      enabled,
+      ...(watchEvents ? { watch_events: watchEvents } : {}),
+      ...(watchChannel ? { watch_channel: watchChannel } : {}),
+      ...(watchKind ? { watch_kind: watchKind } : {})
     });
   }
 

@@ -124,6 +124,25 @@ export type WorkflowRunResult = {
   filters: Record<string, unknown> | null;
 };
 
+export type ObjectTask = {
+  task_id: string;
+  owner_oid: string;
+  creator_pid: string;
+  runner_pid: string | null;
+  tool: string;
+  tool_id: string | null;
+  status: string;
+  notification: Record<string, unknown>;
+  owner_watch: Record<string, unknown>;
+  result_oid: string | null;
+  error: string | null;
+  wait: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+};
+
 export type ImageSummary = {
   image_id: string;
   name: string;
@@ -173,6 +192,7 @@ export type RuntimeSnapshot = {
   events: RuntimeEvent[];
   audit: AuditRecord[];
   llm_calls: LlmCall[];
+  object_tasks: ObjectTask[];
   tools: ToolSummary[];
   images: ImageSummary[];
   skills: Record<string, unknown>[];

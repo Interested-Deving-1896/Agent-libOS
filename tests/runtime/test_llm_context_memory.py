@@ -21,6 +21,7 @@ from agent_libos.models import (
     ObjectType,
     PROMPT_MODE_LIBOS_DEFAULT,
     ProcessStatus,
+    ResourceBudget,
     ViewMode,
 )
 from tests.support.fakes import FakeDenoSandbox, RecordingActionClient
@@ -68,6 +69,27 @@ class TestLLMContextMemory:
             kinds = [entry['kind'] for entry in context.payload['entries']]
             assert 'memory_delta' in kinds
             assert len(second) > len(first)
+        finally:
+            runtime.close()
+
+    def test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([{'action': 'process_exit', 'payload': {'should_not_run': True}}])
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='budget context before model call',
+                resource_budget=ResourceBudget(
+                    max_context_materialization_tokens=100_000,
+                    max_context_materialization_total_tokens=1,
+                ),
+            )
+
+            result = runtime.run_next_process_once()
+
+            assert result['resource_limit_exceeded']
+            assert runtime.llm.client.tool_batches == []
+            assert runtime.process.get(pid).status == ProcessStatus.KILLED
         finally:
             runtime.close()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from reprlib import Repr
+from collections.abc import Callable
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
@@ -28,6 +29,7 @@ from agent_libos.models import (
     Provenance,
     RelationType,
     ResourceUsage,
+    UNSET,
     ViewMode,
     AgentObject,
 )
@@ -55,6 +57,14 @@ class ObjectMemoryManager:
         self.audit = audit
         self.events = events
         self.resources = resources
+        self._object_pin_checker: Callable[[str], bool] | None = None
+        self._object_change_notifier: Callable[[str, dict[str, Any], str], None] | None = None
+
+    def bind_object_pin_checker(self, checker: Callable[[str], bool] | None) -> None:
+        self._object_pin_checker = checker
+
+    def bind_object_change_notifier(self, notifier: Callable[[str, dict[str, Any], str], None] | None) -> None:
+        self._object_change_notifier = notifier
 
     def create_object(
         self,
@@ -313,8 +323,7 @@ class ObjectMemoryManager:
             issued_by=issued_by,
             uses_remaining=1 if one_time else None,
         )
-        for decision in decisions:
-            self._consume_one_time_decision(decision)
+        self._consume_one_time_decisions(decisions)
         self.audit.record(
             actor=pid,
             action="memory.handle_for_name",
@@ -382,17 +391,29 @@ class ObjectMemoryManager:
         if next_namespace != current.namespace or next_name != current.name:
             namespace_decisions.append(self._require_namespace_right(pid, current.namespace, "write"))
             self._require_unique_name(next_name, next_namespace, except_oid=current.oid)
-        if patch.payload is not None:
+        payload_is_set = patch.payload is not UNSET
+        if payload_is_set:
             self._validate_payload_size(patch.payload, "object payload")
-        next_payload = current.payload if patch.payload is None else patch.payload
+        next_payload = current.payload if not payload_is_set else patch.payload
         if patch.metadata is None:
             next_metadata = (
                 current.metadata
-                if patch.payload is None
+                if not payload_is_set
                 else self._metadata_for_payload(next_payload, current.metadata, force_token_estimate=True)
             )
         else:
             next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
+        changed_fields: list[str] = []
+        if payload_is_set:
+            changed_fields.append("payload")
+        if patch.metadata is not None:
+            changed_fields.append("metadata")
+        if patch.provenance is not None:
+            changed_fields.append("provenance")
+        if next_namespace != current.namespace:
+            changed_fields.append("namespace")
+        if next_name != current.name:
+            changed_fields.append("name")
         updated = replace(
             current,
             namespace=next_namespace,
@@ -404,7 +425,7 @@ class ObjectMemoryManager:
             updated_at=utc_now(),
         )
         self.store.update_object(updated)
-        self.events.emit(
+        event = self.events.emit(
             EventType.OBJECT_UPDATED,
             source=pid,
             target=pid,
@@ -426,6 +447,16 @@ class ObjectMemoryManager:
             decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
         )
         self._consume_one_time_decisions(namespace_decisions)
+        self._notify_object_changed(
+            updated.oid,
+            {
+                "event": "updated",
+                "event_id": event.event_id,
+                "version": updated.version,
+                "change": {"operation": "patch", "fields": sorted(changed_fields)},
+            },
+            pid,
+        )
         return handle
 
     def append_object_by_name(
@@ -478,7 +509,7 @@ class ObjectMemoryManager:
         )
         self.store.update_object(updated)
         self._consume_one_time_decisions(decisions)
-        self.events.emit(
+        event = self.events.emit(
             EventType.OBJECT_UPDATED,
             source=pid,
             target=pid,
@@ -508,6 +539,20 @@ class ObjectMemoryManager:
             },
         )
         self._consume_one_time_decision(namespace_decision)
+        self._notify_object_changed(
+            updated.oid,
+            {
+                "event": "updated",
+                "event_id": event.event_id,
+                "version": updated.version,
+                "change": {
+                    "operation": "append",
+                    "list_field": output_list_field,
+                    "length": length,
+                },
+            },
+            pid,
+        )
         return updated, output_list_field, length
 
     def link_objects(
@@ -530,7 +575,7 @@ class ObjectMemoryManager:
             created_at=utc_now(),
         )
         self.store.insert_link(link)
-        self.events.emit(
+        event = self.events.emit(
             EventType.OBJECT_LINKED,
             source=pid,
             target=pid,
@@ -543,6 +588,72 @@ class ObjectMemoryManager:
             input_refs=[src.oid, dst.oid],
             capability_refs=[src.capability_id, dst.capability_id],
             decision={"relation": link.relation.value},
+        )
+        updated_src = self.store.get_object(src.oid)
+        self._notify_object_changed(
+            src.oid,
+            {
+                "event": "linked",
+                "event_id": event.event_id,
+                "version": updated_src.version if updated_src is not None else None,
+                "relation": link.relation.value,
+                "dst_oid": dst.oid,
+                "link_id": link.link_id,
+                "change": {"operation": "link"},
+            },
+            pid,
+        )
+
+    def link_objects_trusted(
+        self,
+        actor: str,
+        src_oid: str,
+        relation: RelationType | str,
+        dst_oid: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        reason: str,
+    ) -> None:
+        if self.store.get_object(src_oid) is None:
+            raise NotFound(f"object not found: {src_oid}")
+        if self.store.get_object(dst_oid) is None:
+            raise NotFound(f"object not found: {dst_oid}")
+        link = ObjectLink(
+            link_id=new_id("lnk"),
+            src=src_oid,
+            relation=RelationType(relation),
+            dst=dst_oid,
+            metadata=metadata or {},
+            created_by=actor,
+            created_at=utc_now(),
+        )
+        self.store.insert_link(link)
+        event = self.events.emit(
+            EventType.OBJECT_LINKED,
+            source=actor,
+            target=actor,
+            payload={"src": src_oid, "relation": link.relation.value, "dst": dst_oid},
+        )
+        self.audit.record(
+            actor=actor,
+            action="memory.link_objects_trusted",
+            target=f"object:{src_oid}",
+            input_refs=[src_oid, dst_oid],
+            decision={"relation": link.relation.value, "reason": reason},
+        )
+        updated_src = self.store.get_object(src_oid)
+        self._notify_object_changed(
+            src_oid,
+            {
+                "event": "linked",
+                "event_id": event.event_id,
+                "version": updated_src.version if updated_src is not None else None,
+                "relation": link.relation.value,
+                "dst_oid": dst_oid,
+                "link_id": link.link_id,
+                "change": {"operation": "link"},
+            },
+            actor,
         )
 
     def query_objects(self, pid: str, query: ObjectQuery) -> list[ObjectHandle]:
@@ -747,10 +858,11 @@ class ObjectMemoryManager:
         preserve = set(preserve_oids or set())
         released: list[str] = []
         for oid in self.store.list_object_oids_created_by(pid):
+            if self._is_object_pinned(oid):
+                preserve.add(oid)
+                continue
             if oid in preserve:
-                obj = self.store.get_object(oid)
-                if obj is not None:
-                    self.store.update_object(replace(obj, created_by=f"process_result:{pid}"))
+                self.preserve_process_owned(pid, {oid})
                 continue
             self.store.delete_object(oid)
             released.append(oid)
@@ -765,12 +877,70 @@ class ObjectMemoryManager:
             )
         return released
 
+    def _is_object_pinned(self, oid: str) -> bool:
+        if self._object_pin_checker is None:
+            return False
+        return bool(self._object_pin_checker(oid))
+
+    def _notify_object_changed(self, oid: str, change: dict[str, Any], actor_pid: str) -> None:
+        if self._object_change_notifier is None:
+            return
+        try:
+            self._object_change_notifier(oid, change, actor_pid)
+        except Exception as exc:
+            self.audit.record(
+                actor="memory",
+                action="memory.object_change_notify_failed",
+                target=f"object:{oid}",
+                input_refs=[oid],
+                decision={"actor_pid": actor_pid, "change": change, "error": str(exc)},
+            )
+
+    def preserve_process_owned(self, pid: str, oids: Iterable[str]) -> list[str]:
+        preserved: list[str] = []
+        for oid in sorted(set(oids)):
+            obj = self.store.get_object(oid)
+            if obj is None or obj.created_by != pid:
+                continue
+            self.store.update_object(replace(obj, created_by=f"process_result:{pid}"))
+            preserved.append(oid)
+        if preserved:
+            self.audit.record(
+                actor="memory",
+                action="memory.preserve_process_owned",
+                target=f"process:{pid}",
+                input_refs=preserved,
+                output_refs=preserved,
+                decision={"pid": pid, "preserved": preserved},
+            )
+        return preserved
+
+    def adopt_process_owned(self, from_pid: str, to_pid: str, oids: Iterable[str]) -> list[str]:
+        adopted: list[str] = []
+        for oid in sorted(set(oids)):
+            obj = self.store.get_object(oid)
+            if obj is None or obj.created_by != from_pid:
+                continue
+            self.store.update_object(replace(obj, created_by=to_pid))
+            adopted.append(oid)
+        if adopted:
+            self.audit.record(
+                actor="memory",
+                action="memory.adopt_process_owned",
+                target=f"process:{from_pid}",
+                input_refs=adopted,
+                output_refs=adopted,
+                decision={"from_pid": from_pid, "to_pid": to_pid, "adopted": adopted},
+            )
+        return adopted
+
     def materialize_context(
         self,
         pid: str,
         view: MemoryView,
         policy: str | None = None,
         budget_tokens: int | None = None,
+        charge_resources: bool = True,
     ) -> MaterializedContext:
         selected_policy = policy or self.config.memory.context_policy
         selected_budget = budget_tokens if budget_tokens is not None else self.config.memory.materialize_budget_tokens
@@ -786,11 +956,17 @@ class ObjectMemoryManager:
                 selected_budget = min(selected_budget, max(0, int(remaining)))
         objects: list[AgentObject] = []
         omitted: list[str] = []
+        filtered: list[str] = []
         for handle in view.roots:
             try:
                 self.capabilities.assert_handle(pid, handle, ObjectRight.MATERIALIZE)
                 obj = self.store.get_object(handle.oid)
-                if obj is not None:
+                if obj is None:
+                    continue
+                if not self._matches_view_filters(obj, view.filters):
+                    omitted.append(obj.oid)
+                    filtered.append(obj.oid)
+                else:
                     objects.append(obj)
             except CapabilityDenied:
                 omitted.append(handle.oid)
@@ -820,9 +996,15 @@ class ObjectMemoryManager:
             target=f"view:{view.view_id}",
             input_refs=[handle.oid for handle in view.roots],
             output_refs=refs,
-            decision={"tokens": total, "omitted": omitted, "policy": selected_policy},
+            decision={
+                "tokens": total,
+                "omitted": omitted,
+                "filtered": filtered,
+                "policy": selected_policy,
+                "charged": charge_resources,
+            },
         )
-        if resources is not None:
+        if resources is not None and charge_resources:
             resources.charge(
                 pid,
                 ResourceUsage(context_materialized_tokens=total),
@@ -832,6 +1014,20 @@ class ObjectMemoryManager:
                 kill_on_exceed=False,
             )
         return context
+
+    def _matches_view_filters(self, obj: AgentObject, filters: list[ObjectFilter]) -> bool:
+        if not filters:
+            return True
+        return any(self._matches_filter(obj, item) for item in filters)
+
+    def _matches_filter(self, obj: AgentObject, item: ObjectFilter) -> bool:
+        if item.type is not None and obj.type != ObjectType(item.type):
+            return False
+        if item.tags and not set(item.tags).issubset(set(obj.metadata.tags)):
+            return False
+        if item.text and item.text.lower() not in self._search_text(obj).lower():
+            return False
+        return True
 
     def _search_text(self, obj: AgentObject) -> str:
         payload_preview = self._bounded_payload_repr(obj.payload)

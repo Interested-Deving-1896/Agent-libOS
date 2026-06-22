@@ -178,6 +178,7 @@ function userPageSnapshot(): RuntimeSnapshot {
     events: [],
     audit: [],
     llm_calls: [],
+    object_tasks: [],
     tools: [],
     images: [],
     skills: [],

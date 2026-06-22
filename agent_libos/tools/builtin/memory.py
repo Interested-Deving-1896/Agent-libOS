@@ -115,7 +115,12 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
     )
     args_schema = CreateMemoryObjectArgs
     output_schema = CreateMemoryObjectOutput
-    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object"]
 
     def run(self, args: CreateMemoryObjectArgs, ctx: ToolContext) -> CreateMemoryObjectOutput:

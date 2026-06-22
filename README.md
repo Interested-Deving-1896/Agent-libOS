@@ -41,6 +41,9 @@ The implementation currently includes:
 - Async runtime supervision through `Runtime.arun_until_idle()`.
 - Process-local working directories for filesystem and shell operations.
 - Durable process message queues for IPC, including interrupt delivery.
+- Object-bound background tool tasks that can notify processes through the
+  same durable message queues, including optional owner-change watches, without
+  exposing their runner child processes to the LLM scheduler.
 - Human queue integration for ordinary questions and per-use approval.
 - Process-private Object Memory namespaces by default, with explicit shared
   namespaces available through capabilities.

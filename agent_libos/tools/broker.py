@@ -41,7 +41,7 @@ from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
-from agent_libos.tools.base import BaseAgentTool, ToolContext
+from agent_libos.tools.base import BaseAgentTool, SyncAgentTool, ToolContext
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult
 from agent_libos.utils.serde import dumps
@@ -196,6 +196,17 @@ class ToolBroker:
             },
         )
         return handle.tool_id
+
+    def process_has_tool(self, pid: str, tool: ToolHandle | str) -> bool:
+        handle = self.resolve(tool, pid=pid)
+        return self._process_has_tool(pid, handle)
+
+    def is_sync_side_effect_tool(self, tool: ToolHandle | str) -> bool:
+        handle = self.resolve(tool)
+        implementation = self._tools.get(handle.tool_id)
+        if implementation is None:
+            return False
+        return isinstance(implementation, SyncAgentTool) and bool(implementation.spec().policy.get("side_effects"))
 
     def propose(
         self,

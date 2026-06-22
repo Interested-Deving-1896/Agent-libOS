@@ -9,6 +9,14 @@ from agent_libos.models.base import CapabilityID, MemoryViewID, NamespaceID, OID
 _MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
 
 
+class _UnsetPayload:
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _UnsetPayload()
+
+
 class ObjectType(StrEnum):
     TASK = "task"
     GOAL = "goal"
@@ -146,7 +154,7 @@ class ObjectQuery:
 class ObjectPatch:
     name: str | None = None
     namespace: NamespaceID | None = None
-    payload: Any | None = None
+    payload: Any = UNSET
     metadata: ObjectMetadata | None = None
     provenance: Provenance | None = None
 

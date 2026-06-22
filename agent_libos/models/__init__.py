@@ -68,9 +68,17 @@ from agent_libos.models.memory import (
     ObjectType,
     Provenance,
     RelationType,
+    UNSET,
     ViewMode,
 )
 from agent_libos.models.messages import ProcessMessage, ProcessMessageKind, ProcessMessageStatus
+from agent_libos.models.object_tasks import (
+    ObjectTask,
+    ObjectTaskNotification,
+    ObjectTaskNotificationStatus,
+    ObjectTaskOwnerWatch,
+    ObjectTaskStatus,
+)
 from agent_libos.models.policy import PolicyDecision
 from agent_libos.models.process import (
     AgentImage,
@@ -165,6 +173,11 @@ __all__ = [
     "ObjectPatch",
     "ObjectQuery",
     "ObjectRight",
+    "ObjectTask",
+    "ObjectTaskNotification",
+    "ObjectTaskNotificationStatus",
+    "ObjectTaskOwnerWatch",
+    "ObjectTaskStatus",
     "ObjectType",
     "OperationContext",
     "PID",
@@ -182,6 +195,7 @@ __all__ = [
     "ProcessStatus",
     "Provenance",
     "RelationType",
+    "UNSET",
     "ResourceBudget",
     "ResourceReservation",
     "ResourceUsage",

@@ -30,6 +30,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   namespaces do not bypass object capabilities.
 - `object-memory-materialization-budget-is-authoritative`: Object Memory
   context materialization uses current payload token estimates.
+- `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
+  remains mergeable, then is adopted or released by the parent lifecycle.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, consume one-shot grants, and route through primitives.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
@@ -53,6 +55,13 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `workflow-entry-uses-toolbroker-authority`: user-facing workflow entrypoints
   run tools through process tool tables, ToolBroker, result objects, and normal
   wait/exit/exec lifecycle semantics.
+- `object-task-entry-uses-toolbroker-and-object-authority`: Object-bound
+  background tasks run tools through ToolBroker, process tool tables, Object
+  capabilities, owner-watch Object Memory primitive notifications, and
+  process-message boundaries. Runner processes are host-managed and excluded
+  from the LLM scheduler; terminal/cancel reconciliation must not leave active
+  pins behind, and owner-watch resumes only replay tools with explicitly safe
+  message-receive semantics.
 - `llm-call-records-are-bounded-and-redacted`: LLM call persistence stores
   bounded preview, size, hash, and truncation metadata instead of raw prompts,
   tool arguments, reasoning, or provider responses.

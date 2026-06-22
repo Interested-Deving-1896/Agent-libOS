@@ -5,8 +5,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import ObjectMetadata, ObjectType
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.observability import ensure_json_size, json_size_bytes
 from agent_libos.utils.ids import estimate_tokens
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -105,6 +107,7 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
             "bytes_read": result.bytes_read,
             "truncated": result.truncated,
         }
+        payload = self._fit_payload_to_memory_limit(payload, args.allow_truncated, runtime.config.tools.memory_payload_hard_limit_bytes)
         handle = runtime.memory.create_object(
             pid=ctx.pid,
             object_type=ObjectType(args.object_type),
@@ -127,8 +130,54 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
             type=args.object_type,
             source_path=result.path,
             bytes_read=result.bytes_read,
-            truncated=result.truncated,
+            truncated=bool(payload["truncated"]),
         )
+
+    def _fit_payload_to_memory_limit(
+        self,
+        payload: dict[str, Any],
+        allow_truncated: bool,
+        limit_bytes: int,
+    ) -> dict[str, Any]:
+        try:
+            ensure_json_size(payload, limit_bytes, "file object payload")
+            return payload
+        except ValidationError as exc:
+            if not allow_truncated:
+                raise ToolExecutionError(
+                    "File object payload exceeded Object Memory payload limit; no object was created.",
+                    code=ToolErrorCode.EXECUTION_ERROR,
+                    details={"limit_bytes": limit_bytes, "payload_bytes": json_size_bytes(payload)},
+                ) from exc
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise ToolExecutionError(
+                "File object payload does not contain text content to truncate.",
+                code=ToolErrorCode.EXECUTION_ERROR,
+                details={"limit_bytes": limit_bytes},
+            )
+        base = dict(payload)
+        base["truncated"] = True
+        low = 0
+        high = len(content)
+        best: dict[str, Any] | None = None
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = dict(base)
+            candidate["content"] = content[:mid]
+            candidate["stored_bytes"] = len(candidate["content"].encode(str(payload.get("encoding") or "utf-8")))
+            if json_size_bytes(candidate) <= limit_bytes:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best is None:
+            raise ToolExecutionError(
+                "File object metadata alone exceeded Object Memory payload limit; no object was created.",
+                code=ToolErrorCode.EXECUTION_ERROR,
+                details={"limit_bytes": limit_bytes},
+            )
+        return best
 
 
 class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):

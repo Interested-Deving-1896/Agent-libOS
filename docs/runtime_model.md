@@ -148,7 +148,10 @@ Context materialization has both a per-call cap
 (`max_context_materialization_tokens`) and a separate cumulative budget
 (`max_context_materialization_total_tokens`). The cumulative context token
 budget is charged when Object Memory materializes prompt context and is
-accounted independently from provider-reported LLM tokens.
+accounted independently from provider-reported LLM tokens. In the LLM executor,
+the final rendered `llm_context:<pid>` prompt context is the charged unit;
+source object materialization for delta capture does not double-charge the same
+quantum, and over-budget rendered context fails closed before the model call.
 
 Shell and Deno subprocesses are run through provider-level monitors. The
 default local provider uses cross-platform process-tree sampling to enforce wall
@@ -197,6 +200,20 @@ message ids.
 
 Interrupt messages preempt before non-message tool calls until read. Normal
 messages notify after a tool call and do not block the current action.
+
+ObjectTask completion and waiting notices use the same queue. By default they
+arrive on channel `object-task` from sender `object_task:<task_id>`. A process
+can block with `receive_process_messages(channel="object-task")` and will be
+woken by matching task notifications. If the selected notification process has
+already exited, the task records `undelivered_terminal`; task success is not
+converted into failure.
+
+ObjectTask owner-watch notices also use this queue. They are addressed to the
+runner process on `object-task-owner` by default and can resume a task that is
+blocked in `receive_process_messages`; the notice contains event metadata and
+object ids, not Object Memory read authority. ObjectTask runner processes are
+host-managed and skipped by the LLM scheduler; owner-watch auto-resume is
+limited to message receive tools that are safe to replay.
 
 CLI examples:
 

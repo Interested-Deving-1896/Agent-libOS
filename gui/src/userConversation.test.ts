@@ -174,6 +174,7 @@ function snapshot(): RuntimeSnapshot {
       }
     ],
     tools: [],
+    object_tasks: [],
     images: [],
     skills: [],
     jsonrpc_endpoints: [],

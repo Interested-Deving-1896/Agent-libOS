@@ -37,6 +37,11 @@ from agent_libos.models import (
     ObjectLink,
     ObjectMetadata,
     ObjectNamespace,
+    ObjectTask,
+    ObjectTaskNotification,
+    ObjectTaskNotificationStatus,
+    ObjectTaskOwnerWatch,
+    ObjectTaskStatus,
     ObjectType,
     ProcessStatus,
     ProcessMessage,
@@ -332,6 +337,34 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_process_messages_correlation
                   ON process_messages(recipient_pid, correlation_id, status, created_at);
 
+                CREATE TABLE IF NOT EXISTS object_tasks (
+                  task_id TEXT PRIMARY KEY,
+                  owner_oid TEXT NOT NULL,
+                  creator_pid TEXT NOT NULL,
+                  runner_pid TEXT,
+                  tool TEXT NOT NULL,
+                  tool_id TEXT,
+                  status TEXT NOT NULL,
+                  notification_json TEXT NOT NULL,
+                  owner_watch_json TEXT NOT NULL,
+                  result_oid TEXT,
+                  error TEXT,
+                  wait_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  started_at TEXT,
+                  completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_object_tasks_owner_status
+                  ON object_tasks(owner_oid, status, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_object_tasks_creator_status
+                  ON object_tasks(creator_pid, status, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_object_tasks_runner
+                  ON object_tasks(runner_pid);
+
                 CREATE TABLE IF NOT EXISTS skills (
                   skill_id TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
@@ -435,6 +468,7 @@ class SQLiteStore:
             self._ensure_audit_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
+            self._ensure_object_task_schema()
             self._ensure_checkpoint_schema()
             self._ensure_external_effect_schema()
             self._ensure_skill_schema()
@@ -549,9 +583,12 @@ class SQLiteStore:
 
     def list_objects(self, namespace: str | None = None) -> list[AgentObject]:
         if namespace is None:
-            rows = self._query("SELECT * FROM objects")
+            rows = self._query("SELECT * FROM objects ORDER BY updated_at DESC, created_at DESC, oid ASC")
         else:
-            rows = self._query("SELECT * FROM objects WHERE namespace = ?", (namespace,))
+            rows = self._query(
+                "SELECT * FROM objects WHERE namespace = ? ORDER BY updated_at DESC, created_at DESC, oid ASC",
+                (namespace,),
+            )
         return [
             self._row_to_object(row)
             for row in rows
@@ -1270,6 +1307,109 @@ class SQLiteStore:
         rows = self._query(f"SELECT * FROM process_messages{where} ORDER BY created_at, message_id{limit_sql}", params)
         return [self._row_to_process_message(row) for row in rows]
 
+    def insert_object_task(self, task: ObjectTask) -> None:
+        self._execute(
+            """
+            INSERT INTO object_tasks (
+                task_id, owner_oid, creator_pid, runner_pid, tool, tool_id, status,
+                notification_json, owner_watch_json, result_oid, error, wait_json, created_at,
+                updated_at, started_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._object_task_params(task),
+        )
+
+    def update_object_task(self, task: ObjectTask) -> None:
+        self._execute(
+            """
+            UPDATE object_tasks
+                   SET owner_oid = ?, creator_pid = ?, runner_pid = ?, tool = ?, tool_id = ?,
+                   status = ?, notification_json = ?, owner_watch_json = ?, result_oid = ?, error = ?, wait_json = ?,
+                   created_at = ?, updated_at = ?, started_at = ?, completed_at = ?
+             WHERE task_id = ?
+            """,
+            (
+                task.owner_oid,
+                task.creator_pid,
+                task.runner_pid,
+                task.tool,
+                task.tool_id,
+                task.status.value,
+                dumps(task.notification),
+                dumps(task.owner_watch),
+                task.result_oid,
+                task.error,
+                dumps(task.wait),
+                task.created_at,
+                task.updated_at,
+                task.started_at,
+                task.completed_at,
+                task.task_id,
+            ),
+        )
+
+    def get_object_task(self, task_id: str) -> ObjectTask | None:
+        rows = self._query("SELECT * FROM object_tasks WHERE task_id = ?", (task_id,))
+        return self._row_to_object_task(rows[0]) if rows else None
+
+    def list_object_tasks(
+        self,
+        *,
+        owner_oid: str | None = None,
+        creator_pid: str | None = None,
+        statuses: Iterable[str | ObjectTaskStatus] | None = None,
+        include_terminal: bool = True,
+        limit: int | None = None,
+    ) -> list[ObjectTask]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if owner_oid is not None:
+            clauses.append("owner_oid = ?")
+            params.append(owner_oid)
+        if creator_pid is not None:
+            clauses.append("creator_pid = ?")
+            params.append(creator_pid)
+        if statuses is not None:
+            selected = [ObjectTaskStatus(status).value for status in statuses]
+            if not selected:
+                return []
+            clauses.append(f"status IN ({', '.join('?' for _ in selected)})")
+            params.extend(selected)
+        elif not include_terminal:
+            terminal = [
+                ObjectTaskStatus.SUCCEEDED.value,
+                ObjectTaskStatus.FAILED.value,
+                ObjectTaskStatus.CANCELLED.value,
+                ObjectTaskStatus.ABANDONED.value,
+            ]
+            clauses.append(f"status NOT IN ({', '.join('?' for _ in terminal)})")
+            params.extend(terminal)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self._query(f"SELECT * FROM object_tasks{where} ORDER BY updated_at DESC, created_at DESC, task_id ASC{limit_sql}", params)
+        return [self._row_to_object_task(row) for row in rows]
+
+    def mark_object_tasks_abandoned(self, reason: str) -> list[str]:
+        active = self.list_object_tasks(include_terminal=False)
+        if not active:
+            return []
+        now = utc_now()
+        task_ids = [task.task_id for task in active]
+        with self._lock:
+            self.conn.executemany(
+                """
+                UPDATE object_tasks
+                   SET status = ?, error = ?, updated_at = ?, completed_at = ?
+                 WHERE task_id = ?
+                """,
+                [(ObjectTaskStatus.ABANDONED.value, reason, now, now, task_id) for task_id in task_ids],
+            )
+            self.conn.commit()
+        return task_ids
+
     def insert_tool(self, handle: ToolHandle, spec: ToolSpec, registered_by: str, created_at: str, ephemeral: bool) -> None:
         self._execute(
             "INSERT INTO tools VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1863,6 +2003,51 @@ class SQLiteStore:
             """
         )
 
+    def _ensure_object_task_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS object_tasks (
+              task_id TEXT PRIMARY KEY,
+              owner_oid TEXT NOT NULL,
+              creator_pid TEXT NOT NULL,
+              runner_pid TEXT,
+              tool TEXT NOT NULL,
+              tool_id TEXT,
+              status TEXT NOT NULL,
+              notification_json TEXT NOT NULL,
+              owner_watch_json TEXT NOT NULL,
+              result_oid TEXT,
+              error TEXT,
+              wait_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              started_at TEXT,
+              completed_at TEXT
+            )
+            """
+        )
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(object_tasks)")}
+        if "owner_watch_json" not in columns:
+            self.conn.execute("ALTER TABLE object_tasks ADD COLUMN owner_watch_json TEXT NOT NULL DEFAULT '{}'")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_object_tasks_owner_status
+              ON object_tasks(owner_oid, status, updated_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_object_tasks_creator_status
+              ON object_tasks(creator_pid, status, updated_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_object_tasks_runner
+              ON object_tasks(runner_pid)
+            """
+        )
+
     def _ensure_checkpoint_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(checkpoints)")}
         if "created_by" not in columns:
@@ -1994,6 +2179,12 @@ class SQLiteStore:
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_namespace_name ON objects(namespace, name)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_created_by ON objects(created_by, created_at, oid)")
         self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_objects_namespace_updated ON objects(namespace, updated_at, created_at, oid)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_objects_namespace_type_updated ON objects(namespace, type, updated_at, created_at, oid)"
+        )
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_object_namespaces_created_by ON object_namespaces(created_by, namespace)"
         )
         self.conn.execute(
@@ -2100,6 +2291,26 @@ class SQLiteStore:
             process.working_directory,
             process.created_at,
             process.updated_at,
+        )
+
+    def _object_task_params(self, task: ObjectTask) -> tuple[Any, ...]:
+        return (
+            task.task_id,
+            task.owner_oid,
+            task.creator_pid,
+            task.runner_pid,
+            task.tool,
+            task.tool_id,
+            task.status.value,
+            dumps(task.notification),
+            dumps(task.owner_watch),
+            task.result_oid,
+            task.error,
+            dumps(task.wait),
+            task.created_at,
+            task.updated_at,
+            task.started_at,
+            task.completed_at,
         )
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -2334,6 +2545,32 @@ class SQLiteStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def _row_to_object_task(self, row: sqlite3.Row) -> ObjectTask:
+        raw_notification = loads(row["notification_json"], {})
+        if isinstance(raw_notification.get("status"), str):
+            raw_notification["status"] = ObjectTaskNotificationStatus(raw_notification["status"])
+        notification = ObjectTaskNotification(**raw_notification)
+        raw_owner_watch = loads(row["owner_watch_json"], {})
+        owner_watch = ObjectTaskOwnerWatch(**raw_owner_watch)
+        return ObjectTask(
+            task_id=row["task_id"],
+            owner_oid=row["owner_oid"],
+            creator_pid=row["creator_pid"],
+            runner_pid=row["runner_pid"],
+            tool=row["tool"],
+            tool_id=row["tool_id"],
+            status=ObjectTaskStatus(row["status"]),
+            notification=notification,
+            owner_watch=owner_watch,
+            result_oid=row["result_oid"],
+            error=row["error"],
+            wait=loads(row["wait_json"], {}),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
 
     def _llm_call_limit(self, limit: int | None) -> int:
         selected = _LLM_DEFAULTS.call_record_list_limit if limit is None else int(limit)

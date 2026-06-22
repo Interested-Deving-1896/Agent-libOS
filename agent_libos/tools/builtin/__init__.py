@@ -39,6 +39,14 @@ from agent_libos.tools.builtin.memory import (
 )
 from agent_libos.tools.builtin.messages import ReadProcessMessagesTool, ReceiveProcessMessagesTool, SendProcessMessageTool
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
+from agent_libos.tools.builtin.object_tasks import (
+    CancelObjectTaskTool,
+    GetObjectTaskTool,
+    ListObjectTasksTool,
+    StartObjectTaskTool,
+    WaitObjectTaskTool,
+    WatchObjectTaskOwnerTool,
+)
 from agent_libos.tools.builtin.permission import RequestPermissionTool
 from agent_libos.tools.builtin.process import (
     ExecProcessTool,
@@ -68,6 +76,7 @@ __all__ = [
     "CreateCheckpointTool",
     "AppendMemoryObjectTool",
     "CallJsonRpcMethodTool",
+    "CancelObjectTaskTool",
     "CommitCheckpointToImageTool",
     "DeleteDirectoryTool",
     "DeleteFileTool",
@@ -78,6 +87,7 @@ __all__ = [
     "DiffCheckpointTool",
     "GetWorkingDirectoryTool",
     "GetCurrentTimeTool",
+    "GetObjectTaskTool",
     "AskHumanTool",
     "HumanOutputTool",
     "InspectCheckpointTool",
@@ -98,6 +108,7 @@ __all__ = [
     "ReadMemoryObjectTool",
     "ReadSkillResourceTool",
     "ListMemoryNamespaceTool",
+    "ListObjectTasksTool",
     "ReadTextFileTool",
     "RequestPermissionTool",
     "RegisterJitTool",
@@ -111,9 +122,12 @@ __all__ = [
     "SetWorkingDirectoryTool",
     "SleepTool",
     "SpawnChildProcessTool",
+    "StartObjectTaskTool",
     "UnloadSkillTool",
     "ValidateJitTool",
     "WaitChildProcessTool",
+    "WaitObjectTaskTool",
+    "WatchObjectTaskOwnerTool",
     "WriteDirectoryTool",
     "WriteObjectToFileTool",
     "WriteTextFileTool",

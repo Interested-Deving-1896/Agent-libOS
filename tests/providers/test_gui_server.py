@@ -6,6 +6,7 @@ import threading
 import urllib.request
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
+from agent_libos.models import ObjectMetadata, ObjectType
 
 class TestGuiServer:
 
@@ -257,6 +258,115 @@ class TestGuiServer:
         assert status == 200
         processes = {process['pid']: process for process in snapshot['processes']}
         assert processes[result['pid']]['status'] == 'exited'
+
+    def test_object_task_endpoint_runs_task_and_exposes_snapshot(self) -> None:
+        status, spawned = self.request('POST', '/api/processes', {'goal': 'object task', 'auto_run': False})
+        assert status == 200
+        pid = spawned['pid']
+        owner = self.server.service.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'name': 'owner'},
+            metadata=ObjectMetadata(title='owner'),
+            immutable=False,
+        )
+
+        status, started = self.request(
+            'POST',
+            '/api/object-tasks/start',
+            {
+                'pid': pid,
+                'owner_oid': owner.oid,
+                'tool': 'get_working_directory',
+                'args': {},
+                'owner_watch': True,
+                'watch_events': ['updated'],
+                'watch_channel': 'owner-watch',
+            },
+        )
+        assert status == 200
+        assert started['owner_watch']['enabled'] is True
+        assert started['owner_watch']['events'] == ['updated']
+        assert started['owner_watch']['channel'] == 'owner-watch'
+        status, waited = self.request('POST', f"/api/object-tasks/{started['task_id']}/wait", {'pid': pid, 'timeout_s': 2})
+        assert status == 200
+        assert waited['status'] == 'succeeded'
+        assert waited['result_oid'] is not None
+        status, snapshot = self.request('GET', '/api/snapshot')
+        assert status == 200
+        assert any(
+            task['task_id'] == started['task_id']
+            and task['status'] == 'succeeded'
+            and task['owner_watch']['enabled'] is True
+            for task in snapshot['object_tasks']
+        )
+
+    def test_object_task_watch_owner_endpoint_updates_existing_task(self) -> None:
+        status, spawned = self.request('POST', '/api/processes', {'goal': 'object task watch', 'auto_run': False})
+        assert status == 200
+        pid = spawned['pid']
+        owner = self.server.service.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'name': 'owner'},
+            metadata=ObjectMetadata(title='owner'),
+            immutable=False,
+        )
+        status, started = self.request(
+            'POST',
+            '/api/object-tasks/start',
+            {'pid': pid, 'owner_oid': owner.oid, 'tool': 'receive_process_messages', 'args': {'channel': 'owner-watch'}},
+        )
+        assert status == 200
+        status, waited = self.request('POST', f"/api/object-tasks/{started['task_id']}/wait", {'pid': pid, 'timeout_s': 2})
+        assert status == 200
+        assert waited['status'] == 'waiting_message'
+
+        status, watched = self.request(
+            'POST',
+            f"/api/object-tasks/{started['task_id']}/watch-owner",
+            {
+                'pid': pid,
+                'enabled': True,
+                'watch_events': ['updated'],
+                'watch_channel': 'owner-watch',
+                'watch_kind': 'interrupt',
+            },
+        )
+
+        assert status == 200
+        assert watched['owner_watch']['enabled'] is True
+        assert watched['owner_watch']['events'] == ['updated']
+        assert watched['owner_watch']['channel'] == 'owner-watch'
+        assert watched['owner_watch']['kind'] == 'interrupt'
+
+    def test_object_task_start_rejects_invalid_watch_kind_as_bad_request(self) -> None:
+        status, spawned = self.request('POST', '/api/processes', {'goal': 'bad watch kind', 'auto_run': False})
+        assert status == 200
+        pid = spawned['pid']
+        owner = self.server.service.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'name': 'owner'},
+            metadata=ObjectMetadata(title='owner'),
+            immutable=False,
+        )
+
+        status, body = self.request(
+            'POST',
+            '/api/object-tasks/start',
+            {
+                'pid': pid,
+                'owner_oid': owner.oid,
+                'tool': 'get_working_directory',
+                'args': {},
+                'owner_watch': True,
+                'watch_kind': 'bad-kind',
+            },
+        )
+
+        assert status == 400
+        assert 'owner watch kind' in body['error']['message']
 
     def test_jsonrpc_register_rejects_host_file_path(self) -> None:
         status, body = self.request('POST', '/api/jsonrpc/register', {'path': 'secrets.yaml', 'confirmed': True})

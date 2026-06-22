@@ -328,6 +328,16 @@ class ObjectMemoryDefaults:
 
 
 @dataclass(frozen=True)
+class ObjectTaskDefaults:
+    max_running_global: int = 16
+    max_running_per_object: int = 4
+    notification_channel: str = "object-task"
+    owner_watch_channel: str = "object-task-owner"
+    owner_watch_events: tuple[str, ...] = ("updated", "linked")
+    shutdown_join_timeout_s: float = 2.0
+
+
+@dataclass(frozen=True)
 class LLMContextDefaults:
     policy: str = "llm_context_object"
     schema_version: int = 1
@@ -446,6 +456,7 @@ class AgentLibOSConfig:
     image: ImageDefaults = field(default_factory=ImageDefaults)
     image_commit: ImageCommitDefaults = field(default_factory=ImageCommitDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
+    object_tasks: ObjectTaskDefaults = field(default_factory=ObjectTaskDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     checkpoint: CheckpointDefaults = field(default_factory=CheckpointDefaults)
     skills: SkillDefaults = field(default_factory=SkillDefaults)

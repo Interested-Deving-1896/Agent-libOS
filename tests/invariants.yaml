@@ -63,6 +63,7 @@
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_namespace_write_and_list_rights_are_enforced",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_read_grant_is_consumed_after_successful_lookup",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_write_grant_is_consumed_after_successful_create",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_multi_right_name_handle_consumes_source_capability_once",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_read_write_grant_allows_single_append_operation",
         "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_copy_file_via_named_object_without_materializing_content_to_process"
       ],
@@ -75,7 +76,22 @@
       "node_ids": [
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_append_refreshes_token_estimate_for_materialization_budget",
-        "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_file_object_token_estimate_limits_prompt_materialization"
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_memory_view_filters_apply_before_context_materialization",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call",
+        "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_file_object_token_estimate_limits_prompt_materialization",
+        "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_create_object_from_file_enforces_memory_payload_limit_before_create_and_can_truncate"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "child-memory-merge-lifecycle-is-explicit",
+      "title": "Terminal child process memory remains mergeable, then is adopted or released by the parent lifecycle.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_merge_child_memory_tool_adds_child_view_objects_to_parent",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_merge_after_child_exit_preserves_non_result_child_created_memory_until_parent_exit",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_parent_exit_releases_unmerged_terminal_child_memory",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_process_exit_releases_owned_memory_except_result_object"
       ],
       "benchmark_attack_classes": []
     },
@@ -178,6 +194,9 @@
       "lane": "unit",
       "node_ids": [
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_tool_policy_is_metadata_not_self_granted_authority",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_create_memory_object_declares_object_write_side_effect",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_start_object_task_declares_object_and_process_side_effects",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_watch_object_task_owner_declares_message_side_effects",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_process_cannot_call_tool_outside_creation_tool_table"
       ],
       "benchmark_attack_classes": []
@@ -196,6 +215,38 @@
         "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_workflow_run_prints_result_and_persists_exited_process",
         "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_workflow_run_failure_exits_nonzero_after_printing_json",
         "tests/providers/test_gui_server.py::TestGuiServer::test_workflow_run_endpoint_returns_result_and_snapshot_process"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "object-task-entry-uses-toolbroker-and-object-authority",
+      "title": "Object task entrypoints run through ToolBroker, process tool tables, object capabilities, and process message boundaries.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runs_visible_tool_links_result_and_notifies_creator",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_cannot_run_tool_outside_creator_tool_table",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_start_requires_owner_write_and_link_rights",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runner_does_not_inherit_external_capability_unless_explicit",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runner_is_not_scheduled_by_llm_scheduler",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_completion_survives_one_time_owner_handle",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notification_can_interrupt_and_wake_message_waiter",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_result_oid_in_notification_does_not_grant_result_authority",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_waiting_message_state_does_not_repeat_tool_call",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_update_resumes_waiting_runner",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_does_not_replay_unsafe_waiting_tool",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_link_payload_does_not_grant_dst_authority",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_disabled_does_not_notify_runner",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_terminal_task_is_not_notified",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_pins_owner_object_after_creator_exit_until_task_completes",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_refuses_to_cancel_running_sync_side_effect_tool",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_reconciles_external_runner_kill",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_list_limit_applies_after_visibility_filter",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_per_object_concurrency_limit_is_enforced",
+        "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_object_task_start_outputs_json",
+        "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_object_task_watch_owner_updates_existing_task",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_object_task_endpoint_runs_task_and_exposes_snapshot",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_object_task_watch_owner_endpoint_updates_existing_task",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_object_task_start_rejects_invalid_watch_kind_as_bad_request"
       ],
       "benchmark_attack_classes": []
     },
@@ -285,6 +336,7 @@
         "tests/unit/test_resource_manager.py::TestResourceManager::test_jsonrpc_remaining_budget_counts_request_and_response_together",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_child_process_creation_is_hierarchical_usage",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_parent_budget_exceedance_kills_parent_subtree",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_tool_call_budget_is_consumed_and_denies_next_tool_before_execution",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_child_llm_usage_counts_against_parent_budget",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_capability_grant_does_not_expand_tool_call_budget",

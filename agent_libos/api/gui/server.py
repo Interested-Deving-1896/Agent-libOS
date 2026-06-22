@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessSignal, ProcessStatus
+from agent_libos.models import CapabilityRight, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.utils.serde import to_jsonable
@@ -311,6 +311,7 @@ class GuiRuntimeService:
             "events": to_jsonable(self.runtime.events.list()[-200:]),
             "audit": to_jsonable(self.runtime.audit.trace(limit=200)),
             "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=100)),
+            "object_tasks": to_jsonable(self.runtime.object_tasks.list()),
             "tools": self._tool_summaries(),
             "images": to_jsonable(self.runtime.image_registry.list_images()),
             "skills": to_jsonable(self.runtime.skills.discover_skills(require_capability=False)),
@@ -457,6 +458,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return {"pid": pid, "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
         if len(route) >= 1 and route[0] == "workflows":
             return self._dispatch_workflows(method, route[1:])
+        if len(route) >= 1 and route[0] == "object-tasks":
+            return self._dispatch_object_tasks(method, route[1:], query)
         if route[:2] == ["scheduler", "auto"] and method == "POST":
             body = self._read_body()
             return service.scheduler.set_auto_run(bool(body.get("enabled", True)))
@@ -500,6 +503,89 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes("workflow.run")
             return to_jsonable(result)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown workflows endpoint")
+
+    def _dispatch_object_tasks(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return to_jsonable(
+                service.runtime.object_tasks.list(
+                    actor_pid=_query_str(query, "pid"),
+                    owner_oid=_query_str(query, "owner_oid"),
+                    include_terminal=_query_str(query, "active") not in {"1", "true", "yes"},
+                    limit=_query_int(query, "limit"),
+                )
+            )
+        if method == "POST" and route == ["start"]:
+            body = self._read_body()
+            pid = str(body.get("pid") or "").strip()
+            if not pid:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "pid is required")
+            tool = str(body.get("tool") or "").strip()
+            if not tool:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "tool is required")
+            raw_args = body.get("args") if "args" in body else {}
+            if not isinstance(raw_args, dict):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "object task args must be a JSON object")
+            owner = _object_task_owner_handle(
+                service.runtime,
+                pid,
+                body.get("owner_oid"),
+                body.get("owner_name"),
+                body.get("namespace"),
+            )
+            task = service.runtime.object_tasks.start(
+                pid,
+                owner,
+                tool,
+                raw_args,
+                notify_pid=str(body["notify_pid"]) if body.get("notify_pid") is not None else None,
+                notify_kind=str(body.get("notify_kind") or ProcessMessageKind.NORMAL.value),
+                notify_channel=str(body["notify_channel"]) if body.get("notify_channel") is not None else None,
+                inherit_capabilities=body.get("inherit_capabilities") if isinstance(body.get("inherit_capabilities"), list) else [],
+                grant_result_to_notify=bool(body.get("grant_result_to_notify", False)),
+                owner_watch=_object_task_owner_watch_body(body),
+            )
+            service.publish_runtime_changes("object_task.start")
+            return to_jsonable(task)
+        if len(route) == 1 and method == "GET":
+            return to_jsonable(service.runtime.object_tasks.get(route[0], actor_pid=_query_str(query, "pid")))
+        if len(route) == 2 and route[1] == "cancel" and method == "POST":
+            body = self._read_body()
+            pid = str(body.get("pid") or "").strip()
+            if not pid:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "pid is required")
+            task = service.runtime.object_tasks.cancel(route[0], actor_pid=pid, reason=body.get("reason"))
+            service.publish_runtime_changes("object_task.cancel")
+            return to_jsonable(task)
+        if len(route) == 2 and route[1] == "wait" and method == "POST":
+            body = self._read_body(optional=True)
+            pid = str(body.get("pid")) if body.get("pid") is not None else None
+            task = service.runtime.object_tasks.wait(
+                route[0],
+                actor_pid=pid,
+                timeout=float(body["timeout_s"]) if body.get("timeout_s") is not None else None,
+            )
+            service.publish_runtime_changes("object_task.wait")
+            return to_jsonable(task)
+        if len(route) == 2 and route[1] == "watch-owner" and method == "POST":
+            body = self._read_body()
+            pid = str(body.get("pid") or "").strip()
+            if not pid:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "pid is required")
+            raw_events = body.get("watch_events")
+            if raw_events is not None and not isinstance(raw_events, list):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "watch_events must be a JSON array")
+            task = service.runtime.object_tasks.watch_owner(
+                route[0],
+                actor_pid=pid,
+                enabled=bool(body.get("enabled", True)),
+                events=[str(item) for item in raw_events] if raw_events is not None else None,
+                channel=str(body["watch_channel"]) if body.get("watch_channel") is not None else None,
+                kind=str(body["watch_kind"]) if body.get("watch_kind") is not None else None,
+            )
+            service.publish_runtime_changes("object_task.watch_owner")
+            return to_jsonable(task)
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown object-tasks endpoint")
 
     def _dispatch_process(self, method: str, pid: str, route: list[str], query: dict[str, list[str]]) -> Any:
         service = self.server.service
@@ -1053,6 +1139,48 @@ def _query_int(query: dict[str, list[str]], key: str) -> int | None:
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _object_task_owner_handle(
+    runtime: Runtime,
+    pid: str,
+    owner_oid: Any,
+    owner_name: Any,
+    namespace: Any,
+):
+    if owner_oid is not None:
+        return runtime.memory.handle_for_oid(
+            pid,
+            str(owner_oid),
+            required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+        )
+    if owner_name is not None:
+        return runtime.memory.handle_for_name(
+            pid,
+            str(owner_name),
+            rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+            namespace=str(namespace) if namespace is not None else None,
+        )
+    raise GuiServerError(HTTPStatus.BAD_REQUEST, "owner_oid or owner_name is required")
+
+
+def _object_task_owner_watch_body(body: dict[str, Any]) -> dict[str, Any] | bool:
+    raw_events = body.get("watch_events")
+    if raw_events is not None and not isinstance(raw_events, list):
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, "watch_events must be a JSON array")
+    events = [str(item) for item in raw_events] if raw_events is not None else []
+    enabled = bool(body.get("owner_watch", False) or events or body.get("watch_channel") or "watch_kind" in body)
+    if not enabled:
+        return False
+    selected: dict[str, Any] = {
+        "enabled": True,
+        "kind": str(body.get("watch_kind") or ProcessMessageKind.NORMAL.value),
+    }
+    if events:
+        selected["events"] = events
+    if body.get("watch_channel") is not None:
+        selected["channel"] = str(body["watch_channel"])
+    return selected
 
 
 def _allowed_cors_origin(origin: str | None) -> str | None:

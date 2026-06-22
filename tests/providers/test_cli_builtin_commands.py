@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
-from agent_libos.models import ProcessMessageKind, ProcessStatus
+from agent_libos.models import ObjectMetadata, ObjectType, ProcessMessageKind, ProcessStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 class TestCLIBuiltinCommand:
@@ -132,6 +132,74 @@ class TestCLIBuiltinCommand:
             assert result['ok'] is False
             assert result['status'] == ProcessStatus.FAILED.value
             assert 'not in process tool table' in result['error']
+
+    def test_cli_object_task_start_outputs_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        pid = runtime.process.spawn(image='base-agent:v0', goal='object task cli')
+        owner = runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'name': 'owner'},
+            metadata=ObjectMetadata(title='owner'),
+            immutable=False,
+        )
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        result = _run_cli_json([
+            'object-task',
+            'start',
+            '--pid',
+            pid,
+            '--owner-oid',
+            owner.oid,
+            '--watch-owner',
+            '--watch-events',
+            'updated',
+            'get_working_directory',
+            '--wait',
+            '--timeout',
+            '2',
+        ])
+
+        assert result['status'] == 'succeeded'
+        assert result['owner_oid'] == owner.oid
+        assert result['owner_watch']['enabled'] is True
+        assert result['owner_watch']['events'] == ['updated']
+        assert result['result_oid'] is not None
+
+    def test_cli_object_task_watch_owner_updates_existing_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        pid = runtime.process.spawn(image='base-agent:v0', goal='object task watch cli')
+        owner = runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'name': 'owner'},
+            metadata=ObjectMetadata(title='owner'),
+            immutable=False,
+        )
+        task = runtime.object_tasks.start(pid, owner, 'receive_process_messages', {'channel': 'owner-watch'})
+        runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        result = _run_cli_json([
+            'object-task',
+            'watch-owner',
+            task.task_id,
+            '--pid',
+            pid,
+            '--watch-events',
+            'updated',
+            '--watch-channel',
+            'owner-watch',
+            '--watch-kind',
+            'interrupt',
+        ])
+
+        assert result['task_id'] == task.task_id
+        assert result['owner_watch']['enabled'] is True
+        assert result['owner_watch']['events'] == ['updated']
+        assert result['owner_watch']['channel'] == 'owner-watch'
+        assert result['owner_watch']['kind'] == 'interrupt'
 
 @contextlib.contextmanager
 def _temporary_cwd(path: Path):

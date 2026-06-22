@@ -3,9 +3,10 @@ import pytest
 import json
 import sqlite3
 import tempfile
+from dataclasses import replace
 from agent_libos import Runtime
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectHandle, ObjectPatch, ObjectQuery, ObjectType
+from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectPatch, ObjectQuery, ObjectType
 
 class TestObjectMemoryName:
 
@@ -129,6 +130,61 @@ class TestObjectMemoryName:
         context = self.runtime.memory.materialize_context(pid, view, budget_tokens=4)
         assert handle.oid in context.omitted_objects
         assert sentinel not in context.text
+
+    def test_object_patch_distinguishes_unset_payload_from_json_null(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='patch null')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'value': 1},
+            name='patch.null',
+            immutable=False,
+        )
+
+        self.runtime.memory.update_object(pid, handle, ObjectPatch(name='patch.null.renamed'))
+        assert self.runtime.memory.get_object(pid, handle).payload == {'value': 1}
+
+        self.runtime.memory.update_object(pid, handle, ObjectPatch(payload=None))
+        assert self.runtime.memory.get_object(pid, handle).payload is None
+
+    def test_memory_view_filters_apply_before_context_materialization(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='filtered context')
+        tagged = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.EVIDENCE,
+            payload={'text': 'include this needle'},
+            metadata=ObjectMetadata(tags=['keep']),
+            name='filter.tagged',
+        )
+        typed = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.SUMMARY,
+            payload={'text': 'include this summary'},
+            name='filter.typed',
+        )
+        omitted = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.PLAN,
+            payload={'text': 'do not include this'},
+            name='filter.omitted',
+        )
+        view = self.runtime.memory.create_view(
+            pid,
+            [tagged, typed, omitted],
+            filters=[
+                ObjectFilter(tags=['keep'], text='needle'),
+                ObjectFilter(type=ObjectType.SUMMARY),
+            ],
+        )
+
+        context = self.runtime.memory.materialize_context(pid, view)
+
+        assert tagged.oid in context.object_refs
+        assert typed.oid in context.object_refs
+        assert omitted.oid in context.omitted_objects
+        assert 'include this needle' in context.text
+        assert 'include this summary' in context.text
+        assert 'do not include this' not in context.text
 
     @pytest.mark.parametrize('name', ('project/note', 'project\\note', '.', '..'))
     def test_object_name_cannot_contain_namespace_separators(self, name: str) -> None:
@@ -334,6 +390,41 @@ class TestObjectMemoryName:
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object(handle_reader, one_shot_handle)
 
+    def test_one_time_multi_right_name_handle_consumes_source_capability_once(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner multi-right')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='reader multi-right')
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='one.shot.multi',
+            immutable=False,
+        )
+        owner_namespace = self.runtime.memory.resolve_namespace(owner)
+        self.runtime.capability.grant(subject=reader, resource=f'object_namespace:{owner_namespace}', rights=['read'], issued_by='test')
+        source_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object:{handle.oid}',
+            [CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by='test',
+        )
+
+        one_shot_handle = self.runtime.memory.handle_for_name(
+            reader,
+            'one.shot.multi',
+            rights=['read', 'write'],
+            namespace=owner_namespace,
+        )
+
+        consumes = [
+            record
+            for record in self.runtime.audit.trace()
+            if record.action == 'capability.consume' and source_cap.cap_id in record.capability_refs
+        ]
+        assert one_shot_handle.rights == {'read', 'write'}
+        assert len(consumes) == 1
+        assert not self.runtime.store.get_capability(source_cap.cap_id).active
+
     def test_one_time_read_write_grant_allows_single_append_operation(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='one-shot append')
         handle = self.runtime.memory.create_object(
@@ -374,6 +465,27 @@ class TestObjectMemoryName:
         results = self.runtime.memory.query_objects(other, ObjectQuery(name='claim.capability', namespace=owner_namespace))
         assert len(results) == 1
         assert results[0].oid == handle.oid
+
+    def test_query_limit_uses_deterministic_recent_first_order(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='ordered query')
+        older = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'rank': 'older'},
+            name='ordered.older',
+        )
+        newer = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'rank': 'newer'},
+            name='ordered.newer',
+        )
+        self.runtime.store.update_object(replace(self.runtime.store.get_object(older.oid), updated_at='2026-01-01T00:00:00Z'))
+        self.runtime.store.update_object(replace(self.runtime.store.get_object(newer.oid), updated_at='2026-01-02T00:00:00Z'))
+
+        results = self.runtime.memory.query_objects(pid, ObjectQuery(type=ObjectType.OBSERVATION, limit=1))
+
+        assert [handle.oid for handle in results] == [newer.oid]
 
     def test_query_with_read_only_authority_does_not_grant_materialize_or_link(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query materialize')

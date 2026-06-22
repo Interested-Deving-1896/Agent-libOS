@@ -217,6 +217,63 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_merge_after_child_exit_preserves_non_result_child_created_memory_until_parent_exit(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='merge child scratch')
+            child = runtime.process.fork(parent, goal='produce scratch and result')
+            scratch = runtime.tools.call(
+                child,
+                'create_memory_object',
+                {'name': 'child.scratch', 'type': 'evidence', 'payload': {'scratch': True}},
+            )
+            result = runtime.tools.call(
+                child,
+                'create_memory_object',
+                {'name': 'child.final', 'type': 'summary', 'payload': {'result': True}},
+            )
+            assert scratch.ok, scratch.error
+            assert result.ok, result.error
+            scratch_oid = scratch.payload['oid']
+            result_oid = result.payload['oid']
+
+            exited = runtime.tools.call(child, 'process_exit', {'result_oid': result_oid})
+            assert exited.ok, exited.error
+            assert runtime.store.get_object(scratch_oid) is not None
+
+            merged = runtime.tools.call(parent, 'merge_child_memory', {'child_pid': child})
+
+            assert merged.ok, merged.error
+            assert scratch_oid in merged.payload['merged_oids']
+            assert result_oid in merged.payload['merged_oids']
+            assert runtime.store.get_object(scratch_oid).created_by == parent
+            runtime.process.exit(parent)
+            assert runtime.store.get_object(scratch_oid) is None
+            assert runtime.store.get_object(result_oid) is None
+        finally:
+            runtime.close()
+
+    def test_parent_exit_releases_unmerged_terminal_child_memory(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='discard child memory')
+            child = runtime.process.fork(parent, goal='produce unmerged scratch')
+            scratch = runtime.tools.call(
+                child,
+                'create_memory_object',
+                {'name': 'child.unmerged', 'type': 'evidence', 'payload': {'temporary': True}},
+            )
+            assert scratch.ok, scratch.error
+            scratch_oid = scratch.payload['oid']
+            runtime.tools.call(child, 'process_exit', {'payload': {'done': True}})
+            assert runtime.store.get_object(scratch_oid) is not None
+
+            runtime.process.exit(parent)
+
+            assert runtime.store.get_object(scratch_oid) is None
+        finally:
+            runtime.close()
+
     def test_fork_root_oids_do_not_upgrade_read_only_objects_to_materialize(self) -> None:
         runtime = Runtime.open('local')
         try:

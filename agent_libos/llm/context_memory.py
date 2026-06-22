@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import ResourceLimitExceeded
 from agent_libos.utils.ids import estimate_tokens, utc_now
 from agent_libos.models import (
     AgentImage,
@@ -19,6 +20,7 @@ from agent_libos.models import (
     ObjectPatch,
     ObjectRight,
     ObjectType,
+    ResourceUsage,
     ViewMode,
 )
 
@@ -69,12 +71,37 @@ class LLMContextMemory:
             )
             obj = self.runtime.memory.get_object(pid, handle)
         rendered = self.render(obj.payload)
+        token_count = estimate_tokens(rendered)
+        self._charge_rendered_context(pid, process, obj.oid, token_count)
         return MaterializedContext(
             text=rendered,
             object_refs=[obj.oid, *source_context.object_refs],
-            token_count=estimate_tokens(rendered),
+            token_count=token_count,
             omitted_objects=source_context.omitted_objects,
             policy_used=LLM_CONTEXT_POLICY,
+        )
+
+    def _charge_rendered_context(self, pid: str, process: AgentProcess, context_oid: str, token_count: int) -> None:
+        resources = getattr(self.runtime, "resources", None)
+        if resources is None:
+            return
+        window_limit = resources.context_materialization_window_limit(pid)
+        if token_count > window_limit:
+            raise ResourceLimitExceeded(
+                "llm_context materialization tokens="
+                f"{token_count} exceeds max_context_materialization_tokens={window_limit}"
+            )
+        resources.charge(
+            pid,
+            ResourceUsage(context_materialized_tokens=token_count),
+            source="llm.context_memory",
+            context={
+                "view_id": process.memory_view.view_id if process.memory_view is not None else None,
+                "object_oid": context_oid,
+                "policy": LLM_CONTEXT_POLICY,
+            },
+            allow_overage=False,
+            kill_on_exceed=False,
         )
 
     def ensure(self, pid: str, image: AgentImage, process: AgentProcess, tools: list[dict[str, Any]]) -> ObjectHandle:

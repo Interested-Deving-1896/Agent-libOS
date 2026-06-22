@@ -29,18 +29,30 @@ class AsyncProcessScheduler:
         audit: AuditManager,
         poll_interval_s: float = _SCHEDULER_DEFAULTS.poll_interval_s,
         resources: Any | None = None,
+        skip_pid: Callable[[str], bool] | None = None,
     ):
         self.store = store
         self.audit = audit
         self.poll_interval_s = poll_interval_s
         self.resources = resources
+        self._skip_pid = skip_pid
 
     def next_runnable(self) -> str | None:
         runnable = self.store.list_processes_by_status(ProcessStatus.RUNNABLE)
-        return runnable[0].pid if runnable else None
+        for process in runnable:
+            if self._is_schedulable(process.pid):
+                return process.pid
+        return None
 
     def runnable_pids(self) -> list[str]:
-        return [proc.pid for proc in self.store.list_processes_by_status(ProcessStatus.RUNNABLE)]
+        return [
+            proc.pid
+            for proc in self.store.list_processes_by_status(ProcessStatus.RUNNABLE)
+            if self._is_schedulable(proc.pid)
+        ]
+
+    def _is_schedulable(self, pid: str) -> bool:
+        return self._skip_pid is None or not self._skip_pid(pid)
 
     async def arun_once(self, quantum: Quantum) -> Any:
         pid = self.next_runnable()

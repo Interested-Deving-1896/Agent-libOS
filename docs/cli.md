@@ -101,6 +101,43 @@ copied into the goal object. Use `--goal` only when the workflow process needs a
 human-readable label. `ok:false` is still printed as JSON and exits the CLI with
 status code 1.
 
+## Object Tasks
+
+`object-task` commands expose Object-bound background tool tasks. A task belongs
+to an existing Object Memory object, runs one visible tool through a dedicated
+runner child process, and reports status as JSON.
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite \
+  object-task start --pid <pid> --owner-oid <oid> get_working_directory --wait
+
+uv run agent-libos --db .agent_libos.sqlite \
+  object-task start --pid <pid> --owner-oid <oid> \
+  --watch-owner --watch-events updated,linked receive_process_messages \
+  --args-json '{"channel":"object-task-owner"}' --wait
+
+uv run agent-libos --db .agent_libos.sqlite object-task list --pid <pid>
+uv run agent-libos --db .agent_libos.sqlite object-task wait <task_id> --pid <pid>
+uv run agent-libos --db .agent_libos.sqlite object-task cancel <task_id> --pid <pid>
+uv run agent-libos --db .agent_libos.sqlite \
+  object-task watch-owner <task_id> --pid <pid> --watch-events updated \
+  --watch-channel object-task-owner
+```
+
+The task still uses the creator process tool table, ToolBroker, capabilities,
+resource budgets, events, audit, and Object Memory result semantics. A
+task started with `--watch-owner` receives owner `updated` and `linked` notices
+as process messages in its runner process; those notices contain object ids and
+event metadata, not object payloads or new capabilities. A
+`watch-owner` subcommand can update or disable that watch while the task is
+still active. Owner-watch auto-resume is limited to tools with safe
+message-receive replay semantics, currently `receive_process_messages`.
+Running synchronous side-effect tools are not force-cancelled because Python
+cannot safely stop their worker thread after side effects may have started. A
+one-shot CLI invocation cannot keep detached in-memory tasks alive after the
+CLI Runtime shuts down; long-running ObjectTask supervision is intended for a
+live Runtime such as the GUI server or an embedded host process.
+
 ## LLM Calls
 
 Inspect persisted LLM action-selection calls:

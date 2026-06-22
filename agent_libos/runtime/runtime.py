@@ -37,6 +37,7 @@ from agent_libos.runtime.checkpoint_manager import CheckpointManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
+from agent_libos.runtime.object_tasks import ObjectTaskManager
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.resource_manager import ResourceManager
 from agent_libos.runtime.scheduler import SimpleScheduler
@@ -157,11 +158,15 @@ class Runtime:
             resources=self.resources,
         )
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
+        self.object_tasks = ObjectTaskManager(self, config=self.config)
+        self.memory.bind_object_pin_checker(self.object_tasks.has_active_for_owner)
+        self.memory.bind_object_change_notifier(self.object_tasks.notify_owner_changed)
         self.scheduler = SimpleScheduler(
             store,
             self.audit,
             poll_interval_s=self.config.scheduler.poll_interval_s,
             resources=self.resources,
+            skip_pid=self.object_tasks.is_runner_pid,
         )
         self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
         self.checkpoint.bind_runtime(self)
@@ -329,6 +334,7 @@ class Runtime:
             payload={"reason": reason},
         )
         for name, component in [
+            ("object_tasks", getattr(self, "object_tasks", None)),
             ("llm.client", getattr(self.llm, "client", None)),
             ("substrate", self.substrate),
         ]:
