@@ -71,6 +71,8 @@ class ModuleContext:
     def register_provider_hook(self, kind: str, hook: ProviderHook) -> None:
         normalized = self._normalize_name(kind, "provider hook")
         self._require_declared(normalized, self.manifest.provides.provider_hooks, "provider hook")
+        if normalized in self.provider_hooks:
+            raise ValidationError(f"module registered duplicate provider hook: {normalized}")
         if not callable(hook):
             raise ValidationError(f"provider hook is not callable: {normalized}")
         self.provider_hooks[normalized].append(hook)

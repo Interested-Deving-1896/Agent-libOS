@@ -14,6 +14,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.modules.loader import ModuleLoader
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
@@ -85,6 +86,44 @@ class TestRuntimeModule:
             finally:
                 runtime.close()
 
+    def test_import_string_resolve_does_not_execute_package_init_before_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / 'pkg'
+            package.mkdir()
+            sentinel = root / 'import_side_effect.txt'
+            (package / '__init__.py').write_text(
+                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding='utf-8',
+            )
+            source = package / 'test_module.py'
+            source.write_text("def register_module(ctx):\n    pass\n", encoding='utf-8')
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            manifest = root / 'module.yaml'
+            manifest.write_text(
+                f"""
+schema_version: 1
+module_id: package-module:v0
+name: Package module
+entrypoint: pkg.test_module:register_module
+provides: {{}}
+sha256: {source_sha}
+""".lstrip(),
+                encoding='utf-8',
+            )
+
+            resolved = ModuleLoader().resolve(manifest)
+
+            assert resolved.source_path == str(source.resolve())
+            assert not sentinel.exists()
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'package-module:v0:{source_sha}',))
+            try:
+                loaded = runtime.modules.inspect_module('package-module:v0')
+                assert loaded['status'] == 'loaded'
+                assert not sentinel.exists()
+            finally:
+                runtime.close()
+
     def test_import_string_entrypoint_executes_current_source_not_cached_module(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -124,6 +163,25 @@ class TestRuntimeModule:
                     sys.modules.pop('test_module', None)
                 else:
                     sys.modules['test_module'] = previous
+
+    def test_runtime_loaded_module_after_start_runs_hooks_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root, provider_hook=True)
+            runtime = Runtime.open()
+            try:
+                loaded = runtime.modules.load_module_manifest(
+                    manifest,
+                    trusted_modules=(f'test-module:v0:{source_sha}',),
+                )
+                actions = [record.action for record in runtime.audit.trace()]
+                assert loaded['status'] == 'loaded'
+                assert 'test.provider_hook' in actions
+                assert 'test.startup_hook' in actions
+                assert 'module.provider_hook' in actions
+                assert 'module.startup_hook' in actions
+            finally:
+                runtime.close()
 
     def test_source_hash_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -256,6 +314,35 @@ class TestRuntimeModule:
             assert 'test-module:v0' in [module['module_id'] for module in listed]
             spawned = _run_cli_json(['--db', str(db), '--module-manifest', str(manifest), '--trusted-module', trust, 'spawn', '--image', 'module-agent:v0', '--goal', 'cli module'])
             assert spawned['image'] == 'module-agent:v0'
+
+    def test_json_manifest_duplicate_keys_are_rejected(self) -> None:
+        with pytest.raises(ValidationError, match='duplicate module manifest JSON key'):
+            ModuleLoader().parse_manifest(
+                """
+{
+  "schema_version": 1,
+  "module_id": "json-module:v0",
+  "name": "first",
+  "name": "second",
+  "entrypoint": "./module.py:register_module",
+  "provides": {},
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}
+""".strip()
+            )
+
+    def test_manifest_schema_version_must_be_integer(self) -> None:
+        with pytest.raises(ValidationError, match='schema_version must be an integer'):
+            ModuleLoader().parse_manifest(
+                """
+schema_version: true
+module_id: bool-schema:v0
+name: Bool schema
+entrypoint: ./module.py:register_module
+provides: {}
+sha256: 0000000000000000000000000000000000000000000000000000000000000000
+""".lstrip()
+            )
 
 def _write_module(root: Path, *, expose_read_tool: bool=False, invalid_registration: bool=False, invalid_image: bool=False, provider_hook: bool=False, failing_startup_hook: bool=False, entrypoint: str='./test_module.py:register_module', marker: str='module') -> tuple[Path, str]:
     source = root / 'test_module.py'

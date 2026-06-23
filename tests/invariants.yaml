@@ -361,8 +361,12 @@
       "node_ids": [
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_untrusted_module_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_source_hash_mismatch_is_rejected",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_json_manifest_duplicate_keys_are_rejected",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_manifest_schema_version_must_be_integer",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_import_string_resolve_does_not_execute_package_init_before_trust",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_import_string_entrypoint_executes_current_source_not_cached_module",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_source_size_limit_fails_before_import",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_runtime_loaded_module_after_start_runs_hooks_immediately",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_apply_failure_rolls_back_registered_tool_and_failed_status",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_startup_hook_failure_rolls_back_external_module_state",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_duplicate_module_id_does_not_overwrite_loaded_record",

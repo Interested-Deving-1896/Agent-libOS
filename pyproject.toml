@@ -23,6 +23,7 @@ dependencies = [
     "psutil>=7.0.0",
     "pydantic>=2.13.4",
     "jsonschema>=4.25.0",
+    "pyyaml>=6.0.3",
 ]
 
 [dependency-groups]

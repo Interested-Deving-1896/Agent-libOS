@@ -14,9 +14,10 @@ Modules are part of the host trusted computing base:
 - The `(module_id, source_sha256)` pair must be trusted by config or CLI.
 - Loading a module never grants filesystem, shell, Object Memory, human,
   process, checkpoint, Skill, image, or JSON-RPC capabilities to a process.
-- Import-string entrypoints are resolved to a concrete source file, then loaded
-  fresh under the module import lock so a previous `sys.modules` entry cannot
-  satisfy a newer trusted hash.
+- Import-string entrypoints are resolved to a concrete source file under the
+  manifest directory without importing package code, then that source file is
+  loaded fresh under an isolated module name so a previous `sys.modules` entry
+  cannot satisfy a newer trusted hash.
 - Module source files are hashed with a configured size limit
   (`AgentLibOSConfig.modules.source_max_bytes`) before import.
 
@@ -48,8 +49,17 @@ metadata:
 ```
 
 The manifest may also use an import-string entrypoint such as
-`example_package.module:register_module`. File entrypoints are resolved relative
-to the manifest directory and cannot escape that directory with `../`.
+`example_package.module:register_module`. Import strings and file entrypoints
+are resolved relative to the manifest directory; file entrypoints cannot escape
+that directory with `../`. Package import strings require each package parent to
+exist under the manifest directory with an `__init__.py`, which keeps manifest
+resolution from drifting to arbitrary installed packages. The package parents
+are not imported or executed by the module loader; the trusted hash covers the
+entrypoint source file.
+
+YAML and JSON manifests both reject duplicate mapping keys. Treat duplicate-key
+errors as authoring bugs rather than relying on parser-specific overwrite
+behavior.
 
 ## Entrypoint
 
@@ -71,6 +81,11 @@ runtime registries and the module row is recorded as failed. Hook code may still
 perform arbitrary trusted host-side effects, so hooks should be kept small and
 idempotent.
 
+`Runtime.open()` runs all configured startup hooks before returning. If host code
+manually calls `runtime.modules.load_module_manifest()` after startup has already
+completed, that module's provider and startup hooks run immediately; failure
+rolls back the newly loaded module.
+
 ## Registration Surfaces
 
 `ctx.register_tool(tool)` registers a static model-facing tool through
@@ -84,8 +99,8 @@ normal process bootstrap rules and never by module loading itself.
 router. The handler receives the `LibOSSyscallSession` and syscall args. It
 must call existing primitives for protected effects.
 
-`ctx.register_provider_hook(kind, hook)` records a trusted provider hook for
-runtime-level extension code. Hooks are startup module code, not process
+`ctx.register_provider_hook(kind, hook)` records one trusted provider hook for a
+declared provider hook kind. Hooks are startup module code, not process
 capabilities.
 
 `ctx.add_startup_hook(fn)` runs a synchronous hook after all startup module

@@ -87,9 +87,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   prompt context without granting resources; API actor mode must still honor
   skill capability or human-approval gates.
 - `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
-  trust to the current source hash, reject duplicate module ids, bound source
-  hashing, and roll back failed registrations so persisted module status stays
-  aligned with loaded runtime state.
+  trust to the current source hash, reject ambiguous manifests and duplicate
+  module ids, resolve import strings without executing untrusted package code,
+  bound source hashing, and roll back failed registrations so persisted module
+  status stays aligned with loaded runtime state.
 - `checkpoint-restore-and-fork-are-scoped`: checkpoint restore/fork are scoped,
   capability-controlled, and append-only outside reconstructable state.
 - `image-self-evolution-requires-image-authority`: image registration, package

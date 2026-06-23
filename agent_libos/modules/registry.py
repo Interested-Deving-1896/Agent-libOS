@@ -143,29 +143,13 @@ class RuntimeModuleRegistry:
             return
         for module_id, hook_name, hook in list(self._provider_hooks):
             try:
-                result = hook(self.runtime)
-                if inspect.isawaitable(result):
-                    raise ValidationError(f"provider hook must be synchronous before runtime start: {module_id}:{hook_name}")
-                self.runtime.audit.record(
-                    actor=f"module:{module_id}",
-                    action="module.provider_hook",
-                    target=f"module:{module_id}:{hook_name}",
-                    decision={"hook": hook_name},
-                )
+                self._run_module_hook(module_id, hook_name, hook, kind="provider")
             except Exception as exc:
                 self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
                 raise
         for module_id, hook_name, hook in list(self._startup_hooks):
             try:
-                result = hook(self.runtime)
-                if inspect.isawaitable(result):
-                    raise ValidationError(f"startup hook must be synchronous before runtime start: {module_id}:{hook_name}")
-                self.runtime.audit.record(
-                    actor=f"module:{module_id}",
-                    action="module.startup_hook",
-                    target=f"module:{module_id}:{hook_name}",
-                    decision={"hook": hook_name},
-                )
+                self._run_module_hook(module_id, hook_name, hook, kind="startup")
             except Exception as exc:
                 self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
                 raise
@@ -225,6 +209,8 @@ class RuntimeModuleRegistry:
                     "registered": summary,
                 },
             )
+            if self._startup_hooks_ran and not self._is_internal_module(source.manifest.module_id):
+                self._run_context_hooks(ctx)
             return self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
         except Exception:
             self._rollback_context(ctx)
@@ -313,6 +299,27 @@ class RuntimeModuleRegistry:
             )
         for name, hook in ctx.startup_hooks.items():
             self._startup_hooks.append((ctx.module_id, name, hook))
+
+    def _run_context_hooks(self, ctx: ModuleContext) -> None:
+        for kind, hooks in ctx.provider_hooks.items():
+            for index, hook in enumerate(hooks):
+                self._run_module_hook(ctx.module_id, f"{kind}:{index}", hook, kind="provider")
+        for name, hook in ctx.startup_hooks.items():
+            self._run_module_hook(ctx.module_id, name, hook, kind="startup")
+
+    def _run_module_hook(self, module_id: str, hook_name: str, hook: StartupHook, *, kind: str) -> None:
+        result = hook(self.runtime)
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise ValidationError(f"{kind} hook must be synchronous: {module_id}:{hook_name}")
+        self.runtime.audit.record(
+            actor=f"module:{module_id}",
+            action=f"module.{kind}_hook",
+            target=f"module:{module_id}:{hook_name}",
+            decision={"hook": hook_name},
+        )
 
     def _rollback_external_modules_after_hook_failure(self, failed_module_id: str, exc: Exception, *, hook_name: str) -> None:
         module_ids = [

@@ -181,6 +181,15 @@ Do not scatter magic numbers in implementation code when a value affects
 runtime behavior, policy, persistence, or test reproducibility. Add a typed
 config default instead.
 
+## Manifest YAML
+
+Runtime YAML manifests and `SKILL.md` frontmatter are parsed through
+`agent_libos.utils.yaml_loader.load_yaml_mapping`, which uses PyYAML's safe
+loader plus a duplicate-key check. YAML syntax follows PyYAML, while the
+runtime schema validators still restrict which fields and value shapes each
+manifest accepts. Duplicate mapping keys are rejected so authority-bearing
+manifests fail closed instead of silently overwriting earlier declarations.
+
 ## Documentation Rules
 
 README is the entrypoint. Detailed implementation documentation belongs in

@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import importlib.machinery
 import importlib.util
 import json
 import re
 import sys
 import threading
-from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -19,10 +17,11 @@ from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSou
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _MODULE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
+_PYTHON_OBJECT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PYTHON_MODULE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _SYSCALL_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 _HEX_SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 _IMPORT_LOCK = threading.RLock()
-_MISSING_MODULE = object()
 
 
 class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
@@ -126,6 +125,8 @@ class ModuleLoader:
         if missing:
             raise ValidationError(f"missing required module manifest fields: {missing}")
         schema_version = data["schema_version"]
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ValidationError("schema_version must be an integer")
         if schema_version != self.config.modules.schema_version:
             raise ValidationError(f"unsupported module schema_version: {schema_version}")
         provides = self._coerce_provides(data["provides"])
@@ -145,14 +146,7 @@ class ModuleLoader:
     def import_entrypoint(self, source: ModuleSource) -> Any:
         module_ref, object_name = self._split_entrypoint(source.manifest.entrypoint)
         with _IMPORT_LOCK:
-            if self._is_path_ref(module_ref):
-                module = self._import_file(Path(source.source_path), source.manifest.module_id, source.source_sha256)
-            else:
-                module = self._import_string_fresh(
-                    module_ref,
-                    Path(source.manifest_path).parent,
-                    Path(source.source_path),
-                )
+            module = self._import_file(Path(source.source_path), source.manifest.module_id, source.source_sha256)
         self._verify_imported_module_source(module, source)
         entrypoint = getattr(module, object_name, None)
         if not callable(entrypoint):
@@ -178,11 +172,22 @@ class ModuleLoader:
     def _load_mapping(self, text: str) -> dict[str, Any]:
         stripped = text.lstrip()
         if stripped.startswith("{"):
-            data = json.loads(text)
+            data = self._load_json_mapping(text)
             if not isinstance(data, dict):
                 raise ValidationError("module manifest JSON must be a mapping")
             return data
         return load_yaml_mapping(text)
+
+    def _load_json_mapping(self, text: str) -> dict[str, Any]:
+        try:
+            data = json.loads(text, object_pairs_hook=_unique_json_object)
+        except ValidationError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"invalid module manifest JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValidationError("module manifest JSON must be a mapping")
+        return data
 
     def _coerce_provides(self, value: Any) -> ModuleProvides:
         if not isinstance(value, dict):
@@ -220,6 +225,13 @@ class ModuleLoader:
         for name in provides.syscalls:
             if not _SYSCALL_PATTERN.match(name):
                 raise ValidationError(f"invalid syscall name in module manifest: {name}")
+        for field, values in {
+            "provider_hooks": provides.provider_hooks,
+            "startup_hooks": provides.startup_hooks,
+        }.items():
+            for name in values:
+                if not _SYSCALL_PATTERN.match(name):
+                    raise ValidationError(f"invalid {field[:-1]} name in module manifest: {name}")
 
     def _resolve_entrypoint(self, manifest_path: Path, entrypoint: str) -> tuple[Path, str]:
         module_ref, object_name = self._split_entrypoint(entrypoint)
@@ -227,11 +239,7 @@ class ModuleLoader:
             source = (manifest_path.parent / module_ref).resolve()
             self._require_under(source, manifest_path.parent.resolve())
         else:
-            with _IMPORT_LOCK:
-                spec = self._find_spec_fresh(module_ref, manifest_path.parent)
-            if spec is None or spec.origin is None:
-                raise NotFound(f"module entrypoint import not found: {module_ref}")
-            source = Path(spec.origin).resolve()
+            source = self._resolve_import_source(manifest_path.parent.resolve(), module_ref)
         if not source.is_file():
             raise NotFound(f"module entrypoint source not found: {source}")
         return source, object_name
@@ -244,10 +252,43 @@ class ModuleLoader:
         object_name = object_name.strip()
         if not module_ref or not object_name:
             raise ValidationError("module entrypoint must include both module/path and callable")
+        if not self._is_path_ref(module_ref) and not _PYTHON_MODULE_PATTERN.match(module_ref):
+            raise ValidationError(f"module entrypoint import is not a valid Python module path: {module_ref}")
+        if not _PYTHON_OBJECT_PATTERN.match(object_name):
+            raise ValidationError(f"module entrypoint callable is not a valid Python identifier: {object_name}")
         return module_ref, object_name
 
     def _is_path_ref(self, module_ref: str) -> bool:
         return module_ref.endswith(".py") or module_ref.startswith(".") or "/" in module_ref or "\\" in module_ref
+
+    def _resolve_import_source(self, manifest_dir: Path, module_ref: str) -> Path:
+        """Resolve import-string entrypoints without executing package code."""
+
+        parts = module_ref.split(".")
+        self._require_package_parent_files(manifest_dir, parts[:-1], module_ref)
+        module_path = manifest_dir.joinpath(*parts)
+        file_source = module_path.with_suffix(".py")
+        package_source = module_path / "__init__.py"
+        if file_source.is_file():
+            source = file_source.resolve()
+            self._require_under(source, manifest_dir)
+            return source
+        if package_source.is_file():
+            source = package_source.resolve()
+            self._require_under(source, manifest_dir)
+            return source
+        raise NotFound(f"module entrypoint import not found under manifest directory: {module_ref}")
+
+    def _require_package_parent_files(self, manifest_dir: Path, package_parts: list[str], module_ref: str) -> None:
+        for index in range(1, len(package_parts) + 1):
+            init_path = manifest_dir.joinpath(*package_parts[:index], "__init__.py")
+            if not init_path.is_file():
+                package_name = ".".join(package_parts[:index])
+                raise NotFound(
+                    "module entrypoint import requires package parent "
+                    f"{package_name!r} with __init__.py under the manifest directory: {module_ref}"
+                )
+            self._require_under(init_path.resolve(), manifest_dir)
 
     def _require_under(self, path: Path, root: Path) -> None:
         try:
@@ -269,43 +310,12 @@ class ModuleLoader:
             raise ValidationError(f"cannot import module entrypoint source: {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         return module
-
-    def _import_string_fresh(self, module_ref: str, manifest_dir: Path, source_path: Path) -> ModuleType:
-        names = self._module_prefixes(module_ref)
-        previous = {name: sys.modules.pop(name, _MISSING_MODULE) for name in names}
-        importlib.invalidate_caches()
-        try:
-            with self._temporary_sys_path(manifest_dir):
-                parent_name = module_ref.rpartition(".")[0]
-                if parent_name:
-                    importlib.import_module(parent_name)
-                return self._exec_source_module(module_ref, source_path)
-        finally:
-            for name in reversed(names):
-                sys.modules.pop(name, None)
-                old = previous[name]
-                if old is not _MISSING_MODULE:
-                    sys.modules[name] = old
-
-    def _find_spec_fresh(self, module_ref: str, manifest_dir: Path) -> Any:
-        names = self._module_prefixes(module_ref)
-        previous = {name: sys.modules.pop(name, _MISSING_MODULE) for name in names}
-        importlib.invalidate_caches()
-        try:
-            with self._temporary_sys_path(manifest_dir):
-                return importlib.util.find_spec(module_ref)
-        finally:
-            for name in reversed(names):
-                sys.modules.pop(name, None)
-                old = previous[name]
-                if old is not _MISSING_MODULE:
-                    sys.modules[name] = old
-
-    def _module_prefixes(self, module_ref: str) -> list[str]:
-        parts = [part for part in module_ref.split(".") if part]
-        return [".".join(parts[:index]) for index in range(1, len(parts) + 1)]
 
     def _verify_imported_module_source(self, module: ModuleType, source: ModuleSource) -> None:
         module_file = getattr(module, "__file__", None)
@@ -324,21 +334,6 @@ class ModuleLoader:
                 "module entrypoint source changed after verification: "
                 f"expected {source.source_sha256}, got {imported_sha}"
             )
-
-    @contextmanager
-    def _temporary_sys_path(self, path: Path):
-        text = str(path)
-        inserted = text not in sys.path
-        if inserted:
-            sys.path.insert(0, text)
-        try:
-            yield
-        finally:
-            if inserted:
-                try:
-                    sys.path.remove(text)
-                except ValueError:
-                    pass
 
     def _identifier(self, value: Any, field: str, max_chars: int) -> str:
         text = self._string(value, field, max_chars)
@@ -392,3 +387,12 @@ class ModuleLoader:
 
     def _sha256_bytes(self, value: bytes) -> str:
         return hashlib.sha256(value).hexdigest()
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    mapping: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in mapping:
+            raise ValidationError(f"duplicate module manifest JSON key: {key!r}")
+        mapping[key] = value
+    return mapping
