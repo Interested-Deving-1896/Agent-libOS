@@ -302,6 +302,14 @@ class ObjectTaskManager:
             ):
                 continue
             if task.status in _TERMINAL_STATUSES:
+                # Terminal task state is written before the worker coroutine
+                # delivers its completion notification. Keep waiters on the
+                # worker until that final notification write has settled.
+                if self._has_active_future(task.task_id):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return task
+                    time.sleep(0.01)
+                    continue
                 self._cleanup_owner_pin_after_terminal(task)
                 return task
             if (

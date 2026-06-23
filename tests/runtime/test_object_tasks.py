@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+import threading
 import time
 from uuid import uuid4
 
@@ -90,6 +92,49 @@ class TestObjectTasks:
             assert unread[-1].channel == runtime.config.object_tasks.notification_channel
             assert unread[-1].payload["status"] == ObjectTaskStatus.SUCCEEDED.value
         finally:
+            runtime.close()
+
+    def test_object_task_wait_includes_terminal_notification_delivery(self) -> None:
+        runtime = Runtime.open("local")
+        release_notification = threading.Event()
+        notification_started = threading.Event()
+        original_post = runtime.messages.post
+
+        def delayed_post(*args: object, **kwargs: object) -> object:
+            if (
+                str(kwargs.get("sender") or "").startswith("object_task:")
+                and kwargs.get("channel") == runtime.config.object_tasks.notification_channel
+            ):
+                notification_started.set()
+                if not release_notification.wait(timeout=2):
+                    raise TimeoutError("timed out waiting to release object task notification")
+            return original_post(*args, **kwargs)
+
+        runtime.messages.post = delayed_post  # type: ignore[method-assign]
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="object task wait notification")
+            owner = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {"name": "owner"},
+                metadata=ObjectMetadata(title="owner"),
+                immutable=False,
+            )
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                waiter = executor.submit(runtime.object_tasks.wait, task.task_id, actor_pid=pid, timeout=2)
+                assert notification_started.wait(timeout=2)
+                time.sleep(0.05)
+                assert not waiter.done()
+                release_notification.set()
+                completed = waiter.result(timeout=2)
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.notification.status == ObjectTaskNotificationStatus.DELIVERED
+        finally:
+            release_notification.set()
+            runtime.messages.post = original_post  # type: ignore[method-assign]
             runtime.close()
 
     def test_object_task_cannot_run_tool_outside_creator_tool_table(self) -> None:
