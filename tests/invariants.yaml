@@ -91,6 +91,23 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "context-compaction-preserves-authority-and-fails-closed",
+      "title": "Context compaction preserves process authority, validates summaries, and fails closed on races or invalid output.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_waits_for_compressor_child_and_replaces_context",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_skips_small_context_without_force",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_invalid_child_output_does_not_replace_context",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_rejects_forged_resume_job",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_spawn_failure_marks_job_failed",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_version_race_does_not_overwrite_new_context",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_uses_multiple_chunks",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_pending_context_compaction_survives_runtime_reopen",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_reopen_after_compressor_exit_reruns_missing_result_stage"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "child-memory-merge-lifecycle-is-explicit",
       "title": "Terminal child process memory remains mergeable, then is adopted or released by the parent lifecycle.",
       "lane": "runtime",

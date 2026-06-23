@@ -419,6 +419,330 @@ class TestLLMContextMemory:
             finally:
                 reopened.close()
 
+    def test_compact_process_context_waits_for_compressor_child_and_replaces_context(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': 'compact_process_context',
+                    'force': True,
+                    'target_tokens': 512,
+                    'max_chunks': 1,
+                    'preserve_recent_entries': 1,
+                },
+                {'action': 'process_exit', 'payload': _compact_summary('compressed state')},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='compact current context')
+
+            results = runtime.run_until_idle(max_quanta=3)
+
+            completed = _last_action_result(results, 'compact_process_context')
+            assert completed['result']['ok']
+            output = completed['result']['payload']
+            assert output['compacted'] is True
+            assert len(output['compressor_pids']) == 1
+            child = runtime.process.get(output['compressor_pids'][0])
+            assert child.image_id == 'context-compressor:v0'
+            assert set(child.tool_table) == {'process_exit'}
+
+            context = runtime.store.get_object_by_name(context_object_name(pid), namespace=runtime.memory.resolve_namespace(pid))
+            assert context is not None
+            assert context.version == output['new_version']
+            compacted_entry = context.payload['entries'][0]
+            assert compacted_entry['kind'] == 'context_compacted'
+            assert compacted_entry['summary']['goal'] == 'compressed state'
+            assert compacted_entry['compaction_method'] == 'agent_image_child'
+            assert compacted_entry['compaction_metadata']['compressor_image_id'] == 'context-compressor:v0'
+            assert compacted_entry['compaction_metadata']['tool_name'] == 'compact_process_context'
+            assert 'compacted' in context.metadata.tags
+            assert 'compaction_method:agent_image_child' in context.metadata.tags
+            assert any(isinstance(result, dict) and result.get('waiting_event') for result in results)
+            child_tool_names = {tool['function']['name'] for tool in runtime.llm.client.tool_batches[1]}
+            assert child_tool_names == {'process_exit'}
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_skips_small_context_without_force(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': 'compact_process_context',
+                    'target_tokens': 64_000,
+                    'force': False,
+                }
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='small context')
+
+            result = runtime.run_next_process_once()
+
+            assert result['action']['action'] == 'compact_process_context'
+            assert result['result']['ok']
+            output = result['result']['payload']
+            assert output['compacted'] is False
+            assert output['reason'] == 'context_under_target'
+            assert runtime.process.list_children(pid) == []
+            context = runtime.store.get_object_by_name(context_object_name(pid), namespace=runtime.memory.resolve_namespace(pid))
+            assert context is not None
+            assert not any(entry.get('kind') == 'context_compacted' for entry in context.payload['entries'])
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_invalid_child_output_does_not_replace_context(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': 'compact_process_context',
+                    'force': True,
+                    'target_tokens': 512,
+                    'max_chunks': 1,
+                },
+                {'action': 'process_exit', 'payload': {'goal': 'missing required fields'}},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='invalid compressor output')
+
+            waiting = runtime.run_next_process_once()
+            assert waiting['waiting_event']
+            before = runtime.store.get_object_by_name(context_object_name(pid), namespace=runtime.memory.resolve_namespace(pid))
+            assert before is not None
+            before_version = before.version
+            before_payload = json.loads(json.dumps(before.payload))
+
+            results = runtime.run_until_idle(max_quanta=2)
+
+            completed = _last_action_result(results, 'compact_process_context')
+            assert completed['result']['ok'] is False
+            assert 'missing required fields' in (completed['result']['error'] or '')
+            after = runtime.store.get_object(before.oid)
+            assert after is not None
+            assert after.version == before_version
+            assert after.payload == before_payload
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_rejects_forged_resume_job(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reject forged resume')
+            context = _seed_context_entries(runtime, pid, count=1)
+            forged_job = {
+                'kind': 'context_compaction_job',
+                'schema_version': 1,
+                'status': 'active',
+                'caller_pid': pid,
+                'context_oid': context.oid,
+                'source_version': context.version,
+                'source_payload': json.loads(json.dumps(context.payload)),
+                'source_tokens': 1,
+                'target_tokens': 512,
+                'preserve_recent_entries': 0,
+                'max_chunks': 1,
+                'stage_index': 1,
+                'current_child_pid': 'pid_forged_child',
+                'compressor_pids': [],
+                'summaries': [_compact_summary('forged state')],
+            }
+
+            result = runtime.tools.call(pid, 'compact_process_context', {'_resume_job': forged_job})
+
+            assert result.ok is False
+            assert 'not callable directly' in (result.error or '')
+            after = runtime.store.get_object(context.oid)
+            assert after is not None
+            assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
+            assert runtime.process.list_children(pid) == []
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_spawn_failure_marks_job_failed(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': 'compact_process_context',
+                    'force': True,
+                    'target_tokens': 512,
+                    'max_chunks': 64,
+                    'preserve_recent_entries': 0,
+                },
+                *[
+                    {'action': 'process_exit', 'payload': _compact_summary(f'stage {index}')}
+                    for index in range(runtime.config.process.max_child_processes)
+                ],
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fail exhausted compaction')
+            _seed_context_entries(runtime, pid, count=40)
+
+            failed = None
+            for _ in range(80):
+                result = runtime.run_next_process_once()
+                if (
+                    isinstance(result, dict)
+                    and result.get('action', {}).get('action') == 'compact_process_context'
+                    and result.get('result', {}).get('ok') is False
+                ):
+                    failed = result
+                    break
+
+            assert failed is not None
+            assert 'exhausted child process budget' in (failed['result']['error'] or '')
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['status'] == 'failed'
+            assert 'exhausted child process budget' in job.payload['error']
+            assert len(runtime.process.list_children(pid)) == runtime.config.process.max_child_processes
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_version_race_does_not_overwrite_new_context(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': 'compact_process_context',
+                    'force': True,
+                    'target_tokens': 512,
+                    'max_chunks': 1,
+                },
+                {'action': 'process_exit', 'payload': _compact_summary('stale summary')},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='race context')
+
+            waiting = runtime.run_next_process_once()
+            assert waiting['waiting_event']
+            context = runtime.store.get_object_by_name(context_object_name(pid), namespace=runtime.memory.resolve_namespace(pid))
+            assert context is not None
+            handle = runtime.memory.handle_for_name(
+                pid,
+                context_object_name(pid),
+                rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+            )
+            changed_payload = json.loads(json.dumps(context.payload))
+            changed_payload['entries'].append({'kind': 'external_update', 'value': 'must survive'})
+            runtime.memory.update_object(pid, handle, ObjectPatch(payload=changed_payload))
+
+            results = runtime.run_until_idle(max_quanta=2)
+
+            completed = _last_action_result(results, 'compact_process_context')
+            assert completed['result']['ok'] is False
+            assert 'changed during compaction' in (completed['result']['error'] or '')
+            after = runtime.store.get_object(context.oid)
+            assert after is not None
+            assert after.payload['entries'][-1] == {'kind': 'external_update', 'value': 'must survive'}
+            assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_uses_multiple_chunks(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {
+                    'action': 'compact_process_context',
+                    'force': True,
+                    'target_tokens': 512,
+                    'max_chunks': 2,
+                    'preserve_recent_entries': 0,
+                },
+                {'action': 'process_exit', 'payload': _compact_summary('stage one')},
+                {'action': 'process_exit', 'payload': _compact_summary('stage two')},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='multi chunk context')
+
+            results = runtime.run_until_idle(max_quanta=5)
+
+            completed = _last_action_result(results, 'compact_process_context')
+            assert completed['result']['ok']
+            output = completed['result']['payload']
+            assert output['compacted'] is True
+            assert len(output['compressor_pids']) == 2
+            context = runtime.store.get_object_by_name(context_object_name(pid), namespace=runtime.memory.resolve_namespace(pid))
+            assert context is not None
+            summary_goal = context.payload['entries'][0]['summary']['goal']
+            assert summary_goal == ['stage one', 'stage two']
+            assert context.payload['entries'][0]['compaction_metadata']['stage_count'] == 2
+        finally:
+            runtime.close()
+
+    def test_pending_context_compaction_survives_runtime_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                runtime.llm.client = RecordingActionClient([
+                    {
+                        'action': 'compact_process_context',
+                        'force': True,
+                        'target_tokens': 512,
+                        'max_chunks': 1,
+                    }
+                ])
+                pid = runtime.process.spawn(image='base-agent:v0', goal='reopen compaction')
+                waiting = runtime.run_next_process_once()
+                assert waiting['waiting_event']
+                assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'child'
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db)
+            try:
+                reopened.llm.client = RecordingActionClient([
+                    {'action': 'process_exit', 'payload': _compact_summary('reopened state')},
+                ])
+                results = reopened.run_until_idle(max_quanta=2)
+                completed = _last_action_result(results, 'compact_process_context')
+                assert completed['result']['ok']
+                context = reopened.store.get_object_by_name(context_object_name(pid), namespace=reopened.memory.resolve_namespace(pid))
+                assert context is not None
+                assert context.payload['entries'][0]['summary']['goal'] == 'reopened state'
+                assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
+            finally:
+                reopened.close()
+
+    def test_reopen_after_compressor_exit_reruns_missing_result_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                runtime.llm.client = RecordingActionClient([
+                    {
+                        'action': 'compact_process_context',
+                        'force': True,
+                        'target_tokens': 512,
+                        'max_chunks': 1,
+                    },
+                    {'action': 'process_exit', 'payload': _compact_summary('lost result')},
+                ])
+                pid = runtime.process.spawn(image='base-agent:v0', goal='rerun missing child result')
+                waiting = runtime.run_next_process_once()
+                child_pid = waiting['child_pid']
+                child_exit = runtime.run_process_once(child_pid)
+                assert child_exit['result']['ok']
+                assert runtime.store.get_llm_pending_action(pid)['status'] == 'pending'
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db)
+            try:
+                reopened.llm.client = RecordingActionClient([
+                    {'action': 'process_exit', 'payload': _compact_summary('rerun result')},
+                ])
+                results = reopened.run_until_idle(max_quanta=3)
+                completed = _last_action_result(results, 'compact_process_context')
+                assert completed['result']['ok']
+                output = completed['result']['payload']
+                assert len(output['compressor_pids']) == 2
+                context = reopened.store.get_object_by_name(context_object_name(pid), namespace=reopened.memory.resolve_namespace(pid))
+                assert context is not None
+                assert context.payload['entries'][0]['summary']['goal'] == 'rerun result'
+                assert context.payload['entries'][0]['compaction_metadata']['discarded_compressor_pids']
+            finally:
+                reopened.close()
+
 def _register_multiplexed_image(
     runtime: Runtime,
     *,
@@ -470,3 +794,45 @@ class ExplodingClient:
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         raise AssertionError('LLM client should not be called when the process image is missing')
+
+
+def _compact_summary(goal: str) -> dict[str, Any]:
+    return {
+        'goal': goal,
+        'constraints': ['preserve exact ids'],
+        'user_preferences': [],
+        'completed': [],
+        'pending': ['continue from compacted state'],
+        'key_references': {},
+        'recent_decisions': [],
+        'risks': [],
+        'uncertainties': [],
+        'next_steps': ['resume caller process'],
+    }
+
+
+def _last_action_result(results: list[Any], action: str) -> dict[str, Any]:
+    for result in reversed(results):
+        if isinstance(result, dict) and result.get('action', {}).get('action') == action:
+            return result
+    raise AssertionError(f'action result not found: {action}')
+
+
+def _seed_context_entries(runtime: Runtime, pid: str, *, count: int) -> Any:
+    process = runtime.process.get(pid)
+    handle = runtime.llm.context_memory.ensure(
+        pid,
+        runtime.images[process.image_id],
+        process,
+        runtime.tools.visible_tools(pid),
+    )
+    context = runtime.memory.get_object(pid, handle)
+    payload = json.loads(json.dumps(context.payload))
+    payload['entries'].extend({'kind': 'seed_entry', 'index': index} for index in range(count))
+    write_handle = runtime.memory.handle_for_name(
+        pid,
+        context_object_name(pid),
+        rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+    )
+    updated = runtime.memory.update_object(pid, write_handle, ObjectPatch(payload=payload))
+    return runtime.memory.get_object(pid, updated)

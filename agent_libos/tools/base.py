@@ -144,6 +144,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
         policy = self.policy.model_dump()
         _apply_runtime_policy_overrides(policy, selected_config)
         input_schema = self.args_schema.model_json_schema()
+        _strip_internal_schema_fields(input_schema)
         _apply_runtime_schema_overrides(self.name, input_schema, selected_config)
         return ToolSpec(
             name=self.name,
@@ -477,6 +478,19 @@ def _set_property_default(properties: dict[str, Any], field: str, value: Any) ->
     prop = properties.get(field)
     if isinstance(prop, dict):
         prop["default"] = value
+
+
+def _strip_internal_schema_fields(schema: dict[str, Any]) -> None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    required = schema.get("required")
+    for name, prop in list(properties.items()):
+        if isinstance(prop, dict) and prop.get("x-agent-libos-internal"):
+            properties.pop(name, None)
+            if isinstance(required, list):
+                while name in required:
+                    required.remove(name)
 
 
 def _set_number_bounds(

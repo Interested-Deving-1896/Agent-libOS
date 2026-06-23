@@ -21,6 +21,8 @@ The current built-in tool surface includes tools for:
 - Clock: current time and async sleep.
 - Process lifecycle: fork, spawn, wait, list children, signal, merge memory,
   exec, exit, cwd get/set, and process messages.
+- Context: `compact_process_context` compresses the caller's
+  `llm_context:<pid>` object through a `context-compressor:v0` child process.
 - Shell: argv-only subprocess execution through policy.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
 - Image registry: load image manifests from YAML.
@@ -30,6 +32,37 @@ The current built-in tool surface includes tools for:
 - Utility actions such as `echo` and `parse_pytest_log`.
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
+
+## Context Compaction
+
+`compact_process_context` is a model-visible wrapper for bounded long-running
+sessions. It reads the caller process' `llm_context:<pid>` object, spawns a
+`context-compressor:v0` child image with only `process_exit` visible, and
+replaces the caller context with one `context_compacted` entry plus the recent
+verbatim entries requested by `preserve_recent_entries`.
+
+The writeback path is method-neutral: different compressors may produce the
+standard compact summary contract, while the LLM context helper records
+`compaction_method` and `compaction_metadata` on the `context_compacted` entry
+and owns the schema validation, version check, and replacement.
+
+The tool does not grant external resource authority to the compressor. The
+compressor child receives only the current chunk, prior stage summary, and stage
+goal material needed for summarization; filesystem, shell, memory-write,
+JSON-RPC, human, Skill, checkpoint, and process-control access remain absent
+unless separately granted by normal primitives. The wrapper is visible to the
+model, but Object Memory and Process primitives still enforce reads, writes,
+child creation, waiting, resource budgets, audit, and lifecycle.
+
+Compaction is fail-closed. If the compressor fails or is killed, returns an
+invalid or empty schema, the source context version changes before final
+writeback, resource limits are exceeded, or the durable pending state cannot be
+resumed, the tool returns failure and leaves the original materialized context
+unchanged. Pending child waits store the minimum resume state in
+`llm_pending_actions`; after runtime reopen the compressor child goal can be
+reconstructed and the final compacted context is recreated under the same
+`llm_context:<pid>` name when the old runtime-only payload is no longer
+materializable.
 
 ## Workflow Entry Point
 

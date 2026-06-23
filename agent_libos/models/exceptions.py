@@ -24,9 +24,10 @@ class HumanResponseRequired(HumanApprovalRequired):
 
 
 class ProcessWaitRequired(LibOSError):
-    def __init__(self, child_pid: str, message: str):
+    def __init__(self, child_pid: str, message: str, resume_action: dict | None = None):
         super().__init__(message)
         self.child_pid = child_pid
+        self.resume_action = dict(resume_action) if resume_action is not None else None
 
 
 class ProcessMessageWaitRequired(LibOSError):

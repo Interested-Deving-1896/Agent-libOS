@@ -186,7 +186,7 @@ class LLMProcessExecutor:
             except ProcessWaitRequired as exc:
                 return self._wait_for_child_action(
                     pid=pid,
-                    action=action,
+                    action=exc.resume_action or action,
                     child_pid=exc.child_pid,
                     message=str(exc),
                     content_preview=completion.content[: self.config.llm.content_preview_chars],
@@ -431,7 +431,7 @@ class LLMProcessExecutor:
             except ProcessWaitRequired as exc:
                 return self._wait_for_child_action(
                     pid=pid,
-                    action=action,
+                    action=exc.resume_action or action,
                     child_pid=exc.child_pid,
                     message=str(exc),
                     content_preview=str(pending.get("content_preview", "")),
@@ -475,11 +475,18 @@ class LLMProcessExecutor:
         action = dict(pending["action"])
         self._pending_wait_actions.pop(pid, None)
         try:
-            result = await self.adispatch(pid, action)
+            result = await self.adispatch(
+                pid,
+                action,
+                context_metadata={
+                    "pending_child_resume": True,
+                    "pending_child_pid": child_pid,
+                },
+            )
         except ProcessWaitRequired as exc:
             return self._wait_for_child_action(
                 pid=pid,
-                action=action,
+                action=exc.resume_action or action,
                 child_pid=exc.child_pid,
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
@@ -543,7 +550,7 @@ class LLMProcessExecutor:
         except ProcessWaitRequired as exc:
             return self._wait_for_child_action(
                 pid=pid,
-                action=action,
+                action=exc.resume_action or action,
                 child_pid=exc.child_pid,
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
@@ -1042,6 +1049,21 @@ class LLMProcessExecutor:
             if wait_type == "human" and pending.get("request_id"):
                 self._pending_human_actions[pid] = {**common, "request_id": str(pending["request_id"])}
             elif wait_type == "child" and pending.get("child_pid"):
-                self._pending_wait_actions[pid] = {**common, "child_pid": str(pending["child_pid"])}
+                restored = {**common, "child_pid": str(pending["child_pid"])}
+                self._pending_wait_actions[pid] = restored
+                self._restore_pending_compaction_child_goal({**pending, **restored})
             elif wait_type == "message":
                 self._pending_message_actions[pid] = {**common, "filters": dict(pending.get("filters") or {})}
+
+    def _restore_pending_compaction_child_goal(self, pending: dict[str, Any]) -> None:
+        try:
+            from agent_libos.tools.builtin.context import restore_pending_compaction_child_goal
+
+            restore_pending_compaction_child_goal(self.runtime, pending)
+        except Exception as exc:
+            self.runtime.audit.record(
+                actor="llm.executor",
+                action="llm.pending_compaction_child_restore_failed",
+                target=f"process:{pending.get('pid')}",
+                decision={"error": str(exc), "child_pid": pending.get("child_pid")},
+            )

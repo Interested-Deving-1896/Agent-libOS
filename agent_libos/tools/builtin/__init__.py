@@ -14,6 +14,7 @@ from agent_libos.tools.builtin.checkpoint import (
     ListCheckpointsTool,
     RestoreCheckpointTool,
 )
+from agent_libos.tools.builtin.context import CompactProcessContextTool
 from agent_libos.tools.builtin.filesystem import (
     DeleteDirectoryTool,
     DeleteFileTool,
@@ -77,6 +78,7 @@ __all__ = [
     "AppendMemoryObjectTool",
     "CallJsonRpcMethodTool",
     "CancelObjectTaskTool",
+    "CompactProcessContextTool",
     "CommitCheckpointToImageTool",
     "DeleteDirectoryTool",
     "DeleteFileTool",

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import ResourceLimitExceeded
+from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.utils.ids import estimate_tokens, utc_now
 from agent_libos.models import (
     AgentImage,
@@ -163,6 +164,194 @@ class LLMContextMemory:
             lines.append("---")
             lines.append(_stable_json(entry))
         return "\n".join(lines).rstrip()
+
+    def replace_with_compacted_summary(
+        self,
+        pid: str,
+        *,
+        context_oid: str,
+        expected_version: int,
+        summary: dict[str, Any],
+        compaction_method: str,
+        compaction_metadata: dict[str, Any] | None = None,
+        preserve_recent_entries: int,
+        source_tokens: int,
+        target_tokens: int,
+        compressor_pids: list[str],
+        source_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically replace LLM context entries with a validated compact summary."""
+        obj = self.runtime.store.get_object(context_oid)
+        if obj is None and source_payload is None:
+            raise ValidationError(f"LLM context object not found: {context_oid}")
+        if obj is not None and obj.version != expected_version:
+            raise ValidationError(
+                "LLM context changed during compaction: "
+                f"expected version {expected_version}, found {obj.version}"
+            )
+        if obj is None:
+            current = self.runtime.store.get_object_by_name(
+                context_object_name(pid),
+                namespace=self.runtime.memory.resolve_namespace(pid),
+            )
+            if current is not None:
+                raise ValidationError(
+                    "LLM context changed during compaction: "
+                    f"expected missing oid {context_oid}, found {current.oid} version {current.version}"
+                )
+            payload = self._payload_dict(source_payload)
+        else:
+            payload = self._payload(obj)
+        compacted_payload, compacted_tokens, preserved_count = self._build_compacted_payload(
+            context_oid=context_oid,
+            expected_version=expected_version,
+            payload=payload,
+            summary=summary,
+            compaction_method=compaction_method,
+            compaction_metadata=compaction_metadata,
+            preserve_recent_entries=preserve_recent_entries,
+            source_tokens=source_tokens,
+            target_tokens=target_tokens,
+            compressor_pids=compressor_pids,
+        )
+        metadata = ObjectMetadata(
+            title=f"LLM context for {pid}",
+            summary="Compacted process prompt context optimized for bounded long-running sessions.",
+            tags=["llm_context", "prompt_cache", "compacted", f"compaction_method:{compaction_method}"],
+            token_estimate=estimate_tokens(compacted_payload),
+        )
+        if obj is None:
+            handle = self.runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.PROCESS_STATE,
+                payload=compacted_payload,
+                metadata=metadata,
+                immutable=False,
+                name=context_object_name(pid),
+            )
+            updated_obj = self.runtime.memory.get_object(pid, handle)
+        else:
+            handle = self.runtime.memory.handle_for_oid(
+                pid,
+                context_oid,
+                required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+                optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
+                issued_by="llm.context.compact",
+            )
+            updated = self.runtime.memory.update_object(
+                pid,
+                handle,
+                ObjectPatch(payload=compacted_payload, metadata=metadata),
+            )
+            updated_obj = self.runtime.memory.get_object(pid, updated)
+        view_handle = self.runtime.capability.handle_for_object(
+            pid,
+            updated_obj.oid,
+            {
+                ObjectRight.READ.value,
+                ObjectRight.WRITE.value,
+                ObjectRight.MATERIALIZE.value,
+                ObjectRight.LINK.value,
+                ObjectRight.DIFF.value,
+            },
+            issued_by="llm.context.compact",
+        )
+        self._add_handle_to_view(pid, view_handle)
+        return {
+            "context_oid": updated_obj.oid,
+            "old_version": expected_version,
+            "new_version": updated_obj.version,
+            "source_tokens": source_tokens,
+            "compacted_tokens": compacted_tokens,
+            "preserved_recent_entries": preserved_count,
+        }
+
+    def _build_compacted_payload(
+        self,
+        *,
+        context_oid: str,
+        expected_version: int,
+        payload: dict[str, Any],
+        summary: dict[str, Any],
+        compaction_method: str,
+        compaction_metadata: dict[str, Any] | None,
+        preserve_recent_entries: int,
+        source_tokens: int,
+        target_tokens: int,
+        compressor_pids: list[str],
+    ) -> tuple[dict[str, Any], int, int]:
+        compact_summary = self._validate_compact_summary(summary)
+        selected_method = self._validate_compaction_method(compaction_method)
+        selected_metadata = self._validate_compaction_metadata(compaction_metadata)
+        entries = list(payload.get("entries", []))
+        preserved_count = max(0, min(int(preserve_recent_entries), len(entries)))
+        preserved_entries = deepcopy(entries[-preserved_count:]) if preserved_count else []
+        compacted_payload = deepcopy(payload)
+        compact_entry = {
+            "kind": "context_compacted",
+            "at": utc_now(),
+            "source_oid": context_oid,
+            "source_version": expected_version,
+            "source_entry_count": len(entries),
+            "source_tokens": source_tokens,
+            "target_tokens": target_tokens,
+            "compaction_method": selected_method,
+            "compaction_metadata": selected_metadata,
+            "compressor_pids": list(compressor_pids),
+            "summary": compact_summary,
+            "preserved_recent_entries": preserved_count,
+        }
+        compacted_payload["entries"] = [compact_entry, *preserved_entries]
+        compacted_payload["cache_strategy"] = {
+            **dict(compacted_payload.get("cache_strategy") or {}),
+            "mode": "compacted_stable_prefix",
+            "reason": (
+                "Older append-only entries were summarized by context compaction; "
+                "recent entries remain verbatim."
+            ),
+            "compacted_at": compact_entry["at"],
+        }
+        rendered = self.render(compacted_payload)
+        compacted_tokens = estimate_tokens(rendered)
+        compact_entry["compacted_tokens"] = compacted_tokens
+        return compacted_payload, compacted_tokens, preserved_count
+
+    def _validate_compaction_method(self, method: str) -> str:
+        if not isinstance(method, str) or not method.strip():
+            raise ValidationError("context compaction method must be a non-empty string")
+        selected = method.strip()
+        if len(selected) > 128:
+            raise ValidationError("context compaction method is too long")
+        return selected
+
+    def _validate_compaction_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, dict):
+            raise ValidationError("context compaction metadata must be a JSON object")
+        return deepcopy(metadata)
+
+    def _validate_compact_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(summary, dict):
+            raise ValidationError("context compaction summary must be a JSON object")
+        required = {
+            "goal",
+            "constraints",
+            "user_preferences",
+            "completed",
+            "pending",
+            "key_references",
+            "recent_decisions",
+            "risks",
+            "uncertainties",
+            "next_steps",
+        }
+        missing = sorted(required - set(summary))
+        if missing:
+            raise ValidationError(f"context compaction summary missing fields: {missing}")
+        if not any(summary.get(key) for key in required):
+            raise ValidationError("context compaction summary is empty")
+        return deepcopy(summary)
 
     def _initial_payload(
         self,
@@ -325,9 +514,12 @@ class LLMContextMemory:
         return {"version": obj.version, "updated_at": obj.updated_at}
 
     def _payload(self, obj: AgentObject) -> dict[str, Any]:
-        if not isinstance(obj.payload, dict) or obj.payload.get("kind") != "llm_context":
-            raise ValueError(f"object is not an LLM context object: {obj.name}")
-        return obj.payload
+        return self._payload_dict(obj.payload, label=obj.name)
+
+    def _payload_dict(self, payload: Any, *, label: str = "payload") -> dict[str, Any]:
+        if not isinstance(payload, dict) or payload.get("kind") != "llm_context":
+            raise ValidationError(f"object is not an LLM context object: {label}")
+        return payload
 
     def _context_oid(self, pid: str) -> str | None:
         obj = self.runtime.store.get_object_by_name(
