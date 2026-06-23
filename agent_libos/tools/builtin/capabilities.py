@@ -93,7 +93,7 @@ class DelegateCapabilityTool(SyncAgentTool[DelegateCapabilityArgs]):
     description = "Delegate an attenuated capability to a direct child process."
     args_schema = DelegateCapabilityArgs
     output_schema = DelegateCapabilityOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False)
+    policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"capability.write"})
     tags = ["capability", "authority"]
 
     def run(self, args: DelegateCapabilityArgs, ctx: ToolContext) -> DelegateCapabilityOutput:
@@ -127,7 +127,7 @@ class RevokeCapabilityTool(SyncAgentTool[RevokeCapabilityArgs]):
     description = "Revoke a capability when the current process has holder, issuer, revoke, or admin authority."
     args_schema = RevokeCapabilityArgs
     output_schema = RevokeCapabilityOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False)
+    policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"capability.write"})
     tags = ["capability", "authority"]
 
     def run(self, args: RevokeCapabilityArgs, ctx: ToolContext) -> RevokeCapabilityOutput:

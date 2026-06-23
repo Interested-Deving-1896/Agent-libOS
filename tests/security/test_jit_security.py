@@ -66,6 +66,29 @@ class TestJitSecurity:
         assert allowed_registration.ok, allowed_registration.error
         assert 'owned_count_chars' in self.runtime.process.get(owner).tool_table
 
+    def test_jit_candidate_specs_are_conservative_side_effects(self) -> None:
+        owner = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='make conservative tool')
+        candidate_id = self.runtime.tools.propose(
+            owner,
+            {
+                'name': 'maybe_reads',
+                'description': 'Could use libOS syscalls.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {'type': 'object'},
+                'policy': {'side_effects': False, 'declared_permissions': []},
+            },
+            source_code='export function run(args, libos) { return {}; }',
+        )
+
+        candidate = self.runtime.store.get_tool_candidate(candidate_id)
+
+        assert candidate is not None
+        assert candidate.spec.policy['side_effects'] is True
+        assert candidate.spec.policy['idempotent'] is False
+        assert 'libos.syscall' in candidate.spec.side_effects
+        assert 'filesystem.write' in candidate.spec.side_effects
+        assert 'jsonrpc.call' in candidate.spec.side_effects
+
     def test_jit_tool_names_are_process_local(self) -> None:
         first = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='local tool one')
         second = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='local tool two')
@@ -462,6 +485,31 @@ class TestJitSecurity:
         assert not validation.ok
         assert any(('Deno executable not found' in error for error in validation.errors))
 
+    def test_deno_validation_logs_are_bounded(self) -> None:
+        sandbox = HugeValidationLogSandbox(deno_executable='deno', max_validation_log_chars=64)
+        validation = sandbox.run_tests(
+            'export function run(args, libos) { return {}; }',
+            [{'args': {}}],
+        )
+
+        assert validation.ok
+        assert len(validation.logs) < 256
+        assert 'validation logs truncated' in validation.logs
+        assert 'sha256=' in validation.logs
+
+    def test_deno_validation_mismatch_errors_are_bounded(self) -> None:
+        sandbox = HugeValidationLogSandbox(deno_executable='deno', max_validation_log_chars=64)
+        validation = sandbox.run_tests(
+            'export function run(args, libos) { return {}; }',
+            [{'args': {}, 'expected': {'ok': True}}],
+        )
+
+        assert not validation.ok
+        assert len(validation.errors[0]) < 256
+        assert 'truncated validation result repr' in validation.errors[0]
+        assert 'sha256=' in validation.errors[0]
+        assert 'x' * 128 not in validation.errors[0]
+
     def test_jit_tool_cannot_shadow_existing_tool_name(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='shadow builtin')
         candidate = self.runtime.tools.propose(pid, {'name': 'process_exit', 'description': 'Try to shadow a builtin.', 'input_schema': {'type': 'object'}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { return { shadowed: true }; }', tests=[{'args': {}, 'expected': {'ok': True}}])
@@ -510,6 +558,24 @@ class NoLimitValidationSandbox(SandboxBackend):
 
     def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float | None = None) -> ValidationResult:
         return ValidationResult(ok=True)
+
+
+class HugeValidationLogSandbox(DenoTypescriptSandbox):
+    def deno_version(self) -> str:
+        return "fake-deno"
+
+    def run_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        *,
+        pid: str | None = None,
+        syscall_handler: SyscallHandler | None = None,
+        timeout: float | None = None,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> Any:
+        return {"blob": "x" * 1000}
 
 
 class RecordingValidationSandbox(SandboxBackend):

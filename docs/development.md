@@ -161,7 +161,7 @@ numeric limits are negative, non-finite, inverted, or otherwise unsafe.
 Current default groups include:
 
 - runtime database and default ids,
-- scheduler quanta and poll interval,
+- scheduler quantum, worker, drain, and shutdown limits,
 - process resource budgets, usage accounting, and default cwd,
 - LLM timeouts and provider compatibility knobs,
 - tool limits and text encodings,

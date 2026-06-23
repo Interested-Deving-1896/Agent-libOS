@@ -33,6 +33,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   context materialization uses current payload token estimates.
 - `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
   remains mergeable, then is adopted or released by the parent lifecycle.
+- `object-memory-lifecycle-is-explicit`: Object Memory ownership, release, and
+  RAII cleanup are explicit and revoke stale authority.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, consume one-shot grants, are decided exactly once from pending state,
   and route through primitives.
@@ -54,6 +56,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   and budgets rather than dangerous API regex blacklists.
 - `tool-policy-cannot-self-grant-authority`: ToolPolicy declarations cannot
   grant execution, resource authority, or confirmation.
+- `tool-result-size-boundary-is-explicit`: tool result payload limits prevent
+  unbounded result persistence while preserving committed side effects as
+  explicit omitted-success results instead of retryable failures.
 - `workflow-entry-uses-toolbroker-authority`: user-facing workflow entrypoints
   run tools through process tool tables, ToolBroker, result objects, and normal
   wait/exit/exec lifecycle semantics.

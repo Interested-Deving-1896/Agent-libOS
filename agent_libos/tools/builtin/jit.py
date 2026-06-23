@@ -70,7 +70,12 @@ class ProposeJitTool(SyncAgentTool[ProposeJitToolArgs]):
     )
     args_schema = ProposeJitToolArgs
     output_schema = ProposeJitToolOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.write", "tool.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["jit", "tool", "typescript"]
 
     def run(self, args: ProposeJitToolArgs, ctx: ToolContext) -> ProposeJitToolOutput:
@@ -98,7 +103,12 @@ class ValidateJitTool(SyncAgentTool[ValidateJitToolArgs]):
     description = "Validate a proposed Deno/TypeScript JIT tool with static checks and candidate tests."
     args_schema = ValidateJitToolArgs
     output_schema = ValidateJitToolOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"jit.validate", "tool.validate"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["jit", "tool", "typescript", "validation"]
 
     def run(self, args: ValidateJitToolArgs, ctx: ToolContext) -> ValidateJitToolOutput:
@@ -119,7 +129,12 @@ class RegisterJitTool(SyncAgentTool[RegisterJitToolArgs]):
     description = "Register a validated Deno/TypeScript JIT tool into the current process tool table."
     args_schema = RegisterJitToolArgs
     output_schema = RegisterJitToolOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"tool.write", "tool.table"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["jit", "tool", "typescript", "registration"]
 
     def run(self, args: RegisterJitToolArgs, ctx: ToolContext) -> RegisterJitToolOutput:

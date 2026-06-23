@@ -50,7 +50,12 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
     description = "Discover registered standard Agent Skills visible to this process."
     args_schema = DiscoverSkillsArgs
     output_schema = DiscoverSkillsOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=False,
+        idempotent=True,
+        declared_permissions={"skill.read"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["skill", "inspect"]
 
     def run(self, args: DiscoverSkillsArgs, ctx: ToolContext) -> DiscoverSkillsOutput:
@@ -64,7 +69,12 @@ class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
     description = "Activate a registered standard Agent Skill in this process."
     args_schema = ActivateSkillArgs
     output_schema = ActivateSkillOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"skill.read", "tool.write", "tool.table"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["skill", "activate"]
 
     def run(self, args: ActivateSkillArgs, ctx: ToolContext) -> ActivateSkillOutput:
@@ -76,7 +86,12 @@ class ReadSkillResourceTool(SyncAgentTool[ReadSkillResourceArgs]):
     description = "Read a bundled resource from a loaded standard Agent Skill snapshot."
     args_schema = ReadSkillResourceArgs
     output_schema = ReadSkillResourceOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=False,
+        idempotent=True,
+        declared_permissions={"skill.read"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["skill", "resource", "inspect"]
 
     def run(self, args: ReadSkillResourceArgs, ctx: ToolContext) -> ReadSkillResourceOutput:
@@ -96,7 +111,12 @@ class UnloadSkillTool(SyncAgentTool[UnloadSkillArgs]):
     description = "Unload a skill from this process tool table and prompt context."
     args_schema = UnloadSkillArgs
     output_schema = UnloadSkillOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"tool.table"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["skill", "unload"]
 
     def run(self, args: UnloadSkillArgs, ctx: ToolContext) -> UnloadSkillOutput:

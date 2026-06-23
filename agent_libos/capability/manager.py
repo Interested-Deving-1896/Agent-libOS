@@ -339,6 +339,29 @@ class CapabilityManager:
                 )
                 return self._record_decision(decision, audit=audit)
             if not all(bool(item.get("ok")) for item in constraint_results.values()):
+                restrictive_constraint_failed = (
+                    cap.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}
+                    and not self._constraint_failure_is_scoped_miss(constraint_results)
+                )
+                if restrictive_constraint_failed:
+                    # Restrictive policy records must fail closed. The one
+                    # exception is an AuthorityRule deny/ask whose rule simply
+                    # does not match this operation; that is a scoped miss, not
+                    # a malformed restriction.
+                    decision = CapabilityDecision(
+                        subject=subject,
+                        resource=resource,
+                        right=requested_right,
+                        allowed=False,
+                        effect=CapabilityEffect.DENY,
+                        reason=f"capability constraints denied {requested_right} on {resource}",
+                        matched_capability_ids=matched_ids,
+                        selected_capability_id=cap.cap_id,
+                        issuer_chain=self._issuer_chain(cap),
+                        constraint_results=constraint_results,
+                        context=selected_context,
+                    )
+                    return self._record_decision(decision, audit=audit)
                 failed_constraints.append((cap, constraint_results))
                 continue
             if cap.effect == CapabilityEffect.DENY:
@@ -585,6 +608,36 @@ class CapabilityManager:
             decision={"reason": reason, "subject": cap.subject},
         )
         return updated
+
+    def revoke_resource_trusted(
+        self,
+        resource: str,
+        *,
+        revoked_by: str,
+        reason: str | None = None,
+    ) -> list[Capability]:
+        revoked: list[Capability] = []
+        for cap in self.store.list_capabilities():
+            if cap.resource != resource or not cap.active:
+                continue
+            updated = replace(cap, status=CapabilityStatus.REVOKED)
+            self.store.update_capability(updated)
+            revoked.append(updated)
+            self.events.emit(
+                EventType.CAPABILITY_REVOKED,
+                source=revoked_by,
+                target=cap.subject,
+                payload={"capability_id": cap.cap_id, "reason": reason},
+            )
+        if revoked:
+            self.audit.record(
+                actor=revoked_by,
+                action="capability.revoke_resource",
+                target=resource,
+                capability_refs=[cap.cap_id for cap in revoked],
+                decision={"revoked": len(revoked), "reason": reason},
+            )
+        return revoked
 
     def authorize_handle(self, subject: str, handle: ObjectHandle, right: str | CapabilityRight) -> CapabilityDecision:
         requested = str(right)
@@ -1123,6 +1176,17 @@ class CapabilityManager:
         if CapabilityEffect.ALLOW.value in effects:
             return CapabilityEffect.ALLOW
         return None
+
+    def _constraint_failure_is_scoped_miss(self, constraint_results: dict[str, Any]) -> bool:
+        failed = {
+            key: result
+            for key, result in constraint_results.items()
+            if not bool(result.get("ok"))
+        }
+        return (
+            set(failed) == {AUTHORITY_RULES_KEY}
+            and failed[AUTHORITY_RULES_KEY].get("reason") == "no authority rule matched operation context"
+        )
 
     def _evaluate_authority_rules(self, rules: list[Any], context: dict[str, Any]) -> dict[str, Any]:
         operation = str(context.get("authority_operation") or context.get("operation") or "")

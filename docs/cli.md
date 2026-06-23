@@ -35,12 +35,13 @@ processes     print process table
 resources     print process resource budget, usage, and remaining budget
 tools         print registered tools
 workflow      run a user-facing workflow tool directly
+object-task   start, inspect, wait for, watch, or cancel Object tasks
 spawn         spawn a process
 cd            set a process working directory
 exec          replace a process image and goal
 exit          exit a process
 llm-once      run one LLM quantum for one process
-run           run the async scheduler
+run           run the process scheduler
 message       send a normal human process message
 interrupt     send a human interrupt process message
 checkpoint    checkpoint subcommands
@@ -66,10 +67,10 @@ uv run agent-libos --db .agent_libos.sqlite tools
 uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
 
-`run` uses the high-level async supervisor, so human terminal messages are
+`run` uses the high-level runtime scheduler, so human terminal messages are
 processed as part of runtime execution. Without `--max-quanta`, it runs until
-the runtime becomes idle; pass `--max-quanta <n>` to bound the number of LLM/tool
-quanta.
+the runtime becomes idle; pass `--max-quanta <n>` to bound the total number of
+LLM/tool quanta across all runnable processes.
 
 Manual queue processing remains available:
 

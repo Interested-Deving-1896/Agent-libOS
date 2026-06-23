@@ -11,6 +11,8 @@ Target venue: EuroSys 2027 Fall full paper submission
 Note: the 2026-09-24 AoE date is the working deadline used by this roadmap.
 Before artifact freeze, re-check the official CFP and submission system rather
 than treating this file as the source of truth for conference dates.
+This roadmap is not the implementation reference; use `README.md` and `docs/`
+for current runtime behavior, command syntax, and invariant coverage.
 
 ## 1. Submission Goal
 

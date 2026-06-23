@@ -14,10 +14,24 @@ Objects have:
 - version,
 - metadata,
 - payload,
+- creator provenance (`created_by`),
+- explicit owner (`owner_kind`, `owner_id`) and lifecycle state,
 - object capabilities.
 
 Object handles carry object-specific rights such as `read`, `write`,
 `materialize`, `link`, `diff`, or `delete`.
+
+`created_by` is provenance and does not drive cleanup. Runtime cleanup uses the
+explicit owner pair. Ordinary process-created objects start as
+`owner_kind=process`, `owner_id=<pid>`. A final result is retained by
+transferring it to `owner_kind=process_result`, and ObjectTask results are
+transferred to `owner_kind=object_task`.
+
+Object release is centralized in `ObjectMemoryManager`. Releasing an object
+marks the row as `released`, removes its runtime payload, deletes links that
+touch it, and revokes stale `object:<oid>` capabilities. Released objects are
+not returned by oid lookup, name lookup, namespace listing, or materialization;
+their namespace-local names can be reused by new live objects.
 
 ## Namespaces
 
@@ -116,6 +130,12 @@ Active tasks pin their owner object so process-exit cleanup cannot release it
 before the task reaches a terminal state; once the task is terminal, normal
 process-owned memory cleanup can release an owner whose creating process has
 already exited.
+
+Runtime-internal multi-step writes can use an Object Memory lifetime scope.
+Objects created in the scope are released automatically unless the scope is
+committed or the object is transferred to another owner. This is used for
+operations such as tool result creation where a later lifecycle step can still
+fail after the Object has been allocated.
 
 An ObjectTask can opt into owner watches. The Object Memory update, append, and
 link primitives notify active watching tasks after the object change and audit

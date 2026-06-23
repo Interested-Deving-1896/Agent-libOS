@@ -22,6 +22,7 @@ from agent_libos.models import (
     CapabilityRight,
     EventType,
     ObjectHandle,
+    ObjectOwnerKind,
     ProcessStatus,
     ResourceUsage,
     ToolCandidate,
@@ -168,6 +169,9 @@ class Runtime:
             store,
             self.audit,
             poll_interval_s=self.config.scheduler.poll_interval_s,
+            max_workers=self.config.scheduler.max_workers,
+            drain_window_s=self.config.scheduler.drain_window_s,
+            shutdown_join_timeout_s=self.config.scheduler.shutdown_join_timeout_s,
             resources=self.resources,
             skip_pid=self.object_tasks.is_runner_pid,
         )
@@ -336,6 +340,14 @@ class Runtime:
             target="runtime",
             payload={"reason": reason},
         )
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None and not scheduler.shutdown():
+            return {
+                "ok": False,
+                "already_shutdown": False,
+                "reason": reason,
+                "scheduler_stopped": False,
+            }
         for name, component in [
             ("object_tasks", getattr(self, "object_tasks", None)),
             ("llms", getattr(self, "llms", None)),
@@ -369,6 +381,14 @@ class Runtime:
             target="runtime",
             payload={"reason": reason},
         )
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None and not scheduler.shutdown():
+            return {
+                "ok": False,
+                "already_shutdown": False,
+                "reason": reason,
+                "scheduler_stopped": False,
+            }
         for name, component in [
             ("object_tasks", getattr(self, "object_tasks", None)),
             ("llms", getattr(self, "llms", None)),
@@ -447,19 +467,37 @@ class Runtime:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(
-                self.arun_until_idle(
-                    max_quanta=max_quanta,
-                    process_human_queue=process_human_queue,
-                    human=human,
-                    human_auto_approve=human_auto_approve,
-                    human_auto_policy=human_auto_policy,
-                    human_auto_answer=human_auto_answer,
-                )
+            return self._run_until_idle_sync(
+                max_quanta=max_quanta,
+                process_human_queue=process_human_queue,
+                human=human,
+                human_auto_approve=human_auto_approve,
+                human_auto_policy=human_auto_policy,
+                human_auto_answer=human_auto_answer,
             )
         raise RuntimeError("Cannot call run_until_idle() inside a running event loop. Use await arun_until_idle(...).")
 
     async def arun_until_idle(
+        self,
+        max_quanta: int | None = None,
+        *,
+        process_human_queue: bool = True,
+        human: str | None = None,
+        human_auto_approve: bool | None = None,
+        human_auto_policy: str | None = None,
+        human_auto_answer: str | None = None,
+    ) -> list[Any]:
+        return await asyncio.to_thread(
+            self._run_until_idle_sync,
+            max_quanta=max_quanta,
+            process_human_queue=process_human_queue,
+            human=human,
+            human_auto_approve=human_auto_approve,
+            human_auto_policy=human_auto_policy,
+            human_auto_answer=human_auto_answer,
+        )
+
+    def _run_until_idle_sync(
         self,
         max_quanta: int | None = None,
         *,
@@ -485,13 +523,13 @@ class Runtime:
                 # Run all currently runnable processes first. Human queue work below
                 # may wake a process, so this loop intentionally alternates between
                 # process execution and terminal queue draining.
-                batch = await self.scheduler.arun_until_idle(self.arun_process_once, max_quanta=remaining)
+                batch = self.scheduler.run_until_idle(self.arun_process_once, max_quanta=remaining)
                 results.extend(batch)
                 if remaining is not None:
                     remaining -= len(batch)
                 if not process_human_queue:
                     break
-                processed = await self.human.adrain_terminal_queue(
+                processed = self.human.drain_terminal_queue(
                     human=selected_human,
                     auto_approve=human_auto_approve,
                     auto_policy=human_auto_policy,
@@ -505,7 +543,6 @@ class Runtime:
                     target=f"human:{selected_human}",
                     decision={"request_ids": [request.request_id for request in processed]},
                 )
-                await asyncio.sleep(0)
         finally:
             (
                 self._current_human_auto_approve,
@@ -994,7 +1031,12 @@ class Runtime:
         process_rows = self.store.select_table_rows("processes", "pid = ?", (pid,))
         if not process_rows:
             raise NotFound(f"process not found: {pid}")
-        object_rows = self.store.select_table_rows("objects", "created_by = ?", (pid,), order_by="oid")
+        object_rows = self.store.select_table_rows(
+            "objects",
+            "owner_kind = ? AND owner_id = ? AND lifecycle_state = ?",
+            (ObjectOwnerKind.PROCESS.value, pid, "live"),
+            order_by="oid",
+        )
         object_oids = [str(row["oid"]) for row in object_rows]
         namespace_rows = self.store.select_table_rows(
             "object_namespaces",
@@ -1044,7 +1086,12 @@ class Runtime:
         pid = state["pid"]
         tables = state["tables"]
         current_process = self.store.get_process(pid)
-        current_object_rows = self.store.select_table_rows("objects", "created_by = ?", (pid,), order_by="oid")
+        current_object_rows = self.store.select_table_rows(
+            "objects",
+            "owner_kind = ? AND owner_id = ? AND lifecycle_state = ?",
+            (ObjectOwnerKind.PROCESS.value, pid, "live"),
+            order_by="oid",
+        )
         current_object_oids = [str(row["oid"]) for row in current_object_rows]
         object_oids = sorted(set(state["object_oids"]) | set(current_object_oids))
         namespace_names = sorted(
@@ -1069,6 +1116,10 @@ class Runtime:
                     [*object_oids, *object_oids],
                 )
                 cur.execute(f"DELETE FROM objects WHERE oid IN ({placeholders})", object_oids)
+                cur.execute(
+                    f"DELETE FROM capabilities WHERE resource IN ({placeholders})",
+                    [f"object:{oid}" for oid in object_oids],
+                )
                 for oid in object_oids:
                     self.store.forget_object_payload(oid)
             if namespace_names:
@@ -1313,7 +1364,6 @@ class Runtime:
                 description=str(item.get("description") or ""),
                 input_schema=dict(item.get("input_schema") or {}),
                 output_schema=dict(item.get("output_schema") or {}),
-                policy={"declared_permissions": [], "side_effects": False},
                 tags=["image", "jit", "package"],
                 metadata={
                     "image_id": image.image_id,
@@ -1499,6 +1549,10 @@ class Runtime:
             item["name"] = item["oid"]
         item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
         item["created_by"] = pid
+        item["owner_kind"] = ObjectOwnerKind.PROCESS.value
+        item["owner_id"] = pid
+        item["lifecycle_state"] = "live"
+        item["deleted_at"] = None
         provenance = loads(item.get("provenance_json"), {})
         provenance["parent_oids"] = [oid_map.get(oid, oid) for oid in provenance.get("parent_oids", [])]
         item["provenance_json"] = dumps(provenance)

@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 from reprlib import Repr
 from collections.abc import Callable
+from types import TracebackType
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
@@ -20,11 +21,13 @@ from agent_libos.models import (
     ObjectNamespace,
     ObjectFilter,
     ObjectHandle,
+    ObjectLifecycleState,
     ObjectLink,
     ObjectMetadata,
     ObjectPatch,
     ObjectQuery,
     ObjectRight,
+    ObjectOwnerKind,
     ObjectType,
     Provenance,
     RelationType,
@@ -37,6 +40,82 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
 from agent_libos.tools.observability import ensure_json_size
+
+
+class ObjectLifetimeScope:
+    """Runtime-internal RAII guard for multi-step Object Memory writes."""
+
+    def __init__(
+        self,
+        manager: ObjectMemoryManager,
+        *,
+        actor: str,
+        owner_kind: ObjectOwnerKind | str,
+        owner_id: str,
+        reason: str,
+    ) -> None:
+        self.manager = manager
+        self.actor = actor
+        self.owner_kind = ObjectOwnerKind(owner_kind)
+        self.owner_id = owner_id
+        self.reason = reason
+        self._oids: set[str] = set()
+        self._committed = False
+
+    def __enter__(self) -> ObjectLifetimeScope:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        if not self._committed:
+            for oid in sorted(self._oids):
+                self.manager.delete_object_trusted(
+                    self.actor,
+                    oid,
+                    reason=f"{self.reason}.scope_discard",
+                )
+        return False
+
+    def create_object(self, pid: str, *args: Any, **kwargs: Any) -> ObjectHandle:
+        kwargs.setdefault("owner_kind", self.owner_kind)
+        kwargs.setdefault("owner_id", self.owner_id)
+        handle = self.manager.create_object(pid, *args, **kwargs)
+        self._oids.add(handle.oid)
+        return handle
+
+    def track(self, handle_or_oid: ObjectHandle | str) -> None:
+        self._oids.add(handle_or_oid.oid if isinstance(handle_or_oid, ObjectHandle) else str(handle_or_oid))
+
+    def preserve(self, handle_or_oid: ObjectHandle | str) -> None:
+        self._oids.discard(handle_or_oid.oid if isinstance(handle_or_oid, ObjectHandle) else str(handle_or_oid))
+
+    def transfer(
+        self,
+        handle_or_oid: ObjectHandle | str,
+        *,
+        owner_kind: ObjectOwnerKind | str,
+        owner_id: str,
+    ) -> None:
+        oid = handle_or_oid.oid if isinstance(handle_or_oid, ObjectHandle) else str(handle_or_oid)
+        transferred = self.manager.transfer_owner(
+            self.owner_kind,
+            self.owner_id,
+            ObjectOwnerKind(owner_kind),
+            owner_id,
+            [oid],
+            actor=self.actor,
+            reason=f"{self.reason}.scope_transfer",
+        )
+        if oid in transferred:
+            self._oids.discard(oid)
+
+    def commit(self) -> None:
+        self._committed = True
+        self._oids.clear()
 
 
 class ObjectMemoryManager:
@@ -76,46 +155,54 @@ class ObjectMemoryManager:
         provenance: Provenance | None = None,
         name: str | None = None,
         namespace: str | None = None,
+        owner_kind: ObjectOwnerKind | str = ObjectOwnerKind.PROCESS,
+        owner_id: str | None = None,
     ) -> ObjectHandle:
-        now = utc_now()
         obj_type = ObjectType(object_type)
         self._validate_payload_size(payload, "object payload")
-        oid = new_id("obj")
-        object_namespace = self.resolve_namespace(pid, namespace)
-        object_name = self._normalize_name(name or self._default_name(obj_type, oid))
-        namespace_decision = self._require_namespace_right(pid, object_namespace, "write")
-        self._require_namespace_exists(object_namespace)
-        # Names are stable namespace directory entries, not authority. Reads by
-        # name still resolve to an oid and pass through object capability checks.
-        self._require_unique_name(object_name, object_namespace)
-        meta = self._metadata_for_payload(payload, metadata)
-        obj = AgentObject(
-            oid=oid,
-            namespace=object_namespace,
-            name=object_name,
-            type=obj_type,
-            schema_version=self.config.memory.object_schema_version,
-            payload=payload,
-            metadata=meta,
-            provenance=provenance or Provenance(created_from_action="memory.create_object"),
-            version=1,
-            immutable=immutable,
-            created_by=pid,
-            created_at=now,
-            updated_at=now,
-        )
-        self.store.insert_object(obj)
-        rights = {
-            ObjectRight.READ.value,
-            ObjectRight.LINK.value,
-            ObjectRight.DIFF.value,
-            ObjectRight.MATERIALIZE.value,
-            ObjectRight.DELETE.value,
-            ObjectRight.GRANT.value,
-        }
-        if not immutable:
-            rights.add(ObjectRight.WRITE.value)
-        handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory")
+        with self.store._lock:
+            now = utc_now()
+            oid = new_id("obj")
+            object_namespace = self.resolve_namespace(pid, namespace)
+            object_name = self._normalize_name(name or self._default_name(obj_type, oid))
+            namespace_decision = self._require_namespace_right(pid, object_namespace, "write")
+            self._require_namespace_exists(object_namespace)
+            # Names are stable namespace directory entries, not authority. Reads by
+            # name still resolve to an oid and pass through object capability checks.
+            self._require_unique_name(object_name, object_namespace)
+            meta = self._metadata_for_payload(payload, metadata)
+            obj = AgentObject(
+                oid=oid,
+                namespace=object_namespace,
+                name=object_name,
+                type=obj_type,
+                schema_version=self.config.memory.object_schema_version,
+                payload=payload,
+                metadata=meta,
+                provenance=provenance or Provenance(created_from_action="memory.create_object"),
+                version=1,
+                immutable=immutable,
+                created_by=pid,
+                created_at=now,
+                updated_at=now,
+                owner_kind=ObjectOwnerKind(owner_kind),
+                owner_id=owner_id or pid,
+                lifecycle_state=ObjectLifecycleState.LIVE,
+                deleted_at=None,
+            )
+            rights = {
+                ObjectRight.READ.value,
+                ObjectRight.LINK.value,
+                ObjectRight.DIFF.value,
+                ObjectRight.MATERIALIZE.value,
+                ObjectRight.DELETE.value,
+                ObjectRight.GRANT.value,
+            }
+            if not immutable:
+                rights.add(ObjectRight.WRITE.value)
+            self._consume_one_time_decision(namespace_decision)
+            self.store.insert_object(obj)
+            handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory")
         self.events.emit(
             EventType.OBJECT_CREATED,
             source=pid,
@@ -136,7 +223,6 @@ class ObjectMemoryManager:
             capability_refs=[handle.capability_id],
             decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
         )
-        self._consume_one_time_decision(namespace_decision)
         return handle
 
     def process_namespace(self, pid: str) -> str:
@@ -183,38 +269,39 @@ class ObjectMemoryManager:
         parent_namespace: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ObjectNamespace:
-        namespace_name = self._normalize_namespace(namespace)
-        if self.store.namespace_exists(namespace_name):
-            raise ValidationError(f"Object Memory namespace already exists: {namespace_name}")
-        parent = self._normalize_namespace(parent_namespace) if parent_namespace else self._parent_namespace(namespace_name)
-        parent_decision = None
-        if parent is not None:
-            parent_decision = self._require_namespace_right(pid, parent, "write")
-            self._require_namespace_exists(parent)
-        now = utc_now()
-        ns = ObjectNamespace(
-            namespace=namespace_name,
-            parent_namespace=parent,
-            metadata=dict(metadata or {}),
-            created_by=pid,
-            created_at=now,
-            updated_at=now,
-        )
-        self.store.insert_namespace(ns)
-        self.capabilities.grant(
-            subject=pid,
-            resource=self._namespace_resource(namespace_name),
-            rights=["read", "write", "admin"],
-            issued_by="memory.namespace",
-        )
+        with self.store._lock:
+            namespace_name = self._normalize_namespace(namespace)
+            if self.store.namespace_exists(namespace_name):
+                raise ValidationError(f"Object Memory namespace already exists: {namespace_name}")
+            parent = self._normalize_namespace(parent_namespace) if parent_namespace else self._parent_namespace(namespace_name)
+            parent_decision = None
+            if parent is not None:
+                parent_decision = self._require_namespace_right(pid, parent, "write")
+                self._require_namespace_exists(parent)
+            now = utc_now()
+            ns = ObjectNamespace(
+                namespace=namespace_name,
+                parent_namespace=parent,
+                metadata=dict(metadata or {}),
+                created_by=pid,
+                created_at=now,
+                updated_at=now,
+            )
+            if parent_decision is not None:
+                self._consume_one_time_decision(parent_decision)
+            self.store.insert_namespace(ns)
+            self.capabilities.grant(
+                subject=pid,
+                resource=self._namespace_resource(namespace_name),
+                rights=["read", "write", "admin"],
+                issued_by="memory.namespace",
+            )
         self.audit.record(
             actor=pid,
             action="memory.create_namespace",
             target=self._namespace_resource(namespace_name),
             decision={"namespace": namespace_name, "parent_namespace": parent},
         )
-        if parent_decision is not None:
-            self._consume_one_time_decision(parent_decision)
         return ns
 
     def get_namespace(self, pid: str, namespace: str | None = None) -> ObjectNamespace:
@@ -373,58 +460,62 @@ class ObjectMemoryManager:
         return handle
 
     def update_object(self, pid: str, handle: ObjectHandle, patch: ObjectPatch) -> ObjectHandle:
-        self.capabilities.assert_handle(pid, handle, ObjectRight.WRITE)
-        current = self.store.get_object(handle.oid)
-        if current is None:
-            raise NotFound(f"object not found: {handle.oid}")
-        if current.immutable:
-            raise CapabilityDenied(f"immutable object cannot be updated: {handle.oid}")
-        next_namespace = current.namespace
-        next_name = current.name
-        namespace_decisions = []
-        if patch.namespace is not None:
-            next_namespace = self._normalize_namespace(patch.namespace)
-            namespace_decisions.append(self._require_namespace_right(pid, next_namespace, "write"))
-            self._require_namespace_exists(next_namespace)
-        if patch.name is not None:
-            next_name = self._normalize_name(patch.name)
-        if next_namespace != current.namespace or next_name != current.name:
-            namespace_decisions.append(self._require_namespace_right(pid, current.namespace, "write"))
-            self._require_unique_name(next_name, next_namespace, except_oid=current.oid)
-        payload_is_set = patch.payload is not UNSET
-        if payload_is_set:
-            self._validate_payload_size(patch.payload, "object payload")
-        next_payload = current.payload if not payload_is_set else patch.payload
-        if patch.metadata is None:
-            next_metadata = (
-                current.metadata
-                if not payload_is_set
-                else self._metadata_for_payload(next_payload, current.metadata, force_token_estimate=True)
+        with self.store._lock:
+            write_decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.WRITE)
+            if not write_decision.allowed:
+                raise CapabilityDenied(write_decision.reason)
+            current = self.store.get_object(handle.oid)
+            if current is None:
+                raise NotFound(f"object not found: {handle.oid}")
+            if current.immutable:
+                raise CapabilityDenied(f"immutable object cannot be updated: {handle.oid}")
+            next_namespace = current.namespace
+            next_name = current.name
+            namespace_decisions = []
+            if patch.namespace is not None:
+                next_namespace = self._normalize_namespace(patch.namespace)
+                namespace_decisions.append(self._require_namespace_right(pid, next_namespace, "write"))
+                self._require_namespace_exists(next_namespace)
+            if patch.name is not None:
+                next_name = self._normalize_name(patch.name)
+            if next_namespace != current.namespace or next_name != current.name:
+                namespace_decisions.append(self._require_namespace_right(pid, current.namespace, "write"))
+                self._require_unique_name(next_name, next_namespace, except_oid=current.oid)
+            payload_is_set = patch.payload is not UNSET
+            if payload_is_set:
+                self._validate_payload_size(patch.payload, "object payload")
+            next_payload = current.payload if not payload_is_set else patch.payload
+            if patch.metadata is None:
+                next_metadata = (
+                    current.metadata
+                    if not payload_is_set
+                    else self._metadata_for_payload(next_payload, current.metadata, force_token_estimate=True)
+                )
+            else:
+                next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
+            changed_fields: list[str] = []
+            if payload_is_set:
+                changed_fields.append("payload")
+            if patch.metadata is not None:
+                changed_fields.append("metadata")
+            if patch.provenance is not None:
+                changed_fields.append("provenance")
+            if next_namespace != current.namespace:
+                changed_fields.append("namespace")
+            if next_name != current.name:
+                changed_fields.append("name")
+            updated = replace(
+                current,
+                namespace=next_namespace,
+                name=next_name,
+                payload=next_payload,
+                metadata=next_metadata,
+                provenance=current.provenance if patch.provenance is None else patch.provenance,
+                version=current.version + 1,
+                updated_at=utc_now(),
             )
-        else:
-            next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
-        changed_fields: list[str] = []
-        if payload_is_set:
-            changed_fields.append("payload")
-        if patch.metadata is not None:
-            changed_fields.append("metadata")
-        if patch.provenance is not None:
-            changed_fields.append("provenance")
-        if next_namespace != current.namespace:
-            changed_fields.append("namespace")
-        if next_name != current.name:
-            changed_fields.append("name")
-        updated = replace(
-            current,
-            namespace=next_namespace,
-            name=next_name,
-            payload=next_payload,
-            metadata=next_metadata,
-            provenance=current.provenance if patch.provenance is None else patch.provenance,
-            version=current.version + 1,
-            updated_at=utc_now(),
-        )
-        self.store.update_object(updated)
+            self._consume_one_time_decisions([write_decision, *namespace_decisions])
+            self.store.update_object(updated)
         event = self.events.emit(
             EventType.OBJECT_UPDATED,
             source=pid,
@@ -446,7 +537,6 @@ class ObjectMemoryManager:
             capability_refs=[handle.capability_id],
             decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
         )
-        self._consume_one_time_decisions(namespace_decisions)
         self._notify_object_changed(
             updated.oid,
             {
@@ -469,46 +559,47 @@ class ObjectMemoryManager:
         *,
         issued_by: str = "memory.append",
     ) -> tuple[AgentObject, str | None, int]:
-        object_namespace = self.resolve_namespace(pid, namespace)
-        object_name = self._normalize_name(name)
-        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
-        self._require_namespace_exists(object_namespace)
-        obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
-        if obj is None:
-            raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-        rights, decisions = self._authorized_object_rights(
-            pid,
-            obj.oid,
-            required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
-            optional_rights=set(),
-        )
-        if obj.immutable:
-            raise CapabilityDenied(f"immutable object cannot be updated: {obj.oid}")
-        ensure_json_size(entry, self.config.tools.memory_append_entry_max_bytes, "memory append entry")
-        payload = deepcopy(obj.payload)
-        if isinstance(payload, dict):
-            values = payload.setdefault(list_field, [])
-            if not isinstance(values, list):
-                raise ValidationError("target object list_field is not a list")
-            values.append(entry)
-            length = len(values)
-            output_list_field: str | None = list_field
-        elif isinstance(payload, list):
-            payload.append(entry)
-            length = len(payload)
-            output_list_field = None
-        else:
-            raise ValidationError("target object payload is not appendable")
-        self._validate_payload_size(payload, "memory payload")
-        updated = replace(
-            obj,
-            payload=payload,
-            metadata=self._metadata_for_payload(payload, obj.metadata, force_token_estimate=True),
-            version=obj.version + 1,
-            updated_at=utc_now(),
-        )
-        self.store.update_object(updated)
-        self._consume_one_time_decisions(decisions)
+        with self.store._lock:
+            object_namespace = self.resolve_namespace(pid, namespace)
+            object_name = self._normalize_name(name)
+            namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+            self._require_namespace_exists(object_namespace)
+            obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
+            if obj is None:
+                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+            rights, decisions = self._authorized_object_rights(
+                pid,
+                obj.oid,
+                required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+                optional_rights=set(),
+            )
+            if obj.immutable:
+                raise CapabilityDenied(f"immutable object cannot be updated: {obj.oid}")
+            ensure_json_size(entry, self.config.tools.memory_append_entry_max_bytes, "memory append entry")
+            payload = deepcopy(obj.payload)
+            if isinstance(payload, dict):
+                values = payload.setdefault(list_field, [])
+                if not isinstance(values, list):
+                    raise ValidationError("target object list_field is not a list")
+                values.append(entry)
+                length = len(values)
+                output_list_field: str | None = list_field
+            elif isinstance(payload, list):
+                payload.append(entry)
+                length = len(payload)
+                output_list_field = None
+            else:
+                raise ValidationError("target object payload is not appendable")
+            self._validate_payload_size(payload, "memory payload")
+            updated = replace(
+                obj,
+                payload=payload,
+                metadata=self._metadata_for_payload(payload, obj.metadata, force_token_estimate=True),
+                version=obj.version + 1,
+                updated_at=utc_now(),
+            )
+            self._consume_one_time_decisions([*decisions, namespace_decision])
+            self.store.update_object(updated)
         event = self.events.emit(
             EventType.OBJECT_UPDATED,
             source=pid,
@@ -538,7 +629,6 @@ class ObjectMemoryManager:
                 "issued_by": issued_by,
             },
         )
-        self._consume_one_time_decision(namespace_decision)
         self._notify_object_changed(
             updated.oid,
             {
@@ -795,7 +885,8 @@ class ObjectMemoryManager:
         child_handles = {handle.oid: handle for handle in child_view.roots}
         if policy.include_child_created:
             candidate_oids.update(
-                obj.oid for obj in self.store.list_objects() if obj.created_by == child_view.owner_pid
+                obj.oid
+                for obj in self.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, child_view.owner_pid)
             )
         for oid in sorted(candidate_oids):
             obj = self.store.get_object(oid)
@@ -853,29 +944,92 @@ class ObjectMemoryManager:
         return snapshot_id
 
     def release_process_owned(self, pid: str, preserve_oids: set[str] | None = None) -> list[str]:
-        # Process-owned Object payloads behave like volatile memory: they are
-        # reclaimed on exit unless explicitly promoted as the process result.
+        preserve = set(preserve_oids or set())
+        if preserve:
+            self.retain_as_process_result(pid, preserve)
+        released = self.release_owner(
+            ObjectOwnerKind.PROCESS,
+            pid,
+            preserve_oids=preserve,
+            actor="memory",
+            reason="process_owned_release",
+        )
+        released.extend(
+            self.release_owner(
+                ObjectOwnerKind.PROCESS_RESULT,
+                pid,
+                preserve_oids=preserve,
+                actor="memory",
+                reason="process_result_release",
+            )
+        )
+        return released
+
+    def release_owner(
+        self,
+        owner_kind: ObjectOwnerKind | str,
+        owner_id: str,
+        *,
+        preserve_oids: set[str] | None = None,
+        actor: str = "memory",
+        reason: str = "owner_release",
+    ) -> list[str]:
         preserve = set(preserve_oids or set())
         released: list[str] = []
-        for oid in self.store.list_object_oids_created_by(pid):
+        pinned: list[str] = []
+        preserved: list[str] = []
+        selected_owner_kind = ObjectOwnerKind(owner_kind)
+        for oid in self.store.list_object_oids_owned_by(selected_owner_kind, owner_id):
             if self._is_object_pinned(oid):
-                preserve.add(oid)
+                pinned.append(oid)
                 continue
             if oid in preserve:
-                self.preserve_process_owned(pid, {oid})
+                preserved.append(oid)
                 continue
-            self.store.delete_object(oid)
-            released.append(oid)
-        if released or preserve:
+            if self.delete_object_trusted(actor, oid, reason=reason):
+                released.append(oid)
+        if released or preserve or pinned:
             self.audit.record(
-                actor="memory",
-                action="memory.release_process_owned",
-                target=f"process:{pid}",
+                actor=actor,
+                action="memory.release_owner",
+                target=f"object_owner:{selected_owner_kind.value}:{owner_id}",
                 input_refs=released,
-                output_refs=sorted(preserve),
-                decision={"released": released, "preserved": sorted(preserve)},
+                output_refs=sorted(preserved or preserve),
+                decision={
+                    "owner_kind": selected_owner_kind.value,
+                    "owner_id": owner_id,
+                    "released": released,
+                    "preserved": sorted(preserved or preserve),
+                    "pinned": pinned,
+                    "reason": reason,
+                },
             )
         return released
+
+    def delete_object_trusted(self, actor: str, oid: str, *, reason: str) -> bool:
+        obj = self.store.get_object(oid)
+        if obj is None:
+            return False
+        revoked = self.capabilities.revoke_resource_trusted(
+            f"object:{oid}",
+            revoked_by=actor,
+            reason=f"object released: {reason}",
+        )
+        self.store.delete_object(oid)
+        self.audit.record(
+            actor=actor,
+            action="memory.delete_object",
+            target=f"object:{oid}",
+            input_refs=[oid],
+            capability_refs=[cap.cap_id for cap in revoked],
+            decision={
+                "reason": reason,
+                "owner_kind": obj.owner_kind.value,
+                "owner_id": obj.owner_id,
+                "revoked_capabilities": len(revoked),
+            },
+        )
+        return True
 
     def _is_object_pinned(self, oid: str) -> bool:
         if self._object_pin_checker is None:
@@ -897,42 +1051,103 @@ class ObjectMemoryManager:
             )
 
     def preserve_process_owned(self, pid: str, oids: Iterable[str]) -> list[str]:
-        preserved: list[str] = []
-        for oid in sorted(set(oids)):
-            obj = self.store.get_object(oid)
-            if obj is None or obj.created_by != pid:
-                continue
-            self.store.update_object(replace(obj, created_by=f"process_result:{pid}"))
-            preserved.append(oid)
-        if preserved:
-            self.audit.record(
-                actor="memory",
-                action="memory.preserve_process_owned",
-                target=f"process:{pid}",
-                input_refs=preserved,
-                output_refs=preserved,
-                decision={"pid": pid, "preserved": preserved},
-            )
-        return preserved
+        return self.retain_as_process_result(pid, oids)
+
+    def retain_as_process_result(self, pid: str, oids: Iterable[str]) -> list[str]:
+        return self.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            pid,
+            ObjectOwnerKind.PROCESS_RESULT,
+            pid,
+            oids,
+            actor="memory",
+            reason="process_result",
+        )
 
     def adopt_process_owned(self, from_pid: str, to_pid: str, oids: Iterable[str]) -> list[str]:
-        adopted: list[str] = []
+        selected_oids = sorted(set(oids))
+        adopted = self.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            from_pid,
+            ObjectOwnerKind.PROCESS,
+            to_pid,
+            selected_oids,
+            actor="memory",
+            reason="process_adopt",
+        )
+        adopted.extend(
+            self.transfer_owner(
+                ObjectOwnerKind.PROCESS_RESULT,
+                from_pid,
+                ObjectOwnerKind.PROCESS,
+                to_pid,
+                selected_oids,
+                actor="memory",
+                reason="process_result_adopt",
+            )
+        )
+        return adopted
+
+    def transfer_owner(
+        self,
+        from_owner_kind: ObjectOwnerKind | str,
+        from_owner_id: str,
+        to_owner_kind: ObjectOwnerKind | str,
+        to_owner_id: str,
+        oids: Iterable[str],
+        *,
+        actor: str = "memory",
+        reason: str = "owner_transfer",
+    ) -> list[str]:
+        transferred: list[str] = []
+        selected_from_kind = ObjectOwnerKind(from_owner_kind)
+        selected_to_kind = ObjectOwnerKind(to_owner_kind)
         for oid in sorted(set(oids)):
             obj = self.store.get_object(oid)
-            if obj is None or obj.created_by != from_pid:
+            if obj is None or obj.owner_kind != selected_from_kind or obj.owner_id != from_owner_id:
                 continue
-            self.store.update_object(replace(obj, created_by=to_pid))
-            adopted.append(oid)
-        if adopted:
-            self.audit.record(
-                actor="memory",
-                action="memory.adopt_process_owned",
-                target=f"process:{from_pid}",
-                input_refs=adopted,
-                output_refs=adopted,
-                decision={"from_pid": from_pid, "to_pid": to_pid, "adopted": adopted},
+            self.store.update_object(
+                replace(
+                    obj,
+                    owner_kind=selected_to_kind,
+                    owner_id=to_owner_id,
+                    updated_at=utc_now(),
+                )
             )
-        return adopted
+            transferred.append(oid)
+        if transferred:
+            self.audit.record(
+                actor=actor,
+                action="memory.transfer_owner",
+                target=f"object_owner:{selected_from_kind.value}:{from_owner_id}",
+                input_refs=transferred,
+                output_refs=transferred,
+                decision={
+                    "from_owner_kind": selected_from_kind.value,
+                    "from_owner_id": from_owner_id,
+                    "to_owner_kind": selected_to_kind.value,
+                    "to_owner_id": to_owner_id,
+                    "transferred": transferred,
+                    "reason": reason,
+                },
+            )
+        return transferred
+
+    def lifetime_scope(
+        self,
+        *,
+        actor: str,
+        owner_kind: ObjectOwnerKind | str,
+        owner_id: str,
+        reason: str,
+    ) -> ObjectLifetimeScope:
+        return ObjectLifetimeScope(
+            self,
+            actor=actor,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            reason=reason,
+        )
 
     def materialize_context(
         self,

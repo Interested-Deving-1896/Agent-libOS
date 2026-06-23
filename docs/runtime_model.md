@@ -108,7 +108,20 @@ updates one process working directory and leaves other processes unchanged.
 
 ## Scheduler
 
-The high-level async entrypoint is:
+The scheduler is thread-backed. It starts one worker task per runnable process
+up to `config.scheduler.max_workers`, and each task advances only that process
+until it blocks, exits, fails, or the shared quantum budget is exhausted. Public
+async APIs remain available for event-loop hosts, but they are wrappers around
+the same scheduler and do not mean process quanta are serialized on one asyncio
+loop.
+
+The high-level synchronous entrypoint is:
+
+```python
+results = runtime.run_until_idle(max_quanta=10)
+```
+
+Event-loop hosts should use:
 
 ```python
 results = await runtime.arun_until_idle(max_quanta=10)
@@ -123,9 +136,26 @@ By default it:
 5. stops when no runnable or human-resumable work remains, or when the quantum
    budget is exhausted.
 
+`max_quanta` is a global budget across all process workers, not a per-process
+limit. A bounded run may briefly reserve extra dependency quanta when a running
+process is already waiting on a runnable child or message dependency and the
+main worker pool is full; that keeps parent/child waits from deadlocking behind
+the nominal budget. After budget exhaustion, `config.scheduler.drain_window_s`
+gives already-running workers a short chance to finish before unfinished quanta
+are cancelled or detached.
+
+The scheduler serializes top-level `run_until_idle`, `run_pid_until_idle`, and
+single-step invocations for one `Runtime` instance, so two host calls cannot
+re-enter the same runnable process concurrently. Individual process claims are
+also status-checked at the store boundary before a quantum changes a process
+from `runnable` to `running`.
+
 Single-step APIs remain available for tests and debugging:
 
 ```python
+result = runtime.run_next_process_once()
+result = runtime.run_process_once(pid)
+
 result = await runtime.arun_next_process_once()
 result = await runtime.arun_process_once(pid)
 ```
@@ -135,6 +165,13 @@ For debugging pending approval states, disable human queue processing:
 ```python
 results = await runtime.arun_until_idle(max_quanta=1, process_human_queue=False)
 ```
+
+`Runtime.shutdown()` first asks the scheduler to cancel and join tracked worker
+futures for up to `config.scheduler.shutdown_join_timeout_s`. If a synchronous
+quantum cannot stop safely, shutdown reports `ok: false` with
+`scheduler_stopped: false` and leaves the SQLite store open rather than closing
+it underneath a live worker. Once the worker finishes, a later shutdown can
+complete normal resource cleanup.
 
 ## Resource Budgets
 
@@ -267,7 +304,8 @@ Signals can pause, resume, cancel, interrupt, or terminate direct children.
 
 `process_exit` marks a process as `exited` or `failed` and can attach a final
 Object Memory result. Process-owned memory is released on exit unless retained
-as the process result.
+as the process result. Cleanup follows explicit Object Memory owner fields, not
+the object's creator provenance, and release revokes stale object capabilities.
 
 When a Deno JIT tool calls `process.exit` or `process.exec`, the syscall records
 a deferred lifecycle change. The runtime applies that change only after the JIT

@@ -117,8 +117,11 @@ Host-facing control surfaces live under `agent_libos.api`. The CLI entrypoint
 and the local GUI HTTP/SSE server are different presentations over the same
 runtime managers and primitives; neither is an authority boundary by itself.
 Both must call `Runtime.shutdown()` when they own a runtime instance. Shutdown
-releases host resources and emits runtime lifecycle audit/event records, but it
-does not mark AgentProcess records as exited.
+first stops scheduler work, then releases host resources and emits runtime
+lifecycle audit/event records. If a synchronous quantum cannot be joined safely,
+shutdown reports that the scheduler did not stop and leaves owned storage open
+so a live worker is not racing a closed SQLite connection. Host shutdown never
+marks AgentProcess records as exited.
 
 ## Tool Boundary
 

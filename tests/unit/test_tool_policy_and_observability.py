@@ -5,6 +5,9 @@ from typing import Any
 from pydantic import BaseModel
 
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
+from agent_libos.tools.builtin.capabilities import DelegateCapabilityTool
+from agent_libos.tools.builtin.checkpoint import RestoreCheckpointTool
+from agent_libos.tools.builtin.process import ProcessExitTool
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
 from agent_libos.tools.builtin.object_tasks import StartObjectTaskTool, WatchObjectTaskOwnerTool
 from agent_libos.tools.builtin.permission import RequestPermissionTool
@@ -70,6 +73,16 @@ class TestToolPolicyAndObservability:
         assert spec.policy["side_effects"] is True
         assert set(spec.side_effects) == {"capability.write", "human.ask"}
 
+    def test_authority_and_lifecycle_tools_declare_side_effects(self) -> None:
+        process_exit = ProcessExitTool().spec()
+        delegate = DelegateCapabilityTool().spec()
+        restore = RestoreCheckpointTool().spec()
+
+        assert process_exit.policy["side_effects"] is True
+        assert "process.lifecycle" in process_exit.side_effects
+        assert "capability.write" in delegate.side_effects
+        assert "checkpoint.restore" in restore.side_effects
+
     def test_observability_sanitizes_sensitive_fields_with_stable_hash(self) -> None:
         secret = "SECRET_TOKEN_SHOULD_NOT_APPEAR"
         value = {
@@ -87,3 +100,17 @@ class TestToolPolicyAndObservability:
         assert secret not in first["preview"]
         assert first["redacted"] is True
         assert "sha256" in first["preview"]
+
+    def test_observability_redacts_common_credential_keys(self) -> None:
+        secret = "sk_live_very_secret"
+        value = {
+            "api_key": secret,
+            "accessToken": secret,
+            "Authorization": f"Bearer {secret}",
+            "nested": {"database-password": secret},
+        }
+
+        sanitized = sanitize_for_observability(value, preview_chars=10_000)
+
+        assert secret not in sanitized["preview"]
+        assert sanitized["redacted"] is True

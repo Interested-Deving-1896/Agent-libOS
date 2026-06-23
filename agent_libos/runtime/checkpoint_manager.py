@@ -12,6 +12,7 @@ from agent_libos.models import (
     Checkpoint,
     EventType,
     HumanRequestStatus,
+    ObjectOwnerKind,
     ProcessMessageStatus,
     ProcessStatus,
     ToolHandle,
@@ -263,9 +264,7 @@ class CheckpointManager:
         external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
         external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
         external_effect_summary = self._external_effect_summary_since(checkpoint, pids=external_effect_pids)
-        cancelled_human_requests = self._cancel_pending_human_requests(current_pids, checkpoint)
-        superseded_messages = self._supersede_post_checkpoint_messages(current_pids, checkpoint)
-        self._restore_scoped_rows(snapshot, current_pids)
+        cancelled_human_requests, superseded_messages = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
         self._restore_images(snapshot)
         self._restore_jit_sources(snapshot)
         self.events.emit(
@@ -461,13 +460,25 @@ class CheckpointManager:
         if missing:
             raise ValidationError(f"checkpoint requires startup modules that are not loaded: {missing}")
 
-    def _restore_scoped_rows(self, snapshot: dict[str, Any], current_pids: list[str]) -> None:
+    def _restore_scoped_rows(
+        self,
+        snapshot: dict[str, Any],
+        current_pids: list[str],
+        checkpoint: Checkpoint,
+    ) -> tuple[list[str], list[str]]:
         rows = snapshot["rows"]
         object_oids = set(snapshot.get("object_oids", [])) | set(self._current_scoped_object_oids(current_pids))
         namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
         with self.store.transaction(include_object_payloads=True) as cur:
+            # Pending human/message state belongs to the same reconstructable
+            # restore boundary as process rows. If a later insert fails, these
+            # status changes must roll back with the SQLite rows and in-memory
+            # object payloads.
+            cancelled_human_requests = self._cancel_pending_human_requests(cur, current_pids, checkpoint)
+            superseded_messages = self._supersede_post_checkpoint_messages(cur, current_pids, checkpoint)
             self._delete_object_links(cur, object_oids)
             self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
+            self._delete_object_capabilities(cur, object_oids)
             for oid in object_oids:
                 self.store.forget_object_payload(oid)
             self._delete_rows_by_ids(cur, "object_namespaces", "namespace", namespace_names)
@@ -507,6 +518,8 @@ class CheckpointManager:
                 self._upsert_row(cur, "llm_pending_actions", row, "pid")
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
+            self._reconcile_restored_wait_states(cur, [str(row["pid"]) for row in rows.get("processes", [])])
+        return cancelled_human_requests, superseded_messages
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None) -> dict[str, Any]:
         original_pids = list(snapshot["subtree_pids"])
@@ -769,8 +782,9 @@ class CheckpointManager:
                 if isinstance(root, dict) and root.get("oid"):
                     oids.add(str(root["oid"]))
         for pid in pids:
-            for obj in self.store.list_objects_created_by(pid):
-                oids.add(obj.oid)
+            for owner_kind in (ObjectOwnerKind.PROCESS, ObjectOwnerKind.PROCESS_RESULT):
+                for obj in self.store.list_objects_owned_by(owner_kind, pid):
+                    oids.add(obj.oid)
         return sorted(oid for oid in oids if oid in self.store._object_payloads)
 
     def _current_scoped_object_oids(self, pids: list[str]) -> list[str]:
@@ -997,37 +1011,122 @@ class CheckpointManager:
             selected.update(str(pid) for pid in current_pids)
         return sorted(selected)
 
-    def _cancel_pending_human_requests(self, pids: list[str], checkpoint: Checkpoint) -> list[str]:
+    def _cancel_pending_human_requests(self, cur: Any, pids: list[str], checkpoint: Checkpoint) -> list[str]:
         cancelled: list[str] = []
-        for request in self.store.list_human_requests():
-            if request.pid not in pids or request.created_at <= checkpoint.created_at:
-                continue
-            if request.status != HumanRequestStatus.PENDING:
-                continue
-            request.status = HumanRequestStatus.CANCELLED
-            request.decision = {"cancelled_by": f"checkpoint:{checkpoint.checkpoint_id}"}
-            request.updated_at = utc_now()
-            self.store.update_human_request(request)
-            cancelled.append(request.request_id)
+        for pid in pids:
+            for request in self.store.list_human_requests(pid=pid, status=HumanRequestStatus.PENDING):
+                if request.created_at <= checkpoint.created_at:
+                    continue
+                cur.execute(
+                    """
+                    UPDATE human_requests
+                       SET status = ?, decision_json = ?, updated_at = ?
+                     WHERE request_id = ?
+                    """,
+                    (
+                        HumanRequestStatus.CANCELLED.value,
+                        dumps({"cancelled_by": f"checkpoint:{checkpoint.checkpoint_id}"}),
+                        utc_now(),
+                        request.request_id,
+                    ),
+                )
+                cancelled.append(request.request_id)
         return cancelled
 
-    def _supersede_post_checkpoint_messages(self, pids: list[str], checkpoint: Checkpoint) -> list[str]:
+    def _supersede_post_checkpoint_messages(self, cur: Any, pids: list[str], checkpoint: Checkpoint) -> list[str]:
         superseded: list[str] = []
-        for message in self.store.list_process_messages():
-            if message.recipient_pid not in pids or message.created_at <= checkpoint.created_at:
-                continue
-            if message.status != ProcessMessageStatus.UNREAD:
-                continue
-            message.status = ProcessMessageStatus.SUPERSEDED_BY_RESTORE
-            message.payload = {
-                **message.payload,
-                "superseded_by_restore": checkpoint.checkpoint_id,
-                "superseded_at": utc_now(),
-            }
-            message.updated_at = utc_now()
-            self.store.update_process_message(message)
-            superseded.append(message.message_id)
+        for pid in pids:
+            for message in self.store.list_process_messages(pid, status=ProcessMessageStatus.UNREAD):
+                if message.created_at <= checkpoint.created_at:
+                    continue
+                payload = {
+                    **message.payload,
+                    "superseded_by_restore": checkpoint.checkpoint_id,
+                    "superseded_at": utc_now(),
+                }
+                cur.execute(
+                    """
+                    UPDATE process_messages
+                       SET payload_json = ?, status = ?, updated_at = ?
+                     WHERE message_id = ?
+                    """,
+                    (
+                        dumps(payload),
+                        ProcessMessageStatus.SUPERSEDED_BY_RESTORE.value,
+                        utc_now(),
+                        message.message_id,
+                    ),
+                )
+                superseded.append(message.message_id)
         return superseded
+
+    def _reconcile_restored_wait_states(self, cur: Any, pids: list[str]) -> None:
+        for pid in pids:
+            process = self.store.get_process(pid)
+            if process is None:
+                continue
+            status, message = self._resolved_restored_wait_state(process.pid, process.status, process.status_message)
+            if status is None:
+                continue
+            cur.execute(
+                """
+                UPDATE processes
+                   SET status = ?, status_message = ?, updated_at = ?
+                 WHERE pid = ?
+                """,
+                (status.value, message, utc_now(), pid),
+            )
+
+    def _resolved_restored_wait_state(
+        self,
+        pid: str,
+        status: ProcessStatus,
+        status_message: str | None,
+    ) -> tuple[ProcessStatus | None, str | None]:
+        if status == ProcessStatus.WAITING_HUMAN:
+            request_id = self._human_request_id_from_wait(status_message)
+            request = self.store.get_human_request(request_id) if request_id is not None else None
+            if request is None or request.status == HumanRequestStatus.PENDING:
+                return None, None
+            if request.status == HumanRequestStatus.APPROVED or request.payload.get("type") == "permission_request":
+                return ProcessStatus.RUNNABLE, None
+            return ProcessStatus.PAUSED, f"human request {request_id} resolved as {request.status.value}"
+        if status != ProcessStatus.WAITING_EVENT:
+            return None, None
+        child_pid = self._child_pid_from_wait(status_message)
+        if child_pid is not None:
+            child = self.store.get_process(child_pid)
+            if child is not None and child.status in self.TERMINAL_STATUSES:
+                return ProcessStatus.RUNNABLE, None
+        runtime = getattr(self, "runtime", None)
+        messages = getattr(runtime, "messages", None)
+        if messages is not None:
+            filters = messages._filters_from_wait_status(status_message)
+            if filters is not None and self.store.list_process_messages(
+                pid,
+                status=ProcessMessageStatus.UNREAD,
+                kind=filters.get("kind"),
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+            ):
+                return ProcessStatus.RUNNABLE, None
+        return None, None
+
+    def _human_request_id_from_wait(self, status_message: str | None) -> str | None:
+        prefix = "waiting for human request "
+        if not status_message or not status_message.startswith(prefix):
+            return None
+        return status_message[len(prefix) :].strip() or None
+
+    def _child_pid_from_wait(self, status_message: str | None) -> str | None:
+        prefix = "waiting for "
+        if not status_message or not status_message.startswith(prefix):
+            return None
+        child_pid = status_message[len(prefix) :].strip()
+        return child_pid or None
 
     def _build_current_state_for_diff(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         pids = self._subtree_pids(snapshot["pid"])
@@ -1072,6 +1171,13 @@ class CheckpointManager:
             [*object_oids, *object_oids],
         )
 
+    def _delete_object_capabilities(self, cur: Any, object_oids: set[str]) -> None:
+        if not object_oids:
+            return
+        resources = [f"object:{oid}" for oid in sorted(object_oids)]
+        placeholders = ", ".join("?" for _ in resources)
+        cur.execute(f"DELETE FROM capabilities WHERE resource IN ({placeholders})", resources)
+
     def _delete_rows_by_ids(self, cur: Any, table: str, column: str, values: Iterable[str]) -> None:
         selected = list(dict.fromkeys(values))
         if not selected:
@@ -1102,12 +1208,36 @@ class CheckpointManager:
         )
 
     def _insert_row(self, cur: Any, table: str, row: dict[str, Any]) -> None:
-        columns = list(row)
+        item = self._object_row_with_lifecycle_defaults(row) if table == "objects" else row
+        columns = list(item)
         placeholders = ", ".join("?" for _ in columns)
         cur.execute(
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-            tuple(row[column] for column in columns),
+            tuple(item[column] for column in columns),
         )
+
+    def _object_row_with_lifecycle_defaults(self, row: dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        created_by = str(item.get("created_by", "runtime"))
+        if not item.get("owner_kind"):
+            if created_by.startswith("process_result:"):
+                item["owner_kind"] = ObjectOwnerKind.PROCESS_RESULT.value
+            elif created_by.startswith("object_task:"):
+                item["owner_kind"] = ObjectOwnerKind.OBJECT_TASK.value
+            elif created_by == "runtime" or created_by.startswith("runtime."):
+                item["owner_kind"] = ObjectOwnerKind.RUNTIME.value
+            else:
+                item["owner_kind"] = ObjectOwnerKind.PROCESS.value
+        if not item.get("owner_id"):
+            if created_by.startswith("process_result:"):
+                item["owner_id"] = created_by.split(":", 1)[1]
+            elif created_by.startswith("object_task:"):
+                item["owner_id"] = created_by.split(":", 1)[1]
+            else:
+                item["owner_id"] = created_by
+        item.setdefault("lifecycle_state", "live")
+        item.setdefault("deleted_at", None)
+        return item
 
     def _upsert_row(self, cur: Any, table: str, row: dict[str, Any], key: str) -> None:
         columns = list(row)
@@ -1200,6 +1330,12 @@ class CheckpointManager:
         item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
         if item.get("created_by") in pid_map:
             item["created_by"] = pid_map[item["created_by"]]
+        if item.get("owner_kind") in {ObjectOwnerKind.PROCESS.value, ObjectOwnerKind.PROCESS_RESULT.value}:
+            if item.get("owner_id") in pid_map:
+                item["owner_id"] = pid_map[item["owner_id"]]
+        elif item.get("owner_kind") is None:
+            item["owner_kind"] = ObjectOwnerKind.PROCESS.value
+            item["owner_id"] = pid_map.get(str(item.get("created_by")), item.get("created_by"))
         provenance = loads(item["provenance_json"], {})
         provenance["parent_oids"] = [object_map.get(oid, oid) for oid in provenance.get("parent_oids", [])]
         item["provenance_json"] = dumps(provenance)

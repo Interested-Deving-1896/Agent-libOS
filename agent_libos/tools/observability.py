@@ -12,24 +12,50 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 SENSITIVE_OBSERVABILITY_KEYS = frozenset(
     {
         "answer",
+        "api_key",
+        "apikey",
         "arguments",
         "args",
+        "authorization",
+        "auth_token",
         "body",
         "content",
         "context",
+        "credential",
+        "credentials",
         "input",
         "message",
         "metadata",
         "output",
+        "passwd",
+        "password",
         "params",
         "payload",
+        "private_key",
         "question",
         "reasoning",
         "result",
+        "secret",
+        "session_token",
         "source_code",
         "stderr",
         "stdout",
         "tests",
+        "token",
+    }
+)
+
+SENSITIVE_OBSERVABILITY_KEY_FRAGMENTS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "password",
+        "passwd",
+        "private_key",
+        "secret",
+        "token",
     }
 )
 
@@ -91,7 +117,7 @@ def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
         redacted: dict[str, Any] = {}
         for key, item in jsonable.items():
             key_text = str(key)
-            if key_text.lower() in sensitive_keys:
+            if _is_sensitive_observability_key(key_text, sensitive_keys=sensitive_keys):
                 envelope = observation_envelope(item)
                 envelope["preview"] = "[redacted]"
                 redacted[key_text] = {"redacted": True, **envelope}
@@ -101,3 +127,10 @@ def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
     if isinstance(jsonable, list):
         return [_redact_value(item, sensitive_keys=sensitive_keys) for item in jsonable]
     return jsonable
+
+
+def _is_sensitive_observability_key(key: str, *, sensitive_keys: frozenset[str]) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    if normalized in sensitive_keys:
+        return True
+    return any(fragment in normalized for fragment in SENSITIVE_OBSERVABILITY_KEY_FRAGMENTS)

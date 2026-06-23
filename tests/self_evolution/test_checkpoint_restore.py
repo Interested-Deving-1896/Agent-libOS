@@ -166,6 +166,23 @@ class TestCheckpointRestore:
         finally:
             runtime.close()
 
+    def test_restore_reconciles_terminal_human_wait_state(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='human wait')
+            request_id = runtime.human.ask(pid, 'continue?', blocking=True)
+            checkpoint_id = runtime.checkpoint.create(pid, 'waiting for human', actor=pid)
+            runtime.human.approve(request_id, {'approved': True})
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored = runtime.process.get(pid)
+            assert restored.status == ProcessStatus.RUNNABLE
+            assert restored.status_message is None
+            assert runtime.human.get(request_id).status == HumanRequestStatus.APPROVED
+        finally:
+            runtime.close()
+
     def test_restore_rolls_back_rows_and_payloads_when_insert_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')
         try:
@@ -180,6 +197,13 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before failed restore', actor=pid)
             runtime.memory.update_object(pid, handle, ObjectPatch(payload={'version': 2}))
+            message = runtime.human.send_process_message(pid, 'late message')
+            request_id = runtime.human.query(
+                pid=pid,
+                human=runtime.config.runtime.default_human,
+                request={'type': 'question', 'question': 'still pending?'},
+                blocking=False,
+            )
             original_insert = runtime.checkpoint._insert_row
 
             def fail_on_process_insert(cur, table, row):
@@ -194,5 +218,7 @@ class TestCheckpointRestore:
             restored = runtime.memory.get_object_by_name(pid, 'state')
             assert restored.payload == {'version': 2}
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+            assert runtime.store.get_process_message(message.message_id).status == ProcessMessageStatus.UNREAD
+            assert runtime.human.get(request_id).status == HumanRequestStatus.PENDING
         finally:
             runtime.close()

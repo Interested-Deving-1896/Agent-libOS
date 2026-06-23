@@ -33,6 +33,7 @@
       "node_ids": [
         "tests/security/test_capability.py::TestCapabilityManager::test_typed_resource_matching_rejects_prefix_collision",
         "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_matching_allow",
+        "tests/security/test_capability.py::TestCapabilityManager::test_restrictive_capability_with_bad_constraint_fails_closed_over_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_authority_rules_are_enforced_against_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_scoped_deny_rule_only_denies_matching_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_one_shot_grant_authority_is_consumed_after_successful_issue",
@@ -95,9 +96,23 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_merge_child_memory_tool_adds_child_view_objects_to_parent",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_parent_exit_releases_waited_child_result_memory",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_merge_after_child_exit_preserves_non_result_child_created_memory_until_parent_exit",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_parent_exit_releases_unmerged_terminal_child_memory",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_process_exit_releases_owned_memory_except_result_object"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "object-memory-lifecycle-is-explicit",
+      "title": "Object Memory ownership, release, and RAII cleanup are explicit and revoke stale authority.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_lifetime_scope_releases_uncommitted_objects_and_revokes_capabilities",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_lifetime_scope_commit_keeps_objects_with_explicit_owner",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_process_exit_releases_owned_memory_except_result_object",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_parent_exit_releases_waited_child_result_memory",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runs_visible_tool_links_result_and_notifies_creator"
       ],
       "benchmark_attack_classes": []
     },
@@ -183,6 +198,7 @@
       "lane": "security",
       "node_ids": [
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_sanitizes_sensitive_fields_with_stable_hash",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_common_credential_keys",
         "tests/security/test_jit_security.py::TestJitSecurity::test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args"
       ],
       "benchmark_attack_classes": []
@@ -194,7 +210,10 @@
       "node_ids": [
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
-        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability"
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_specs_are_conservative_side_effects",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_validation_logs_are_bounded",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_validation_mismatch_errors_are_bounded"
       ],
       "benchmark_attack_classes": []
     },
@@ -208,7 +227,18 @@
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_start_object_task_declares_object_and_process_side_effects",
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_watch_object_task_owner_declares_message_side_effects",
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_request_permission_declares_human_and_capability_side_effects",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_authority_and_lifecycle_tools_declare_side_effects",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_process_cannot_call_tool_outside_creation_tool_table"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "tool-result-size-boundary-is-explicit",
+      "title": "Tool result payload limits prevent unbounded result persistence without hiding committed side effects as retryable failures.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_tool_result_limits.py::TestToolResultLimits::test_tool_result_payload_limit_rejects_before_result_object_creation",
+        "tests/runtime/test_tool_result_limits.py::TestToolResultLimits::test_side_effect_tool_oversize_result_is_reported_as_omitted_success"
       ],
       "benchmark_attack_classes": []
     },

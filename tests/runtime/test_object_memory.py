@@ -1,4 +1,6 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import pytest
 import json
 import sqlite3
@@ -6,7 +8,7 @@ import tempfile
 from dataclasses import replace
 from agent_libos import Runtime
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectPatch, ObjectQuery, ObjectType
+from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType
 
 class TestObjectMemoryName:
 
@@ -359,6 +361,43 @@ class TestObjectMemoryName:
                 namespace=namespace,
             )
 
+    def test_concurrent_one_time_namespace_write_create_commits_only_once(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace race owner')
+        writer = self.runtime.process.spawn(image='base-agent:v0', goal='namespace race writer')
+        namespace = 'shared-write-race'
+        self.runtime.memory.create_namespace(owner, namespace)
+        namespace_cap = self.runtime.capability.grant_once(
+            writer,
+            f'object_namespace:{namespace}',
+            ['write'],
+            issued_by='test',
+        )
+        workers = 2
+        barrier = threading.Barrier(workers)
+
+        def create(index: int) -> bool:
+            barrier.wait()
+            try:
+                self.runtime.memory.create_object(
+                    pid=writer,
+                    object_type=ObjectType.OBSERVATION,
+                    payload={'index': index},
+                    name=f'created.{index}',
+                    namespace=namespace,
+                )
+                return True
+            except CapabilityDenied:
+                return False
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            outcomes = list(executor.map(create, range(workers)))
+
+        objects = [obj for obj in self.runtime.store.list_objects(namespace=namespace) if obj.name.startswith('created.')]
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 1
+        assert len(objects) == 1
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+
     def test_mutable_object_can_move_between_namespaces_when_target_name_is_unique(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='move namespace')
         self.runtime.memory.create_namespace(pid, 'drafts')
@@ -484,6 +523,109 @@ class TestObjectMemoryName:
         assert self.runtime.store.get_object(handle.oid).payload == {'entries': [{'x': 1}]}
         second = self.runtime.tools.call(pid, 'append_memory_object', {'name': 'one.shot.append', 'entry': {'x': 2}})
         assert not second.ok
+
+    def test_one_time_namespace_write_update_consumes_once_after_successful_validation(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='rename owner')
+        writer = self.runtime.process.spawn(image='base-agent:v0', goal='rename writer')
+        namespace = 'rename-once'
+        self.runtime.memory.create_namespace(owner, namespace)
+        owner_handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.OBSERVATION,
+            payload={'value': 'draft'},
+            name='draft',
+            namespace=namespace,
+            immutable=False,
+        )
+        self.runtime.capability.grant(
+            subject=writer,
+            resource=f'object:{owner_handle.oid}',
+            rights=[CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            writer,
+            f'object_namespace:{namespace}',
+            ['write'],
+            issued_by='test',
+        )
+        writer_handle = self.runtime.memory.handle_for_oid(
+            writer,
+            owner_handle.oid,
+            required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+        )
+
+        self.runtime.memory.update_object(writer, writer_handle, ObjectPatch(name='renamed'))
+
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+        renamed = self.runtime.memory.get_object(owner, owner_handle)
+        assert renamed.name == 'renamed'
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.update_object(writer, writer_handle, ObjectPatch(name='renamed-again'))
+
+    def test_concurrent_appends_do_not_drop_entries(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='concurrent append')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='concurrent.append',
+            immutable=False,
+        )
+        workers = 25
+        barrier = threading.Barrier(workers)
+
+        def append(index: int) -> None:
+            barrier.wait()
+            self.runtime.memory.append_object_by_name(pid, 'concurrent.append', {'index': index})
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(append, range(workers)))
+
+        obj = self.runtime.memory.get_object(pid, handle)
+        entries = obj.payload['entries']
+        assert len(entries) == workers
+        assert sorted(item['index'] for item in entries) == list(range(workers))
+        assert obj.version == workers + 1
+
+    def test_concurrent_one_time_append_authority_commits_only_once(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='one-shot append race')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'entries': []},
+            name='one.shot.append.race',
+            immutable=False,
+        )
+        for cap in self.runtime.capability.capabilities_for(pid):
+            if cap.resource == f'object:{handle.oid}':
+                self.runtime.capability.revoke(cap.cap_id, revoked_by='test', require_authority=False)
+        source_cap = self.runtime.capability.grant_once(
+            pid,
+            f'object:{handle.oid}',
+            [CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        workers = 2
+        barrier = threading.Barrier(workers)
+
+        def append(index: int) -> bool:
+            barrier.wait()
+            try:
+                self.runtime.memory.append_object_by_name(pid, 'one.shot.append.race', {'index': index})
+                return True
+            except CapabilityDenied:
+                return False
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            outcomes = list(executor.map(append, range(workers)))
+
+        obj = self.runtime.store.get_object(handle.oid)
+        assert obj is not None
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 1
+        assert len(obj.payload['entries']) == 1
+        assert not self.runtime.store.get_capability(source_cap.cap_id).active
 
     def test_query_by_name_only_returns_accessible_objects(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query')
@@ -647,6 +789,42 @@ class TestObjectMemoryName:
                 reopened.close()
         self.runtime = Runtime.open('local')
 
+    def test_stale_runtime_memory_row_is_released_on_reopen_so_name_can_be_reused(self) -> None:
+        self.runtime.close()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db_path)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='reuse stale name')
+                old = runtime.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.ARTIFACT,
+                    payload={'runtime_only': True},
+                    name='reuse.after.reopen',
+                )
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db_path)
+            try:
+                old_row = reopened.store.select_table_rows('objects', 'oid = ?', (old.oid,))[0]
+                assert old_row['lifecycle_state'] == 'released'
+                assert old_row['deleted_at'] is not None
+
+                replacement = reopened.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.ARTIFACT,
+                    payload={'replacement': True},
+                    name='reuse.after.reopen',
+                )
+                obj = reopened.memory.get_object(pid, replacement)
+                assert replacement.oid != old.oid
+                assert obj.payload == {'replacement': True}
+                assert obj.namespace == reopened.memory.resolve_namespace(pid)
+            finally:
+                reopened.close()
+        self.runtime = Runtime.open('local')
+
     def test_legacy_name_only_schema_does_not_block_process_namespace(self) -> None:
         self.runtime.close()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -660,6 +838,10 @@ class TestObjectMemoryName:
                 conn.close()
             runtime = Runtime.open(db_path)
             try:
+                legacy_row = runtime.store.select_table_rows('objects', 'oid = ?', ('obj_legacy',))[0]
+                assert legacy_row['owner_kind'] == ObjectOwnerKind.PROCESS.value
+                assert legacy_row['owner_id'] == 'legacy'
+                assert legacy_row['lifecycle_state'] == 'live'
                 pid = runtime.process.spawn(image='base-agent:v0', goal='legacy migration')
                 runtime.memory.create_namespace(pid, 'legacy')
                 handle = runtime.memory.create_object(pid=pid, object_type=ObjectType.ARTIFACT, payload={'namespaced': True}, name='same.local', namespace='legacy')
@@ -678,5 +860,65 @@ class TestObjectMemoryName:
         assert self.runtime.store.get_object(scratch.oid) is None
         assert self.runtime.store.get_object(result.oid) is not None
         assert self.runtime.store.get_object(result.oid).payload == {'kept': True}
+        assert self.runtime.store.get_object(result.oid).owner_kind == ObjectOwnerKind.PROCESS_RESULT
+        assert self.runtime.store.get_object(result.oid).owner_id == pid
         with pytest.raises(NotFound):
             self.runtime.memory.get_object_by_name(pid, 'scratch.memory')
+
+    def test_lifetime_scope_releases_uncommitted_objects_and_revokes_capabilities(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='scope release')
+        handle: ObjectHandle | None = None
+
+        with pytest.raises(RuntimeError):
+            with self.runtime.memory.lifetime_scope(
+                actor='test',
+                owner_kind=ObjectOwnerKind.PROCESS,
+                owner_id=pid,
+                reason='test_scope',
+            ) as scope:
+                handle = scope.create_object(
+                    pid=pid,
+                    object_type=ObjectType.OBSERVATION,
+                    payload={'temporary': True},
+                    name='scoped.temp',
+                )
+                assert self.runtime.store.get_object(handle.oid) is not None
+                raise RuntimeError('discard scope')
+
+        assert handle is not None
+        assert self.runtime.store.get_object(handle.oid) is None
+        row = self.runtime.store.select_table_rows('objects', 'oid = ?', (handle.oid,))[0]
+        assert row['lifecycle_state'] == 'released'
+        assert row['deleted_at'] is not None
+        assert not self.runtime.capability.check(pid, f'object:{handle.oid}', CapabilityRight.READ)
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(pid, handle)
+
+        reused = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'replacement': True},
+            name='scoped.temp',
+        )
+        assert reused.oid != handle.oid
+
+    def test_lifetime_scope_commit_keeps_objects_with_explicit_owner(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='scope commit')
+        with self.runtime.memory.lifetime_scope(
+            actor='test',
+            owner_kind=ObjectOwnerKind.PROCESS,
+            owner_id=pid,
+            reason='test_scope',
+        ) as scope:
+            handle = scope.create_object(
+                pid=pid,
+                object_type=ObjectType.SUMMARY,
+                payload={'kept': True},
+                name='scoped.keep',
+            )
+            scope.commit()
+
+        obj = self.runtime.store.get_object(handle.oid)
+        assert obj is not None
+        assert obj.owner_kind == ObjectOwnerKind.PROCESS
+        assert obj.owner_id == pid

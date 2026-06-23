@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -128,6 +129,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         max_source_chars: int = _TOOL_DEFAULTS.jit_source_max_chars,
         max_tests: int = _TOOL_DEFAULTS.jit_tests_max_count,
         max_test_case_bytes: int = _TOOL_DEFAULTS.jit_test_case_max_bytes,
+        max_validation_log_chars: int = _TOOL_DEFAULTS.jit_validation_log_max_chars,
     ) -> None:
         self.deno_executable = deno_executable
         self.default_timeout_s = default_timeout_s
@@ -138,6 +140,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         self.max_source_chars = max_source_chars
         self.max_tests = max_tests
         self.max_test_case_bytes = max_test_case_bytes
+        self.max_validation_log_chars = max_validation_log_chars
         self.profile_builder = SandboxProfileBuilder()
 
     def static_check(self, source_code: str) -> ValidationResult:
@@ -291,13 +294,17 @@ class DenoTypescriptSandbox(SandboxBackend):
             except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
                 raise
             except Exception as exc:
-                errors.append(f"test {index} failed to run: {exc}")
+                errors.append(f"test {index} failed to run: {self._bounded_result_repr(exc)}")
                 continue
-            logs.append(f"test {index} result: {result_value!r}")
+            logs.append(f"test {index} result: {self._bounded_result_repr(result_value)}")
             if "expected" in test and result_value != test["expected"]:
-                errors.append(f"test {index} expected {test['expected']!r}, got {result_value!r}")
+                errors.append(
+                    "test "
+                    f"{index} expected {self._bounded_result_repr(test['expected'])}, "
+                    f"got {self._bounded_result_repr(result_value)}"
+                )
         metadata = {"metrics": self._aggregate_metrics(metrics)} if return_metrics else {}
-        return ValidationResult(ok=not errors, errors=errors, logs="\n".join(logs), metadata=metadata)
+        return ValidationResult(ok=not errors, errors=errors, logs=self._bounded_logs(logs), metadata=metadata)
 
     def metadata_for_source(self, source_code: str) -> dict[str, Any]:
         metadata: dict[str, Any] = {
@@ -575,6 +582,23 @@ class DenoTypescriptSandbox(SandboxBackend):
             "killed": any(item.killed for item in metrics),
             "limit_kind": next((item.limit_kind for item in metrics if item.limit_kind), None),
         }
+
+    def _bounded_result_repr(self, value: Any) -> str:
+        text = repr(value)
+        if len(text) <= self.max_validation_log_chars:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        return (
+            text[: self.max_validation_log_chars]
+            + f"... [truncated validation result repr chars={len(text)} sha256={digest}]"
+        )
+
+    def _bounded_logs(self, logs: list[str]) -> str:
+        text = "\n".join(logs)
+        if len(text) <= self.max_validation_log_chars:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        return text[: self.max_validation_log_chars] + f"\n[validation logs truncated chars={len(text)} sha256={digest}]"
 
     def _extract_imports(self, source_code: str) -> list[str]:
         imports = [match.group(1) for match in self._IMPORT_RE.finditer(source_code)]

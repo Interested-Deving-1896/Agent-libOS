@@ -46,10 +46,14 @@ admin mode. Supplying `actor` opts into process-authority mode and requires
 that process to hold the capability needed by the underlying primitive, keeping
 audit attribution aligned with the capability decision.
 
-Closing the GUI server calls `Runtime.shutdown()`, which shuts down the host
-control surface and closes the owned runtime resources, including the SQLite
-store. It does not mark AgentProcess records as exited; process lifecycle
-changes still go through the runtime `process.exit` primitive/tool path.
+Closing the GUI server pauses auto-run and asks the scheduler to stop before it
+calls `Runtime.shutdown()` on an owned runtime. If no scheduler worker is still
+inside a synchronous quantum, shutdown closes owned runtime resources,
+including the SQLite store. If a worker cannot be joined safely, the GUI server
+leaves the runtime store open and relies on process teardown instead of closing
+SQLite underneath the live worker. Host shutdown does not mark AgentProcess
+records as exited; process lifecycle changes still go through the runtime
+`process.exit` primitive/tool path.
 
 ## Development
 

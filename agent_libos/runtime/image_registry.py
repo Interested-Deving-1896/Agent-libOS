@@ -24,6 +24,7 @@ from agent_libos.models import (
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     JIT_TOOL_EXPOSURES,
     OPENAI_TOOL_NAME_MAX_CHARS,
+    ObjectOwnerKind,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODES,
     ToolHandle,
@@ -1450,7 +1451,7 @@ class ImageRegistryPrimitive:
             if isinstance(root, dict) and root.get("oid"):
                 oids.add(str(root["oid"]))
         for row in snapshot.get("rows", {}).get("objects", []):
-            if row.get("created_by") == source_pid:
+            if row.get("owner_kind") == ObjectOwnerKind.PROCESS.value and row.get("owner_id") == source_pid:
                 oids.add(str(row["oid"]))
         available = set(snapshot.get("object_payloads", {}).keys())
         return {oid for oid in oids if oid in available}

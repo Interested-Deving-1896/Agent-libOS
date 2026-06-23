@@ -5,7 +5,7 @@ import json
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models import CapabilityRight, ObjectOwnerKind, ObjectType, ProcessStatus, ResourceBudget
 from agent_libos.models.exceptions import NotFound, ProcessError, ProcessWaitRequired
 from scripts.llm_context_probe import last_tool_result, static_prefix
 
@@ -26,15 +26,42 @@ class TestChildProcessTool:
             assert any((isinstance(result, dict) and result.get('waiting_event') for result in results))
             wait_result = next((result for result in results if _action_name(result) == 'wait_child_process'))
             result_oid = wait_result['result']['payload']['result_oid']
-            child_result = runtime.store.get_object(result_oid)
-            assert child_result is not None
-            assert child_result is not None
-            assert child_result.payload['value'] == 42
             parent_view = runtime.process.get(parent).memory_view
             assert parent_view is not None
             assert parent_view is not None
             assert result_oid in [handle.oid for handle in parent_view.roots]
+            assert runtime.store.get_object(result_oid) is None
+            assert not runtime.capability.check(parent, f'object:{result_oid}', CapabilityRight.READ)
             assert 'process.wait_wake' in [record.action for record in runtime.audit.trace()]
+        finally:
+            runtime.close()
+
+    def test_parent_exit_releases_waited_child_result_memory(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='wait child result')
+            child = runtime.process.fork(parent, goal='produce waited result')
+            result = runtime.memory.create_object(
+                child,
+                ObjectType.SUMMARY,
+                {'waited': True},
+                name='waited.child.result',
+            )
+            runtime.process.exit(child, result=result)
+
+            waited = runtime.process.wait(parent, child)
+
+            assert waited.result is not None
+            result_obj = runtime.store.get_object(result.oid)
+            assert result_obj is not None
+            assert result_obj.owner_kind == ObjectOwnerKind.PROCESS_RESULT
+            assert result_obj.owner_id == child
+            assert runtime.capability.check(parent, f'object:{result.oid}', CapabilityRight.READ)
+
+            runtime.process.exit(parent)
+
+            assert runtime.store.get_object(result.oid) is None
+            assert not runtime.capability.check(parent, f'object:{result.oid}', CapabilityRight.READ)
         finally:
             runtime.close()
 
@@ -246,7 +273,9 @@ class TestChildProcessTool:
             assert merged.ok, merged.error
             assert scratch_oid in merged.payload['merged_oids']
             assert result_oid in merged.payload['merged_oids']
-            assert runtime.store.get_object(scratch_oid).created_by == parent
+            scratch_obj = runtime.store.get_object(scratch_oid)
+            assert scratch_obj.owner_kind == ObjectOwnerKind.PROCESS
+            assert scratch_obj.owner_id == parent
             runtime.process.exit(parent)
             assert runtime.store.get_object(scratch_oid) is None
             assert runtime.store.get_object(result_oid) is None

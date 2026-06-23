@@ -43,6 +43,26 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_restrictive_capability_with_bad_constraint_fails_closed_over_allow(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='malformed restrictive policy')
+            runtime.capability.grant(pid, 'filesystem:workspace:*', [CapabilityRight.READ], issued_by='test')
+            runtime.capability.issue_trusted(
+                pid,
+                'filesystem:workspace:secret.txt',
+                [CapabilityRight.READ],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+                constraints={'unknown_constraint': True},
+            )
+            decision = runtime.capability.authorize(pid, 'filesystem:workspace:secret.txt', CapabilityRight.READ)
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.DENY
+            assert 'unknown_constraint' in decision.constraint_results
+        finally:
+            runtime.close()
+
     def test_one_shot_capability_is_consumed_after_successful_use(self) -> None:
         runtime = Runtime.open('local')
         try:

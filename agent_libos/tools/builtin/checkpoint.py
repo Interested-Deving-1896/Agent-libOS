@@ -92,7 +92,12 @@ class CreateCheckpointTool(SyncAgentTool[CreateCheckpointArgs]):
     description = "Create a durable checkpoint for this process subtree."
     args_schema = CreateCheckpointArgs
     output_schema = CreateCheckpointOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"checkpoint.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["checkpoint", "durable"]
 
     def run(self, args: CreateCheckpointArgs, ctx: ToolContext) -> CreateCheckpointOutput:
@@ -147,7 +152,12 @@ class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
     description = "Restore this checkpoint's process subtree. Requires checkpoint admin capability."
     args_schema = RestoreCheckpointArgs
     output_schema = RestoreCheckpointOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"capability.write", "checkpoint.restore", "object.write", "process.lifecycle"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["checkpoint", "restore", "high_risk"]
 
     def run(self, args: RestoreCheckpointArgs, ctx: ToolContext) -> dict[str, Any]:
@@ -159,7 +169,12 @@ class ForkCheckpointTool(SyncAgentTool[ForkCheckpointArgs]):
     description = "Fork a new isolated process subtree from a checkpoint. Requires checkpoint execute capability."
     args_schema = ForkCheckpointArgs
     output_schema = ForkCheckpointOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"capability.write", "checkpoint.execute", "object.write", "process.spawn"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["checkpoint", "fork"]
 
     def run(self, args: ForkCheckpointArgs, ctx: ToolContext) -> ForkCheckpointOutput:

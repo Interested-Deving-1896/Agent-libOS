@@ -126,6 +126,14 @@ they conflict with restored state. Post-checkpoint mailbox entries are kept in
 history but marked as superseded by restore so they are not delivered as unread
 by default.
 
+After restored process rows are written, restore reconciles wait states against
+the restored runtime facts. A process waiting on an already-terminal child or a
+now-available matching message is made runnable. A process waiting on a human
+request that restored as approved resumes; one restored as rejected or
+cancelled becomes paused with an explanatory status message. This keeps
+checkpoint state from preserving stale waits whose blocking condition has
+already resolved in the restored snapshot.
+
 The current tool call's result object can still be appended after restore so
 the process receives a coherent action result.
 

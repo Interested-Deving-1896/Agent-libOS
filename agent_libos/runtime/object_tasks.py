@@ -15,6 +15,7 @@ from agent_libos.models import (
     EventType,
     HumanRequestStatus,
     ObjectHandle,
+    ObjectOwnerKind,
     ObjectRight,
     ObjectTask,
     ObjectTaskNotification,
@@ -300,7 +301,10 @@ class ObjectTaskManager:
                 and self._schedule_waiting_human_resume(task)
             ):
                 continue
-            if task.status in _TERMINAL_STATUSES or (
+            if task.status in _TERMINAL_STATUSES:
+                self._cleanup_owner_pin_after_terminal(task)
+                return task
+            if (
                 task.status in {
                     ObjectTaskStatus.WAITING_HUMAN,
                     ObjectTaskStatus.WAITING_PROCESS,
@@ -413,7 +417,15 @@ class ObjectTaskManager:
             if result.ok:
                 result_oid = result.result_handle.oid if result.result_handle is not None else None
                 if result_oid is not None:
-                    self.runtime.memory.adopt_process_owned(str(task.runner_pid), f"object_task:{task_id}", [result_oid])
+                    self.runtime.memory.transfer_owner(
+                        ObjectOwnerKind.PROCESS,
+                        str(task.runner_pid),
+                        ObjectOwnerKind.OBJECT_TASK,
+                        task_id,
+                        [result_oid],
+                        actor=f"object_task:{task_id}",
+                        reason="object_task_result",
+                    )
                     creator_handle = self.runtime.capability.handle_for_object(
                         task.creator_pid,
                         result_oid,
@@ -961,9 +973,13 @@ class ObjectTaskManager:
         if result_oid is None:
             return
         obj = self.runtime.store.get_object(result_oid)
-        if obj is None or obj.created_by != runner_pid:
+        if obj is None or obj.owner_kind != ObjectOwnerKind.PROCESS or obj.owner_id != runner_pid:
             return
-        self.runtime.store.delete_object(result_oid)
+        self.runtime.memory.delete_object_trusted(
+            "object_task",
+            result_oid,
+            reason="cancelled_object_task_result",
+        )
         self.runtime.audit.record(
             actor="object_task",
             action="object_task.discard_cancelled_result",

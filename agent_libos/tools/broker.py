@@ -25,6 +25,7 @@ from agent_libos.models import (
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     OPENAI_TOOL_NAME_MAX_CHARS,
     ObjectMetadata,
+    ObjectOwnerKind,
     ObjectType,
     ProcessStatus,
     ResourceUsage,
@@ -49,6 +50,28 @@ from agent_libos.utils.serde import dumps
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _TOOL_CALLABLE_PROCESS_STATUSES = {ProcessStatus.RUNNABLE, ProcessStatus.RUNNING}
+_JIT_DECLARED_PERMISSIONS = (
+    "checkpoint.read",
+    "checkpoint.write",
+    "filesystem.delete",
+    "filesystem.read",
+    "filesystem.write",
+    "human.ask",
+    "human.output",
+    "image.write",
+    "jsonrpc.call",
+    "libos.syscall",
+    "object.link",
+    "object.read",
+    "object.write",
+    "process.lifecycle",
+    "process.message",
+    "process.signal",
+    "process.spawn",
+    "shell.execute",
+    "skill.read",
+    "skill.write",
+)
 
 _JIT_MULTIPLEXER_INPUT_SCHEMA = {
     "type": "object",
@@ -76,8 +99,13 @@ _JIT_MULTIPLEXER_SPEC = ToolSpec(
     ),
     input_schema=_JIT_MULTIPLEXER_INPUT_SCHEMA,
     output_schema={"type": "object"},
-    policy={"side_effects": True, "idempotent": False},
+    policy={
+        "side_effects": True,
+        "idempotent": False,
+        "declared_permissions": list(_JIT_DECLARED_PERMISSIONS),
+    },
     tags=["jit", "tool", "multiplexer", "protocol"],
+    side_effects=list(_JIT_DECLARED_PERMISSIONS),
 )
 
 
@@ -112,6 +140,7 @@ class ToolBroker:
             max_stdout_bytes=self.config.tools.deno_max_stdout_bytes,
             max_stderr_bytes=self.config.tools.deno_max_stderr_bytes,
             jsr_allowlist=self.config.tools.deno_jsr_allowlist,
+            max_validation_log_chars=self.config.tools.jit_validation_log_max_chars,
         )
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self._tools: dict[str, BaseAgentTool] = {}
@@ -238,7 +267,8 @@ class ToolBroker:
         tests: builtins.list[dict[str, Any]] | None = None,
         requested_capabilities: builtins.list[dict[str, Any]] | None = None,
     ) -> str:
-        tool_spec = spec if isinstance(spec, ToolSpec) else ToolSpec(**spec)
+        raw_tool_spec = spec if isinstance(spec, ToolSpec) else ToolSpec(**spec)
+        tool_spec = _conservative_jit_tool_spec(raw_tool_spec)
         self._validate_jit_tool_spec(tool_spec)
         if self._jit_exposure_for_process(pid) == JIT_TOOL_EXPOSURE_MULTIPLEXED and tool_spec.name == JIT_MULTIPLEXER_TOOL_NAME:
             raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
@@ -500,6 +530,7 @@ class ToolBroker:
             payload={"call_id": call_id, "args": sanitize_for_observability(args)},
         )
         started_at = time.perf_counter()
+        result_was_omitted = False
         try:
             jit_session: LibOSSyscallSession | None = None
             if handle.tool_id in self._tools:
@@ -689,45 +720,34 @@ class ToolBroker:
             )
         except ValidationError as exc:
             error = str(exc)
-            self.events.emit(
-                EventType.TOOL_FAILED,
-                source=resource,
-                target=pid,
-                payload={"call_id": call_id, "error": error, "policy_decision": "validation_error"},
-            )
-            self.audit.record(
-                actor=pid,
-                action="tool.call",
-                target=resource,
-                decision={
-                    "ok": False,
-                    "tool": handle.name,
-                    "policy_decision": "validation_error",
-                    "error": error,
-                    "result": self._oversize_result_observation(),
-                    "tool_wall_seconds": self._elapsed(started_at),
-                },
-            )
-            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
-
-        result_handle = self.memory.create_object(
-            pid=pid,
-            object_type=ObjectType.TOOL_RESULT,
-            payload=result_payload,
-            metadata=ObjectMetadata(title=f"Tool result: {handle.name}", tags=["tool_result", handle.name]),
-            immutable=True,
-        )
-        if jit_session is not None:
-            try:
-                await jit_session.apply_deferred_lifecycle(result_handle)
-            except Exception as exc:
-                self.store.delete_object(result_handle.oid)
-                error = str(exc)
+            if self._tool_has_side_effects(handle):
+                # At this point a side-effecting tool has already run. Reporting
+                # failure would invite unsafe retries, so persist a bounded
+                # success envelope and make the omitted payload explicit.
+                result_was_omitted = True
+                payload = {
+                    "result_omitted": True,
+                    "reason": error,
+                    "tool_id": handle.tool_id,
+                    "tool_name": handle.name,
+                }
+                result_payload = {
+                    "tool_id": handle.tool_id,
+                    "tool_name": handle.name,
+                    "result": payload,
+                    "content": "[tool result omitted after size-limit failure]",
+                    "artifacts": [],
+                    "metadata": {
+                        "result_omitted": True,
+                        "omission_reason": error,
+                    },
+                }
+            else:
                 self.events.emit(
                     EventType.TOOL_FAILED,
                     source=resource,
                     target=pid,
-                    payload={"call_id": call_id, "error": error, "policy_decision": "lifecycle_error"},
+                    payload={"call_id": call_id, "error": error, "policy_decision": "validation_error"},
                 )
                 self.audit.record(
                     actor=pid,
@@ -736,36 +756,80 @@ class ToolBroker:
                     decision={
                         "ok": False,
                         "tool": handle.name,
-                        "policy_decision": "lifecycle_error",
-                        "error": sanitize_for_observability(error),
+                        "policy_decision": "validation_error",
+                        "error": error,
+                        "result": self._oversize_result_observation(),
                         "tool_wall_seconds": self._elapsed(started_at),
                     },
                 )
-                return ToolCallResult(
-                    call_id=call_id,
-                    tool_id=handle.tool_id,
-                    result_handle=None,
-                    payload=None,
-                    ok=False,
-                    error=error,
-                )
+                return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
+
+        with self.memory.lifetime_scope(
+            actor=resource,
+            owner_kind=ObjectOwnerKind.PROCESS,
+            owner_id=pid,
+            reason="tool_result",
+        ) as result_scope:
+            result_handle = result_scope.create_object(
+                pid=pid,
+                object_type=ObjectType.TOOL_RESULT,
+                payload=result_payload,
+                metadata=ObjectMetadata(title=f"Tool result: {handle.name}", tags=["tool_result", handle.name]),
+                immutable=True,
+            )
+            if jit_session is not None:
+                try:
+                    await jit_session.apply_deferred_lifecycle(result_handle)
+                except Exception as exc:
+                    error = str(exc)
+                    self.events.emit(
+                        EventType.TOOL_FAILED,
+                        source=resource,
+                        target=pid,
+                        payload={"call_id": call_id, "error": error, "policy_decision": "lifecycle_error"},
+                    )
+                    self.audit.record(
+                        actor=pid,
+                        action="tool.call",
+                        target=resource,
+                        decision={
+                            "ok": False,
+                            "tool": handle.name,
+                            "policy_decision": "lifecycle_error",
+                            "error": sanitize_for_observability(error),
+                            "tool_wall_seconds": self._elapsed(started_at),
+                        },
+                    )
+                    return ToolCallResult(
+                        call_id=call_id,
+                        tool_id=handle.tool_id,
+                        result_handle=None,
+                        payload=None,
+                        ok=False,
+                        error=error,
+                    )
+            result_scope.commit()
         self.events.emit(
             EventType.TOOL_COMPLETED,
             source=resource,
             target=pid,
             payload={"call_id": call_id, "result_oid": result_handle.oid},
         )
+        decision = {
+            "ok": True,
+            "tool": handle.name,
+            "policy_decision": "allow",
+            "tool_wall_seconds": self._elapsed(started_at),
+        }
+        if result_was_omitted:
+            decision["result_omitted"] = True
+            decision["result"] = self._oversize_result_observation()
         self.audit.record(
             actor=pid,
             action="tool.call",
             target=resource,
             output_refs=[result_handle.oid],
-            decision={
-                "ok": True,
-                "tool": handle.name,
-                "policy_decision": "allow",
-                "tool_wall_seconds": self._elapsed(started_at),
-            },
+            decision=decision,
         )
         return ToolCallResult(
             call_id=call_id,
@@ -786,6 +850,13 @@ class ToolBroker:
             allow_overage=False,
             kill_on_exceed=False,
         )
+
+    def _tool_has_side_effects(self, handle: ToolHandle) -> bool:
+        implementation = self._tools.get(handle.tool_id)
+        if implementation is not None:
+            return bool(implementation.spec(config=self.config).policy.get("side_effects"))
+        spec = self.store.get_tool_spec(handle.tool_id)
+        return bool(spec is not None and spec.policy.get("side_effects"))
 
     async def _run_sandbox_source(
         self,
@@ -1392,3 +1463,33 @@ class ToolBroker:
 def _stable_static_tool_id(name: str, digest_chars: int = _TOOL_DEFAULTS.static_tool_id_digest_chars) -> str:
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:digest_chars]
     return f"tool_static_{digest}"
+
+
+def _conservative_jit_tool_spec(spec: ToolSpec) -> ToolSpec:
+    policy = dict(spec.policy)
+    declared_permissions = _string_set(policy.get("declared_permissions")) | set(_JIT_DECLARED_PERMISSIONS)
+    policy["side_effects"] = True
+    policy["idempotent"] = False
+    policy["declared_permissions"] = sorted(declared_permissions)
+    return ToolSpec(
+        name=spec.name,
+        description=spec.description,
+        version=spec.version,
+        input_schema=dict(spec.input_schema),
+        output_schema=dict(spec.output_schema),
+        policy=policy,
+        tags=list(dict.fromkeys([*spec.tags, "jit", "side_effect"])),
+        metadata=dict(spec.metadata),
+        required_capabilities=[dict(item) for item in spec.required_capabilities],
+        side_effects=sorted(set(spec.side_effects) | declared_permissions),
+    )
+
+
+def _string_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {str(item) for item in value}
+    return {str(value)}

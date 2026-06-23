@@ -14,6 +14,7 @@ from agent_libos.models import (
     CapabilityRight,
     ObjectHandle,
     ObjectMetadata,
+    ObjectOwnerKind,
     ObjectPatch,
     ObjectRight,
     ObjectTaskNotificationStatus,
@@ -80,6 +81,8 @@ class TestObjectTasks:
             assert completed.result_oid is not None
             assert completed.notification.status == ObjectTaskNotificationStatus.DELIVERED
             assert runtime.store.get_object(completed.result_oid) is not None
+            assert runtime.store.get_object(completed.result_oid).owner_kind == ObjectOwnerKind.OBJECT_TASK
+            assert runtime.store.get_object(completed.result_oid).owner_id == task.task_id
             links = runtime.store.list_links(src=owner.oid)
             assert [(link.relation, link.dst) for link in links] == [(RelationType.PRODUCED, completed.result_oid)]
             unread = runtime.messages.unread(pid)

@@ -38,7 +38,9 @@ The implementation currently includes:
 - Hierarchical process resource budgets for tool calls, LLM token usage,
   subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, and Deno
   syscalls.
-- Async runtime supervision through `Runtime.arun_until_idle()`.
+- Thread-backed process scheduling through `Runtime.run_until_idle()` and the
+  async host wrapper `Runtime.arun_until_idle()`, so blocked quanta do not
+  monopolize scheduler progress.
 - Process-local working directories for filesystem and shell operations.
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
@@ -100,6 +102,8 @@ Start here, then read the deeper references as needed:
   HTTP/SSE APIs, and development commands.
 - [docs/benchmark.md](docs/benchmark.md): M1 runtime-safety benchmark tasks,
   runners, oracle, outputs, and metrics.
+- [docs/mini_swe_agent_image.md](docs/mini_swe_agent_image.md): package-only
+  `mini-swe-agent` image behavior and known interface differences.
 - [docs/development.md](docs/development.md): setup, tests, real LLM smoke,
   configuration defaults, and contribution rules.
 - [docs/invariants.md](docs/invariants.md): current invariant-to-test map.
@@ -341,11 +345,12 @@ config built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))` if
 you want to validate and run real Deno/TypeScript JIT tools from another binary.
 
 Runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`, including
-scheduler quanta, process budgets, image ids, workspace namespace, tool limits,
-filesystem/Object Memory size limits, Deno sandbox limits, JSR import
-allowlists, shell policy lists, launcher presets, Skill defaults, and
-checkpoint defaults. `AgentLibOSConfig` is validated at construction time, so
-invalid or inverted bounds fail before a Runtime starts.
+scheduler quantum, worker, drain, and shutdown limits; process budgets; image
+ids; workspace namespace; tool limits; filesystem/Object Memory size limits;
+Deno sandbox limits; JSR import allowlists; shell policy lists; launcher
+presets; Skill defaults; and checkpoint defaults. `AgentLibOSConfig` is
+validated at construction time, so invalid or inverted bounds fail before a
+Runtime starts.
 
 Add runtime dependencies with `uv add <package>` and development dependencies
 with `uv add --dev <package>`. Commit both `pyproject.toml` and `uv.lock` after

@@ -35,9 +35,11 @@ from agent_libos.models import (
     MemoryView,
     ObjectFilter,
     ObjectHandle,
+    ObjectLifecycleState,
     ObjectLink,
     ObjectMetadata,
     ObjectNamespace,
+    ObjectOwnerKind,
     ObjectTask,
     ObjectTaskNotification,
     ObjectTaskNotificationStatus,
@@ -122,6 +124,10 @@ class SQLiteStore:
                   version INTEGER NOT NULL,
                   immutable INTEGER NOT NULL,
                   created_by TEXT NOT NULL,
+                  owner_kind TEXT NOT NULL DEFAULT 'process',
+                  owner_id TEXT,
+                  lifecycle_state TEXT NOT NULL DEFAULT 'live',
+                  deleted_at TEXT,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
@@ -502,6 +508,7 @@ class SQLiteStore:
             self._ensure_tool_candidate_schema()
             self._ensure_jsonrpc_endpoint_schema()
             self._ensure_runtime_module_schema()
+            self._release_missing_runtime_object_payloads()
             self.conn.commit()
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -542,8 +549,9 @@ class SQLiteStore:
                 """
                 INSERT INTO objects (
                     oid, namespace, name, type, schema_version, payload_json, metadata_json,
-                    provenance_json, version, immutable, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provenance_json, version, immutable, created_by, owner_kind, owner_id,
+                    lifecycle_state, deleted_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     obj.oid,
@@ -557,6 +565,10 @@ class SQLiteStore:
                     obj.version,
                     int(obj.immutable),
                     obj.created_by,
+                    obj.owner_kind.value,
+                    obj.owner_id,
+                    obj.lifecycle_state.value,
+                    obj.deleted_at,
                     obj.created_at,
                     obj.updated_at,
                 ),
@@ -570,6 +582,7 @@ class SQLiteStore:
                 UPDATE objects
                    SET namespace = ?, name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
                        provenance_json = ?, version = ?, immutable = ?, created_by = ?,
+                       owner_kind = ?, owner_id = ?, lifecycle_state = ?, deleted_at = ?,
                        created_at = ?, updated_at = ?
                  WHERE oid = ?
                 """,
@@ -584,6 +597,10 @@ class SQLiteStore:
                     obj.version,
                     int(obj.immutable),
                     obj.created_by,
+                    obj.owner_kind.value,
+                    obj.owner_id,
+                    obj.lifecycle_state.value,
+                    obj.deleted_at,
                     obj.created_at,
                     obj.updated_at,
                     obj.oid,
@@ -591,7 +608,10 @@ class SQLiteStore:
             )
 
     def get_object(self, oid: str) -> AgentObject | None:
-        rows = self._query("SELECT * FROM objects WHERE oid = ?", (oid,))
+        rows = self._query(
+            "SELECT * FROM objects WHERE oid = ? AND lifecycle_state = ?",
+            (oid, ObjectLifecycleState.LIVE.value),
+        )
         # A row without an in-memory payload is a directory remnant from a prior
         # runtime instance or checkpoint restore, not a materializable Object.
         if not rows or oid not in self._object_payloads:
@@ -599,22 +619,35 @@ class SQLiteStore:
         return self._row_to_object(rows[0])
 
     def get_object_by_name(self, name: str, namespace: str) -> AgentObject | None:
-        rows = self._query("SELECT * FROM objects WHERE namespace = ? AND name = ?", (namespace, name))
+        rows = self._query(
+            "SELECT * FROM objects WHERE namespace = ? AND name = ? AND lifecycle_state = ?",
+            (namespace, name, ObjectLifecycleState.LIVE.value),
+        )
         if not rows or rows[0]["oid"] not in self._object_payloads:
             return None
         return self._row_to_object(rows[0])
 
     def object_name_exists(self, name: str, namespace: str, except_oid: str | None = None) -> bool:
-        rows = self._query("SELECT oid FROM objects WHERE namespace = ? AND name = ?", (namespace, name))
+        rows = self._query(
+            "SELECT oid FROM objects WHERE namespace = ? AND name = ? AND lifecycle_state = ?",
+            (namespace, name, ObjectLifecycleState.LIVE.value),
+        )
         return any(row["oid"] != except_oid for row in rows)
 
     def list_objects(self, namespace: str | None = None) -> list[AgentObject]:
         if namespace is None:
-            rows = self._query("SELECT * FROM objects ORDER BY updated_at DESC, created_at DESC, oid ASC")
+            rows = self._query(
+                "SELECT * FROM objects WHERE lifecycle_state = ? ORDER BY updated_at DESC, created_at DESC, oid ASC",
+                (ObjectLifecycleState.LIVE.value,),
+            )
         else:
             rows = self._query(
-                "SELECT * FROM objects WHERE namespace = ? ORDER BY updated_at DESC, created_at DESC, oid ASC",
-                (namespace,),
+                """
+                SELECT * FROM objects
+                 WHERE namespace = ? AND lifecycle_state = ?
+                 ORDER BY updated_at DESC, created_at DESC, oid ASC
+                """,
+                (namespace, ObjectLifecycleState.LIVE.value),
             )
         return [
             self._row_to_object(row)
@@ -623,11 +656,43 @@ class SQLiteStore:
         ]
 
     def list_object_oids_created_by(self, created_by: str) -> list[str]:
-        rows = self._query("SELECT oid FROM objects WHERE created_by = ? ORDER BY created_at", (created_by,))
+        rows = self._query(
+            "SELECT oid FROM objects WHERE created_by = ? AND lifecycle_state = ? ORDER BY created_at",
+            (created_by, ObjectLifecycleState.LIVE.value),
+        )
         return [str(row["oid"]) for row in rows]
 
     def list_objects_created_by(self, created_by: str) -> list[AgentObject]:
-        rows = self._query("SELECT * FROM objects WHERE created_by = ? ORDER BY created_at, oid", (created_by,))
+        rows = self._query(
+            "SELECT * FROM objects WHERE created_by = ? AND lifecycle_state = ? ORDER BY created_at, oid",
+            (created_by, ObjectLifecycleState.LIVE.value),
+        )
+        return [
+            self._row_to_object(row)
+            for row in rows
+            if row["oid"] in self._object_payloads
+        ]
+
+    def list_object_oids_owned_by(self, owner_kind: str | ObjectOwnerKind, owner_id: str) -> list[str]:
+        rows = self._query(
+            """
+            SELECT oid FROM objects
+             WHERE owner_kind = ? AND owner_id = ? AND lifecycle_state = ?
+             ORDER BY created_at, oid
+            """,
+            (str(owner_kind), owner_id, ObjectLifecycleState.LIVE.value),
+        )
+        return [str(row["oid"]) for row in rows]
+
+    def list_objects_owned_by(self, owner_kind: str | ObjectOwnerKind, owner_id: str) -> list[AgentObject]:
+        rows = self._query(
+            """
+            SELECT * FROM objects
+             WHERE owner_kind = ? AND owner_id = ? AND lifecycle_state = ?
+             ORDER BY created_at, oid
+            """,
+            (str(owner_kind), owner_id, ObjectLifecycleState.LIVE.value),
+        )
         return [
             self._row_to_object(row)
             for row in rows
@@ -635,10 +700,24 @@ class SQLiteStore:
         ]
 
     def delete_object(self, oid: str) -> None:
+        now = utc_now()
         with self.transaction(include_object_payloads=True) as cur:
             self._object_payloads.pop(oid, None)
             cur.execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
-            cur.execute("DELETE FROM objects WHERE oid = ?", (oid,))
+            cur.execute(
+                """
+                UPDATE objects
+                   SET payload_json = ?, lifecycle_state = ?, deleted_at = ?, updated_at = ?
+                 WHERE oid = ?
+                """,
+                (
+                    dumps(self._memory_payload_marker(present=False)),
+                    ObjectLifecycleState.RELEASED.value,
+                    now,
+                    now,
+                    oid,
+                ),
+            )
 
     def insert_namespace(self, namespace: ObjectNamespace) -> None:
         self._execute(
@@ -2282,12 +2361,27 @@ class SQLiteStore:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(objects)")}
         if "namespace" not in columns or self._has_name_only_unique_index():
             self._rebuild_objects_table_with_namespace(columns)
+            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(objects)")}
         elif "name" not in columns:
             self.conn.execute("ALTER TABLE objects ADD COLUMN name TEXT")
             self.conn.execute("UPDATE objects SET name = oid WHERE name IS NULL OR name = ''")
+        self._ensure_object_lifecycle_columns(columns)
         self.conn.execute("DROP INDEX IF EXISTS idx_objects_name")
-        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_namespace_name ON objects(namespace, name)")
+        self.conn.execute("DROP INDEX IF EXISTS idx_objects_namespace_name")
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_namespace_name_live
+              ON objects(namespace, name)
+             WHERE lifecycle_state = 'live'
+            """
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_created_by ON objects(created_by, created_at, oid)")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_objects_owner_live
+              ON objects(owner_kind, owner_id, lifecycle_state, created_at, oid)
+            """
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_objects_namespace_updated ON objects(namespace, updated_at, created_at, oid)"
         )
@@ -2344,6 +2438,10 @@ class SQLiteStore:
               version INTEGER NOT NULL,
               immutable INTEGER NOT NULL,
               created_by TEXT NOT NULL,
+              owner_kind TEXT NOT NULL DEFAULT 'process',
+              owner_id TEXT,
+              lifecycle_state TEXT NOT NULL DEFAULT 'live',
+              deleted_at TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
@@ -2355,16 +2453,56 @@ class SQLiteStore:
             f"""
             INSERT INTO objects (
                 oid, namespace, name, type, schema_version, payload_json, metadata_json,
-                provenance_json, version, immutable, created_by, created_at, updated_at
+                provenance_json, version, immutable, created_by, owner_kind, owner_id,
+                lifecycle_state, deleted_at, created_at, updated_at
             )
             SELECT
                 oid, COALESCE({namespace_expr}, '{self.SYSTEM_NAMESPACE}'), COALESCE({name_expr}, oid), type,
                 schema_version, payload_json, metadata_json, provenance_json, version,
-                immutable, created_by, created_at, updated_at
+                immutable, created_by,
+                CASE
+                    WHEN created_by LIKE 'process_result:%' THEN 'process_result'
+                    WHEN created_by LIKE 'object_task:%' THEN 'object_task'
+                    WHEN created_by = 'runtime' OR created_by LIKE 'runtime.%' THEN 'runtime'
+                    ELSE 'process'
+                END,
+                CASE
+                    WHEN created_by LIKE 'process_result:%' THEN substr(created_by, length('process_result:') + 1)
+                    WHEN created_by LIKE 'object_task:%' THEN substr(created_by, length('object_task:') + 1)
+                    ELSE created_by
+                END,
+                'live', NULL, created_at, updated_at
             FROM objects_old
             """
         )
         self.conn.execute("DROP TABLE objects_old")
+
+    def _ensure_object_lifecycle_columns(self, columns: set[str]) -> None:
+        if "owner_kind" not in columns:
+            self.conn.execute("ALTER TABLE objects ADD COLUMN owner_kind TEXT NOT NULL DEFAULT 'process'")
+        if "owner_id" not in columns:
+            self.conn.execute("ALTER TABLE objects ADD COLUMN owner_id TEXT")
+        if "lifecycle_state" not in columns:
+            self.conn.execute("ALTER TABLE objects ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'live'")
+        if "deleted_at" not in columns:
+            self.conn.execute("ALTER TABLE objects ADD COLUMN deleted_at TEXT")
+        self.conn.execute(
+            """
+            UPDATE objects
+               SET owner_kind = CASE
+                       WHEN created_by LIKE 'process_result:%' THEN 'process_result'
+                       WHEN created_by LIKE 'object_task:%' THEN 'object_task'
+                       WHEN created_by = 'runtime' OR created_by LIKE 'runtime.%' THEN 'runtime'
+                       ELSE owner_kind
+                   END,
+                   owner_id = CASE
+                       WHEN created_by LIKE 'process_result:%' THEN substr(created_by, length('process_result:') + 1)
+                       WHEN created_by LIKE 'object_task:%' THEN substr(created_by, length('object_task:') + 1)
+                       ELSE created_by
+                   END
+             WHERE owner_id IS NULL OR owner_id = ''
+            """
+        )
 
     def _has_name_only_unique_index(self) -> bool:
         for index in self.conn.execute("PRAGMA index_list(objects)"):
@@ -2381,6 +2519,64 @@ class SQLiteStore:
 
     def _memory_payload_marker(self, present: bool) -> dict[str, Any]:
         return {"storage": "runtime_memory", "present": present}
+
+    def _release_missing_runtime_object_payloads(self) -> None:
+        """Release Object Memory rows whose runtime-only payload cannot exist after reopen."""
+
+        stale_oids: list[str] = []
+        rows = self.conn.execute(
+            """
+            SELECT oid, payload_json FROM objects
+             WHERE lifecycle_state = ?
+            """,
+            (ObjectLifecycleState.LIVE.value,),
+        )
+        for row in rows:
+            try:
+                marker = loads(row["payload_json"], {})
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(marker, dict)
+                and marker.get("storage") == "runtime_memory"
+                and marker.get("present") is True
+                and row["oid"] not in self._object_payloads
+            ):
+                stale_oids.append(str(row["oid"]))
+        if not stale_oids:
+            return
+
+        now = utc_now()
+        placeholders = ", ".join("?" for _ in stale_oids)
+        self.conn.execute(
+            f"""
+            UPDATE objects
+               SET payload_json = ?, lifecycle_state = ?, deleted_at = ?, updated_at = ?
+             WHERE oid IN ({placeholders})
+            """,
+            (
+                dumps(self._memory_payload_marker(present=False)),
+                ObjectLifecycleState.RELEASED.value,
+                now,
+                now,
+                *stale_oids,
+            ),
+        )
+        self.conn.execute(
+            f"DELETE FROM object_links WHERE src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
+            (*stale_oids, *stale_oids),
+        )
+        resources = [f"object:{oid}" for oid in stale_oids]
+        resource_placeholders = ", ".join("?" for _ in resources)
+        self.conn.execute(
+            f"""
+            UPDATE capabilities
+               SET status = ?
+             WHERE resource IN ({resource_placeholders})
+               AND status = ?
+            """,
+            (CapabilityStatus.REVOKED.value, *resources, CapabilityStatus.ACTIVE.value),
+        )
 
     def _process_params(self, process: AgentProcess) -> tuple[Any, ...]:
         return (
@@ -2473,6 +2669,10 @@ class SQLiteStore:
                 created_by=row["created_by"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
+                owner_kind=ObjectOwnerKind(row["owner_kind"]),
+                owner_id=row["owner_id"],
+                lifecycle_state=ObjectLifecycleState(row["lifecycle_state"]),
+                deleted_at=row["deleted_at"],
             )
 
     def _row_to_namespace(self, row: sqlite3.Row) -> ObjectNamespace:

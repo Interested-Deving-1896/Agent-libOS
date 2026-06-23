@@ -162,7 +162,12 @@ class CreateMemoryNamespaceTool(SyncAgentTool[CreateMemoryNamespaceArgs]):
     )
     args_schema = CreateMemoryNamespaceArgs
     output_schema = CreateMemoryNamespaceOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object", "namespace"]
 
     def run(self, args: CreateMemoryNamespaceArgs, ctx: ToolContext) -> CreateMemoryNamespaceOutput:
@@ -190,7 +195,12 @@ class ListMemoryNamespaceTool(SyncAgentTool[ListMemoryNamespaceArgs]):
     )
     args_schema = ListMemoryNamespaceArgs
     output_schema = ListMemoryNamespaceOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=False,
+        idempotent=True,
+        declared_permissions={"object.read"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object", "namespace", "read"]
 
     def run(self, args: ListMemoryNamespaceArgs, ctx: ToolContext) -> ListMemoryNamespaceOutput:
@@ -227,7 +237,12 @@ class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
     )
     args_schema = ReadMemoryObjectArgs
     output_schema = ReadMemoryObjectOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=False,
+        idempotent=True,
+        declared_permissions={"object.read"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object", "read"]
 
     def run(self, args: ReadMemoryObjectArgs, ctx: ToolContext) -> ReadMemoryObjectOutput:
@@ -259,7 +274,12 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
     )
     args_schema = AppendMemoryObjectArgs
     output_schema = AppendMemoryObjectOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object", "write", "append"]
 
     def run(self, args: AppendMemoryObjectArgs, ctx: ToolContext) -> AppendMemoryObjectOutput:

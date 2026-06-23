@@ -92,6 +92,9 @@ class CapabilityDefaults:
 class SchedulerDefaults:
     max_quanta: int | None = None
     poll_interval_s: float = 0.01
+    max_workers: int = 8
+    drain_window_s: float = 0.5
+    shutdown_join_timeout_s: float = 2.0
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -190,6 +193,7 @@ class ToolDefaults:
     jit_tests_max_count: int = 32
     jit_test_case_max_bytes: int = 32_768
     jit_validation_timeout_s: float = 5.0
+    jit_validation_log_max_chars: int = 131_072
     deno_executable: str = "deno"
     deno_timeout_s: float = 5.0
     deno_max_rpc_calls: int = 64
@@ -540,6 +544,9 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     scheduler = config.scheduler
     _positive_optional("scheduler.max_quanta", scheduler.max_quanta)
     _positive("scheduler.poll_interval_s", scheduler.poll_interval_s)
+    _positive("scheduler.max_workers", scheduler.max_workers)
+    _nonnegative("scheduler.drain_window_s", scheduler.drain_window_s)
+    _nonnegative("scheduler.shutdown_join_timeout_s", scheduler.shutdown_join_timeout_s)
 
     process = config.process
     _nonnegative_optional_fields(
@@ -647,6 +654,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "jit_source_max_chars",
         "jit_tests_max_count",
         "jit_test_case_max_bytes",
+        "jit_validation_log_max_chars",
         "deno_max_rpc_calls",
         "deno_max_stdout_bytes",
         "deno_max_stderr_bytes",

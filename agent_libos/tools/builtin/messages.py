@@ -83,7 +83,12 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
     )
     args_schema = SendProcessMessageArgs
     output_schema = SendProcessMessageOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"process.message"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "message"]
 
     def run(self, args: SendProcessMessageArgs, ctx: ToolContext) -> SendProcessMessageOutput:
@@ -124,7 +129,12 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
     description = "Read this process message queue. By default, returned unread messages are acknowledged."
     args_schema = ReadProcessMessagesArgs
     output_schema = ReadProcessMessagesOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"process.message"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "message", "inspect"]
 
     def run(self, args: ReadProcessMessagesArgs, ctx: ToolContext) -> ReadProcessMessagesOutput:
@@ -176,7 +186,12 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
     )
     args_schema = ReceiveProcessMessagesArgs
     output_schema = ReadProcessMessagesOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"process.message"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "message", "ipc", "receive"]
 
     def run(self, args: ReceiveProcessMessagesArgs, ctx: ToolContext) -> ReadProcessMessagesOutput:

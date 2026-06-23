@@ -253,7 +253,12 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
     )
     args_schema = ProcessExitArgs
     output_schema = ProcessExitOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.read", "object.write", "process.lifecycle"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "lifecycle"]
 
     def run(self, args: ProcessExitArgs, ctx: ToolContext) -> ProcessExitOutput:
@@ -303,7 +308,12 @@ class SetWorkingDirectoryTool(SyncAgentTool[SetWorkingDirectoryArgs]):
     )
     args_schema = SetWorkingDirectoryArgs
     output_schema = SetWorkingDirectoryOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"process.cwd"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "working_directory"]
 
     def run(self, args: SetWorkingDirectoryArgs, ctx: ToolContext) -> SetWorkingDirectoryOutput:
@@ -322,7 +332,12 @@ class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
     )
     args_schema = ExecProcessArgs
     output_schema = ExecProcessOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.write", "process.lifecycle", "tool.table"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "lifecycle", "exec"]
 
     def run(self, args: ExecProcessArgs, ctx: ToolContext) -> ExecProcessOutput:
@@ -365,7 +380,12 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
     )
     args_schema = ForkChildProcessArgs
     output_schema = ForkChildProcessOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"capability.write", "object.read", "object.write", "process.spawn"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "child", "fork"]
 
     def run(self, args: ForkChildProcessArgs, ctx: ToolContext) -> ForkChildProcessOutput:
@@ -474,7 +494,12 @@ class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
     )
     args_schema = SpawnChildProcessArgs
     output_schema = SpawnChildProcessOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"capability.write", "object.write", "process.spawn"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "child", "spawn"]
 
     def run(self, args: SpawnChildProcessArgs, ctx: ToolContext) -> SpawnChildProcessOutput:
@@ -533,7 +558,12 @@ class WaitChildProcessTool(SyncAgentTool[WaitChildProcessArgs]):
     )
     args_schema = WaitChildProcessArgs
     output_schema = WaitChildProcessOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"process.wait"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "child", "wait"]
 
     def run(self, args: WaitChildProcessArgs, ctx: ToolContext) -> WaitChildProcessOutput:
@@ -585,7 +615,12 @@ class SignalChildProcessTool(SyncAgentTool[SignalChildProcessArgs]):
     description = "Pause, resume, cancel, or terminate a direct child AgentProcess."
     args_schema = SignalChildProcessArgs
     output_schema = SignalChildProcessOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"process.signal"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "child", "signal"]
 
     def run(self, args: SignalChildProcessArgs, ctx: ToolContext) -> SignalChildProcessOutput:
@@ -615,7 +650,12 @@ class MergeChildMemoryTool(SyncAgentTool[MergeChildMemoryArgs]):
     description = "Merge result-visible Object Memory from an exited direct child into the parent process view."
     args_schema = MergeChildMemoryArgs
     output_schema = MergeChildMemoryOutput
-    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.link", "object.write"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["process", "child", "memory"]
 
     def run(self, args: MergeChildMemoryArgs, ctx: ToolContext) -> MergeChildMemoryOutput:

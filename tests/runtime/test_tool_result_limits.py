@@ -25,6 +25,23 @@ class HugeResultTool(SyncAgentTool[EmptyArgs]):
         return {"blob": "x" * (ctx.runtime.config.tools.tool_result_payload_hard_limit_bytes + 1)}
 
 
+class HugeSideEffectResultTool(SyncAgentTool[EmptyArgs]):
+    name = "huge_side_effect_result"
+    description = "Mutate runtime state and then return a result larger than the broker persistence boundary."
+    args_schema = EmptyArgs
+    policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"object.write"})
+
+    def run(self, args: EmptyArgs, ctx: ToolContext) -> dict[str, str]:
+        assert ctx.runtime is not None
+        ctx.runtime.memory.create_object(
+            ctx.pid,
+            ObjectType.OBSERVATION,
+            {"committed": True},
+            name="huge.side.effect.committed",
+        )
+        return {"blob": "x" * (ctx.runtime.config.tools.tool_result_payload_hard_limit_bytes + 1)}
+
+
 class SlowSyncSideEffectTool(SyncAgentTool[EmptyArgs]):
     name = "slow_sync_side_effect"
     description = "Sleep past the declared timeout and then mutate runtime state."
@@ -91,6 +108,31 @@ class TestToolResultLimits:
             assert [obj for obj in runtime.store.list_objects() if obj.type.value == "tool_result"] == []
             audit = [record for record in runtime.audit.trace() if record.action == "tool.call"][-1]
             assert audit.decision["result"]["preview"] == "[tool result omitted after size-limit failure]"
+        finally:
+            runtime.close()
+
+    def test_side_effect_tool_oversize_result_is_reported_as_omitted_success(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="huge side effect result")
+            handle = runtime.tools.register_tool(HugeSideEffectResultTool(), registered_by="test", ephemeral=True)
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+
+            result = runtime.tools.call(pid, "huge_side_effect_result", {})
+
+            assert result.ok, result.error
+            assert result.result_handle is not None
+            assert result.payload["result_omitted"] is True
+            assert runtime.store.get_object_by_name(
+                "huge.side.effect.committed",
+                namespace=runtime.memory.resolve_namespace(pid),
+            ) is not None
+            stored = runtime.store.get_object(result.result_handle.oid)
+            assert stored is not None
+            assert stored.payload["metadata"]["result_omitted"] is True
+            audit = [record for record in runtime.audit.trace() if record.action == "tool.call"][-1]
+            assert audit.decision["ok"] is True
+            assert audit.decision["result_omitted"] is True
         finally:
             runtime.close()
 

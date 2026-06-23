@@ -76,6 +76,18 @@ class ViewMode(StrEnum):
     EPHEMERAL = "ephemeral"
 
 
+class ObjectOwnerKind(StrEnum):
+    PROCESS = "process"
+    PROCESS_RESULT = "process_result"
+    OBJECT_TASK = "object_task"
+    RUNTIME = "runtime"
+
+
+class ObjectLifecycleState(StrEnum):
+    LIVE = "live"
+    RELEASED = "released"
+
+
 @dataclass
 class ObjectMetadata:
     title: str | None = None
@@ -121,6 +133,10 @@ class AgentObject:
     created_by: PID | str
     created_at: str
     updated_at: str
+    owner_kind: ObjectOwnerKind = ObjectOwnerKind.PROCESS
+    owner_id: PID | str | None = None
+    lifecycle_state: ObjectLifecycleState = ObjectLifecycleState.LIVE
+    deleted_at: str | None = None
 
 
 @dataclass(frozen=True)
