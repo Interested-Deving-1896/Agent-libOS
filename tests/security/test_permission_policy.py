@@ -1,7 +1,10 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 import hashlib
 import json
+import threading
+import time
 from dataclasses import replace
 from uuid import uuid4
 from agent_libos import Runtime
@@ -365,6 +368,35 @@ class TestPermissionPolicy:
         pending = [request for request in self.runtime.human.pending() if request.pid == pid_2]
         assert len(pending) == 1
         assert pending[0].request_id != request_1.request_id
+
+    def test_concurrent_identical_request_permission_calls_share_pending_request(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request permission concurrently')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        original_request_permission = self.runtime.human.request_permission
+
+        def slow_request_permission(*args: object, **kwargs: object) -> str:
+            time.sleep(0.05)
+            return original_request_permission(*args, **kwargs)
+
+        self.runtime.human.request_permission = slow_request_permission  # type: ignore[method-assign]
+        barrier = threading.Barrier(2)
+
+        def call() -> str:
+            barrier.wait(timeout=2)
+            with pytest.raises(HumanResponseRequired) as raised:
+                self.runtime.tools.call(
+                    pid,
+                    'request_permission',
+                    {'resource': resource, 'rights': ['write'], 'reason': 'same request'},
+                )
+            return raised.value.request_id
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            request_ids = list(executor.map(lambda _: call(), range(2)))
+
+        assert request_ids[0] == request_ids[1]
+        assert [request.request_id for request in self.runtime.human.pending()] == [request_ids[0]]
 
     def _path(self) -> str:
         return f'agent_outputs/permission_policy_{uuid4().hex}.txt'

@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import HumanRequestStatus
 from agent_libos.models.exceptions import HumanResponseRequired
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
@@ -97,20 +98,27 @@ class AskHumanTool(SyncAgentTool[AskHumanArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         key = self._pending_key(ctx.pid, args)
-        with self._lock:
-            request_id = self._pending_by_key.get(key)
-        if request_id is None:
-            # The first call queues the question and raises; the resumed call
-            # with the same arguments returns the already-recorded answer.
-            request_id = runtime.human.ask(
-                pid=ctx.pid,
-                human=args.human,
-                question=args.question,
-                context=args.context,
-                blocking=True,
-            )
+        request_id = ctx.metadata.get("human_resume_request_id")
+        if isinstance(request_id, str) and request_id:
+            self._validate_resume_request(runtime, ctx.pid, args, request_id)
+        else:
             with self._lock:
-                self._pending_by_key[key] = request_id
+                request_id = self._pending_by_key.get(key)
+                if request_id is None:
+                    # The first call queues the question and raises; the resumed
+                    # call with the same arguments returns the recorded answer.
+                    request_id = runtime.human.ask(
+                        pid=ctx.pid,
+                        human=args.human,
+                        question=args.question,
+                        context=args.context,
+                        blocking=True,
+                    )
+                    self._pending_by_key[key] = request_id
+        if request_id is None:
+            raise ToolExecutionError("Human request id was not created.", code=ToolErrorCode.EXECUTION_ERROR)
+        request = runtime.human.get(request_id)
+        if request.status == HumanRequestStatus.PENDING:
             raise HumanResponseRequired(
                 request_id=request_id,
                 message=f"{ctx.pid} is waiting for human answer to {request_id}",
@@ -127,6 +135,24 @@ class AskHumanTool(SyncAgentTool[AskHumanArgs]):
         with self._lock:
             self._pending_by_key.pop(key, None)
         return AskHumanResult(request_id=request_id, answer=answer, status="answered")
+
+    def _validate_resume_request(self, runtime: Any, pid: str, args: AskHumanArgs, request_id: str) -> None:
+        request = runtime.human.get(request_id)
+        if request.pid != pid or request.human != args.human:
+            raise ToolExecutionError(
+                "Human resume request does not belong to this ask_human call.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
+        expected_payload = {
+            "type": "question",
+            "question": args.question,
+            "context": args.context,
+        }
+        if request.payload != expected_payload:
+            raise ToolExecutionError(
+                "Human resume request payload does not match this ask_human call.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
 
     def _pending_key(self, pid: str, args: AskHumanArgs) -> str:
         payload = {

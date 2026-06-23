@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import time
+from dataclasses import replace
 
 from pydantic import BaseModel
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import ObjectType
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 
@@ -40,6 +42,33 @@ class HugeSideEffectResultTool(SyncAgentTool[EmptyArgs]):
             name="huge.side.effect.committed",
         )
         return {"blob": "x" * (ctx.runtime.config.tools.tool_result_payload_hard_limit_bytes + 1)}
+
+
+class MediumResultTool(SyncAgentTool[EmptyArgs]):
+    name = "medium_result"
+    description = "Return a result that fits the broker boundary but not Object Memory."
+    args_schema = EmptyArgs
+
+    def run(self, args: EmptyArgs, ctx: ToolContext) -> dict[str, str]:
+        assert ctx.runtime is not None
+        return {"blob": "x" * (ctx.runtime.config.tools.memory_payload_hard_limit_bytes + 1)}
+
+
+class MediumSideEffectResultTool(SyncAgentTool[EmptyArgs]):
+    name = "medium_side_effect_result"
+    description = "Mutate runtime state then return a result that is too large to persist in Object Memory."
+    args_schema = EmptyArgs
+    policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"object.write"})
+
+    def run(self, args: EmptyArgs, ctx: ToolContext) -> dict[str, str]:
+        assert ctx.runtime is not None
+        ctx.runtime.memory.create_object(
+            ctx.pid,
+            ObjectType.OBSERVATION,
+            {"committed": True},
+            name="medium.side.effect.committed",
+        )
+        return {"blob": "x" * (ctx.runtime.config.tools.memory_payload_hard_limit_bytes + 1)}
 
 
 class SlowSyncSideEffectTool(SyncAgentTool[EmptyArgs]):
@@ -136,6 +165,44 @@ class TestToolResultLimits:
         finally:
             runtime.close()
 
+    def test_result_too_large_for_object_memory_is_rejected_without_result_object(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="medium result")
+            handle = runtime.tools.register_tool(MediumResultTool(), registered_by="test", ephemeral=True)
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+
+            result = runtime.tools.call(pid, "medium_result", {})
+
+            assert not result.ok
+            assert result.result_handle is None
+            assert "tool result payload exceeds" in (result.error or "")
+            assert [obj for obj in runtime.store.list_objects() if obj.type.value == "tool_result"] == []
+        finally:
+            runtime.close()
+
+    def test_side_effect_result_too_large_for_object_memory_is_reported_as_omitted_success(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="medium side effect result")
+            handle = runtime.tools.register_tool(MediumSideEffectResultTool(), registered_by="test", ephemeral=True)
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+
+            result = runtime.tools.call(pid, "medium_side_effect_result", {})
+
+            assert result.ok, result.error
+            assert result.result_handle is not None
+            assert result.payload["result_omitted"] is True
+            assert runtime.store.get_object_by_name(
+                "medium.side.effect.committed",
+                namespace=runtime.memory.resolve_namespace(pid),
+            ) is not None
+            stored = runtime.store.get_object(result.result_handle.oid)
+            assert stored is not None
+            assert stored.payload["metadata"]["result_omitted"] is True
+        finally:
+            runtime.close()
+
     def test_sync_side_effect_tool_does_not_return_before_background_work_finishes(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -185,3 +252,22 @@ class TestToolResultLimits:
                 assert spec["description"] == "v2 description"
             finally:
                 runtime.close()
+
+    def test_oversize_tool_arguments_are_rejected_before_observability_event(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(DEFAULT_CONFIG.tools, tool_call_args_hard_limit_bytes=256),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="oversize args")
+            runtime.tools.configure_process_tools(pid, ["echo"], assigned_by="test")
+
+            result = runtime.tools.call(pid, "echo", {"blob": "x" * 1000})
+
+            assert not result.ok
+            assert result.result_handle is None
+            assert "tool call arguments exceed" in (result.error or "")
+            assert all(event.type.value != "tool_called" for event in runtime.events.list(target=pid))
+        finally:
+            runtime.close()

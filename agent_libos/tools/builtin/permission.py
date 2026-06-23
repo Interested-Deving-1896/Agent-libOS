@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -66,23 +67,22 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
             ) from exc
         key = self._pending_key(ctx.pid, args, rights)
         request_id = ctx.metadata.get("human_resume_request_id")
-        if not isinstance(request_id, str) or not request_id:
+        if isinstance(request_id, str) and request_id:
+            self._validate_resume_request(runtime, ctx.pid, args, rights, request_id)
+        else:
             with self._lock:
                 request_id = self._pending_by_key.get(key)
+                if request_id is None:
+                    request_id = runtime.human.request_permission(
+                        pid=ctx.pid,
+                        human=args.human,
+                        resource=args.resource,
+                        rights=rights,
+                        reason=args.reason,
+                    )
+                    self._pending_by_key[key] = request_id
         if request_id is None:
-            request_id = runtime.human.request_permission(
-                pid=ctx.pid,
-                human=args.human,
-                resource=args.resource,
-                rights=rights,
-                reason=args.reason,
-            )
-            with self._lock:
-                self._pending_by_key[key] = request_id
-            raise HumanResponseRequired(
-                request_id=request_id,
-                message=f"{ctx.pid} is waiting for human permission decision {request_id}",
-            )
+            raise ToolExecutionError("Human permission request id was not created.", code=ToolErrorCode.EXECUTION_ERROR)
         request = runtime.human.get(request_id)
         if request.status == HumanRequestStatus.PENDING:
             raise HumanResponseRequired(
@@ -102,6 +102,37 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
             rights=rights,
             status=request.status.value,
         )
+
+    def _validate_resume_request(
+        self,
+        runtime: Any,
+        pid: str,
+        args: RequestPermissionArgs,
+        rights: list[str],
+        request_id: str,
+    ) -> None:
+        request = runtime.human.get(request_id)
+        if request.pid != pid or request.human != args.human:
+            raise ToolExecutionError(
+                "Human resume request does not belong to this request_permission call.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
+        payload = request.payload
+        requested = payload.get("requested_permission") if isinstance(payload, dict) else None
+        context = payload.get("context") if isinstance(payload, dict) else None
+        if (
+            not isinstance(requested, dict)
+            or not isinstance(context, dict)
+            or payload.get("type") != "permission_request"
+            or requested.get("subject") != pid
+            or requested.get("rights") != rights
+            or context.get("resource") != args.resource
+            or context.get("reason") != args.reason
+        ):
+            raise ToolExecutionError(
+                "Human resume request payload does not match this request_permission call.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
 
     def _pending_key(self, pid: str, args: RequestPermissionArgs, rights: list[str]) -> str:
         payload = {

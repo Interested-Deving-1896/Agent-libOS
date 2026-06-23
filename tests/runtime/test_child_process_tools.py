@@ -5,7 +5,7 @@ import json
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, ObjectOwnerKind, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models import CapabilityRight, EventType, ObjectOwnerKind, ObjectType, ProcessStatus, ResourceBudget
 from agent_libos.models.exceptions import NotFound, ProcessError, ProcessWaitRequired
 from scripts.llm_context_probe import last_tool_result, static_prefix
 
@@ -107,6 +107,37 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_wait_child_process_rechecks_child_after_wait_state_write(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='wait race parent')
+            child = runtime.spawn_child_process(parent, 'wait race child')
+            original_update_process = runtime.store.update_process
+            triggered = {'value': False}
+
+            def racing_update_process(process):
+                if (
+                    process.pid == parent
+                    and process.status == ProcessStatus.WAITING_EVENT
+                    and not triggered['value']
+                ):
+                    triggered['value'] = True
+                    runtime.process.exit(child, message='done before parent wait persisted')
+                return original_update_process(process)
+
+            runtime.store.update_process = racing_update_process
+            try:
+                waited = runtime.process.wait(parent, child)
+            finally:
+                runtime.store.update_process = original_update_process
+
+            assert triggered['value']
+            assert waited.status == ProcessStatus.EXITED
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(parent).status_message is None
+        finally:
+            runtime.close()
+
     def test_terminal_process_cannot_be_resumed_by_signal(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -117,6 +148,37 @@ class TestChildProcessTool:
                 runtime.process.resume(pid)
 
             assert runtime.process.get(pid).status == ProcessStatus.EXITED
+        finally:
+            runtime.close()
+
+    def test_waiting_process_cannot_be_resumed_without_wait_condition(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='wait parent')
+            child = runtime.spawn_child_process(parent, 'wait child')
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
+
+            with pytest.raises(ProcessError, match='cannot resume waiting process'):
+                runtime.process.resume(parent)
+
+            assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+            assert runtime.process.get(parent).status_message == f'waiting for {child}'
+        finally:
+            runtime.close()
+
+    def test_terminal_process_cannot_exit_again_or_overwrite_status(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='exit once')
+            runtime.process.exit(pid, message='done')
+
+            with pytest.raises(ProcessError, match='cannot exit terminal process'):
+                runtime.process.exit(pid, message='late overwrite')
+
+            process = runtime.process.get(pid)
+            assert process.status == ProcessStatus.EXITED
+            assert process.status_message == 'done'
         finally:
             runtime.close()
 
@@ -134,6 +196,60 @@ class TestChildProcessTool:
             assert runtime.process.get(child).status == ProcessStatus.KILLED
             assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
             assert runtime.process.get(parent).status_message is None
+        finally:
+            runtime.close()
+
+    def test_resource_kill_uses_terminal_cleanup_for_root_process_memory(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='root killed')
+            owned = runtime.memory.create_object(
+                pid,
+                ObjectType.OBSERVATION,
+                {'released': True},
+                name='root.kill.released',
+            )
+
+            runtime.resources.kill_if_exceeded(pid, reason='test budget exhausted')
+
+            assert runtime.process.get(pid).status == ProcessStatus.KILLED
+            assert runtime.store.get_object(owned.oid) is None
+            assert any(
+                event.type == EventType.PROCESS_EXITED
+                and event.source == pid
+                and event.payload.get('status') == ProcessStatus.KILLED.value
+                for event in runtime.events.list()
+            )
+        finally:
+            runtime.close()
+
+    def test_failed_spawn_child_launch_does_not_leave_runnable_or_budget_residue(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='parent',
+                resource_budget=ResourceBudget(max_child_processes=1),
+            )
+            failed_pid = {'value': None}
+
+            def fail_child_launch(pid: str, image_id: str) -> None:
+                process = runtime.process.get(pid)
+                if process.parent_pid == parent:
+                    failed_pid['value'] = pid
+                    raise RuntimeError('child boot failed')
+
+            runtime.process.add_after_spawn_hook(fail_child_launch)
+
+            with pytest.raises(RuntimeError, match='child boot failed'):
+                runtime.spawn_child_process(parent, 'child fails during boot')
+
+            assert failed_pid['value'] is not None
+            assert runtime.store.get_process(failed_pid['value']) is None
+            assert runtime.process.list_children(parent) == []
+            assert runtime.process.get(parent).resource_usage.child_processes == 0
+            assert runtime.store.get_namespace(runtime.memory.process_namespace(failed_pid['value'])) is None
+            assert runtime.capability.capabilities_for(failed_pid['value']) == []
         finally:
             runtime.close()
 

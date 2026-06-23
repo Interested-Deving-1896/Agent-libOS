@@ -161,6 +161,7 @@ class Runtime:
             resources=self.resources,
             llm_profile_resolver=self._resolve_launch_llm_profile_id,
         )
+        self.resources.bind_process_kill_finalizer(self.process.finalize_killed_processes)
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
         self.object_tasks = ObjectTaskManager(self, config=self.config)
         self.memory.bind_object_pin_checker(self.object_tasks.has_active_for_owner)
@@ -174,6 +175,7 @@ class Runtime:
             shutdown_join_timeout_s=self.config.scheduler.shutdown_join_timeout_s,
             resources=self.resources,
             skip_pid=self.object_tasks.is_runner_pid,
+            cancel_process=self.process.cancel,
         )
         self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
         self.checkpoint.bind_runtime(self)

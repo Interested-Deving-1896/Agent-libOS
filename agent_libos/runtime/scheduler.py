@@ -42,6 +42,7 @@ class AsyncProcessScheduler:
         shutdown_join_timeout_s: float = _SCHEDULER_DEFAULTS.shutdown_join_timeout_s,
         resources: Any | None = None,
         skip_pid: Callable[[str], bool] | None = None,
+        cancel_process: Callable[[str, str], None] | None = None,
     ):
         self.store = store
         self.audit = audit
@@ -51,6 +52,7 @@ class AsyncProcessScheduler:
         self.shutdown_join_timeout_s = shutdown_join_timeout_s
         self.resources = resources
         self._skip_pid = skip_pid
+        self._cancel_process = cancel_process
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent-libos-scheduler")
         self._unblock_executor = ThreadPoolExecutor(
             max_workers=max(1, max_workers),
@@ -458,6 +460,13 @@ class AsyncProcessScheduler:
         decision: dict[str, Any] = {"reason": reason}
         if detached:
             decision["detached"] = True
+            if self._cancel_process is not None:
+                try:
+                    self._cancel_process(pid, reason)
+                    decision["process_cancelled"] = True
+                except Exception as exc:
+                    decision["process_cancel_error"] = str(exc)
+                    decision["process_cancel_error_type"] = type(exc).__name__
         self.audit.record(
             actor="scheduler",
             action="scheduler.process_task_cancelled",

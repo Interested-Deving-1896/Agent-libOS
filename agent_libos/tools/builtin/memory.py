@@ -145,12 +145,13 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             namespace=args.namespace,
         )
         obj = runtime.memory.get_object(ctx.pid, handle)
-        process = runtime.process.get(ctx.pid)
-        if process.memory_view is None:
-            process.memory_view = runtime.memory.create_view(ctx.pid, [handle], mode=ViewMode.READ_ONLY)
-        elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
-            process.memory_view.roots.append(handle)
-        runtime.store.update_process(process)
+        with runtime.store._lock:
+            process = runtime.process.get(ctx.pid)
+            if process.memory_view is None:
+                process.memory_view = runtime.memory.create_view(ctx.pid, [handle], mode=ViewMode.READ_ONLY)
+            elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
+                process.memory_view.roots.append(handle)
+            runtime.store.update_process(process)
         return CreateMemoryObjectOutput(oid=handle.oid, namespace=obj.namespace, name=obj.name, type=args.type)
 
 

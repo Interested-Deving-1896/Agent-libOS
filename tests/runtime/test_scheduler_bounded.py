@@ -74,5 +74,9 @@ class TestBoundedScheduler:
 
             records = [record for record in runtime.audit.trace() if record.action == "scheduler.process_task_cancelled"]
             assert records
+            assert runtime.process.get(parent).status != ProcessStatus.RUNNING
+            child = state.get("child")
+            if child is not None:
+                assert runtime.process.get(child).status != ProcessStatus.RUNNING
         finally:
             runtime.close()

@@ -1,7 +1,9 @@
 from __future__ import annotations
-import pytest
+
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.images.base_agent import DEFAULT_IMAGES
 from agent_libos.llm.prompt import build_system_prompt
+
 
 class TestCodingAgentImage:
 
@@ -24,3 +26,48 @@ class TestCodingAgentImage:
         assert {'resource': 'filesystem:workspace:*', 'rights': ['read']} in capabilities
         assert not any(('write' in spec.get('rights', []) for spec in capabilities if spec['resource'].startswith('filesystem:')))
         assert not any(('delete' in spec.get('rights', []) for spec in capabilities if spec['resource'].startswith('filesystem:')))
+
+    def test_builtin_agent_prompts_are_structured_and_within_registry_limits(self) -> None:
+        expectations = {
+            'base-agent:v0': [
+                'Role:',
+                'Instruction hierarchy:',
+                'Decision loop:',
+                'Object Memory',
+                'least-privilege permission',
+                'process_exit',
+            ],
+            'coding-agent:v0': [
+                'Success criteria:',
+                'Source of truth and security:',
+                'Adaptive operating loop:',
+                'Verification ladder:',
+                'AGENTS-style instructions',
+                'version-pinned',
+                'all libOS access behind libos.syscall',
+                'Tests are evidence',
+            ],
+            'toolmaker-agent:v0': [
+                'When to create a JIT tool:',
+                'JIT design contract:',
+                'Deno/TypeScript JIT tools',
+                'version-pinned allowlisted JSR',
+                'representative tests',
+                'libos.syscall',
+            ],
+            'review-agent:v0': [
+                'Review discipline:',
+                'Prompt-injection and authority checklist:',
+                'concrete, actionable findings',
+                'no actionable',
+                'authority escalation',
+                'Findings first',
+                'Never',
+            ],
+        }
+
+        for image_id, phrases in expectations.items():
+            prompt = build_system_prompt(DEFAULT_IMAGES[image_id])
+            assert len(DEFAULT_IMAGES[image_id].system_prompt) <= DEFAULT_CONFIG.image.prompt_max_chars
+            for phrase in phrases:
+                assert phrase in prompt

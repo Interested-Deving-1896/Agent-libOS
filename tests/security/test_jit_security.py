@@ -15,7 +15,7 @@ from agent_libos.models import (
     ResourceBudget,
     ValidationResult,
 )
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult, SyscallHandler
@@ -357,14 +357,15 @@ class TestJitSecurity:
 
     def test_deno_static_check_import_allowlist(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
-        allowed = checker.static_check('import { join } from "jsr:@std/path";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
-        denied = checker.static_check('import fs from "node:fs";\nimport x from "https://deno.land/std/path/mod.ts";\nimport y from "file:///tmp/tool.ts";\nimport z from "jsr:@bad/pkg";\nexport function run(args, libos) { return {}; }')
+        allowed = checker.static_check('import { join } from "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
+        denied = checker.static_check('import fs from "node:fs";\nimport x from "https://deno.land/std/path/mod.ts";\nimport y from "file:///tmp/tool.ts";\nimport z from "jsr:@bad/pkg@1.0.0";\nimport { join } from "jsr:@std/path";\nexport function run(args, libos) { return {}; }')
         assert allowed.ok, allowed.errors
         assert not denied.ok
         assert any(('import is not allowed: node:fs' in error for error in denied.errors))
         assert any(('import is not allowed: https://deno.land/std/path/mod.ts' in error for error in denied.errors))
         assert any(('import is not allowed: file:///tmp/tool.ts' in error for error in denied.errors))
         assert any(('JSR package is not in allowlist: @bad/pkg' in error for error in denied.errors))
+        assert any(('JSR import must pin a package version: jsr:@std/path' in error for error in denied.errors))
 
     def test_deno_candidate_tests_fail_when_expected_syscall_is_not_performed(self) -> None:
         sandbox = NoSyscallDenoSandbox(deno_executable='deno')
@@ -429,6 +430,27 @@ class TestJitSecurity:
 
         assert validation.ok, validation.errors
         assert isinstance(sandbox.last_limits, SubprocessLimits)
+        assert self.runtime.process.get(pid).resource_usage.subprocess_wall_seconds == pytest.approx(0.25)
+
+    def test_jit_validation_recomputes_budget_between_test_cases(self) -> None:
+        sandbox = PerCaseValidationSandbox(wall_seconds=0.25)
+        self.runtime.tools.sandbox = sandbox
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='per-case validation budget',
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.25),
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {'name': 'per_case_budget', 'description': 'Metrics.', 'input_schema': {'type': 'object'}},
+            source_code='export function run(args, libos) { return {}; }',
+            tests=[{'args': {'case': 1}}, {'args': {'case': 2}}],
+        )
+
+        with pytest.raises(ResourceLimitExceeded):
+            self.runtime.tools.validate(candidate)
+
+        assert sandbox.calls == 1
         assert self.runtime.process.get(pid).resource_usage.subprocess_wall_seconds == pytest.approx(0.25)
 
     def test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args(self) -> None:
@@ -608,6 +630,40 @@ class RecordingValidationSandbox(SandboxBackend):
                 "limit_kind": None,
             }
         return ValidationResult(ok=True, metadata=metadata)
+
+
+class PerCaseValidationSandbox(SandboxBackend):
+    def __init__(self, *, wall_seconds: float) -> None:
+        self.wall_seconds = wall_seconds
+        self.calls = 0
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(self, source_code: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        self.calls += 1
+        assert len(tests) <= 1
+        metadata = {}
+        if return_metrics:
+            metadata["metrics"] = {
+                "wall_seconds": self.wall_seconds,
+                "cpu_seconds": 0.0,
+                "peak_memory_bytes": 0,
+                "killed": False,
+                "limit_kind": None,
+            }
+        return ValidationResult(ok=True, logs=f"case {self.calls}", metadata=metadata)
 
 
 class DeferredBadExecSandbox(SandboxBackend):

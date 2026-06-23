@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import fields
 import math
 from typing import Any
@@ -53,6 +54,10 @@ class ResourceManager:
         self.store = store
         self.audit = audit
         self.events = events
+        self._process_kill_finalizer: Callable[..., None] | None = None
+
+    def bind_process_kill_finalizer(self, finalizer: Callable[..., None]) -> None:
+        self._process_kill_finalizer = finalizer
 
     def preflight(
         self,
@@ -146,6 +151,8 @@ class ResourceManager:
                 killed.append(process.pid)
             for killed_pid in killed:
                 self._wake_parent_waiting_on_child(killed_pid)
+            if killed and self._process_kill_finalizer is not None:
+                self._process_kill_finalizer(killed, reason=reason)
             self.events.emit(
                 EventType.RESOURCE_LIMIT_EXCEEDED,
                 source="resource_manager",

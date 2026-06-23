@@ -167,6 +167,7 @@ class ToolDefaults:
     interactive_timeout_s: float = 2.0
     default_text_encoding: str = "utf-8"
     tool_observability_preview_chars: int = 256
+    tool_call_args_hard_limit_bytes: int = 1_500_000
     tool_result_payload_hard_limit_bytes: int = 1_500_000
     filesystem_read_max_bytes: int = 65_536
     filesystem_read_hard_limit_bytes: int = 1_048_576
@@ -632,6 +633,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     )
     for name in (
         "tool_result_payload_hard_limit_bytes",
+        "tool_call_args_hard_limit_bytes",
         "filesystem_read_max_bytes",
         "filesystem_read_hard_limit_bytes",
         "directory_entry_limit",

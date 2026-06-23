@@ -319,9 +319,8 @@ class ToolBroker:
         candidate = self._get_candidate(candidate_id)
         owner_pid = pid or candidate.pid
         self._require_candidate_owner(candidate, owner_pid)
-        limits = self._subprocess_limits(owner_pid)
         try:
-            result = self._run_candidate_tests(candidate, limits)
+            result = self._run_candidate_tests(candidate, owner_pid)
         except SubprocessLimitExceeded as exc:
             self._charge_subprocess_metrics(
                 owner_pid,
@@ -338,13 +337,6 @@ class ToolBroker:
                 context={"candidate_id": candidate_id, "tool": candidate.spec.name},
             )
             raise
-        metrics = self._metrics_from_validation(result.metadata.get("metrics"))
-        self._charge_subprocess_metrics(
-            owner_pid,
-            metrics,
-            source="tool.validate.deno",
-            context={"candidate_id": candidate_id, "tool": candidate.spec.name},
-        )
         errors = list(result.errors)
         warnings = list(result.warnings)
         if candidate.requested_capabilities:
@@ -519,6 +511,32 @@ class ToolBroker:
                     "ok": False,
                     "tool": handle.name,
                     "policy_decision": "resource_limit",
+                    "error": error,
+                },
+            )
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
+        try:
+            ensure_json_size(
+                args,
+                self.config.tools.tool_call_args_hard_limit_bytes,
+                "tool call arguments",
+            )
+        except ValidationError as exc:
+            error = str(exc)
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={"call_id": call_id, "error": error, "policy_decision": "validation_error"},
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "validation_error",
                     "error": error,
                 },
             )
@@ -715,7 +733,7 @@ class ToolBroker:
         try:
             ensure_json_size(
                 result_payload,
-                self.config.tools.tool_result_payload_hard_limit_bytes,
+                self._tool_result_persistence_limit(),
                 "tool result payload",
             )
         except ValidationError as exc:
@@ -858,6 +876,12 @@ class ToolBroker:
         spec = self.store.get_tool_spec(handle.tool_id)
         return bool(spec is not None and spec.policy.get("side_effects"))
 
+    def _tool_result_persistence_limit(self) -> int:
+        return min(
+            self.config.tools.tool_result_payload_hard_limit_bytes,
+            self.config.tools.memory_payload_hard_limit_bytes,
+        )
+
     async def _run_sandbox_source(
         self,
         source_code: str,
@@ -911,6 +935,44 @@ class ToolBroker:
     def _run_candidate_tests(
         self,
         candidate: ToolCandidate,
+        owner_pid: str,
+    ) -> ValidationResult:
+        batches = [[test] for test in candidate.tests] or [[]]
+        errors: list[str] = []
+        warnings: list[str] = []
+        logs: list[str] = []
+        metrics: list[CommandMetrics] = []
+        ok = True
+        for index, tests in enumerate(batches, start=1):
+            limits = self._subprocess_limits(owner_pid)
+            self._preflight_validation_budget(owner_pid, limits, candidate, index)
+            result = self._run_candidate_test_batch(candidate, tests, limits)
+            ok = ok and result.ok
+            errors.extend(result.errors)
+            warnings.extend(result.warnings)
+            if result.logs:
+                logs.append(result.logs)
+            result_metrics = self._metrics_from_validation(result.metadata.get("metrics"))
+            self._charge_subprocess_metrics(
+                owner_pid,
+                result_metrics,
+                source="tool.validate.deno",
+                context={"candidate_id": candidate.candidate_id, "tool": candidate.spec.name, "test_index": index},
+            )
+            if result_metrics is not None:
+                metrics.append(result_metrics)
+        return ValidationResult(
+            ok=ok and not errors,
+            errors=errors,
+            warnings=warnings,
+            logs=self._bounded_validation_logs(logs),
+            metadata={"metrics": self._aggregate_command_metrics(metrics)},
+        )
+
+    def _run_candidate_test_batch(
+        self,
+        candidate: ToolCandidate,
+        tests: list[dict[str, Any]],
         limits: SubprocessLimits | None,
     ) -> ValidationResult:
         kwargs: dict[str, Any] = {
@@ -926,7 +988,32 @@ class ToolBroker:
             raise ValidationError("sandbox backend must accept SubprocessLimits when validating with resource limits")
         if limits is not None and "return_metrics" not in selected_kwargs:
             raise ValidationError("sandbox backend must return validation subprocess metrics")
-        return self.sandbox.run_tests(candidate.source_code, candidate.tests, **selected_kwargs)
+        return self.sandbox.run_tests(candidate.source_code, tests, **selected_kwargs)
+
+    def _preflight_validation_budget(
+        self,
+        owner_pid: str,
+        limits: SubprocessLimits | None,
+        candidate: ToolCandidate,
+        test_index: int,
+    ) -> None:
+        if self.resources is None or limits is None:
+            return
+        usage = ResourceUsage()
+        if limits.wall_seconds is not None and limits.wall_seconds <= 0:
+            usage = ResourceUsage(subprocess_wall_seconds=1e-9)
+        elif limits.cpu_seconds is not None and limits.cpu_seconds <= 0:
+            usage = ResourceUsage(subprocess_cpu_seconds=1e-9)
+        elif limits.memory_bytes is not None and limits.memory_bytes <= 0:
+            usage = ResourceUsage(subprocess_peak_memory_bytes=1)
+        else:
+            return
+        self.resources.preflight(
+            owner_pid,
+            usage,
+            source="tool.validate.deno",
+            context={"candidate_id": candidate.candidate_id, "tool": candidate.spec.name, "test_index": test_index},
+        )
 
     def _validate_jit_source_and_tests(self, source_code: str, tests: list[dict[str, Any]]) -> None:
         if len(source_code) > self.config.tools.jit_source_max_chars:
@@ -1116,6 +1203,33 @@ class ToolBroker:
             peak_memory_bytes=int(value.get("peak_memory_bytes") or 0),
             killed=bool(value.get("killed", False)),
             limit_kind=str(value["limit_kind"]) if value.get("limit_kind") is not None else None,
+        )
+
+    def _aggregate_command_metrics(self, metrics: list[CommandMetrics]) -> dict[str, Any]:
+        if not metrics:
+            return {
+                "wall_seconds": 0.0,
+                "cpu_seconds": 0.0,
+                "peak_memory_bytes": 0,
+                "killed": False,
+                "limit_kind": None,
+            }
+        return {
+            "wall_seconds": sum(item.wall_seconds for item in metrics),
+            "cpu_seconds": sum(item.cpu_seconds for item in metrics),
+            "peak_memory_bytes": max(item.peak_memory_bytes for item in metrics),
+            "killed": any(item.killed for item in metrics),
+            "limit_kind": next((item.limit_kind for item in metrics if item.limit_kind), None),
+        }
+
+    def _bounded_validation_logs(self, logs: list[str]) -> str:
+        text = "\n".join(logs)
+        if len(text) <= self.config.tools.jit_validation_log_max_chars:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        return (
+            text[: self.config.tools.jit_validation_log_max_chars]
+            + f"\n[validation logs truncated chars={len(text)} sha256={digest}]"
         )
 
     def _elapsed(self, started_at: float) -> float:

@@ -153,12 +153,16 @@ class DenoTypescriptSandbox(SandboxBackend):
         if re.search(r"\bimport\s*\(", source_code):
             errors.append("dynamic import() is not allowed")
         for specifier in self._extract_imports(source_code):
-            package = self._jsr_package(specifier)
+            parsed = self._jsr_package_and_version(specifier)
+            package = parsed[0] if parsed is not None else None
             if package is None:
                 errors.append(f"import is not allowed: {specifier}")
                 continue
             if package not in self.jsr_allowlist:
                 errors.append(f"JSR package is not in allowlist: {package}")
+                continue
+            if parsed[1] is None:
+                errors.append(f"JSR import must pin a package version: {specifier}")
         return ValidationResult(ok=not errors, errors=errors, warnings=warnings)
 
     async def arun_source(
@@ -605,7 +609,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         imports.extend(match.group(1) for match in self._SIDE_EFFECT_IMPORT_RE.finditer(source_code))
         return sorted(set(imports))
 
-    def _jsr_package(self, specifier: str) -> str | None:
+    def _jsr_package_and_version(self, specifier: str) -> tuple[str, str | None] | None:
         if not specifier.startswith("jsr:"):
             return None
         body = specifier[4:]
@@ -615,10 +619,11 @@ class DenoTypescriptSandbox(SandboxBackend):
         if len(parts) < 2:
             return None
         scope = parts[0]
-        name = parts[1].split("@", 1)[0]
+        name_part = parts[1]
+        name, version = name_part.split("@", 1) if "@" in name_part else (name_part, None)
         if not scope or not name:
             return None
-        return f"{scope}/{name}"
+        return f"{scope}/{name}", version or None
 
     def _resolve_deno(self) -> str:
         candidate = self.deno_executable

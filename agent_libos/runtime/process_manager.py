@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 from collections.abc import Callable
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
@@ -76,58 +77,65 @@ class ProcessManager:
         selected_image = image or self.config.runtime.default_image_id
         selected_llm_profile = self._resolve_root_llm_profile(selected_image, llm_profile_id)
         cwd = self._normalize_working_directory(working_directory or self.config.process.default_working_directory)
-        process = AgentProcess(
-            pid=pid,
-            parent_pid=None,
-            image_id=selected_image,
-            status=ProcessStatus.CREATED,
-            goal_oid=None,
-            memory_view=None,
-            capabilities=[],
-            loaded_skills={},
-            tool_table={},
-            event_cursor=None,
-            checkpoint_head=None,
-            resource_budget=resource_budget or self._default_resource_budget(),
-            resource_usage=ResourceUsage(),
-            created_at=now,
-            updated_at=now,
-            working_directory=cwd,
-            llm_profile_id=selected_llm_profile,
-        )
-        self.store.insert_process(process)
-        self.memory.ensure_process_namespace(pid)
-        goal_handle = self._ensure_goal(pid, goal)
-        # A process starts with a mutable view rooted at its goal. Later tool
-        # results are appended to this view by the LLM executor.
-        view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
-        process.goal_oid = goal_handle.oid
-        process.memory_view = view
-        process.status = ProcessStatus.RUNNABLE
-        process.updated_at = utc_now()
-        self.store.update_process(process)
-        self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
-        self.events.emit(
-            EventType.PROCESS_CREATED,
-            source="runtime",
-            target=pid,
-            payload={
-                "pid": pid,
-                "image": selected_image,
-                "goal_oid": goal_handle.oid,
-                "working_directory": cwd,
-                "llm_profile_id": selected_llm_profile,
-            },
-        )
-        self.audit.record(
-            actor="runtime",
-            action="process.spawn",
-            target=f"process:{pid}",
-            output_refs=[goal_handle.oid],
-            decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
-        )
-        self._run_after_spawn_hooks(pid, selected_image)
-        return pid
+        try:
+            process = AgentProcess(
+                pid=pid,
+                parent_pid=None,
+                image_id=selected_image,
+                status=ProcessStatus.CREATED,
+                goal_oid=None,
+                memory_view=None,
+                capabilities=[],
+                loaded_skills={},
+                tool_table={},
+                event_cursor=None,
+                checkpoint_head=None,
+                resource_budget=resource_budget or self._default_resource_budget(),
+                resource_usage=ResourceUsage(),
+                created_at=now,
+                updated_at=now,
+                working_directory=cwd,
+                llm_profile_id=selected_llm_profile,
+            )
+            self.store.insert_process(process)
+            self.memory.ensure_process_namespace(pid)
+            goal_handle = self._ensure_goal(pid, goal)
+            # A process starts with a mutable view rooted at its goal. Later tool
+            # results are appended to this view by the LLM executor.
+            view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
+            process.goal_oid = goal_handle.oid
+            process.memory_view = view
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+            self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
+            self._run_after_spawn_hooks(pid, selected_image)
+            process = self._get(pid)
+            process.status = ProcessStatus.RUNNABLE
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+            self.events.emit(
+                EventType.PROCESS_CREATED,
+                source="runtime",
+                target=pid,
+                payload={
+                    "pid": pid,
+                    "image": selected_image,
+                    "goal_oid": goal_handle.oid,
+                    "working_directory": cwd,
+                    "llm_profile_id": selected_llm_profile,
+                },
+            )
+            self.audit.record(
+                actor="runtime",
+                action="process.spawn",
+                target=f"process:{pid}",
+                output_refs=[goal_handle.oid],
+                decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
+            )
+            return pid
+        except Exception:
+            self._cleanup_failed_launch(pid)
+            raise
 
     def fork(
         self,
@@ -190,7 +198,6 @@ class ProcessManager:
             child_view.roots.append(goal_handle)
             child.goal_oid = goal_handle.oid
             child.memory_view = child_view
-            child.status = ProcessStatus.RUNNABLE
             child.updated_at = utc_now()
             self.store.update_process(child)
             self._grant_specs(child_pid, capabilities or [], issued_by=f"process.fork:{parent}")
@@ -200,7 +207,12 @@ class ProcessManager:
                 specs=inherit_specs,
                 issued_by=f"process.fork:{parent}",
             )
+            self._run_after_spawn_hooks(child_pid, child.image_id)
             self._charge_child_creation(parent)
+            child = self._get(child_pid)
+            child.status = ProcessStatus.RUNNABLE
+            child.updated_at = utc_now()
+            self.store.update_process(child)
             self.events.emit(
                 EventType.PROCESS_FORKED,
                 source=parent,
@@ -226,9 +238,9 @@ class ProcessManager:
                     "llm_profile_id": selected_llm_profile,
                 },
             )
-            self._run_after_spawn_hooks(child_pid, child.image_id)
             return child_pid
         except Exception:
+            self._cleanup_failed_launch(child_pid)
             self._release_child_budget(child_pid)
             raise
 
@@ -286,7 +298,6 @@ class ProcessManager:
             # Object Memory view rooted only at the child goal.
             child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
             child.goal_oid = goal_handle.oid
-            child.status = selected_initial_status
             child.updated_at = utc_now()
             self.store.update_process(child)
             self._grant_specs(child_pid, capabilities or [], issued_by=f"process.spawn_child:{parent}")
@@ -296,7 +307,12 @@ class ProcessManager:
                 specs=inherit_specs,
                 issued_by=f"process.spawn_child:{parent}",
             )
+            self._run_after_spawn_hooks(child_pid, child.image_id)
             self._charge_child_creation(parent)
+            child = self._get(child_pid)
+            child.status = selected_initial_status
+            child.updated_at = utc_now()
+            self.store.update_process(child)
             self.events.emit(
                 EventType.PROCESS_CREATED,
                 source=parent,
@@ -323,9 +339,9 @@ class ProcessManager:
                     "llm_profile_id": selected_llm_profile,
                 },
             )
-            self._run_after_spawn_hooks(child_pid, child.image_id)
             return child_pid
         except Exception:
+            self._cleanup_failed_launch(child_pid)
             self._release_child_budget(child_pid)
             raise
 
@@ -402,16 +418,23 @@ class ProcessManager:
         )
 
     def wait(self, pid: str, child: str, timeout: float | None = None) -> ProcessResult:
-        parent = self._get(pid)
-        child_proc = self._require_child(parent.pid, child)
-        if child_proc.status not in self.TERMINAL_STATUSES:
-            if timeout == 0:
-                raise TimeoutError(f"child still running: {child}")
-            parent.status = ProcessStatus.WAITING_EVENT
-            parent.status_message = f"waiting for {child}"
-            parent.updated_at = utc_now()
-            self.store.update_process(parent)
-            raise ProcessWaitRequired(child_pid=child, message=f"{pid} is waiting for child process {child}")
+        with self.store._lock:
+            parent = self._get(pid)
+            child_proc = self._require_child(parent.pid, child)
+            if child_proc.status not in self.TERMINAL_STATUSES:
+                if timeout == 0:
+                    raise TimeoutError(f"child still running: {child}")
+                parent.status = ProcessStatus.WAITING_EVENT
+                parent.status_message = f"waiting for {child}"
+                parent.updated_at = utc_now()
+                self.store.update_process(parent)
+                child_proc = self._require_child(parent.pid, child)
+                if child_proc.status not in self.TERMINAL_STATUSES:
+                    raise ProcessWaitRequired(child_pid=child, message=f"{pid} is waiting for child process {child}")
+                parent.status = ProcessStatus.RUNNABLE
+                parent.status_message = None
+                parent.updated_at = utc_now()
+                self.store.update_process(parent)
         result_handle = None
         if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
             oid = child_proc.status_message.split(":", 1)[1]
@@ -539,9 +562,14 @@ class ProcessManager:
         if proc.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot signal terminal process: {proc.pid} status={proc.status.value}")
         if sig == ProcessSignal.PAUSE:
+            if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
+                raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
             proc.status = ProcessStatus.PAUSED
         elif sig == ProcessSignal.RESUME:
-            proc.status = ProcessStatus.RUNNABLE
+            if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
+                raise ProcessError(f"cannot resume waiting process: {proc.pid} status={proc.status.value}")
+            if proc.status in {ProcessStatus.PAUSED, ProcessStatus.SUSPENDED}:
+                proc.status = ProcessStatus.RUNNABLE
         elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
             proc.status = ProcessStatus.KILLED
         proc.status_message = payload.get("reason")
@@ -549,7 +577,7 @@ class ProcessManager:
         self.store.update_process(proc)
         if proc.status in self.TERMINAL_STATUSES:
             self._release_child_budget(proc.pid)
-            self._finalize_process_memory(proc, preserve_oids=set())
+            self._finalize_terminal_process(proc, preserve_oids=set())
         self.events.emit(
             EventType.PROCESS_SIGNAL,
             source=actor,
@@ -574,10 +602,18 @@ class ProcessManager:
 
     def exit(self, pid: str, result: ObjectHandle | None = None, failed: bool = False, message: str | None = None) -> None:
         process = self._get(pid)
-        process.status = ProcessStatus.FAILED if failed else ProcessStatus.EXITED
-        process.status_message = f"result_oid:{result.oid}" if result is not None else message
-        process.updated_at = utc_now()
-        self.store.update_process(process)
+        if process.status in self.TERMINAL_STATUSES:
+            self._release_rejected_exit_result(pid, result)
+            raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
+        with self.store._lock:
+            process = self._get(pid)
+            if process.status in self.TERMINAL_STATUSES:
+                self._release_rejected_exit_result(pid, result)
+                raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
+            process.status = ProcessStatus.FAILED if failed else ProcessStatus.EXITED
+            process.status_message = f"result_oid:{result.oid}" if result is not None else message
+            process.updated_at = utc_now()
+            self.store.update_process(process)
         self._release_child_budget(pid)
         self.events.emit(
             EventType.PROCESS_EXITED,
@@ -592,10 +628,23 @@ class ProcessManager:
             output_refs=[result.oid] if result else [],
             decision={"status": process.status.value, "message": message},
         )
-        self._finalize_process_memory(process, preserve_oids={result.oid} if result is not None else set())
+        self._finalize_terminal_process(process, preserve_oids={result.oid} if result is not None else set())
         self._wake_parent_waiting_on_child(process)
 
-    def _finalize_process_memory(self, process: AgentProcess, preserve_oids: set[str]) -> None:
+    def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:
+        for pid in pids:
+            process = self.store.get_process(pid)
+            if process is None or process.status != ProcessStatus.KILLED:
+                continue
+            self._finalize_terminal_process(process, preserve_oids=set())
+            self.events.emit(
+                EventType.PROCESS_EXITED,
+                source=pid,
+                target=process.parent_pid,
+                payload={"pid": pid, "status": process.status.value, "result_oid": None, "reason": reason},
+            )
+
+    def _finalize_terminal_process(self, process: AgentProcess, preserve_oids: set[str]) -> None:
         self._release_terminal_child_memory(process.pid, preserve_oids=preserve_oids)
         if process.parent_pid is None:
             # Root process-owned memory is volatile and is reclaimed immediately.
@@ -604,10 +653,22 @@ class ProcessManager:
             self.memory.release_process_owned(process.pid, preserve_oids=preserve_oids)
 
     def _release_terminal_child_memory(self, pid: str, preserve_oids: set[str]) -> None:
-        for child in self.store.list_processes():
-            if child.parent_pid != pid or child.status not in self.TERMINAL_STATUSES:
-                continue
-            self._release_terminal_child_memory(child.pid, preserve_oids=preserve_oids)
+        stack = [
+            child
+            for child in self.store.list_child_processes(pid)
+            if child.status in self.TERMINAL_STATUSES
+        ]
+        terminal_children: builtins.list[AgentProcess] = []
+        while stack:
+            child = stack.pop()
+            if child.status in self.TERMINAL_STATUSES:
+                terminal_children.append(child)
+                stack.extend(
+                    grandchild
+                    for grandchild in self.store.list_child_processes(child.pid)
+                    if grandchild.status in self.TERMINAL_STATUSES
+                )
+        for child in reversed(terminal_children):
             self.memory.release_process_owned(child.pid, preserve_oids=preserve_oids)
 
     def get(self, pid: str) -> AgentProcess:
@@ -827,6 +888,29 @@ class ProcessManager:
     def _run_after_spawn_hooks(self, pid: str, image_id: str) -> None:
         for hook in self._after_spawn_hooks:
             hook(pid, image_id)
+
+    def _cleanup_failed_launch(self, pid: str) -> None:
+        with contextlib.suppress(Exception):
+            self.memory.release_process_owned(pid)
+        namespace = self.memory.process_namespace(pid)
+        namespace_resource = f"object_namespace:{namespace}"
+        with contextlib.suppress(Exception):
+            with self.store.transaction(include_object_payloads=True) as cur:
+                cur.execute("DELETE FROM capabilities WHERE subject = ? OR resource = ?", (pid, namespace_resource))
+                cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
+                cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
+                cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
+                cur.execute("DELETE FROM process_messages WHERE sender = ? OR recipient_pid = ?", (pid, pid))
+                cur.execute("DELETE FROM object_namespaces WHERE namespace = ? AND created_by = ?", (namespace, pid))
+                cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
+
+    def _release_rejected_exit_result(self, pid: str, result: ObjectHandle | None) -> None:
+        if result is None:
+            return
+        obj = self.store.get_object(result.oid)
+        if obj is None or obj.owner_kind != ObjectOwnerKind.PROCESS or obj.owner_id != pid:
+            return
+        self.memory.delete_object_trusted("process", result.oid, reason="terminal_exit_rejected")
 
     def _require_child(self, parent: str, child: str) -> AgentProcess:
         self._get(parent)
