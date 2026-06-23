@@ -131,6 +131,11 @@ without exposing raw prompt or provider payloads by default.
 If the host runtime is configured with `llm.persist_full_io=True`, the same
 `llm_calls` API returns full stored LLM inputs and outputs.
 
+`POST /api/processes` and `POST /api/processes/{pid}/exec` accept optional
+`llm_profile` fields for host-selected per-process LLM routing. Snapshots expose
+each process `llm_profile_id`; profile secrets stay in the host process
+environment and are not returned by the GUI API.
+
 Process snapshots include `resource_budget`, `resource_usage`, and
 `resource_remaining` so the GUI can show quota state without treating it as a
 Capability grant. Budget exhaustion is still enforced by the runtime and

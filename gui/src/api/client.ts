@@ -80,8 +80,12 @@ export class LibOSClient {
     return this.request("POST", "/api/scheduler/pause", {});
   }
 
-  async spawn(goal: string, image: string, maxQuanta: OptionalQuanta, autoRun: boolean) {
-    return this.request("POST", "/api/processes", withOptionalQuanta({ goal, image, auto_run: autoRun }, maxQuanta));
+  async spawn(goal: string, image: string, maxQuanta: OptionalQuanta, autoRun: boolean, llmProfile?: string) {
+    return this.request(
+      "POST",
+      "/api/processes",
+      withOptionalQuanta({ goal, image, auto_run: autoRun, ...(llmProfile ? { llm_profile: llmProfile } : {}) }, maxQuanta)
+    );
   }
 
   async run(pid: string, maxQuanta: OptionalQuanta) {
@@ -239,12 +243,13 @@ export class LibOSClient {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/cd`, { path });
   }
 
-  async execProcess(pid: string, image: string, goal: string, confirmed: boolean, autoRun: boolean) {
+  async execProcess(pid: string, image: string, goal: string, confirmed: boolean, autoRun: boolean, llmProfile?: string) {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/exec`, {
       image,
       goal,
       confirmed,
-      auto_run: autoRun
+      auto_run: autoRun,
+      ...(llmProfile ? { llm_profile: llmProfile } : {})
     });
   }
 

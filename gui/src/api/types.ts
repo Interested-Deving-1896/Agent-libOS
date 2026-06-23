@@ -15,6 +15,7 @@ export type RuntimeProcess = {
   pid: string;
   parent_pid: string | null;
   image_id: string;
+  llm_profile_id: string;
   status: string;
   goal_oid: string | null;
   checkpoint_head: string | null;
@@ -85,7 +86,9 @@ export type LlmCall = {
   image_id: string | null;
   purpose: string;
   status: string;
+  api: string | null;
   model: string | null;
+  request_options: Record<string, unknown>;
   response_content: string;
   tool_calls: unknown[];
   usage: Record<string, unknown>;

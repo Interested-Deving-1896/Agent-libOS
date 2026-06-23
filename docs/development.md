@@ -29,6 +29,7 @@ Run:
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
 uv run python scripts/test_matrix.py --lane unit
 uv run python scripts/test_matrix.py --lane security
+uv run python scripts/test_matrix.py --lane runtime
 uv run python scripts/check_test_invariants.py
 uv run python scripts/test_matrix.py --lane gui
 git diff --check
@@ -47,10 +48,12 @@ uv run python scripts/test_matrix.py --lane all --workers 4
 uv run python scripts/test_matrix.py --lane runtime --workers auto
 ```
 
-`--workers` applies only to Python lanes. The default is serial execution, and
-the conservative parallel scheduler is `--dist loadfile`; use `--dist load` for
-finer-grained balancing when investigating local speed. Run the `gui` lane
-separately because it writes shared frontend build artifacts.
+`--workers` applies only to Python lanes. The `runtime` and `all` lanes default
+to bounded parallel execution with at most four workers and `--dist worksteal`,
+which keeps CI runtime below the lane budget while balancing long SQLite and
+runtime-reopen tests. Pass `--workers 1` for serial failure diagnosis, or set
+`AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to override defaults in CI.
+Run the `gui` lane separately because it writes shared frontend build artifacts.
 
 Pytest cleans files created under the ignored `agent_outputs/` directory at the
 end of each test session, while preserving anything that existed before the
@@ -135,6 +138,14 @@ provider ids, model/API mode, usage, errors, and bounded observability envelopes
 for prompt, visible tools, output, tool calls, reasoning metadata, and raw
 responses. Full prompt and raw provider payloads are intentionally not persisted
 by default.
+
+LLM providers are selected through host-configured named profiles. Processes
+persist only `llm_profile_id`; the Runtime resolves that id for each quantum and
+reads API keys from the profile's `api_key_env` environment variable. The
+configured default profile preserves the existing `OPENAI_*` environment
+behavior. Other named profiles do not inherit ambient provider/model
+environment variables; set their profile fields explicitly when they should use
+a non-default model or endpoint.
 
 Set `config.llm.persist_full_io=True` to opt into full prompt, visible tool
 schema, model output, tool call, reasoning, and raw response persistence. This

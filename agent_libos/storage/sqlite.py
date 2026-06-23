@@ -161,6 +161,7 @@ class SQLiteStore:
                   resource_budget_json TEXT NOT NULL,
                   resource_usage_json TEXT NOT NULL DEFAULT '{}',
                   working_directory TEXT NOT NULL DEFAULT '.',
+                  llm_profile_id TEXT NOT NULL DEFAULT 'default',
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
@@ -711,8 +712,8 @@ class SQLiteStore:
                 pid, parent_pid, image_id, status, goal_oid, memory_view_json,
                 capabilities_json, loaded_skills_json, tool_table_json, event_cursor,
                 checkpoint_head, status_message, resource_budget_json, resource_usage_json,
-                working_directory, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                working_directory, llm_profile_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._process_params(process),
         )
@@ -725,7 +726,7 @@ class SQLiteStore:
                    memory_view_json = ?, capabilities_json = ?, loaded_skills_json = ?,
                    tool_table_json = ?, event_cursor = ?, checkpoint_head = ?,
                    status_message = ?, resource_budget_json = ?, resource_usage_json = ?,
-                   working_directory = ?, created_at = ?, updated_at = ?
+                   working_directory = ?, llm_profile_id = ?, created_at = ?, updated_at = ?
              WHERE pid = ?
             """,
             (
@@ -743,6 +744,7 @@ class SQLiteStore:
                 dumps(process.resource_budget),
                 dumps(process.resource_usage),
                 process.working_directory,
+                process.llm_profile_id,
                 process.created_at,
                 process.updated_at,
                 process.pid,
@@ -924,6 +926,38 @@ class SQLiteStore:
             ),
         )
 
+    def consume_capability_uses(self, cap_id: str, count: int = 1) -> Capability | None:
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                UPDATE capabilities
+                   SET uses_remaining = uses_remaining - ?,
+                       status = CASE
+                           WHEN uses_remaining - ? <= 0 THEN ?
+                           ELSE status
+                       END
+                 WHERE cap_id = ?
+                   AND status = ?
+                   AND uses_remaining IS NOT NULL
+                   AND uses_remaining >= ?
+                """,
+                (
+                    count,
+                    count,
+                    CapabilityStatus.REVOKED.value,
+                    cap_id,
+                    CapabilityStatus.ACTIVE.value,
+                    count,
+                ),
+            )
+            self.conn.commit()
+            if cur.rowcount != 1:
+                return None
+            rows = list(self.conn.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
+            return self._row_to_capability(rows[0]) if rows else None
+
     def update_capability(self, cap: Capability) -> None:
         self._execute(
             """
@@ -963,9 +997,12 @@ class SQLiteStore:
 
     def list_capabilities(self, subject: str | None = None) -> list[Capability]:
         if subject is None:
-            rows = self._query("SELECT * FROM capabilities")
+            rows = self._query("SELECT * FROM capabilities ORDER BY subject ASC, issued_at ASC, cap_id ASC")
         else:
-            rows = self._query("SELECT * FROM capabilities WHERE subject = ?", (subject,))
+            rows = self._query(
+                "SELECT * FROM capabilities WHERE subject = ? ORDER BY issued_at ASC, cap_id ASC",
+                (subject,),
+            )
         return [self._row_to_capability(row) for row in rows]
 
     def insert_audit(self, record: AuditRecord) -> None:
@@ -1935,6 +1972,13 @@ class SQLiteStore:
             self.conn.execute("ALTER TABLE processes ADD COLUMN working_directory TEXT NOT NULL DEFAULT '.'")
         if "resource_usage_json" not in columns:
             self.conn.execute("ALTER TABLE processes ADD COLUMN resource_usage_json TEXT NOT NULL DEFAULT '{}'")
+        if "llm_profile_id" not in columns:
+            self.conn.execute("ALTER TABLE processes ADD COLUMN llm_profile_id TEXT NOT NULL DEFAULT 'default'")
+            if self.config.llm.default_profile_id != "default":
+                self.conn.execute(
+                    "UPDATE processes SET llm_profile_id = ? WHERE llm_profile_id = 'default'",
+                    (self.config.llm.default_profile_id,),
+                )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_processes_status_created ON processes(status, created_at, pid)"
         )
@@ -1972,6 +2016,15 @@ class SQLiteStore:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
         if "max_delegation_depth" not in columns:
             self.conn.execute("ALTER TABLE capabilities ADD COLUMN max_delegation_depth INTEGER")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capabilities_subject_status ON capabilities(subject, status)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capabilities_subject_resource_status ON capabilities(subject, resource, status)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capabilities_parent ON capabilities(parent_cap_id)"
+        )
 
     def _ensure_audit_schema(self) -> None:
         self.conn.execute(
@@ -2346,6 +2399,7 @@ class SQLiteStore:
             dumps(process.resource_budget),
             dumps(process.resource_usage),
             process.working_directory,
+            process.llm_profile_id,
             process.created_at,
             process.updated_at,
         )
@@ -2465,6 +2519,11 @@ class SQLiteStore:
                 updated_at=row["updated_at"],
                 working_directory=row["working_directory"] if "working_directory" in row.keys() else ".",
                 status_message=row["status_message"],
+                llm_profile_id=(
+                    row["llm_profile_id"]
+                    if "llm_profile_id" in row.keys() and row["llm_profile_id"]
+                    else self.config.llm.default_profile_id
+                ),
             )
 
     def _row_to_resource_reservation(self, row: sqlite3.Row) -> ResourceReservation:

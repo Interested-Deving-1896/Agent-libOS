@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image")
     spawn_parser.add_argument("--goal", required=True)
+    spawn_parser.add_argument("--llm-profile", help="Optional host-selected LLM profile id for the new process.")
     cd_parser = sub.add_parser("cd", help="Set an AgentProcess working directory")
     cd_parser.add_argument("pid")
     cd_parser.add_argument("path")
@@ -88,6 +89,7 @@ def main(argv: list[str] | None = None) -> None:
     exec_parser.add_argument("image", help="Target AgentImage id, or an image package directory containing IMAGE.yaml.")
     exec_parser.add_argument("goal", help="Replacement process goal.")
     exec_parser.add_argument("--pid", required=True, help="Process id to exec.")
+    exec_parser.add_argument("--llm-profile", help="Optional host-selected LLM profile id for the existing process.")
     exec_parser.add_argument("--replace-image", action="store_true", help="Allow an image package to replace an existing image id.")
     exec_parser.add_argument("--args-json", default="{}", help="JSON object recorded as structured exec args.")
     exec_parser.add_argument(
@@ -168,8 +170,16 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "object-task":
             _print_json(_run_object_task_command(runtime, args))
         elif args.command == "spawn":
-            pid = runtime.process.spawn(image=args.image, goal=args.goal)
-            _print_json({"pid": pid, "image": runtime.process.get(pid).image_id, "goal": args.goal})
+            pid = runtime.process.spawn(image=args.image, goal=args.goal, llm_profile_id=args.llm_profile)
+            process = runtime.process.get(pid)
+            _print_json(
+                {
+                    "pid": pid,
+                    "image": process.image_id,
+                    "llm_profile_id": process.llm_profile_id,
+                    "goal": args.goal,
+                }
+            )
         elif args.command == "cd":
             _print_json(_run_cd_command(runtime, args))
         elif args.command == "exec":
@@ -447,7 +457,9 @@ async def _run_exec_command(runtime: Runtime, args: argparse.Namespace) -> dict[
     )
     target_image = loaded_image["image_id"] if loaded_image is not None else args.image
     exec_args = _parse_json_mapping(args.args_json, "--args-json")
-    old_image = runtime.process.get(args.pid).image_id
+    old_process = runtime.process.get(args.pid)
+    old_image = old_process.image_id
+    old_llm_profile = old_process.llm_profile_id
     process = runtime.exec_process(
         args.pid,
         target_image,
@@ -455,6 +467,7 @@ async def _run_exec_command(runtime: Runtime, args: argparse.Namespace) -> dict[
         goal=args.goal,
         preserve_memory=args.preserve_memory,
         preserve_capabilities=args.preserve_capabilities,
+        llm_profile_id=args.llm_profile,
     )
     results: list[Any] = []
     if args.run:
@@ -468,6 +481,8 @@ async def _run_exec_command(runtime: Runtime, args: argparse.Namespace) -> dict[
         "exec": {
             "old_image": old_image,
             "new_image": process.image_id,
+            "old_llm_profile_id": old_llm_profile,
+            "new_llm_profile_id": process.llm_profile_id,
             "preserve_memory": args.preserve_memory,
             "preserve_capabilities": args.preserve_capabilities,
             "args": exec_args,

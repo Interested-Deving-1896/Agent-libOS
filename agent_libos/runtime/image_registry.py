@@ -101,6 +101,7 @@ class ImageRegistryPrimitive:
         "default_tools",
         "context_policy",
         "safety_profile",
+        "llm_profile_id",
         "required_capabilities",
         "metadata",
         "signature",
@@ -264,6 +265,7 @@ class ImageRegistryPrimitive:
             default_tools=list(image.default_tools),
             context_policy=image.context_policy,
             safety_profile=image.safety_profile,
+            llm_profile_id=image.llm_profile_id,
             required_capabilities=list(image.required_capabilities),
             metadata={
                 **dict(image.metadata),
@@ -571,6 +573,7 @@ class ImageRegistryPrimitive:
             default_tools=default_tools,
             context_policy=self._optional_string(image_data.get("context_policy"), "context_policy") or "plan_first",
             safety_profile=self._optional_string(image_data.get("safety_profile"), "safety_profile") or "default",
+            llm_profile_id=self._optional_string(image_data.get("llm_profile"), "llm_profile"),
             required_capabilities=self._capability_specs(image_data.get("required_capabilities")),
             metadata=self._mapping(image_data.get("metadata"), "metadata"),
             signature=self._optional_string(image_data.get("signature"), "signature"),
@@ -617,6 +620,7 @@ class ImageRegistryPrimitive:
             "default_tools",
             "context_policy",
             "safety_profile",
+            "llm_profile",
             "required_capabilities",
             "metadata",
             "signature",
@@ -1063,6 +1067,7 @@ class ImageRegistryPrimitive:
             default_tools=list(artifact.get("static_default_tools", [])),
             context_policy=source_image.context_policy if source_image is not None else "plan_first",
             safety_profile=source_image.safety_profile if source_image is not None else "default",
+            llm_profile_id=source_image.llm_profile_id if source_image is not None else None,
             required_capabilities=self._dedupe_capability_specs(artifact.get("required_capabilities", [])),
             metadata={
                 **(metadata or {}),
@@ -1161,6 +1166,7 @@ class ImageRegistryPrimitive:
             default_tools=self._string_list(image.get("default_tools"), "default_tools"),
             context_policy=self._optional_string(image.get("context_policy"), "context_policy") or "plan_first",
             safety_profile=self._optional_string(image.get("safety_profile"), "safety_profile") or "default",
+            llm_profile_id=self._optional_string(image.get("llm_profile_id"), "llm_profile_id"),
             required_capabilities=self._capability_specs(image.get("required_capabilities")),
             metadata=self._mapping(image.get("metadata"), "metadata"),
             signature=self._optional_string(image.get("signature"), "signature"),
@@ -1177,6 +1183,10 @@ class ImageRegistryPrimitive:
             raise ValidationError(f"unknown jit_tool_exposure: {image.jit_tool_exposure}")
         if image.jit_tool_exposure == JIT_TOOL_EXPOSURE_MULTIPLEXED and JIT_MULTIPLEXER_TOOL_NAME in image.default_tools:
             raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
+        if image.llm_profile_id is not None:
+            self._validate_string_length(image.llm_profile_id, "llm_profile_id", self.config.image.id_max_chars)
+            if not image.llm_profile_id.strip():
+                raise ValidationError("llm_profile_id must be non-empty when provided")
         if len(image.system_prompt) > self.config.image.prompt_max_chars:
             raise ValidationError(f"system_prompt exceeds prompt_max_chars={self.config.image.prompt_max_chars}")
         self._validate_mapping_size(image.planner, "planner")
@@ -1541,6 +1551,7 @@ class ImageRegistryPrimitive:
             "default_tools": list(image.default_tools),
             "context_policy": image.context_policy,
             "safety_profile": image.safety_profile,
+            "llm_profile_id": image.llm_profile_id,
             "required_capabilities": list(image.required_capabilities),
             "metadata": dict(image.metadata),
             "signature": image.signature,
@@ -1555,6 +1566,7 @@ class ImageRegistryPrimitive:
             "boot_kind": (image.boot or {}).get("kind", "fresh"),
             "prompt_mode": image.prompt_mode,
             "jit_tool_exposure": image.jit_tool_exposure,
+            "llm_profile_id": image.llm_profile_id,
             "default_tools": list(image.default_tools),
             "default_skills": list(image.default_skills),
             "required_capabilities_count": len(image.required_capabilities),

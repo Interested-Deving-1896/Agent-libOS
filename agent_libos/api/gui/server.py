@@ -528,6 +528,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 image=str(body["image"]) if body.get("image") is not None else None,
                 goal=body.get("goal", ""),
                 working_directory=body.get("working_directory"),
+                llm_profile_id=str(body["llm_profile"]) if body.get("llm_profile") is not None else None,
             )
             service.publish_runtime_changes("process.spawn")
             if body.get("auto_run", True):
@@ -750,7 +751,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return to_jsonable(process)
         if method == "POST" and route == ["exec"]:
             body = self._read_body()
-            self._require_confirmed("process.exec", body, {"pid": pid, "image": body.get("image"), "goal": body.get("goal")})
+            self._require_confirmed(
+                "process.exec",
+                body,
+                {"pid": pid, "image": body.get("image"), "goal": body.get("goal"), "llm_profile": body.get("llm_profile")},
+            )
             process = service.runtime.exec_process(
                 pid,
                 str(body["image"]),
@@ -758,6 +763,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 goal=body.get("goal"),
                 preserve_memory=bool(body.get("preserve_memory", True)),
                 preserve_capabilities=bool(body.get("preserve_capabilities", False)),
+                llm_profile_id=str(body["llm_profile"]) if body.get("llm_profile") is not None else None,
             )
             service.publish_runtime_changes("process.exec")
             if body.get("auto_run", True):

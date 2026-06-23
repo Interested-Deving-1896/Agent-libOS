@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from agent_libos.capability.profiles import SandboxProfileBuilder
@@ -29,6 +30,12 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import SQLiteStore
 from agent_libos.utils.ids import new_id, utc_now
+
+
+@dataclass(frozen=True)
+class _IssueAuthority:
+    mutation_decision: CapabilityDecision | None = None
+    transfer_parent: Capability | None = None
 
 
 class CapabilityManager:
@@ -68,10 +75,26 @@ class CapabilityManager:
     ) -> Capability:
         selected = self._coerce_spec(spec)
         if require_authority:
-            authority_decision = self._require_issue_authority(actor, selected)
-            issuer_cap_id = authority_decision.selected_capability_id if authority_decision is not None else None
+            issue_authority = self._require_issue_authority(actor, selected)
+            issuer_cap_id = (
+                issue_authority.mutation_decision.selected_capability_id
+                if issue_authority.mutation_decision is not None
+                else None
+            )
         else:
-            authority_decision = None
+            issue_authority = _IssueAuthority()
+        transfer_parent = issue_authority.transfer_parent
+        delegation_depth = transfer_parent.delegation_depth + 1 if transfer_parent is not None else 0
+        max_delegation_depth = (
+            self._delegated_max_delegation_depth(transfer_parent, selected)
+            if transfer_parent is not None and selected.delegable
+            else self._initial_max_delegation_depth(selected)
+        )
+        self._consume_mutation_authority(
+            issue_authority.mutation_decision,
+            used_by=actor,
+            reason="one-time issue authority consumed",
+        )
         cap = self._insert_capability(
             subject=subject,
             resource=selected.resource,
@@ -81,15 +104,14 @@ class CapabilityManager:
             metadata=selected.metadata,
             issued_by=actor,
             issuer_cap_id=issuer_cap_id,
-            parent_cap_id=None,
-            delegation_depth=0,
-            max_delegation_depth=self._initial_max_delegation_depth(selected),
+            parent_cap_id=transfer_parent.cap_id if transfer_parent is not None else None,
+            delegation_depth=delegation_depth,
+            max_delegation_depth=max_delegation_depth,
             expires_at=selected.expires_at,
             uses_remaining=selected.uses_remaining,
             delegable=selected.delegable,
             revocable=selected.revocable,
         )
-        self._consume_mutation_authority(authority_decision, used_by=actor, reason="one-time issue authority consumed")
         self.audit.record(
             actor=actor,
             action="capability.issue",
@@ -273,6 +295,7 @@ class CapabilityManager:
             for cap in capabilities
             if cap.active
             and not self._is_expired(cap)
+            and self._parent_chain_active(cap)
             and self._resource_matches(cap.resource, resource)
             and requested_right in cap.rights
         ]
@@ -475,25 +498,23 @@ class CapabilityManager:
             uses_remaining=1,
         )
 
-    def consume_use(self, cap_id: str, *, used_by: str, reason: str = "capability use consumed") -> Capability:
+    def consume_use(self, cap_id: str, *, used_by: str, reason: str = "capability use consumed", count: int = 1) -> Capability:
+        if count < 1:
+            raise ValidationError("capability consume count must be >= 1")
         cap = self.store.get_capability(cap_id)
         if cap is None:
             raise NotFound(f"capability not found: {cap_id}")
         if cap.uses_remaining is None:
             return cap
-        remaining = max(0, cap.uses_remaining - 1)
-        updated = replace(
-            cap,
-            uses_remaining=remaining,
-            status=CapabilityStatus.REVOKED if remaining == 0 else cap.status,
-        )
-        self.store.update_capability(updated)
+        updated = self.store.consume_capability_uses(cap_id, count)
+        if updated is None:
+            raise CapabilityDenied(f"capability use exhausted: {cap_id}")
         self.audit.record(
             actor=used_by,
             action="capability.consume",
             target=cap.resource,
             capability_refs=[cap_id],
-            decision={"uses_remaining": remaining, "reason": reason},
+            decision={"uses_remaining": updated.uses_remaining, "count": count, "reason": reason},
         )
         if updated.revoked:
             self.events.emit(
@@ -571,7 +592,7 @@ class CapabilityManager:
         if requested not in handle.rights:
             raise CapabilityDenied(f"object handle lacks {requested}: {handle.oid}")
         cap = self.store.get_capability(handle.capability_id)
-        if cap is None or cap.revoked or not cap.active:
+        if cap is None or cap.revoked or not cap.active or self._is_expired(cap) or not self._parent_chain_active(cap):
             raise CapabilityDenied(f"invalid object capability: {handle.capability_id}")
         if cap.subject != subject:
             raise CapabilityDenied(f"capability subject mismatch: {cap.subject} != {subject}")
@@ -644,7 +665,7 @@ class CapabilityManager:
     def list_subject(self, subject: str, *, include_inactive: bool = False, limit: int | None = None) -> list[Capability]:
         caps = self.capabilities_for(subject)
         if not include_inactive:
-            caps = [cap for cap in caps if cap.active and not self._is_expired(cap)]
+            caps = [cap for cap in caps if cap.active and not self._is_expired(cap) and self._parent_chain_active(cap)]
         return caps[: (limit or self.config.capability.list_limit)]
 
     def inspect(self, cap_id: str) -> dict[str, Any]:
@@ -742,6 +763,7 @@ class CapabilityManager:
             raise ValidationError("uses_remaining must be >= 1 when set")
         if max_delegation_depth is not None and max_delegation_depth < delegation_depth:
             raise ValidationError("max_delegation_depth cannot be less than delegation_depth")
+        normalized_expires_at = self._normalize_expires_at(expires_at)
         cap = Capability(
             cap_id=new_id("cap"),
             subject=subject,
@@ -750,7 +772,7 @@ class CapabilityManager:
             constraints=dict(constraints),
             issued_by=issued_by,
             issued_at=utc_now(),
-            expires_at=expires_at,
+            expires_at=normalized_expires_at,
             delegable=delegable,
             revocable=revocable,
             effect=effect,
@@ -783,15 +805,22 @@ class CapabilityManager:
             return
         self.consume_use(decision.consume_capability_id, used_by=used_by, reason=reason)
 
-    def _require_issue_authority(self, actor: str, spec: CapabilitySpec) -> CapabilityDecision | None:
+    def claim_decision_use(self, decision: CapabilityDecision, *, used_by: str, reason: str) -> None:
+        if decision.consume_capability_id is None:
+            return
+        self.consume_use(decision.consume_capability_id, used_by=used_by, reason=reason)
+
+    def _require_issue_authority(self, actor: str, spec: CapabilitySpec) -> _IssueAuthority:
         if self._is_trusted_issuer(actor):
-            return None
-        grant = self.authorize(actor, spec.resource, CapabilityRight.GRANT)
-        if grant.allowed:
-            return grant
+            return _IssueAuthority()
         admin = self.authorize(actor, spec.resource, CapabilityRight.ADMIN)
         if admin.allowed:
-            return admin
+            return _IssueAuthority(mutation_decision=admin)
+        grant = self.authorize(actor, spec.resource, CapabilityRight.GRANT)
+        if grant.allowed:
+            transfer_parent = self._find_transfer_parent(actor, spec)
+            self._validate_transfer_parent(transfer_parent, spec)
+            return _IssueAuthority(mutation_decision=grant, transfer_parent=transfer_parent)
         raise CapabilityDenied(f"{actor} lacks grant/admin authority to issue {sorted(spec.rights)} on {spec.resource}")
 
     def _require_revoke_authority(self, actor: str, cap: Capability) -> CapabilityDecision | None:
@@ -815,6 +844,7 @@ class CapabilityManager:
             for cap in self.capabilities_for(parent)
             if cap.active
             and not self._is_expired(cap)
+            and self._parent_chain_active(cap)
             and cap.effect == CapabilityEffect.ALLOW
             and cap.delegable
             and self._resource_covers(cap.resource, spec.resource)
@@ -825,14 +855,30 @@ class CapabilityManager:
         candidates.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
         return candidates[0]
 
+    def _find_transfer_parent(self, actor: str, spec: CapabilitySpec) -> Capability:
+        candidates = [
+            cap
+            for cap in self.capabilities_for(actor)
+            if cap.active
+            and not self._is_expired(cap)
+            and self._parent_chain_active(cap)
+            and cap.effect == CapabilityEffect.ALLOW
+            and self._resource_covers(cap.resource, spec.resource)
+            and spec.rights.issubset(cap.rights)
+        ]
+        if not candidates:
+            raise CapabilityDenied(
+                f"{actor} cannot grant {sorted(spec.rights)} on {spec.resource} without already holding those rights"
+            )
+        candidates.sort(key=lambda cap: (len(cap.resource), cap.issued_at, cap.cap_id), reverse=True)
+        return candidates[0]
+
     def _validate_delegation_parent(self, parent_cap: Capability, selected: CapabilitySpec) -> None:
+        if parent_cap.uses_remaining is not None:
+            raise CapabilityDenied("finite-use capabilities cannot be delegated")
         if selected.delegable and not parent_cap.delegable:
             raise CapabilityDenied(f"parent capability is not delegable: {parent_cap.cap_id}")
-        if parent_cap.expires_at is not None and selected.expires_at is not None and selected.expires_at > parent_cap.expires_at:
-            raise CapabilityDenied("delegated capability cannot outlive parent capability")
-        if parent_cap.uses_remaining is not None:
-            if selected.uses_remaining is None or selected.uses_remaining > parent_cap.uses_remaining:
-                raise CapabilityDenied("delegated capability cannot have broader use count than parent")
+        self._require_temporal_attenuation(parent_cap, selected, action="delegated")
         parent_max_depth = self._capability_max_delegation_depth(parent_cap)
         if parent_cap.delegation_depth >= parent_max_depth:
             raise CapabilityDenied("delegation depth exhausted")
@@ -842,6 +888,25 @@ class CapabilityManager:
         if selected.delegable and parent_cap.delegation_depth + 1 >= child_max_depth:
             raise CapabilityDenied("delegated capability cannot be delegable after depth exhaustion")
         self._require_constraint_attenuation(parent_cap, selected)
+
+    def _validate_transfer_parent(self, parent_cap: Capability, selected: CapabilitySpec) -> None:
+        if selected.effect != CapabilityEffect.ALLOW:
+            raise CapabilityDenied("grant authority can only transfer allow capabilities")
+        if parent_cap.uses_remaining is not None:
+            raise CapabilityDenied("finite-use capabilities cannot be granted onward")
+        if selected.delegable and not parent_cap.delegable:
+            raise CapabilityDenied(f"transferred capability cannot be delegable from non-delegable parent: {parent_cap.cap_id}")
+        self._require_temporal_attenuation(parent_cap, selected, action="transferred")
+        parent_max_depth = self._capability_max_delegation_depth(parent_cap)
+        if selected.max_delegation_depth is not None and selected.max_delegation_depth > parent_max_depth:
+            raise CapabilityDenied("transferred capability cannot increase parent delegation depth")
+        if selected.delegable and parent_cap.delegation_depth + 1 >= parent_max_depth:
+            raise CapabilityDenied("transferred capability cannot be delegable after depth exhaustion")
+        self._require_constraint_attenuation(parent_cap, selected)
+
+    def _require_temporal_attenuation(self, parent_cap: Capability, selected: CapabilitySpec, *, action: str) -> None:
+        if parent_cap.expires_at is not None and selected.expires_at is not None and selected.expires_at > parent_cap.expires_at:
+            raise CapabilityDenied(f"{action} capability cannot outlive parent capability")
 
     def _initial_max_delegation_depth(self, selected: CapabilitySpec) -> int | None:
         if selected.max_delegation_depth is not None:
@@ -873,6 +938,8 @@ class CapabilityManager:
         for cap in self.store.list_capabilities(subject=subject):
             if not cap.active or self._is_expired(cap):
                 continue
+            if not self._parent_chain_active(cap):
+                continue
             if not include_ask and cap.effect == CapabilityEffect.ASK:
                 continue
             if not self._resource_matches(cap.resource, resource):
@@ -880,15 +947,9 @@ class CapabilityManager:
             if requested_right not in cap.rights:
                 continue
             matches.append(cap)
-        matches.sort(
-            key=lambda cap: (
-                0 if cap.effect == CapabilityEffect.DENY else 1,
-                len(cap.resource),
-                cap.issued_at,
-            ),
-            reverse=True,
-        )
-        # Deny dominates regardless of specificity.
+        matches.sort(key=lambda cap: cap.cap_id)
+        matches.sort(key=lambda cap: cap.issued_at, reverse=True)
+        matches.sort(key=lambda cap: len(cap.resource), reverse=True)
         matches.sort(key=lambda cap: 0 if cap.effect == CapabilityEffect.DENY else 1)
         return matches
 
@@ -930,7 +991,7 @@ class CapabilityManager:
         else:
             constraints.pop(self.POLICY_KEY, None)
         uses_remaining = data.get("uses_remaining")
-        expires_at = data.get("expires_at")
+        expires_at = self._normalize_expires_at(data.get("expires_at"))
         if policy is not None:
             effect, uses_remaining = self._effect_from_policy(str(policy))
         lease = data.get("lease")
@@ -966,9 +1027,9 @@ class CapabilityManager:
         uses_remaining = value.get("uses_remaining")
         if uses_remaining is not None:
             uses_remaining = int(uses_remaining)
-        expires_at = value.get("expires_at")
+        expires_at = self._normalize_expires_at(value.get("expires_at"))
         return CapabilityLease(
-            expires_at=str(expires_at) if expires_at is not None else None,
+            expires_at=expires_at,
             uses_remaining=uses_remaining,
         )
 
@@ -1221,7 +1282,48 @@ class CapabilityManager:
         return dict(context)
 
     def _is_expired(self, cap: Capability) -> bool:
-        return cap.expires_at is not None and cap.expires_at <= utc_now()
+        if cap.expires_at is None:
+            return False
+        try:
+            return self._expires_at_datetime(cap.expires_at) <= datetime.now(timezone.utc)
+        except ValidationError:
+            return True
+
+    def _parent_chain_active(self, cap: Capability) -> bool:
+        parent_id = cap.parent_cap_id
+        seen = {cap.cap_id}
+        while parent_id is not None:
+            if parent_id in seen:
+                return False
+            parent = self.store.get_capability(parent_id)
+            if parent is None or not parent.active or self._is_expired(parent):
+                return False
+            seen.add(parent_id)
+            parent_id = parent.parent_cap_id
+        return True
+
+    def _normalize_expires_at(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        dt = self._expires_at_datetime(value)
+        return dt.astimezone(timezone.utc).isoformat()
+
+    def _expires_at_datetime(self, value: Any) -> datetime:
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                raise ValidationError("capability expires_at must be a non-empty ISO timestamp")
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValidationError("capability expires_at must be an ISO timestamp") from exc
+        else:
+            raise ValidationError("capability expires_at must be an ISO timestamp")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _is_trusted_issuer(self, actor: str) -> bool:
         if actor in self.config.capability.trusted_issuers:

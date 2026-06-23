@@ -118,7 +118,26 @@ class ProcessDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class LLMProfile:
+    kind: Literal["openai_compatible"] = "openai_compatible"
+    base_url: str | None = None
+    model: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"
+    api_mode: Literal["auto", "responses", "chat"] | None = None
+    timeout_s: float | None = None
+    max_retries: int | None = None
+    store: bool | None = None
+    reasoning_effort: str | None = None
+    verbosity: Literal["low", "medium", "high"] | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    allow_custom_base_url: bool = False
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMDefaults:
+    default_profile_id: str = "default"
+    profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: float = 0.2
     max_tokens: int = 65_536
     timeout_s: float = 60.0
@@ -550,6 +569,24 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _nonnegative("process.fork_min_child_processes", process.fork_min_child_processes)
 
     llm = config.llm
+    _require_non_empty("llm.default_profile_id", llm.default_profile_id)
+    if llm.default_profile_id not in llm.profiles:
+        raise ValueError(f"llm.default_profile_id does not reference a configured profile: {llm.default_profile_id}")
+    for profile_id, profile in llm.profiles.items():
+        _require_non_empty("llm.profiles key", profile_id)
+        if profile.kind != "openai_compatible":
+            raise ValueError(f"llm.profiles[{profile_id!r}].kind is not supported: {profile.kind}")
+        if profile.base_url is not None:
+            _require_non_empty(f"llm.profiles[{profile_id!r}].base_url", profile.base_url)
+        if profile.model is not None:
+            _require_non_empty(f"llm.profiles[{profile_id!r}].model", profile.model)
+        _require_non_empty(f"llm.profiles[{profile_id!r}].api_key_env", profile.api_key_env)
+        if profile.api_mode is not None and profile.api_mode not in {"auto", "responses", "chat"}:
+            raise ValueError(f"llm.profiles[{profile_id!r}].api_mode is not supported: {profile.api_mode}")
+        _positive_optional(f"llm.profiles[{profile_id!r}].timeout_s", profile.timeout_s)
+        _nonnegative_optional(f"llm.profiles[{profile_id!r}].max_retries", profile.max_retries)
+        _nonnegative_optional(f"llm.profiles[{profile_id!r}].temperature", profile.temperature)
+        _positive_optional(f"llm.profiles[{profile_id!r}].max_tokens", profile.max_tokens)
     _nonnegative("llm.temperature", llm.temperature)
     _positive("llm.max_tokens", llm.max_tokens)
     _positive("llm.timeout_s", llm.timeout_s)

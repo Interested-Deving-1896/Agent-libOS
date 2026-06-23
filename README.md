@@ -123,14 +123,14 @@ Run tests:
 ```bash
 uv run python scripts/test_matrix.py --lane unit
 uv run python scripts/test_matrix.py --lane security
-uv run python scripts/test_matrix.py --lane runtime --workers 4
+uv run python scripts/test_matrix.py --lane runtime
 uv run python scripts/check_test_invariants.py
 ```
 
-Python test lanes run serially by default for easy failure diagnosis. Add
-`--workers N` (or `--workers auto`) to use pytest-xdist parallel workers for
-`unit`, `runtime`, `security`, `self-evolution`, `providers`, `benchmark`, or
-`all`. The GUI lane builds shared frontend artifacts and should be run
+The `runtime` and `all` lanes use bounded pytest-xdist parallelism by default
+to keep CI wall-clock time under control. Pass `--workers 1` for serial failure
+diagnosis, or `--workers N` / `--workers auto` to override the worker count for
+any Python lane. The GUI lane builds shared frontend artifacts and should be run
 separately. Pytest removes files created under ignored `agent_outputs/` at the
 end of a test session; use `--keep-agent-outputs` when debugging generated
 files.

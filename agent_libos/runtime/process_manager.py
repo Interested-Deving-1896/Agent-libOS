@@ -47,6 +47,7 @@ class ProcessManager:
         events: EventBus,
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
+        llm_profile_resolver: Callable[[str, str | None], str] | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -55,6 +56,7 @@ class ProcessManager:
         self.audit = audit
         self.events = events
         self.resources = resources
+        self._llm_profile_resolver = llm_profile_resolver
         self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
 
     def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
@@ -67,10 +69,12 @@ class ProcessManager:
         capabilities: builtins.list[dict[str, Any]] | None = None,
         resource_budget: ResourceBudget | None = None,
         working_directory: str | None = None,
+        llm_profile_id: str | None = None,
     ) -> str:
         now = utc_now()
         pid = new_id("pid")
         selected_image = image or self.config.runtime.default_image_id
+        selected_llm_profile = self._resolve_root_llm_profile(selected_image, llm_profile_id)
         cwd = self._normalize_working_directory(working_directory or self.config.process.default_working_directory)
         process = AgentProcess(
             pid=pid,
@@ -89,6 +93,7 @@ class ProcessManager:
             created_at=now,
             updated_at=now,
             working_directory=cwd,
+            llm_profile_id=selected_llm_profile,
         )
         self.store.insert_process(process)
         self.memory.ensure_process_namespace(pid)
@@ -106,14 +111,20 @@ class ProcessManager:
             EventType.PROCESS_CREATED,
             source="runtime",
             target=pid,
-            payload={"pid": pid, "image": selected_image, "goal_oid": goal_handle.oid, "working_directory": cwd},
+            payload={
+                "pid": pid,
+                "image": selected_image,
+                "goal_oid": goal_handle.oid,
+                "working_directory": cwd,
+                "llm_profile_id": selected_llm_profile,
+            },
         )
         self.audit.record(
             actor="runtime",
             action="process.spawn",
             target=f"process:{pid}",
             output_refs=[goal_handle.oid],
-            decision={"image": selected_image, "working_directory": cwd},
+            decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
         )
         self._run_after_spawn_hooks(pid, selected_image)
         return pid
@@ -129,6 +140,7 @@ class ProcessManager:
         image: str | None = None,
         mode: ForkMode | str = ForkMode.RESTRICTED,
         working_directory: str | None = None,
+        llm_profile_id: str | None = None,
     ) -> str:
         parent_proc = self._get(parent)
         fork_mode = ForkMode(mode)
@@ -139,6 +151,7 @@ class ProcessManager:
         self._validate_inherit_capability_specs(parent, inherit_specs)
         selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
+        selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
         self._reserve_child_budget(parent, child_pid, selected_budget)
@@ -160,6 +173,7 @@ class ProcessManager:
                 created_at=now,
                 updated_at=now,
                 working_directory=cwd,
+                llm_profile_id=selected_llm_profile,
             )
             self.store.insert_process(child)
             self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
@@ -191,7 +205,13 @@ class ProcessManager:
                 EventType.PROCESS_FORKED,
                 source=parent,
                 target=child_pid,
-                payload={"parent": parent, "child": child_pid, "mode": fork_mode.value, "working_directory": cwd},
+                payload={
+                    "parent": parent,
+                    "child": child_pid,
+                    "mode": fork_mode.value,
+                    "working_directory": cwd,
+                    "llm_profile_id": selected_llm_profile,
+                },
             )
             self.audit.record(
                 actor=parent,
@@ -199,7 +219,12 @@ class ProcessManager:
                 target=f"process:{child_pid}",
                 input_refs=[parent_proc.goal_oid] if parent_proc.goal_oid else [],
                 output_refs=[goal_handle.oid],
-                decision={"mode": fork_mode.value, "image": child.image_id, "working_directory": child.working_directory},
+                decision={
+                    "mode": fork_mode.value,
+                    "image": child.image_id,
+                    "working_directory": child.working_directory,
+                    "llm_profile_id": selected_llm_profile,
+                },
             )
             self._run_after_spawn_hooks(child_pid, child.image_id)
             return child_pid
@@ -217,6 +242,7 @@ class ProcessManager:
         image: str | None = None,
         working_directory: str | None = None,
         initial_status: ProcessStatus | str = ProcessStatus.RUNNABLE,
+        llm_profile_id: str | None = None,
     ) -> str:
         parent_proc = self._get(parent)
         if parent_proc.status in self.TERMINAL_STATUSES:
@@ -229,6 +255,7 @@ class ProcessManager:
         if selected_initial_status in self.TERMINAL_STATUSES:
             raise ProcessError(f"spawn_child initial_status cannot be terminal: {selected_initial_status.value}")
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
+        selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
         self._reserve_child_budget(parent, child_pid, selected_budget)
@@ -250,6 +277,7 @@ class ProcessManager:
                 created_at=now,
                 updated_at=now,
                 working_directory=cwd,
+                llm_profile_id=selected_llm_profile,
             )
             self.store.insert_process(child)
             self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
@@ -280,6 +308,7 @@ class ProcessManager:
                     "goal_oid": goal_handle.oid,
                     "working_directory": child.working_directory,
                     "status": child.status.value,
+                    "llm_profile_id": selected_llm_profile,
                 },
             )
             self.audit.record(
@@ -287,7 +316,12 @@ class ProcessManager:
                 action="process.spawn_child",
                 target=f"process:{child_pid}",
                 output_refs=[goal_handle.oid],
-                decision={"image": child.image_id, "working_directory": child.working_directory, "status": child.status.value},
+                decision={
+                    "image": child.image_id,
+                    "working_directory": child.working_directory,
+                    "status": child.status.value,
+                    "llm_profile_id": selected_llm_profile,
+                },
             )
             self._run_after_spawn_hooks(child_pid, child.image_id)
             return child_pid
@@ -303,6 +337,7 @@ class ProcessManager:
         goal: dict[str, Any] | str | ObjectHandle | None = None,
         preserve_memory: bool = True,
         preserve_capabilities: bool = False,
+        llm_profile_id: str | None = None,
     ) -> None:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
@@ -330,6 +365,8 @@ class ProcessManager:
         elif not preserve_memory:
             process.memory_view = None
         process.image_id = image
+        if llm_profile_id is not None:
+            process.llm_profile_id = self._normalize_llm_profile_id(llm_profile_id)
         process.loaded_skills = {}
         process.updated_at = utc_now()
         self.store.update_process(process)
@@ -344,6 +381,7 @@ class ProcessManager:
                 "preserve_capabilities": preserve_capabilities,
                 "goal_oid": goal_handle.oid if goal_handle is not None else process.goal_oid,
                 "working_directory": process.working_directory,
+                "llm_profile_id": process.llm_profile_id,
             },
         )
         self.audit.record(
@@ -359,6 +397,7 @@ class ProcessManager:
                 "preserve_memory": preserve_memory,
                 "preserve_capabilities": preserve_capabilities,
                 "working_directory": process.working_directory,
+                "llm_profile_id": process.llm_profile_id,
             },
         )
 
@@ -619,6 +658,24 @@ class ProcessManager:
                 continue
             parts.append(part)
         return "/".join(parts) if parts else "."
+
+    def _resolve_root_llm_profile(self, image_id: str, explicit_profile_id: str | None) -> str:
+        if self._llm_profile_resolver is not None:
+            return self._llm_profile_resolver(image_id, explicit_profile_id)
+        if explicit_profile_id is not None:
+            return self._normalize_llm_profile_id(explicit_profile_id)
+        return self.config.llm.default_profile_id
+
+    def _resolve_child_llm_profile(self, parent: AgentProcess, explicit_profile_id: str | None) -> str:
+        if explicit_profile_id is not None:
+            return self._normalize_llm_profile_id(explicit_profile_id)
+        return parent.llm_profile_id or self.config.llm.default_profile_id
+
+    def _normalize_llm_profile_id(self, profile_id: str) -> str:
+        selected = str(profile_id or "").strip()
+        if not selected:
+            raise ProcessError("LLM profile id must be a non-empty string")
+        return selected
 
     def _child_resource_budget(self, parent: AgentProcess) -> ResourceBudget:
         budget = self.resources.remaining_budget(parent.pid) if self.resources is not None else parent.resource_budget

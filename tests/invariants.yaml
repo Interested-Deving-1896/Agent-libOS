@@ -35,7 +35,12 @@
         "tests/security/test_capability.py::TestCapabilityManager::test_authority_rules_are_enforced_against_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_scoped_deny_rule_only_denies_matching_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_one_shot_grant_authority_is_consumed_after_successful_issue",
+        "tests/security/test_capability.py::TestCapabilityManager::test_grant_authority_can_only_transfer_existing_allow_rights",
+        "tests/security/test_capability.py::TestCapabilityManager::test_one_time_capability_claim_is_conditional",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegate_can_only_attenuate_delegable_parent_capability",
+        "tests/security/test_capability.py::TestCapabilityManager::test_delegated_capability_stops_authorizing_when_parent_is_revoked",
+        "tests/security/test_capability.py::TestCapabilityManager::test_finite_use_capability_cannot_be_delegated_or_granted_onward",
+        "tests/security/test_capability.py::TestCapabilityManager::test_capability_expiry_must_be_valid_iso_timestamp",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegation_cannot_increase_parent_max_depth",
         "tests/security/test_capability.py::TestCapabilityRuntimeInterface::test_capability_syscalls_do_not_bypass_authority"
       ],
@@ -267,6 +272,20 @@
       "node_ids": [
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_call_records_persist_sanitized_prompt_output_usage_and_reasoning",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-profile-selection-is-process-local",
+      "title": "LLM profile selection is host-controlled, process-local, persisted, and fail-closed.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_different_processes_use_different_profile_clients",
+        "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_spawn_child_fork_and_exec_profile_selection_rules",
+        "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_unknown_profile_fails_closed_when_llm_quantum_runs",
+        "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_process_llm_profile_persists_across_reopen",
+        "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_only_default_profile_inherits_legacy_openai_environment",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_preserves_llm_profile_default"
       ],
       "benchmark_attack_classes": []
     },

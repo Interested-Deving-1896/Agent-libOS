@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -39,6 +40,7 @@ class LLMClient:
     base_url: str | None = None
     model: str | None = None
     api_key: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"
     timeout: float | None = None
     max_retries: int | None = None
     api_mode: Literal["auto", "responses", "chat"] | None = None
@@ -82,6 +84,7 @@ class LLMClient:
             base_url=env.get("OPENAI_BASE_URL"),
             model=env.get("OPENAI_LANGUAGE_MODEL") or env.get("OPENAI_MODEL"),
             api_key=env.get("OPENAI_API_KEY"),
+            api_key_env="OPENAI_API_KEY",
             timeout=_float_env_from(env, "OPENAI_TIMEOUT", default=defaults.timeout_s),
             max_retries=_int_env_from(env, "OPENAI_MAX_RETRIES", default=defaults.max_retries),
             api_mode=api_mode,  # type: ignore[arg-type]
@@ -101,10 +104,24 @@ class LLMClient:
             if callable(close):
                 result = close()
                 if inspect.isawaitable(result):
-                    _run_sync(result)
+                    _run_close_sync(result)
             setattr(self, attr, None)
 
     shutdown = close
+
+    async def aclose(self) -> None:
+        for attr in ("_client", "_async_client"):
+            client = getattr(self, attr)
+            if client is None:
+                continue
+            close = getattr(client, "close", None) or getattr(client, "aclose", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            setattr(self, attr, None)
+
+    ashutdown = aclose
 
     def complete(
         self,
@@ -320,16 +337,17 @@ class LLMClient:
         self._validate_base_url_policy()
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
-        if not (self.api_key or os.getenv("OPENAI_API_KEY")):
-            raise LLMError("OPENAI_API_KEY is not configured")
+        api_key = self.api_key or os.getenv(self.api_key_env)
+        if not api_key:
+            raise LLMError(f"{self.api_key_env} is not configured")
 
         kwargs: dict[str, Any] = {
             "timeout": self.timeout,
             # Let the SDK own transient network/rate-limit retry behavior.
             "max_retries": self.max_retries,
         }
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
+        if api_key:
+            kwargs["api_key"] = api_key
         if self.base_url:
             kwargs["base_url"] = self.base_url
         return kwargs
@@ -826,6 +844,28 @@ def _run_sync(awaitable: Any) -> Any:
     if inspect.iscoroutine(awaitable):
         awaitable.close()
     raise RuntimeError("Cannot use sync LLMClient APIs inside a running event loop. Use async APIs instead.")
+
+
+def _run_close_sync(awaitable: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable)
+
+    result: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(awaitable)
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, name="agent-libos-llm-close", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def read_dotenv(path: str | Path) -> dict[str, str]:

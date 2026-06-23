@@ -34,6 +34,55 @@ class TestTestMatrix:
         assert command[:4] == [test_matrix.sys.executable, "-m", "pytest", "tests"]
         assert command[4:8] == ["-n", "4", "--dist", "load"]
 
+    def test_runtime_lane_defaults_to_bounded_parallel_worksteal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(workers=None, dist=None)
+        monkeypatch.setattr(test_matrix.os, "cpu_count", lambda: 12)
+
+        test_matrix._resolve_defaults(parser, args)
+
+        assert args.workers == str(test_matrix.DEFAULT_PARALLEL_WORKER_CAP)
+        assert args.dist == "worksteal"
+
+    def test_all_lane_defaults_to_bounded_parallel_worksteal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(lane="all", workers=None, dist=None)
+        monkeypatch.setattr(test_matrix.os, "cpu_count", lambda: 2)
+
+        test_matrix._resolve_defaults(parser, args)
+
+        assert args.workers == "2"
+        assert args.dist == "worksteal"
+
+    def test_non_runtime_lane_defaults_to_serial_execution(self) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(lane="security", workers=None, dist=None)
+
+        test_matrix._resolve_defaults(parser, args)
+
+        assert args.workers == "1"
+        assert args.dist == "loadfile"
+
+    def test_explicit_workers_override_parallel_default(self) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(workers="1", dist=None)
+
+        test_matrix._resolve_defaults(parser, args)
+
+        assert args.workers == "1"
+        assert args.dist == "loadfile"
+
+    def test_worker_env_overrides_lane_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(lane="security", workers=None, dist=None)
+        monkeypatch.setenv(test_matrix.WORKERS_ENV, "3")
+        monkeypatch.setenv(test_matrix.DIST_ENV, "load")
+
+        test_matrix._resolve_defaults(parser, args)
+
+        assert args.workers == "3"
+        assert args.dist == "load"
+
     def test_worker_count_accepts_positive_int_auto_and_logical(self) -> None:
         assert test_matrix._worker_count("4") == "4"
         assert test_matrix._worker_count("auto") == "auto"
@@ -50,4 +99,3 @@ class TestTestMatrix:
 
         with pytest.raises(SystemExit):
             test_matrix._validate_args(parser, _args(lane="gui", workers="2"))
-

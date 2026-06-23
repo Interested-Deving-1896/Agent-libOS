@@ -15,6 +15,7 @@ from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, JsonRpcPri
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
+from agent_libos.llm.profiles import LLMProfileRegistry
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     AgentImage,
@@ -77,6 +78,7 @@ class Runtime:
         self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
         self.store = store
         self.store.config = self.config
+        self.llms = LLMProfileRegistry(self, config=self.config)
         self.audit = AuditManager(store)
         self.events = EventBus(store)
         self.resources = ResourceManager(store, self.audit, self.events)
@@ -135,6 +137,7 @@ class Runtime:
             config=self.config,
             resources=self.resources,
         )
+        self.images: dict[str, AgentImage] = {}
         self.tools = ToolBroker(
             store,
             self.memory,
@@ -155,6 +158,7 @@ class Runtime:
             self.events,
             config=self.config,
             resources=self.resources,
+            llm_profile_resolver=self._resolve_launch_llm_profile_id,
         )
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
         self.object_tasks = ObjectTaskManager(self, config=self.config)
@@ -178,7 +182,6 @@ class Runtime:
             config=self.config,
         )
         self.skills.bind_runtime(self)
-        self.images: dict[str, AgentImage] = {}
         self.image_registry = ImageRegistryPrimitive(
             self.images,
             self.capability,
@@ -335,11 +338,44 @@ class Runtime:
         )
         for name, component in [
             ("object_tasks", getattr(self, "object_tasks", None)),
-            ("llm.client", getattr(self.llm, "client", None)),
+            ("llms", getattr(self, "llms", None)),
             ("substrate", self.substrate),
         ]:
             try:
                 self._shutdown_component(component)
+            except Exception as exc:
+                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
+        self._closed = True
+        self.store.close()
+        if errors:
+            raise RuntimeError(f"runtime shutdown completed with component errors: {errors}")
+        return {"ok": True, "already_shutdown": False, "reason": reason}
+
+    async def ashutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:
+        """Async shutdown variant for event-loop hosts."""
+        if self._closed:
+            return {"ok": True, "already_shutdown": True, "reason": self._shutdown_reason}
+        self._shutdown_reason = reason
+        errors: list[dict[str, str]] = []
+        self.audit.record(
+            actor=actor,
+            action="runtime.shutdown",
+            target="runtime",
+            decision={"reason": reason},
+        )
+        self.events.emit(
+            EventType.RUNTIME_SHUTDOWN,
+            source=actor,
+            target="runtime",
+            payload={"reason": reason},
+        )
+        for name, component in [
+            ("object_tasks", getattr(self, "object_tasks", None)),
+            ("llms", getattr(self, "llms", None)),
+            ("substrate", self.substrate),
+        ]:
+            try:
+                await self._ashutdown_component(component)
             except Exception as exc:
                 errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
         self._closed = True
@@ -354,6 +390,29 @@ class Runtime:
 
     def _shutdown_component(self, component: Any) -> None:
         if component is None:
+            return
+        shutdown = getattr(component, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+            return
+        close = getattr(component, "close", None)
+        if callable(close):
+            close()
+
+    async def _ashutdown_component(self, component: Any) -> None:
+        if component is None:
+            return
+        ashutdown = getattr(component, "ashutdown", None)
+        if callable(ashutdown):
+            result = ashutdown()
+            if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+                await result
+            return
+        aclose = getattr(component, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+                await result
             return
         shutdown = getattr(component, "shutdown", None)
         if callable(shutdown):
@@ -757,6 +816,7 @@ class Runtime:
         goal: dict[str, Any] | str | None = None,
         preserve_memory: bool = True,
         preserve_capabilities: bool = False,
+        llm_profile_id: str | None = None,
     ) -> Any:
         selected_image = self._require_image(image)
         self._preflight_process_image_boot(selected_image)
@@ -768,6 +828,7 @@ class Runtime:
             goal=goal,
             preserve_memory=preserve_memory,
             preserve_capabilities=preserve_capabilities,
+            llm_profile_id=llm_profile_id,
         )
         try:
             # Exec swaps the process image and tool table, but deliberately does
@@ -802,6 +863,7 @@ class Runtime:
         inherit_capabilities: list[dict[str, Any]] | None = None,
         resource_budget: Any | None = None,
         working_directory: str | None = None,
+        llm_profile_id: str | None = None,
     ) -> str:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
@@ -818,11 +880,23 @@ class Runtime:
             inherit_capabilities=inherit_capabilities,
             resource_budget=resource_budget,
             working_directory=selected_cwd,
+            llm_profile_id=llm_profile_id,
         )
 
     def set_process_working_directory(self, pid: str, path: str) -> Any:
         relative = self.resolve_process_working_directory(pid, path)
         return self.process.set_working_directory(pid, relative)
+
+    def _resolve_launch_llm_profile_id(self, image_id: str, explicit_profile_id: str | None) -> str:
+        if explicit_profile_id is not None:
+            selected = str(explicit_profile_id).strip()
+            if not selected:
+                raise ValidationError("LLM profile id must be a non-empty string")
+            return selected
+        image = self.images.get(image_id)
+        if image is not None and image.llm_profile_id:
+            return image.llm_profile_id
+        return self.config.llm.default_profile_id
 
     def resolve_process_working_directory(self, pid: str, path: str) -> str:
         current_cwd = self.process.working_directory(pid)

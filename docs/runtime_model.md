@@ -2,8 +2,8 @@
 
 Agent libOS models work as `AgentProcess` instances. A process has identity,
 status, a goal object, a memory view, a process-local working directory, a tool
-table, loaded Skills, capabilities, children, message queue state, and resource
-budgets.
+table, loaded Skills, capabilities, children, message queue state, an
+`llm_profile_id`, and resource budgets.
 
 The paper frames this process model as the substrate for self-evolving agents:
 a process can change visible tools, activate Skills, register process-local JIT
@@ -31,7 +31,8 @@ Terminal statuses are `exited`, `failed`, and `killed`.
 
 An `AgentImage` defines the default process prompt, tool table, default Skills,
 prompt mode, context policy, safety profile, declared required capabilities,
-and optional boot metadata. Fresh images boot from their manifest.
+an optional default LLM profile, and optional boot metadata. Fresh images boot
+from their manifest.
 Checkpoint-commit images boot from an immutable internal runtime artifact
 derived from one checkpoint root process. Image-package images boot from an
 immutable directory-package artifact created from `IMAGE.yaml`, `prompt.md`,
@@ -57,6 +58,17 @@ shell, or other builtin access, it must list that tool explicitly. Internal
 runtime paths such as JIT syscalls may still call primitives directly through
 their syscall session without exposing the corresponding builtin tool to the
 model.
+
+LLM selection is host-controlled and process-local. A process stores only an
+`llm_profile_id`; the host Runtime resolves that id to a configured
+OpenAI-compatible profile at LLM-call time. Root spawn uses an explicit host
+profile, then the image default, then `config.llm.default_profile_id`. Fork and
+fresh child creation inherit the parent profile by default. Exec keeps the
+current profile unless the host explicitly overrides it. Model-facing process
+tools do not expose LLM profile switching in v1. Only the configured default
+profile inherits legacy `OPENAI_*` provider and model environment variables;
+other named profiles require explicit host profile fields for non-default
+routing.
 
 `jit_tool_exposure` controls how JIT tools appear to the LLM. `direct` exposes
 each visible JIT as its own OpenAI tool. `multiplexed` exposes one stable

@@ -29,6 +29,44 @@ class TestCLIBuiltinCommand:
             finally:
                 runtime.close()
 
+    def test_cli_spawn_and_exec_accept_llm_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            with _temporary_cwd(root):
+                spawn = _run_cli_json([
+                    '--db',
+                    str(db),
+                    'spawn',
+                    '--image',
+                    'base-agent:v0',
+                    '--goal',
+                    'profiled',
+                    '--llm-profile',
+                    'cli-spawn',
+                ])
+                result = _run_cli_json([
+                    '--db',
+                    str(db),
+                    'exec',
+                    'base-agent:v0',
+                    'profiled exec',
+                    '--pid',
+                    spawn['pid'],
+                    '--llm-profile',
+                    'cli-exec',
+                    '--no-run',
+                ])
+            runtime = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
+            try:
+                process = runtime.process.get(spawn['pid'])
+                assert spawn['llm_profile_id'] == 'cli-spawn'
+                assert result['exec']['old_llm_profile_id'] == 'cli-spawn'
+                assert result['exec']['new_llm_profile_id'] == 'cli-exec'
+                assert process.llm_profile_id == 'cli-exec'
+            finally:
+                runtime.close()
+
     def test_cli_exit_marks_process_exited_with_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -121,6 +121,12 @@ class ShellAdapter:
             cwd=cwd,
         )
         correlation_id = intent_record.record_id
+        if decision.consume_once and decision.consume_capability_id is not None:
+            self.capabilities.consume_use(
+                decision.consume_capability_id,
+                used_by="shell",
+                reason="one-time shell permission consumed",
+            )
         try:
             proc = self._provider_run(checked, timeout=selected_timeout, cwd=cwd, limits=limits)
             proc = self._bounded_result(proc)
@@ -213,14 +219,6 @@ class ShellAdapter:
                 parent_record_id=intent_record.record_id,
             )
             raise
-        finally:
-            if decision.consume_once:
-                if decision.consume_capability_id is not None:
-                    self.capabilities.consume_use(
-                        decision.consume_capability_id,
-                        used_by="shell",
-                        reason="one-time shell permission consumed",
-                    )
         event = self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd, correlation_id=correlation_id)
         audit_record = self.audit.record(
             actor=pid,

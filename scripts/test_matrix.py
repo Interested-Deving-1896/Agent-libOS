@@ -22,6 +22,12 @@ LANE_PATHS = {
 PYTHON_LANES = tuple(LANE_PATHS)
 DEFAULT_MAX_LANE_SECONDS = 300.0
 DEFAULT_WORKERS = "1"
+DEFAULT_PARALLEL_WORKER_CAP = 4
+PARALLEL_BY_DEFAULT_LANES = {"runtime", "all"}
+DEFAULT_SERIAL_DIST = "loadfile"
+DEFAULT_PARALLEL_DIST = "worksteal"
+WORKERS_ENV = "AGENT_LIBOS_TEST_WORKERS"
+DIST_ENV = "AGENT_LIBOS_TEST_DIST"
 XDIST_DISTS = ("loadfile", "loadscope", "load", "worksteal")
 
 
@@ -53,16 +59,20 @@ def main(argv: list[str] | None = None) -> int:
         "-n",
         "--workers",
         type=_worker_count,
-        default=DEFAULT_WORKERS,
-        help="number of pytest-xdist workers for Python lanes; use 1 to run serially, or auto/logical",
+        default=None,
+        help=(
+            "number of pytest-xdist workers for Python lanes; use 1 to run serially, or auto/logical "
+            f"(default: bounded parallel for {', '.join(sorted(PARALLEL_BY_DEFAULT_LANES))})"
+        ),
     )
     parser.add_argument(
         "--dist",
         choices=XDIST_DISTS,
-        default="loadfile",
+        default=None,
         help="pytest-xdist scheduling strategy used when --workers is greater than 1",
     )
     args = parser.parse_args(argv)
+    _resolve_defaults(parser, args)
     _validate_args(parser, args)
 
     commands = _commands_for(args)
@@ -122,6 +132,34 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--workers only applies to pytest lanes; run the gui lane separately")
     if _workers_enabled(args) and importlib.util.find_spec("xdist") is None:
         parser.error("pytest-xdist is required for --workers; run `uv sync --all-groups` first")
+
+
+def _resolve_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.workers is None:
+        args.workers = _default_workers_for_lane(args.lane)
+    if args.dist is None:
+        args.dist = _default_dist(parser, args)
+
+
+def _default_workers_for_lane(lane: str) -> str:
+    env_workers = os.getenv(WORKERS_ENV)
+    if env_workers:
+        return _worker_count(env_workers)
+    if lane in PARALLEL_BY_DEFAULT_LANES:
+        cpu_count = os.cpu_count() or 1
+        return str(max(1, min(DEFAULT_PARALLEL_WORKER_CAP, cpu_count)))
+    return DEFAULT_WORKERS
+
+
+def _default_dist(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
+    env_dist = os.getenv(DIST_ENV)
+    if env_dist:
+        if env_dist not in XDIST_DISTS:
+            parser.error(f"{DIST_ENV} must be one of {', '.join(XDIST_DISTS)}")
+        return env_dist
+    if _workers_enabled(args):
+        return DEFAULT_PARALLEL_DIST
+    return DEFAULT_SERIAL_DIST
 
 
 def _worker_count(value: str) -> str:

@@ -77,6 +77,15 @@ Manual queue processing remains available:
 uv run agent-libos --db .agent_libos.sqlite human
 ```
 
+`spawn` and `exec` accept `--llm-profile <profile-id>` for host-selected
+per-process LLM routing. The process row stores only the profile id; API keys
+remain in host environment variables configured by the profile. If omitted,
+spawn uses the selected image's `llm_profile` default and then
+`config.llm.default_profile_id`; exec keeps the current process profile unless
+overridden. Only the configured default profile inherits legacy `OPENAI_*`
+provider/model environment variables. Other named profiles should declare their
+model and endpoint explicitly.
+
 ## Workflow Run
 
 `workflow run` is a direct user entrypoint for tools. It spawns a fresh
@@ -263,6 +272,7 @@ name: review-agent
 prompt: prompt.md
 prompt_mode: image_only
 jit_tool_exposure: direct
+llm_profile: review-fast
 default_tools:
   - read_memory_object
   - human_output
@@ -289,6 +299,10 @@ when the image wants one stable OpenAI tool schema named `run_jit_tool` for all
 JIT tools. Multiplexed packages must describe their JIT catalog in their own
 prompt or Skill instructions; the runtime does not inject the individual JIT
 names or schemas into prompt context.
+
+`llm_profile` is optional and names a host-configured LLM profile used when a
+root process is spawned from the image. It is only an id; provider API keys stay
+in the host environment and are not packaged into the image.
 
 `default_tools` is exact. The runtime does not add `process_exit`,
 `create_memory_object`, or any other builtin automatically. List every

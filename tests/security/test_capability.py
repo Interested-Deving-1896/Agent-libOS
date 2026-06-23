@@ -214,13 +214,57 @@ class TestCapabilityManager:
         try:
             issuer = runtime.process.spawn(image='base-agent:v0', goal='issuer')
             subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            runtime.capability.issue_trusted(issuer, 'object:alpha', [CapabilityRight.READ], issued_by='test')
             grant_cap = runtime.capability.grant_once(issuer, 'object:alpha', [CapabilityRight.GRANT], issued_by='test')
             issued = runtime.capability.issue(issuer, subject, CapabilitySpec(resource='object:alpha', rights={CapabilityRight.READ.value}))
             assert runtime.capability.check(subject, 'object:alpha', CapabilityRight.READ)
             assert issued.issuer_cap_id == grant_cap.cap_id
+            assert issued.parent_cap_id != grant_cap.cap_id
             assert runtime.capability.inspect(grant_cap.cap_id)['status'] == 'revoked'
             with pytest.raises(CapabilityDenied):
                 runtime.capability.issue(issuer, subject, CapabilitySpec(resource='object:alpha', rights={CapabilityRight.WRITE.value}))
+        finally:
+            runtime.close()
+
+    def test_grant_authority_can_only_transfer_existing_allow_rights(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            issuer = runtime.process.spawn(image='base-agent:v0', goal='issuer')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            spec = CapabilitySpec(resource='object:alpha', rights={CapabilityRight.READ.value})
+            runtime.capability.issue_trusted(issuer, 'object:alpha', [CapabilityRight.GRANT], issued_by='test')
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(issuer, subject, spec)
+            source = runtime.capability.issue_trusted(issuer, 'object:alpha', [CapabilityRight.READ], issued_by='test')
+            issued = runtime.capability.issue(issuer, subject, spec)
+            assert issued.parent_cap_id == source.cap_id
+            assert runtime.capability.check(subject, 'object:alpha', CapabilityRight.READ)
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(issuer, subject, CapabilitySpec(resource='object:alpha', rights={CapabilityRight.ADMIN.value}))
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(
+                    issuer,
+                    subject,
+                    CapabilitySpec(
+                        resource='object:alpha',
+                        rights={CapabilityRight.READ.value},
+                        effect=CapabilityEffect.DENY,
+                    ),
+                )
+        finally:
+            runtime.close()
+
+    def test_one_time_capability_claim_is_conditional(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='claim once')
+            cap = runtime.capability.grant_once(pid, 'object:once', [CapabilityRight.READ], issued_by='test')
+            first = runtime.capability.authorize(pid, 'object:once', CapabilityRight.READ)
+            second = runtime.capability.authorize(pid, 'object:once', CapabilityRight.READ)
+            runtime.capability.claim_decision_use(first, used_by=pid, reason='test claim')
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.claim_decision_use(second, used_by=pid, reason='test claim')
+            assert runtime.capability.inspect(cap.cap_id)['status'] == 'revoked'
         finally:
             runtime.close()
 
@@ -232,6 +276,7 @@ class TestCapabilityManager:
             spec = CapabilitySpec(resource='object:alpha', rights={CapabilityRight.READ.value})
             with pytest.raises(CapabilityDenied):
                 runtime.capability.issue(issuer, subject, spec)
+            runtime.capability.issue_trusted(issuer, 'object:alpha', [CapabilityRight.READ], issued_by='test')
             runtime.capability.issue_trusted(issuer, 'object:alpha', [CapabilityRight.GRANT], issued_by='test')
             cap = runtime.capability.issue(issuer, subject, spec)
             assert runtime.capability.check(subject, 'object:alpha', CapabilityRight.READ)
@@ -261,6 +306,42 @@ class TestCapabilityManager:
             assert not runtime.capability.check(child, 'filesystem:workspace:src/main.py', CapabilityRight.WRITE)
             with pytest.raises(CapabilityDenied):
                 runtime.capability.delegate(parent, child, CapabilitySpec(resource='filesystem:workspace:other.py', rights={CapabilityRight.READ.value}))
+        finally:
+            runtime.close()
+
+    def test_delegated_capability_stops_authorizing_when_parent_is_revoked(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            child = runtime.spawn_child_process(parent, 'child')
+            parent_cap = runtime.capability.grant(parent, 'object:shared', [CapabilityRight.READ], issued_by='test', delegable=True)
+            delegated = runtime.capability.delegate(parent, child, CapabilitySpec(resource='object:shared', rights={CapabilityRight.READ.value}))
+            assert runtime.capability.check(child, 'object:shared', CapabilityRight.READ)
+            assert delegated.parent_cap_id == parent_cap.cap_id
+            runtime.capability.revoke(parent_cap.cap_id, revoked_by='test')
+            assert not runtime.capability.check(child, 'object:shared', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_finite_use_capability_cannot_be_delegated_or_granted_onward(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            child = runtime.spawn_child_process(parent, 'child')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            runtime.capability.issue_trusted(
+                parent,
+                'object:finite',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=1,
+                delegable=True,
+            )
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.delegate(parent, child, CapabilitySpec(resource='object:finite', rights={CapabilityRight.READ.value}))
+            runtime.capability.issue_trusted(parent, 'object:finite', [CapabilityRight.GRANT], issued_by='test')
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(parent, subject, CapabilitySpec(resource='object:finite', rights={CapabilityRight.READ.value}))
         finally:
             runtime.close()
 
@@ -326,6 +407,23 @@ class TestCapabilityManager:
             assert not runtime.capability.check(owner, 'filesystem:workspace:secret.txt', CapabilityRight.READ)
             runtime.capability.revoke(deny.cap_id, revoked_by='test')
             assert runtime.capability.inspect(deny.cap_id)['status'] == 'revoked'
+        finally:
+            runtime.close()
+
+    def test_capability_expiry_must_be_valid_iso_timestamp(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='expiry')
+            with pytest.raises(ValidationError):
+                runtime.capability.grant(pid, 'object:bad-expiry', [CapabilityRight.READ], issued_by='test', expires_at='zzzz')
+            cap = runtime.capability.grant(
+                pid,
+                'object:good-expiry',
+                [CapabilityRight.READ],
+                issued_by='test',
+                expires_at='2999-01-01T00:00:00Z',
+            )
+            assert runtime.capability.inspect(cap.cap_id)['expires_at'] == '2999-01-01T00:00:00+00:00'
         finally:
             runtime.close()
 

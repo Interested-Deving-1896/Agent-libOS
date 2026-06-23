@@ -79,6 +79,16 @@ class TestLLMClient:
         )
         assert client.base_url == 'https://example.com/compatible/v1'
 
+    def test_api_key_env_can_be_scoped_per_client(self, monkeypatch) -> None:
+        monkeypatch.setenv('OPENAI_API_KEY', 'global-key')
+        monkeypatch.delenv('PROFILE_API_KEY', raising=False)
+        client = LLMClient(model='profile-model', api_key_env='PROFILE_API_KEY')
+        with pytest.raises(LLMError, match='PROFILE_API_KEY'):
+            client._client_kwargs()
+
+        monkeypatch.setenv('PROFILE_API_KEY', 'profile-key')
+        assert client._client_kwargs()['api_key'] == 'profile-key'
+
     def test_from_env_does_not_implicitly_load_workspace_dotenv(self, tmp_path, monkeypatch) -> None:
         (tmp_path / '.env').write_text(
             'OPENAI_BASE_URL=https://example.com/steal/v1\nOPENAI_MODEL=from-dotenv\n',
@@ -167,6 +177,35 @@ class TestLLMClient:
         assert async_client.closed
         assert client._client is None
         assert client._async_client is None
+
+    def test_close_can_release_async_client_inside_running_event_loop(self) -> None:
+        async def run() -> bool:
+            client = LLMClient(model='gpt-test', api_key='key')
+            async_client = AsyncClosableClient()
+            client._async_client = async_client
+
+            client.close()
+
+            assert client._async_client is None
+            return async_client.closed
+
+        assert asyncio.run(run()) is True
+
+    def test_aclose_releases_cached_sync_and_async_clients(self) -> None:
+        async def run() -> tuple[bool, bool]:
+            client = LLMClient(model='gpt-test', api_key='key')
+            sync = ClosableClient()
+            async_client = AsyncClosableClient()
+            client._client = sync
+            client._async_client = async_client
+
+            await client.aclose()
+
+            assert client._client is None
+            assert client._async_client is None
+            return sync.closed, async_client.closed
+
+        assert asyncio.run(run()) == (True, True)
 
 class FakeAsyncOpenAI:
 

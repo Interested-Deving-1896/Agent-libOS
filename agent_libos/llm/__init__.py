@@ -4,6 +4,7 @@ from agent_libos.llm.context_protocol import format_context_message
 from agent_libos.llm.context_memory import LLMContextMemory, context_object_name
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
+from agent_libos.llm.profiles import LLMProfileRegistry, ResolvedLLMProfile
 from agent_libos.llm.tool_protocol import tool_call_to_action
 
 __all__ = [
@@ -11,6 +12,8 @@ __all__ = [
     "LLMCompletion",
     "LLMError",
     "LLMProcessExecutor",
+    "LLMProfileRegistry",
+    "ResolvedLLMProfile",
     "build_system_prompt",
     "build_user_prompt",
     "format_context_message",

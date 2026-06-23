@@ -181,6 +181,20 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_image_package_preserves_llm_profile_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', llm_profile='package-review')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                result = runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(image='package-agent:v0', goal='profile default')
+
+                assert result.image.llm_profile_id == 'package-review'
+                assert runtime.get_image('package-agent:v0').llm_profile_id == 'package-review'
+                assert runtime.process.get(pid).llm_profile_id == 'package-review'
+            finally:
+                runtime.close()
+
     def test_image_package_without_workspace_grants_cannot_read_materialized_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', workspace_grants=False)
@@ -484,6 +498,7 @@ def _write_image_package(
     jit_name: str = 'package_count',
     prompt_mode: str | None = None,
     jit_tool_exposure: str | None = None,
+    llm_profile: str | None = None,
 ) -> Path:
     root.mkdir(parents=True)
     grants = """
@@ -495,12 +510,13 @@ def _write_image_package(
     jit_line = "\njit_tools: tools/jit-tools.json" if with_jit else ""
     prompt_mode_line = f"prompt_mode: {prompt_mode}\n" if prompt_mode else ""
     jit_tool_exposure_line = f"jit_tool_exposure: {jit_tool_exposure}\n" if jit_tool_exposure else ""
+    llm_profile_line = f"llm_profile: {llm_profile}\n" if llm_profile else ""
     root.joinpath('IMAGE.yaml').write_text(f"""
 image_id: package-agent:v0
 name: package-agent
 version: v0
 prompt: prompt.md
-{prompt_mode_line}{jit_tool_exposure_line}default_tools:
+{prompt_mode_line}{jit_tool_exposure_line}{llm_profile_line}default_tools:
   - human_output
   - read_memory_object
 context_policy: evidence_first

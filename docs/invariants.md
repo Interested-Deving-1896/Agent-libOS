@@ -23,7 +23,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `primitive-checks-before-effects`: primitives enforce capability, policy,
   approval, and validation before side effects.
 - `capability-matching-and-delegation`: typed matching, deny dominance,
-  one-shot grants, revocation, and delegation attenuation.
+  one-shot grants, revocation, grant-as-transfer, parent-linked delegation
+  attenuation, and ISO-normalized leases.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
@@ -66,6 +67,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `llm-call-records-are-bounded-and-redacted`: LLM call persistence stores
   bounded preview, size, hash, and truncation metadata instead of raw prompts,
   tool arguments, reasoning, or provider responses.
+- `llm-profile-selection-is-process-local`: host-selected LLM profiles are
+  stored as process-local ids, resolved at LLM-call time, inherited by child
+  processes, preserved by image-package defaults, isolated from non-default
+  ambient provider environment, and fail closed when the id is unknown.
 - `resource-budgets-are-hierarchical`: resource usage is charged to the acting
   process and its parent chain, and visibility/capability mechanisms cannot
   mint additional budget.

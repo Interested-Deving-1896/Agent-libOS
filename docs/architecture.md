@@ -101,8 +101,9 @@ but v1 does not apply external compensation.
 - `SimpleScheduler` runs runnable processes and wakes waiting work.
 - `CheckpointManager` snapshots and restores reconstructable process-subtree
   state; checkpoint-derived image commit reuses that internal snapshot boundary.
-- `LLMProcessExecutor` materializes prompt context, calls the LLM client, and
-  dispatches selected tool calls.
+- `LLMProcessExecutor` materializes prompt context, resolves the process
+  `llm_profile_id` through the host profile registry, calls that LLM client,
+  and dispatches selected tool calls.
 
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.

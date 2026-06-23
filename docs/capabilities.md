@@ -140,12 +140,18 @@ approval context, audit, and external-effect metadata where applicable.
 
 All authority mutation goes through explicit operations:
 
-- `issue(actor, subject, spec)`: `actor` must be trusted, or hold covering
-  `grant` or `admin` authority for the target resource.
+- `issue(actor, subject, spec)`: `actor` must be trusted, hold covering
+  `admin` authority, or hold both covering `grant` authority and covering
+  `allow` capabilities for every right being transferred. `grant` is not a
+  capability-minting right: it can only transfer rights the actor already has,
+  cannot create `deny`/`ask` policy records, and cannot transfer finite-use
+  capabilities onward.
 - `delegate(parent, child, spec)`: `parent` must hold a covering delegable
   `allow` capability. Delegation can only attenuate resource, rights, expiry,
-  use count, constraints, and delegation depth. Child records cannot drop parent
-  constraints such as `shell_policy_level`.
+  constraints, and delegation depth. Finite-use capabilities are consumed by
+  direct use and cannot be delegated. Delegated records keep a parent link, so a
+  later parent revocation or expiry stops the child record from authorizing.
+  Child records cannot drop parent constraints such as `shell_policy_level`.
 - `revoke(actor, cap_id)`: allowed for trusted issuers, the original issuer,
   the holder relinquishing its own capability, or an actor with covering
   `revoke`/`admin` authority.

@@ -42,7 +42,8 @@ class LLMProcessExecutor:
     def __init__(self, runtime: "Runtime", client: LLMClient | None = None, config: AgentLibOSConfig | None = None):
         self.runtime = runtime
         self.config = config or DEFAULT_CONFIG
-        self.client = client or LLMClient.from_env(config=self.config)
+        if client is not None:
+            self.runtime.llms.set_test_client(self.config.llm.default_profile_id, client)
         # Pending actions are held outside Object Memory because the process has
         # not received a tool result yet. The action is retried after the human
         # queue records a decision, without asking the model for a new action.
@@ -51,6 +52,15 @@ class LLMProcessExecutor:
         self._pending_message_actions: dict[str, dict[str, Any]] = {}
         self.context_memory = LLMContextMemory(runtime)
         self._load_pending_actions()
+
+    @property
+    def client(self) -> Any:
+        """Compatibility view of the default LLM profile client."""
+        return self.runtime.llms.default_client
+
+    @client.setter
+    def client(self, value: Any) -> None:
+        self.runtime.llms.set_test_client(self.config.llm.default_profile_id, value)
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -696,16 +706,31 @@ class LLMProcessExecutor:
         call_id = new_id("llmcall")
         process = self.runtime.process.get(pid)
         created_at = utc_now()
+        profile_id = process.llm_profile_id if process is not None else self.config.llm.default_profile_id
         request_options = {
             "attempt": attempt,
             "max_attempts": max_attempts,
             "purpose": "action_selection",
-            "client_class": type(self.client).__name__,
-            "real_llm_client": isinstance(self.client, LLMClient),
+            "llm_profile_id": profile_id,
         }
         self._preflight_llm_call(pid)
         try:
-            completion = await self._complete_action(messages, tools)
+            resolved = self.runtime.llms.resolve(profile_id)
+            client = resolved.client
+            request_options.update(
+                {
+                    "llm_profile_id": resolved.profile_id,
+                    "client_class": type(client).__name__,
+                    "real_llm_client": isinstance(client, LLMClient),
+                }
+            )
+            completion = await self._complete_action(
+                client,
+                messages,
+                tools,
+                temperature=resolved.temperature,
+                max_tokens=resolved.max_tokens,
+            )
         except Exception as exc:
             self._charge_llm_attempt(pid, source="llm.error", context={"error_type": type(exc).__name__})
             self.runtime.store.insert_llm_call(
@@ -838,20 +863,28 @@ class LLMProcessExecutor:
                 continue
         return 0
 
-    async def _complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
-        kwargs = {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens}
-        if hasattr(self.client, "acomplete_action"):
+    async def _complete_action(
+        self,
+        client: Any,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Any:
+        kwargs = {"temperature": temperature, "max_tokens": max_tokens}
+        if hasattr(client, "acomplete_action"):
             result = (
-                self.client.acomplete_action(messages, tools, **kwargs)
-                if isinstance(self.client, LLMClient)
-                else self.client.acomplete_action(messages, tools)
+                client.acomplete_action(messages, tools, **kwargs)
+                if isinstance(client, LLMClient)
+                else client.acomplete_action(messages, tools)
             )
             if inspect.isawaitable(result):
                 return await result
             return result
-        if isinstance(self.client, LLMClient):
-            return await asyncio.to_thread(self.client.complete_action, messages, tools, **kwargs)
-        return await asyncio.to_thread(self.client.complete_action, messages, tools)
+        if isinstance(client, LLMClient):
+            return await asyncio.to_thread(client.complete_action, messages, tools, **kwargs)
+        return await asyncio.to_thread(client.complete_action, messages, tools)
 
     def dispatch(
         self,

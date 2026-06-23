@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from pydantic import ValidationError as PydanticValidationError
 
-from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, LLMDefaults, RuntimeDefaults
+from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, LLMDefaults, LLMProfile, RuntimeDefaults
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
 from agent_libos.models import CapabilityRight, ProcessStatus
@@ -13,6 +13,22 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore
 
 class TestConfigDefaults:
+
+    def test_llm_profiles_validate_default_profile_reference(self) -> None:
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                default_profile_id="coding",
+                profiles={
+                    "default": LLMProfile(),
+                    "coding": LLMProfile(model="coding-model", temperature=0.0, max_tokens=256),
+                },
+            )
+        )
+        assert config.llm.default_profile_id == "coding"
+        assert config.llm.profiles["coding"].model == "coding-model"
+
+        with pytest.raises(ValueError, match="default_profile_id"):
+            AgentLibOSConfig(llm=LLMDefaults(default_profile_id="missing", profiles={"default": LLMProfile()}))
 
     def test_runtime_default_run_until_idle_is_unbounded(self) -> None:
         runtime = Runtime(SQLiteStore(':memory:'), llm_client=ScriptedActionClient())

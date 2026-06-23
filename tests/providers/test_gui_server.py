@@ -76,9 +76,14 @@ class TestGuiServer:
         assert health['ok']
         assert not health['scheduler']['auto_run']
         assert health['scheduler']['default_max_quanta'] is None
-        status, spawned = self.request('POST', '/api/processes', {'goal': 'inspect README', 'auto_run': False})
+        status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'inspect README', 'auto_run': False, 'llm_profile': 'gui-spawn'},
+        )
         assert status == 200
         pid = spawned['pid']
+        assert spawned['process']['llm_profile_id'] == 'gui-spawn'
         status, message = self.request('POST', f'/api/processes/{pid}/message', {'body': 'hello', 'auto_run': False})
         assert status == 200
         assert message['message']['body'] == 'hello'
@@ -88,6 +93,7 @@ class TestGuiServer:
         status, snapshot = self.request('GET', '/api/snapshot')
         assert status == 200
         assert len(snapshot['processes']) == 1
+        assert snapshot['processes'][0]['llm_profile_id'] == 'gui-spawn'
         assert snapshot['processes'][0]['unread_message_count'] >= 2
         assert 'tools' in snapshot
         assert 'images' in snapshot
@@ -175,15 +181,31 @@ class TestGuiServer:
     def test_high_risk_exec_requires_confirmation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'goal', 'auto_run': False})
         pid = spawned['pid']
-        status, denied = self.request('POST', f'/api/processes/{pid}/exec', {'image': 'base-agent:v0', 'goal': 'new'})
+        status, denied = self.request(
+            'POST',
+            f'/api/processes/{pid}/exec',
+            {'image': 'base-agent:v0', 'goal': 'new', 'llm_profile': 'gui-exec'},
+        )
         assert status == 409
         assert denied['error']['confirmation_required']
+        assert denied['error']['preview']['llm_profile'] == 'gui-exec'
         status, string_confirmed = self.request('POST', f'/api/processes/{pid}/exec', {'image': 'base-agent:v0', 'goal': 'new', 'confirmed': 'true'})
         assert status == 409
         assert string_confirmed['error']['confirmation_required']
-        status, allowed = self.request('POST', f'/api/processes/{pid}/exec', {'image': 'base-agent:v0', 'goal': 'new', 'confirmed': True, 'auto_run': False})
+        status, allowed = self.request(
+            'POST',
+            f'/api/processes/{pid}/exec',
+            {
+                'image': 'base-agent:v0',
+                'goal': 'new',
+                'confirmed': True,
+                'auto_run': False,
+                'llm_profile': 'gui-exec',
+            },
+        )
         assert status == 200
         assert allowed['process']['image_id'] == 'base-agent:v0'
+        assert allowed['process']['llm_profile_id'] == 'gui-exec'
 
     def test_high_risk_image_commit_requires_confirmation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'commit source', 'auto_run': False})

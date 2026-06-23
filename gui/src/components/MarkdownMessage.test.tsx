@@ -133,6 +133,7 @@ function userPageSnapshot(): RuntimeSnapshot {
         pid: "pid_1",
         parent_pid: null,
         image_id: "coding-agent:v0",
+        llm_profile_id: "default",
         status: "runnable",
         goal_oid: null,
         checkpoint_head: null,

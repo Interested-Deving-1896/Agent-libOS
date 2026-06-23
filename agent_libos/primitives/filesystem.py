@@ -150,44 +150,39 @@ class FilesystemAdapter:
             context=effect_context,
         )
         require_external_effect_classifier(self.provider, "read_bytes")
-        attempted = False
-        try:
-            attempted = True
-            raw = self._provider_read_bytes(target, max_bytes=read_limit)
-            truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
-            selected = raw[:max_bytes]
-            content = self._decode_text_prefix(selected, encoding, truncated=truncated)
-            event = self.events.emit(
-                EventType.EXTERNAL_READ,
-                source=pid,
-                target=resource,
-                payload={"adapter": "filesystem", "path": relative, "bytes_read": len(selected), "truncated": truncated},
-            )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.read_text",
-                target=resource,
-                decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="read_bytes",
-                target=resource,
-                context=effect_context,
-                result={"bytes_read": len(selected), "truncated": truncated},
-                event=event,
-                audit_record=audit_record,
-            )
-            self._charge_resource_usage(
-                pid,
-                ResourceUsage(external_read_bytes=len(raw)),
-                source="primitive.filesystem.read_text",
-                context=effect_context,
-            )
-            return FileReadResult(path=relative, content=content, bytes_read=len(selected), truncated=truncated)
-        finally:
-            if attempted:
-                self._consume_one_time_decision(decision, used_by="filesystem")
+        self._consume_one_time_decision(decision, used_by="filesystem")
+        raw = self._provider_read_bytes(target, max_bytes=read_limit)
+        truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
+        selected = raw[:max_bytes]
+        content = self._decode_text_prefix(selected, encoding, truncated=truncated)
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=resource,
+            payload={"adapter": "filesystem", "path": relative, "bytes_read": len(selected), "truncated": truncated},
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.read_text",
+            target=resource,
+            decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="read_bytes",
+            target=resource,
+            context=effect_context,
+            result={"bytes_read": len(selected), "truncated": truncated},
+            event=event,
+            audit_record=audit_record,
+        )
+        self._charge_resource_usage(
+            pid,
+            ResourceUsage(external_read_bytes=len(raw)),
+            source="primitive.filesystem.read_text",
+            context=effect_context,
+        )
+        return FileReadResult(path=relative, content=content, bytes_read=len(selected), truncated=truncated)
 
     def read_bytes(
         self,
@@ -231,49 +226,44 @@ class FilesystemAdapter:
             context=effect_context,
         )
         require_external_effect_classifier(self.provider, "read_bytes")
-        attempted = False
-        try:
-            attempted = True
-            raw = self._provider_read_bytes(target, max_bytes=read_limit)
-            truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
-            selected = raw[:max_bytes]
-            event = self.events.emit(
-                EventType.EXTERNAL_READ,
-                source=pid,
-                target=resource,
-                payload={
-                    "adapter": "filesystem",
-                    "operation": "read_bytes",
-                    "path": relative,
-                    "bytes_read": len(selected),
-                    "truncated": truncated,
-                },
-            )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.read_bytes",
-                target=resource,
-                decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="read_bytes",
-                target=resource,
-                context=effect_context,
-                result={"bytes_read": len(selected), "truncated": truncated},
-                event=event,
-                audit_record=audit_record,
-            )
-            self._charge_resource_usage(
-                pid,
-                ResourceUsage(external_read_bytes=len(raw)),
-                source="primitive.filesystem.read_bytes",
-                context=effect_context,
-            )
-            return FileBytesReadResult(path=relative, content=selected, bytes_read=len(selected), truncated=truncated)
-        finally:
-            if attempted:
-                self._consume_one_time_decision(decision, used_by="filesystem")
+        self._consume_one_time_decision(decision, used_by="filesystem")
+        raw = self._provider_read_bytes(target, max_bytes=read_limit)
+        truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
+        selected = raw[:max_bytes]
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=resource,
+            payload={
+                "adapter": "filesystem",
+                "operation": "read_bytes",
+                "path": relative,
+                "bytes_read": len(selected),
+                "truncated": truncated,
+            },
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.read_bytes",
+            target=resource,
+            decision={"path": relative, "bytes_read": len(selected), "truncated": truncated},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="read_bytes",
+            target=resource,
+            context=effect_context,
+            result={"bytes_read": len(selected), "truncated": truncated},
+            event=event,
+            audit_record=audit_record,
+        )
+        self._charge_resource_usage(
+            pid,
+            ResourceUsage(external_read_bytes=len(raw)),
+            source="primitive.filesystem.read_bytes",
+            context=effect_context,
+        )
+        return FileBytesReadResult(path=relative, content=selected, bytes_read=len(selected), truncated=truncated)
 
     def write_text(
         self,
@@ -321,57 +311,55 @@ class FilesystemAdapter:
             source="primitive.filesystem.write_text",
             context={"path": relative, "resource": resource, "encoding": encoding, "overwrite": overwrite},
         )
-        try:
-            target_state = self.provider.state(target)
-            created = not target_state.exists
-            if target_state.exists and target_state.kind != "file":
-                raise CapabilityDenied(f"path is not a file: {relative}")
-            if target_state.exists and not overwrite:
-                raise FileExistsError(f"file already exists: {relative}")
-            effect_context = {
-                "path": relative,
-                "resource": resource,
-                "encoding": encoding,
-                "overwrite": overwrite,
-                "created": created,
-            }
-            require_external_effect_classifier(self.provider, "write_text")
-            self.provider.write_text(target, text, encoding=encoding, newline="\n")
-            bytes_written = bytes_to_write
-            event = self.events.emit(
-                EventType.EXTERNAL_WRITE,
-                source=pid,
-                target=resource,
-                payload={"adapter": "filesystem", "path": relative, "bytes_written": bytes_written, "created": created},
+        if consume_capability_id is not None:
+            self.capabilities.consume_use(
+                consume_capability_id,
+                used_by="filesystem",
+                reason="one-time filesystem write permission consumed",
             )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.write_text",
-                target=resource,
-                decision={"path": relative, "bytes_written": bytes_written, "created": created},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="write_text",
-                target=resource,
-                context=effect_context,
-                result={"bytes_written": bytes_written, "created": created},
-                event=event,
-                audit_record=audit_record,
-            )
-            self._charge_resource_usage(
-                pid,
-                ResourceUsage(external_write_bytes=bytes_written),
-                source="primitive.filesystem.write_text",
-                context=effect_context,
-            )
-        finally:
-            if consume_capability_id is not None:
-                self.capabilities.consume_use(
-                    consume_capability_id,
-                    used_by="filesystem",
-                    reason="one-time filesystem write permission consumed",
-                )
+        target_state = self.provider.state(target)
+        created = not target_state.exists
+        if target_state.exists and target_state.kind != "file":
+            raise CapabilityDenied(f"path is not a file: {relative}")
+        if target_state.exists and not overwrite:
+            raise FileExistsError(f"file already exists: {relative}")
+        effect_context = {
+            "path": relative,
+            "resource": resource,
+            "encoding": encoding,
+            "overwrite": overwrite,
+            "created": created,
+        }
+        require_external_effect_classifier(self.provider, "write_text")
+        self.provider.write_text(target, text, encoding=encoding, newline="\n")
+        bytes_written = bytes_to_write
+        event = self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source=pid,
+            target=resource,
+            payload={"adapter": "filesystem", "path": relative, "bytes_written": bytes_written, "created": created},
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.write_text",
+            target=resource,
+            decision={"path": relative, "bytes_written": bytes_written, "created": created},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="write_text",
+            target=resource,
+            context=effect_context,
+            result={"bytes_written": bytes_written, "created": created},
+            event=event,
+            audit_record=audit_record,
+        )
+        self._charge_resource_usage(
+            pid,
+            ResourceUsage(external_write_bytes=bytes_written),
+            source="primitive.filesystem.write_text",
+            context=effect_context,
+        )
         return FileWriteResult(path=relative, bytes_written=bytes_written, created=created)
 
     def read_directory(
@@ -409,51 +397,46 @@ class FilesystemAdapter:
             raise CapabilityDenied(f"path is not a directory: {relative}")
         effect_context = {"path": relative, "resource": resource, "limit": limit}
         require_external_effect_classifier(self.provider, "list_directory")
-        attempted = False
-        try:
-            attempted = True
-            children = list(self.provider.list_directory(target, limit=limit + 1))
-            selected = children[:limit]
-            entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
-            truncated = len(children) > len(selected)
-            metadata_bytes = self._directory_metadata_bytes(children)
-            event = self.events.emit(
-                EventType.EXTERNAL_READ,
-                source=pid,
-                target=resource,
-                payload={
-                    "adapter": "filesystem",
-                    "operation": "read_directory",
-                    "path": relative,
-                    "count": len(entries),
-                    "truncated": truncated,
-                },
-            )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.read_directory",
-                target=resource,
-                decision={"path": relative, "count": len(entries), "truncated": truncated},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="list_directory",
-                target=resource,
-                context=effect_context,
-                result={"count": len(entries), "truncated": truncated},
-                event=event,
-                audit_record=audit_record,
-            )
-            self._charge_resource_usage(
-                pid,
-                ResourceUsage(external_read_bytes=metadata_bytes),
-                source="primitive.filesystem.read_directory",
-                context={**effect_context, "metadata_bytes": metadata_bytes, "listed_entries": len(children)},
-            )
-            return DirectoryReadResult(path=relative, entries=entries, count=len(entries), truncated=truncated)
-        finally:
-            if attempted:
-                self._consume_one_time_decision(decision, used_by="filesystem")
+        self._consume_one_time_decision(decision, used_by="filesystem")
+        children = list(self.provider.list_directory(target, limit=limit + 1))
+        selected = children[:limit]
+        entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
+        truncated = len(children) > len(selected)
+        metadata_bytes = self._directory_metadata_bytes(children)
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=resource,
+            payload={
+                "adapter": "filesystem",
+                "operation": "read_directory",
+                "path": relative,
+                "count": len(entries),
+                "truncated": truncated,
+            },
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.read_directory",
+            target=resource,
+            decision={"path": relative, "count": len(entries), "truncated": truncated},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="list_directory",
+            target=resource,
+            context=effect_context,
+            result={"count": len(entries), "truncated": truncated},
+            event=event,
+            audit_record=audit_record,
+        )
+        self._charge_resource_usage(
+            pid,
+            ResourceUsage(external_read_bytes=metadata_bytes),
+            source="primitive.filesystem.read_directory",
+            context={**effect_context, "metadata_bytes": metadata_bytes, "listed_entries": len(children)},
+        )
+        return DirectoryReadResult(path=relative, entries=entries, count=len(entries), truncated=truncated)
 
     def write_directory(
         self,
@@ -494,50 +477,48 @@ class FilesystemAdapter:
             question=f"Allow this process to create or update directory {relative}?",
             extra_context={"parents": parents, "exist_ok": exist_ok},
         )
-        try:
-            target_state = self.provider.state(target)
-            created = not target_state.exists
-            if target_state.exists and target_state.kind != "directory":
-                raise CapabilityDenied(f"path is not a directory: {relative}")
-            if target_state.exists and not exist_ok:
-                raise FileExistsError(f"directory already exists: {relative}")
-            effect_context = {
-                "path": relative,
-                "resource": resource,
-                "parents": parents,
-                "exist_ok": exist_ok,
-                "created": created,
-            }
-            require_external_effect_classifier(self.provider, "make_directory")
-            self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
-            event = self.events.emit(
-                EventType.EXTERNAL_WRITE,
-                source=pid,
-                target=resource,
-                payload={"adapter": "filesystem", "operation": "write_directory", "path": relative, "created": created},
+        if consume_capability_id is not None:
+            self.capabilities.consume_use(
+                consume_capability_id,
+                used_by="filesystem",
+                reason="one-time filesystem write permission consumed",
             )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.write_directory",
-                target=resource,
-                decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="make_directory",
-                target=resource,
-                context=effect_context,
-                result={"created": created},
-                event=event,
-                audit_record=audit_record,
-            )
-        finally:
-            if consume_capability_id is not None:
-                self.capabilities.consume_use(
-                    consume_capability_id,
-                    used_by="filesystem",
-                    reason="one-time filesystem write permission consumed",
-                )
+        target_state = self.provider.state(target)
+        created = not target_state.exists
+        if target_state.exists and target_state.kind != "directory":
+            raise CapabilityDenied(f"path is not a directory: {relative}")
+        if target_state.exists and not exist_ok:
+            raise FileExistsError(f"directory already exists: {relative}")
+        effect_context = {
+            "path": relative,
+            "resource": resource,
+            "parents": parents,
+            "exist_ok": exist_ok,
+            "created": created,
+        }
+        require_external_effect_classifier(self.provider, "make_directory")
+        self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
+        event = self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source=pid,
+            target=resource,
+            payload={"adapter": "filesystem", "operation": "write_directory", "path": relative, "created": created},
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.write_directory",
+            target=resource,
+            decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="make_directory",
+            target=resource,
+            context=effect_context,
+            result={"created": created},
+            event=event,
+            audit_record=audit_record,
+        )
         return DirectoryWriteResult(path=relative, created=created)
 
     def delete_file(
@@ -577,46 +558,44 @@ class FilesystemAdapter:
             recursive=False,
             missing_ok=missing_ok,
         )
-        try:
-            target_state = self.provider.state(target)
-            if not target_state.exists:
-                if not missing_ok:
-                    raise NotFound(f"file does not exist: {relative}")
-                return DeleteResult(path=relative, kind="missing", deleted=False)
-            if target_state.kind != "file":
-                raise CapabilityDenied(f"path is not a file: {relative}")
-            effect_context = {"path": relative, "resource": resource, "missing_ok": missing_ok}
-            require_external_effect_classifier(self.provider, "delete_file")
-            self.provider.delete_file(target)
-            event = self.events.emit(
-                EventType.EXTERNAL_WRITE,
-                source=pid,
-                target=resource,
-                payload={"adapter": "filesystem", "operation": "delete_file", "path": relative},
+        if consume_capability_id is not None:
+            self.capabilities.consume_use(
+                consume_capability_id,
+                used_by="filesystem",
+                reason="one-time filesystem delete permission consumed",
             )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.delete_file",
-                target=resource,
-                decision={"path": relative, "deleted": True},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="delete_file",
-                target=resource,
-                context=effect_context,
-                result={"deleted": True},
-                event=event,
-                audit_record=audit_record,
-            )
-            return DeleteResult(path=relative, kind="file", deleted=True)
-        finally:
-            if consume_capability_id is not None:
-                self.capabilities.consume_use(
-                    consume_capability_id,
-                    used_by="filesystem",
-                    reason="one-time filesystem delete permission consumed",
-                )
+        target_state = self.provider.state(target)
+        if not target_state.exists:
+            if not missing_ok:
+                raise NotFound(f"file does not exist: {relative}")
+            return DeleteResult(path=relative, kind="missing", deleted=False)
+        if target_state.kind != "file":
+            raise CapabilityDenied(f"path is not a file: {relative}")
+        effect_context = {"path": relative, "resource": resource, "missing_ok": missing_ok}
+        require_external_effect_classifier(self.provider, "delete_file")
+        self.provider.delete_file(target)
+        event = self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source=pid,
+            target=resource,
+            payload={"adapter": "filesystem", "operation": "delete_file", "path": relative},
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.delete_file",
+            target=resource,
+            decision={"path": relative, "deleted": True},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="delete_file",
+            target=resource,
+            context=effect_context,
+            result={"deleted": True},
+            event=event,
+            audit_record=audit_record,
+        )
+        return DeleteResult(path=relative, kind="file", deleted=True)
 
     def delete_directory(
         self,
@@ -658,56 +637,54 @@ class FilesystemAdapter:
             recursive=recursive,
             missing_ok=missing_ok,
         )
-        try:
-            target_state = self.provider.state(target)
-            if not target_state.exists:
-                if not missing_ok:
-                    raise NotFound(f"directory does not exist: {relative}")
-                return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
-            if target_state.kind != "directory":
-                raise CapabilityDenied(f"path is not a directory: {relative}")
-            effect_context = {
+        if consume_capability_id is not None:
+            self.capabilities.consume_use(
+                consume_capability_id,
+                used_by="filesystem",
+                reason="one-time filesystem delete permission consumed",
+            )
+        target_state = self.provider.state(target)
+        if not target_state.exists:
+            if not missing_ok:
+                raise NotFound(f"directory does not exist: {relative}")
+            return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
+        if target_state.kind != "directory":
+            raise CapabilityDenied(f"path is not a directory: {relative}")
+        effect_context = {
+            "path": relative,
+            "resource": resource,
+            "recursive": recursive,
+            "missing_ok": missing_ok,
+        }
+        require_external_effect_classifier(self.provider, "delete_directory")
+        self.provider.delete_directory(target, recursive=recursive)
+        event = self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source=pid,
+            target=resource,
+            payload={
+                "adapter": "filesystem",
+                "operation": "delete_directory",
                 "path": relative,
-                "resource": resource,
                 "recursive": recursive,
-                "missing_ok": missing_ok,
-            }
-            require_external_effect_classifier(self.provider, "delete_directory")
-            self.provider.delete_directory(target, recursive=recursive)
-            event = self.events.emit(
-                EventType.EXTERNAL_WRITE,
-                source=pid,
-                target=resource,
-                payload={
-                    "adapter": "filesystem",
-                    "operation": "delete_directory",
-                    "path": relative,
-                    "recursive": recursive,
-                },
-            )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.filesystem.delete_directory",
-                target=resource,
-                decision={"path": relative, "deleted": True, "recursive": recursive},
-            )
-            self._record_external_effect(
-                pid=pid,
-                operation="delete_directory",
-                target=resource,
-                context=effect_context,
-                result={"deleted": True, "recursive": recursive},
-                event=event,
-                audit_record=audit_record,
-            )
-            return DeleteResult(path=relative, kind="directory", deleted=True, recursive=recursive)
-        finally:
-            if consume_capability_id is not None:
-                self.capabilities.consume_use(
-                    consume_capability_id,
-                    used_by="filesystem",
-                    reason="one-time filesystem delete permission consumed",
-                )
+            },
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action="primitive.filesystem.delete_directory",
+            target=resource,
+            decision={"path": relative, "deleted": True, "recursive": recursive},
+        )
+        self._record_external_effect(
+            pid=pid,
+            operation="delete_directory",
+            target=resource,
+            context=effect_context,
+            result={"deleted": True, "recursive": recursive},
+            event=event,
+            audit_record=audit_record,
+        )
+        return DeleteResult(path=relative, kind="directory", deleted=True, recursive=recursive)
 
     def grant_workspace(
         self,
@@ -899,10 +876,8 @@ class FilesystemAdapter:
         return len(json.dumps(payload, ensure_ascii=True, default=str).encode("utf-8"))
 
     def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
-        if decision.consume_capability_id is None:
-            return
-        self.capabilities.consume_use(
-            decision.consume_capability_id,
+        self.capabilities.claim_decision_use(
+            decision,
             used_by=used_by,
             reason="one-time filesystem permission consumed",
         )

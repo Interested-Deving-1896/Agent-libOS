@@ -155,6 +155,7 @@ class AgentImage:
     default_tools: list[str] = field(default_factory=list)
     context_policy: str = "plan_first"
     safety_profile: str = "default"
+    llm_profile_id: str | None = None
     required_capabilities: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     signature: str | None = None
@@ -180,6 +181,7 @@ class AgentProcess:
     updated_at: str
     working_directory: str = "."
     status_message: str | None = None
+    llm_profile_id: str = field(default_factory=lambda: DEFAULT_CONFIG.llm.default_profile_id)
 
 
 @dataclass

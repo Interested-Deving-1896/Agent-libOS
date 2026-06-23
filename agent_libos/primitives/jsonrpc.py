@@ -243,58 +243,53 @@ class JsonRpcPrimitive:
         require_external_effect_classifier(self.provider, "call")
         preflight_classification = classify_external_effect(self.provider, "call", effect_context, {"preflight": True})
         self._validate_runtime_resolution(spec)
-        attempted = False
+        self.capabilities.claim_decision_use(
+            decision,
+            used_by="jsonrpc",
+            reason="one-time JSON-RPC method permission consumed",
+        )
+        started = time.monotonic()
         try:
-            attempted = True
-            started = time.monotonic()
-            try:
-                transport = self.provider.call(
-                    spec,
-                    method,
-                    request_body,
-                    timeout_s=spec.timeout_s,
-                    max_response_bytes=spec.max_response_bytes,
-                )
-            except Exception as exc:
-                transport = JsonRpcTransportResult(
-                    status_code=None,
-                    body=b"",
-                    elapsed_s=time.monotonic() - started,
-                    response_bytes=0,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            result = self._call_result_from_transport(spec, method, request_id, transport)
-            event = self._emit_call_event(pid, resource, result, method)
-            audit_record = self._record_call_audit(pid, resource, result, method, operation_context)
-            self._record_external_effect(
-                pid,
-                resource,
-                effect_context,
-                result,
-                event,
-                audit_record,
-                preflight_classification=preflight_classification,
+            transport = self.provider.call(
+                spec,
+                method,
+                request_body,
+                timeout_s=spec.timeout_s,
+                max_response_bytes=spec.max_response_bytes,
             )
-            self._charge_resource_usage(
-                pid,
-                ResourceUsage(jsonrpc_request_bytes=len(request_body), jsonrpc_response_bytes=result.response_bytes),
-                source="primitive.jsonrpc.call",
-                context={
-                    "endpoint_id": endpoint_id,
-                    "method_id": method_id,
-                    "request_bytes": len(request_body),
-                    "response_bytes": result.response_bytes,
-                    "status": result.status.value,
-                },
+        except Exception as exc:
+            transport = JsonRpcTransportResult(
+                status_code=None,
+                body=b"",
+                elapsed_s=time.monotonic() - started,
+                response_bytes=0,
+                error=f"{type(exc).__name__}: {exc}",
             )
-            return result
-        finally:
-            if attempted and decision.consume_capability_id is not None:
-                self.capabilities.consume_use(
-                    decision.consume_capability_id,
-                    used_by="jsonrpc",
-                    reason="one-time JSON-RPC method permission consumed",
-                )
+        result = self._call_result_from_transport(spec, method, request_id, transport)
+        event = self._emit_call_event(pid, resource, result, method)
+        audit_record = self._record_call_audit(pid, resource, result, method, operation_context)
+        self._record_external_effect(
+            pid,
+            resource,
+            effect_context,
+            result,
+            event,
+            audit_record,
+            preflight_classification=preflight_classification,
+        )
+        self._charge_resource_usage(
+            pid,
+            ResourceUsage(jsonrpc_request_bytes=len(request_body), jsonrpc_response_bytes=result.response_bytes),
+            source="primitive.jsonrpc.call",
+            context={
+                "endpoint_id": endpoint_id,
+                "method_id": method_id,
+                "request_bytes": len(request_body),
+                "response_bytes": result.response_bytes,
+                "status": result.status.value,
+            },
+        )
+        return result
 
     async def acall(self, pid: str, endpoint_id: str, method_id: str, params: Any = None) -> JsonRpcCallResult:
         return await asyncio.to_thread(self.call, pid, endpoint_id, method_id, params)
