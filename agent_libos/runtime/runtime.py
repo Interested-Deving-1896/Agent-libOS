@@ -356,7 +356,13 @@ class Runtime:
             ("substrate", self.substrate),
         ]:
             try:
-                self._shutdown_component(component)
+                if not self._shutdown_component(component):
+                    return {
+                        "ok": False,
+                        "already_shutdown": False,
+                        "reason": reason,
+                        f"{name}_stopped": False,
+                    }
             except Exception as exc:
                 errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
         self._closed = True
@@ -397,7 +403,13 @@ class Runtime:
             ("substrate", self.substrate),
         ]:
             try:
-                await self._ashutdown_component(component)
+                if not await self._ashutdown_component(component):
+                    return {
+                        "ok": False,
+                        "already_shutdown": False,
+                        "reason": reason,
+                        f"{name}_stopped": False,
+                    }
             except Exception as exc:
                 errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
         self._closed = True
@@ -410,39 +422,39 @@ class Runtime:
         """Compatibility alias for shutdown(); prefer Runtime.shutdown()."""
         self.shutdown(actor="runtime.close", reason="runtime.close")
 
-    def _shutdown_component(self, component: Any) -> None:
+    def _shutdown_component(self, component: Any) -> bool:
         if component is None:
-            return
+            return True
         shutdown = getattr(component, "shutdown", None)
         if callable(shutdown):
-            shutdown()
-            return
+            return shutdown() is not False
         close = getattr(component, "close", None)
         if callable(close):
             close()
+        return True
 
-    async def _ashutdown_component(self, component: Any) -> None:
+    async def _ashutdown_component(self, component: Any) -> bool:
         if component is None:
-            return
+            return True
         ashutdown = getattr(component, "ashutdown", None)
         if callable(ashutdown):
             result = ashutdown()
             if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
-                await result
-            return
+                result = await result
+            return result is not False
         aclose = getattr(component, "aclose", None)
         if callable(aclose):
             result = aclose()
             if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
                 await result
-            return
+            return True
         shutdown = getattr(component, "shutdown", None)
         if callable(shutdown):
-            shutdown()
-            return
+            return shutdown() is not False
         close = getattr(component, "close", None)
         if callable(close):
             close()
+        return True
 
     def run_process_once(self, pid: str) -> dict[str, Any]:
         return self.llm.run_once(pid)

@@ -617,6 +617,49 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_runtime_shutdown_drains_object_task_wait_transition_before_store_close(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="shutdown object task wait")
+            owner = _owner(runtime, pid)
+            runtime.object_tasks.start(pid, owner, "receive_process_messages", {"channel": "never"})
+
+            result = runtime.shutdown(actor="test", reason="object-task-wait-drain")
+
+            assert result["ok"] is True
+        finally:
+            runtime.close()
+
+    def test_runtime_shutdown_keeps_store_open_when_object_task_executor_is_still_running(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            object_tasks=replace(DEFAULT_CONFIG.object_tasks, shutdown_join_timeout_s=0.01),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            handle = runtime.tools.register_tool(SlowSyncSideEffectTool(), registered_by="test", ephemeral=True)
+            pid = runtime.process.spawn(image="base-agent:v0", goal="shutdown slow object task")
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(pid, owner, "slow_sync_side_effect_for_object_task", {})
+            deadline = time.monotonic() + 1.0
+            while runtime.object_tasks.get(task.task_id, actor_pid=pid).status != ObjectTaskStatus.RUNNING:
+                if time.monotonic() >= deadline:
+                    pytest.fail("object task did not enter running state")
+                time.sleep(0.01)
+
+            result = runtime.shutdown(actor="test", reason="object-task-slow-drain")
+
+            assert result["ok"] is False
+            assert result["object_tasks_stopped"] is False
+            assert runtime.store.get_object_task(task.task_id) is not None
+
+            time.sleep(0.3)
+            retry = runtime.shutdown(actor="test", reason="object-task-slow-drain-retry")
+            assert retry["ok"] is True
+        finally:
+            runtime.close()
+
     def test_object_task_per_object_concurrency_limit_is_enforced(self) -> None:
         config = replace(
             DEFAULT_CONFIG,

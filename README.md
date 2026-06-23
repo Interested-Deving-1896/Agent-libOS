@@ -347,10 +347,10 @@ you want to validate and run real Deno/TypeScript JIT tools from another binary.
 Runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`, including
 scheduler quantum, worker, drain, and shutdown limits; process budgets; image
 ids; workspace namespace; tool limits; filesystem/Object Memory size limits;
-Deno sandbox limits; JSR import allowlists; shell policy lists; launcher
-presets; Skill defaults; and checkpoint defaults. `AgentLibOSConfig` is
-validated at construction time, so invalid or inverted bounds fail before a
-Runtime starts.
+Deno sandbox limits; ObjectTask notification and shutdown limits; JSR import
+allowlists; shell policy lists; launcher presets; Skill defaults; and
+checkpoint defaults. `AgentLibOSConfig` is validated at construction time, so
+invalid or inverted bounds fail before a Runtime starts.
 
 Add runtime dependencies with `uv add <package>` and development dependencies
 with `uv add --dev <package>`. Commit both `pyproject.toml` and `uv.lock` after

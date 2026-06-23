@@ -4,7 +4,7 @@ import asyncio
 import math
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from typing import Any, TYPE_CHECKING, Iterable
 
@@ -73,6 +73,10 @@ class ObjectTaskManager:
         self.config = config or DEFAULT_CONFIG
         self._lock = threading.RLock()
         self._loop = asyncio.new_event_loop()
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.config.object_tasks.max_running_global,
+            thread_name_prefix="agent-libos-object-task-tool",
+        )
         self._loop_ready = threading.Event()
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -82,6 +86,7 @@ class ObjectTaskManager:
         self._futures: dict[str, Future[Any]] = {}
         self._grant_result_to_notify: dict[str, bool] = {}
         self._pending_args: dict[str, dict[str, Any]] = {}
+        self._closing = False
         self._closed = False
         self._thread.start()
         self._loop_ready.wait(timeout=1.0)
@@ -380,26 +385,46 @@ class ObjectTaskManager:
                 notified.append(task.task_id)
         return notified
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         if self._closed:
-            return
-        self._closed = True
-        active = self.runtime.store.list_object_tasks(include_terminal=False)
+            return True
+        with self._lock:
+            first_shutdown_attempt = not self._closing
+            self._closing = True
+        if first_shutdown_attempt:
+            active = self.runtime.store.list_object_tasks(include_terminal=False)
+            for task in active:
+                latest = self.runtime.store.get_object_task(task.task_id)
+                if latest is not None and latest.status not in _TERMINAL_STATUSES:
+                    self._mark_cancelled(latest, actor="runtime.shutdown", reason="runtime shutdown")
+        self._drain_done_futures()
         with self._lock:
             futures = list(self._futures.values())
-        for future in futures:
-            future.cancel()
-        for task in active:
-            latest = self.runtime.store.get_object_task(task.task_id)
-            if latest is not None and latest.status not in _TERMINAL_STATUSES:
-                self._mark_cancelled(latest, actor="runtime.shutdown", reason="runtime shutdown")
-        for future in futures:
-            try:
-                future.result(timeout=self.config.object_tasks.shutdown_join_timeout_s)
-            except Exception:
-                pass
+        if futures:
+            wait(futures, timeout=self.config.object_tasks.shutdown_join_timeout_s)
+        self._drain_done_futures()
+        with self._lock:
+            unfinished = [future for future in self._futures.values() if not future.done()]
+        if unfinished:
+            self.runtime.audit.record(
+                actor="runtime.shutdown",
+                action="object_task.shutdown_deferred",
+                target="object_tasks",
+                decision={"unfinished": len(unfinished)},
+            )
+            return False
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=self.config.object_tasks.shutdown_join_timeout_s)
+        if self._thread.is_alive():
+            self.runtime.audit.record(
+                actor="runtime.shutdown",
+                action="object_task.shutdown_deferred",
+                target="object_tasks",
+                decision={"reason": "event loop thread did not stop"},
+            )
+            return False
+        self._closed = True
+        return True
 
     async def _run_task(self, task_id: str) -> None:
         task = self._get(task_id)
@@ -473,6 +498,7 @@ class ObjectTaskManager:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._loop.set_default_executor(self._executor)
         self._loop_ready.set()
         self._loop.run_forever()
         pending = asyncio.all_tasks(self._loop)
@@ -480,9 +506,14 @@ class ObjectTaskManager:
             task.cancel()
         if pending:
             self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        # Sync tools run via asyncio.to_thread(), so the object-task loop must
+        # drain its default executor before Runtime closes the shared store.
+        self._loop.run_until_complete(self._loop.shutdown_default_executor())
         self._loop.close()
 
     def _schedule_task_locked(self, task_id: str) -> Future[Any]:
+        if self._closing or self._closed:
+            raise RuntimeError("object task manager is shutting down")
         future = asyncio.run_coroutine_threadsafe(self._run_task(task_id), self._loop)
         self._futures[task_id] = future
         future.add_done_callback(lambda _future, task_id=task_id: self._forget_future(task_id))
@@ -1071,6 +1102,16 @@ class ObjectTaskManager:
                 return
             self._cleanup_task_state_locked(task_id)
 
+    def _drain_done_futures(self) -> None:
+        with self._lock:
+            task_ids = [
+                task_id
+                for task_id, future in self._futures.items()
+                if future.done()
+            ]
+        for task_id in task_ids:
+            self._forget_future(task_id)
+
     def _cleanup_task_state(self, task_id: str) -> None:
         with self._lock:
             self._cleanup_task_state_locked(task_id)
@@ -1080,5 +1121,5 @@ class ObjectTaskManager:
         self._pending_args.pop(task_id, None)
 
     def _ensure_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             raise RuntimeError("object task manager is shut down")

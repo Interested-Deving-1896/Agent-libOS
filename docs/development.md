@@ -167,6 +167,7 @@ Current default groups include:
 - tool limits and text encodings,
 - filesystem and Object Memory size limits,
 - Deno sandbox limits and JSR import allowlist,
+- ObjectTask notification, owner-watch, and shutdown limits,
 - shell policy allow/block lists,
 - JSON-RPC endpoint manifest, timeout, and request/response limits,
 - image registry limits,
