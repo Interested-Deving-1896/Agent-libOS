@@ -338,6 +338,8 @@ class TestShellPrimitive:
             with pytest.raises(ValidationError):
                 runtime.shell.run(pid, ['git', 'status', '--short'], timeout=0)
             with pytest.raises(ValidationError):
+                runtime.shell.run(pid, ['git', 'status', '--short'], timeout=float('nan'))
+            with pytest.raises(ValidationError):
                 runtime.shell.run(pid, ['git', 'status', '--short'], timeout=runtime.config.shell.timeout_hard_limit_s + 1)
         finally:
             runtime.close()

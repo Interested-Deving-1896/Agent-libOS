@@ -169,10 +169,13 @@ class TestResourceConstraints:
             finally:
                 runtime.close()
 
-    def test_directory_listing_metadata_is_charged_to_external_read_budget(self) -> None:
+    def test_directory_listing_preflights_metadata_budget_before_provider_read(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            provider = RecordingListFilesystemProvider(temp_dir)
+            substrate = LocalResourceProviderSubstrate(temp_dir)
+            substrate.filesystem = provider
             Path(temp_dir, "item.txt").write_text("content", encoding="utf-8")
-            runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime = Runtime.open("local", substrate=substrate)
             try:
                 pid = runtime.process.spawn(
                     image="base-agent:v0",
@@ -184,8 +187,9 @@ class TestResourceConstraints:
                 with pytest.raises(ResourceLimitExceeded):
                     runtime.filesystem.read_directory(pid, ".")
 
-                assert runtime.process.get(pid).status.value == "killed"
-                assert runtime.process.get(pid).resource_usage.external_read_bytes > 1
+                assert provider.list_calls == 0
+                assert runtime.process.get(pid).status.value == "runnable"
+                assert runtime.process.get(pid).resource_usage.external_read_bytes == 0
             finally:
                 runtime.close()
 
@@ -218,3 +222,13 @@ class RecordingLimitedFilesystemProvider(LocalFilesystemProvider):
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
         self.read_limits.append(max_bytes)
         return super().read_bytes(path, max_bytes=max_bytes)
+
+
+class RecordingListFilesystemProvider(LocalFilesystemProvider):
+    def __init__(self, root: str | Path):
+        super().__init__(root)
+        self.list_calls = 0
+
+    def list_directory(self, path: ResolvedPath, *, limit: int | None = None):
+        self.list_calls += 1
+        return super().list_directory(path, limit=limit)

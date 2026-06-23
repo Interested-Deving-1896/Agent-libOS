@@ -18,6 +18,7 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_primitive_enforces_read_limits_without_tool_schema",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_primitive_enforces_limit_without_tool_schema",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_shell_execute_before_human_prompt",
@@ -253,6 +254,7 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_refuses_to_cancel_running_sync_side_effect_tool",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_reconciles_external_runner_kill",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_list_limit_applies_after_visibility_filter",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_rejects_invalid_list_limit_and_wait_timeout",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_per_object_concurrency_limit_is_enforced",
         "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_object_task_start_outputs_json",
         "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_object_task_start_requires_wait",
@@ -360,6 +362,7 @@
       "title": "JSON-RPC calls require registered endpoint/method authority and classified provider effects.",
       "lane": "providers",
       "node_ids": [
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_manifest_validation_rejects_unsafe_endpoint_shapes",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_requires_method_capability_and_records_http_effect",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_rejects_dns_resolution_to_private_address_before_provider_attempt",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_jsonrpc_params_are_sanitized_in_audit_and_external_effects",
@@ -391,7 +394,7 @@
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_terminal_process_cannot_call_visible_tools_directly",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_waiting_process_cannot_be_advanced_by_direct_tool_call",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_filesystem_read_uses_provider_limited_read_and_charges_actual_bytes",
-        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_directory_listing_metadata_is_charged_to_external_read_budget",
+        "tests/security/test_resource_constraints.py::TestResourceConstraints::test_directory_listing_preflights_metadata_budget_before_provider_read",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_save_or_restore_resource_state"
       ],
       "benchmark_attack_classes": []

@@ -553,6 +553,22 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_rejects_invalid_list_limit_and_wait_timeout(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="invalid object task bounds")
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(pid, owner, "receive_process_messages", {"channel": "never"})
+
+            with pytest.raises(ValidationError, match="list limit"):
+                runtime.object_tasks.list(actor_pid=pid, limit=True)
+            with pytest.raises(ValidationError, match="list limit"):
+                runtime.object_tasks.list(actor_pid=pid, limit=-1)
+            with pytest.raises(ValidationError, match="wait timeout"):
+                runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=float("nan"))
+        finally:
+            runtime.close()
+
     def test_object_task_per_object_concurrency_limit_is_enforced(self) -> None:
         config = replace(
             DEFAULT_CONFIG,

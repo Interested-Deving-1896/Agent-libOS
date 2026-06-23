@@ -4,12 +4,17 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
 import time
 from typing import Any
 from urllib.parse import urlsplit
+
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
+from jsonschema.validators import validator_for as jsonschema_validator_for
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
@@ -161,7 +166,7 @@ class JsonRpcPrimitive:
     ) -> list[dict[str, Any]]:
         if require_capability and actor is not None:
             self.capabilities.require(actor, self.config.jsonrpc.registry_resource, CapabilityRight.READ)
-        selected_limit = self.config.jsonrpc.list_limit if limit is None else limit
+        selected_limit = self._bounded_list_limit(limit)
         endpoints: list[dict[str, Any]] = []
         for spec, metadata in self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit):
             self._validate_endpoint(spec)
@@ -191,6 +196,7 @@ class JsonRpcPrimitive:
         self._load_endpoint(endpoint_id)
         if require_capability:
             self.capabilities.require(actor, self.endpoint_resource(endpoint_id), CapabilityRight.ADMIN)
+        self._disable_replaced_endpoint_method_capabilities(endpoint_id, actor=actor)
         self.store.delete_jsonrpc_endpoint(endpoint_id)
         self.audit.record(
             actor=actor,
@@ -212,6 +218,7 @@ class JsonRpcPrimitive:
         if method is None:
             raise NotFound(f"JSON-RPC method not found: {endpoint_id}/{method_id}")
         self._validate_json_value(params, "params")
+        self._validate_params_against_schema(method, params)
         resource = self.method_resource(endpoint_id, method_id)
         request_id = new_id("jrpc")
         operation_context = self._operation_context(pid, spec, method, params, request_id=request_id)
@@ -242,7 +249,7 @@ class JsonRpcPrimitive:
         effect_context = self._effect_context(spec, method, operation_context, request_bytes=len(request_body))
         require_external_effect_classifier(self.provider, "call")
         preflight_classification = classify_external_effect(self.provider, "call", effect_context, {"preflight": True})
-        self._validate_runtime_resolution(spec)
+        resolved_addresses = self._validate_runtime_resolution(spec)
         self.capabilities.claim_decision_use(
             decision,
             used_by="jsonrpc",
@@ -256,6 +263,7 @@ class JsonRpcPrimitive:
                 request_body,
                 timeout_s=spec.timeout_s,
                 max_response_bytes=spec.max_response_bytes,
+                resolved_addresses=resolved_addresses,
             )
         except Exception as exc:
             transport = JsonRpcTransportResult(
@@ -684,14 +692,20 @@ class JsonRpcPrimitive:
         if not isinstance(methods, list) or not methods:
             raise ValidationError("JSON-RPC endpoint requires a non-empty methods list")
         spec = JsonRpcEndpointSpec(
-            schema_version=int(value.get("schema_version", 1)),
+            schema_version=self._coerce_positive_int(value.get("schema_version", 1), "schema_version"),
             endpoint_id=self._require_string(value.get("endpoint_id"), "endpoint_id"),
             url=self._require_string(value.get("url"), "url"),
             headers=self._header_specs(value.get("headers") or {}),
             methods=[self._method_spec(item) for item in methods],
-            timeout_s=float(value.get("timeout_s", self.config.jsonrpc.timeout_s)),
-            max_request_bytes=int(value.get("max_request_bytes", self.config.jsonrpc.max_request_bytes)),
-            max_response_bytes=int(value.get("max_response_bytes", self.config.jsonrpc.max_response_bytes)),
+            timeout_s=self._coerce_positive_float(value.get("timeout_s", self.config.jsonrpc.timeout_s), "timeout_s"),
+            max_request_bytes=self._coerce_positive_int(
+                value.get("max_request_bytes", self.config.jsonrpc.max_request_bytes),
+                "max_request_bytes",
+            ),
+            max_response_bytes=self._coerce_positive_int(
+                value.get("max_response_bytes", self.config.jsonrpc.max_response_bytes),
+                "max_response_bytes",
+            ),
             metadata=dict(value.get("metadata") or {}),
         )
         self._validate_endpoint(spec)
@@ -702,11 +716,14 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC endpoint schema_version must be 1")
         self._validate_identifier(endpoint.endpoint_id, "endpoint_id", self.config.jsonrpc.endpoint_id_max_chars)
         self._validate_url(endpoint.url)
-        if not 0 < endpoint.timeout_s <= self.config.jsonrpc.timeout_hard_limit_s:
+        self._validate_positive_finite(endpoint.timeout_s, "timeout_s")
+        self._validate_positive_integer(endpoint.max_request_bytes, "max_request_bytes")
+        self._validate_positive_integer(endpoint.max_response_bytes, "max_response_bytes")
+        if endpoint.timeout_s > self.config.jsonrpc.timeout_hard_limit_s:
             raise ValidationError("JSON-RPC endpoint timeout_s exceeds configured bounds")
-        if not 0 < endpoint.max_request_bytes <= self.config.jsonrpc.max_request_hard_limit_bytes:
+        if endpoint.max_request_bytes > self.config.jsonrpc.max_request_hard_limit_bytes:
             raise ValidationError("JSON-RPC endpoint max_request_bytes exceeds configured bounds")
-        if not 0 < endpoint.max_response_bytes <= self.config.jsonrpc.max_response_hard_limit_bytes:
+        if endpoint.max_response_bytes > self.config.jsonrpc.max_response_hard_limit_bytes:
             raise ValidationError("JSON-RPC endpoint max_response_bytes exceeds configured bounds")
         seen: set[str] = set()
         for name, header in endpoint.headers.items():
@@ -764,6 +781,30 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC method has invalid rollback_class or rollback_status") from exc
         if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED and bool(method.state_mutation):
             raise ValidationError("no_rollback_required JSON-RPC methods cannot declare state_mutation=true")
+        self._validate_params_schema(method.params_schema)
+
+    def _validate_params_schema(self, schema: dict[str, Any]) -> None:
+        if not schema:
+            return
+        try:
+            jsonschema_validator_for(schema).check_schema(schema)
+        except JsonSchemaSchemaError as exc:
+            raise ValidationError("JSON-RPC method params_schema is not a valid JSON Schema") from exc
+
+    def _validate_params_against_schema(self, method: JsonRpcMethodSpec, params: Any) -> None:
+        schema = method.params_schema
+        if not schema:
+            return
+        try:
+            validator_cls = jsonschema_validator_for(schema)
+            validator_cls.check_schema(schema)
+            validator_cls(schema).validate(params)
+        except JsonSchemaSchemaError as exc:
+            raise ValidationError("JSON-RPC method params_schema is not a valid JSON Schema") from exc
+        except JsonSchemaValidationError as exc:
+            path = ".".join(str(item) for item in exc.path)
+            location = f" at {path}" if path else ""
+            raise ValidationError(f"JSON-RPC params do not match params_schema{location}") from exc
 
     def _header_specs(self, value: Any) -> dict[str, JsonRpcHeaderSpec]:
         if not isinstance(value, dict):
@@ -802,12 +843,32 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC header suffix must be empty")
 
     def _require_header_environment(self, endpoint: JsonRpcEndpointSpec) -> None:
-        missing = sorted(spec.env for spec in endpoint.headers.values() if os.environ.get(spec.env) is None)
+        missing: list[str] = []
+        invalid: list[str] = []
+        for spec in endpoint.headers.values():
+            value = os.environ.get(spec.env)
+            if value is None:
+                missing.append(spec.env)
+                continue
+            resolved = f"{spec.prefix}{value}{spec.suffix}"
+            if len(resolved) > self.config.jsonrpc.header_value_max_chars or "\r" in resolved or "\n" in resolved:
+                invalid.append(spec.env)
+                continue
+            try:
+                resolved.encode("iso-8859-1")
+            except UnicodeEncodeError:
+                invalid.append(spec.env)
         if missing:
             raise ValidationError(f"missing JSON-RPC header environment variables: {missing}")
+        if invalid:
+            raise ValidationError(f"invalid JSON-RPC header environment variable values: {invalid}")
 
     def _validate_url(self, url: str) -> None:
         parsed = urlsplit(url)
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValidationError("JSON-RPC endpoint URL has invalid port") from exc
         if parsed.username or parsed.password:
             raise ValidationError("JSON-RPC endpoint URL must not include userinfo")
         if parsed.fragment:
@@ -828,7 +889,7 @@ class JsonRpcPrimitive:
             return
         self._validate_remote_address(address, allow_loopback=True)
 
-    def _validate_runtime_resolution(self, endpoint: JsonRpcEndpointSpec) -> None:
+    def _validate_runtime_resolution(self, endpoint: JsonRpcEndpointSpec) -> tuple[str, ...]:
         parsed = urlsplit(endpoint.url)
         host = (parsed.hostname or "").rstrip(".").lower()
         if not host:
@@ -841,6 +902,7 @@ class JsonRpcPrimitive:
         if not addresses:
             raise ValidationError(f"JSON-RPC endpoint host resolved no addresses: {host}")
         allow_loopback = host in _LOCAL_HTTP_HOSTS
+        resolved: list[str] = []
         for item in addresses:
             raw_address = str(item[4][0]).split("%", 1)[0]
             try:
@@ -848,6 +910,10 @@ class JsonRpcPrimitive:
             except ValueError as exc:
                 raise ValidationError(f"JSON-RPC endpoint resolved invalid address: {raw_address}") from exc
             self._validate_remote_address(address, allow_loopback=allow_loopback)
+            text = str(address)
+            if text not in resolved:
+                resolved.append(text)
+        return tuple(resolved)
 
     def _validate_remote_address(self, address: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> None:
         if address.is_loopback:
@@ -891,11 +957,56 @@ class JsonRpcPrimitive:
             raise ValidationError(f"JSON-RPC {field} must be a boolean")
         return value
 
+    def _coerce_positive_float(self, value: Any, field: str) -> float:
+        if isinstance(value, bool):
+            raise ValidationError(f"JSON-RPC {field} must be a number")
+        try:
+            selected = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"JSON-RPC {field} must be a number") from exc
+        self._validate_positive_finite(selected, field)
+        return selected
+
+    def _coerce_positive_int(self, value: Any, field: str) -> int:
+        if isinstance(value, bool):
+            raise ValidationError(f"JSON-RPC {field} must be an integer")
+        try:
+            selected = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"JSON-RPC {field} must be an integer") from exc
+        self._validate_positive_integer(selected, field)
+        return selected
+
+    def _validate_positive_finite(self, value: Any, field: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValidationError(f"JSON-RPC {field} must be finite")
+        if float(value) <= 0:
+            raise ValidationError(f"JSON-RPC {field} must be > 0")
+
+    def _validate_positive_integer(self, value: Any, field: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValidationError(f"JSON-RPC {field} must be an integer")
+        if value <= 0:
+            raise ValidationError(f"JSON-RPC {field} must be > 0")
+
     def _validate_json_value(self, value: Any, field: str) -> None:
         try:
             dumps(value)
         except Exception as exc:
             raise ValidationError(f"JSON-RPC {field} must be JSON-serializable") from exc
+
+    def _bounded_list_limit(self, limit: int | None) -> int:
+        selected = self.config.jsonrpc.list_limit if limit is None else limit
+        if isinstance(selected, bool) or not isinstance(selected, int):
+            raise ValidationError("JSON-RPC endpoint list limit must be an integer")
+        value = selected
+        if value < 1:
+            raise ValidationError("JSON-RPC endpoint list limit must be >= 1")
+        if value > self.config.jsonrpc.list_limit:
+            raise ValidationError(
+                f"JSON-RPC endpoint list limit exceeds configured maximum {self.config.jsonrpc.list_limit}"
+            )
+        return value
 
     def _load_endpoint(self, endpoint_id: str) -> tuple[JsonRpcEndpointSpec, dict[str, Any]]:
         self._validate_identifier(endpoint_id, "endpoint_id", self.config.jsonrpc.endpoint_id_max_chars)

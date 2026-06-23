@@ -90,6 +90,11 @@ Headers are environment-backed. The registry stores the environment variable
 name and a small approved prefix such as `Bearer `, never the resolved secret
 value. Missing environment variables and runtime DNS policy failures happen
 before the HTTP attempt and before one-shot remote method authority is consumed.
+For remote HTTPS calls, the primitive passes the validated address set to the
+default provider, which opens the socket to one of those exact addresses while
+preserving the original Host header and TLS server name. This prevents a host
+from passing runtime DNS policy and then being re-resolved by the HTTP client to
+a different private or loopback address.
 
 The default provider does not follow HTTP redirects. Redirects are treated as
 HTTP failures so a registered endpoint cannot silently move a call to a new

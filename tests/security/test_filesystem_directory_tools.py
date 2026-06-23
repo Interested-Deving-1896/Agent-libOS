@@ -106,6 +106,8 @@ class TestFilesystemDirectoryTool:
         with pytest.raises(ValidationError):
             self.runtime.filesystem.read_text(pid, path, max_bytes=0)
         with pytest.raises(ValidationError):
+            self.runtime.filesystem.read_text(pid, path, max_bytes=True)
+        with pytest.raises(ValidationError):
             self.runtime.filesystem.read_text(pid, path, max_bytes=DEFAULT_FILESYSTEM_READ_HARD_LIMIT + 1)
 
     def test_directory_primitive_enforces_limit_without_tool_schema(self) -> None:
@@ -115,6 +117,8 @@ class TestFilesystemDirectoryTool:
         self.runtime.filesystem.grant_directory(pid, base, [CapabilityRight.READ], issued_by='test')
         with pytest.raises(ValidationError):
             self.runtime.filesystem.read_directory(pid, base, limit=0)
+        with pytest.raises(ValidationError):
+            self.runtime.filesystem.read_directory(pid, base, limit=True)
         with pytest.raises(ValidationError):
             self.runtime.filesystem.read_directory(pid, base, limit=DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT + 1)
 
@@ -140,6 +144,39 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
+    def test_one_time_mutation_capability_survives_provider_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            provider = FailingMutationProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='mutation failure')
+                write_cap = runtime.capability.grant_once(
+                    pid,
+                    runtime.filesystem.resource_for_path('out.txt'),
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                with pytest.raises(OSError, match='simulated write failure'):
+                    runtime.filesystem.write_text(pid, 'out.txt', 'content')
+                assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 1
+
+                (root / 'delete.txt').write_text('delete me', encoding='utf-8')
+                delete_cap = runtime.capability.grant_once(
+                    pid,
+                    runtime.filesystem.resource_for_path('delete.txt'),
+                    [CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+                with pytest.raises(OSError, match='simulated delete failure'):
+                    runtime.filesystem.delete_file(pid, 'delete.txt')
+                assert runtime.store.get_capability(delete_cap.cap_id).uses_remaining == 1
+                assert (root / 'delete.txt').exists()
+            finally:
+                runtime.close()
+
     def _write_fixture(self, path: str, content: str) -> str:
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -159,3 +196,11 @@ class SwappingSymlinkProvider(LocalFilesystemProvider):
             os.symlink(self.outside, Path(self.root_display) / 'dir', target_is_directory=True)
             self.swapped = True
         super().write_text(path, text, encoding=encoding, newline=newline)
+
+
+class FailingMutationProvider(LocalFilesystemProvider):
+    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = '\n') -> None:
+        raise OSError('simulated write failure')
+
+    def delete_file(self, path: ResolvedPath) -> None:
+        raise OSError('simulated delete failure')

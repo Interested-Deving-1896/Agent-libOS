@@ -3,6 +3,7 @@ import pytest
 import time
 from datetime import datetime
 from agent_libos import Runtime
+from agent_libos.models.exceptions import ValidationError
 
 class TestClockTool:
 
@@ -46,6 +47,12 @@ class TestClockTool:
         result = self.runtime.tools.call(pid, 'sleep', {'seconds': 61})
         assert not result.ok
         assert 'Invalid arguments' in (result.error or '')
+        assert 'primitive.clock.sleep' not in self._audit_actions()
+
+    def test_clock_primitive_rejects_non_finite_sleep_duration(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='sleep nan')
+        with pytest.raises(ValidationError, match='finite'):
+            self.runtime.clock.sleep(pid, float('nan'))
         assert 'primitive.clock.sleep' not in self._audit_actions()
 
     def test_clock_tools_are_in_process_tool_table(self) -> None:

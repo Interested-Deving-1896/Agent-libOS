@@ -18,10 +18,12 @@ from agent_libos.models import (
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
     JsonRpcTransportResult,
+    JsonRpcEndpointSpec,
+    JsonRpcMethodSpec,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate
 
 class TestJsonRpcPrimitive:
 
@@ -29,10 +31,21 @@ class TestJsonRpcPrimitive:
         runtime = Runtime.open('local')
         try:
             runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('valid', 'https://api.example.test/jsonrpc'), actor='cli', require_capability=False)
-            invalid_cases = [_manifest('bad-http', 'http://api.example.test/jsonrpc'), _manifest('bad-userinfo', 'https://user:pass@example.test/jsonrpc'), _manifest('bad-fragment', 'https://api.example.test/jsonrpc#secret'), _manifest('bad:colon', 'https://api.example.test/jsonrpc'), _manifest('bad-private-ip', 'https://10.0.0.10/jsonrpc'), _manifest('bad-metadata-ip', 'https://169.254.169.254/jsonrpc'), _manifest('bad-metadata-host', 'https://metadata.google.internal/jsonrpc'), _manifest('missing-class', 'https://api.example.test/jsonrpc', rollback_class=None), _manifest('literal-header', 'https://api.example.test/jsonrpc', literal_header=True), _manifest('bad-prefix', 'https://api.example.test/jsonrpc', header_prefix='Bearer literal-secret '), _manifest('bad-suffix', 'https://api.example.test/jsonrpc', header_suffix=' literal-secret'), _manifest('bad-bool', 'https://api.example.test/jsonrpc', state_mutation='"false"'), _manifest('dup-method', 'https://api.example.test/jsonrpc', duplicate_method=True)]
+            invalid_cases = [_manifest('bad-http', 'http://api.example.test/jsonrpc'), _manifest('bad-userinfo', 'https://user:pass@example.test/jsonrpc'), _manifest('bad-fragment', 'https://api.example.test/jsonrpc#secret'), _manifest('bad:colon', 'https://api.example.test/jsonrpc'), _manifest('bad-private-ip', 'https://10.0.0.10/jsonrpc'), _manifest('bad-metadata-ip', 'https://169.254.169.254/jsonrpc'), _manifest('bad-metadata-host', 'https://metadata.google.internal/jsonrpc'), _manifest('missing-class', 'https://api.example.test/jsonrpc', rollback_class=None), _manifest('literal-header', 'https://api.example.test/jsonrpc', literal_header=True), _manifest('bad-prefix', 'https://api.example.test/jsonrpc', header_prefix='Bearer literal-secret '), _manifest('bad-suffix', 'https://api.example.test/jsonrpc', header_suffix=' literal-secret'), _manifest('bad-bool', 'https://api.example.test/jsonrpc', state_mutation='"false"'), _manifest('dup-method', 'https://api.example.test/jsonrpc', duplicate_method=True), _manifest('bad-port', 'https://api.example.test:99999/jsonrpc'), _manifest('bad-timeout', 'https://api.example.test/jsonrpc', timeout_s='.nan'), _manifest('bad-bool-bytes', 'https://api.example.test/jsonrpc', max_request_bytes='true')]
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.jsonrpc.register_endpoint_from_yaml_text(text, actor='cli', require_capability=False)
+        finally:
+            runtime.close()
+
+    def test_list_endpoints_rejects_unbounded_primitive_limits(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('valid', 'https://api.example.test/jsonrpc'), actor='cli', require_capability=False)
+            with pytest.raises(ValidationError, match='limit'):
+                runtime.jsonrpc.list_endpoints(require_capability=False, limit=0)
+            with pytest.raises(ValidationError, match='limit'):
+                runtime.jsonrpc.list_endpoints(require_capability=False, limit=runtime.config.jsonrpc.list_limit + 1)
         finally:
             runtime.close()
 
@@ -80,6 +93,67 @@ class TestJsonRpcPrimitive:
         finally:
             runtime.close()
 
+    def test_call_passes_validated_resolved_addresses_to_provider(self, monkeypatch: MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        monkeypatch.setattr(
+            'agent_libos.primitives.jsonrpc.socket.getaddrinfo',
+            lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))],
+        )
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='dns pinned provider')
+            runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('pinned', 'https://safe.example.test/jsonrpc', with_header=False), actor='cli', require_capability=False)
+            runtime.capability.grant(pid, 'jsonrpc:pinned:echo', [CapabilityRight.READ], issued_by='test')
+
+            result = runtime.jsonrpc.call(pid, 'pinned', 'echo', {'x': 1})
+
+            assert result.ok
+            assert provider.kwargs[0]['resolved_addresses'] == ('93.184.216.34',)
+        finally:
+            runtime.close()
+
+    def test_http_jsonrpc_provider_connects_to_pinned_address(self, monkeypatch: MonkeyPatch) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = JsonRpcEndpointSpec(
+            schema_version=1,
+            endpoint_id='direct-pin',
+            url='https://api.example.test/rpc',
+            headers={},
+            methods=[
+                JsonRpcMethodSpec(
+                    method_id='echo',
+                    rpc_method='demo.echo',
+                    right='read',
+                    rollback_class='no_rollback_required',
+                    state_mutation=False,
+                    information_flow=True,
+                )
+            ],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+        )
+        called: list[tuple[str, int]] = []
+
+        def fail_connect(address: tuple[str, int], *_args: Any, **_kwargs: Any) -> Any:
+            called.append(address)
+            raise OSError('stop before network')
+
+        monkeypatch.setattr('agent_libos.substrate.local.socket.create_connection', fail_connect)
+
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b'{}',
+            timeout_s=1,
+            max_response_bytes=1024,
+            resolved_addresses=('93.184.216.34',),
+        )
+
+        assert not result.status_code
+        assert called == [('93.184.216.34', 443)]
+
     def test_jsonrpc_params_are_sanitized_in_audit_and_external_effects(self) -> None:
         with _jsonrpc_server() as server:
             runtime = Runtime.open('local')
@@ -103,6 +177,44 @@ class TestJsonRpcPrimitive:
                 assert 'redacted' in persisted
             finally:
                 runtime.close()
+
+    def test_params_schema_is_enforced_before_provider_call_and_one_shot_consumption(self) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='schema params')
+                manifest = _manifest(
+                    'schema-demo',
+                    server.url,
+                    with_header=False,
+                    params_schema='\n      type: object\n      required: [city]\n      properties:\n        city:\n          type: string\n      additionalProperties: false\n',
+                )
+                runtime.jsonrpc.register_endpoint_from_yaml_text(manifest, actor='cli', require_capability=False)
+                cap = runtime.capability.grant_once(pid, 'jsonrpc:schema-demo:echo', [CapabilityRight.READ], issued_by='test')
+
+                with pytest.raises(ValidationError, match='params_schema'):
+                    runtime.jsonrpc.call(pid, 'schema-demo', 'echo', {'city': 3})
+
+                assert server.requests == []
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+                assert runtime.jsonrpc.call(pid, 'schema-demo', 'echo', {'city': 'Beijing'}).ok
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            finally:
+                runtime.close()
+
+    def test_invalid_params_schema_is_rejected_at_registration(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            manifest = _manifest(
+                'bad-schema',
+                'https://api.example.test/jsonrpc',
+                with_header=False,
+                params_schema='\n      type: definitely-not-a-json-schema-type\n',
+            )
+            with pytest.raises(ValidationError, match='params_schema'):
+                runtime.jsonrpc.register_endpoint_from_yaml_text(manifest, actor='cli', require_capability=False)
+        finally:
+            runtime.close()
 
     def test_jsonrpc_errors_and_http_failures_are_structured_results(self) -> None:
         with _jsonrpc_server() as server:
@@ -134,6 +246,21 @@ class TestJsonRpcPrimitive:
                 cap = runtime.capability.grant_once(pid, 'jsonrpc:needs-token:echo', [CapabilityRight.READ], issued_by='test')
                 with pytest.raises(ValidationError):
                     runtime.jsonrpc.call(pid, 'needs-token', 'echo', {})
+                assert server.requests == []
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            finally:
+                runtime.close()
+
+    def test_invalid_header_env_value_fails_before_http_attempt_and_one_shot_consumption(self, monkeypatch: MonkeyPatch) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            monkeypatch.setenv('AGENT_LIBOS_JSONRPC_TEST_TOKEN', 'token\r\nX-Injected: yes')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='bad header env')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('bad-header-env', server.url), actor='cli', require_capability=False)
+                cap = runtime.capability.grant_once(pid, 'jsonrpc:bad-header-env:echo', [CapabilityRight.READ], issued_by='test')
+                with pytest.raises(ValidationError, match='header environment'):
+                    runtime.jsonrpc.call(pid, 'bad-header-env', 'echo', {})
                 assert server.requests == []
                 assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
             finally:
@@ -229,6 +356,22 @@ class TestJsonRpcPrimitive:
                 assert not runtime.store.get_capability(cap.cap_id).active
                 with pytest.raises(CapabilityDenied):
                     runtime.jsonrpc.call(pid, 'replace-demo', 'echo', {})
+            finally:
+                runtime.close()
+
+    def test_endpoint_unregister_disables_existing_method_grants_before_reuse(self) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='endpoint reuse')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('reuse-demo', server.url, with_header=False), actor='cli', require_capability=False)
+                cap = runtime.capability.grant(pid, 'jsonrpc:reuse-demo:echo', [CapabilityRight.READ], issued_by='test')
+                runtime.jsonrpc.unregister_endpoint('reuse-demo', actor='cli', require_capability=False)
+                runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('reuse-demo', server.url, with_header=False), actor='cli', require_capability=False)
+
+                assert not runtime.store.get_capability(cap.cap_id).active
+                with pytest.raises(CapabilityDenied):
+                    runtime.jsonrpc.call(pid, 'reuse-demo', 'echo', {})
             finally:
                 runtime.close()
 
@@ -339,9 +482,11 @@ class _RecordingJsonRpcProvider:
 
     def __init__(self) -> None:
         self.calls: list[bytes] = []
+        self.kwargs: list[dict[str, Any]] = []
 
     def call(self, _endpoint: Any, _method: Any, request_body: bytes, **_kwargs: Any) -> JsonRpcTransportResult:
         self.calls.append(request_body)
+        self.kwargs.append(dict(_kwargs))
         payload = json.loads(request_body.decode('utf-8'))
         return JsonRpcTransportResult(
             status_code=200,
@@ -376,7 +521,7 @@ class _PostCallClassifierFailsProvider(_RecordingJsonRpcProvider):
             return super().classify_external_effect(operation, context, result)
         raise RuntimeError('classifier failed after provider call')
 
-def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_rollback_required', state_mutation: bool | str=False, with_header: bool=True, literal_header: bool=False, duplicate_method: bool=False, header_prefix: str='Bearer ', header_suffix: str='', rpc_method: str='demo.echo') -> str:
+def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_rollback_required', state_mutation: bool | str=False, with_header: bool=True, literal_header: bool=False, duplicate_method: bool=False, header_prefix: str='Bearer ', header_suffix: str='', rpc_method: str='demo.echo', params_schema: str='', timeout_s: str='5', max_request_bytes: str='65536', max_response_bytes: str='1048576') -> str:
     header = ''
     if literal_header:
         header = '\nheaders:\n  Authorization: "Bearer literal-secret"\n'
@@ -387,7 +532,8 @@ def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_roll
     rollback = f'    rollback_class: {rollback_class}\n' if rollback_class is not None else ''
     second = '\n  - method_id: echo\n    rpc_method: demo.echo2\n    right: read\n    rollback_class: no_rollback_required\n    state_mutation: false\n    information_flow: true\n' if duplicate_method else ''
     state = 'true' if state_mutation is True else 'false' if state_mutation is False else state_mutation
-    return f'\nschema_version: 1\nendpoint_id: {endpoint_id}\nurl: {url}\n{header}methods:\n  - method_id: echo\n    rpc_method: {rpc_method}\n    right: read\n{rollback}    state_mutation: {state}\n    information_flow: true\n{second}timeout_s: 5\nmax_request_bytes: 65536\nmax_response_bytes: 1048576\n'.lstrip()
+    schema = f'    params_schema:{params_schema}' if params_schema else ''
+    return f'\nschema_version: 1\nendpoint_id: {endpoint_id}\nurl: {url}\n{header}methods:\n  - method_id: echo\n    rpc_method: {rpc_method}\n    right: read\n{rollback}    state_mutation: {state}\n    information_flow: true\n{schema}{second}timeout_s: {timeout_s}\nmax_request_bytes: {max_request_bytes}\nmax_response_bytes: {max_response_bytes}\n'.lstrip()
 
 def _run_cli_json(argv: list[str]) -> Any:
     buffer = io.StringIO()

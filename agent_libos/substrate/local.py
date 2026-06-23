@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import heapq
 import os
 import shutil
+import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -13,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
+from urllib.parse import urlsplit
 
 import psutil
 
@@ -500,7 +504,16 @@ class HttpJsonRpcProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        resolved_addresses: tuple[str, ...] | None = None,
     ) -> JsonRpcTransportResult:
+        if resolved_addresses:
+            return self._call_pinned(
+                endpoint,
+                request_body,
+                timeout_s=timeout_s,
+                max_response_bytes=max_response_bytes,
+                resolved_addresses=resolved_addresses,
+            )
         started = time.monotonic()
         request = urlrequest.Request(
             endpoint.url,
@@ -550,6 +563,109 @@ class HttpJsonRpcProvider:
                 response_bytes=0,
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+    def _call_pinned(
+        self,
+        endpoint: JsonRpcEndpointSpec,
+        request_body: bytes,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+        resolved_addresses: tuple[str, ...],
+    ) -> JsonRpcTransportResult:
+        # Keep DNS policy and the actual socket target coupled. urlopen()
+        # re-resolves hostnames internally, which can reopen DNS rebinding
+        # after the primitive has already accepted a safe address set.
+        started = time.monotonic()
+        parsed = urlsplit(endpoint.url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        request_target = parsed.path or "/"
+        if parsed.query:
+            request_target = f"{request_target}?{parsed.query}"
+        headers = {
+            "Host": self._host_header(host, port, parsed.scheme),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Content-Length": str(len(request_body)),
+            "Connection": "close",
+            **self._resolved_headers(endpoint),
+        }
+        request_head = self._http_request_head("POST", request_target, headers)
+        last_error: str | None = None
+        deadline = started + timeout_s
+        for address in resolved_addresses:
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                last_error = "TimeoutError: JSON-RPC pinned request timed out"
+                break
+            try:
+                with self._pinned_socket(
+                    address,
+                    port,
+                    host=host,
+                    scheme=parsed.scheme,
+                    timeout_s=remaining_timeout,
+                ) as sock:
+                    sock.sendall(request_head + request_body)
+                    response = http.client.HTTPResponse(sock)
+                    response.begin()
+                    body = response.read(max_response_bytes + 1)
+                    too_large = len(body) > max_response_bytes
+                    if too_large:
+                        body = body[:max_response_bytes]
+                    return JsonRpcTransportResult(
+                        status_code=int(response.status),
+                        body=body,
+                        elapsed_s=time.monotonic() - started,
+                        response_bytes=len(body),
+                        too_large=too_large,
+                    )
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+        return JsonRpcTransportResult(
+            status_code=None,
+            body=b"",
+            elapsed_s=time.monotonic() - started,
+            response_bytes=0,
+            error=last_error or "no pinned JSON-RPC addresses were available",
+        )
+
+    def _pinned_socket(
+        self,
+        address: str,
+        port: int,
+        *,
+        host: str,
+        scheme: str,
+        timeout_s: float,
+    ) -> socket.socket:
+        raw = socket.create_connection((address, port), timeout=timeout_s)
+        raw.settimeout(timeout_s)
+        try:
+            if scheme == "https":
+                context = ssl.create_default_context()
+                return context.wrap_socket(raw, server_hostname=host)
+            return raw
+        except Exception:
+            raw.close()
+            raise
+
+    def _host_header(self, host: str, port: int, scheme: str) -> str:
+        default_port = 443 if scheme == "https" else 80
+        if port == default_port:
+            return host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{host}:{port}"
+
+    def _http_request_head(self, method: str, target: str, headers: dict[str, str]) -> bytes:
+        lines = [f"{method} {target} HTTP/1.1"]
+        lines.extend(f"{name}: {value}" for name, value in headers.items())
+        lines.append("")
+        lines.append("")
+        return "\r\n".join(lines).encode("iso-8859-1")
 
     def classify_external_effect(
         self,

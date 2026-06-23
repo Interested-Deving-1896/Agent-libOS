@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -105,6 +106,8 @@ class ClockPrimitive:
 
     def _validate_sleep_duration(self, seconds: float) -> float:
         duration = float(seconds)
+        if not math.isfinite(duration):
+            raise ValidationError("sleep seconds must be finite")
         if duration < 0:
             raise ValidationError("sleep seconds must be non-negative")
         if duration > self.max_sleep_seconds:

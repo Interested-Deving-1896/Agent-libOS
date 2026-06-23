@@ -311,12 +311,6 @@ class FilesystemAdapter:
             source="primitive.filesystem.write_text",
             context={"path": relative, "resource": resource, "encoding": encoding, "overwrite": overwrite},
         )
-        if consume_capability_id is not None:
-            self.capabilities.consume_use(
-                consume_capability_id,
-                used_by="filesystem",
-                reason="one-time filesystem write permission consumed",
-            )
         target_state = self.provider.state(target)
         created = not target_state.exists
         if target_state.exists and target_state.kind != "file":
@@ -332,6 +326,7 @@ class FilesystemAdapter:
         }
         require_external_effect_classifier(self.provider, "write_text")
         self.provider.write_text(target, text, encoding=encoding, newline="\n")
+        self._consume_mutation_capability(consume_capability_id, right="write")
         bytes_written = bytes_to_write
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
@@ -396,6 +391,13 @@ class FilesystemAdapter:
         if target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
         effect_context = {"path": relative, "resource": resource, "limit": limit}
+        estimated_metadata_bytes = self._directory_metadata_preflight_bytes(limit)
+        self._preflight_resource_usage(
+            pid,
+            ResourceUsage(external_read_bytes=estimated_metadata_bytes),
+            source="primitive.filesystem.read_directory",
+            context={**effect_context, "estimated_metadata_bytes": estimated_metadata_bytes},
+        )
         require_external_effect_classifier(self.provider, "list_directory")
         self._consume_one_time_decision(decision, used_by="filesystem")
         children = list(self.provider.list_directory(target, limit=limit + 1))
@@ -477,12 +479,6 @@ class FilesystemAdapter:
             question=f"Allow this process to create or update directory {relative}?",
             extra_context={"parents": parents, "exist_ok": exist_ok},
         )
-        if consume_capability_id is not None:
-            self.capabilities.consume_use(
-                consume_capability_id,
-                used_by="filesystem",
-                reason="one-time filesystem write permission consumed",
-            )
         target_state = self.provider.state(target)
         created = not target_state.exists
         if target_state.exists and target_state.kind != "directory":
@@ -498,6 +494,7 @@ class FilesystemAdapter:
         }
         require_external_effect_classifier(self.provider, "make_directory")
         self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
+        self._consume_mutation_capability(consume_capability_id, right="write")
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -558,22 +555,18 @@ class FilesystemAdapter:
             recursive=False,
             missing_ok=missing_ok,
         )
-        if consume_capability_id is not None:
-            self.capabilities.consume_use(
-                consume_capability_id,
-                used_by="filesystem",
-                reason="one-time filesystem delete permission consumed",
-            )
         target_state = self.provider.state(target)
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"file does not exist: {relative}")
+            self._consume_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False)
         if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "missing_ok": missing_ok}
         require_external_effect_classifier(self.provider, "delete_file")
         self.provider.delete_file(target)
+        self._consume_mutation_capability(consume_capability_id, right="delete")
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -637,16 +630,11 @@ class FilesystemAdapter:
             recursive=recursive,
             missing_ok=missing_ok,
         )
-        if consume_capability_id is not None:
-            self.capabilities.consume_use(
-                consume_capability_id,
-                used_by="filesystem",
-                reason="one-time filesystem delete permission consumed",
-            )
         target_state = self.provider.state(target)
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"directory does not exist: {relative}")
+            self._consume_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
         if target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
@@ -658,6 +646,7 @@ class FilesystemAdapter:
         }
         require_external_effect_classifier(self.provider, "delete_directory")
         self.provider.delete_directory(target, recursive=recursive)
+        self._consume_mutation_capability(consume_capability_id, right="delete")
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -875,11 +864,26 @@ class FilesystemAdapter:
         payload = [getattr(entry, "__dict__", {"entry": str(entry)}) for entry in entries]
         return len(json.dumps(payload, ensure_ascii=True, default=str).encode("utf-8"))
 
+    def _directory_metadata_preflight_bytes(self, limit: int) -> int:
+        # Directory entry names and timestamps are only known after reading the
+        # directory. Reserve a conservative per-entry envelope first so tight
+        # information-flow budgets fail closed before metadata is observed.
+        return max(1, (limit + 1) * 512)
+
     def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
         self.capabilities.claim_decision_use(
             decision,
             used_by=used_by,
             reason="one-time filesystem permission consumed",
+        )
+
+    def _consume_mutation_capability(self, capability_id: str | None, *, right: str) -> None:
+        if capability_id is None:
+            return
+        self.capabilities.consume_use(
+            capability_id,
+            used_by="filesystem",
+            reason=f"one-time filesystem {right} permission consumed",
         )
 
     def _resolve(
@@ -915,7 +919,7 @@ class FilesystemAdapter:
         text: str,
         encoding: str,
         overwrite: bool,
-    ) -> bool:
+    ) -> str | None:
         return self._require_write_operation(
             pid=pid,
             resource=resource,
@@ -1201,6 +1205,8 @@ class FilesystemAdapter:
         return result
 
     def _bounded_positive_int(self, value: int, *, label: str, hard_limit: int) -> int:
+        if isinstance(value, bool):
+            raise ValidationError(f"{label} must be an integer")
         try:
             selected = int(value)
         except (TypeError, ValueError) as exc:

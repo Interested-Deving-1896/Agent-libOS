@@ -164,6 +164,7 @@ class JsonRpcProvider(Protocol):
         *,
         timeout_s: float,
         max_response_bytes: int,
+        resolved_addresses: tuple[str, ...] | None = None,
     ) -> JsonRpcTransportResult: ...
 
     def classify_external_effect(

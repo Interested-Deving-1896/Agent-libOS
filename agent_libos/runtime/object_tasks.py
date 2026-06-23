@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from concurrent.futures import Future
@@ -258,18 +259,19 @@ class ObjectTaskManager:
         include_terminal: bool = True,
         limit: int | None = None,
     ) -> list[ObjectTask]:
+        selected_limit = self._coerce_list_limit(limit)
         tasks = [
             self._refresh_task_from_runner(task)
             for task in self.runtime.store.list_object_tasks(
                 owner_oid=owner_oid,
                 include_terminal=include_terminal,
-                limit=None if actor_pid is not None and limit is not None else limit,
+                limit=None if actor_pid is not None and selected_limit is not None else selected_limit,
             )
         ]
         if actor_pid is not None:
             tasks = [task for task in tasks if self._can_view_task(actor_pid, task)]
-        if limit is not None:
-            tasks = tasks[: max(0, int(limit))]
+        if selected_limit is not None:
+            tasks = tasks[:selected_limit]
         return tasks
 
     def cancel(self, task_id: str, *, actor_pid: str, reason: str | None = None) -> ObjectTask:
@@ -288,7 +290,8 @@ class ObjectTaskManager:
         return self._mark_cancelled(task, actor=actor_pid, reason=reason or "cancelled")
 
     def wait(self, task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> ObjectTask:
-        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        selected_timeout = self._coerce_wait_timeout(timeout)
+        deadline = None if selected_timeout is None else time.monotonic() + selected_timeout
         while True:
             task = self.get(task_id, actor_pid=actor_pid)
             if (
@@ -309,6 +312,34 @@ class ObjectTaskManager:
             if deadline is not None and time.monotonic() >= deadline:
                 return task
             time.sleep(0.01)
+
+    def _coerce_list_limit(self, limit: int | None) -> int | None:
+        if limit is None:
+            return None
+        if isinstance(limit, bool):
+            raise ValidationError("object task list limit must be an integer")
+        try:
+            selected = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("object task list limit must be an integer") from exc
+        if selected < 0:
+            raise ValidationError("object task list limit must be non-negative")
+        return selected
+
+    def _coerce_wait_timeout(self, timeout: float | None) -> float | None:
+        if timeout is None:
+            return None
+        if isinstance(timeout, bool):
+            raise ValidationError("object task wait timeout must be a number")
+        try:
+            selected = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("object task wait timeout must be a number") from exc
+        if not math.isfinite(selected):
+            raise ValidationError("object task wait timeout must be finite")
+        if selected < 0:
+            raise ValidationError("object task wait timeout must be non-negative")
+        return selected
 
     def has_active_for_owner(self, owner_oid: str) -> bool:
         for task in self.runtime.store.list_object_tasks(owner_oid=owner_oid, include_terminal=False):

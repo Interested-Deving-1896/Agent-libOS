@@ -4,6 +4,7 @@ import os
 import asyncio
 import hashlib
 import inspect
+import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -807,6 +808,8 @@ class ShellAdapter:
             selected = float(timeout)
         except (TypeError, ValueError) as exc:
             raise ValidationError("shell timeout must be a number") from exc
+        if not math.isfinite(selected):
+            raise ValidationError("shell timeout must be finite")
         if selected <= 0:
             raise ValidationError("shell timeout must be > 0")
         if selected > self.config.shell.timeout_hard_limit_s:
