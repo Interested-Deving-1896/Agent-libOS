@@ -325,8 +325,25 @@ class FilesystemAdapter:
             "created": created,
         }
         require_external_effect_classifier(self.provider, "write_text")
-        self.provider.write_text(target, text, encoding=encoding, newline="\n")
-        self._consume_mutation_capability(consume_capability_id, right="write")
+        intent_record = self._record_mutation_intent(
+            pid=pid,
+            action="primitive.filesystem.write_text.intent",
+            target=resource,
+            decision={"path": relative, "bytes_to_write": bytes_to_write, "created": created},
+        )
+        reservation = self._reserve_mutation_capability(consume_capability_id, right="write")
+        try:
+            self.provider.write_text(target, text, encoding=encoding, newline="\n")
+        except Exception as exc:
+            self._restore_mutation_capability(reservation, right="write")
+            self._record_mutation_failure(
+                pid=pid,
+                action="primitive.filesystem.write_text.failed",
+                target=resource,
+                intent_record=intent_record,
+                decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
         bytes_written = bytes_to_write
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
@@ -339,6 +356,8 @@ class FilesystemAdapter:
             action="primitive.filesystem.write_text",
             target=resource,
             decision={"path": relative, "bytes_written": bytes_written, "created": created},
+            correlation_id=intent_record.record_id,
+            parent_record_id=intent_record.record_id,
         )
         self._record_external_effect(
             pid=pid,
@@ -493,8 +512,25 @@ class FilesystemAdapter:
             "created": created,
         }
         require_external_effect_classifier(self.provider, "make_directory")
-        self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
-        self._consume_mutation_capability(consume_capability_id, right="write")
+        intent_record = self._record_mutation_intent(
+            pid=pid,
+            action="primitive.filesystem.write_directory.intent",
+            target=resource,
+            decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
+        )
+        reservation = self._reserve_mutation_capability(consume_capability_id, right="write")
+        try:
+            self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
+        except Exception as exc:
+            self._restore_mutation_capability(reservation, right="write")
+            self._record_mutation_failure(
+                pid=pid,
+                action="primitive.filesystem.write_directory.failed",
+                target=resource,
+                intent_record=intent_record,
+                decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -506,6 +542,8 @@ class FilesystemAdapter:
             action="primitive.filesystem.write_directory",
             target=resource,
             decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
+            correlation_id=intent_record.record_id,
+            parent_record_id=intent_record.record_id,
         )
         self._record_external_effect(
             pid=pid,
@@ -559,14 +597,31 @@ class FilesystemAdapter:
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"file does not exist: {relative}")
-            self._consume_mutation_capability(consume_capability_id, right="delete")
+            self._reserve_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False)
         if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "missing_ok": missing_ok}
         require_external_effect_classifier(self.provider, "delete_file")
-        self.provider.delete_file(target)
-        self._consume_mutation_capability(consume_capability_id, right="delete")
+        intent_record = self._record_mutation_intent(
+            pid=pid,
+            action="primitive.filesystem.delete_file.intent",
+            target=resource,
+            decision={"path": relative, "missing_ok": missing_ok},
+        )
+        reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
+        try:
+            self.provider.delete_file(target)
+        except Exception as exc:
+            self._restore_mutation_capability(reservation, right="delete")
+            self._record_mutation_failure(
+                pid=pid,
+                action="primitive.filesystem.delete_file.failed",
+                target=resource,
+                intent_record=intent_record,
+                decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -578,6 +633,8 @@ class FilesystemAdapter:
             action="primitive.filesystem.delete_file",
             target=resource,
             decision={"path": relative, "deleted": True},
+            correlation_id=intent_record.record_id,
+            parent_record_id=intent_record.record_id,
         )
         self._record_external_effect(
             pid=pid,
@@ -634,7 +691,7 @@ class FilesystemAdapter:
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"directory does not exist: {relative}")
-            self._consume_mutation_capability(consume_capability_id, right="delete")
+            self._reserve_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
         if target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
@@ -645,8 +702,25 @@ class FilesystemAdapter:
             "missing_ok": missing_ok,
         }
         require_external_effect_classifier(self.provider, "delete_directory")
-        self.provider.delete_directory(target, recursive=recursive)
-        self._consume_mutation_capability(consume_capability_id, right="delete")
+        intent_record = self._record_mutation_intent(
+            pid=pid,
+            action="primitive.filesystem.delete_directory.intent",
+            target=resource,
+            decision={"path": relative, "recursive": recursive, "missing_ok": missing_ok},
+        )
+        reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
+        try:
+            self.provider.delete_directory(target, recursive=recursive)
+        except Exception as exc:
+            self._restore_mutation_capability(reservation, right="delete")
+            self._record_mutation_failure(
+                pid=pid,
+                action="primitive.filesystem.delete_directory.failed",
+                target=resource,
+                intent_record=intent_record,
+                decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -663,6 +737,8 @@ class FilesystemAdapter:
             action="primitive.filesystem.delete_directory",
             target=resource,
             decision={"path": relative, "deleted": True, "recursive": recursive},
+            correlation_id=intent_record.record_id,
+            parent_record_id=intent_record.record_id,
         )
         self._record_external_effect(
             pid=pid,
@@ -877,13 +953,60 @@ class FilesystemAdapter:
             reason="one-time filesystem permission consumed",
         )
 
-    def _consume_mutation_capability(self, capability_id: str | None, *, right: str) -> None:
+    def _reserve_mutation_capability(self, capability_id: str | None, *, right: str) -> str | None:
         if capability_id is None:
-            return
+            return None
+        # Filesystem mutations cross an external provider boundary, so one-shot
+        # grants are reserved before the side effect and refunded only if the
+        # provider raises. This closes the concurrent authorize-then-write race
+        # without consuming approval for ordinary provider failures.
         self.capabilities.consume_use(
             capability_id,
             used_by="filesystem",
-            reason=f"one-time filesystem {right} permission consumed",
+            reason=f"one-time filesystem {right} permission reserved",
+        )
+        return capability_id
+
+    def _restore_mutation_capability(self, capability_id: str | None, *, right: str) -> None:
+        if capability_id is None:
+            return
+        self.capabilities._restore_reserved_use(
+            capability_id,
+            restored_by="filesystem",
+            reason=f"one-time filesystem {right} permission restored after provider failure",
+        )
+
+    def _record_mutation_intent(
+        self,
+        *,
+        pid: str,
+        action: str,
+        target: str,
+        decision: dict[str, Any],
+    ) -> Any:
+        return self.audit.record(
+            actor=pid,
+            action=action,
+            target=target,
+            decision=decision,
+        )
+
+    def _record_mutation_failure(
+        self,
+        *,
+        pid: str,
+        action: str,
+        target: str,
+        intent_record: Any,
+        decision: dict[str, Any],
+    ) -> None:
+        self.audit.record(
+            actor=pid,
+            action=action,
+            target=target,
+            decision=decision,
+            correlation_id=intent_record.record_id,
+            parent_record_id=intent_record.record_id,
         )
 
     def _resolve(

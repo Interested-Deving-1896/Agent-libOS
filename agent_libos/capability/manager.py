@@ -548,6 +548,39 @@ class CapabilityManager:
             )
         return updated
 
+    def _restore_reserved_use(
+        self,
+        cap_id: str,
+        *,
+        restored_by: str,
+        reason: str = "reserved capability use restored",
+        count: int = 1,
+    ) -> Capability:
+        """Restore a use consumed as an effect reservation before provider I/O.
+
+        This is intentionally not part of the public capability workflow:
+        regular callers should grant or consume capabilities, while primitives
+        use this only when a provider raises before reporting a committed effect.
+        """
+        if count < 1:
+            raise ValidationError("capability restore count must be >= 1")
+        cap = self.store.get_capability(cap_id)
+        if cap is None:
+            raise NotFound(f"capability not found: {cap_id}")
+        if cap.uses_remaining is None:
+            return cap
+        updated = self.store.restore_reserved_capability_uses(cap_id, count)
+        if updated is None:
+            raise CapabilityDenied(f"reserved capability use cannot be restored: {cap_id}")
+        self.audit.record(
+            actor=restored_by,
+            action="capability.restore_reserved_use",
+            target=cap.resource,
+            capability_refs=[cap_id],
+            decision={"uses_remaining": updated.uses_remaining, "count": count, "reason": reason},
+        )
+        return updated
+
     def consume_allow_once(self, subject: str, resource: str, right: str | CapabilityRight, used_by: str) -> None:
         decision = self.authorize(subject, resource, right)
         if decision.consume_capability_id is not None:

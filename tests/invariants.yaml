@@ -19,6 +19,7 @@
       "node_ids": [
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_primitive_enforces_read_limits_without_tool_schema",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_primitive_enforces_limit_without_tool_schema",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_concurrent_one_time_file_write_crosses_provider_once",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_shell_execute_before_human_prompt",

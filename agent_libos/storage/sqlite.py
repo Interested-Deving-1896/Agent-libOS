@@ -1037,6 +1037,37 @@ class SQLiteStore:
             rows = list(self.conn.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
             return self._row_to_capability(rows[0]) if rows else None
 
+    def restore_reserved_capability_uses(self, cap_id: str, count: int = 1) -> Capability | None:
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                UPDATE capabilities
+                   SET uses_remaining = uses_remaining + ?,
+                       status = CASE
+                           WHEN status = ? THEN ?
+                           ELSE status
+                       END
+                 WHERE cap_id = ?
+                   AND uses_remaining IS NOT NULL
+                   AND status IN (?, ?)
+                """,
+                (
+                    count,
+                    CapabilityStatus.REVOKED.value,
+                    CapabilityStatus.ACTIVE.value,
+                    cap_id,
+                    CapabilityStatus.ACTIVE.value,
+                    CapabilityStatus.REVOKED.value,
+                ),
+            )
+            self.conn.commit()
+            if cur.rowcount != 1:
+                return None
+            rows = list(self.conn.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
+            return self._row_to_capability(rows[0]) if rows else None
+
     def update_capability(self, cap: Capability) -> None:
         self._execute(
             """

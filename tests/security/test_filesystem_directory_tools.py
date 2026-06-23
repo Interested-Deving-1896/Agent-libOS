@@ -1,8 +1,11 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 import os
 import pytest
 import shutil
 import tempfile
+import threading
+import time
 from pathlib import Path
 from uuid import uuid4
 from agent_libos import Runtime
@@ -177,6 +180,42 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
+    def test_concurrent_one_time_file_write_crosses_provider_once(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            provider = SlowCountingMutationProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='filesystem write race')
+                write_cap = runtime.capability.grant_once(
+                    pid,
+                    runtime.filesystem.resource_for_path('race.txt'),
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                workers = 2
+                barrier = threading.Barrier(workers)
+
+                def write(index: int) -> bool:
+                    barrier.wait(timeout=2)
+                    try:
+                        runtime.filesystem.write_text(pid, 'race.txt', f'content {index}')
+                        return True
+                    except CapabilityDenied:
+                        return False
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    outcomes = list(executor.map(write, range(workers)))
+
+                assert outcomes.count(True) == 1
+                assert outcomes.count(False) == 1
+                assert provider.write_attempts == 1
+                assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 0
+            finally:
+                runtime.close()
+
     def _write_fixture(self, path: str, content: str) -> str:
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -204,3 +243,16 @@ class FailingMutationProvider(LocalFilesystemProvider):
 
     def delete_file(self, path: ResolvedPath) -> None:
         raise OSError('simulated delete failure')
+
+
+class SlowCountingMutationProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self._lock = threading.Lock()
+        self.write_attempts = 0
+
+    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = '\n') -> None:
+        with self._lock:
+            self.write_attempts += 1
+        time.sleep(0.05)
+        super().write_text(path, text, encoding=encoding, newline=newline)
