@@ -1,0 +1,24 @@
+schema_version: 1
+module_id: agent-libos-pty:v0
+name: Agent libOS PTY module
+version: v0
+entrypoint: ./pty_module.py:register_module
+provides:
+  tools:
+    - pty_create
+    - pty_write
+    - pty_read
+    - pty_resize
+    - pty_close
+    - pty_list
+  images:
+    - pty-agent:v0
+  syscalls: []
+  provider_hooks: []
+  startup_hooks:
+    - initialize_pty
+sha256: 61e85c8ffa015fc30f6ef5918c6985ed2a9fccd746373f342e954a7b8cff256a
+metadata:
+  owner: local
+  external_effects:
+    - pty.spawn
