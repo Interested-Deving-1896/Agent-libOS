@@ -83,6 +83,14 @@ class TestTestMatrix:
         assert args.workers == "3"
         assert args.dist == "load"
 
+    def test_invalid_worker_env_reports_parser_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(workers=None, dist=None)
+        monkeypatch.setenv(test_matrix.WORKERS_ENV, "maybe")
+
+        with pytest.raises(SystemExit):
+            test_matrix._resolve_defaults(parser, args)
+
     def test_worker_count_accepts_positive_int_auto_and_logical(self) -> None:
         assert test_matrix._worker_count("4") == "4"
         assert test_matrix._worker_count("auto") == "auto"

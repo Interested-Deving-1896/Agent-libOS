@@ -136,7 +136,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
 
 def _resolve_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.workers is None:
-        args.workers = _default_workers_for_lane(args.lane)
+        try:
+            args.workers = _default_workers_for_lane(args.lane)
+        except argparse.ArgumentTypeError as exc:
+            parser.error(f"{WORKERS_ENV}: {exc}")
     if args.dist is None:
         args.dist = _default_dist(parser, args)
 
