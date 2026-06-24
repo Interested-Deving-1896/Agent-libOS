@@ -116,3 +116,22 @@ class TestToolPolicyAndObservability:
 
         assert secret not in sanitized["preview"]
         assert sanitized["redacted"] is True
+
+    def test_observability_redacts_scalar_credential_patterns(self) -> None:
+        secret = "sk_live_scalar_secret"
+        quoted_password = "hunter2"
+        quoted_token = "plainquotedtoken"
+        sentinel = "SECRET_TOKEN_SHOULD_NOT_APPEAR"
+        sanitized = sanitize_for_observability(
+            f"provider failed Authorization: Bearer {secret}; token={secret}; password='{quoted_password}'; api_key=\"{quoted_token}\"; {sentinel}",
+            preview_chars=10_000,
+        )
+        plain = sanitize_for_observability("ordinary failure message", preview_chars=10_000)
+
+        assert secret not in sanitized["preview"]
+        assert quoted_password not in sanitized["preview"]
+        assert quoted_token not in sanitized["preview"]
+        assert sentinel not in sanitized["preview"]
+        assert sanitized["redacted"] is True
+        assert plain["redacted"] is False
+        assert "ordinary failure message" in plain["preview"]

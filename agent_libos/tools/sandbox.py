@@ -27,6 +27,11 @@ from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.serde import to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_EXACT_JSR_VERSION_RE = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
 
@@ -147,6 +152,8 @@ class DenoTypescriptSandbox(SandboxBackend):
             errors.append("TypeScript tool source must export function run(args, libos)")
         if self._contains_dynamic_import(source_code):
             errors.append("dynamic import() is not allowed")
+        if self._contains_runtime_code_generation(source_code):
+            errors.append("runtime code generation is not allowed")
         for specifier in self._extract_imports(source_code):
             parsed = self._jsr_package_and_version(specifier)
             package = parsed[0] if parsed is not None else None
@@ -158,6 +165,9 @@ class DenoTypescriptSandbox(SandboxBackend):
                 continue
             if parsed[1] is None:
                 errors.append(f"JSR import must pin a package version: {specifier}")
+                continue
+            if not self._is_exact_jsr_version(parsed[1]):
+                errors.append(f"JSR import must use an exact semantic version: {specifier}")
         return ValidationResult(ok=not errors, errors=errors, warnings=warnings)
 
     async def arun_source(
@@ -614,6 +624,54 @@ class DenoTypescriptSandbox(SandboxBackend):
                 return True
         return False
 
+    def _contains_runtime_code_generation(self, source_code: str) -> bool:
+        tokens = self._typescript_tokens(source_code)
+        for index, token in enumerate(tokens):
+            if token == ("identifier", "eval"):
+                if self._looks_like_method_definition(tokens, index):
+                    continue
+                previous_token = tokens[index - 1] if index > 0 else None
+                previous_previous_token = tokens[index - 2] if index > 1 else None
+                if previous_token == ("punct", ".") and previous_previous_token in {
+                    ("identifier", "globalThis"),
+                    ("identifier", "window"),
+                }:
+                    return True
+                if previous_token != ("punct", ".") and self._token_is_call(tokens, index):
+                    return True
+            if token == ("identifier", "Function"):
+                if self._looks_like_method_definition(tokens, index):
+                    continue
+                previous_token = tokens[index - 1] if index > 0 else None
+                previous_previous_token = tokens[index - 2] if index > 1 else None
+                if previous_token == ("punct", ".") and previous_previous_token in {
+                    ("identifier", "globalThis"),
+                    ("identifier", "window"),
+                }:
+                    return True
+                if previous_token != ("punct", ".") and self._token_is_call(tokens, index):
+                    return True
+            if token[0] == "string" and token[1] in {"eval", "Function"}:
+                if self._token_is_bracketed_global_property(tokens, index):
+                    return True
+        return False
+
+    def _token_is_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else None
+        return next_token == ("punct", "(")
+
+    def _token_is_bracketed_global_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        if index < 2 or index + 1 >= len(tokens):
+            return False
+        if tokens[index - 1] != ("punct", "["):
+            return False
+        if tokens[index + 1] != ("punct", "]"):
+            return False
+        object_index = index - 2
+        if tokens[object_index] == ("punct", ".") and object_index > 0:
+            object_index -= 1
+        return tokens[object_index] in {("identifier", "globalThis"), ("identifier", "window")}
+
     def _extract_imports(self, source_code: str) -> list[str]:
         tokens = self._typescript_tokens(source_code)
         imports: set[str] = set()
@@ -827,6 +885,9 @@ class DenoTypescriptSandbox(SandboxBackend):
         if not scope or not name:
             return None
         return f"{scope}/{name}", version or None
+
+    def _is_exact_jsr_version(self, version: str) -> bool:
+        return _EXACT_JSR_VERSION_RE.fullmatch(version) is not None
 
     def _resolve_deno(self) -> str:
         candidate = self.deno_executable

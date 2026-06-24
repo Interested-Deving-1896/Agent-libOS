@@ -256,6 +256,104 @@ class TestGuiServer:
         assert status == 403
         assert 'checkpoint' in body['error']['message']
 
+    def test_capability_actor_mode_enforces_process_authority(self) -> None:
+        runtime = self.server.service.runtime
+        _status, actor = self.request('POST', '/api/processes', {'goal': 'capability actor', 'auto_run': False})
+        _status, subject = self.request('POST', '/api/processes', {'goal': 'capability subject', 'auto_run': False})
+
+        status, denied = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-actor-grant',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 403
+        assert 'lacks grant/admin authority' in denied['error']['message']
+
+        status, admin_granted = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-admin-grant',
+                'rights': ['read'],
+                'confirmed': True,
+            },
+        )
+        assert status == 200
+        assert admin_granted['subject'] == subject['pid']
+
+        runtime.capability.grant(actor['pid'], 'object:gui-actor-grant', [CapabilityRight.READ], issued_by='test')
+        runtime.capability.grant(actor['pid'], 'object:gui-actor-grant', [CapabilityRight.GRANT], issued_by='test')
+        status, granted = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-actor-grant',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 200
+        assert granted['subject'] == subject['pid']
+        assert granted['parent_cap_id']
+
+        runtime.capability.grant(actor['pid'], 'object:gui-delegate', [CapabilityRight.READ], issued_by='test', delegable=True)
+        status, mismatched_parent = self.request(
+            'POST',
+            '/api/capabilities/delegate',
+            {
+                'parent': subject['pid'],
+                'child': actor['pid'],
+                'resource': 'object:gui-delegate',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 403
+        assert 'actor-mode delegation' in mismatched_parent['error']['message']
+
+        status, delegated = self.request(
+            'POST',
+            '/api/capabilities/delegate',
+            {
+                'parent': actor['pid'],
+                'child': subject['pid'],
+                'resource': 'object:gui-delegate',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 200
+        assert delegated['subject'] == subject['pid']
+
+        cap = runtime.capability.grant(subject['pid'], 'object:gui-revoke', [CapabilityRight.READ], issued_by='test')
+        status, revoke_denied = self.request(
+            'POST',
+            f"/api/capabilities/{cap.cap_id}/revoke",
+            {'actor': actor['pid'], 'confirmed': True},
+        )
+        assert status == 403
+        assert 'lacks revoke/admin authority' in revoke_denied['error']['message']
+
+        runtime.capability.grant(actor['pid'], 'object:gui-revoke', [CapabilityRight.REVOKE], issued_by='test')
+        status, revoked = self.request(
+            'POST',
+            f"/api/capabilities/{cap.cap_id}/revoke",
+            {'actor': actor['pid'], 'confirmed': True},
+        )
+        assert status == 200
+        assert revoked['status'] == 'revoked'
+
     def test_image_register_accepts_package_files_and_rejects_host_file_path(self) -> None:
         files = _gui_image_package_files()
         status, denied = self.request('POST', '/api/images/register', {'files': files, 'source': 'gui-package-agent'})

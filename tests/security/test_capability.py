@@ -279,6 +279,42 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_grant_transfer_inherits_parent_expiration(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            issuer = runtime.process.spawn(image='base-agent:v0', goal='issuer')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            source = runtime.capability.issue_trusted(
+                issuer,
+                'object:leased',
+                [CapabilityRight.READ],
+                issued_by='test',
+                expires_at='2999-01-01T00:00:00Z',
+            )
+            runtime.capability.issue_trusted(issuer, 'object:leased', [CapabilityRight.GRANT], issued_by='test')
+
+            issued = runtime.capability.issue(
+                issuer,
+                subject,
+                CapabilitySpec(resource='object:leased', rights={CapabilityRight.READ.value}),
+            )
+
+            assert issued.parent_cap_id == source.cap_id
+            assert issued.expires_at == source.expires_at
+            assert runtime.capability.inspect(issued.cap_id)['expires_at'] == source.expires_at
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(
+                    issuer,
+                    subject,
+                    CapabilitySpec(
+                        resource='object:leased',
+                        rights={CapabilityRight.READ.value},
+                        expires_at='3000-01-01T00:00:00Z',
+                    ),
+                )
+        finally:
+            runtime.close()
+
     def test_one_time_capability_claim_is_conditional(self) -> None:
         runtime = Runtime.open('local')
         try:

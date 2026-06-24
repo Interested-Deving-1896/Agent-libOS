@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import CapabilityRight, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
+from agent_libos.models import CapabilityRight, CapabilitySpec, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -951,19 +951,48 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and route == ["grant"]:
             body = self._read_body()
             self._require_confirmed("capability.grant", body, {"subject": body.get("subject"), "resource": body.get("resource"), "rights": body.get("rights")})
-            cap = service.runtime.capability.grant(str(body["subject"]), str(body["resource"]), body.get("rights") or [CapabilityRight.READ.value], issued_by=str(body.get("actor") or "gui"))
+            rights = _gui_capability_rights(body.get("rights"))
+            actor = body.get("actor")
+            if actor is None:
+                cap = service.runtime.capability.grant(
+                    str(body["subject"]),
+                    str(body["resource"]),
+                    rights,
+                    issued_by="gui",
+                )
+            else:
+                cap = service.runtime.capability.issue(
+                    actor=str(actor),
+                    subject=str(body["subject"]),
+                    spec=CapabilitySpec(resource=str(body["resource"]), rights=set(rights)),
+                    require_authority=True,
+                )
             service.publish_runtime_changes("capability.grant")
             return to_jsonable(cap)
         if method == "POST" and route == ["delegate"]:
             body = self._read_body()
             self._require_confirmed("capability.delegate", body, {"parent": body.get("parent"), "child": body.get("child"), "resource": body.get("resource"), "rights": body.get("rights")})
-            cap = service.runtime.capability.delegate(str(body["parent"]), str(body["child"]), {"resource": body["resource"], "rights": body.get("rights") or [CapabilityRight.READ.value]}, actor=str(body.get("actor") or "gui"))
+            actor = body.get("actor")
+            parent = str(body["parent"])
+            if actor is not None and parent != str(actor):
+                raise CapabilityDenied("GUI actor-mode delegation may only delegate from the actor process")
+            cap = service.runtime.capability.delegate(
+                parent,
+                str(body["child"]),
+                {"resource": body["resource"], "rights": _gui_capability_rights(body.get("rights"))},
+                actor=str(actor or "gui"),
+            )
             service.publish_runtime_changes("capability.delegate")
             return to_jsonable(cap)
         if method == "POST" and len(route) == 2 and route[1] == "revoke":
             body = self._read_body()
             self._require_confirmed("capability.revoke", body, {"capability_id": route[0], "reason": body.get("reason")})
-            cap = service.runtime.capability.revoke(route[0], revoked_by=str(body.get("actor") or "gui"), reason=body.get("reason"), require_authority=False)
+            cap = service.runtime.capability.revoke(
+                route[0],
+                revoked_by=str(body.get("actor") or "gui"),
+                reason=body.get("reason"),
+                require_authority=body.get("actor") is not None,
+            )
             service.publish_runtime_changes("capability.revoke")
             return to_jsonable(cap)
         if method == "POST" and route == ["explain"]:
@@ -1306,6 +1335,14 @@ def _positive_int_or_none(value: Any, name: str) -> int | None:
     if parsed <= 0:
         raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{name} must be a positive integer or omitted")
     return parsed
+
+
+def _gui_capability_rights(value: Any) -> list[str]:
+    if value is None:
+        return [CapabilityRight.READ.value]
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
 
 
 def _bounded_float_or_default(value: Any, name: str, *, default: float, maximum: float) -> float:
