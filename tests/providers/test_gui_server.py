@@ -323,6 +323,7 @@ class TestGuiServer:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'object task', 'auto_run': False})
         assert status == 200
         pid = spawned['pid']
+        self.server.service.runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         owner = self.server.service.runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,
@@ -365,6 +366,7 @@ class TestGuiServer:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'object task watch', 'auto_run': False})
         assert status == 200
         pid = spawned['pid']
+        self.server.service.runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         owner = self.server.service.runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,
