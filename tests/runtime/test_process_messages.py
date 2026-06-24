@@ -6,9 +6,14 @@ import tempfile
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import ProcessMessageKind, ProcessStatus
+from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessStatus
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
+
+
+def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
 
 class TestProcessMessage:
 
@@ -16,6 +21,7 @@ class TestProcessMessage:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             sent = runtime.tools.call(parent, 'send_process_message', {'recipient_pid': child, 'kind': 'normal', 'subject': 'status', 'body': 'send a status update', 'payload': {'priority': 1}})
             assert sent.ok, sent.error
@@ -62,6 +68,7 @@ class TestProcessMessage:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             parent_session = LibOSSyscallSession(runtime, parent)
             child_session = LibOSSyscallSession(runtime, child)
@@ -78,6 +85,7 @@ class TestProcessMessage:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             first = runtime.messages.send_from_process(parent, child, channel='control', correlation_id='job-1', subject='request', body='start')
             runtime.messages.send_from_process(parent, child, channel='noise', correlation_id='job-1', subject='ignore')
@@ -208,6 +216,7 @@ class TestProcessMessage:
         runtime.llm.client = client
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'wait for control message')
             waiting = runtime.run_process_once(child)
             assert waiting['waiting_message']
@@ -239,6 +248,7 @@ class TestProcessMessage:
         try:
             runtime.scheduler.poll_interval_s = 0.001
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'wait via syscall')
             child_session = LibOSSyscallSession(runtime, child)
 
@@ -269,6 +279,7 @@ class TestProcessMessage:
         try:
             runtime.scheduler.poll_interval_s = 0.001
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'default receive')
             child_session = LibOSSyscallSession(runtime, child)
 

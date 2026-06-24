@@ -413,6 +413,7 @@ class TestImageRegistration:
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
+                runtime.capability.grant(pid, runtime.image_registry.resource_for('package-agent:v0'), [CapabilityRight.READ], issued_by='test')
                 runtime.exec_process(pid, 'package-agent:v0', goal='after exec', preserve_capabilities=False)
                 process = runtime.process.get(pid)
 
@@ -432,6 +433,7 @@ class TestImageRegistration:
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
+                runtime.capability.grant(pid, runtime.image_registry.resource_for('package-agent:v0'), [CapabilityRight.READ], issued_by='test')
                 before = runtime.process.get(pid)
 
                 with pytest.raises(ValidationError, match='package validation failed'):

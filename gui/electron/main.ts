@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { databaseTargetFromRenderer } from "./database.js";
 import { readImagePackageFiles } from "./imagePackage.js";
 
 type ServerConnection = {
@@ -383,7 +384,7 @@ ipcMain.handle("libos:chooseImagePackage", async () => {
 });
 
 ipcMain.handle("libos:useDatabase", async (_event, db: string) => {
-  return startRuntimeServer(db && db.trim() ? db.trim() : "local");
+  return startRuntimeServer(databaseTargetFromRenderer(db));
 });
 
 ipcMain.handle("libos:openExternal", async (_event, url: string) => {

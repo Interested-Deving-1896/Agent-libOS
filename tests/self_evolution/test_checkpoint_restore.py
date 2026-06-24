@@ -29,6 +29,7 @@ class TestCheckpointRestore:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='root')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
             child = runtime.spawn_child_process(pid, 'child')
             unrelated = runtime.process.spawn(image='base-agent:v0', goal='other')
             handle = runtime.memory.create_object(pid, ObjectType.SUMMARY, {'version': 1}, ObjectMetadata(title='state'), immutable=False, name='state')
@@ -151,6 +152,7 @@ class TestCheckpointRestore:
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
             try:
                 owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+                runtime.capability.grant(owner, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
                 child = runtime.spawn_child_process(owner, 'child')
                 unrelated = runtime.process.spawn(image='base-agent:v0', goal='other')
                 runtime.filesystem.grant_path(owner, 'owner.txt', [CapabilityRight.WRITE], issued_by='test')

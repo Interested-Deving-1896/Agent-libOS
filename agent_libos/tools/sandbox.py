@@ -110,11 +110,6 @@ class DenoTypescriptSandbox(SandboxBackend):
     libOS runtime broker over stdin/stdout.
     """
 
-    _IMPORT_RE = re.compile(
-        r"^\s*(?:import|export)\s+(?:[^\"']*?\s+from\s+)?[\"']([^\"']+)[\"']",
-        re.MULTILINE,
-    )
-    _SIDE_EFFECT_IMPORT_RE = re.compile(r"^\s*import\s*[\"']([^\"']+)[\"']", re.MULTILINE)
     _RUN_EXPORT_RE = re.compile(r"export\s+(?:async\s+)?function\s+run\s*\(\s*args\b[\s\S]*?,\s*libos\b")
 
     def __init__(
@@ -150,7 +145,7 @@ class DenoTypescriptSandbox(SandboxBackend):
             errors.append(f"TypeScript tool source exceeds max chars: {self.max_source_chars}")
         if not self._RUN_EXPORT_RE.search(source_code):
             errors.append("TypeScript tool source must export function run(args, libos)")
-        if re.search(r"\bimport\s*\(", source_code):
+        if self._contains_dynamic_import(source_code):
             errors.append("dynamic import() is not allowed")
         for specifier in self._extract_imports(source_code):
             parsed = self._jsr_package_and_version(specifier)
@@ -604,10 +599,218 @@ class DenoTypescriptSandbox(SandboxBackend):
         digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         return text[: self.max_validation_log_chars] + f"\n[validation logs truncated chars={len(text)} sha256={digest}]"
 
+    def _contains_dynamic_import(self, source_code: str) -> bool:
+        tokens = self._typescript_tokens(source_code)
+        for index, token in enumerate(tokens):
+            if token != ("identifier", "import"):
+                continue
+            previous_token = tokens[index - 1] if index > 0 else None
+            if previous_token == ("punct", "."):
+                continue
+            next_token = tokens[index + 1] if index + 1 < len(tokens) else None
+            if next_token == ("punct", "("):
+                if self._looks_like_method_definition(tokens, index):
+                    continue
+                return True
+        return False
+
     def _extract_imports(self, source_code: str) -> list[str]:
-        imports = [match.group(1) for match in self._IMPORT_RE.finditer(source_code)]
-        imports.extend(match.group(1) for match in self._SIDE_EFFECT_IMPORT_RE.finditer(source_code))
-        return sorted(set(imports))
+        tokens = self._typescript_tokens(source_code)
+        imports: set[str] = set()
+        for index, token in enumerate(tokens):
+            if token == ("identifier", "import"):
+                imports.update(self._module_specifier_after_import(tokens, index))
+            elif token == ("identifier", "export"):
+                imports.update(self._module_specifier_after_export(tokens, index))
+        return sorted(imports)
+
+    def _module_specifier_after_import(self, tokens: list[tuple[str, str]], index: int) -> list[str]:
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else None
+        if next_token is None or next_token == ("punct", "("):
+            return []
+        if next_token[0] == "string":
+            return [next_token[1]]
+        specifier = self._string_after_from(tokens, index + 1)
+        return [specifier] if specifier is not None else []
+
+    def _module_specifier_after_export(self, tokens: list[tuple[str, str]], index: int) -> list[str]:
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else None
+        if next_token is not None and next_token[0] == "identifier" and next_token[1] in {
+            "abstract",
+            "async",
+            "class",
+            "const",
+            "declare",
+            "default",
+            "enum",
+            "function",
+            "interface",
+            "let",
+            "namespace",
+            "var",
+        }:
+            return []
+        specifier = self._string_after_from(tokens, index + 1)
+        return [specifier] if specifier is not None else []
+
+    def _looks_like_method_definition(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        previous_token = tokens[index - 1] if index > 0 else None
+        if previous_token not in {("punct", "{"), ("punct", ",")}:
+            return False
+        depth = 0
+        for cursor in range(index + 1, len(tokens)):
+            token = tokens[cursor]
+            if token == ("punct", "("):
+                depth += 1
+                continue
+            if token == ("punct", ")"):
+                depth -= 1
+                if depth == 0:
+                    next_token = tokens[cursor + 1] if cursor + 1 < len(tokens) else None
+                    return next_token == ("punct", "{")
+        return False
+
+    def _string_after_from(self, tokens: list[tuple[str, str]], index: int) -> str | None:
+        for cursor in range(index, len(tokens)):
+            kind, value = tokens[cursor]
+            if (kind, value) == ("punct", ";"):
+                return None
+            if (kind, value) != ("identifier", "from"):
+                continue
+            next_token = tokens[cursor + 1] if cursor + 1 < len(tokens) else None
+            return next_token[1] if next_token is not None and next_token[0] == "string" else None
+        return None
+
+    def _typescript_tokens(self, source_code: str) -> list[tuple[str, str]]:
+        tokens: list[tuple[str, str]] = []
+        index = 0
+        length = len(source_code)
+        while index < length:
+            char = source_code[index]
+            if char.isspace():
+                index += 1
+                continue
+            if char == "/" and index + 1 < length and source_code[index + 1] == "/":
+                index = self._skip_line_comment(source_code, index + 2)
+                continue
+            if char == "/" and index + 1 < length and source_code[index + 1] == "*":
+                index = self._skip_block_comment(source_code, index + 2)
+                continue
+            if char in {"'", '"'}:
+                value, index = self._read_string_literal(source_code, index)
+                tokens.append(("string", value))
+                continue
+            if char == "`":
+                template_tokens, index = self._read_template_literal_tokens(source_code, index + 1)
+                tokens.extend(template_tokens)
+                continue
+            if self._is_identifier_start(char):
+                start = index
+                index += 1
+                while index < length and self._is_identifier_part(source_code[index]):
+                    index += 1
+                tokens.append(("identifier", source_code[start:index]))
+                continue
+            if char in "(){}[];,.":
+                tokens.append(("punct", char))
+            index += 1
+        return tokens
+
+    def _skip_line_comment(self, source_code: str, index: int) -> int:
+        newline = source_code.find("\n", index)
+        return len(source_code) if newline == -1 else newline + 1
+
+    def _skip_block_comment(self, source_code: str, index: int) -> int:
+        end = source_code.find("*/", index)
+        return len(source_code) if end == -1 else end + 2
+
+    def _read_string_literal(self, source_code: str, index: int) -> tuple[str, int]:
+        quote = source_code[index]
+        chars: list[str] = []
+        index += 1
+        while index < len(source_code):
+            char = source_code[index]
+            if char == "\\":
+                if index + 1 < len(source_code):
+                    chars.append(source_code[index + 1])
+                    index += 2
+                    continue
+                index += 1
+                break
+            if char == quote:
+                return "".join(chars), index + 1
+            chars.append(char)
+            index += 1
+        return "".join(chars), index
+
+    def _read_template_literal_tokens(self, source_code: str, index: int) -> tuple[list[tuple[str, str]], int]:
+        tokens: list[tuple[str, str]] = []
+        while index < len(source_code):
+            char = source_code[index]
+            if char == "\\":
+                index += 2
+                continue
+            if char == "`":
+                return tokens, index + 1
+            if char == "$" and index + 1 < len(source_code) and source_code[index + 1] == "{":
+                expression_tokens, index = self._read_template_expression_tokens(source_code, index + 2)
+                tokens.extend(expression_tokens)
+                continue
+            index += 1
+        return tokens, index
+
+    def _read_template_expression_tokens(self, source_code: str, index: int) -> tuple[list[tuple[str, str]], int]:
+        tokens: list[tuple[str, str]] = []
+        depth = 1
+        length = len(source_code)
+        while index < length:
+            char = source_code[index]
+            if char.isspace():
+                index += 1
+                continue
+            if char == "/" and index + 1 < length and source_code[index + 1] == "/":
+                index = self._skip_line_comment(source_code, index + 2)
+                continue
+            if char == "/" and index + 1 < length and source_code[index + 1] == "*":
+                index = self._skip_block_comment(source_code, index + 2)
+                continue
+            if char in {"'", '"'}:
+                value, index = self._read_string_literal(source_code, index)
+                tokens.append(("string", value))
+                continue
+            if char == "`":
+                template_tokens, index = self._read_template_literal_tokens(source_code, index + 1)
+                tokens.extend(template_tokens)
+                continue
+            if self._is_identifier_start(char):
+                start = index
+                index += 1
+                while index < length and self._is_identifier_part(source_code[index]):
+                    index += 1
+                tokens.append(("identifier", source_code[start:index]))
+                continue
+            if char == "{":
+                depth += 1
+                tokens.append(("punct", char))
+                index += 1
+                continue
+            if char == "}":
+                depth -= 1
+                if depth == 0:
+                    return tokens, index + 1
+                tokens.append(("punct", char))
+                index += 1
+                continue
+            if char in "()[];,.":
+                tokens.append(("punct", char))
+            index += 1
+        return tokens, index
+
+    def _is_identifier_start(self, char: str) -> bool:
+        return char == "_" or char == "$" or char.isalpha()
+
+    def _is_identifier_part(self, char: str) -> bool:
+        return self._is_identifier_start(char) or char.isdigit()
 
     def _jsr_package_and_version(self, specifier: str) -> tuple[str, str | None] | None:
         if not specifier.startswith("jsr:"):

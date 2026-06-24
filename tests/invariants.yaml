@@ -64,6 +64,10 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_requires_process_spawn_authority",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_fork_syscall_requires_process_spawn_authority",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_cross_image_spawn_and_exec_require_image_read_authority",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_start_requires_process_spawn_authority",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_inherits_only_explicit_capabilities",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exec_process_swaps_image_without_granting_target_image_capabilities",
         "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_shell_tool_runs_from_process_working_directory"
@@ -179,6 +183,7 @@
         "tests/runtime/test_pty_module.py::TestPtyModule::test_shell_once_approval_does_not_authorize_pty_spawn",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_other_process_without_object_capability_cannot_operate_pty",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_fails_closed_without_budget_limit_support",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_charges_returned_subprocess_metrics",
@@ -245,6 +250,7 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_specs_are_conservative_side_effects",
@@ -424,6 +430,7 @@
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_undeclared_root_files",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_spawns_baked_memory_without_external_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_exec_into_committed_image_restores_baked_memory_without_granting_required_caps",
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_boot_requires_image_read_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_remains_process_local",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_source_survives_runtime_reopen",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_package_external_registry_or_skill_trust"

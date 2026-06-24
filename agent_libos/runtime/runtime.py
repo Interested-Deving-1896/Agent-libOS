@@ -22,6 +22,9 @@ from agent_libos.models import (
     AgentImage,
     CapabilityRight,
     EventType,
+    ForkMode,
+    MemoryView,
+    MemoryViewSpec,
     ObjectHandle,
     ObjectOwnerKind,
     ProcessStatus,
@@ -685,6 +688,7 @@ class Runtime:
             goal=goal if goal is not None else f"workflow:{tool_name}",
             working_directory=working_directory,
         )
+        self._grant_workflow_tool_authority(pid, selected_image, tool_name, tool_args)
         initial = self.process.get(pid)
         initial_image = initial.image_id
         initial_goal_oid = initial.goal_oid
@@ -775,6 +779,21 @@ class Runtime:
             child_pid=child_pid,
             waiting_message=waiting_message,
             filters=dict(filters or {}) if filters is not None else None,
+        )
+
+    def _grant_workflow_tool_authority(self, pid: str, selected_image: str, tool_name: str, tool_args: dict[str, Any]) -> None:
+        if tool_name != "exec_process":
+            return
+        target_image = tool_args.get("image")
+        if not isinstance(target_image, str) or target_image == selected_image:
+            return
+        if target_image not in self.images:
+            return
+        self.capability.grant(
+            pid,
+            self.image_registry.resource_for(target_image),
+            [CapabilityRight.READ],
+            issued_by="workflow",
         )
 
     def _workflow_result_from_tool_call(
@@ -923,7 +942,10 @@ class Runtime:
         preserve_capabilities: bool = False,
         llm_profile_id: str | None = None,
     ) -> Any:
+        process = self.process.get(pid)
         selected_image = self._require_image(image)
+        if image != process.image_id:
+            self._require_process_image_boot_authority(pid, image)
         self._preflight_process_image_boot(selected_image)
         previous_state = self._snapshot_process_exec_state(pid)
         self.process.exec(
@@ -973,6 +995,9 @@ class Runtime:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
         self._require_image(selected_image)
+        self._require_process_spawn_authority(parent)
+        if selected_image != parent_process.image_id:
+            self._require_process_image_boot_authority(parent, selected_image)
         selected_cwd = (
             self.resolve_process_working_directory(parent, working_directory)
             if working_directory is not None
@@ -988,9 +1013,48 @@ class Runtime:
             llm_profile_id=llm_profile_id,
         )
 
+    def fork_child_process(
+        self,
+        parent: str,
+        goal: dict[str, Any] | str | ObjectHandle,
+        *,
+        memory_view: MemoryView | MemoryViewSpec | None = None,
+        capabilities: list[dict[str, Any]] | None = None,
+        inherit_capabilities: list[dict[str, Any]] | None = None,
+        resource_budget: Any | None = None,
+        image: str | None = None,
+        mode: ForkMode | str = ForkMode.RESTRICTED,
+        working_directory: str | None = None,
+        llm_profile_id: str | None = None,
+    ) -> str:
+        parent_process = self.process.get(parent)
+        selected_image = image or parent_process.image_id
+        self._require_image(selected_image)
+        self._require_process_spawn_authority(parent)
+        if selected_image != parent_process.image_id:
+            self._require_process_image_boot_authority(parent, selected_image)
+        return self.process.fork(
+            parent=parent,
+            goal=goal,
+            memory_view=memory_view,
+            capabilities=capabilities,
+            inherit_capabilities=inherit_capabilities,
+            resource_budget=resource_budget,
+            image=selected_image,
+            mode=mode,
+            working_directory=working_directory,
+            llm_profile_id=llm_profile_id,
+        )
+
     def set_process_working_directory(self, pid: str, path: str) -> Any:
         relative = self.resolve_process_working_directory(pid, path)
         return self.process.set_working_directory(pid, relative)
+
+    def _require_process_spawn_authority(self, pid: str) -> None:
+        self.capability.require(pid, "process:spawn", CapabilityRight.WRITE)
+
+    def _require_process_image_boot_authority(self, pid: str, image_id: str) -> None:
+        self.capability.require(pid, self.image_registry.resource_for(image_id), CapabilityRight.READ)
 
     def _resolve_launch_llm_profile_id(self, image_id: str, explicit_profile_id: str | None) -> str:
         if explicit_profile_id is not None:
