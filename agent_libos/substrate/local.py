@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.client
 import heapq
 import os
+import signal
 import shutil
 import socket
 import ssl
@@ -258,6 +260,7 @@ class LocalShellProvider:
                 shell=False,
                 stdout=stdout_file,
                 stderr=stderr_file,
+                **self._process_group_kwargs(),
             )
             ps_proc = psutil.Process(proc.pid)
             peak_memory = 0
@@ -292,6 +295,7 @@ class LocalShellProvider:
                             pass
                         break
                     if proc.poll() is not None:
+                        self._terminate_process_group(proc)
                         break
                     time.sleep(0.02)
             finally:
@@ -421,7 +425,16 @@ class LocalShellProvider:
                 continue
         return cpu_seconds, max(peak_memory, memory_bytes)
 
+    def _process_group_kwargs(self) -> dict[str, Any]:
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"start_new_session": True}
+
     def _kill_process_tree(self, ps_proc: psutil.Process, proc: subprocess.Popen[str]) -> None:
+        # The direct child may exit after spawning background work, at which
+        # point psutil no longer sees those processes as descendants. A process
+        # group gives the provider one cleanup handle for the whole shell run.
+        self._terminate_process_group(proc)
         processes: list[psutil.Process] = []
         try:
             processes.extend(ps_proc.children(recursive=True))
@@ -444,6 +457,17 @@ class LocalShellProvider:
                 proc.kill()
             except ProcessLookupError:
                 pass
+
+    def _terminate_process_group(self, proc: subprocess.Popen[str]) -> None:
+        if os.name == "nt":
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
 
 class LocalHumanProvider:

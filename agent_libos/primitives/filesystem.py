@@ -597,6 +597,8 @@ class FilesystemAdapter:
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"file does not exist: {relative}")
+            # A no-op delete still consumes the exact one-shot approval: if the
+            # path appears later, this grant must not turn into a real delete.
             self._reserve_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False)
         if target_state.kind != "file":
@@ -691,6 +693,8 @@ class FilesystemAdapter:
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"directory does not exist: {relative}")
+            # A no-op delete still consumes the exact one-shot approval: if the
+            # path appears later, this grant must not turn into a real delete.
             self._reserve_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
         if target_state.kind != "directory":
