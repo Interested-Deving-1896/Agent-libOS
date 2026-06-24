@@ -1020,6 +1020,8 @@ class ShellAdapter:
         return value[:limit], True
 
     def _command_identity(self, argv0: str) -> str:
+        if self._argv0_has_path(argv0):
+            return argv0.strip().replace("\\", "/").casefold()
         return self._normalize_executable(argv0)
 
     def _normalize_executable(self, value: str) -> str:

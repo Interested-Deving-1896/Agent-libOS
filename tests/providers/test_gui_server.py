@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
-from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType
+from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
 
@@ -157,6 +157,24 @@ class TestGuiServer:
         assert status == 200
         assert 'audit.window.204' in actions
         assert 'audit.window.0' not in actions
+
+    def test_snapshot_truncates_model_amplified_event_payloads(self) -> None:
+        huge = 'x' * (self.server.service.runtime.config.gui.snapshot_string_max_chars + 100)
+        self.server.service.runtime.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source='gui-test',
+            target='gui-test',
+            payload={'blob': huge},
+        )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        serialized = json.dumps(snapshot)
+        assert huge not in serialized
+        event = snapshot['events'][-1]
+        assert event['payload']['blob']['truncated'] is True
+        assert len(event['payload']['blob']['preview']) == self.server.service.runtime.config.gui.snapshot_string_max_chars
 
     def test_process_audit_filters_before_limit(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'audit target', 'auto_run': False})

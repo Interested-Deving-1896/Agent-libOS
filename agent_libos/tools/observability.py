@@ -105,8 +105,7 @@ def sanitize_for_observability(
     sensitive_keys: frozenset[str] = SENSITIVE_OBSERVABILITY_KEYS,
 ) -> dict[str, Any]:
     redacted = _redact_value(value, sensitive_keys=sensitive_keys)
-    envelope = observation_envelope(value, preview_chars=preview_chars)
-    envelope["preview"] = observation_envelope(redacted, preview_chars=preview_chars)["preview"]
+    envelope = observation_envelope(redacted, preview_chars=preview_chars)
     envelope["redacted"] = redacted != to_jsonable(value)
     return envelope
 
@@ -118,9 +117,7 @@ def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
         for key, item in jsonable.items():
             key_text = str(key)
             if _is_sensitive_observability_key(key_text, sensitive_keys=sensitive_keys):
-                envelope = observation_envelope(item)
-                envelope["preview"] = "[redacted]"
-                redacted[key_text] = {"redacted": True, **envelope}
+                redacted[key_text] = {"redacted": True, "preview": "[redacted]"}
             else:
                 redacted[key_text] = _redact_value(item, sensitive_keys=sensitive_keys)
         return redacted

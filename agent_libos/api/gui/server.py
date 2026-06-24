@@ -34,6 +34,45 @@ _TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _CONFIG_DEFAULT = object()
 
 
+def _bounded_gui_value(value: Any, *, string_limit: int, collection_limit: int) -> Any:
+    jsonable = to_jsonable(value)
+    if isinstance(jsonable, str):
+        if len(jsonable) <= string_limit:
+            return jsonable
+        return {
+            "truncated": True,
+            "chars": len(jsonable),
+            "preview": jsonable[:string_limit],
+        }
+    if isinstance(jsonable, list):
+        selected = [_bounded_gui_value(item, string_limit=string_limit, collection_limit=collection_limit) for item in jsonable[:collection_limit]]
+        if len(jsonable) > collection_limit:
+            selected.append({"truncated": True, "omitted": len(jsonable) - collection_limit})
+        return selected
+    if isinstance(jsonable, dict):
+        items = list(jsonable.items())
+        bounded = {
+            str(key): _bounded_gui_value(item, string_limit=string_limit, collection_limit=collection_limit)
+            for key, item in items[:collection_limit]
+        }
+        if len(items) > collection_limit:
+            bounded["_truncated"] = {"omitted": len(items) - collection_limit}
+        return bounded
+    return jsonable
+
+
+def _sse_payload_data(data: dict[str, Any], *, max_bytes: int, string_limit: int, collection_limit: int) -> dict[str, Any]:
+    bounded = _bounded_gui_value(data, string_limit=string_limit, collection_limit=collection_limit)
+    encoded = json.dumps(bounded, ensure_ascii=False, default=str).encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return bounded
+    return {
+        "truncated": True,
+        "bytes": len(encoded),
+        "reason": "gui event payload exceeds sse_payload_max_bytes",
+    }
+
+
 class GuiServerError(Exception):
     def __init__(self, status: int, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -325,17 +364,18 @@ class GuiRuntimeService:
         with self.runtime_lock:
             processes = [self._process_summary(process.pid, include_messages=True) for process in self.runtime.process.list()]
             static = self._static_snapshot()
-            return {
+            snapshot = {
                 "db": self.db,
                 "scheduler": self.scheduler.status(),
                 "processes": processes,
                 "human_requests": to_jsonable(self.runtime.human.list()),
-                "events": to_jsonable(self.runtime.events.list()[-200:]),
-                "audit": to_jsonable(self.runtime.audit.trace(limit=200)),
-                "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=100)),
-                "object_tasks": to_jsonable(self.runtime.object_tasks.list()),
+                "events": to_jsonable(self.runtime.events.list()[-self.runtime.config.gui.snapshot_event_limit :]),
+                "audit": to_jsonable(self.runtime.audit.trace(limit=self.runtime.config.gui.snapshot_audit_limit)),
+                "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=self.runtime.config.gui.snapshot_llm_call_limit)),
+                "object_tasks": to_jsonable(self.runtime.object_tasks.list(limit=self.runtime.config.gui.snapshot_object_task_limit)),
                 **static,
             }
+            return self._bounded_snapshot(snapshot)
 
     def _static_snapshot(self) -> dict[str, Any]:
         if self._static_snapshot_cache is None or self._static_snapshot_dirty:
@@ -355,8 +395,12 @@ class GuiRuntimeService:
     def _process_summary(self, pid: str, *, include_messages: bool = False) -> dict[str, Any]:
         process = self.runtime.process.get(pid)
         unread = self.runtime.messages.list(pid, include_acked=False)
-        messages = self.runtime.messages.list(pid, include_acked=True, limit=100) if include_messages else []
-        calls = self.runtime.store.list_llm_calls(pid=pid, limit=20)
+        messages = (
+            self.runtime.messages.list(pid, include_acked=True, limit=self.runtime.config.gui.snapshot_process_message_limit)
+            if include_messages
+            else []
+        )
+        calls = self.runtime.store.list_llm_calls(pid=pid, limit=self.runtime.config.gui.snapshot_process_llm_call_limit)
         return {
             **to_jsonable(process),
             "terminal": process.status in _TERMINAL,
@@ -367,6 +411,13 @@ class GuiRuntimeService:
             "token_total": sum(int((call.usage or {}).get("total_tokens", 0) or 0) for call in calls),
             "resource_remaining": to_jsonable(self.runtime.resources.remaining_budget(pid)),
         }
+
+    def _bounded_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_gui_value(
+            snapshot,
+            string_limit=self.runtime.config.gui.snapshot_string_max_chars,
+            collection_limit=self.runtime.config.gui.snapshot_collection_max_items,
+        )
 
     def _tool_summaries(self) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
@@ -1090,7 +1141,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         threading.Thread(target=shutdown_after_response, name="agent-libos-gui-http-shutdown", daemon=True).start()
 
     def _write_sse(self, event: GuiEvent) -> None:
-        payload = json.dumps(to_jsonable(event.data), ensure_ascii=False, default=str)
+        payload_data = _sse_payload_data(
+            event.data,
+            max_bytes=self.server.service.runtime.config.gui.sse_payload_max_bytes,
+            string_limit=self.server.service.runtime.config.gui.snapshot_string_max_chars,
+            collection_limit=self.server.service.runtime.config.gui.snapshot_collection_max_items,
+        )
+        payload = json.dumps(payload_data, ensure_ascii=False, default=str)
         self.wfile.write(f"id: {event.seq}\nevent: {event.event}\ndata: {payload}\n\n".encode("utf-8"))
         self.wfile.flush()
 

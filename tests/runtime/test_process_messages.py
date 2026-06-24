@@ -104,6 +104,7 @@ class TestProcessMessage:
             too_long_subject = 's' * (runtime.config.tools.message_subject_max_chars + 1)
             too_long_body = 'b' * (runtime.config.tools.message_body_max_chars + 1)
             oversized_payload = {'blob': 'x' * runtime.config.tools.message_payload_max_bytes}
+            too_long_id = 'i' * (runtime.config.tools.message_id_max_chars + 1)
 
             with pytest.raises(ValidationError):
                 runtime.messages.post(sender='test', recipient_pid=pid, subject=too_long_subject)
@@ -111,6 +112,10 @@ class TestProcessMessage:
                 runtime.messages.post(sender='test', recipient_pid=pid, body=too_long_body)
             with pytest.raises(ValidationError):
                 runtime.messages.post(sender='test', recipient_pid=pid, payload=oversized_payload)
+            with pytest.raises(ValidationError):
+                runtime.messages.post(sender='test', recipient_pid=pid, correlation_id=too_long_id)
+            with pytest.raises(ValidationError):
+                runtime.messages.post(sender='test', recipient_pid=pid, reply_to=too_long_id)
 
             for index in range(runtime.config.tools.message_read_limit + 5):
                 runtime.messages.post(sender='test', recipient_pid=pid, subject=f'msg-{index}')
@@ -123,6 +128,25 @@ class TestProcessMessage:
                     pid,
                     message_ids=[f'pmsg_{index}' for index in range(runtime.config.tools.message_filter_ids_hard_limit + 1)],
                 )
+            with pytest.raises(ValidationError):
+                runtime.messages.receive(pid, message_ids=[too_long_id])
+        finally:
+            runtime.close()
+
+    def test_blocking_receive_rejects_oversized_wait_filters_before_status_write(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='oversized wait filters')
+            ids = [
+                f'pmsg_{index:04d}_' + ('x' * (runtime.config.tools.message_id_max_chars - 10))
+                for index in range(runtime.config.tools.message_filter_ids_hard_limit)
+            ]
+
+            with pytest.raises(ValidationError):
+                runtime.messages.receive(pid, block=True, message_ids=ids)
+
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(pid).status_message is None
         finally:
             runtime.close()
 
