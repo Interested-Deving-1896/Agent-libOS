@@ -33,6 +33,7 @@ _EXACT_JSR_VERSION_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 _RUNTIME_CODE_GENERATION_NAMES = {"eval", "Function", "AsyncFunction", "GeneratorFunction", "AsyncGeneratorFunction"}
+_RUNTIME_GLOBAL_OBJECT_NAMES = {"globalThis", "window"}
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
 
@@ -630,53 +631,133 @@ class DenoTypescriptSandbox(SandboxBackend):
     def _contains_runtime_code_generation(self, source_code: str) -> bool:
         tokens = self._typescript_tokens(source_code)
         for index, token in enumerate(tokens):
+            if token[0] == "identifier" and token[1] in _RUNTIME_GLOBAL_OBJECT_NAMES:
+                if self._token_starts_global_runtime_code_generation_property(tokens, index):
+                    return True
             if token[0] == "identifier" and token[1] in _RUNTIME_CODE_GENERATION_NAMES:
                 if self._looks_like_method_definition(tokens, index):
                     continue
                 previous_token = tokens[index - 1] if index > 0 else None
-                previous_previous_token = tokens[index - 2] if index > 1 else None
-                if previous_token == ("punct", ".") and previous_previous_token in {
-                    ("identifier", "globalThis"),
-                    ("identifier", "window"),
-                }:
-                    return True
-                if previous_token != ("punct", ".") and self._token_is_call(tokens, index):
+                if previous_token == ("punct", "."):
+                    continue
+                if previous_token == ("punct", "["):
+                    continue
+                if self._looks_like_property_key(tokens, index):
+                    continue
+                if self._looks_like_declaration_name(tokens, index):
+                    continue
+                if self._looks_like_member_name(tokens, index):
+                    continue
+                return True
+            if token[0] == "string" and token[1] in _RUNTIME_CODE_GENERATION_NAMES:
+                if self._token_is_bracketed_global_property(tokens, index):
                     return True
             if token == ("identifier", "constructor"):
                 previous_token = tokens[index - 1] if index > 0 else None
                 if previous_token == ("punct", ".") and self._token_is_call(tokens, index):
-                    return True
-            if token[0] == "string" and token[1] in _RUNTIME_CODE_GENERATION_NAMES:
-                if self._token_is_bracketed_global_property(tokens, index):
                     return True
             if token == ("string", "constructor") and self._token_is_bracketed_property_call(tokens, index):
                 return True
         return False
 
     def _token_is_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        next_token = tokens[index + 1] if index + 1 < len(tokens) else None
-        return next_token == ("punct", "(")
+        return self._token_is_call_after(tokens, index)
+
+    def _token_is_call_after(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        cursor = index + 1
+        if cursor < len(tokens) and tokens[cursor] == ("punct", "?"):
+            cursor += 1
+            if cursor < len(tokens) and tokens[cursor] == ("punct", "."):
+                cursor += 1
+        if cursor < len(tokens) and tokens[cursor] == ("punct", "("):
+            return True
+        if cursor + 2 < len(tokens) and tokens[cursor] == ("punct", ".") and tokens[cursor + 1] == ("identifier", "call"):
+            return tokens[cursor + 2] == ("punct", "(")
+        return False
 
     def _token_is_bracketed_global_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        if index < 2 or index + 1 >= len(tokens):
+        property_name, open_index, _ = self._constant_bracket_property_name_at(tokens, index)
+        if property_name not in _RUNTIME_CODE_GENERATION_NAMES:
             return False
-        if tokens[index - 1] != ("punct", "["):
+        object_index = open_index - 1
+        if object_index < 0:
             return False
-        if tokens[index + 1] != ("punct", "]"):
-            return False
-        object_index = index - 2
         if tokens[object_index] == ("punct", ".") and object_index > 0:
             object_index -= 1
-        return tokens[object_index] in {("identifier", "globalThis"), ("identifier", "window")}
+        if tokens[object_index] == ("punct", "?") and object_index > 0:
+            object_index -= 1
+        return tokens[object_index][0] == "identifier" and tokens[object_index][1] in _RUNTIME_GLOBAL_OBJECT_NAMES
 
     def _token_is_bracketed_property_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        if index < 1 or index + 2 >= len(tokens):
+        property_name, _, close_index = self._constant_bracket_property_name_at(tokens, index)
+        return property_name == "constructor" and self._token_is_call_after(tokens, close_index)
+
+    def _token_starts_global_runtime_code_generation_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        cursor = index + 1
+        if cursor < len(tokens) and tokens[cursor] == ("punct", "?"):
+            cursor += 1
+        if cursor < len(tokens) and tokens[cursor] == ("punct", "."):
+            cursor += 1
+        if cursor >= len(tokens):
             return False
-        return (
-            tokens[index - 1] == ("punct", "[")
-            and tokens[index + 1] == ("punct", "]")
-            and tokens[index + 2] == ("punct", "(")
-        )
+        token = tokens[cursor]
+        if token[0] == "identifier":
+            return token[1] in _RUNTIME_CODE_GENERATION_NAMES
+        if token == ("punct", "["):
+            property_name, _ = self._constant_bracket_property_name_from_open(tokens, cursor)
+            return property_name in _RUNTIME_CODE_GENERATION_NAMES
+        return False
+
+    def _constant_bracket_property_name_at(
+        self, tokens: list[tuple[str, str]], index: int
+    ) -> tuple[str | None, int, int]:
+        if index < 1 or tokens[index - 1] != ("punct", "["):
+            return None, -1, -1
+        property_name, close_index = self._constant_bracket_property_name_from_open(tokens, index - 1)
+        return property_name, index - 1, close_index
+
+    def _constant_bracket_property_name_from_open(
+        self, tokens: list[tuple[str, str]], open_index: int
+    ) -> tuple[str | None, int]:
+        parts: list[str] = []
+        cursor = open_index + 1
+        expecting_string = True
+        while cursor < len(tokens):
+            token = tokens[cursor]
+            if token == ("punct", "]"):
+                return ("".join(parts), cursor) if parts and not expecting_string else (None, cursor)
+            if expecting_string and token[0] == "string":
+                parts.append(token[1])
+                expecting_string = False
+                cursor += 1
+                continue
+            if not expecting_string and token == ("punct", "+"):
+                expecting_string = True
+                cursor += 1
+                continue
+            return None, cursor
+        return None, cursor
+
+    def _looks_like_property_key(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        previous_token = tokens[index - 1] if index > 0 else None
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else None
+        return previous_token in {("punct", "{"), ("punct", ",")} and next_token == ("punct", ":")
+
+    def _looks_like_declaration_name(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        previous_token = tokens[index - 1] if index > 0 else None
+        return previous_token in {
+            ("identifier", "const"),
+            ("identifier", "let"),
+            ("identifier", "var"),
+            ("identifier", "function"),
+            ("identifier", "class"),
+            ("identifier", "interface"),
+            ("identifier", "type"),
+        }
+
+    def _looks_like_member_name(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        previous_token = tokens[index - 1] if index > 0 else None
+        return previous_token == ("punct", ".")
 
     def _extract_imports(self, source_code: str) -> list[str]:
         tokens = self._typescript_tokens(source_code)
@@ -775,7 +856,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                     index += 1
                 tokens.append(("identifier", source_code[start:index]))
                 continue
-            if char in "(){}[];,.":
+            if char in "(){}[];,.?+:":
                 tokens.append(("punct", char))
             index += 1
         return tokens
@@ -865,7 +946,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                 tokens.append(("punct", char))
                 index += 1
                 continue
-            if char in "()[];,.":
+            if char in "()[];,.?+:":
                 tokens.append(("punct", char))
             index += 1
         return tokens, index

@@ -429,10 +429,17 @@ class TestJitSecurity:
         bracket_function_import = checker.static_check('export async function run(args, libos) { const loader = globalThis["Function"]("s", "return import(s)"); return await loader(args.spec); }')
         bracket_function_call_import = checker.static_check('export async function run(args, libos) { return globalThis["Function"].call(null, "return import(args.spec)")(); }')
         bracket_eval_import = checker.static_check('export async function run(args, libos) { return await window["eval"]("import(args.spec)"); }')
+        optional_eval_import = checker.static_check('export async function run(args, libos) { return await eval?.("import(args.spec)"); }')
+        indirect_eval_import = checker.static_check('export async function run(args, libos) { return await (0, eval)("import(args.spec)"); }')
+        computed_eval_import = checker.static_check('export async function run(args, libos) { return await globalThis["ev" + "al"]("import(args.spec)"); }')
+        optional_function_import = checker.static_check('export async function run(args, libos) { const loader = Function?.("s", "return import(s)"); return await loader(args.spec); }')
+        function_call_import = checker.static_check('export async function run(args, libos) { const loader = Function.call(null, "s", "return import(s)"); return await loader(args.spec); }')
         async_function_import = checker.static_check('export async function run(args, libos) { const AsyncFunction = (async function() {}).constructor; return await AsyncFunction("return import(args.spec)")(); }')
         generator_function_import = checker.static_check('export function run(args, libos) { const GeneratorFunction = (function* () {}).constructor; return GeneratorFunction("yield 1")().next(); }')
         direct_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {}).constructor("return import(args.spec)")(); }')
         bracket_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {})["constructor"]("return import(args.spec)")(); }')
+        optional_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {}).constructor?.("return import(args.spec)")(); }')
+        bracket_constructor_call_import = checker.static_check('export async function run(args, libos) { return await (async function() {})["constructor"].call(null, "return import(args.spec)")(); }')
         local_methods = checker.static_check(
             'export function run(args, libos) { '
             'const obj = { eval() { return 1; }, Function() { return 2; } }; '
@@ -453,6 +460,16 @@ class TestJitSecurity:
         assert any('runtime code generation is not allowed' in error for error in bracket_function_call_import.errors)
         assert not bracket_eval_import.ok
         assert any('runtime code generation is not allowed' in error for error in bracket_eval_import.errors)
+        assert not optional_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_eval_import.errors)
+        assert not indirect_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in indirect_eval_import.errors)
+        assert not computed_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in computed_eval_import.errors)
+        assert not optional_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_function_import.errors)
+        assert not function_call_import.ok
+        assert any('runtime code generation is not allowed' in error for error in function_call_import.errors)
         assert not async_function_import.ok
         assert any('runtime code generation is not allowed' in error for error in async_function_import.errors)
         assert not generator_function_import.ok
@@ -461,6 +478,10 @@ class TestJitSecurity:
         assert any('runtime code generation is not allowed' in error for error in direct_constructor_import.errors)
         assert not bracket_constructor_import.ok
         assert any('runtime code generation is not allowed' in error for error in bracket_constructor_import.errors)
+        assert not optional_constructor_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_constructor_import.errors)
+        assert not bracket_constructor_call_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_constructor_call_import.errors)
         assert local_methods.ok, local_methods.errors
 
     def test_deno_executable_resolution_rejects_workspace_path_hijack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
