@@ -28,10 +28,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Deno
-        uses: denoland/setup-deno@v2
+        uses: denoland/setup-deno@v2.0.4
         with:
           deno-version: lts
-          cache: true
 
       - name: Install dependencies
         run: uv sync --frozen --all-groups
@@ -88,10 +87,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Deno
-        uses: denoland/setup-deno@v2
+        uses: denoland/setup-deno@v2.0.4
         with:
           deno-version: lts
-          cache: true
 
       - name: Install dependencies
         run: uv sync --frozen --all-groups

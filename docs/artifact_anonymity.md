@@ -61,8 +61,9 @@ uv sync --frozen --all-groups
 uv run python scripts/test_matrix.py --lane all
 ```
 
-The Deno executable is optional for the Python unit suite. Tests that require a
-real Deno installation should skip with a clear message when `deno` is missing.
+Deno-backed tests run by default when `deno` is installed. Tests that require a
+real Deno installation skip with a clear message when `deno` is missing; use
+`--skip-real-deno` only for runs that intentionally exclude them.
 
 ## Documentation Consistency
 
