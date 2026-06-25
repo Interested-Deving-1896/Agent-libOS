@@ -12,7 +12,7 @@ import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ _EXACT_JSR_VERSION_RE = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+_RUNTIME_CODE_GENERATION_NAMES = {"eval", "Function", "AsyncFunction", "GeneratorFunction", "AsyncGeneratorFunction"}
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
 
@@ -130,6 +131,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         max_tests: int = _TOOL_DEFAULTS.jit_tests_max_count,
         max_test_case_bytes: int = _TOOL_DEFAULTS.jit_test_case_max_bytes,
         max_validation_log_chars: int = _TOOL_DEFAULTS.jit_validation_log_max_chars,
+        forbidden_executable_roots: Iterable[str | Path] = (),
     ) -> None:
         self.deno_executable = deno_executable
         self.default_timeout_s = default_timeout_s
@@ -141,6 +143,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         self.max_tests = max_tests
         self.max_test_case_bytes = max_test_case_bytes
         self.max_validation_log_chars = max_validation_log_chars
+        self.forbidden_executable_roots = tuple(Path(root).resolve() for root in forbidden_executable_roots)
         self.profile_builder = SandboxProfileBuilder()
 
     def static_check(self, source_code: str) -> ValidationResult:
@@ -627,7 +630,7 @@ class DenoTypescriptSandbox(SandboxBackend):
     def _contains_runtime_code_generation(self, source_code: str) -> bool:
         tokens = self._typescript_tokens(source_code)
         for index, token in enumerate(tokens):
-            if token == ("identifier", "eval"):
+            if token[0] == "identifier" and token[1] in _RUNTIME_CODE_GENERATION_NAMES:
                 if self._looks_like_method_definition(tokens, index):
                     continue
                 previous_token = tokens[index - 1] if index > 0 else None
@@ -639,21 +642,15 @@ class DenoTypescriptSandbox(SandboxBackend):
                     return True
                 if previous_token != ("punct", ".") and self._token_is_call(tokens, index):
                     return True
-            if token == ("identifier", "Function"):
-                if self._looks_like_method_definition(tokens, index):
-                    continue
+            if token == ("identifier", "constructor"):
                 previous_token = tokens[index - 1] if index > 0 else None
-                previous_previous_token = tokens[index - 2] if index > 1 else None
-                if previous_token == ("punct", ".") and previous_previous_token in {
-                    ("identifier", "globalThis"),
-                    ("identifier", "window"),
-                }:
+                if previous_token == ("punct", ".") and self._token_is_call(tokens, index):
                     return True
-                if previous_token != ("punct", ".") and self._token_is_call(tokens, index):
-                    return True
-            if token[0] == "string" and token[1] in {"eval", "Function"}:
+            if token[0] == "string" and token[1] in _RUNTIME_CODE_GENERATION_NAMES:
                 if self._token_is_bracketed_global_property(tokens, index):
                     return True
+            if token == ("string", "constructor") and self._token_is_bracketed_property_call(tokens, index):
+                return True
         return False
 
     def _token_is_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
@@ -671,6 +668,15 @@ class DenoTypescriptSandbox(SandboxBackend):
         if tokens[object_index] == ("punct", ".") and object_index > 0:
             object_index -= 1
         return tokens[object_index] in {("identifier", "globalThis"), ("identifier", "window")}
+
+    def _token_is_bracketed_property_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        if index < 1 or index + 2 >= len(tokens):
+            return False
+        return (
+            tokens[index - 1] == ("punct", "[")
+            and tokens[index + 1] == ("punct", "]")
+            and tokens[index + 2] == ("punct", "(")
+        )
 
     def _extract_imports(self, source_code: str) -> list[str]:
         tokens = self._typescript_tokens(source_code)
@@ -892,15 +898,40 @@ class DenoTypescriptSandbox(SandboxBackend):
     def _resolve_deno(self) -> str:
         candidate = self.deno_executable
         if os.path.sep in candidate or (os.path.altsep and os.path.altsep in candidate):
-            path = Path(candidate)
+            path = Path(candidate).expanduser().resolve()
             if path.exists():
-                return str(path)
-        resolved = shutil.which(candidate)
+                return str(self._require_allowed_executable(path))
+        resolved = shutil.which(candidate, path=self._safe_executable_search_path())
         if resolved is None:
+            unsafe_resolved = shutil.which(candidate)
+            if unsafe_resolved is not None and self._path_is_forbidden(Path(unsafe_resolved).resolve()):
+                raise SandboxError(f"Deno executable resolves inside a forbidden root: {Path(unsafe_resolved).resolve()}")
             raise SandboxError(
                 f"Deno executable not found: {candidate!r}. Install Deno or configure tools.deno_executable."
             )
-        return resolved
+        return str(self._require_allowed_executable(Path(resolved).resolve()))
+
+    def _safe_executable_search_path(self) -> str:
+        entries: list[str] = []
+        for item in os.environ.get("PATH", "").split(os.pathsep):
+            if not item:
+                continue
+            raw = Path(item).expanduser()
+            if not raw.is_absolute():
+                continue
+            resolved = raw.resolve()
+            if self._path_is_forbidden(resolved):
+                continue
+            entries.append(str(resolved))
+        return os.pathsep.join(entries)
+
+    def _require_allowed_executable(self, path: Path) -> Path:
+        if self._path_is_forbidden(path):
+            raise SandboxError(f"Deno executable resolves inside a forbidden root: {path}")
+        return path
+
+    def _path_is_forbidden(self, path: Path) -> bool:
+        return any(path == root or root in path.parents for root in self.forbidden_executable_roots)
 
     def _profile_json(self, profile: Any) -> dict[str, Any]:
         return {
