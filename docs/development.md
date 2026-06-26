@@ -213,6 +213,9 @@ Current behavior must not claim:
 - Skill activation as a capability grant.
 
 `agent_libos_design_doc.md` remains a historical archive and can be stale.
+`plan.md` is a dated paper roadmap; keep it useful for planning, but do not use
+it as the implementation reference for current command syntax or runtime
+behavior.
 
 ## Adding Runtime Code
 

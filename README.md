@@ -117,6 +117,10 @@ Start here, then read the deeper references as needed:
   non-goals.
 - [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md):
   benchmark task schema v0.
+- [plan.md](plan.md): dated paper-submission roadmap; not the implementation
+  reference for current behavior.
+- [AGENTS.md](AGENTS.md): repository structure, testing, security, and
+  contribution guidance for local agents and contributors.
 
 ## Quick Start
 
@@ -322,9 +326,13 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - `process.exit` and `process.exec` are ordinary syscalls from TypeScript. The
   runtime applies lifecycle changes after the JIT tool returns its normal tool
   result.
-- Checkpoint restore covers reconstructable process-subtree state only. It does
-  not delete append-only audit/events/LLM calls or roll back filesystem, shell,
-  image, network, or provider side effects.
+- Files under ignored `agent_outputs/` are generated workspace output, not a
+  control channel. Agent lifecycle actions such as mini-swe-agent submission must
+  come from explicit tool/syscall arguments, not parsed stdout or file content.
+- Checkpoint restore covers reconstructable process-subtree state and captured
+  image registry metadata needed by that state. It does not delete append-only
+  audit/events/LLM calls or roll back filesystem, shell, image-package source,
+  network, or provider side effects.
 - Checkpoint-derived images capture internal reconstructable runtime state, not
   external provider state. Their required capabilities are declarations and are
   not granted automatically at spawn or exec.
