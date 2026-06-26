@@ -329,6 +329,7 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_completion_survives_one_time_owner_handle",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notification_can_interrupt_and_wake_message_waiter",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_result_oid_in_notification_does_not_grant_result_authority",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notify_result_consumes_one_time_grant_authority",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_waiting_message_state_does_not_repeat_tool_call",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_request_permission_resumes_after_human_decision",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_update_resumes_waiting_runner",
@@ -425,6 +426,8 @@
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_normalizes_waiting_process_state",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_replace_current_image_without_image_write",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_requires_image_write_to_restore_missing_image",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_checkpoint_restore_and_fork_do_not_resurrect_global_skill_trust"
       ],
       "benchmark_attack_classes": ["self_evolution_checkpoint"]
@@ -449,7 +452,9 @@
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_boot_requires_image_read_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_remains_process_local",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_source_survives_runtime_reopen",
-        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_package_external_registry_or_skill_trust"
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_package_external_registry_or_skill_trust",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_replace_current_image_without_image_write",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_requires_image_write_to_restore_missing_image"
       ],
       "benchmark_attack_classes": ["self_evolution_image"]
     },
