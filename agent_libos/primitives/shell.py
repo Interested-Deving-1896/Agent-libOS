@@ -1070,10 +1070,32 @@ class ShellAdapter:
             candidates = [value]
             if index > 0 and value.startswith("-") and "=" in value:
                 candidates = [value.split("=", 1)[1]]
+            elif index > 0 and value.startswith("-") and not value.startswith("--"):
+                attached = self._attached_short_option_path(value)
+                candidates = [] if attached is None else [attached]
             for candidate in candidates:
                 if self._is_path_like_argument(candidate, argv0=index == 0):
                     tokens.append(candidate)
         return tokens
+
+    def _attached_short_option_path(self, value: str) -> str | None:
+        if len(value) <= 2:
+            return None
+        lowered = value.casefold()
+        if "://" in lowered and "file://" not in lowered:
+            return None
+        operand = value[2:]
+        normalized_operand = operand.replace("\\", "/")
+        if operand in {".", "..", "~"} or normalized_operand.startswith(("./", "../", "~/", "/")):
+            return operand
+        if self._is_absolute_path(operand):
+            return operand
+        normalized = value.replace("\\", "/")
+        for marker in ("../", "./", "~/", "/"):
+            position = normalized.find(marker, 2)
+            if position >= 0:
+                return value[position:]
+        return None
 
     def _is_path_like_argument(self, value: str, *, argv0: bool) -> bool:
         if not value:
@@ -1106,7 +1128,9 @@ class ShellAdapter:
             raise CapabilityDenied(f"shell argument path uses file URL syntax: {value}")
         if value.startswith("~"):
             raise CapabilityDenied(f"shell argument path uses host home expansion: {value}")
-        raw = Path(value)
+        if PureWindowsPath(value).is_absolute() and not Path(value).is_absolute():
+            raise CapabilityDenied(f"shell argument path uses host absolute path syntax: {value}")
+        raw = Path(value.replace("\\", os.sep))
         if self._is_absolute_path(value):
             return raw.resolve()
         return (cwd / raw).resolve()

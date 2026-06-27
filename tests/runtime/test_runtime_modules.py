@@ -336,6 +336,24 @@ sha256: {source_sha}
             finally:
                 runtime.close()
 
+    def test_multifile_module_package_ignores_generated_cache_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_multifile_module(root)
+            cache_dir = root / 'pkg' / '__pycache__'
+            cache_dir.mkdir()
+            (cache_dir / 'helper.cpython-314.pyc').write_bytes(b'generated cache')
+
+            verified = ModuleLoader().verify(manifest)
+
+            assert verified['source_sha256'] == package_sha
+            assert all('__pycache__' not in item['path'] for item in verified['source_files'])
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+            try:
+                assert runtime.modules.inspect_module('multi-module:v0')['status'] == 'loaded'
+            finally:
+                runtime.close()
+
     def test_multifile_module_helper_change_rejects_old_package_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

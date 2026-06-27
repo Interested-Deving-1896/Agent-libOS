@@ -20,6 +20,7 @@ def _profile_config() -> AgentLibOSConfig:
                 "slow": LLMProfile(model="slow-model", temperature=0.4, max_tokens=256),
                 "image-default": LLMProfile(model="image-model"),
                 "override": LLMProfile(model="override-model"),
+                "parallel": LLMProfile(model="parallel-model", parallel_tool_calls=True),
             },
         )
     )
@@ -126,6 +127,18 @@ class TestLLMProfiles:
             finally:
                 reopened.close()
 
+    def test_llm_profile_can_override_parallel_tool_calls(self) -> None:
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            default = runtime.llms.resolve("default")
+            parallel = runtime.llms.resolve("parallel")
+
+            assert default.parallel_tool_calls is False
+            assert parallel.parallel_tool_calls is True
+            assert parallel.client.parallel_tool_calls is True
+        finally:
+            runtime.close()
+
     def test_only_default_profile_inherits_legacy_openai_environment(self, monkeypatch) -> None:
         monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.example/v1")
         monkeypatch.setenv("OPENAI_MODEL", "ambient-model")
@@ -135,6 +148,7 @@ class TestLLMProfiles:
         monkeypatch.setenv("OPENAI_STORE", "1")
         monkeypatch.setenv("OPENAI_REASONING_EFFORT", "medium")
         monkeypatch.setenv("OPENAI_VERBOSITY", "high")
+        monkeypatch.setenv("OPENAI_PARALLEL_TOOL_CALLS", "1")
         monkeypatch.setenv("AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", "1")
         monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
         monkeypatch.setenv("PROFILE_API_KEY", "profile-key")
@@ -149,7 +163,8 @@ class TestLLMProfiles:
         )
         runtime = Runtime(SQLiteStore(":memory:"), config=config)
         try:
-            default_client = runtime.llms.resolve("default").client
+            default_resolved = runtime.llms.resolve("default")
+            default_client = default_resolved.client
             isolated_client = runtime.llms.resolve("isolated").client
 
             assert default_client.base_url == "https://ambient.example/v1"
@@ -160,6 +175,8 @@ class TestLLMProfiles:
             assert default_client.store is True
             assert default_client.reasoning_effort == "medium"
             assert default_client.verbosity == "high"
+            assert default_client.parallel_tool_calls is True
+            assert default_resolved.parallel_tool_calls is True
             assert isolated_client.base_url is None
             assert isolated_client.model == "isolated-model"
             assert isolated_client.api_mode == config.llm.api_mode
@@ -168,6 +185,7 @@ class TestLLMProfiles:
             assert isolated_client.store == config.llm.store
             assert isolated_client.reasoning_effort is None
             assert isolated_client.verbosity is None
+            assert isolated_client.parallel_tool_calls == config.llm.parallel_tool_calls
             assert isolated_client.api_key == "profile-key"
         finally:
             runtime.close()

@@ -7,8 +7,9 @@ Electron desktop console described in [docs/gui.md](gui.md).
 Both entrypoints are implemented under `agent_libos.api`, because they are
 host-facing control surfaces over the same runtime boundary.
 
-Use `--db` to select a runtime database. The default `local` target is
-in-memory. A filesystem path creates or opens a persistent SQLite database.
+Use `--db` to select a runtime database. The sentinel target `local` is
+in-memory. Any other filesystem path creates or opens a persistent SQLite
+database.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite <command>
@@ -35,16 +36,23 @@ runtime:
   local_store_target: .agent_libos.sqlite
   run_until_idle_max_quanta: 10
 llm:
+  parallel_tool_calls: false
   default_profile_id: coding
   profiles:
     coding:
       model: gpt-4.1
+      parallel_tool_calls: true
 ```
 
-Explicit CLI options still win over config defaults. For example `--db` uses the
-configured `runtime.local_store_target` only when `--db` is omitted.
+Explicit CLI options still win over config defaults. When `--db` is omitted,
+the CLI uses `runtime.local_store_target`: `local` means in-memory, while a path
+such as `.agent_libos.sqlite` is persistent SQLite.
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
+`llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
+is enabled, OpenAI may return multiple tool calls in one action-selection
+response; Agent libOS dispatches them sequentially in the same quantum rather
+than running tools concurrently.
 
 Use `--module-manifest` and `--trusted-module` before the command name to load
 trusted Runtime Modules before the runtime is used:
@@ -58,6 +66,9 @@ uv run agent-libos --db .agent_libos.sqlite \
 
 For multi-file modules, `<source_sha256>` is the package digest reported by
 `modules verify`; for single-file modules it is the entrypoint file hash.
+For local development only, `--trusted-module-sha256 <sha256>` trusts a source
+or package digest regardless of module id. Prefer `--trusted-module
+<module_id>:<sha256>` when the module id is known.
 
 ## Top-Level Commands
 
@@ -181,10 +192,13 @@ message-receive replay semantics, currently `receive_process_messages`.
 Running synchronous side-effect tools are not force-cancelled because Python
 cannot safely stop their worker thread after side effects may have started. A
 one-shot CLI invocation cannot keep detached in-memory tasks alive after the
-CLI Runtime shuts down, so `object-task start` requires `--wait`. Long-running
-ObjectTask supervision is intended for a live Runtime such as the GUI server or
-an embedded host process; use `object-task list|get|wait|cancel|watch-owner` to
-inspect or control tasks owned by such a live runtime.
+CLI Runtime shuts down, so `object-task start` requires `--wait`. A separate
+one-shot CLI process also opens a fresh Runtime; if it opens the same database
+as a live GUI or embedded host, unfinished ObjectTasks may be reconciled as
+abandoned. Use GUI server APIs or the embedding host for live ObjectTask
+supervision. The one-shot CLI `list|get|wait|cancel|watch-owner` commands are
+intended for the Runtime opened by that CLI invocation or for terminal task
+records after the live owner has stopped.
 
 ## LLM Calls
 
@@ -203,7 +217,8 @@ default.
 For OpenAI Responses requests, request options may show strict tool-schema
 counts, whether prompt-cache or safety identifiers were configured, and any
 non-secret `previous_response_id` chain; configured cache keys and safety
-identifier values are not persisted there.
+identifier values are not persisted there. They also show whether
+`parallel_tool_calls` was enabled for the action-selection request.
 Set `config.llm.persist_full_io=True` only when the operator explicitly wants
 complete LLM input/output persistence in SQLite for debugging or forensics.
 
@@ -234,9 +249,14 @@ pending, in which case it answers that request.
 
 Interactive slash commands:
 
+- `/help`: show available interactive commands.
 - `/message <text>`: force a normal process message.
 - `/interrupt <text>`: send an interrupt message.
 - `/pid <pid>`: switch the default target process.
+- `/answer <text>` or plain text while a human question is pending: answer the
+  pending request.
+- `/approve`, `/reject`, `/allow`, and `/ask`: respond to pending approval or
+  permission requests.
 - `/exit`: leave the interactive loop.
 
 ## Process Messages
@@ -249,7 +269,7 @@ uv run agent-libos --db .agent_libos.sqlite message <pid> "Use this as job input
 
 Useful options:
 
-- `--kind normal|interrupt|...`
+- `--kind normal|interrupt`
 - `--human <name>`
 - `--channel <channel>`
 - `--subject <text>`
@@ -263,7 +283,7 @@ Useful options:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite cd <pid> src
-uv run agent-libos --db .agent_libos.sqlite exec images/review-agent "Review README.md" --pid <pid> --run
+uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review README.md" --pid <pid> --run
 uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
 ```
 
@@ -480,6 +500,8 @@ loading the module. For single-file modules this is the entry file hash; for
 multi-file modules it is the inferred Python source package digest and includes
 the covered `source_files` list. `modules list` and `modules inspect` show
 persisted module load records for the opened runtime database.
+`--trusted-module-sha256 <sha256>` is accepted as a weaker local-development
+shortcut that trusts the digest for any module id.
 
 ## Benchmark Scripts
 

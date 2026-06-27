@@ -232,7 +232,8 @@ class Runtime:
     ) -> "Runtime":
         selected_config = config or DEFAULT_CONFIG
         selected_target = selected_config.runtime.local_store_target if target is None else target
-        store_target = ":memory:" if str(selected_target) == selected_config.runtime.local_store_target else str(selected_target)
+        selected_target_text = str(selected_target)
+        store_target = ":memory:" if selected_target_text in {"local", ":memory:"} else selected_target_text
         store = SQLiteStore(store_target, config=selected_config)
         try:
             return cls(

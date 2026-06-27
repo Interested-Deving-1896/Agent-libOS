@@ -1,15 +1,30 @@
+import { useMemo, useState } from "react";
 import { AlertTriangle, Bot, CheckCircle2, MessageSquare, Radio, UserRound } from "lucide-react";
 import type { AuditRecord, HumanRequest, LlmCall, ProcessMessage, RuntimeEvent } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
 import { isHumanOutput } from "../userConversation";
 
-type TimelineItem =
+export type TimelineItemKind = "message" | "human" | "llm" | "event" | "audit";
+export type TimelineFilter = "all" | TimelineItemKind;
+
+export type TimelineItem =
   | { kind: "message"; time: string; item: ProcessMessage }
   | { kind: "human"; time: string; item: HumanRequest }
   | { kind: "llm"; time: string; item: LlmCall }
   | { kind: "event"; time: string; item: RuntimeEvent }
   | { kind: "audit"; time: string; item: AuditRecord };
+
+const timelineItemKinds = ["message", "human", "llm", "event", "audit"] as const satisfies readonly TimelineItemKind[];
+const timelineFilters = ["all", ...timelineItemKinds] as const satisfies readonly TimelineFilter[];
+const timelineFilterLabels: Record<TimelineFilter, TranslationKey> = {
+  all: "timeline.filter.all",
+  message: "timeline.filter.message",
+  human: "timeline.filter.human",
+  llm: "timeline.filter.llm",
+  event: "timeline.filter.event",
+  audit: "timeline.filter.audit"
+};
 
 export function Timeline({
   pid,
@@ -27,34 +42,100 @@ export function Timeline({
   audit: AuditRecord[];
 }) {
   const { formatTime, t } = useI18n();
+  const [filter, setFilter] = useState<TimelineFilter>("all");
+  const items = useMemo(
+    () => pid ? buildTimelineItems({ pid, messages, humanRequests, llmCalls, events, audit }) : [],
+    [audit, events, humanRequests, llmCalls, messages, pid]
+  );
+  const counts = useMemo(() => countTimelineItemsByKind(items), [items]);
+  const filteredItems = useMemo(() => filterTimelineItems(items, filter), [filter, items]);
+
   if (!pid) return <div className="empty">{t("timeline.selectProcess")}</div>;
-  const items: TimelineItem[] = [
+  if (items.length === 0) return <div className="empty">{t("timeline.empty")}</div>;
+
+  return (
+    <section className="timeline" aria-label={t("timeline.label")}>
+      <div className="timelineFilter" role="group" aria-label={t("timeline.filterLabel")}>
+        {timelineFilters.map((option) => {
+          const count = option === "all" ? items.length : counts[option];
+          const active = filter === option;
+          return (
+            <button
+              type="button"
+              key={option}
+              className={active ? "active" : ""}
+              aria-pressed={active}
+              onClick={() => setFilter(option)}
+            >
+              {t(timelineFilterLabel(option))}
+              <span className="timelineFilterCount">{count}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="timelineEntries">
+        {filteredItems.length === 0 ? (
+          <div className="empty timelineEmpty">{t("timeline.filterEmpty")}</div>
+        ) : filteredItems.map((entry, index) => (
+          <article className={`timelineItem ${entry.kind}`} key={`${entry.kind}-${entry.time}-${index}`}>
+            <div className="timelineIcon">{icon(entry)}</div>
+            <div className="timelineBody">
+              <div className="timelineHeader">
+                <strong>{title(entry, t)}</strong>
+                <time>{formatTime(entry.time)}</time>
+              </div>
+              <p className="timelineSummary" title={summary(entry, t)}>{summary(entry, t)}</p>
+              <CollapsibleJson value={entry.item} />
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+export function buildTimelineItems({
+  pid,
+  messages,
+  humanRequests,
+  llmCalls,
+  events,
+  audit
+}: {
+  pid: string;
+  messages: ProcessMessage[];
+  humanRequests: HumanRequest[];
+  llmCalls: LlmCall[];
+  events: RuntimeEvent[];
+  audit: AuditRecord[];
+}): TimelineItem[] {
+  return [
     ...messages.map((item) => ({ kind: "message" as const, time: item.created_at, item })),
     ...humanRequests.filter((item) => item.pid === pid).map((item) => ({ kind: "human" as const, time: item.created_at, item })),
     ...llmCalls.filter((item) => item.pid === pid).map((item) => ({ kind: "llm" as const, time: item.created_at, item })),
     ...events.filter((item) => item.target === pid || item.source === pid).map((item) => ({ kind: "event" as const, time: item.created_at, item })),
     ...audit.filter((item) => item.actor === pid || item.target === `process:${pid}`).map((item) => ({ kind: "audit" as const, time: item.timestamp, item }))
   ].sort((a, b) => a.time.localeCompare(b.time));
+}
 
-  if (items.length === 0) return <div className="empty">{t("timeline.empty")}</div>;
+export function countTimelineItemsByKind(items: TimelineItem[]): Record<TimelineItemKind, number> {
+  const counts: Record<TimelineItemKind, number> = {
+    message: 0,
+    human: 0,
+    llm: 0,
+    event: 0,
+    audit: 0
+  };
+  for (const item of items) counts[item.kind] += 1;
+  return counts;
+}
 
-  return (
-    <section className="timeline" aria-label={t("timeline.label")}>
-      {items.map((entry, index) => (
-        <article className={`timelineItem ${entry.kind}`} key={`${entry.kind}-${entry.time}-${index}`}>
-          <div className="timelineIcon">{icon(entry)}</div>
-          <div className="timelineBody">
-            <div className="timelineHeader">
-              <strong>{title(entry, t)}</strong>
-              <time>{formatTime(entry.time)}</time>
-            </div>
-            <p className="timelineSummary" title={summary(entry, t)}>{summary(entry, t)}</p>
-            <CollapsibleJson value={entry.item} />
-          </div>
-        </article>
-      ))}
-    </section>
-  );
+export function filterTimelineItems(items: TimelineItem[], filter: TimelineFilter): TimelineItem[] {
+  return filter === "all" ? items : items.filter((item) => item.kind === filter);
+}
+
+function timelineFilterLabel(filter: TimelineFilter): TranslationKey {
+  return timelineFilterLabels[filter];
 }
 
 function icon(entry: TimelineItem) {

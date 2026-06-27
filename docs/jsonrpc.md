@@ -14,8 +14,11 @@ wire method names at call time. They pass only:
 
 The runtime resolves endpoint metadata from the JSON-RPC endpoint registry,
 checks the caller pid's capabilities, optionally asks the human, performs a
-single JSON-RPC HTTP POST through the provider, records audit/events, and writes
-a provider-classified external-effect row.
+single primitive/provider call through the JSON-RPC provider, records
+audit/events, and writes a provider-classified external-effect row. The default
+HTTP provider may try another previously validated pinned address if connection
+setup fails before a response is received; endpoint methods must not rely on a
+single wire-level POST attempt for non-idempotency guarantees.
 
 ## Endpoint Manifest V1
 
@@ -28,7 +31,7 @@ endpoint_id: demo-weather
 url: https://api.example.test/jsonrpc
 headers:
   Authorization:
-    env: DEMO_WEATHER_TOKEN
+    env: AGENT_LIBOS_JSONRPC_DEMO_WEATHER_TOKEN
     prefix: "Bearer "
 methods:
   - method_id: forecast
@@ -47,10 +50,13 @@ max_response_bytes: 1048576
 
 Required endpoint fields:
 
-- `schema_version: 1`
 - `endpoint_id`
 - `url`
 - non-empty `methods`
+
+`schema_version` is optional and defaults to `1` when omitted. Repository
+manifests should include it explicitly so future migrations are visible in
+review.
 
 Required method fields:
 
@@ -121,6 +127,16 @@ Method invocation uses the right declared by the method spec. A `read` method
 requires `read` on `jsonrpc:<endpoint_id>:<method_id>`. A `write` method
 requires `write`, and an `execute` method requires `execute`.
 
+Endpoint registry operations use endpoint metadata authority:
+
+| Operation | Required capability when `--actor-pid` is used |
+| --- | --- |
+| list endpoints | `jsonrpc_endpoint:* read` |
+| inspect endpoint | `jsonrpc_endpoint:<endpoint_id> read` |
+| register new endpoint | `jsonrpc_endpoint:<endpoint_id> write` |
+| replace endpoint | `jsonrpc_endpoint:<endpoint_id> admin` |
+| unregister endpoint | `jsonrpc_endpoint:<endpoint_id> admin` |
+
 Tool visibility does not grant remote authority. Default images expose
 `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, and
 `call_jsonrpc_method`, but a call still fails without the method capability.
@@ -142,6 +158,10 @@ perform remote rollback or compensation.
 Audit and external-effect metadata store bounded, redacted observations of
 `params` with size and hash. Raw params are sent to the registered provider but
 are not persisted in audit or provider-effect context.
+
+`params_schema`, when present, is validated at registration time and enforced
+before each call. Parameter validation failures do not contact the provider and
+do not consume one-shot method authority.
 
 ## CLI
 
@@ -173,6 +193,9 @@ the target pid and are authorized by that pid's method capability.
 Replacing an existing endpoint requires endpoint `admin` when an actor pid is
 used. A replace invalidates existing exact method grants for that endpoint so
 old authority cannot silently point at a new URL or wire method.
+Unregistering an endpoint also invalidates exact and wildcard method grants for
+that endpoint, so reusing the same endpoint id cannot revive stale method
+authority.
 
 ## Tools And Syscalls
 
@@ -199,6 +222,6 @@ values are not persisted.
 
 Checkpoint snapshots preserve process capabilities that reference JSON-RPC
 resources, but they do not copy or restore endpoint registry rows. Restore and
-fork therefore fail closed if the current runtime does not have a matching
-registered endpoint; a host operator must register provider configuration
-explicitly.
+fork can still load the capability records, but later inspect/call operations
+fail closed if the current runtime does not have a matching registered
+endpoint. A host operator must register provider configuration explicitly.

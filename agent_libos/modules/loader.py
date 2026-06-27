@@ -473,6 +473,12 @@ class ModuleLoader:
         records: list[ModuleSourceFile] = []
         total_bytes = 0
         for item in sorted(root.rglob("*")):
+            try:
+                source_relative_parts = item.relative_to(root).parts
+            except ValueError as exc:
+                raise ValidationError(f"module package path escapes source root: {item}") from exc
+            if any(part.lower() in _CACHE_PACKAGE_SEGMENTS for part in source_relative_parts):
+                continue
             before = item.lstat()
             relative = self._manifest_relative_path(manifest_dir, item.resolve() if not stat.S_ISLNK(before.st_mode) else item)
             self._validate_source_relative_path(relative)

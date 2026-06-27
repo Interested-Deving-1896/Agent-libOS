@@ -20,6 +20,7 @@ from agent_libos.models import (
     ObjectRight,
     ObjectType,
     PROMPT_MODE_LIBOS_DEFAULT,
+    ProcessMessageKind,
     ProcessStatus,
     ResourceBudget,
     ViewMode,
@@ -280,6 +281,320 @@ class TestLLMContextMemory:
             assert 'old-object-token' in first
             assert 'new-object-token' in second
             assert second.startswith(first)
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_disabled_uses_existing_single_action_path(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+                    {'action': 'process_exit', 'payload': {'done': True}},
+                ]
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel disabled')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['action']['action'] == 'process_exit'
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'create_memory_object'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_execute_batch_in_order_and_record_observability(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+                    {'action': 'process_exit', 'payload': {'done': True}},
+                ]
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel enabled')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['parallel_tool_calls'] is True
+            assert result['executed_count'] == 2
+            assert [action['action'] for action in result['actions']] == ['create_memory_object', 'process_exit']
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            tool_calls = [
+                record.decision.get('tool')
+                for record in runtime.audit.trace()
+                if record.action == 'tool.call'
+            ]
+            assert tool_calls[:2] == ['create_memory_object', 'process_exit']
+            llm_call = runtime.store.list_llm_calls(pid)[0]
+            assert llm_call.request_options['openai_parallel_tool_calls_enabled'] is True
+            assert llm_call.tool_calls['sha256']
+            batches = [record for record in runtime.audit.trace() if record.action == 'llm.action_batch']
+            assert len(batches) == 1
+            assert batches[0].decision['executed_count'] == 2
+            assert batches[0].decision['stop_reason'] == 'process_terminal'
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_invalid_batch_repairs_before_dispatch(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True, action_repair_attempts=2),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'should_not_run': True}},
+                    {'action': 'missing_tool', 'payload': {'bad': True}},
+                ],
+                [{'action': 'process_exit', 'payload': {'done': True}}],
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='repair invalid batch')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['action']['action'] == 'process_exit'
+            assert len(runtime.llm.client.user_prompts) == 2
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'create_memory_object'
+                for record in runtime.audit.trace()
+            )
+            repairs = [record for record in runtime.audit.trace() if record.action == 'llm.action_repair_requested']
+            assert len(repairs) == 1
+            assert 'missing_tool' in repairs[0].decision['error']
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_stop_after_process_exit(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'process_exit', 'payload': {'done': True}},
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'should_not_run': True}},
+                ]
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stop after exit')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['executed_count'] == 1
+            assert result['action']['action'] == 'process_exit'
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'create_memory_object'
+                for record in runtime.audit.trace()
+            )
+            batch = [record for record in runtime.audit.trace() if record.action == 'llm.action_batch'][0]
+            assert batch.decision['stop_reason'] == 'process_terminal'
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_interrupt_notice_is_not_counted_as_executed(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'get_current_time', 'timezone': 'UTC'},
+                    {'action': 'process_exit', 'payload': {'should_not_run': True}},
+                ]
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel interrupt')
+            runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                kind=ProcessMessageKind.INTERRUPT,
+                subject='urgent',
+            )
+
+            result = runtime.run_process_once(pid)
+
+            assert result['ok']
+            assert result['parallel_tool_calls'] is True
+            assert result['executed_count'] == 0
+            assert result['actions'] == []
+            assert result['results'] == []
+            assert result['stop_reason'] == 'interrupted_by_message'
+            assert result['action']['action'] == 'get_current_time'
+            assert result['result']['interrupted_by_message']
+            assert result['stopped_action']['action'] == 'get_current_time'
+            assert result['stopped_result']['interrupted_by_message']
+            assert not any(record.action == 'primitive.clock.now' for record in runtime.audit.trace())
+            assert not any(record.action == 'tool.call' for record in runtime.audit.trace())
+            batch = [record for record in runtime.audit.trace() if record.action == 'llm.action_batch'][0]
+            assert batch.decision['executed_count'] == 0
+            assert batch.decision['stop_reason'] == 'interrupted_by_message'
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_tool_failure_keeps_quantum_ok(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'get_current_time', 'timezone': 'Mars/Olympus'},
+                    {'action': 'process_exit', 'payload': {'should_not_run': True}},
+                ]
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel tool failure')
+
+            result = runtime.run_process_once(pid)
+
+            assert result['ok']
+            assert result['parallel_tool_calls'] is True
+            assert result['executed_count'] == 1
+            assert result['action']['action'] == 'get_current_time'
+            assert result['result']['ok'] is False
+            assert 'unknown timezone' in (result['result']['error'] or '')
+            assert result['stop_reason'] == 'tool_failed'
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_message_wait_stops_batch_and_resumes_pending_action(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 'before-wait'}},
+                    {'action': 'receive_process_messages', 'channel': 'control', 'correlation_id': 'job-1'},
+                    {'action': 'process_exit', 'payload': {'should_not_run': True}},
+                ]
+            ])
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'parallel message wait')
+
+            waiting = runtime.run_process_once(child)
+
+            assert waiting['waiting_message']
+            assert waiting['parallel_tool_calls'] is True
+            assert waiting['executed_count'] == 1
+            assert waiting['completed_actions'][0]['action'] == 'create_memory_object'
+            assert runtime.process.get(child).status == ProcessStatus.WAITING_EVENT
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
+
+            matching = runtime.messages.send_from_process(
+                parent,
+                child,
+                channel='control',
+                correlation_id='job-1',
+                subject='resume',
+                payload={'ready': True},
+            )
+            resumed = runtime.run_process_once(child)
+
+            assert resumed['ok']
+            assert resumed['resumed_after_message']
+            assert resumed['action']['action'] == 'receive_process_messages'
+            assert resumed['result']['payload']['messages'][0]['message_id'] == matching.message_id
+            assert len(runtime.llm.client.user_prompts) == 1
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_child_wait_stops_batch_and_resumes_pending_action(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parallel child wait')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'still running')
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 'before-wait'}},
+                    {'action': 'wait_child_process', 'child_pid': child},
+                    {'action': 'process_exit', 'payload': {'should_not_run': True}},
+                ]
+            ])
+
+            waiting = runtime.run_process_once(parent)
+
+            assert waiting['waiting_event']
+            assert waiting['parallel_tool_calls'] is True
+            assert waiting['executed_count'] == 1
+            assert waiting['completed_actions'][0]['action'] == 'create_memory_object'
+            assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
+
+            runtime.process.exit(child, message='done')
+            resumed = runtime.run_process_once(parent)
+
+            assert resumed['ok']
+            assert resumed['action']['action'] == 'wait_child_process'
+            assert len(runtime.llm.client.user_prompts) == 1
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_human_wait_stops_batch_and_resumes_pending_action(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 'before-human'}},
+                    {'action': 'ask_human', 'question': 'Continue?'},
+                    {'action': 'process_exit', 'payload': {'should_not_run': True}},
+                ]
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel human wait')
+
+            waiting = runtime.run_process_once(pid)
+
+            assert waiting['waiting_human']
+            assert waiting['parallel_tool_calls'] is True
+            assert waiting['executed_count'] == 1
+            assert waiting['completed_actions'][0]['action'] == 'create_memory_object'
+            assert runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
+
+            request_id = waiting['request_id']
+            runtime.human.drain_terminal_queue(auto_answer='yes')
+            resumed = runtime.run_process_once(pid)
+
+            assert resumed['ok']
+            assert resumed['resumed_after_human']
+            assert resumed['action']['action'] == 'ask_human'
+            assert resumed['result']['payload']['request_id'] == request_id
+            assert resumed['result']['payload']['answer'] == 'yes'
+            assert len(runtime.llm.client.user_prompts) == 1
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+                for record in runtime.audit.trace()
+            )
         finally:
             runtime.close()
 
@@ -876,6 +1191,38 @@ class MetadataActionClient:
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         return LLMCompletion(content='visible assistant text', tool_calls=[{'id': 'tool_123', 'name': 'process_exit', 'arguments': json.dumps({'payload': {'done': True}})}], raw=SimpleNamespace(id='raw_resp', provider='fake'), api='chat', response_id='resp_123', request_id='req_123', model='test-model', usage={'prompt_tokens': 13, 'completion_tokens': 4, 'total_tokens': 17}, reasoning={'summary': 'selected process_exit'})
+
+
+class MultiToolActionClient:
+    def __init__(self, batches: list[list[dict[str, Any]]]) -> None:
+        self.batches = list(batches)
+        self.user_prompts: list[str] = []
+        self.tool_batches: list[list[dict[str, Any]]] = []
+
+    def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
+        self.user_prompts.append(str(messages[-1]["content"]))
+        self.tool_batches.append(tools)
+        batch = self.batches.pop(0)
+        tool_calls = []
+        for index, action in enumerate(batch, start=1):
+            name = str(action["action"])
+            args = {key: value for key, value in action.items() if key != "action"}
+            tool_calls.append(
+                {
+                    "id": f"parallel_{len(self.user_prompts)}_{index}",
+                    "name": name,
+                    "arguments": json.dumps(args),
+                }
+            )
+        return LLMCompletion(
+            content="",
+            tool_calls=tool_calls,
+            api="chat",
+            response_id=f"resp_parallel_{len(self.user_prompts)}",
+            request_id=f"req_parallel_{len(self.user_prompts)}",
+            model="test-model",
+            usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        )
 
 
 class ExplodingClient:

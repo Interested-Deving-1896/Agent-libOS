@@ -118,9 +118,15 @@ Arguments continue through the existing bounded, redacted tool audit path.
 
 The runner is a child process whose tool table is narrowed to the requested
 tool. Starting a task requires the creator to hold `read`, `write`, and `link`
-rights on the owner object, and the requested tool must already be visible in
-the creator process tool table. External capabilities are inherited only when
-explicitly delegated.
+rights on the owner object, `process:spawn` `write`, available per-object and
+global ObjectTask concurrency slots, and the requested tool must already be
+visible in the creator process tool table. External capabilities are inherited
+only when explicitly delegated.
+
+ObjectTask rows are persisted, but active task execution is runtime-local. When
+a runtime reopens an existing store, unfinished tasks are marked `abandoned`,
+their runner processes are terminalized, and owner pins are cleaned up. The
+original tool arguments are not persisted for replay.
 
 Successful tasks keep the tool result as a new Object Memory object and link
 the owner object to it with `PRODUCED`. That link is part of the start-time
@@ -161,6 +167,8 @@ returning full file content as a process-visible tool result:
 
 This is useful for large content movement and reduces accidental prompt
 exposure. It does not bypass filesystem or object capabilities.
+`write_object_to_file` accepts only a string payload or a mapping with a string
+`content` field; other payload shapes fail instead of being guessed.
 
 ## Context Materialization
 
@@ -170,6 +178,10 @@ Each process also has a mutable context object named `llm_context:<pid>`.
 
 The runtime appends new process facts and summaries to the end of that object so
 repeated prompt prefixes remain stable for prompt caching.
+
+The `compact_process_context` tool is the explicit exception to the append-only
+shape: after validation it atomically replaces older entries with one
+`context_compacted` summary plus the configured recent verbatim entries.
 
 Materialization budgets use each object's current `metadata.token_estimate`.
 Object creation, payload updates, file imports, and append-style writes refresh

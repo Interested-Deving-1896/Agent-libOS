@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import os
+import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -14,7 +15,7 @@ from agent_libos import Runtime
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.models import AgentImage, CapabilityRight, ExternalEffectClassification
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
-from agent_libos.models.exceptions import HumanApprovalRequired
+from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
 from modules.pty.pty_module import LocalPtyProvider
 
@@ -316,6 +317,103 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_provider_without_limits_support_fails_closed_when_budgeted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = NoLimitsPtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pty limits required",
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=1.0),
+                )
+
+                result = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+
+                assert not result.ok
+                assert "SubprocessLimits" in (result.error or "")
+                assert provider.spawned == []
+            finally:
+                runtime.close()
+
+    def test_pty_provider_that_supports_limits_receives_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pty passes limits",
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=1.0),
+                )
+
+                created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+
+                assert created.ok, created.error
+                assert isinstance(provider.spawned[0]["limits"], SubprocessLimits)
+            finally:
+                runtime.close()
+
+    def test_windows_local_pty_provider_fails_closed_for_budgeted_spawn(self) -> None:
+        if os.name != "nt":
+            pytest.skip("Windows PTY limit enforcement is platform-specific")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalPtyProvider(temp_dir)
+            with pytest.raises(ValidationError, match="SubprocessLimits"):
+                provider.spawn([os.fspath(Path(temp_dir) / "unused.exe")], limits=SubprocessLimits(wall_seconds=1.0))
+
+    def test_posix_pty_exit_cleanup_kills_background_descendant(self) -> None:
+        if os.name == "nt":
+            pytest.skip("POSIX process-group cleanup is platform-specific")
+        marker = f"PTY_EXIT_CLEANUP_{time.monotonic_ns()}"
+        child_script = (
+            "import pathlib, sys, time; "
+            "time.sleep(0.5); "
+            "pathlib.Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sentinel = Path(temp_dir) / "sentinel.txt"
+            parent_script = (
+                "import subprocess, sys; "
+                "subprocess.Popen("
+                f"[sys.executable, '-c', {child_script!r}, {str(sentinel)!r}, {marker!r}], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                "print('parent-exit')"
+            )
+            runtime = _open_pty_runtime(temp_dir, LocalPtyProvider(temp_dir))
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty exit cleanup")
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": [sys.executable, "-c", parent_script], "startup_timeout_s": 0.2},
+                )
+                assert created.ok, created.error
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not sentinel.exists():
+                    time.sleep(0.05)
+                assert not sentinel.exists()
+            finally:
+                runtime.close()
+
+    def test_pty_exit_cleanup_closes_provider_forcefully(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_alive=False)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty force exit cleanup")
+                created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                assert created.ok, created.error
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not provider.sessions[0].close_forces:
+                    time.sleep(0.01)
+
+                assert provider.sessions[0].close_forces == [True]
+            finally:
+                runtime.close()
+
     def test_pty_input_limit_fails_closed_before_provider_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider()
@@ -569,7 +667,11 @@ def _open_pty_runtime(
     if settings is not None:
         substrate.pty_settings = settings
     manifest = _module_manifest()
-    source_sha = hashlib.sha256((manifest.parent / "pty_module.py").read_bytes()).hexdigest()
+    source_sha = next(
+        line.split(":", 1)[1].strip()
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+        if line.startswith("sha256:")
+    )
     return Runtime.open(
         "local",
         substrate=substrate,
@@ -579,7 +681,9 @@ def _open_pty_runtime(
 
 
 def _module_manifest() -> Path:
-    return Path("modules/pty/module.yaml").resolve()
+    manifest = Path("modules/pty/module.yaml").resolve()
+    shutil.rmtree(manifest.parent / "__pycache__", ignore_errors=True)
+    return manifest
 
 
 def _pty_adapter(runtime: Runtime) -> Any:
@@ -587,6 +691,8 @@ def _pty_adapter(runtime: Runtime) -> Any:
 
 
 class FakePtyProvider:
+    supports_subprocess_limits = True
+
     def __init__(
         self,
         *,
@@ -642,6 +748,10 @@ class FakePtyProvider:
         )
 
 
+class NoLimitsPtyProvider(FakePtyProvider):
+    supports_subprocess_limits = False
+
+
 class FakePtySession:
     backend = "fake-pty"
 
@@ -662,6 +772,7 @@ class FakePtySession:
         self.size = (cols, rows)
         self.close_failures = close_failures
         self.pid = pid
+        self.close_forces: list[bool] = []
 
     def read(self, *, timeout_s: float = 0.0) -> str:
         if self.outputs:
@@ -685,6 +796,7 @@ class FakePtySession:
         return 0 if self.closed or not self.alive else None
 
     def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
+        self.close_forces.append(force)
         if self.close_failures > 0:
             self.close_failures -= 1
             raise RuntimeError("simulated close failure")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import pytest
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -485,7 +486,7 @@ class TestJitSecurity:
         assert local_methods.ok, local_methods.errors
 
     def test_deno_executable_resolution_rejects_workspace_path_hijack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        hijack_deno = tmp_path / 'deno'
+        hijack_deno = tmp_path / ('deno.exe' if os.name == 'nt' else 'deno')
         hijack_deno.write_text('#!/bin/sh\necho hijack-deno\n', encoding='utf-8')
         hijack_deno.chmod(0o755)
         monkeypatch.setenv('PATH', str(tmp_path))

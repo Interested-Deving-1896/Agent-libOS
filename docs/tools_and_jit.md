@@ -18,6 +18,8 @@ The current built-in tool surface includes tools for:
   files.
 - Filesystem: read/write text, list/create/delete directories, and delete files.
 - Human I/O: ask questions, output messages, and request permission.
+- Capabilities: list, inspect, delegate, and revoke capabilities owned by the
+  current process.
 - Clock: current time and async sleep.
 - Process lifecycle: fork, spawn, wait, list children, signal, merge memory,
   exec, exit, cwd get/set, and process messages.
@@ -25,7 +27,8 @@ The current built-in tool surface includes tools for:
   `llm_context:<pid>` object through a `context-compressor:v0` child process.
 - Shell: argv-only subprocess execution through policy.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
-- Image registry: load image manifests from YAML.
+- Image registry: load workspace image packages and commit checkpoints into
+  checkpoint-derived images.
 - Checkpoint: create, list, inspect, diff, restore, and fork.
 - Skills: discover, activate, read bundled resources, and unload.
 - JIT: propose, validate, and register Deno/TypeScript tools.
@@ -131,8 +134,9 @@ are intentionally not supported.
 The manual lifecycle is:
 
 1. `propose_jit_tool`: store candidate metadata and TypeScript source.
-2. `validate_jit_tool`: run format/dependency lint, import allowlist checks,
-   and configured tests under the sandbox backend.
+2. `validate_jit_tool`: run static source checks, import allowlist checks,
+   schema/source/test size validation, and configured tests under the sandbox
+   backend.
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
 
@@ -240,11 +244,12 @@ The current syscall surface covers existing primitive areas:
 - filesystem read/write/list/mkdir/delete,
 - memory namespace/object read/write/list/append,
 - human ask/output/request permission,
+- capability list/inspect/request permission/delegate/revoke,
 - clock now/sleep,
 - process cwd/fork/spawn/wait/list/signal/merge/exec/exit/messages,
 - shell run,
 - JSON-RPC list/inspect/call,
-- image load/register,
+- image list/inspect/load package/commit checkpoint,
 - checkpoint create/list/inspect/diff/restore/fork/replay,
 - Skill discover/inspect/register_path/activate/read_resource/unload.
 

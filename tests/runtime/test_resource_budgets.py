@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessStatus, ResourceBudget
 
@@ -27,6 +29,36 @@ class TestResourceBudgets:
             assert not second.ok
             assert "max_tool_calls" in (second.error or "")
             assert runtime.process.get(pid).resource_usage.tool_calls == 1
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_batch_budget_denial_leaves_no_partial_tool_execution(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True, action_repair_attempts=1),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            runtime.llm.client = ParallelBudgetClient(
+                [
+                    {"action": "create_memory_object", "type": "observation", "payload": {"should_not_run": True}},
+                    {"action": "process_exit", "payload": {"done": True}},
+                ]
+            )
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="budget batch",
+                resource_budget=ResourceBudget(max_tool_calls=1),
+            )
+
+            result = runtime.run_next_process_once()
+            process = runtime.process.get(pid)
+
+            assert not result["ok"]
+            assert "parallel tool call batch exceeds remaining tool-call budget" in result["error"]
+            assert process.status == ProcessStatus.FAILED
+            assert process.resource_usage.tool_calls == 0
+            assert not any(record.action == "tool.call" for record in runtime.audit.trace())
         finally:
             runtime.close()
 
@@ -141,6 +173,19 @@ class UsageClient:
             model="test-model",
             usage=usage,
         )
+
+
+class ParallelBudgetClient:
+    def __init__(self, actions: list[dict[str, Any]]) -> None:
+        self.actions = actions
+
+    def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        tool_calls = []
+        for index, action in enumerate(self.actions, start=1):
+            name = str(action["action"])
+            args = {key: value for key, value in action.items() if key != "action"}
+            tool_calls.append({"id": f"budget_{index}", "name": name, "arguments": json.dumps(args)})
+        return LLMCompletion(content="", tool_calls=tool_calls)
 
 
 class FailingClient:

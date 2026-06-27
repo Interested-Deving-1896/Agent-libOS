@@ -25,6 +25,7 @@ class ResolvedLLMProfile:
     client: Any
     temperature: float
     max_tokens: int
+    parallel_tool_calls: bool
 
 
 class LLMProfileRegistry:
@@ -85,6 +86,7 @@ class LLMProfileRegistry:
             client=client,
             temperature=self.config.llm.temperature if profile.temperature is None else profile.temperature,
             max_tokens=self.config.llm.max_tokens if profile.max_tokens is None else profile.max_tokens,
+            parallel_tool_calls=self._resolved_parallel_tool_calls(profile, client),
         )
 
     @property
@@ -184,12 +186,29 @@ class LLMProfileRegistry:
                     self.config.llm.responses_previous_response_id,
                 )
             ),
+            parallel_tool_calls=(
+                profile.parallel_tool_calls
+                if profile.parallel_tool_calls is not None
+                else _bool_env(
+                    legacy_env,
+                    "OPENAI_PARALLEL_TOOL_CALLS",
+                    self.config.llm.parallel_tool_calls,
+                )
+            ),
             allow_custom_base_url=(
                 profile.allow_custom_base_url
                 or _bool_env(env, "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", False)
             ),
             defaults=self.config.llm,
         )
+
+    def _resolved_parallel_tool_calls(self, profile: LLMProfile, client: Any) -> bool:
+        if profile.parallel_tool_calls is not None:
+            return bool(profile.parallel_tool_calls)
+        client_value = getattr(client, "parallel_tool_calls", None)
+        if client_value is not None:
+            return bool(client_value)
+        return bool(self.config.llm.parallel_tool_calls)
 
     def _profile_safety_identifier(
         self,

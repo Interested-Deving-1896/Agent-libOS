@@ -31,6 +31,39 @@ class TestLLMClient:
         assert completion.usage['total_tokens'] == 14
         assert completion.reasoning[0]['summary'][0]['text'] == 'choose write_text_file'
 
+    def test_action_requests_send_configured_parallel_tool_calls(self) -> None:
+        response = SimpleNamespace(id='resp_parallel', model='gpt-test', output_text='', output=[])
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model='gpt-test', api_key='key', api_mode='responses', parallel_tool_calls=True)
+        client._async_client = fake
+
+        asyncio.run(
+            client.acomplete_action(
+                messages=[{'role': 'user', 'content': 'call tools'}],
+                tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}],
+            )
+        )
+
+        assert fake.responses.payloads[0]['parallel_tool_calls'] is True
+
+        chat_completion = SimpleNamespace(
+            id='chatcmpl_parallel',
+            model='gpt-test',
+            choices=[SimpleNamespace(finish_reason='tool_calls', message=SimpleNamespace(content='', tool_calls=[]))],
+        )
+        chat_fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(chat_completion)))
+        chat_client = LLMClient(model='gpt-test', api_key='key', api_mode='chat', parallel_tool_calls=True)
+        chat_client._async_client = chat_fake
+
+        asyncio.run(
+            chat_client.acomplete_action(
+                messages=[{'role': 'user', 'content': 'call tools'}],
+                tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}],
+            )
+        )
+
+        assert chat_fake.chat.completions.payloads[0]['parallel_tool_calls'] is True
+
     def test_responses_text_request_uses_json_mode_when_requested(self) -> None:
         response = SimpleNamespace(id='resp_json', model='gpt-test', output_text='{"ok":true}', output=[])
         fake = FakeAsyncOpenAI(responses=FakeResponses(response))
@@ -188,6 +221,7 @@ class TestLLMClient:
         client._async_client = fake
         completion = asyncio.run(client.acomplete_action(messages=[{'role': 'user', 'content': 'exit'}], tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}]))
         assert fake.chat.completions.payloads[0]['model'] == 'compat-model'
+        assert fake.chat.completions.payloads[0]['parallel_tool_calls'] is False
         assert fake.chat.completions.payloads[0]['tools'][0]['function']['strict'] is True
         assert not fake.responses.payloads
         assert completion.api == 'chat'
@@ -238,6 +272,7 @@ class TestLLMClient:
         monkeypatch.setenv('OPENAI_PROMPT_CACHE_KEY', 'cache-key')
         monkeypatch.setenv('OPENAI_PROMPT_CACHE_RETENTION', 'in-memory')
         monkeypatch.setenv('OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID', 'true')
+        monkeypatch.setenv('OPENAI_PARALLEL_TOOL_CALLS', 'true')
 
         client = LLMClient.from_env()
 
@@ -245,6 +280,7 @@ class TestLLMClient:
         assert client.prompt_cache_key == 'cache-key'
         assert client.prompt_cache_retention == 'in-memory'
         assert client.responses_previous_response_id is True
+        assert client.parallel_tool_calls is True
 
     def test_from_env_does_not_implicitly_load_workspace_dotenv(self, tmp_path, monkeypatch) -> None:
         (tmp_path / '.env').write_text(

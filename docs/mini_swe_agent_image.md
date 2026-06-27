@@ -5,9 +5,12 @@ mini-swe-agent `mini.yaml` tool-call shape: the model sees a single `bash`
 tool with a required `command` string and an optional `submit` boolean.
 
 ```bash
-uv run agent-libos images validate images/mini-swe-agent
-uv run agent-libos images register images/mini-swe-agent
+uv run agent-libos --db .agent_libos.sqlite images validate images/mini-swe-agent
+uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agent
 ```
+
+Omitting `--db` uses the default `local` in-memory runtime store, so the
+registration is not available to later CLI invocations.
 
 The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 `default_tools: []`. At boot, the image package registers one process-local JIT
@@ -23,6 +26,18 @@ bash -lc "exec 2>&1; <command>"
 ```
 
 with a 30 second timeout and a 10000 character observation window.
+
+The package declares required capabilities for workspace filesystem read/write
+and shell execute authority. Those declarations are metadata checked by normal
+process bootstrap rules; they do not grant live authority by themselves. A host
+or benchmark runner must still grant the spawned process the filesystem and
+shell authority it should have for the task.
+
+Observations longer than the window return `output_head`, `output_tail`, and
+`elided_chars` instead of a full `output` field. Timed-out or permission-denied
+commands return a non-zero observation with `exception_info`; the agent prompt
+treats an unrecoverable permission, dependency, or timeout condition as a
+blocker that can be submitted explicitly.
 
 Known differences from upstream mini-swe-agent remain:
 

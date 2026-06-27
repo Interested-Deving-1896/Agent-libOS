@@ -71,7 +71,7 @@ Important resource conventions include:
 - `object_namespace:<namespace>` for Object Memory namespace listing and name
   lookup.
 - `process:<pid>` and `process:*` for process operations.
-- `message:<pid>` and `message:*` for message queue operations.
+- `process:spawn` for child process and ObjectTask runner creation.
 - `image:<image_id>` and `image:*` for image registration.
 - `skill:<skill_id>` and `skill:*` for Skill operations.
 - `skill_source:workspace:<relative_path>` and
@@ -158,7 +158,9 @@ All authority mutation goes through explicit operations:
 
 Runtime bootstrap, image bootstrap, human approval, admin CLI, checkpoint
 restore/fork, and tests use explicit trusted issuer paths and emit audit
-records. Trusted issuers are exact configured actor names, not broad prefixes.
+records. Trusted issuers are exact configured actor names by default. The host
+configuration can also allow audited trusted issuer prefixes for controlled
+local integrations; the default prefix list is empty.
 Ordinary AgentProcess, Skill, and JIT tool execution has no implicit signing
 authority.
 
@@ -227,6 +229,16 @@ Default images expose `list_capabilities` and `inspect_capability` so a process
 can understand its own authority. `delegate_capability` and `revoke_capability`
 are registered static tools but are not included in default image tool tables.
 
+## Process Messages
+
+Process messages are IPC records owned by the runtime message manager, not a
+separate `message:*` capability namespace. Current authorization is based on
+process relationship and target identity: a process can receive its own
+messages, parents and direct children can communicate through the exposed
+message tools, and filters such as channel, correlation id, or explicit message
+ids limit delivery. Message tool visibility still matters, but visibility does
+not grant unrelated process or Object Memory authority.
+
 ## CLI And Syscalls
 
 The CLI supports:
@@ -242,7 +254,12 @@ uv run agent-libos capabilities explain <subject> <resource> <right>
 
 Without `--actor-pid`, CLI commands run as audited admin operations. With
 `--actor-pid`, the command is executed as that process and strict capability
-checks apply.
+checks apply. `--actor-pid` is a `capabilities` command option and must appear
+before the subcommand, for example:
+
+```bash
+uv run agent-libos capabilities --actor-pid <pid> list
+```
 
 Deno/TypeScript JIT tools can use the syscall names:
 
