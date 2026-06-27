@@ -68,6 +68,24 @@ class TestCLIBuiltinCommand:
             assert explicit.exists()
             assert not configured.exists()
 
+    def test_cli_uses_configured_local_store_target_when_db_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            configured = root / 'configured.sqlite'
+            config = root / 'config.yaml'
+            config.write_text(
+                f'runtime:\n  local_store_target: {configured.as_posix()}\n',
+                encoding='utf-8',
+            )
+
+            with _temporary_cwd(root):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cli_main(['--config', str(config), 'init'])
+
+            assert stdout.getvalue().strip() == f'initialized {configured.as_posix()}'
+            assert configured.exists()
+
     def test_cli_cd_changes_process_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

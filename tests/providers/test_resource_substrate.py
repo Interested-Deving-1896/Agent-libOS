@@ -85,6 +85,14 @@ class TestResourceProviderSubstrate:
     def test_local_shell_provider_enforces_subprocess_wall_limit_with_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = LocalShellProvider(temp_dir)
+            if sys.platform == "win32":
+                with pytest.raises(ValidationError, match="SubprocessLimits"):
+                    provider.run(
+                        [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                        timeout=5.0,
+                        limits=SubprocessLimits(wall_seconds=0.05),
+                    )
+                return
             with pytest.raises(SubprocessLimitExceeded) as exc_info:
                 provider.run(
                     [sys.executable, "-c", "import time; time.sleep(0.2)"],
@@ -138,6 +146,40 @@ class TestResourceProviderSubstrate:
                 while time.monotonic() < deadline and _processes_with_marker(marker):
                     time.sleep(0.05)
                 assert _processes_with_marker(marker) == []
+            finally:
+                for proc in _processes_with_marker(marker):
+                    with contextlib.suppress(psutil.Error):
+                        proc.kill()
+
+    def test_local_shell_provider_cleanup_kills_background_sentinel_writer(self) -> None:
+        marker = f"SHELL_PROVIDER_SENTINEL_{time.monotonic_ns()}"
+        child_script = (
+            "import pathlib, sys, time; "
+            "time.sleep(0.5); "
+            "pathlib.Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sentinel = Path(temp_dir) / "sentinel.txt"
+            if sys.platform == "win32":
+                child_kwargs = "dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)"
+            else:
+                child_kwargs = "{}"
+            parent_script = (
+                "import subprocess, sys; "
+                f"kwargs = {child_kwargs}; "
+                "subprocess.Popen("
+                f"[sys.executable, '-c', {child_script!r}, {str(sentinel)!r}, {marker!r}], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)"
+            )
+            provider = LocalShellProvider(temp_dir)
+            try:
+                result = provider.run([sys.executable, "-c", parent_script], timeout=5.0)
+                assert result.returncode == 0
+
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline and not sentinel.exists():
+                    time.sleep(0.05)
+                assert not sentinel.exists()
             finally:
                 for proc in _processes_with_marker(marker):
                     with contextlib.suppress(psutil.Error):

@@ -45,7 +45,8 @@ The implementation currently includes:
 - Optional Object-bound PTY sessions through the trusted `modules/pty` runtime
   module; when that module is loaded, `pty_create` returns an Object Memory
   `EXTERNAL_REF` handle, and read, write, resize, and close rights follow
-  object capabilities.
+  object capabilities. On Windows, real PTY support requires installing the
+  optional `pty` extra; see [docs/modules.md](docs/modules.md).
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
   same durable message queues, including optional owner-change watches, without
@@ -68,7 +69,8 @@ The implementation currently includes:
   ToolBroker without invoking the LLM scheduler.
 - SQLite persistence for process/object metadata, capabilities, messages,
   human requests, LLM calls, events, audit records, tools, Skill/JIT metadata,
-  and scoped checkpoints.
+  object tasks, JSON-RPC endpoints, image definitions/artifacts, Runtime Module
+  load records, external effects, and scoped checkpoints.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
   candidates without granting resource authority.
@@ -143,9 +145,9 @@ The `runtime` and `all` lanes use bounded pytest-xdist parallelism by default
 to keep CI wall-clock time under control. Pass `--workers 1` for serial failure
 diagnosis, or `--workers N` / `--workers auto` to override the worker count for
 any Python lane. The GUI lane builds shared frontend artifacts and should be run
-separately. Pytest removes files created under ignored `agent_outputs/` at the
-end of a test session; use `--keep-agent-outputs` when debugging generated
-files.
+separately after `npm --prefix gui install`. Pytest removes files created under
+ignored `agent_outputs/` at the end of a test session; use
+`--keep-agent-outputs` when debugging generated files.
 
 Run the deterministic local demo:
 
@@ -222,12 +224,14 @@ Create a local `.env` file for real-model execution:
 OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
 OPENAI_LANGUAGE_MODEL=your-model
 OPENAI_API_KEY=...
+AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
 ```
 
 The client uses the OpenAI Python SDK. It uses the Responses API for
 OpenAI-hosted models by default and falls back to Chat Completions for custom
-OpenAI-compatible `base_url` providers. Set `OPENAI_API_MODE=responses` or
-`OPENAI_API_MODE=chat` to force a mode.
+OpenAI-compatible `base_url` providers. Custom OpenAI-compatible endpoints
+require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1`; official OpenAI endpoints do
+not. Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode.
 
 Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
@@ -252,7 +256,7 @@ Manually control process cwd and lifecycle:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite cd <pid> src
-uv run agent-libos --db .agent_libos.sqlite exec images/review-agent "Review README.md" --pid <pid> --run
+uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review README.md" --pid <pid> --run
 uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
 ```
 
@@ -350,6 +354,7 @@ Run the standard local checks:
 
 ```bash
 uv sync --frozen --all-groups
+npm --prefix gui install
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
 uv run python scripts/test_matrix.py --lane all --workers 4
 uv run python scripts/check_test_invariants.py

@@ -9,12 +9,14 @@ Install dependencies:
 
 ```bash
 uv sync --all-groups
+npm --prefix gui install
 ```
 
 Use frozen dependency resolution for artifact and CI-style checks:
 
 ```bash
 uv sync --frozen --all-groups
+npm --prefix gui install
 ```
 
 Deno-backed tests run by default when `deno` is installed. If `deno` is absent,
@@ -55,7 +57,8 @@ to bounded parallel execution with at most four workers and `--dist worksteal`,
 which keeps CI runtime below the lane budget while balancing long SQLite and
 runtime-reopen tests. Pass `--workers 1` for serial failure diagnosis, or set
 `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to override defaults in CI.
-Run the `gui` lane separately because it writes shared frontend build artifacts.
+Run the `gui` lane separately because it writes shared frontend build artifacts;
+install GUI dependencies first with `npm --prefix gui install`.
 
 Pytest cleans files created under the ignored `agent_outputs/` directory at the
 end of each test session, while preserving anything that existed before the
@@ -121,6 +124,7 @@ Useful optional variables:
 - `OPENAI_PROMPT_CACHE_KEY`
 - `OPENAI_PROMPT_CACHE_RETENTION=in-memory|24h`
 - `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID=true|false`
+- `OPENAI_PARALLEL_TOOL_CALLS=true|false`
 - provider-specific `OPENAI_ENABLE_THINKING`
 
 `OPENAI_BASE_URL` is optional for the OpenAI API. Custom OpenAI-compatible
@@ -133,6 +137,10 @@ opt-in `previous_response_id` chaining. The runtime keeps `llm.store=False` and
 Responses state chaining disabled by default; enable both only when retaining
 provider-side response state is acceptable. These OpenAI-specific fields are
 not sent to custom OpenAI-compatible endpoints.
+Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
+provider return multiple tool calls in one action-selection response. Agent
+libOS dispatches that batch sequentially in one quantum; it does not run tools
+concurrently.
 
 Run a script smoke:
 
@@ -160,9 +168,11 @@ behavior. Other named profiles do not inherit ambient provider/model
 environment variables; set their profile fields explicitly when they should use
 a non-default model or endpoint.
 
-Set `config.llm.persist_full_io=True` to opt into full prompt, visible tool
-schema, model output, tool call, reasoning, and raw response persistence. This
-is intended for explicit local debugging or forensic runs because it can store
+Set `llm.persist_full_io: true` in a config overlay, or construct a replacement
+`AgentLibOSConfig`, to opt into full prompt, visible tool schema, model output,
+tool call, reasoning, and raw response persistence. The config dataclasses are
+frozen, so do not mutate `DEFAULT_CONFIG` in place. Full I/O persistence is
+intended for explicit local debugging or forensic runs because it can store
 user data, object memory excerpts, and provider payloads in SQLite.
 
 ## Configuration Defaults
@@ -201,7 +211,10 @@ Current default groups include:
 - shell policy allow/block lists,
 - JSON-RPC endpoint manifest, timeout, and request/response limits,
 - image registry limits,
+- image commit limits,
 - Object Memory and LLM context defaults,
+- capability trusted issuer settings,
+- GUI HTTP/event/request limits,
 - checkpoint snapshot limits,
 - Skill package source, trust, resource, and `SKILL.md` limits,
 - trusted startup Runtime Module manifests, hash trust, and registration limits,
@@ -226,9 +239,11 @@ manifests fail closed instead of silently overwriting earlier declarations.
 README is the entrypoint. Detailed implementation documentation belongs in
 `docs/`.
 
-When behavior changes, update the relevant doc and `docs/invariants.md` in the
-same change. Do not describe future work as current behavior. Paper-facing
-documentation should stay aligned with the fixed title:
+When behavior changes, update the relevant doc. If the change affects a runtime
+invariant, update the machine-readable source in `tests/invariants.yaml` and
+then sync `docs/invariants.md` in the same change. Do not describe future work
+as current behavior. Paper-facing documentation should stay aligned with the
+fixed title:
 `Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM
 Agents`.
 

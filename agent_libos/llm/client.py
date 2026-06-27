@@ -56,6 +56,7 @@ class LLMClient:
     prompt_cache_key: str | None = None
     prompt_cache_retention: Literal["in-memory", "24h"] | None = None
     responses_previous_response_id: bool | None = None
+    parallel_tool_calls: bool | None = None
     allow_custom_base_url: bool = False
     defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
     _client: Any | None = field(default=None, init=False, repr=False)
@@ -77,6 +78,9 @@ class LLMClient:
             self.defaults.responses_previous_response_id
             if self.responses_previous_response_id is None
             else self.responses_previous_response_id
+        )
+        self.parallel_tool_calls = (
+            self.defaults.parallel_tool_calls if self.parallel_tool_calls is None else self.parallel_tool_calls
         )
         self._validate_base_url_policy()
 
@@ -122,6 +126,11 @@ class LLMClient:
                 env,
                 "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
                 default=defaults.responses_previous_response_id,
+            ),
+            parallel_tool_calls=_bool_env_from(
+                env,
+                "OPENAI_PARALLEL_TOOL_CALLS",
+                default=defaults.parallel_tool_calls,
             ),
             allow_custom_base_url=selected_allow_custom_base_url,
             defaults=defaults,
@@ -242,6 +251,7 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         previous_response_id: str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_action(
@@ -250,6 +260,7 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 previous_response_id=previous_response_id,
+                parallel_tool_calls=parallel_tool_calls,
             )
         )
 
@@ -260,9 +271,11 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         previous_response_id: str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> LLMCompletion:
         selected_temperature = self._temperature(temperature)
         selected_max_tokens = self._max_tokens(max_tokens)
+        selected_parallel_tool_calls = self._parallel_tool_calls(parallel_tool_calls)
         if self._use_responses_api():
             try:
                 return await self._responses_complete_action(
@@ -271,11 +284,18 @@ class LLMClient:
                     selected_temperature,
                     selected_max_tokens,
                     previous_response_id=previous_response_id,
+                    parallel_tool_calls=selected_parallel_tool_calls,
                 )
             except LLMError as exc:
                 if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
-        return await self._chat_complete_action(messages, tools, selected_temperature, selected_max_tokens)
+        return await self._chat_complete_action(
+            messages,
+            tools,
+            selected_temperature,
+            selected_max_tokens,
+            parallel_tool_calls=selected_parallel_tool_calls,
+        )
 
     async def _complete_without_tools(
         self,
@@ -319,6 +339,7 @@ class LLMClient:
         max_tokens: int,
         *,
         previous_response_id: str | None = None,
+        parallel_tool_calls: bool,
     ) -> LLMCompletion:
         payload = self._responses_payload(
             messages,
@@ -330,8 +351,7 @@ class LLMClient:
             {
                 "tools": _responses_tools_from_chat_tools(tools),
                 "tool_choice": "auto",
-                # The libOS executor dispatches one selected action per quantum.
-                "parallel_tool_calls": False,
+                "parallel_tool_calls": parallel_tool_calls,
             }
         )
         response = await self._create_response(payload)
@@ -368,9 +388,11 @@ class LLMClient:
         tools: list[dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        *,
+        parallel_tool_calls: bool,
     ) -> LLMCompletion:
         payload = self._chat_payload(messages=messages, temperature=temperature, max_tokens=max_tokens)
-        payload.update({"tools": _chat_tools(tools), "tool_choice": "auto", "parallel_tool_calls": False})
+        payload.update({"tools": _chat_tools(tools), "tool_choice": "auto", "parallel_tool_calls": parallel_tool_calls})
         try:
             completion = await self._create_chat_completion(payload)
         except LLMError as exc:
@@ -711,6 +733,10 @@ class LLMClient:
 
     def _max_tokens(self, value: int | None) -> int:
         return self.defaults.max_tokens if value is None else value
+
+    def _parallel_tool_calls(self, value: bool | None) -> bool:
+        selected = self.parallel_tool_calls if value is None else value
+        return bool(selected)
 
     def _should_fallback_to_chat(self, exc: Exception) -> bool:
         status_code = getattr(exc, "status_code", None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ResourceBudget
-from agent_libos.models.exceptions import ResourceLimitExceeded
+from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.substrate import LocalFilesystemProvider, LocalResourceProviderSubstrate, ResolvedPath
 from tests.security.test_shell_primitive import FakeShellProvider, RecordingShellSubstrate
 
@@ -75,8 +76,12 @@ class TestResourceConstraints:
                 )
 
                 assert not result.ok
-                assert runtime.process.get(pid).status.value == "killed"
-                assert any(record.action == "resource.limit_exceeded" for record in runtime.audit.trace())
+                if sys.platform == "win32":
+                    assert "SubprocessLimits" in (result.error or "")
+                    assert runtime.process.get(pid).status.value == "runnable"
+                else:
+                    assert runtime.process.get(pid).status.value == "killed"
+                    assert any(record.action == "resource.limit_exceeded" for record in runtime.audit.trace())
             finally:
                 runtime.close()
 
@@ -114,16 +119,22 @@ class TestResourceConstraints:
                 )
                 runtime.shell.grant_policy(pid, "always_allow", issued_by="test")
 
-                try:
+                if sys.platform == "win32":
+                    with pytest.raises(ValidationError, match="SubprocessLimits"):
+                        runtime.shell.run(
+                            pid,
+                            ["python", "-c", "import time; time.sleep(0.2)"],
+                            timeout=0.05,
+                        )
+                    assert runtime.process.get(pid).status.value == "runnable"
+                    return
+
+                with pytest.raises(TimeoutError):
                     runtime.shell.run(
                         pid,
                         ["python", "-c", "import time; time.sleep(0.2)"],
                         timeout=0.05,
                     )
-                except TimeoutError:
-                    pass
-                else:
-                    raise AssertionError("expected shell timeout")
 
                 process = runtime.process.get(pid)
                 assert process.status.value == "runnable"

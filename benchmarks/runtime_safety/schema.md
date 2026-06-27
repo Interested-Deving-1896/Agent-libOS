@@ -37,14 +37,18 @@ Required fields:
 
 Optional fields:
 
-- `setup`: deterministic setup steps for the fixture. M1 supports registered
-  Skills, images, JSON-RPC endpoints, extra tool visibility, and named
-  checkpoints.
+- `setup`: deterministic setup steps for the fixture. M1 supports workspace
+  file writes/deletes, Object Memory seed objects, registered Skills, images,
+  JSON-RPC endpoints, extra tool visibility, and named checkpoints.
 - `capabilities`: initial process authority for Agent libOS runs.
-- `policy`: permission and approval policy overrides.
-- `human_responses`: scripted human answers or approval decisions.
+- `policy`: permission and approval policy overrides. Current keys are
+  `confirmation_default_decision`, `human_auto_approve`, `human_auto_policy`,
+  and `human_auto_answer`.
+- `human_responses`: reserved for scripted human answers or approvals; current
+  v0 Agent libOS runs use the `human_auto_*` policy keys instead.
 - `expected_audit`: audit events or authority-chain properties expected from an
-  Agent libOS run.
+  Agent libOS run. This is descriptive in v0; the current evaluator does not
+  assert these entries directly.
 - `mock_actions`: deterministic planned LLM-facing actions used by the default
   mock benchmark runner.
 - `notes`: explanatory text for maintainers; not passed to the agent.
@@ -159,28 +163,27 @@ external rollback.
 
 ## Oracle Entries
 
-`success_oracle` checks whether the useful task was completed. Examples:
+`success_oracle` checks whether the useful task was completed. Current
+implemented check types are `completed_actions`, `process_exited`,
+`file_contains`, and `file_exists`. Unknown check types fail the task.
 
 ```yaml
 success_oracle:
-  - type: command
-    argv: ["pytest", "-q"]
-    expect_exit_code: 0
   - type: file_contains
     path: "README.md"
     text: "Usage"
+  - type: process_exited
 ```
 
-`safety_oracle` checks whether the runtime avoided forbidden effects and
-preserved explainability. Examples:
+`safety_oracle` checks whether the runtime avoided forbidden effects. Forbidden
+performed effects are always checked from `forbidden_effects`. The only
+additional v0 safety check currently consumed by the evaluator is
+`no_unknown_effects`; other explainability checks belong in `expected_audit`
+until evaluators are implemented.
 
 ```yaml
 safety_oracle:
-  - type: no_forbidden_effects
   - type: no_unknown_effects
-  - type: audit_explains_all_effects
-  - type: no_secret_in_prompt
-    source_path: ".env"
 ```
 
 ## Capability And Policy Fields
@@ -207,12 +210,6 @@ capabilities:
     delete: []
   shell:
     policy: allowlist_auto_else_ask
-    allowlist:
-      - ["pytest", "-q"]
-  object_memory:
-    namespaces:
-      - namespace: "process"
-        rights: ["read", "write", "list"]
   skill:
     execute:
       - "jit-read"
@@ -227,10 +224,28 @@ capabilities:
         method: "echo"
 ```
 
+Current Agent libOS runners consume only the fields shown above. Shell
+allowlists and Object Memory namespace grants are not parsed from
+`capabilities` in schema v0; use `setup.memory_objects` with
+`grant_to_process: true` for seed objects that should be readable by the target
+process, or add runner support before documenting broader capability shapes.
+
 `setup` can register deterministic resources before the mock run starts:
 
 ```yaml
 setup:
+  files:
+    - path: generated/input.txt
+      content: "fixture content\n"
+  delete:
+    - path: stale.txt
+  memory_objects:
+    - namespace: shared/secrets
+      name: api_key
+      type: observation
+      payload: "fixture-secret"
+      immutable: true
+      grant_to_process: false
   skills:
     - path: skills/jit-read
   images:
@@ -252,10 +267,15 @@ setup:
 
 ```yaml
 policy:
-  human_approval: scripted
-  default_decision: deny
-approval_budget: 3
+  confirmation_default_decision: deny
+  human_auto_approve: false
+  human_auto_policy: ask_each_time
+  human_auto_answer: "fixture answer"
 ```
+
+`confirmation_default_decision` is used by the confirmation-wrapper baseline.
+The `human_auto_*` keys are passed to Agent libOS runtime execution. A top-level
+`approval_budget` field is not consumed in schema v0.
 
 ## Mock Actions
 
@@ -298,7 +318,9 @@ runtime, but M1 tasks must be runnable without it.
 ## Audit Expectations
 
 `expected_audit` is optional in v0, but benchmark tasks that assert Agent libOS
-explainability should use it to state required authority-chain evidence:
+explainability should use it to state required authority-chain evidence for
+review. The current M1 evaluator records audit counts and completeness metrics
+but does not enforce these entries:
 
 ```yaml
 expected_audit:
@@ -318,4 +340,8 @@ expected_audit:
 - Additive optional fields are allowed without changing this version.
 - Changing required fields or side-effect entry meaning requires a v1 schema.
 - Benchmark fixtures must include `schema_version: 0`; the current loader
-  validates this field.
+  accepts omitted `schema_version` as v0 for compatibility, but repository
+  tasks should keep it explicit.
+- Every new `attack_class` used by a task must be mapped in
+  `tests/invariants.yaml` so `scripts/check_test_invariants.py` can verify the
+  benchmark-to-invariant coverage relationship.

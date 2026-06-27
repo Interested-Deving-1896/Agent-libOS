@@ -146,6 +146,7 @@ class LLMProfile:
     prompt_cache_key: str | None = None
     prompt_cache_retention: Literal["in-memory", "24h"] | None = None
     responses_previous_response_id: bool | None = None
+    parallel_tool_calls: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     allow_custom_base_url: bool = False
@@ -165,6 +166,7 @@ class LLMDefaults:
     prompt_cache_key: str | None = None
     prompt_cache_retention: Literal["in-memory", "24h"] | None = None
     responses_previous_response_id: bool = False
+    parallel_tool_calls: bool = False
     compatibility_retry_attempts: int = 8
     action_repair_attempts: int = 2
     content_preview_chars: int = 500
@@ -334,6 +336,7 @@ class JsonRpcDefaults:
     max_response_hard_limit_bytes: int = 8_388_608
     list_limit: int = 100
     audit_preview_chars: int = 512
+    header_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_JSONRPC_*",)
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -752,6 +755,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_at_least("jsonrpc.timeout_hard_limit_s", jsonrpc.timeout_hard_limit_s, "jsonrpc.timeout_s", jsonrpc.timeout_s)
     _require_at_least("jsonrpc.max_request_hard_limit_bytes", jsonrpc.max_request_hard_limit_bytes, "jsonrpc.max_request_bytes", jsonrpc.max_request_bytes)
     _require_at_least("jsonrpc.max_response_hard_limit_bytes", jsonrpc.max_response_hard_limit_bytes, "jsonrpc.max_response_bytes", jsonrpc.max_response_bytes)
+    _require_non_empty_items("jsonrpc.header_env_allowlist", jsonrpc.header_env_allowlist)
 
     image = config.image
     for name in (

@@ -729,6 +729,7 @@ class JsonRpcPrimitive:
         for name, header in endpoint.headers.items():
             self._validate_header_name(name)
             self._validate_header_value_part(header.env, "header env")
+            self._validate_header_env_allowed(header.env)
             self._validate_header_value_part(header.prefix, "header prefix")
             self._validate_header_value_part(header.suffix, "header suffix")
         for method in endpoint.methods:
@@ -841,6 +842,14 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC header prefix must be empty or an approved auth scheme")
         if field == "header suffix" and value not in _ALLOWED_HEADER_SUFFIXES:
             raise ValidationError("JSON-RPC header suffix must be empty")
+
+    def _validate_header_env_allowed(self, value: str) -> None:
+        for pattern in self.config.jsonrpc.header_env_allowlist:
+            if pattern.endswith("*") and value.startswith(pattern[:-1]):
+                return
+            if value == pattern:
+                return
+        raise ValidationError(f"JSON-RPC header env is not allowed for endpoint manifests: {value!r}")
 
     def _require_header_environment(self, endpoint: JsonRpcEndpointSpec) -> None:
         missing: list[str] = []

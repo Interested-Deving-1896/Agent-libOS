@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import pytest
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -164,6 +165,94 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
+    def test_write_directory_rejects_reparse_swap_before_mkdir_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            (root / 'dir').mkdir()
+            provider = SinkSwapProvider(root, outside_root, operation='make_directory')
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='mkdir reparse race')
+                runtime.filesystem.grant_directory(pid, 'dir/created', [CapabilityRight.WRITE], issued_by='test')
+
+                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                    runtime.filesystem.write_directory(pid, 'dir/created', parents=True)
+
+                assert provider.swapped
+                assert not (outside_root / 'created').exists()
+            finally:
+                runtime.close()
+
+    def test_delete_file_rejects_reparse_swap_before_unlink_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            (root / 'dir').mkdir()
+            (root / 'dir' / 'victim.txt').write_text('inside', encoding='utf-8')
+            outside_file = outside_root / 'victim.txt'
+            outside_file.write_text('outside', encoding='utf-8')
+            provider = SinkSwapProvider(root, outside_root, operation='delete_file')
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='unlink reparse race')
+                runtime.filesystem.grant_path(pid, 'dir/victim.txt', [CapabilityRight.DELETE], issued_by='test')
+
+                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                    runtime.filesystem.delete_file(pid, 'dir/victim.txt')
+
+                assert provider.swapped or os.name == 'nt'
+                assert outside_file.read_text(encoding='utf-8') == 'outside'
+            finally:
+                runtime.close()
+
+    def test_delete_directory_rejects_reparse_swap_before_recursive_delete_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            (root / 'dir' / 'victim').mkdir(parents=True)
+            (root / 'dir' / 'victim' / 'inside.txt').write_text('inside', encoding='utf-8')
+            (outside_root / 'victim').mkdir()
+            outside_file = outside_root / 'victim' / 'outside.txt'
+            outside_file.write_text('outside', encoding='utf-8')
+            provider = SinkSwapProvider(root, outside_root, operation='delete_directory')
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='rmtree reparse race')
+                runtime.filesystem.grant_directory(pid, 'dir/victim', [CapabilityRight.DELETE], issued_by='test')
+
+                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                    runtime.filesystem.delete_directory(pid, 'dir/victim', recursive=True)
+
+                assert provider.swapped or os.name == 'nt'
+                assert outside_file.read_text(encoding='utf-8') == 'outside'
+            finally:
+                runtime.close()
+
+    def test_write_file_rejects_reparse_swap_during_fallback_open_before_truncate(self) -> None:
+        if os.open in os.supports_dir_fd:
+            pytest.skip('fallback open path is not used on this platform')
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            (root / 'dir').mkdir()
+            (root / 'dir' / 'victim.txt').write_text('inside', encoding='utf-8')
+            outside_file = outside_root / 'victim.txt'
+            outside_file.write_text('outside', encoding='utf-8')
+            provider = FallbackOpenSwapProvider(root, outside_root)
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='fallback open reparse race')
+                runtime.filesystem.grant_path(pid, 'dir/victim.txt', [CapabilityRight.WRITE], issued_by='test')
+
+                with pytest.raises(CapabilityDenied, match='opened path changed|escapes filesystem adapter root|symlink|junction'):
+                    runtime.filesystem.write_text(pid, 'dir/victim.txt', 'changed')
+
+                assert provider.swapped
+                assert outside_file.read_text(encoding='utf-8') == 'outside'
+            finally:
+                runtime.close()
+
     def test_directory_listing_does_not_follow_child_symlink_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
             root = Path(workspace)
@@ -294,6 +383,11 @@ class TestFilesystemDirectoryTool:
         target.write_text(content, encoding='utf-8')
         return path
 
+    def _runtime_with_filesystem_provider(self, root: Path, provider: LocalFilesystemProvider) -> Runtime:
+        substrate = LocalResourceProviderSubstrate(root)
+        substrate.filesystem = provider
+        return Runtime.open('local', substrate=substrate)
+
 
 class SwappingSymlinkProvider(LocalFilesystemProvider):
     def __init__(self, root: Path, outside: Path):
@@ -307,6 +401,37 @@ class SwappingSymlinkProvider(LocalFilesystemProvider):
             os.symlink(self.outside, Path(self.root_display) / 'dir', target_is_directory=True)
             self.swapped = True
         super().write_text(path, text, encoding=encoding, newline=newline)
+
+
+class SinkSwapProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path, outside: Path, *, operation: str):
+        super().__init__(root)
+        self.outside = outside
+        self.operation = operation
+        self.swapped = False
+
+    def _before_path_sink(self, operation: str, target: Path) -> None:
+        if self.swapped or operation != self.operation:
+            return
+        link = Path(self.root_display) / 'dir'
+        _remove_directory_for_swap(link)
+        _create_directory_reparse_link(link, self.outside)
+        self.swapped = True
+
+
+class FallbackOpenSwapProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path, outside: Path):
+        super().__init__(root)
+        self.outside = outside
+        self.swapped = False
+
+    def _before_fallback_open(self, target: Path, flags: int) -> None:
+        if self.swapped:
+            return
+        link = Path(self.root_display) / 'dir'
+        _remove_directory_for_swap(link)
+        _create_directory_reparse_link(link, self.outside)
+        self.swapped = True
 
 
 class FailingMutationProvider(LocalFilesystemProvider):
@@ -328,3 +453,31 @@ class SlowCountingMutationProvider(LocalFilesystemProvider):
             self.write_attempts += 1
         time.sleep(0.05)
         super().write_text(path, text, encoding=encoding, newline=newline)
+
+
+def _remove_directory_for_swap(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+        return
+    is_junction = getattr(path, 'is_junction', None)
+    if callable(is_junction) and is_junction():
+        path.rmdir()
+        return
+    shutil.rmtree(path)
+
+
+def _create_directory_reparse_link(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except OSError:
+        if os.name != 'nt':
+            pytest.skip('symlink creation is not available in this environment')
+    result = subprocess.run(
+        ['cmd', '/c', 'mklink', '/J', str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f'junction creation is not available in this environment: {result.stderr or result.stdout}')

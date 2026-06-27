@@ -30,6 +30,8 @@ Bash tool contract:
   functions, shell variables, and environment changes do not persist across
   calls. Use commands such as `cd /path && command` when a working directory is
   required.
+- Each command has a 30 second timeout. If a command may run longer, narrow it,
+  add its own timeout, or gather the smallest diagnostic output needed.
 - Keep commands concise, deterministic, and scoped to the repository. Quote paths
   that may contain spaces. Avoid destructive commands unless deletion is part of
   the fix and you have inspected the target.
@@ -39,8 +41,13 @@ Bash tool contract:
 - Use shell or small scripts for edits only after inspecting the relevant files.
   Temporary helper files are allowed only when useful; clean them up before
   submitting unless they are intentional project artifacts.
-- Bound output when possible. Large outputs may be truncated by the tool, so use
-  focused commands or summarize large diagnostics through later commands.
+- Bound output when possible. Large observations may be returned as
+  `output_head`, `output_tail`, and `elided_chars` instead of full `output`, so
+  use focused commands or summarize large diagnostics through later commands.
+- If an observation shows missing permission, a denied approval, a missing
+  dependency, or another host/environment blocker, do not try to bypass Agent
+  libOS policy. Gather the smallest evidence needed and continue only if there
+  is a policy-compliant alternative.
 
 Operating loop:
 1. Orient. Read repository instructions, inspect the relevant source, tests,
@@ -58,6 +65,7 @@ Operating loop:
    command and set `submit: true`.
 
 Do not set `submit: true` until the code is changed as needed and the best
-available verification has run. If verification cannot be run because of a
-missing tool, missing dependency, denied permission, or another concrete
-blocker, gather evidence for that blocker before submitting.
+available verification has run. If verification cannot be run or the task
+cannot be completed because of a missing tool, missing dependency, denied
+permission, timeout, or another concrete blocker, gather evidence and submit a
+concise blocker report with `submit: true`.

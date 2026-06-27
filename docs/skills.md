@@ -59,6 +59,14 @@ Agent libOS reserves the `agent-libos.*` metadata namespace. Complex extension
 data lives in `references/agent-libos/*.json`; metadata only points at those
 relative files.
 
+Package validation is bounded by `AgentLibOSConfig.skills`: `SKILL.md` is read
+with `skill_md_max_bytes` for process-driven workspace registration and the
+hard host limit is `skill_md_hard_limit_bytes`; bundled resources are limited
+by `resource_read_max_bytes`, `package_max_bytes`, and `max_package_files`.
+Prompt instructions are clipped to `max_prompt_instruction_chars`; Skill JIT
+sources use `max_jit_source_chars`; tool, action, JIT, and
+required-capability counts use their corresponding `max_*` settings.
+
 ## Progressive Disclosure
 
 Discovery returns catalog fields such as `name`, `description`, source, package
@@ -130,12 +138,29 @@ uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
 With `--actor-pid`, the CLI enforces that process's filesystem and Skill
 capabilities.
 
+Capability requirements:
+
+- Discovering registered Skills as a process requires `skill:*` `read`.
+- Inspecting a registered Skill as a process requires `skill:<name>` `read`.
+- Registering or replacing a Skill requires `skill:<name>` `write`.
+- Activating or unloading a Skill requires `skill:<name>` `execute`.
+- Activating or unloading a Skill for a different process also requires
+  `process:<pid>` `admin`.
+- Trusting or untrusting global Skill package hashes requires
+  `skill_trust:*` `admin`.
+
+The host catalog shown to admin callers currently scans `skills/`,
+`.agents/skills/`, `.claude/skills/`, and configured global Skill directories.
+Process-driven workspace registration remains path-based and must pass
+filesystem authority for each package file it snapshots.
+
 ## Activation And Unload
 
-`activate_skill` is atomic. The runtime validates the package, existing tool
-references, duplicate tool/JIT names, TypeScript source limits, Deno static
-checks and tests through ToolBroker, and static tool shadowing before it
-modifies the process tool table or loaded Skill metadata.
+`activate_skill` is atomic with respect to the process tool table and loaded
+Skill metadata. The runtime validates the package, existing tool references,
+duplicate tool/JIT names, TypeScript source limits, Deno static checks and
+tests through ToolBroker, and static tool shadowing before it modifies either
+record.
 
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill. It does not revoke capabilities, delete audit history, delete JIT
@@ -152,7 +177,8 @@ candidate records, or roll back external side effects.
 
 ## SWE-Agent Style Skill
 
-The workspace includes `skills/swe-agent`, registered as `swe-agent`. It
+The workspace includes `skills/swe-agent`, named and registerable as
+`swe-agent`. It
 reproduces the useful SWE-Agent Agent Computer Interface shape inside Agent
 libOS:
 

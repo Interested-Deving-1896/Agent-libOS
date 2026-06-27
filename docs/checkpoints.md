@@ -93,6 +93,7 @@ LLM-facing tools:
 - `diff_checkpoint`
 - `restore_checkpoint`
 - `fork_checkpoint`
+- `commit_checkpoint_to_image` for checkpoint-derived AgentImage commits
 
 Default images expose low-risk create/list/inspect/diff tools. Restore and fork
 tools are registered but require explicit tool visibility plus checkpoint
@@ -107,6 +108,7 @@ JIT syscalls:
 - `checkpoint.restore`
 - `checkpoint.fork`
 - `checkpoint.replay_to_event`
+- `image.commit_checkpoint`
 
 CLI commands:
 
@@ -128,18 +130,18 @@ capabilities. Omitting it runs as an audited admin CLI actor.
 Restore applies at a runtime safe point and is scoped to the checkpoint owner
 subtree. Unrelated processes are not restored.
 
-Post-checkpoint pending human requests for restored processes are cancelled when
-they conflict with restored state. Post-checkpoint mailbox entries are kept in
-history but marked as superseded by restore so they are not delivered as unread
-by default.
+All post-checkpoint pending human requests for restored processes are cancelled.
+Post-checkpoint mailbox entries are kept in history but marked as superseded by
+restore so they are not delivered as unread by default.
 
 After restored process rows are written, restore reconciles wait states against
 the restored runtime facts. A process waiting on an already-terminal child or a
 now-available matching message is made runnable. A process waiting on a human
-request that restored as approved resumes; one restored as rejected or
-cancelled becomes paused with an explanatory status message. This keeps
-checkpoint state from preserving stale waits whose blocking condition has
-already resolved in the restored snapshot.
+request that restored as approved resumes; a restored `permission_request`
+wait also becomes runnable so the permission path can re-check the current
+capability state. Other resolved human waits become paused with an explanatory
+status message. This keeps checkpoint state from preserving stale waits whose
+blocking condition has already resolved in the restored snapshot.
 
 The current tool call's result object can still be appended after restore so
 the process receives a coherent action result.
@@ -189,16 +191,21 @@ uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> statef
 uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --goal "use baked memory"
 ```
 
+The model-visible commit path is the `commit_checkpoint_to_image` tool; the JIT
+syscall path is `image.commit_checkpoint`. Actor-mode commits require `write`
+on the target `image:<image_id>` and read authority on either the checkpoint or
+the checkpointed process.
+
 ## Fork From Checkpoint
 
 Fork creates a new isolated process subtree from checkpoint state. It remaps
 pids, object ids, capability ids, namespace ids, and process-local tool records.
-Fork is non-destructive for the global image registry: it restores only image
-definitions or checkpoint-derived image artifacts that are missing from the
-current runtime, and never replaces an image id that already exists. When actor
-capability checks are enabled, fork therefore requires both `execute` on the
-checkpoint and `write` on each missing `image:<image_id>` resource it would
-reintroduce.
+Fork is non-destructive for the global image registry: it restores only missing
+image definitions, and restores checkpoint-derived image artifacts only for the
+missing images it reintroduces. It never replaces an image id that already
+exists. When actor capability checks are enabled, fork therefore requires both
+`execute` on the checkpoint and `write` on each missing `image:<image_id>`
+resource it would reintroduce.
 
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result

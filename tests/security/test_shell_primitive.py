@@ -224,6 +224,52 @@ class TestShellPrimitive:
             finally:
                 runtime.close()
 
+    def test_shell_denies_attached_short_option_cwd_path_escape_before_execution(self) -> None:
+        self._assert_shell_denies_attached_short_option_path_escape('-C../outside')
+
+    def test_shell_denies_attached_short_option_include_path_escape_before_execution(self) -> None:
+        self._assert_shell_denies_attached_short_option_path_escape('-I/outside')
+
+    def test_shell_denies_attached_short_option_output_path_escape_before_execution(self) -> None:
+        self._assert_shell_denies_attached_short_option_path_escape('-o..\\outside')
+
+    def test_shell_denies_attached_short_option_parent_operand_before_execution(self) -> None:
+        self._assert_shell_denies_attached_short_option_path_escape('-C..')
+
+    def test_shell_denies_attached_short_option_home_operand_before_execution(self) -> None:
+        self._assert_shell_denies_attached_short_option_path_escape('-I~')
+
+    def _assert_shell_denies_attached_short_option_path_escape(self, argument: str) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='attached argv scope')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+            with pytest.raises(CapabilityDenied, match='escapes workspace root|host absolute path syntax|host home expansion'):
+                runtime.shell.run(pid, ['tool', argument], timeout=2.0)
+
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_shell_single_dash_url_and_define_arguments_are_not_path_operands(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='url define argv scope')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+            runtime.shell.run(
+                pid,
+                ['tool', '-DURL=https://example.test/assets/pkg.tar.gz', '-Uhttps://example.test/index'],
+                timeout=2.0,
+            )
+
+            assert provider.calls == [
+                (['tool', '-DURL=https://example.test/assets/pkg.tar.gz', '-Uhttps://example.test/index'], 2.0)
+            ]
+        finally:
+            runtime.close()
+
     def test_always_allow_policy_passes_shell_syntax_payload_as_literal_argv(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
@@ -516,7 +562,7 @@ class TestShellMatcher:
         result = provider.run(['echo', 'safe$(printf${IFS}__INJECTED__)'])
 
         assert result.stdout == 'ok\n'
-        assert Path(captured['argv'][0]).name == 'echo'
+        assert Path(captured['argv'][0]).stem == 'echo'
         assert captured['argv'][1:] == ['safe$(printf${IFS}__INJECTED__)']
         assert captured['kwargs']['stdout'] is not local_substrate.subprocess.PIPE
         assert captured['kwargs']['stderr'] is not local_substrate.subprocess.PIPE
@@ -577,7 +623,7 @@ class TestShellMatcher:
         result = provider.run(['git', 'status'])
 
         assert result.stdout == 'ok\n'
-        assert captured['argv'][0] == '/usr/bin/git'
+        assert captured['argv'][0].replace('\\', '/').endswith('/usr/bin/git')
         assert str(tmp_path) not in searched_paths[0].split(os.pathsep)
         assert str(tmp_path) not in captured['kwargs']['env']['PATH'].split(os.pathsep)
 

@@ -12,7 +12,9 @@ Modules are part of the host trusted computing base:
 - They are loaded only from explicit manifests.
 - The entrypoint source file, or its inferred Python source package, must match
   the manifest `sha256`.
-- The `(module_id, source_sha256)` pair must be trusted by config or CLI.
+- The `(module_id, source_sha256)` pair must be trusted by config or CLI for
+  normal use. The weaker digest-only trust list accepts any module id with that
+  source hash and is intended for local development.
 - Loading a module never grants filesystem, shell, Object Memory, human,
   process, checkpoint, Skill, image, or JSON-RPC capabilities to a process.
 - Import-string entrypoints are resolved to a concrete source file under the
@@ -137,12 +139,14 @@ terminal sessions. When loaded and trusted, it registers the tools
 reader thread, buffer limits, and timeout/window defaults live inside this
 module, not in the core Runtime or default Resource Provider Substrate.
 
-`pty_create(argv, cwd=None, cols=80, rows=24, startup_timeout_s=0.2,
-max_output_chars=4000, name=None)` launches a local PTY through the shell
+`pty_create(argv, cwd=None, cols=None, rows=None, startup_timeout_s=None,
+max_output_chars=None, name=None)` launches a local PTY through the shell
 primitive's argv validation, workspace cwd checks, shell policy, human approval,
-resource budget, provider classification, events, and audit path. It returns a
-mutable Object Memory `EXTERNAL_REF` object id as `session_oid`; the payload is
-descriptive metadata only and is not an authority source.
+resource budget, provider classification, events, and audit path. `None`
+values use `PtyModuleSettings` defaults such as `default_cols`,
+`default_rows`, `startup_timeout_s`, and `startup_output_max_chars`. It returns
+a mutable Object Memory `EXTERNAL_REF` object id as `session_oid`; the payload
+is descriptive metadata only and is not an authority source.
 
 The local PTY backend resolves bare executables on a safe host PATH that
 excludes workspace entries, rejects workspace PATH hijacks, and gives child

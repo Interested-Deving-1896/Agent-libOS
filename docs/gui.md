@@ -86,8 +86,10 @@ npm --prefix gui run electron:dev
 Build and type-check the GUI:
 
 ```bash
+npm --prefix gui run test
 npm --prefix gui run typecheck
 npm --prefix gui run build
+uv run python scripts/test_matrix.py --lane gui
 ```
 
 The Electron smoke path can be run headlessly with
@@ -108,7 +110,8 @@ The first screen is process-centered:
 
 - left pane: process tree, status, image, cwd, resource budget/usage, unread
   message badges,
-- center pane: selected process timeline and human request cards,
+- center pane: selected process timeline with type filters and human request
+  cards,
 - right pane: details for overview, capabilities, tools/Skills, checkpoints,
   audit, LLM calls, Images, JSON-RPC, and Object Memory summary,
 - top bar: database, spawn, auto-run, quanta budget, run, step, pause, refresh.
@@ -155,7 +158,7 @@ the final request to the server:
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
 - JSON-RPC method calls,
-- Skill registration and trust.
+- Skill registration, activation, and unload.
 
 The confirmation dialog shows the pid/resource/action summary. The server also
 rejects high-risk requests without `confirmed: true`, so accidental direct HTTP
@@ -173,6 +176,10 @@ only; it does not grant the target image's declared capabilities. Package
 workspace grants apply only to the private materialized copy declared by the
 package manifest.
 
+Skill registration is the exception to the payload-only pattern today: the GUI
+server still calls the path-based Skill registration API. Global Skill trust is
+not exposed as a GUI endpoint; manage trust through CLI/admin configuration.
+
 ## API Summary
 
 Important endpoints:
@@ -181,8 +188,11 @@ Important endpoints:
 - `POST /api/shutdown`
 - `GET /api/snapshot`
 - `GET /api/events/stream?cursor=<id>`
-- `GET /api/processes`
-- `POST /api/processes`
+- `GET /api/tools`
+- `GET /api/processes`, `POST /api/processes`
+- `POST /api/workflows/run`
+- `POST /api/scheduler/auto`, `POST /api/scheduler/pause`
+- `GET /api/processes/{pid}`
 - `POST /api/processes/{pid}/run|step|pause|resume|signal|message|interrupt|cd|exec|exit`
 - `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`
 - `GET /api/object-tasks`, `POST /api/object-tasks/start`,
@@ -192,9 +202,24 @@ Important endpoints:
   `watch_channel`, and `watch_kind` for owner-change runner messages; the
   `watch-owner` endpoint updates the same fields for an active task. Wait
   requests are bounded by the GUI object-task wait timeout defaults.)
+- `GET /api/human-requests`
 - `POST /api/human-requests/{request_id}/respond` approves or rejects only
   pending requests; terminal or cancelled requests return a conflict.
-- `GET/POST /api/checkpoints`, `/api/skills`, `/api/capabilities`,
-  `/api/images`, `/api/jsonrpc`, and `/api/modules`
+- `GET /api/checkpoints`, `POST /api/checkpoints/create`,
+  `GET /api/checkpoints/{checkpoint_id}`,
+  `GET /api/checkpoints/{checkpoint_id}/diff`, and
+  `POST /api/checkpoints/{checkpoint_id}/restore|fork`
+- `GET /api/skills`, `GET /api/skills/{skill_id}`,
+  `POST /api/skills/register`, and
+  `POST /api/skills/{skill_id}/activate|unload`
+- `GET /api/capabilities`, `GET /api/capabilities/{capability_id}`,
+  `POST /api/capabilities/grant|delegate|explain`, and
+  `POST /api/capabilities/{capability_id}/revoke`
+- `GET /api/images`, `GET /api/images/{image_id}`, and
+  `POST /api/images/register|commit`
+- `GET /api/jsonrpc`, `GET /api/jsonrpc/{endpoint_id}`,
+  `POST /api/jsonrpc/register`, and
+  `POST /api/jsonrpc/{endpoint_id}/call`
+- `GET /api/modules`, `GET /api/modules/{module_id}`
 
 All endpoints require `Authorization: Bearer <session-token>`.

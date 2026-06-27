@@ -169,11 +169,18 @@ class LLMProcessExecutor:
             decision={"messages": len(messages), "policy": image.context_policy},
         )
         try:
-            completion, action = await self._complete_valid_action(
+            completion, actions, parallel_tool_calls = await self._complete_valid_action(
                 pid,
                 messages,
                 self.runtime.tools.openai_tool_schemas(pid),
             )
+            action = actions[-1]
+            if parallel_tool_calls and len(actions) > 1:
+                return await self._dispatch_action_batch(
+                    pid=pid,
+                    completion=completion,
+                    actions=actions,
+                )
             try:
                 result = await self.adispatch(pid, action)
             except HumanApprovalRequired as exc:
@@ -282,6 +289,204 @@ class LLMProcessExecutor:
         if resumed_after_message:
             payload["resumed_after_message"] = True
         return payload
+
+    async def _dispatch_action_batch(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+        actions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        completed_actions: list[dict[str, Any]] = []
+        completed_results: list[dict[str, Any]] = []
+        content_preview = str(getattr(completion, "content", ""))[: self.config.llm.content_preview_chars]
+        tool_call_count = len(getattr(completion, "tool_calls", []) or [])
+        stop_reason = "completed"
+        stopped_action: dict[str, Any] | None = None
+        stopped_result: dict[str, Any] | None = None
+
+        for action in actions:
+            try:
+                result = await self.adispatch(pid, action)
+            except HumanApprovalRequired as exc:
+                stop_reason = "waiting_human"
+                payload = self._wait_for_human_action(
+                    pid=pid,
+                    action=action,
+                    request_id=exc.request_id,
+                    message=str(exc),
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                )
+                self._record_action_batch(
+                    pid=pid,
+                    actions=actions,
+                    completed_actions=completed_actions,
+                    completed_results=completed_results,
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                    stop_reason=stop_reason,
+                    pending_action=action,
+                )
+                return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
+            except ProcessWaitRequired as exc:
+                stop_reason = "waiting_child"
+                pending_action = exc.resume_action or action
+                payload = self._wait_for_child_action(
+                    pid=pid,
+                    action=pending_action,
+                    child_pid=exc.child_pid,
+                    message=str(exc),
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                )
+                self._record_action_batch(
+                    pid=pid,
+                    actions=actions,
+                    completed_actions=completed_actions,
+                    completed_results=completed_results,
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                    stop_reason=stop_reason,
+                    pending_action=pending_action,
+                )
+                return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
+            except ProcessMessageWaitRequired as exc:
+                stop_reason = "waiting_message"
+                payload = self._wait_for_message_action(
+                    pid=pid,
+                    action=action,
+                    filters=exc.filters,
+                    message=str(exc),
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                )
+                self._record_action_batch(
+                    pid=pid,
+                    actions=actions,
+                    completed_actions=completed_actions,
+                    completed_results=completed_results,
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                    stop_reason=stop_reason,
+                    pending_action=action,
+                )
+                return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
+            except ResourceLimitExceeded:
+                self._record_action_batch(
+                    pid=pid,
+                    actions=actions,
+                    completed_actions=completed_actions,
+                    completed_results=completed_results,
+                    content_preview=content_preview,
+                    tool_call_count=tool_call_count,
+                    stop_reason="resource_limit_exceeded",
+                )
+                raise
+
+            if result.get("interrupted_by_message"):
+                stop_reason = "interrupted_by_message"
+                stopped_action = action
+                stopped_result = result
+                break
+            completed_actions.append(action)
+            completed_results.append(result)
+            if not result.get("ok"):
+                stop_reason = "tool_failed"
+                break
+            if result.get("message_notice"):
+                stop_reason = "message_notice"
+                break
+            if self._process_is_terminal(pid):
+                stop_reason = "process_terminal"
+                break
+
+        self._record_action_batch(
+            pid=pid,
+            actions=actions,
+            completed_actions=completed_actions,
+            completed_results=completed_results,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+            stop_reason=stop_reason,
+            stopped_action=stopped_action,
+            stopped_result=stopped_result,
+        )
+        payload: dict[str, Any] = {
+            "ok": True,
+            "parallel_tool_calls": True,
+            "actions": completed_actions,
+            "results": completed_results,
+            "tool_call_count": tool_call_count,
+            "executed_count": len(completed_actions),
+            "stop_reason": stop_reason,
+        }
+        if completed_actions:
+            payload["action"] = completed_actions[-1]
+            payload["result"] = completed_results[-1]
+        elif stopped_action is not None and stopped_result is not None:
+            payload["action"] = stopped_action
+            payload["result"] = stopped_result
+        if stopped_action is not None and stopped_result is not None:
+            payload.update(
+                {
+                    "stopped_action": stopped_action,
+                    "stopped_result": stopped_result,
+                }
+            )
+        return payload
+
+    def _record_action_batch(
+        self,
+        *,
+        pid: str,
+        actions: list[dict[str, Any]],
+        completed_actions: list[dict[str, Any]],
+        completed_results: list[dict[str, Any]],
+        content_preview: str,
+        tool_call_count: int,
+        stop_reason: str,
+        pending_action: dict[str, Any] | None = None,
+        stopped_action: dict[str, Any] | None = None,
+        stopped_result: dict[str, Any] | None = None,
+    ) -> None:
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.action_batch",
+            target=f"process:{pid}",
+            decision={
+                "actions": sanitize_for_observability(actions),
+                "completed_actions": sanitize_for_observability(completed_actions),
+                "completed_results": sanitize_for_observability(completed_results),
+                "pending_action": sanitize_for_observability(pending_action) if pending_action else None,
+                "stopped_action": sanitize_for_observability(stopped_action) if stopped_action else None,
+                "stopped_result": sanitize_for_observability(stopped_result) if stopped_result else None,
+                "content_preview": content_preview,
+                "tool_call_count": tool_call_count,
+                "requested_count": len(actions),
+                "executed_count": len(completed_actions),
+                "stop_reason": stop_reason,
+            },
+        )
+
+    @staticmethod
+    def _with_parallel_batch_progress(
+        payload: dict[str, Any],
+        completed_actions: list[dict[str, Any]],
+        completed_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload["parallel_tool_calls"] = True
+        payload["completed_actions"] = completed_actions
+        payload["completed_results"] = completed_results
+        payload["executed_count"] = len(completed_actions)
+        return payload
+
+    def _process_is_terminal(self, pid: str) -> bool:
+        return self.runtime.process.get(pid).status in {
+            ProcessStatus.EXITED,
+            ProcessStatus.FAILED,
+            ProcessStatus.KILLED,
+        }
 
     def _wait_for_human_action(
         self,
@@ -621,18 +826,43 @@ class LLMProcessExecutor:
                 f"content preview: {content[: self.config.llm.content_preview_chars]!r}"
             ) from exc
 
+    def _completion_to_actions(
+        self,
+        content: str,
+        tool_calls: list[dict[str, Any]],
+        *,
+        parallel_tool_calls: bool,
+    ) -> list[dict[str, Any]]:
+        if not parallel_tool_calls:
+            return [self._completion_to_action(content, tool_calls)]
+        if not tool_calls:
+            return [parse_json_action(content)]
+
+        actions: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for index, tool_call in enumerate(tool_calls, start=1):
+            try:
+                actions.append(tool_call_to_action(tool_call))
+            except Exception as exc:
+                errors.append(f"{index}: {exc}")
+        if errors:
+            raise ValueError(f"invalid parallel tool calls: {errors}")
+        if not actions:
+            raise ValueError("parallel tool call response did not include any function calls")
+        return actions
+
     async def _complete_valid_action(
         self,
         pid: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         max_attempts: int | None = None,
-    ) -> tuple[Any, dict[str, Any]]:
+    ) -> tuple[Any, list[dict[str, Any]], bool]:
         attempt_messages = messages
         last_error: Exception | None = None
         selected_max_attempts = max_attempts or self.config.llm.action_repair_attempts
         for attempt in range(selected_max_attempts):
-            completion = await self._complete_action_recorded(
+            completion, parallel_tool_calls = await self._complete_action_recorded(
                 pid=pid,
                 messages=attempt_messages,
                 tools=tools,
@@ -640,12 +870,19 @@ class LLMProcessExecutor:
                 max_attempts=selected_max_attempts,
             )
             try:
-                action = self.runtime.tools.normalize_model_action(
-                    pid,
-                    self._completion_to_action(completion.content, completion.tool_calls),
-                )
-                self._validate_dispatchable_action(pid, action)
-                return completion, action
+                actions = [
+                    self.runtime.tools.normalize_model_action(pid, action)
+                    for action in self._completion_to_actions(
+                        completion.content,
+                        completion.tool_calls,
+                        parallel_tool_calls=parallel_tool_calls,
+                    )
+                ]
+                for action in actions:
+                    self._validate_dispatchable_action(pid, action)
+                if parallel_tool_calls and len(actions) > 1:
+                    self._preflight_parallel_tool_batch(pid, actions)
+                return completion, actions, parallel_tool_calls
             except ValueError as exc:
                 last_error = exc
                 self.runtime.audit.record(
@@ -668,13 +905,29 @@ class LLMProcessExecutor:
                         "role": "user",
                         "content": (
                             "The previous model response could not be dispatched: "
-                            f"{exc}. Choose exactly one available OpenAI tool call by its function name. "
+                            f"{exc}. Choose "
+                            f"{'one or more' if parallel_tool_calls else 'exactly one'} "
+                            "available OpenAI tool call by its function name. "
                             f"Available tool names: {self.runtime.tools.model_tool_names(pid)}"
                         ),
                     },
                 ]
         assert last_error is not None
         raise last_error
+
+    def _preflight_parallel_tool_batch(self, pid: str, actions: list[dict[str, Any]]) -> None:
+        resources = getattr(self.runtime, "resources", None)
+        if resources is None:
+            return
+        try:
+            resources.preflight(
+                pid,
+                ResourceUsage(tool_calls=len(actions)),
+                source="llm.parallel_tool_batch",
+                context={"action_count": len(actions), "actions": [self._action_name(action) for action in actions]},
+            )
+        except ResourceLimitExceeded as exc:
+            raise ValueError(f"parallel tool call batch exceeds remaining tool-call budget: {exc}") from exc
 
     def _validate_dispatchable_action(self, pid: str, action: dict[str, Any]) -> None:
         name = str(action.get("action") or "").strip()
@@ -725,7 +978,7 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         attempt: int,
         max_attempts: int,
-    ) -> Any:
+    ) -> tuple[Any, bool]:
         call_id = new_id("llmcall")
         process = self.runtime.process.get(pid)
         created_at = utc_now()
@@ -741,6 +994,7 @@ class LLMProcessExecutor:
             resolved = self.runtime.llms.resolve(profile_id)
             client = resolved.client
             previous_response_id = self._previous_response_id_for_state(pid, resolved.profile_id, client)
+            parallel_tool_calls = bool(resolved.parallel_tool_calls)
             request_options.update(
                 {
                     "llm_profile_id": resolved.profile_id,
@@ -760,6 +1014,7 @@ class LLMProcessExecutor:
                     "openai_safety_identifier_configured": bool(
                         isinstance(client, LLMClient) and client.safety_identifier
                     ),
+                    "openai_parallel_tool_calls_enabled": parallel_tool_calls,
                 }
             )
             completion = await self._complete_action(
@@ -769,6 +1024,7 @@ class LLMProcessExecutor:
                 temperature=resolved.temperature,
                 max_tokens=resolved.max_tokens,
                 previous_response_id=previous_response_id,
+                parallel_tool_calls=parallel_tool_calls,
             )
         except Exception as exc:
             self._charge_llm_attempt(pid, source="llm.error", context={"error_type": type(exc).__name__})
@@ -830,7 +1086,7 @@ class LLMProcessExecutor:
             )
         )
         self._charge_llm_completion(pid, completion)
-        return completion
+        return completion, parallel_tool_calls
 
     def _preflight_llm_call(self, pid: str) -> None:
         resources = getattr(self.runtime, "resources", None)
@@ -938,11 +1194,18 @@ class LLMProcessExecutor:
         temperature: float,
         max_tokens: int,
         previous_response_id: str | None = None,
+        parallel_tool_calls: bool,
     ) -> Any:
         kwargs = {"temperature": temperature, "max_tokens": max_tokens}
         if hasattr(client, "acomplete_action"):
             result = (
-                client.acomplete_action(messages, tools, **kwargs, previous_response_id=previous_response_id)
+                client.acomplete_action(
+                    messages,
+                    tools,
+                    **kwargs,
+                    previous_response_id=previous_response_id,
+                    parallel_tool_calls=parallel_tool_calls,
+                )
                 if isinstance(client, LLMClient)
                 else client.acomplete_action(messages, tools)
             )
@@ -956,6 +1219,7 @@ class LLMProcessExecutor:
                 tools,
                 **kwargs,
                 previous_response_id=previous_response_id,
+                parallel_tool_calls=parallel_tool_calls,
             )
         return await asyncio.to_thread(client.complete_action, messages, tools)
 

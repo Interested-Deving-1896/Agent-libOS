@@ -233,7 +233,7 @@ def _object_release_finalizer(adapter: "PtyAdapter"):
 class LocalPtyProvider:
     """Subprocess-backed PTY provider scoped to a configured workspace."""
 
-    supports_subprocess_limits = True
+    supports_subprocess_limits = os.name != "nt"
 
     def __init__(self, cwd: str | Path):
         self.cwd = Path(cwd).resolve()
@@ -247,6 +247,8 @@ class LocalPtyProvider:
         rows: int = 24,
         limits: SubprocessLimits | None = None,
     ) -> PtySession:
+        if limits is not None and not self.supports_subprocess_limits:
+            raise ValidationError("PTY provider cannot enforce SubprocessLimits on this platform")
         selected_cwd = self._resolve_cwd(cwd)
         safe_path = self._safe_path()
         resolved_argv = self._resolve_argv0(argv, selected_cwd)
@@ -703,6 +705,8 @@ class PtyAdapter:
         if not decision.allowed:
             raise CapabilityDenied(f"{pid} denied pty spawn on {resource}: {decision.reason}")
         limits = self.shell._subprocess_limits(pid)
+        if limits is not None and not bool(getattr(self.provider, "supports_subprocess_limits", False)):
+            raise ValidationError("PTY provider must explicitly support SubprocessLimits before budgeted execution")
         require_external_effect_classifier(self.provider, "spawn")
         intent_record = self._record_spawn_intent(
             pid,
@@ -1356,7 +1360,7 @@ class PtyAdapter:
             session.closing = True
         exit_code = session.handle.exit_code()
         try:
-            exit_code = session.handle.close(force=False, timeout_s=0.0)
+            exit_code = session.handle.close(force=True, timeout_s=0.0)
         except Exception as exc:
             with session.lock:
                 session.closing = False

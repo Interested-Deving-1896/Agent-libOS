@@ -6,12 +6,14 @@ import json
 import socket
 import tempfile
 import threading
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from pytest import MonkeyPatch
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
     ExternalEffectClassification,
@@ -263,6 +265,50 @@ class TestJsonRpcPrimitive:
                     runtime.jsonrpc.call(pid, 'bad-header-env', 'echo', {})
                 assert server.requests == []
                 assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            finally:
+                runtime.close()
+
+    def test_provider_secret_header_env_is_rejected_at_registration(self, monkeypatch: MonkeyPatch) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            monkeypatch.setenv('OPENAI_API_KEY', 'provider-secret')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='secret env registration')
+                cap = runtime.capability.grant_once(pid, 'jsonrpc:secret-header:echo', [CapabilityRight.READ], issued_by='test')
+                manifest = _manifest('secret-header', server.url).replace(
+                    'AGENT_LIBOS_JSONRPC_TEST_TOKEN',
+                    'OPENAI_API_KEY',
+                )
+
+                with pytest.raises(ValidationError, match='header env is not allowed'):
+                    runtime.jsonrpc.register_endpoint_from_yaml_text(manifest, actor='cli', require_capability=False)
+
+                assert server.requests == []
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            finally:
+                runtime.close()
+
+    def test_configured_header_env_allowlist_permits_test_secret(self, monkeypatch: MonkeyPatch) -> None:
+        with _jsonrpc_server() as server:
+            config = replace(
+                DEFAULT_CONFIG,
+                jsonrpc=replace(DEFAULT_CONFIG.jsonrpc, header_env_allowlist=('CUSTOM_JSONRPC_TOKEN',)),
+            )
+            runtime = Runtime.open('local', config=config)
+            monkeypatch.setenv('CUSTOM_JSONRPC_TOKEN', 'custom-token')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='custom env registration')
+                manifest = _manifest('custom-header', server.url).replace(
+                    'AGENT_LIBOS_JSONRPC_TEST_TOKEN',
+                    'CUSTOM_JSONRPC_TOKEN',
+                )
+                runtime.jsonrpc.register_endpoint_from_yaml_text(manifest, actor='cli', require_capability=False)
+                runtime.capability.grant(pid, 'jsonrpc:custom-header:echo', [CapabilityRight.READ], issued_by='test')
+
+                result = runtime.jsonrpc.call(pid, 'custom-header', 'echo', {'ok': True})
+
+                assert result.ok
+                assert server.requests[0]['authorization'] == 'Bearer custom-token'
             finally:
                 runtime.close()
 

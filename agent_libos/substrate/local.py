@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import errno
 import http.client
 import heapq
@@ -13,6 +14,7 @@ import ssl
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone, tzinfo
@@ -33,7 +35,7 @@ from agent_libos.models import (
     JsonRpcMethodSpec,
     JsonRpcTransportResult,
 )
-from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.substrate.base import (
     CommandMetrics,
     CommandResult,
@@ -62,6 +64,146 @@ _SAFE_SHELL_ENV_KEYS = {
     "WINDIR",
 }
 
+if os.name == "nt":
+    import msvcrt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    _kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    _kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    _kernel32.SetInformationJobObject.restype = ctypes.c_int
+    _kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    _kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    _kernel32.CreateFileW.restype = ctypes.c_void_p
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_int
+    _kernel32.GetFinalPathNameByHandleW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+    _kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _GENERIC_READ = 0x80000000
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_NAME_NORMALIZED = 0
+    _VOLUME_NAME_DOS = 0
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _WindowsJobObject:
+    def __init__(self, handle: int):
+        self.handle = handle
+        self._closed = False
+
+    @classmethod
+    def create(cls) -> "_WindowsJobObject":
+        if os.name != "nt":
+            raise OSError("Windows job objects are only available on Windows")
+        handle = _kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _kernel32.SetInformationJobObject(
+            handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            _kernel32.CloseHandle(handle)
+            raise ctypes.WinError(error)
+        return cls(int(handle))
+
+    def assign(self, proc: subprocess.Popen[str]) -> None:
+        process_handle = getattr(proc, "_handle", None)
+        if process_handle is None:
+            raise OSError("subprocess handle is unavailable for job assignment")
+        if not _kernel32.AssignProcessToJobObject(self.handle, int(process_handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if os.name == "nt":
+            _kernel32.CloseHandle(self.handle)
+
+
+class _WindowsDirectoryGuard:
+    def __init__(self, handle: int):
+        self.handle = handle
+        self._closed = False
+
+    @classmethod
+    def open(cls, path: Path) -> "_WindowsDirectoryGuard":
+        if os.name != "nt":
+            raise OSError("Windows directory guards are only available on Windows")
+        handle = _kernel32.CreateFileW(
+            os.fspath(path),
+            _GENERIC_READ,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return cls(int(handle))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if os.name == "nt":
+            _kernel32.CloseHandle(self.handle)
+
 
 class LocalFilesystemProvider:
     """Local-workspace implementation of the filesystem substrate."""
@@ -70,6 +212,7 @@ class LocalFilesystemProvider:
         self.root = Path(root).resolve()
         self.namespace = namespace
         self.root_display = str(self.root)
+        self._path_lock = threading.RLock()
 
     def resolve(self, path: Any) -> ResolvedPath:
         raw = Path(path)
@@ -80,54 +223,70 @@ class LocalFilesystemProvider:
         return ResolvedPath(relative=relative, display=str(target), is_root=target == self.root)
 
     def state(self, path: ResolvedPath) -> PathState:
-        target = self._target(path)
-        if not target.exists():
-            return PathState(exists=False, kind="missing")
-        stat = target.stat()
-        kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
-        return PathState(
-            exists=True,
-            kind=kind,
-            size_bytes=stat.st_size if target.is_file() else None,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-        )
+        with self._path_lock:
+            target = self._target(path)
+            if not target.exists():
+                return PathState(exists=False, kind="missing")
+            stat = target.stat()
+            kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
+            return PathState(
+                exists=True,
+                kind=kind,
+                size_bytes=stat.st_size if target.is_file() else None,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            )
 
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
-        target = self._target(path)
-        with self._open_existing_file(target, os.O_RDONLY) as handle:
-            if max_bytes is None:
-                return handle.read()
-            return handle.read(max(0, max_bytes))
+        with self._path_lock:
+            target = self._target(path)
+            self._before_path_sink("read_bytes", target)
+            target = self._target(path)
+            with self._open_existing_file(target, os.O_RDONLY) as handle:
+                if max_bytes is None:
+                    return handle.read()
+                return handle.read(max(0, max_bytes))
 
     def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = "\n") -> None:
-        target = self._target(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target = self._target(path)
-        with self._open_write_file(target, encoding=encoding, newline=newline) as handle:
-            handle.write(text)
+        with self._path_lock:
+            target = self._target(path)
+            self._before_path_sink("write_parent", target.parent)
+            target = self._target(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target = self._target(path)
+            self._before_path_sink("write_text", target)
+            target = self._target(path)
+            with self._open_write_file(target, encoding=encoding, newline=newline) as handle:
+                handle.write(text)
+            self._target(path)
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None:
-        self._target(path).mkdir(parents=parents, exist_ok=exist_ok)
+        with self._path_lock:
+            target = self._target(path)
+            self._before_path_sink("make_directory", target)
+            target = self._target(path)
+            target.mkdir(parents=parents, exist_ok=exist_ok)
+            self._target(path)
 
     def list_directory(self, path: ResolvedPath, *, limit: int | None = None) -> list[DirectoryEntrySnapshot]:
-        target = self._target(path)
-        if limit is not None and limit > 0:
-            children = heapq.nsmallest(limit, target.iterdir(), key=lambda item: item.name)
-        else:
-            children = sorted(target.iterdir(), key=lambda item: item.name)
-        return [self._directory_entry(child) for child in children]
+        with self._path_lock:
+            target = self._target(path)
+            if limit is not None and limit > 0:
+                children = heapq.nsmallest(limit, target.iterdir(), key=lambda item: item.name)
+            else:
+                children = sorted(target.iterdir(), key=lambda item: item.name)
+            return [self._directory_entry(child) for child in children]
 
     def delete_file(self, path: ResolvedPath) -> None:
-        target = self._target(path)
-        self._require_existing_single_link_file(target)
-        target.unlink()
+        with self._path_lock:
+            target = self._target(path)
+            self._delete_file_under_root(path, target)
+            self._target(path)
 
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None:
-        target = self._target(path)
-        if recursive:
-            shutil.rmtree(target)
-        else:
-            target.rmdir()
+        with self._path_lock:
+            target = self._target(path)
+            self._delete_directory_under_root(path, target, recursive=recursive)
+            self._target(path)
 
     def classify_external_effect(
         self,
@@ -160,6 +319,9 @@ class LocalFilesystemProvider:
             raise CapabilityDenied(f"path escapes filesystem adapter root: {path.relative}")
         self._reject_reparse_components(target)
         return target
+
+    def _before_path_sink(self, operation: str, target: Path) -> None:
+        return None
 
     def _reject_reparse_components(self, target: Path) -> None:
         try:
@@ -219,9 +381,175 @@ class LocalFilesystemProvider:
             with contextlib.suppress(OSError):
                 os.close(dir_fd)
 
+    def _delete_file_under_root(self, path: ResolvedPath, target: Path) -> None:
+        if self._supports_dir_fd_deletes():
+            dir_fd, name = self._open_parent_dir_fd(target)
+            try:
+                self._before_path_sink_checked("delete_file", target)
+                self._require_file_component_for_delete(dir_fd, name, target)
+                os.unlink(name, dir_fd=dir_fd)
+            finally:
+                os.close(dir_fd)
+            return
+
+        guard = self._windows_parent_directory_guard(target)
+        if guard is None:
+            raise CapabilityDenied("file delete requires dir_fd support on this platform")
+        try:
+            self._require_existing_single_link_file(target)
+            self._before_path_sink_checked("delete_file", target)
+            self._target(path)
+            self._require_existing_single_link_file(target)
+            target.unlink()
+        finally:
+            guard.close()
+
+    def _delete_directory_under_root(self, path: ResolvedPath, target: Path, *, recursive: bool) -> None:
+        if self._supports_dir_fd_deletes():
+            dir_fd, name = self._open_parent_dir_fd(target)
+            try:
+                self._before_path_sink_checked("delete_directory", target)
+                self._require_directory_component_for_delete(dir_fd, name, target)
+                if recursive:
+                    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+                        raise CapabilityDenied("recursive directory delete requires symlink-safe rmtree support")
+                    shutil.rmtree(name, dir_fd=dir_fd)
+                else:
+                    os.rmdir(name, dir_fd=dir_fd)
+            finally:
+                os.close(dir_fd)
+            return
+
+        guard = self._windows_parent_directory_guard(target)
+        try:
+            self._before_path_sink_checked("delete_directory", target)
+            self._target(path)
+            if recursive:
+                shutil.rmtree(target)
+            else:
+                target.rmdir()
+        finally:
+            if guard is not None:
+                guard.close()
+
+    def _supports_dir_fd_deletes(self) -> bool:
+        return (
+            os.open in os.supports_dir_fd
+            and os.stat in os.supports_dir_fd
+            and os.unlink in os.supports_dir_fd
+            and os.rmdir in os.supports_dir_fd
+        )
+
+    def _open_parent_dir_fd(self, target: Path) -> tuple[int, str]:
+        parts = self._relative_parts(target)
+        if not parts:
+            raise CapabilityDenied("filesystem operation requires a path below the adapter root")
+        dir_fd = self._open_root_dir_fd()
+        try:
+            for part in parts[:-1]:
+                next_fd = self._open_dir_component(dir_fd, part)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            return dir_fd, parts[-1]
+        except Exception:
+            os.close(dir_fd)
+            raise
+
+    def _require_file_component_for_delete(self, dir_fd: int, name: str, target: Path) -> None:
+        try:
+            stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise CapabilityDenied(f"filesystem path changed during delete: {target}") from exc
+        if stat.S_ISLNK(stat_result.st_mode):
+            raise CapabilityDenied(f"filesystem path contains a symlink or junction: {target}")
+        if stat.S_ISREG(stat_result.st_mode) and stat_result.st_nlink > 1:
+            raise CapabilityDenied(f"filesystem path is a hard link with multiple names: {target}")
+
+    def _require_directory_component_for_delete(self, dir_fd: int, name: str, target: Path) -> None:
+        try:
+            stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise CapabilityDenied(f"filesystem path changed during delete: {target}") from exc
+        if stat.S_ISLNK(stat_result.st_mode) or not stat.S_ISDIR(stat_result.st_mode):
+            raise CapabilityDenied(f"filesystem path is not a directory below the adapter root: {target}")
+
+    def _before_path_sink_checked(self, operation: str, target: Path) -> None:
+        try:
+            self._before_path_sink(operation, target)
+        except OSError as exc:
+            raise CapabilityDenied(
+                f"filesystem path contains a symlink or junction, or changed before {operation}: {target}"
+            ) from exc
+
+    def _windows_parent_directory_guard(self, target: Path) -> _WindowsDirectoryGuard | None:
+        if os.name != "nt":
+            return None
+        try:
+            guard = _WindowsDirectoryGuard.open(target.parent)
+            opened = self._windows_final_path_from_handle(guard.handle)
+            requested = Path(os.path.abspath(os.fspath(target.parent)))
+            if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
+                guard.close()
+                raise CapabilityDenied(f"filesystem parent path changed during validation: {target.parent}")
+            if self.root not in opened.parents and opened != self.root:
+                guard.close()
+                raise CapabilityDenied(f"filesystem parent path escapes adapter root: {target.parent}")
+            return guard
+        except OSError as exc:
+            raise CapabilityDenied(f"filesystem parent path could not be guarded: {target.parent}") from exc
+
     def _open_under_root_fallback(self, target: Path, flags: int, mode: int) -> int:
         self._require_existing_single_link_file(target, allow_missing=bool(flags & os.O_CREAT))
-        return os.open(target, flags, mode)
+        self._before_fallback_open(target, flags)
+        fd = os.open(target, flags, mode)
+        try:
+            self._validate_open_target_matches_request(fd, target)
+        except Exception:
+            os.close(fd)
+            raise
+        return fd
+
+    def _before_fallback_open(self, target: Path, flags: int) -> None:
+        return None
+
+    def _validate_open_target_matches_request(self, fd: int, target: Path) -> None:
+        if os.name != "nt":
+            return
+        opened = self._windows_final_path_from_fd(fd)
+        requested = Path(os.path.abspath(os.fspath(target)))
+        if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
+            raise CapabilityDenied(f"filesystem opened path changed during validation: {target}")
+        if self.root not in opened.parents and opened != self.root:
+            raise CapabilityDenied(f"filesystem opened path escapes adapter root: {target}")
+
+    def _windows_final_path_from_fd(self, fd: int) -> Path:
+        if os.name != "nt":
+            raise OSError("Windows final path validation is only available on Windows")
+        handle = msvcrt.get_osfhandle(fd)
+        return self._windows_final_path_from_handle(int(handle))
+
+    def _windows_final_path_from_handle(self, handle: int) -> Path:
+        if os.name != "nt":
+            raise OSError("Windows final path validation is only available on Windows")
+        size = 512
+        while True:
+            buffer = ctypes.create_unicode_buffer(size)
+            result = _kernel32.GetFinalPathNameByHandleW(
+                ctypes.c_void_p(handle),
+                buffer,
+                size,
+                _FILE_NAME_NORMALIZED | _VOLUME_NAME_DOS,
+            )
+            if result == 0:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if result < size:
+                value = buffer.value
+                if value.startswith("\\\\?\\UNC\\"):
+                    value = "\\\\" + value[8:]
+                elif value.startswith("\\\\?\\"):
+                    value = value[4:]
+                return Path(value)
+            size = int(result) + 1
 
     def _relative_parts(self, target: Path) -> tuple[str, ...]:
         try:
@@ -338,7 +666,7 @@ class LocalClockProvider:
 class LocalShellProvider:
     """Subprocess-backed shell provider scoped to a configured working directory."""
 
-    supports_subprocess_limits = True
+    supports_subprocess_limits = os.name != "nt"
 
     def __init__(self, cwd: str | Path):
         self.cwd = Path(cwd).resolve()
@@ -353,22 +681,49 @@ class LocalShellProvider:
         stdout_limit_chars: int | None = None,
         stderr_limit_chars: int | None = None,
     ) -> CommandResult:
+        if limits is not None and not self.supports_subprocess_limits:
+            raise ValidationError("shell provider cannot enforce SubprocessLimits on this platform")
         selected_cwd = self._resolve_cwd(cwd)
         stdout_limit = _SHELL_DEFAULTS.stdout_hard_limit_chars if stdout_limit_chars is None else max(0, int(stdout_limit_chars))
         stderr_limit = _SHELL_DEFAULTS.stderr_hard_limit_chars if stderr_limit_chars is None else max(0, int(stderr_limit_chars))
         checked_argv = self._resolve_argv0(argv, selected_cwd)
         started_at = time.monotonic()
         with tempfile.TemporaryFile("w+b") as stdout_file, tempfile.TemporaryFile("w+b") as stderr_file:
-            proc = subprocess.Popen(
-                checked_argv,
-                cwd=selected_cwd,
-                env=self._safe_env(),
-                shell=False,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                **self._process_group_kwargs(),
-            )
-            ps_proc = psutil.Process(proc.pid)
+            job = self._windows_job_for_run(limits)
+            try:
+                proc = subprocess.Popen(
+                    checked_argv,
+                    cwd=selected_cwd,
+                    env=self._safe_env(),
+                    shell=False,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    **self._process_group_kwargs(),
+                )
+            except Exception:
+                if job is not None:
+                    job.close()
+                raise
+            try:
+                if job is not None:
+                    job.assign(proc)
+            except OSError as exc:
+                job.close()
+                if limits is not None:
+                    with contextlib.suppress(Exception):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=1.0)
+                    raise ValidationError("shell provider could not attach Windows Job Object for budgeted execution") from exc
+                job = None
+            try:
+                ps_proc = psutil.Process(proc.pid)
+            except Exception:
+                if job is not None:
+                    job.close()
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                raise
             peak_memory = 0
             cpu_seconds = 0.0
             limit_kind: str | None = None
@@ -411,6 +766,8 @@ class LocalShellProvider:
                         proc.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
                         pass
+                if job is not None:
+                    job.close()
             stdout, stdout_truncated = self._read_limited_output(stdout_file, stdout_limit)
             stderr, stderr_truncated = self._read_limited_output(stderr_file, stderr_limit)
             wall_seconds = time.monotonic() - started_at
@@ -567,6 +924,16 @@ class LocalShellProvider:
         if os.name == "nt":
             return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         return {"start_new_session": True}
+
+    def _windows_job_for_run(self, limits: SubprocessLimits | None) -> _WindowsJobObject | None:
+        if os.name != "nt":
+            return None
+        try:
+            return _WindowsJobObject.create()
+        except OSError as exc:
+            if limits is not None:
+                raise ValidationError("shell provider could not create Windows Job Object for budgeted execution") from exc
+            return None
 
     def _kill_process_tree(self, ps_proc: psutil.Process, proc: subprocess.Popen[str]) -> None:
         # The direct child may exit after spawning background work, at which

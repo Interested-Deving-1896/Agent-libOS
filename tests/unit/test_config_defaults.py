@@ -113,10 +113,12 @@ class TestConfigDefaults:
                     '  prompt_cache_key: project-cache',
                     '  prompt_cache_retention: 24h',
                     '  responses_previous_response_id: true',
+                    '  parallel_tool_calls: true',
                     '  profiles:',
                     '    default:',
                     '      model: gpt-test',
                     '      safety_identifier_env: OPENAI_SAFE_ID',
+                    '      parallel_tool_calls: false',
                 ]
             ),
             encoding='utf-8',
@@ -128,8 +130,10 @@ class TestConfigDefaults:
         assert config.llm.prompt_cache_key == 'project-cache'
         assert config.llm.prompt_cache_retention == '24h'
         assert config.llm.responses_previous_response_id is True
+        assert config.llm.parallel_tool_calls is True
         assert config.llm.profiles['default'].model == 'gpt-test'
         assert config.llm.profiles['default'].safety_identifier_env == 'OPENAI_SAFE_ID'
+        assert config.llm.profiles['default'].parallel_tool_calls is False
 
     def test_load_config_file_rejects_invalid_yaml_shape(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
@@ -158,6 +162,11 @@ class TestConfigDefaults:
         bad_safety.write_text(f"llm:\n  safety_identifier: {'x' * 65}\n", encoding='utf-8')
         with pytest.raises(PydanticValidationError, match='safety_identifier'):
             load_config_file(bad_safety)
+
+        bad_parallel = tmp_path / 'bad-parallel.yaml'
+        bad_parallel.write_text('llm:\n  parallel_tool_calls: []\n', encoding='utf-8')
+        with pytest.raises(PydanticValidationError, match='parallel_tool_calls'):
+            load_config_file(bad_parallel)
 
     def test_llm_profiles_validate_default_profile_reference(self) -> None:
         config = AgentLibOSConfig(
@@ -233,11 +242,20 @@ class TestConfigDefaults:
         finally:
             runtime.close()
 
-    def test_runtime_open_uses_configured_local_store_target_when_target_is_omitted(self) -> None:
-        config = AgentLibOSConfig(runtime=RuntimeDefaults(local_store_target='ephemeral'))
-        runtime = Runtime.open(config=config)
+    def test_runtime_open_uses_default_local_store_sentinel_as_memory(self) -> None:
+        runtime = Runtime.open()
         try:
             assert runtime.store.path == ':memory:'
+        finally:
+            runtime.close()
+
+    def test_runtime_open_uses_configured_local_store_target_when_target_is_omitted(self, tmp_path: Path) -> None:
+        db = tmp_path / 'configured.sqlite'
+        config = AgentLibOSConfig(runtime=RuntimeDefaults(local_store_target=str(db)))
+        runtime = Runtime.open(config=config)
+        try:
+            assert runtime.store.path == str(db)
+            assert db.exists()
         finally:
             runtime.close()
 
