@@ -9,7 +9,8 @@ describe("previewImageManifest", () => {
         name: "json-agent",
         version: "v0",
         default_tools: ["echo"],
-        required_capabilities: [{ resource: "filesystem:/README.md", rights: ["read"] }]
+        required_capabilities: [{ resource: "filesystem:/README.md", rights: ["read"] }],
+        required_modules: [{ module_id: "module:v0", source_sha256: "0".repeat(64) }]
       }
     }));
 
@@ -18,7 +19,8 @@ describe("previewImageManifest", () => {
       name: "json-agent",
       version: "v0",
       default_tools_count: 1,
-      required_capabilities_count: 1
+      required_capabilities_count: 1,
+      required_modules_count: 1
     });
   });
 
@@ -34,6 +36,9 @@ image:
   required_capabilities:
     - resource: filesystem:/README.md
       rights: [read]
+  required_modules:
+    - module_id: module:v0
+      source_sha256: ${"0".repeat(64)}
 `);
 
     expect(preview).toMatchObject({
@@ -41,7 +46,8 @@ image:
       name: "package-agent",
       version: "v1",
       default_tools_count: 2,
-      required_capabilities_count: 1
+      required_capabilities_count: 1,
+      required_modules_count: 1
     });
   });
 });

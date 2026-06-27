@@ -3,9 +3,18 @@ import pytest
 import asyncio
 import json
 from dataclasses import replace
+from pathlib import Path
 from pydantic import ValidationError as PydanticValidationError
 
-from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, LLMDefaults, LLMProfile, RuntimeDefaults
+from agent_libos.config import (
+    AgentLibOSConfig,
+    DEFAULT_CONFIG,
+    LLMDefaults,
+    LLMProfile,
+    RuntimeDefaults,
+    load_config_file,
+    load_config_from_cwd,
+)
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
 from agent_libos.models import CapabilityRight, ProcessStatus
@@ -13,6 +22,117 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore
 
 class TestConfigDefaults:
+
+    def test_load_config_from_cwd_returns_default_when_file_is_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        assert load_config_from_cwd() is DEFAULT_CONFIG
+
+    def test_load_config_file_overlays_partial_defaults(self, tmp_path: Path) -> None:
+        path = tmp_path / 'config.yaml'
+        path.write_text(
+            '\n'.join(
+                [
+                    'runtime:',
+                    '  default_image_id: custom-base:v0',
+                    '  run_until_idle_max_quanta: 3',
+                    'tools:',
+                    '  filesystem_read_max_bytes: 123',
+                    'scheduler:',
+                    '  max_workers: 2',
+                ]
+            ),
+            encoding='utf-8',
+        )
+
+        config = load_config_file(path)
+
+        assert config.runtime.default_image_id == 'custom-base:v0'
+        assert config.runtime.coding_image_id == DEFAULT_CONFIG.runtime.coding_image_id
+        assert config.runtime.run_until_idle_max_quanta == 3
+        assert config.tools.filesystem_read_max_bytes == 123
+        assert config.scheduler.max_workers == 2
+
+    def test_load_config_file_deep_merges_profile_maps(self, tmp_path: Path) -> None:
+        path = tmp_path / 'config.yaml'
+        path.write_text(
+            '\n'.join(
+                [
+                    'llm:',
+                    '  default_profile_id: coding',
+                    '  profiles:',
+                    '    coding:',
+                    '      model: coding-model',
+                    '      temperature: 0.0',
+                ]
+            ),
+            encoding='utf-8',
+        )
+
+        config = load_config_file(path)
+
+        assert sorted(config.llm.profiles) == ['coding', 'default']
+        assert config.llm.default_profile_id == 'coding'
+        assert config.llm.profiles['coding'].model == 'coding-model'
+        assert config.llm.profiles['default'].api_key_env == DEFAULT_CONFIG.llm.profiles['default'].api_key_env
+
+    def test_load_config_file_accepts_openai_llm_options(self, tmp_path: Path) -> None:
+        path = tmp_path / 'config.yaml'
+        path.write_text(
+            '\n'.join(
+                [
+                    'llm:',
+                    '  safety_identifier: safe-session',
+                    '  prompt_cache_key: project-cache',
+                    '  prompt_cache_retention: 24h',
+                    '  responses_previous_response_id: true',
+                    '  profiles:',
+                    '    default:',
+                    '      model: gpt-test',
+                    '      safety_identifier_env: OPENAI_SAFE_ID',
+                ]
+            ),
+            encoding='utf-8',
+        )
+
+        config = load_config_file(path)
+
+        assert config.llm.safety_identifier == 'safe-session'
+        assert config.llm.prompt_cache_key == 'project-cache'
+        assert config.llm.prompt_cache_retention == '24h'
+        assert config.llm.responses_previous_response_id is True
+        assert config.llm.profiles['default'].model == 'gpt-test'
+        assert config.llm.profiles['default'].safety_identifier_env == 'OPENAI_SAFE_ID'
+
+    def test_load_config_file_rejects_invalid_yaml_shape(self, tmp_path: Path) -> None:
+        path = tmp_path / 'config.yaml'
+        path.write_text('- runtime\n', encoding='utf-8')
+
+        with pytest.raises(ValueError, match='root must be a mapping'):
+            load_config_file(path)
+
+    def test_load_config_file_rejects_unknown_fields_and_invalid_values(self, tmp_path: Path) -> None:
+        unknown = tmp_path / 'unknown.yaml'
+        unknown.write_text('runtime:\n  missing_field: true\n', encoding='utf-8')
+        with pytest.raises(PydanticValidationError, match='missing_field'):
+            load_config_file(unknown)
+
+        invalid = tmp_path / 'invalid.yaml'
+        invalid.write_text('runtime:\n  launcher_max_quanta: 0\n', encoding='utf-8')
+        with pytest.raises(PydanticValidationError, match='launcher_max_quanta'):
+            load_config_file(invalid)
+
+        bad_retention = tmp_path / 'bad-retention.yaml'
+        bad_retention.write_text('llm:\n  prompt_cache_retention: forever\n', encoding='utf-8')
+        with pytest.raises(PydanticValidationError, match='prompt_cache_retention'):
+            load_config_file(bad_retention)
+
+        bad_safety = tmp_path / 'bad-safety.yaml'
+        bad_safety.write_text(f"llm:\n  safety_identifier: {'x' * 65}\n", encoding='utf-8')
+        with pytest.raises(PydanticValidationError, match='safety_identifier'):
+            load_config_file(bad_safety)
 
     def test_llm_profiles_validate_default_profile_reference(self) -> None:
         config = AgentLibOSConfig(

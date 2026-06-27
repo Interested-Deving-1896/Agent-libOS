@@ -117,11 +117,22 @@ Useful optional variables:
 - `OPENAI_STORE`
 - `OPENAI_REASONING_EFFORT`
 - `OPENAI_VERBOSITY`
+- `OPENAI_SAFETY_IDENTIFIER`
+- `OPENAI_PROMPT_CACHE_KEY`
+- `OPENAI_PROMPT_CACHE_RETENTION=in-memory|24h`
+- `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID=true|false`
 - provider-specific `OPENAI_ENABLE_THINKING`
 
 `OPENAI_BASE_URL` is optional for the OpenAI API. Custom OpenAI-compatible
 endpoints require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1` or an explicit
 `allow_custom_base_url=True` client construction.
+
+Official OpenAI Responses requests may also be configured with
+privacy-preserving `safety_identifier`, prompt-cache routing fields, and
+opt-in `previous_response_id` chaining. The runtime keeps `llm.store=False` and
+Responses state chaining disabled by default; enable both only when retaining
+provider-side response state is acceptable. These OpenAI-specific fields are
+not sent to custom OpenAI-compatible endpoints.
 
 Run a script smoke:
 
@@ -159,6 +170,21 @@ user data, object memory excerpts, and provider payloads in SQLite.
 Non-secret runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`.
 `AgentLibOSConfig` uses Pydantic dataclass validation and fails fast when
 numeric limits are negative, non-finite, inverted, or otherwise unsafe.
+Product entrypoints read `config.yaml` from the current working directory when
+present, or an explicit `--config <path>` overlay when provided. The loader
+starts from `DEFAULT_CONFIG`, recursively merges mapping fields, replaces
+scalar/list/tuple fields, and then constructs a fresh `AgentLibOSConfig`; it
+does not mutate `DEFAULT_CONFIG`.
+
+Library and test code should keep passing explicit config objects when a custom
+runtime is required:
+
+```python
+from agent_libos.config import load_config_file
+
+config = load_config_file("config.yaml")
+runtime = Runtime.open(config=config)
+```
 
 Current default groups include:
 

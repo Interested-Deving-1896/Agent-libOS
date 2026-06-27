@@ -154,6 +154,7 @@ export type ImageSummary = {
   default_tools: string[];
   default_skills: string[];
   required_capabilities_count: number;
+  required_modules_count: number;
   [key: string]: unknown;
 };
 
@@ -165,6 +166,7 @@ export type ImageInspectResult = {
     default_tools: string[];
     default_skills: string[];
     required_capabilities: Record<string, unknown>[];
+    required_modules: Record<string, unknown>[];
     boot: Record<string, unknown>;
     metadata: Record<string, unknown>;
     [key: string]: unknown;
@@ -184,6 +186,7 @@ export type ImageMutationResult = {
   package_sha256?: string;
   package_jit_tools?: string[];
   required_capabilities_count: number;
+  required_modules_count: number;
   source?: string | null;
 };
 

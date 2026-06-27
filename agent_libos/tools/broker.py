@@ -15,6 +15,7 @@ from jsonschema.validators import validator_for as jsonschema_validator_for
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.llm.openai_schema import openai_chat_tool_schema
 from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ResourceLimitExceeded, ValidationError
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.utils.ids import new_id, utc_now
@@ -1342,16 +1343,7 @@ class ToolBroker:
             spec = self.store.get_tool_spec(tool_id)
             if spec is None:
                 continue
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": spec.name,
-                        "description": spec.description,
-                        "parameters": spec.input_schema,
-                    },
-                }
-            )
+            schemas.append(openai_chat_tool_schema(spec.name, spec.description, spec.input_schema))
         if multiplex_jit and has_visible_jit:
             schemas.append(self._jit_multiplexer_openai_schema())
         return schemas
@@ -1476,14 +1468,11 @@ class ToolBroker:
         }
 
     def _jit_multiplexer_openai_schema(self) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": _JIT_MULTIPLEXER_SPEC.name,
-                "description": _JIT_MULTIPLEXER_SPEC.description,
-                "parameters": _JIT_MULTIPLEXER_SPEC.input_schema,
-            },
-        }
+        return openai_chat_tool_schema(
+            _JIT_MULTIPLEXER_SPEC.name,
+            _JIT_MULTIPLEXER_SPEC.description,
+            _JIT_MULTIPLEXER_SPEC.input_schema,
+        )
 
     def _tool_sort_key(self, tool_id: str) -> tuple[str, str]:
         handle = self._handles.get(tool_id)

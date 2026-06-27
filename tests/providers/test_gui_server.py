@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
-from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType
+from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessStatus
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
 
@@ -68,6 +68,20 @@ class TestGuiServer:
         conn.close()
         return response.status, response_headers, data
 
+    def request_json_text(self, method: str, path: str, raw: str) -> tuple[int, Any]:
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        conn.request(
+            method,
+            path,
+            body=raw.encode('utf-8'),
+            headers={'Authorization': 'Bearer test-token', 'Content-Type': 'application/json'},
+        )
+        response = conn.getresponse()
+        data = response.read()
+        conn.close()
+        decoded = json.loads(data.decode('utf-8')) if data else None
+        return response.status, decoded
+
     def test_auth_health_snapshot_and_process_flow(self) -> None:
         status, _body = self.request('GET', '/api/health', token='wrong')
         assert status == 401
@@ -104,6 +118,16 @@ class TestGuiServer:
 
         assert status == 200
         assert inspected['image']['image_id'] == 'base-agent:v0'
+
+    def test_process_spawn_accepts_initial_working_directory(self) -> None:
+        status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'cwd target', 'working_directory': 'src\\app', 'auto_run': False},
+        )
+
+        assert status == 200
+        assert spawned['process']['working_directory'] == 'src/app'
 
     def test_cors_is_limited_to_local_gui_origins(self) -> None:
         status, headers, _body = self.request_raw(
@@ -589,6 +613,43 @@ class TestGuiServer:
             server.service.shutdown()
             server.server_close()
 
+    def test_config_argument_controls_gui_runtime_defaults(self) -> None:
+        config = AgentLibOSConfig(
+            runtime=RuntimeDefaults(
+                local_store_target='gui-memory',
+                default_image_id='configured-gui-base:v0',
+                coding_image_id='configured-gui-coding:v0',
+            ),
+            gui=replace(DEFAULT_CONFIG.gui, object_task_wait_default_timeout_s=0.2, object_task_wait_max_timeout_s=0.4),
+        )
+        server = create_gui_http_server(config=config, port=0, token='custom-token', auto_run=False)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        seen: list[float | None] = []
+
+        def fake_wait(task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> dict[str, object]:
+            seen.append(timeout)
+            return {'task_id': task_id, 'actor_pid': actor_pid, 'timeout': timeout, 'status': 'running'}
+
+        server.service.runtime.object_tasks.wait = fake_wait  # type: ignore[method-assign]
+        thread.start()
+        try:
+            assert server.service.db == 'gui-memory'
+            assert server.service.runtime.store.path == ':memory:'
+
+            status, spawned = _request_to_server(server, 'POST', '/api/processes', {'goal': 'custom', 'auto_run': False}, token='custom-token')
+            assert status == 200
+            assert spawned['process']['image_id'] == 'configured-gui-base:v0'
+
+            status, body = _request_to_server(server, 'POST', '/api/object-tasks/task-1/wait', {'pid': spawned['pid']}, token='custom-token')
+            assert status == 200
+            assert body['timeout'] == 0.2
+            assert seen == [0.2]
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.service.shutdown()
+            server.server_close()
+
     def test_injected_runtime_config_controls_request_body_limit(self) -> None:
         runtime = Runtime.open(config=AgentLibOSConfig(gui=GuiDefaults(request_body_max_bytes=8)))
         server = create_gui_http_server(runtime=runtime, port=0, token='custom-token', auto_run=False)
@@ -695,9 +756,28 @@ class TestGuiServer:
         assert 'not pending' in conflict['error']['message']
 
     def test_invalid_max_quanta_is_rejected(self) -> None:
+        before_count = len(self.server.service.runtime.process.list())
+        status, body = self.request('POST', '/api/processes', {'goal': 'goal', 'max_quanta': 1.5})
+        assert status == 400
+        assert 'max_quanta' in body['error']['message']
+        assert len(self.server.service.runtime.process.list()) == before_count
+
         status, body = self.request('POST', '/api/processes', {'goal': 'goal', 'max_quanta': 0})
         assert status == 400
         assert 'max_quanta' in body['error']['message']
+        assert len(self.server.service.runtime.process.list()) == before_count
+
+    def test_process_resume_validates_body_before_mutating_process(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='resume validation')
+        runtime.process.pause(pid, 'hold for invalid resume body')
+        assert runtime.process.get(pid).status == ProcessStatus.PAUSED
+
+        status, body = self.request_json_text('POST', f'/api/processes/{pid}/resume', '[]')
+
+        assert status == 400
+        assert 'JSON object' in body['error']['message']
+        assert runtime.process.get(pid).status == ProcessStatus.PAUSED
 
     def test_request_body_size_is_bounded(self) -> None:
         status, body = self.request('POST', '/api/processes', {'goal': 'x' * 1100000})

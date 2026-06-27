@@ -740,11 +740,26 @@ class LLMProcessExecutor:
         try:
             resolved = self.runtime.llms.resolve(profile_id)
             client = resolved.client
+            previous_response_id = self._previous_response_id_for_state(pid, resolved.profile_id, client)
             request_options.update(
                 {
                     "llm_profile_id": resolved.profile_id,
                     "client_class": type(client).__name__,
                     "real_llm_client": isinstance(client, LLMClient),
+                    "openai_tool_schema": self._tool_schema_observation(tools),
+                    "openai_responses_previous_response_id_enabled": bool(
+                        isinstance(client, LLMClient) and client.responses_previous_response_id
+                    ),
+                    "openai_previous_response_id": previous_response_id,
+                    "openai_prompt_cache_key_configured": bool(
+                        isinstance(client, LLMClient) and client.prompt_cache_key
+                    ),
+                    "openai_prompt_cache_retention": (
+                        client.prompt_cache_retention if isinstance(client, LLMClient) else None
+                    ),
+                    "openai_safety_identifier_configured": bool(
+                        isinstance(client, LLMClient) and client.safety_identifier
+                    ),
                 }
             )
             completion = await self._complete_action(
@@ -753,6 +768,7 @@ class LLMProcessExecutor:
                 tools,
                 temperature=resolved.temperature,
                 max_tokens=resolved.max_tokens,
+                previous_response_id=previous_response_id,
             )
         except Exception as exc:
             self._charge_llm_attempt(pid, source="llm.error", context={"error_type": type(exc).__name__})
@@ -886,6 +902,33 @@ class LLMProcessExecutor:
                 continue
         return 0
 
+    def _previous_response_id_for_state(self, pid: str, profile_id: str, client: Any) -> str | None:
+        if not isinstance(client, LLMClient):
+            return None
+        if not client.responses_previous_response_id or not client.store or not client._use_responses_api():
+            return None
+        for call in reversed(self.runtime.store.list_llm_calls(pid=pid, limit=self.config.llm.call_record_hard_limit)):
+            if call.status != "ok" or call.api != "responses" or not call.response_id:
+                continue
+            if call.request_options.get("llm_profile_id") != profile_id:
+                continue
+            return call.response_id
+        return None
+
+    @staticmethod
+    def _tool_schema_observation(tools: list[dict[str, Any]]) -> dict[str, int]:
+        strict = 0
+        non_strict = 0
+        for tool in tools:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if not isinstance(function, dict):
+                continue
+            if function.get("strict") is True:
+                strict += 1
+            else:
+                non_strict += 1
+        return {"strict": strict, "non_strict": non_strict}
+
     async def _complete_action(
         self,
         client: Any,
@@ -894,11 +937,12 @@ class LLMProcessExecutor:
         *,
         temperature: float,
         max_tokens: int,
+        previous_response_id: str | None = None,
     ) -> Any:
         kwargs = {"temperature": temperature, "max_tokens": max_tokens}
         if hasattr(client, "acomplete_action"):
             result = (
-                client.acomplete_action(messages, tools, **kwargs)
+                client.acomplete_action(messages, tools, **kwargs, previous_response_id=previous_response_id)
                 if isinstance(client, LLMClient)
                 else client.acomplete_action(messages, tools)
             )
@@ -906,7 +950,13 @@ class LLMProcessExecutor:
                 return await result
             return result
         if isinstance(client, LLMClient):
-            return await asyncio.to_thread(client.complete_action, messages, tools, **kwargs)
+            return await asyncio.to_thread(
+                client.complete_action,
+                messages,
+                tools,
+                **kwargs,
+                previous_response_id=previous_response_id,
+            )
         return await asyncio.to_thread(client.complete_action, messages, tools)
 
     def dispatch(

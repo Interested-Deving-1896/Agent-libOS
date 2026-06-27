@@ -98,7 +98,11 @@ export function ImagePanel({
               <strong>{image.image_id}</strong>
               <span>{image.name} · {image.version} · {image.boot_kind}</span>
             </div>
-            <span>{t("image.requiredCaps", { count: image.required_capabilities_count })}</span>
+            <span>
+              {t("image.requiredCaps", { count: image.required_capabilities_count })}
+              {" · "}
+              {t("image.requiredModules", { count: image.required_modules_count })}
+            </span>
             <div className="imageRowActions">
               {onUseForSpawn ? <button onClick={() => onUseForSpawn(image.image_id)}>{t("image.useForSpawn")}</button> : null}
               {onUseForExec ? <button onClick={() => onUseForExec(image.image_id)}>{t("image.useForExec")}</button> : null}

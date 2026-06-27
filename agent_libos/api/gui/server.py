@@ -15,7 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from agent_libos.config import DEFAULT_CONFIG
+from pydantic import ValidationError as PydanticValidationError
+
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_cwd
 from agent_libos.models import CapabilityRight, CapabilitySpec, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -28,10 +30,19 @@ from agent_libos.models.exceptions import (
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.utils.serde import to_jsonable
 
-_RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _GUI_DEFAULTS = DEFAULT_CONFIG.gui
 _TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _CONFIG_DEFAULT = object()
+
+
+def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParser) -> AgentLibOSConfig:
+    try:
+        if config_path:
+            return load_config_file(config_path)
+        return load_config_from_cwd()
+    except (OSError, ValueError, PydanticValidationError) as exc:
+        parser.error(str(exc))
+    raise AssertionError("argparse parser.error should exit")
 
 
 def _bounded_gui_value(value: Any, *, string_limit: int, collection_limit: int) -> Any:
@@ -275,14 +286,16 @@ class GuiRuntimeService:
     def __init__(
         self,
         *,
-        db: str = _RUNTIME_DEFAULTS.local_store_target,
+        db: str | None = None,
         runtime: Runtime | None = None,
+        config: AgentLibOSConfig | None = None,
         token: str | None = None,
         auto_run: bool = True,
         max_quanta: int | None | object = _CONFIG_DEFAULT,
     ) -> None:
-        self.db = db
-        self.runtime = runtime or Runtime.open(db)
+        selected_config = config or getattr(runtime, "config", DEFAULT_CONFIG)
+        self.db = selected_config.runtime.local_store_target if db is None else db
+        self.runtime = runtime or Runtime.open(self.db, config=selected_config)
         self.owns_runtime = runtime is None
         self.token = token or secrets.token_urlsafe(32)
         self.broadcaster = GuiEventBroadcaster(max_events=self.runtime.config.gui.event_buffer_limit)
@@ -575,6 +588,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service._tool_summaries()
         if method == "POST" and route == ["processes"]:
             body = self._read_body()
+            max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             pid = service.runtime.process.spawn(
                 image=str(body["image"]) if body.get("image") is not None else None,
                 goal=body.get("goal", ""),
@@ -584,7 +598,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes("process.spawn")
             if body.get("auto_run", True):
                 service.scheduler.maybe_start(
-                    max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                    max_quanta=max_quanta,
                     reason=f"spawn:{pid}",
                 )
             return {"pid": pid, "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
@@ -764,9 +778,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes("process.pause")
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route == ["resume"]:
+            body = self._read_body(optional=True)
             service.runtime.process.resume(pid)
             service.publish_runtime_changes("process.resume")
-            if self._read_body(optional=True).get("auto_run", False):
+            if body.get("auto_run", False):
                 service.scheduler.maybe_start(reason=f"resume:{pid}")
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route == ["signal"]:
@@ -776,6 +791,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route in (["message"], ["interrupt"]):
             body = self._read_body()
+            max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             kind = ProcessMessageKind.INTERRUPT if route == ["interrupt"] else ProcessMessageKind.NORMAL
             message = service.runtime.human.send_process_message(
                 pid,
@@ -791,7 +807,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes(f"process.{kind.value}_message")
             if body.get("auto_run", True):
                 service.scheduler.maybe_start(
-                    max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                    max_quanta=max_quanta,
                     reason=f"message:{pid}",
                 )
             return {"message": to_jsonable(message), "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
@@ -802,6 +818,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return to_jsonable(process)
         if method == "POST" and route == ["exec"]:
             body = self._read_body()
+            max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             self._require_confirmed(
                 "process.exec",
                 body,
@@ -819,7 +836,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes("process.exec")
             if body.get("auto_run", True):
                 service.scheduler.maybe_start(
-                    max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
+                    max_quanta=max_quanta,
                     reason=f"exec:{pid}",
                 )
             return {"process": to_jsonable(process), "scheduler": service.scheduler.status()}
@@ -837,6 +854,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return to_jsonable(service.runtime.human.list())
         if method == "POST" and len(route) == 2 and route[1] == "respond":
             body = self._read_body()
+            max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             current = service.runtime.human.get(route[0])
             if current.status.value != "pending":
                 raise GuiServerError(
@@ -852,7 +870,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 request = service.runtime.human.reject(route[0], {"approved": False, "source": "gui", **decision})
             service.publish_runtime_changes("human.respond")
             if body.get("auto_run", True):
-                service.scheduler.maybe_start(reason=f"human:{route[0]}")
+                service.scheduler.maybe_start(max_quanta=max_quanta, reason=f"human:{route[0]}")
             return {"request": to_jsonable(request), "scheduler": service.scheduler.status()}
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown human endpoint")
 
@@ -1043,6 +1061,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 "package_sha256": result.image.metadata.get("package_sha256"),
                 "package_jit_tools": result.image.metadata.get("package_jit_tools", []),
                 "required_capabilities_count": len(result.image.required_capabilities),
+                "required_modules_count": len(result.image.required_modules),
             }
         if method == "POST" and route == ["commit"]:
             body = self._read_body()
@@ -1074,6 +1093,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 "replaced": result.replaced,
                 "boot": result.image.boot,
                 "required_capabilities_count": len(result.image.required_capabilities),
+                "required_modules_count": len(result.image.required_modules),
             }
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown image endpoint")
 
@@ -1258,32 +1278,48 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
 
 def create_gui_http_server(
     *,
-    db: str = _RUNTIME_DEFAULTS.local_store_target,
+    db: str | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
     token: str | None = None,
     auto_run: bool = True,
     max_quanta: int | None | object = _CONFIG_DEFAULT,
     runtime: Runtime | None = None,
+    config: AgentLibOSConfig | None = None,
 ) -> GuiHTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("GUI server is local-only and must bind 127.0.0.1")
-    service = GuiRuntimeService(db=db, runtime=runtime, token=token, auto_run=auto_run, max_quanta=max_quanta)
+    service = GuiRuntimeService(
+        db=db,
+        runtime=runtime,
+        config=config,
+        token=token,
+        auto_run=auto_run,
+        max_quanta=max_quanta,
+    )
     return GuiHTTPServer(("127.0.0.1", int(port)), service)
 
 
 def serve(
     *,
-    db: str,
+    db: str | None = None,
     port: int,
     token: str | None,
     auto_run: bool,
     max_quanta: int | None | object,
+    config: AgentLibOSConfig | None = None,
     ready: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
-    server = create_gui_http_server(db=db, port=port, token=token, auto_run=auto_run, max_quanta=max_quanta)
+    server = create_gui_http_server(
+        db=db,
+        port=port,
+        token=token,
+        auto_run=auto_run,
+        max_quanta=max_quanta,
+        config=config,
+    )
     host, selected_port = server.server_address
-    payload = {"url": f"http://{host}:{selected_port}", "token": server.service.token, "db": db}
+    payload = {"url": f"http://{host}:{selected_port}", "token": server.service.token, "db": server.service.db}
     if ready is not None:
         ready(payload)
     else:
@@ -1297,7 +1333,8 @@ def serve(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="agent-libos-gui-server")
-    parser.add_argument("--db", default=_RUNTIME_DEFAULTS.local_store_target)
+    parser.add_argument("--config", help="YAML config overlay. Defaults to ./config.yaml when present.")
+    parser.add_argument("--db")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--token")
     parser.add_argument("--no-auto-run", action="store_true")
@@ -1310,26 +1347,44 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.max_quanta is not _CONFIG_DEFAULT and args.max_quanta <= 0:
         parser.error("--max-quanta must be a positive integer when provided")
+    selected_config = _load_runtime_config(args.config, parser)
     serve(
         db=args.db,
         port=args.port,
         token=args.token,
         auto_run=not args.no_auto_run,
         max_quanta=args.max_quanta,
+        config=selected_config,
     )
 
 
 def _int_or_none(value: Any) -> int | None:
-    if value in {None, ""}:
+    if value is None:
         return None
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise GuiServerError(HTTPStatus.BAD_REQUEST, "integer value expected") from exc
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return None
+        try:
+            return int(stripped, 10)
+        except ValueError as exc:
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, "integer value expected") from exc
+    if isinstance(value, bool):
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, "integer value expected")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, "integer value expected")
+    raise GuiServerError(HTTPStatus.BAD_REQUEST, "integer value expected")
 
 
 def _positive_int_or_none(value: Any, name: str) -> int | None:
-    parsed = _int_or_none(value)
+    try:
+        parsed = _int_or_none(value)
+    except GuiServerError as exc:
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{name} must be a positive integer or omitted") from exc
     if parsed is None:
         return None
     if parsed <= 0:

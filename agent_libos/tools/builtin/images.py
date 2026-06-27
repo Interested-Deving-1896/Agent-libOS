@@ -27,6 +27,7 @@ class LoadImagePackageOutput(BaseModel):
     artifact_id: str
     package_sha256: str
     required_capabilities_count: int
+    required_modules_count: int
 
 
 class CommitCheckpointToImageArgs(BaseModel):
@@ -47,6 +48,7 @@ class CommitCheckpointToImageOutput(BaseModel):
     artifact_id: str
     artifact_sha256: str
     required_capabilities_count: int
+    required_modules_count: int
 
 
 class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
@@ -94,6 +96,7 @@ class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
             artifact_id=str(image.boot.get("artifact_id", "")),
             package_sha256=str(image.boot.get("package_sha256", "")),
             required_capabilities_count=len(image.required_capabilities),
+            required_modules_count=len(image.required_modules),
         )
 
 
@@ -140,4 +143,5 @@ class CommitCheckpointToImageTool(SyncAgentTool[CommitCheckpointToImageArgs]):
             artifact_id=str(image.boot.get("artifact_id", "")),
             artifact_sha256=str(image.boot.get("artifact_sha256", "")),
             required_capabilities_count=len(image.required_capabilities),
+            required_modules_count=len(image.required_modules),
         )

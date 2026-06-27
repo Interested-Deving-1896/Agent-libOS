@@ -1087,6 +1087,7 @@ class Runtime:
             boot_kind = image.boot.get("kind", "fresh")
             is_checkpoint_commit = boot_kind == "checkpoint_commit"
             is_image_package = boot_kind == "image_package"
+            self._preflight_process_image_boot(image)
             # Tool visibility is fixed from the AgentImage at process creation time.
             # External-resource authority is still enforced later by the primitives.
             self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
@@ -1152,12 +1153,25 @@ class Runtime:
         return image
 
     def _preflight_process_image_boot(self, image: AgentImage) -> None:
+        self._require_image_modules(image)
         boot_kind = image.boot.get("kind", "fresh")
         if boot_kind == "checkpoint_commit":
             artifact = self._load_image_artifact(image, expected_kind="checkpoint_commit")
             self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
         elif boot_kind == "image_package":
             self._load_image_artifact(image, expected_kind="image_package")
+
+    def _require_image_modules(self, image: AgentImage) -> None:
+        missing = []
+        for module in image.required_modules:
+            module_id = str(module.get("module_id", ""))
+            source_sha256 = str(module.get("source_sha256", ""))
+            if not module_id:
+                continue
+            if not self.modules.is_loaded(module_id, source_sha256 or None):
+                missing.append({"module_id": module_id, "source_sha256": source_sha256})
+        if missing:
+            raise ValidationError(f"image requires startup modules that are not loaded: {missing}")
 
     def _snapshot_process_exec_state(self, pid: str) -> dict[str, Any]:
         process_rows = self.store.select_table_rows("processes", "pid = ?", (pid,))

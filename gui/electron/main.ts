@@ -5,6 +5,7 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { databaseTargetFromRenderer } from "./database.js";
+import { runtimeServerEnv } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
 
 type ServerConnection = {
@@ -42,6 +43,7 @@ let mainWindow: BrowserWindow | null = null;
 let serverProcess: ChildProcessWithoutNullStreams | null = null;
 let connection: ServerConnection | null = null;
 let stoppingServer: Promise<void> | null = null;
+let startingServer: Promise<ServerConnection> | null = null;
 let quittingAfterServerStop = false;
 
 function smokeLog(stage: string, details: Record<string, unknown> = {}) {
@@ -53,15 +55,21 @@ function smokeLog(stage: string, details: Record<string, unknown> = {}) {
 
 async function stopRuntimeServer({ graceful = true, timeoutMs = 2500 }: { graceful?: boolean; timeoutMs?: number } = {}) {
   if (stoppingServer) return stoppingServer;
-  stoppingServer = doStopRuntimeServer({ graceful, timeoutMs }).finally(() => {
+  const child = serverProcess;
+  const currentConnection = connection;
+  stoppingServer = stopRuntimeServerInstance(child, currentConnection, { graceful, timeoutMs }).finally(() => {
+    if (serverProcess === child) serverProcess = null;
+    if (connection === currentConnection) connection = null;
     stoppingServer = null;
   });
   return stoppingServer;
 }
 
-async function doStopRuntimeServer({ graceful = true, timeoutMs = 2500 }: { graceful?: boolean; timeoutMs?: number } = {}) {
-  const child = serverProcess;
-  const currentConnection = connection;
+async function stopRuntimeServerInstance(
+  child: ChildProcessWithoutNullStreams | null,
+  currentConnection: ServerConnection | null,
+  { graceful = true, timeoutMs = 2500 }: { graceful?: boolean; timeoutMs?: number } = {}
+) {
   if (!child) return;
   if (graceful && currentConnection) {
     await requestServerShutdown(currentConnection, timeoutMs);
@@ -70,8 +78,6 @@ async function doStopRuntimeServer({ graceful = true, timeoutMs = 2500 }: { grac
   if (child.exitCode === null && !child.killed) {
     await killProcessTree(child, timeoutMs);
   }
-  serverProcess = null;
-  connection = null;
 }
 
 async function requestServerShutdown(selected: ServerConnection, timeoutMs: number) {
@@ -170,19 +176,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-async function startRuntimeServer(db = "local"): Promise<ServerConnection> {
-  smokeLog("server.start", { db });
-  if (serverProcess) {
-    await stopRuntimeServer();
+async function startRuntimeServer(db?: string): Promise<ServerConnection> {
+  if (startingServer) {
+    try {
+      await startingServer;
+    } catch {
+      // The next start below gets its own process and error surface.
+    }
   }
-  connection = null;
+  if (serverProcess && serverProcess.exitCode === null && connection && (db === undefined || connection.db === db)) {
+    return connection;
+  }
+  startingServer = doStartRuntimeServer(db).finally(() => {
+    startingServer = null;
+  });
+  return startingServer;
+}
+
+async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
+  smokeLog("server.start", { db: db ?? null });
+  const previousProcess = serverProcess;
+  const previousConnection = connection;
   const serverCommand = resolveRuntimeServerCommand();
   smokeLog("server.command", { command: serverCommand.command, args: serverCommand.args });
-  const child = spawn(serverCommand.command, [...serverCommand.args, "--db", db, "--port", "0"], {
+  const serverArgs = db === undefined
+    ? [...serverCommand.args, "--port", "0"]
+    : [...serverCommand.args, "--db", db, "--port", "0"];
+  const child = spawn(serverCommand.command, serverArgs, {
     cwd: repoRoot,
+    env: runtimeServerEnv(repoRoot),
     windowsHide: true
   });
-  serverProcess = child;
   const startup = await new Promise<ServerConnection>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
@@ -231,10 +255,13 @@ async function startRuntimeServer(db = "local"): Promise<ServerConnection> {
     await waitForServerHealth(startup, 15000);
   } catch (error) {
     await killProcessTree(child, 3000);
-    if (serverProcess === child) serverProcess = null;
     throw error;
   }
+  serverProcess = child;
   connection = startup;
+  if (previousProcess && previousProcess !== child) {
+    await stopRuntimeServerInstance(previousProcess, previousConnection, { graceful: true, timeoutMs: 2500 });
+  }
   return startup;
 }
 

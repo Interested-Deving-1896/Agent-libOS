@@ -186,6 +186,17 @@ class RuntimeModuleRegistry:
                 "version": source.manifest.version,
                 "manifest_sha256": source.manifest_sha256,
                 "source_sha256": source.source_sha256,
+                "source_kind": source.source_kind,
+                "source_root": source.source_root,
+                "source_files": [
+                    {
+                        "path": item.path,
+                        "module_path": item.module_path,
+                        "size_bytes": item.size_bytes,
+                        "sha256": item.sha256,
+                    }
+                    for item in source.source_files
+                ],
                 "entrypoint": source.manifest.entrypoint,
                 "registered": summary,
             }
@@ -206,6 +217,7 @@ class RuntimeModuleRegistry:
                     "version": source.manifest.version,
                     "manifest_sha256": source.manifest_sha256,
                     "source_sha256": source.source_sha256,
+                    "source_kind": source.source_kind,
                     "registered": summary,
                 },
             )

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import errno
+import importlib
+import importlib.abc
 import importlib.machinery
 import importlib.util
 import json
+import os
 import re
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -13,7 +18,7 @@ from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource
+from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource, ModuleSourceFile
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _MODULE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
@@ -21,6 +26,38 @@ _PYTHON_OBJECT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PYTHON_MODULE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _SYSCALL_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 _HEX_SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+_WINDOWS_FORBIDDEN_PATH_CHARS = set('<>:"|?*')
+_WINDOWS_RESERVED_PATH_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+_CACHE_PACKAGE_SEGMENTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".venv",
+    "venv",
+    "node_modules",
+}
+_SENSITIVE_PACKAGE_FILENAMES = {
+    ".env",
+    ".netrc",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+_SENSITIVE_PACKAGE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _IMPORT_LOCK = threading.RLock()
 
 
@@ -28,6 +65,68 @@ class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
     def get_code(self, fullname: str) -> Any:
         source_bytes = self.get_data(self.path)
         return self.source_to_code(source_bytes, self.path)
+
+
+class _SnapshotPackageImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def __init__(self, package_name: str, records: tuple[ModuleSourceFile, ...], entry_module_path: str):
+        self.package_name = package_name
+        self.entry_module_path = entry_module_path
+        self._modules: dict[str, ModuleSourceFile] = {}
+        self._packages: set[str] = {package_name}
+        for record in records:
+            module_name = self._module_name_for_record(record)
+            if module_name is not None:
+                self._modules[module_name] = record
+            self._add_package_dirs(record.module_path)
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> importlib.machinery.ModuleSpec | None:
+        if fullname in self._modules:
+            record = self._modules[fullname]
+            is_package = fullname == self.package_name and record.module_path == "__init__.py"
+            return importlib.util.spec_from_loader(fullname, self, origin=record.absolute_path, is_package=is_package)
+        if fullname in self._packages:
+            spec = importlib.util.spec_from_loader(fullname, self, origin="<agent-libos-module-snapshot>", is_package=True)
+            if spec is not None:
+                spec.submodule_search_locations = []
+            return spec
+        return None
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        record = self._modules.get(module.__name__)
+        if record is None:
+            module.__path__ = []  # type: ignore[attr-defined]
+            module.__package__ = module.__name__
+            return
+        module.__file__ = record.absolute_path
+        if module.__name__ == self.package_name and record.module_path == "__init__.py":
+            module.__package__ = module.__name__
+            module.__path__ = []  # type: ignore[attr-defined]
+        else:
+            module.__package__ = module.__name__.rsplit(".", 1)[0]
+        exec(compile(record.content, record.absolute_path, "exec"), module.__dict__)
+
+    def _module_name_for_record(self, record: ModuleSourceFile) -> str | None:
+        if record.module_path == "__init__.py" or record.module_path.endswith("/__init__.py"):
+            if record.module_path != self.entry_module_path:
+                return None
+            parent = record.module_path[: -len("/__init__.py")] if record.module_path.endswith("/__init__.py") else ""
+            suffix = ".".join(part for part in parent.split("/") if part)
+            return f"{self.package_name}.{suffix}" if suffix else self.package_name
+        if not record.module_path.endswith(".py"):
+            return None
+        relative = record.module_path[: -len(".py")]
+        suffix = ".".join(part for part in relative.split("/") if part)
+        return f"{self.package_name}.{suffix}" if suffix else self.package_name
+
+    def _add_package_dirs(self, module_path: str) -> None:
+        parts = module_path.split("/")[:-1]
+        prefix = self.package_name
+        for part in parts:
+            prefix = f"{prefix}.{part}"
+            self._packages.add(prefix)
 
 
 class ModuleLoader:
@@ -76,6 +175,9 @@ class ModuleLoader:
             "manifest_sha256": source.manifest_sha256,
             "source_path": source.source_path,
             "source_sha256": source.source_sha256,
+            "source_kind": source.source_kind,
+            "source_root": source.source_root,
+            "source_files": self._source_file_summaries(source),
             "trusted": self.is_trusted(source.manifest.module_id, source.source_sha256),
             "provides": {
                 "tools": list(source.manifest.provides.tools),
@@ -96,7 +198,24 @@ class ModuleLoader:
         source_bytes = self._read_source_bytes(source_path)
         source_sha = self._sha256_bytes(source_bytes)
         expected_sha = manifest.sha256.lower()
+        source_root = self._infer_source_root(path.parent.resolve(), source_path, manifest.entrypoint)
+        source_files = self._entry_source_files(path.parent.resolve(), source_root, source_path, source_bytes)
+        source_kind = "file"
         if source_sha != expected_sha:
+            source_files = self._read_package_source_files(path.parent.resolve(), source_root)
+            package_sha = self._package_sha256(source_files)
+            if package_sha != expected_sha:
+                raise ValidationError(
+                    "module source sha256 mismatch: "
+                    f"expected {expected_sha}, got entry={source_sha}, package={package_sha}"
+                )
+            source_sha = package_sha
+            source_kind = "package"
+            entry = next((record for record in source_files if Path(record.absolute_path).resolve() == source_path.resolve()), None)
+            if entry is None:
+                raise ValidationError(f"module entrypoint source is missing from package snapshot: {source_path}")
+            source_bytes = entry.content
+        if source_kind == "file" and source_sha != expected_sha:
             raise ValidationError(
                 "module source sha256 mismatch: "
                 f"expected {expected_sha}, got {source_sha}"
@@ -109,6 +228,9 @@ class ModuleLoader:
             source_sha256=source_sha,
             entrypoint_object=entrypoint_object,
             source_bytes=source_bytes,
+            source_kind=source_kind,
+            source_root=str(source_root),
+            source_files=tuple(source_files),
         )
 
     def parse_manifest(self, text: str) -> ModuleManifest:
@@ -148,12 +270,15 @@ class ModuleLoader:
     def import_entrypoint(self, source: ModuleSource) -> Any:
         module_ref, object_name = self._split_entrypoint(source.manifest.entrypoint)
         with _IMPORT_LOCK:
-            module = self._import_file(
-                Path(source.source_path),
-                source.manifest.module_id,
-                source.source_sha256,
-                source.source_bytes,
-            )
+            if source.source_kind == "package":
+                module = self._import_package(source)
+            else:
+                module = self._import_file(
+                    Path(source.source_path),
+                    source.manifest.module_id,
+                    source.source_sha256,
+                    source.source_bytes,
+                )
         self._verify_imported_module_source(module, source)
         entrypoint = getattr(module, object_name, None)
         if not callable(entrypoint):
@@ -303,12 +428,184 @@ class ModuleLoader:
         except ValueError as exc:
             raise ValidationError(f"module entrypoint path escapes manifest directory: {path}") from exc
 
+    def _infer_source_root(self, manifest_dir: Path, source_path: Path, entrypoint: str) -> Path:
+        module_ref, _object_name = self._split_entrypoint(entrypoint)
+        source = source_path.resolve()
+        self._require_under(source, manifest_dir)
+        if not self._is_path_ref(module_ref):
+            first = module_ref.split(".", 1)[0]
+            candidate = (manifest_dir / first).resolve()
+            if candidate.is_dir():
+                self._require_under(candidate, manifest_dir)
+                return candidate
+        if source.name == "__init__.py":
+            return source.parent
+        current = source.parent
+        root = current
+        while current != manifest_dir and (current / "__init__.py").is_file():
+            root = current
+            current = current.parent
+        return root
+
+    def _entry_source_files(
+        self,
+        manifest_dir: Path,
+        source_root: Path,
+        source_path: Path,
+        source_bytes: bytes,
+    ) -> tuple[ModuleSourceFile, ...]:
+        relative = self._manifest_relative_path(manifest_dir, source_path.resolve())
+        module_path = self._source_root_relative_path(source_root.resolve(), source_path.resolve())
+        return (
+            ModuleSourceFile(
+                path=relative,
+                module_path=module_path,
+                absolute_path=str(source_path.resolve()),
+                size_bytes=len(source_bytes),
+                sha256=self._sha256_bytes(source_bytes),
+                content=source_bytes,
+            ),
+        )
+
+    def _read_package_source_files(self, manifest_dir: Path, source_root: Path) -> tuple[ModuleSourceFile, ...]:
+        root = source_root.resolve()
+        self._require_under(root, manifest_dir)
+        records: list[ModuleSourceFile] = []
+        total_bytes = 0
+        for item in sorted(root.rglob("*")):
+            before = item.lstat()
+            relative = self._manifest_relative_path(manifest_dir, item.resolve() if not stat.S_ISLNK(before.st_mode) else item)
+            self._validate_source_relative_path(relative)
+            if stat.S_ISLNK(before.st_mode):
+                raise ValidationError(f"module package symlinks are not supported: {item}")
+            if stat.S_ISDIR(before.st_mode):
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                raise ValidationError(f"module package path is not a regular file or directory: {item}")
+            if before.st_nlink > 1:
+                raise ValidationError(f"module package hard links are not supported: {item}")
+            if item.suffix != ".py":
+                continue
+            content = self._read_source_bytes(item)
+            total_bytes += len(content)
+            if total_bytes > self.config.modules.package_max_bytes:
+                raise ValidationError(
+                    "module package exceeded "
+                    f"package_max_bytes={self.config.modules.package_max_bytes}"
+                )
+            records.append(
+                ModuleSourceFile(
+                    path=relative,
+                    module_path=self._source_root_relative_path(root, item.resolve()),
+                    absolute_path=str(item.resolve()),
+                    size_bytes=len(content),
+                    sha256=self._sha256_bytes(content),
+                    content=content,
+                )
+            )
+            if len(records) > self.config.modules.max_package_files:
+                raise ValidationError(
+                    "module package exceeded "
+                    f"max_package_files={self.config.modules.max_package_files}"
+                )
+        if not records:
+            raise NotFound(f"module package contains no Python source files: {root}")
+        return tuple(sorted(records, key=lambda record: record.path))
+
+    def _manifest_relative_path(self, manifest_dir: Path, path: Path) -> str:
+        try:
+            return path.relative_to(manifest_dir).as_posix()
+        except ValueError as exc:
+            raise ValidationError(f"module package path escapes manifest directory: {path}") from exc
+
+    def _source_root_relative_path(self, source_root: Path, path: Path) -> str:
+        try:
+            return path.relative_to(source_root).as_posix()
+        except ValueError as exc:
+            raise ValidationError(f"module package path escapes source root: {path}") from exc
+
+    def _validate_source_relative_path(self, path: str) -> None:
+        normalized = path.replace("\\", "/").strip()
+        if not normalized or normalized.startswith("/") or ":" in normalized.split("/", 1)[0]:
+            raise ValidationError(f"module package path must be relative: {path!r}")
+        parts: list[str] = []
+        for part in normalized.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                raise ValidationError(f"module package path escapes source root: {path!r}")
+            parts.append(part)
+        if not parts or "/".join(parts) != normalized:
+            raise ValidationError(f"module package path must be normalized: {path!r}")
+        if any(ord(char) < 32 for char in normalized):
+            raise ValidationError(f"module package path contains control characters: {path!r}")
+        for part in parts:
+            lower = part.lower()
+            stem = part.split(".", 1)[0].upper()
+            if any(char in _WINDOWS_FORBIDDEN_PATH_CHARS for char in part):
+                raise ValidationError(f"module package path contains a Windows-unsafe character: {path!r}")
+            if part.endswith((" ", ".")):
+                raise ValidationError(f"module package path contains a Windows-unsafe segment: {path!r}")
+            if stem in _WINDOWS_RESERVED_PATH_NAMES:
+                raise ValidationError(f"module package path uses a reserved Windows device name: {path!r}")
+            if lower in _CACHE_PACKAGE_SEGMENTS:
+                raise ValidationError(f"module package must not include cache or VCS paths: {path!r}")
+            if lower in _SENSITIVE_PACKAGE_FILENAMES or lower.endswith(_SENSITIVE_PACKAGE_SUFFIXES):
+                raise ValidationError(f"module package must not include likely secret material: {path!r}")
+
+    def _package_sha256(self, source_files: tuple[ModuleSourceFile, ...]) -> str:
+        canonical = [
+            {"path": record.path, "size_bytes": record.size_bytes, "sha256": record.sha256}
+            for record in source_files
+        ]
+        payload = {"kind": "agent_libos_runtime_module_package", "files": canonical}
+        return self._sha256_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+    def _source_file_summaries(self, source: ModuleSource) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": record.path,
+                "module_path": record.module_path,
+                "size_bytes": record.size_bytes,
+                "sha256": record.sha256,
+            }
+            for record in source.source_files
+        ]
+
     def _import_file(self, path: Path, module_id: str, source_sha256: str, source_bytes: bytes) -> ModuleType:
         module_name = (
             "_agent_libos_module_"
             f"{hashlib.sha256((module_id + str(path) + source_sha256).encode('utf-8')).hexdigest()}"
         )
         return self._exec_source_module(module_name, path, source_bytes)
+
+    def _import_package(self, source: ModuleSource) -> ModuleType:
+        package_name = (
+            "_agent_libos_module_pkg_"
+            f"{hashlib.sha256((source.manifest.module_id + source.source_root + source.source_sha256).encode('utf-8')).hexdigest()}"
+        )
+        entry_module_path = self._source_root_relative_path(Path(source.source_root).resolve(), Path(source.source_path).resolve())
+        importer = _SnapshotPackageImporter(package_name, tuple(source.source_files), entry_module_path)
+        if entry_module_path == "__init__.py":
+            entry_name = package_name
+        elif entry_module_path.endswith("/__init__.py"):
+            entry_name = f"{package_name}.{entry_module_path[:-len('/__init__.py')].replace('/', '.')}"
+        else:
+            entry_name = f"{package_name}.{entry_module_path[:-3].replace('/', '.')}"
+        before_modules = set(sys.modules)
+        sys.meta_path.insert(0, importer)
+        try:
+            return importlib.import_module(entry_name)
+        except Exception:
+            for name in set(sys.modules) - before_modules:
+                if name == package_name or name.startswith(f"{package_name}."):
+                    sys.modules.pop(name, None)
+            raise
+        finally:
+            try:
+                sys.meta_path.remove(importer)
+            except ValueError:
+                pass
 
     def _exec_source_module(self, module_name: str, path: Path, source_bytes: bytes) -> ModuleType:
         spec = importlib.util.spec_from_loader(module_name, loader=None, origin=str(path))
@@ -337,6 +634,16 @@ class ModuleLoader:
                 "module entrypoint import resolved to a different source file: "
                 f"expected {expected_path}, got {imported_path}"
             )
+        if source.source_kind == "package":
+            source_root = Path(source.source_root).resolve()
+            manifest_dir = Path(source.manifest_path).resolve().parent
+            imported_sha = self._package_sha256(self._read_package_source_files(manifest_dir, source_root))
+            if imported_sha != source.source_sha256:
+                raise ValidationError(
+                    "module package source changed after verification: "
+                    f"expected {source.source_sha256}, got {imported_sha}"
+                )
+            return
         imported_sha = self._sha256_file(imported_path)
         if imported_sha != source.source_sha256:
             raise ValidationError(
@@ -385,13 +692,39 @@ class ModuleLoader:
         return self._sha256_bytes(self._read_source_bytes(path))
 
     def _read_source_bytes(self, path: Path) -> bytes:
-        size = path.stat().st_size
-        if size > self.config.modules.source_max_bytes:
+        if not path.exists() or not path.is_file():
+            raise NotFound(f"module source not found: {path}")
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValidationError(f"module source is not a regular file: {path}")
+        if before.st_nlink > 1:
+            raise ValidationError(f"module source hard links are not supported: {path}")
+        if before.st_size > self.config.modules.source_max_bytes:
             raise ValidationError(
                 "module source exceeded "
                 f"source_max_bytes={self.config.modules.source_max_bytes}"
             )
-        return path.read_bytes()
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValidationError(f"module source symlinks are not supported: {path}") from exc
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValidationError(f"module source is not a regular file: {path}")
+            if opened.st_nlink > 1:
+                raise ValidationError(f"module source hard links are not supported: {path}")
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValidationError(f"module source changed during read: {path}")
+            raw = handle.read()
+        if len(raw) > self.config.modules.source_max_bytes:
+            raise ValidationError(
+                "module source exceeded "
+                f"source_max_bytes={self.config.modules.source_max_bytes}"
+            )
+        return raw
 
     def _sha256_bytes(self, value: bytes) -> str:
         return hashlib.sha256(value).hexdigest()

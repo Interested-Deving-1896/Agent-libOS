@@ -10,6 +10,11 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults
+from agent_libos.llm.openai_schema import (
+    normalize_openai_chat_tool_schema,
+    normalize_openai_structured_output_schema,
+    openai_responses_tool_schema,
+)
 from agent_libos.models.exceptions import LibOSError
 from agent_libos.utils.serde import to_jsonable
 
@@ -47,6 +52,10 @@ class LLMClient:
     store: bool | None = None
     reasoning_effort: str | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
+    safety_identifier: str | None = None
+    prompt_cache_key: str | None = None
+    prompt_cache_retention: Literal["in-memory", "24h"] | None = None
+    responses_previous_response_id: bool | None = None
     allow_custom_base_url: bool = False
     defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
     _client: Any | None = field(default=None, init=False, repr=False)
@@ -57,6 +66,18 @@ class LLMClient:
         self.max_retries = self.defaults.max_retries if self.max_retries is None else self.max_retries
         self.api_mode = self.defaults.api_mode if self.api_mode is None else self.api_mode
         self.store = self.defaults.store if self.store is None else self.store
+        self.safety_identifier = self.defaults.safety_identifier if self.safety_identifier is None else self.safety_identifier
+        self.prompt_cache_key = self.defaults.prompt_cache_key if self.prompt_cache_key is None else self.prompt_cache_key
+        self.prompt_cache_retention = (
+            self.defaults.prompt_cache_retention
+            if self.prompt_cache_retention is None
+            else self.prompt_cache_retention
+        )
+        self.responses_previous_response_id = (
+            self.defaults.responses_previous_response_id
+            if self.responses_previous_response_id is None
+            else self.responses_previous_response_id
+        )
         self._validate_base_url_policy()
 
     @classmethod
@@ -91,6 +112,17 @@ class LLMClient:
             store=_bool_env_from(env, "OPENAI_STORE", default=defaults.store),
             reasoning_effort=_optional_env_from(env, "OPENAI_REASONING_EFFORT"),
             verbosity=_verbosity_env_from(env, "OPENAI_VERBOSITY"),
+            safety_identifier=_optional_env_from(env, "OPENAI_SAFETY_IDENTIFIER") or defaults.safety_identifier,
+            prompt_cache_key=_optional_env_from(env, "OPENAI_PROMPT_CACHE_KEY") or defaults.prompt_cache_key,
+            prompt_cache_retention=(
+                _prompt_cache_retention_env_from(env, "OPENAI_PROMPT_CACHE_RETENTION")
+                or defaults.prompt_cache_retention
+            ),
+            responses_previous_response_id=_bool_env_from(
+                env,
+                "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
+                default=defaults.responses_previous_response_id,
+            ),
             allow_custom_base_url=selected_allow_custom_base_url,
             defaults=defaults,
         )
@@ -129,12 +161,16 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = True,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> str:
         return self.complete_with_metadata(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             json_mode=json_mode,
+            json_schema=json_schema,
+            schema_name=schema_name,
         ).content
 
     def complete_with_metadata(
@@ -143,6 +179,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = True,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_with_metadata(
@@ -150,6 +188,8 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
             )
         )
 
@@ -159,6 +199,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = True,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> str:
         return (
             await self.acomplete_with_metadata(
@@ -166,6 +208,8 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
             )
         ).content
 
@@ -175,13 +219,17 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = True,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> LLMCompletion:
-        selected_messages = self._messages_with_json_instruction(messages) if json_mode else messages
+        selected_messages = self._messages_with_json_instruction(messages) if json_mode and json_schema is None else messages
         completion = await self._complete_without_tools(
             messages=selected_messages,
             temperature=self._temperature(temperature),
             max_tokens=self._max_tokens(max_tokens),
             json_mode=json_mode,
+            json_schema=json_schema,
+            schema_name=schema_name,
         )
         if not completion.content:
             raise LLMError("LLM returned empty content")
@@ -193,6 +241,7 @@ class LLMClient:
         tools: list[dict[str, Any]],
         temperature: float | None = None,
         max_tokens: int | None = None,
+        previous_response_id: str | None = None,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_action(
@@ -200,6 +249,7 @@ class LLMClient:
                 tools=tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                previous_response_id=previous_response_id,
             )
         )
 
@@ -209,12 +259,19 @@ class LLMClient:
         tools: list[dict[str, Any]],
         temperature: float | None = None,
         max_tokens: int | None = None,
+        previous_response_id: str | None = None,
     ) -> LLMCompletion:
         selected_temperature = self._temperature(temperature)
         selected_max_tokens = self._max_tokens(max_tokens)
         if self._use_responses_api():
             try:
-                return await self._responses_complete_action(messages, tools, selected_temperature, selected_max_tokens)
+                return await self._responses_complete_action(
+                    messages,
+                    tools,
+                    selected_temperature,
+                    selected_max_tokens,
+                    previous_response_id=previous_response_id,
+                )
             except LLMError as exc:
                 if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
@@ -226,14 +283,16 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         json_mode: bool,
+        json_schema: dict[str, Any] | None,
+        schema_name: str,
     ) -> LLMCompletion:
         if self._use_responses_api():
             try:
-                return await self._responses_complete(messages, temperature, max_tokens, json_mode)
+                return await self._responses_complete(messages, temperature, max_tokens, json_mode, json_schema, schema_name)
             except LLMError as exc:
                 if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
-        return await self._chat_complete(messages, temperature, max_tokens, json_mode)
+        return await self._chat_complete(messages, temperature, max_tokens, json_mode, json_schema, schema_name)
 
     async def _responses_complete(
         self,
@@ -241,9 +300,13 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         json_mode: bool,
+        json_schema: dict[str, Any] | None,
+        schema_name: str,
     ) -> LLMCompletion:
         payload = self._responses_payload(messages, temperature=temperature, max_tokens=max_tokens)
-        if json_mode:
+        if json_schema is not None:
+            payload["text"] = self._responses_text_config_for_schema(json_schema, schema_name)
+        elif json_mode:
             payload["text"] = self._text_config(json_mode=True)
         response = await self._create_response(payload)
         return self._completion_from_response(response)
@@ -254,8 +317,15 @@ class LLMClient:
         tools: list[dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        *,
+        previous_response_id: str | None = None,
     ) -> LLMCompletion:
-        payload = self._responses_payload(messages, temperature=temperature, max_tokens=max_tokens)
+        payload = self._responses_payload(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            previous_response_id=previous_response_id,
+        )
         payload.update(
             {
                 "tools": _responses_tools_from_chat_tools(tools),
@@ -273,9 +343,13 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         json_mode: bool,
+        json_schema: dict[str, Any] | None,
+        schema_name: str,
     ) -> LLMCompletion:
         payload = self._chat_payload(messages=messages, temperature=temperature, max_tokens=max_tokens)
-        if json_mode:
+        if json_schema is not None:
+            payload["response_format"] = self._chat_response_format_for_schema(json_schema, schema_name)
+        elif json_mode:
             payload["response_format"] = {"type": "json_object"}
         completion = await self._create_chat_completion(payload)
         result = self._completion_from_chat(completion)
@@ -296,7 +370,7 @@ class LLMClient:
         max_tokens: int,
     ) -> LLMCompletion:
         payload = self._chat_payload(messages=messages, temperature=temperature, max_tokens=max_tokens)
-        payload.update({"tools": tools, "tool_choice": "auto", "parallel_tool_calls": False})
+        payload.update({"tools": _chat_tools(tools), "tool_choice": "auto", "parallel_tool_calls": False})
         try:
             completion = await self._create_chat_completion(payload)
         except LLMError as exc:
@@ -352,7 +426,13 @@ class LLMClient:
             kwargs["base_url"] = self.base_url
         return kwargs
 
-    def _responses_payload(self, messages: list[dict[str, Any]], temperature: float, max_tokens: int) -> dict[str, Any]:
+    def _responses_payload(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        previous_response_id: str | None = None,
+    ) -> dict[str, Any]:
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
         instructions, input_items = _messages_to_responses_parts(messages)
@@ -367,11 +447,14 @@ class LLMClient:
             payload["instructions"] = instructions
         if temperature is not None:
             payload["temperature"] = temperature
+        if previous_response_id and self.store and self._use_openai_request_options():
+            payload["previous_response_id"] = previous_response_id
         if self.reasoning_effort:
             payload["reasoning"] = {"effort": self.reasoning_effort}
         text_config = self._text_config(json_mode=False)
         if text_config:
             payload["text"] = text_config
+        self._add_openai_responses_options(payload)
         extra_body = self._extra_body()
         if extra_body:
             payload["extra_body"] = extra_body
@@ -441,7 +524,21 @@ class LLMClient:
             return retry
         if "max_output_tokens" in message and "max_output_tokens" in retry and api == "responses":
             return None
-        for key in ("parallel_tool_calls", "response_format", "temperature", "store", "reasoning", "reasoning_effort"):
+        if "strict" in message and isinstance(retry.get("tools"), list):
+            retry["tools"] = _tools_without_strict(retry["tools"])
+            return retry
+        for key in (
+            "parallel_tool_calls",
+            "response_format",
+            "temperature",
+            "store",
+            "reasoning",
+            "reasoning_effort",
+            "previous_response_id",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "safety_identifier",
+        ):
             if key in message and key in retry:
                 retry.pop(key, None)
                 return retry
@@ -544,6 +641,56 @@ class LLMClient:
             config["verbosity"] = self.verbosity
         return config
 
+    def _responses_text_config_for_schema(self, schema: dict[str, Any], schema_name: str) -> dict[str, Any]:
+        config = self._text_config(json_mode=False)
+        config["format"] = {
+            "type": "json_schema",
+            "name": self._schema_name(schema_name),
+            "schema": self._strict_structured_output_schema(schema),
+            "strict": True,
+        }
+        return config
+
+    def _chat_response_format_for_schema(self, schema: dict[str, Any], schema_name: str) -> dict[str, Any]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": self._schema_name(schema_name),
+                "schema": self._strict_structured_output_schema(schema),
+                "strict": True,
+            },
+        }
+
+    def _strict_structured_output_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return normalize_openai_structured_output_schema(schema)
+        except ValueError as exc:
+            raise LLMError(str(exc)) from exc
+
+    @staticmethod
+    def _schema_name(value: str) -> str:
+        selected = str(value or "").strip()
+        if not selected:
+            raise LLMError("schema_name must be a non-empty string")
+        return selected
+
+    def _add_openai_responses_options(self, payload: dict[str, Any]) -> None:
+        if not self._use_openai_request_options():
+            return
+        if self.safety_identifier:
+            if len(self.safety_identifier) > 64:
+                raise LLMError("safety_identifier must be at most 64 characters")
+            payload["safety_identifier"] = self.safety_identifier
+        if self.prompt_cache_key:
+            payload["prompt_cache_key"] = self.prompt_cache_key
+        if self.prompt_cache_retention:
+            if self.prompt_cache_retention not in {"in-memory", "24h"}:
+                raise LLMError("prompt_cache_retention must be one of in-memory, 24h")
+            payload["prompt_cache_retention"] = self.prompt_cache_retention
+
+    def _use_openai_request_options(self) -> bool:
+        return self.base_url is None or _is_openai_base_url(self.base_url)
+
     def _extra_body(self) -> dict[str, Any]:
         configured_thinking = os.getenv("OPENAI_ENABLE_THINKING")
         if configured_thinking is None:
@@ -629,25 +776,30 @@ class LLMClient:
 def _responses_tools_from_chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for tool in tools:
-        if tool.get("type") != "function":
-            continue
-        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        name = function.get("name") if isinstance(function, dict) else None
-        if not name:
-            continue
-        converted.append(
-            {
-                "type": "function",
-                "name": name,
-                "description": function.get("description", ""),
-                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
-                # Existing Pydantic-generated schemas are not strict-mode
-                # normalized yet, so keep runtime compatibility while preserving
-                # JSON-schema argument guidance.
-                "strict": False,
-            }
-        )
+        converted_tool = openai_responses_tool_schema(tool)
+        if converted_tool is not None:
+            converted.append(converted_tool)
     return converted
+
+
+def _chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [normalize_openai_chat_tool_schema(tool) for tool in tools]
+
+
+def _tools_without_strict(tools: list[Any]) -> list[Any]:
+    selected: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            selected.append(tool)
+            continue
+        updated = dict(tool)
+        updated.pop("strict", None)
+        function = updated.get("function")
+        if isinstance(function, dict):
+            updated["function"] = dict(function)
+            updated["function"].pop("strict", None)
+        selected.append(updated)
+    return selected
 
 
 def _llm_defaults(config: AgentLibOSConfig | LLMDefaults | None) -> LLMDefaults:
@@ -833,6 +985,16 @@ def _verbosity_env_from(env: dict[str, str], name: str) -> Literal["low", "mediu
     normalized = value.lower()
     if normalized not in {"low", "medium", "high"}:
         raise LLMError(f"{name} must be one of low, medium, high; got {value!r}")
+    return normalized  # type: ignore[return-value]
+
+
+def _prompt_cache_retention_env_from(env: dict[str, str], name: str) -> Literal["in-memory", "24h"] | None:
+    value = _optional_env_from(env, name)
+    if value is None:
+        return None
+    normalized = value.lower()
+    if normalized not in {"in-memory", "24h"}:
+        raise LLMError(f"{name} must be one of in-memory, 24h; got {value!r}")
     return normalized  # type: ignore[return-value]
 
 

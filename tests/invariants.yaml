@@ -402,6 +402,9 @@
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_untrusted_module_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_source_hash_mismatch_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_source_swap_after_trust_does_not_execute_swapped_bytes",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_package_relative_import_registers_runtime_surfaces",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_helper_change_rejects_old_package_hash",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_source_swap_after_trust_does_not_execute_swapped_helper",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_json_manifest_duplicate_keys_are_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_manifest_schema_version_must_be_integer",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_import_string_resolve_does_not_execute_package_init_before_trust",
@@ -411,7 +414,10 @@
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_apply_failure_rolls_back_registered_tool_and_failed_status",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_startup_hook_failure_rolls_back_external_module_state",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_duplicate_module_id_does_not_overwrite_loaded_record",
-        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_checkpoint_restore_requires_same_startup_module_loaded"
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_checkpoint_restore_requires_same_startup_module_loaded",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_image_required_modules_rejects_spawn_when_module_is_not_loaded",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_image_required_modules_rejects_loaded_module_with_different_hash",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_checkpoint_committed_image_carries_required_modules"
       ],
       "benchmark_attack_classes": []
     },
@@ -443,6 +449,7 @@
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_without_workspace_grants_cannot_read_materialized_workspace",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_tools_are_process_local_and_not_workspace_files",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_boot_validation_uses_broker_resource_limits_once",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_required_modules_round_trips_and_boot_requires_loaded_module",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_image_default_skill_spawn_fails_closed_when_skill_missing",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_secret_or_cache_files",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_host_hardlinked_files",

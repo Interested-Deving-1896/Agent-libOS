@@ -39,10 +39,30 @@ describe("deriveUserConversation", () => {
     );
   });
 
+  it("keeps completed human request decisions in the conversation", () => {
+    const items = deriveUserConversation(snapshot(), "pid_1");
+
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        id: "decision:hreq_approved",
+        role: "decision",
+        text: "Use vivado/dev"
+      })
+    );
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        id: "decision:hreq_rejected",
+        role: "decision",
+        status: "rejected",
+        text: ""
+      })
+    );
+  });
+
   it("does not include raw audit events or llm calls in the user conversation", () => {
     const items = deriveUserConversation(snapshot(), "pid_1");
 
-    expect(items).toHaveLength(3);
+    expect(items).toHaveLength(5);
     expect(items.some((item) => item.id.includes("audit"))).toBe(false);
     expect(items.some((item) => item.id.includes("event"))).toBe(false);
     expect(items.some((item) => item.id.includes("llm"))).toBe(false);
@@ -133,6 +153,28 @@ function snapshot(): RuntimeSnapshot {
         blocking: true,
         created_at: "2026-06-19T01:00:04.000Z",
         updated_at: "2026-06-19T01:00:04.000Z"
+      },
+      {
+        request_id: "hreq_approved",
+        pid: "pid_1",
+        human: "owner",
+        payload: { type: "question", question: "Which branch should I use?" },
+        status: "approved",
+        decision: { approved: true, source: "gui", answer: "Use vivado/dev" },
+        blocking: true,
+        created_at: "2026-06-19T01:00:05.000Z",
+        updated_at: "2026-06-19T01:00:06.000Z"
+      },
+      {
+        request_id: "hreq_rejected",
+        pid: "pid_1",
+        human: "owner",
+        payload: { type: "approval", reason: "May I continue?" },
+        status: "rejected",
+        decision: { approved: false, source: "gui" },
+        blocking: true,
+        created_at: "2026-06-19T01:00:07.000Z",
+        updated_at: "2026-06-19T01:00:08.000Z"
       }
     ],
     events: [

@@ -31,8 +31,8 @@ Terminal statuses are `exited`, `failed`, and `killed`.
 
 An `AgentImage` defines the default process prompt, tool table, default Skills,
 prompt mode, context policy, safety profile, declared required capabilities,
-an optional default LLM profile, and optional boot metadata. Fresh images boot
-from their manifest.
+declared required startup modules, an optional default LLM profile, and
+optional boot metadata. Fresh images boot from their manifest.
 Checkpoint-commit images boot from an immutable internal runtime artifact
 derived from one checkpoint root process. Image-package images boot from an
 immutable directory-package artifact created from `IMAGE.yaml`, `prompt.md`,
@@ -48,6 +48,9 @@ built-in images.
 Root process spawn may use image `required_capabilities` as a bootstrap
 declaration for ordinary fresh images. `exec_process`, checkpoint-commit image
 boot, and image-package boot never grant those declarations automatically.
+Image `required_modules` are always startup prerequisites only: spawn and exec
+fail unless each declared module id is already loaded with the declared
+`source_sha256`.
 
 At process creation time, the runtime resolves only the image's explicit
 `default_tools` into the process tool table. No lifecycle, Object Memory, or
@@ -78,9 +81,10 @@ tool sections and event context; image prompts remain responsible for listing
 any JIT catalog the model should know.
 
 A checkpoint-commit image remaps baked Object Memory, process-local JIT tools,
-loaded Skill package snapshots, and cwd into the new process. It does not package or
-restore filesystem, shell, JSON-RPC endpoints, global Skill trust, human,
-network, or provider side effects.
+loaded Skill package snapshots, and cwd into the new process. It also carries
+the checkpoint's loaded startup module summaries as `required_modules`. It does
+not package or restore filesystem, shell, JSON-RPC endpoints, global Skill
+trust, human, network, or provider side effects.
 
 An image-package boot materializes the package `workspace/` seed into a private
 per-process directory under `agent_outputs/image_workspaces/`, sets the process

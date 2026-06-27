@@ -178,6 +178,9 @@ External capabilities in the checkpoint are converted into image
 `required_capabilities` declarations. They are not restored as live authority
 when the committed image is spawned or execed. Internal Object Memory
 capabilities needed to read the baked objects are remapped into the new process.
+Loaded startup module summaries are copied into image `required_modules`; the
+committed image fails closed at boot unless those exact module ids and source
+hashes are loaded in the current runtime.
 
 CLI example:
 

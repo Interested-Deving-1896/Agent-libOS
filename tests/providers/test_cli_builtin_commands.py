@@ -13,6 +13,59 @@ from agent_libos.substrate import LocalResourceProviderSubstrate
 
 class TestCLIBuiltinCommand:
 
+    def test_cli_loads_config_yaml_from_cwd_for_default_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            root.joinpath('config.yaml').write_text(
+                'runtime:\n  default_image_id: configured-base:v0\n',
+                encoding='utf-8',
+            )
+
+            with _temporary_cwd(root):
+                result = _run_cli_json(['--db', str(db), 'spawn', '--goal', 'configured default'])
+
+            assert result['image'] == 'configured-base:v0'
+
+    def test_cli_config_argument_overrides_cwd_config_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            root.joinpath('config.yaml').write_text(
+                'runtime:\n  default_image_id: cwd-base:v0\n',
+                encoding='utf-8',
+            )
+            alt = root / 'alt-config.yaml'
+            alt.write_text(
+                'runtime:\n  default_image_id: alt-base:v0\n',
+                encoding='utf-8',
+            )
+
+            with _temporary_cwd(root):
+                result = _run_cli_json(['--config', str(alt), '--db', str(db), 'spawn', '--goal', 'configured default'])
+
+            assert result['image'] == 'alt-base:v0'
+
+    def test_cli_explicit_db_overrides_configured_local_store_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            configured = root / 'configured.sqlite'
+            explicit = root / 'explicit.sqlite'
+            config = root / 'config.yaml'
+            config.write_text(
+                f'runtime:\n  local_store_target: {configured.as_posix()}\n',
+                encoding='utf-8',
+            )
+
+            with _temporary_cwd(root):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cli_main(['--config', str(config), '--db', str(explicit), 'init'])
+
+            assert stdout.getvalue().strip() == f'initialized {explicit}'
+            assert explicit.exists()
+            assert not configured.exists()
+
     def test_cli_cd_changes_process_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

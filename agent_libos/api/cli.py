@@ -10,8 +10,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError as PydanticValidationError
+
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_cwd
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
@@ -38,12 +40,28 @@ DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
 _TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
 
+def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParser) -> AgentLibOSConfig:
+    try:
+        if config_path:
+            return load_config_file(config_path)
+        return load_config_from_cwd()
+    except (OSError, ValueError, PydanticValidationError) as exc:
+        parser.error(str(exc))
+    raise AssertionError("argparse parser.error should exit")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="agent-libos")
     parser.add_argument(
+        "--config",
+        help="YAML config overlay. Defaults to ./config.yaml when present.",
+    )
+    parser.add_argument(
         "--db",
-        default=_RUNTIME_DEFAULTS.local_store_target,
-        help=f"SQLite DB path, or '{_RUNTIME_DEFAULTS.local_store_target}' for in-memory",
+        help=(
+            "SQLite DB path. If omitted, uses runtime.local_store_target from the selected config "
+            f"(default '{_RUNTIME_DEFAULTS.local_store_target}' is in-memory)."
+        ),
     )
     parser.add_argument(
         "--module-manifest",
@@ -55,13 +73,13 @@ def main(argv: list[str] | None = None) -> None:
         "--trusted-module",
         action="append",
         default=[],
-        help="Trusted startup module entry in the form '<module_id>:<source_sha256>'.",
+        help="Trusted startup module entry in the form '<module_id>:<source_sha256>' where the hash is the entry file or package digest.",
     )
     parser.add_argument(
         "--trusted-module-sha256",
         action="append",
         default=[],
-        help="Trusted startup module source sha256, regardless of module id. Intended for local development only.",
+        help="Trusted startup module source/package sha256, regardless of module id. Intended for local development only.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Initialize a runtime database")
@@ -140,16 +158,19 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("human", help="Process pending human messages in terminal order")
     args = parser.parse_args(argv)
 
+    selected_config = _load_runtime_config(args.config, parser)
+    selected_db = args.db or selected_config.runtime.local_store_target
     load_module_manifests = [] if args.command == "modules" and args.modules_command == "verify" else args.module_manifest
     runtime = Runtime.open(
-        args.db,
+        selected_db,
+        config=selected_config,
         module_manifests=load_module_manifests,
         trusted_modules=args.trusted_module,
         trusted_module_sha256=args.trusted_module_sha256,
     )
     try:
         if args.command == "init":
-            print(f"initialized {args.db}")
+            print(f"initialized {selected_db}")
         elif args.command == "demo":
             print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
         elif args.command == "audit":
@@ -1027,6 +1048,7 @@ def _run_images_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
             "package_sha256": image.metadata.get("package_sha256"),
             "package_jit_tools": image.metadata.get("package_jit_tools", []),
             "required_capabilities_count": len(image.required_capabilities),
+            "required_modules_count": len(image.required_modules),
         }
     if command == "commit":
         result = runtime.image_registry.commit_from_checkpoint(
@@ -1047,6 +1069,7 @@ def _run_images_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
             "replaced": result.replaced,
             "boot": image.boot,
             "required_capabilities_count": len(image.required_capabilities),
+            "required_modules_count": len(image.required_modules),
         }
     raise SystemExit(f"unknown images command: {command}")
 

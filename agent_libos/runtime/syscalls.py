@@ -841,6 +841,7 @@ class LibOSSyscallSession:
             "artifact_id": image.boot.get("artifact_id"),
             "artifact_sha256": image.boot.get("artifact_sha256"),
             "required_capabilities_count": len(image.required_capabilities),
+            "required_modules_count": len(image.required_modules),
         }
 
     def _string_list_arg(self, args: dict[str, Any], key: str) -> list[str]:

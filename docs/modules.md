@@ -10,16 +10,18 @@ Modules are part of the host trusted computing base:
 
 - They run in the Python interpreter, not in the Deno/JIT sandbox.
 - They are loaded only from explicit manifests.
-- The entrypoint source file must match the manifest `sha256`.
+- The entrypoint source file, or its inferred Python source package, must match
+  the manifest `sha256`.
 - The `(module_id, source_sha256)` pair must be trusted by config or CLI.
 - Loading a module never grants filesystem, shell, Object Memory, human,
   process, checkpoint, Skill, image, or JSON-RPC capabilities to a process.
 - Import-string entrypoints are resolved to a concrete source file under the
-  manifest directory without importing package code, then that source file is
-  loaded fresh under an isolated module name so a previous `sys.modules` entry
-  cannot satisfy a newer trusted hash.
-- Module source files are hashed with a configured size limit
-  (`AgentLibOSConfig.modules.source_max_bytes`) before import.
+  manifest directory without importing package code, then trusted source bytes
+  are loaded fresh under an isolated module name so a previous `sys.modules`
+  entry cannot satisfy a newer trusted hash.
+- Module source files are hashed with a configured per-file size limit
+  (`AgentLibOSConfig.modules.source_max_bytes`) before import. Multi-file
+  package hashes also respect `package_max_bytes` and `max_package_files`.
 
 Use Skills when the model needs workflow instructions, tool visibility, or JIT
 tool candidates at runtime. Use Runtime Modules when the system owner wants to
@@ -43,7 +45,7 @@ provides:
   provider_hooks: []
   startup_hooks:
     - initialize_example
-sha256: "<sha256 of example_module.py bytes>"
+sha256: "<sha256 of example_module.py bytes, or the inferred package digest>"
 metadata:
   owner: local
 ```
@@ -54,8 +56,23 @@ are resolved relative to the manifest directory; file entrypoints cannot escape
 that directory with `../`. Package import strings require each package parent to
 exist under the manifest directory with an `__init__.py`, which keeps manifest
 resolution from drifting to arbitrary installed packages. The package parents
-are not imported or executed by the module loader; the trusted hash covers the
-entrypoint source file.
+are not imported or executed by the module loader.
+
+If `sha256` matches the entrypoint source file bytes, the module is treated as a
+single-file module and loaded as before. If it does not match the entrypoint
+file, the loader infers a Python source package from the entrypoint, includes
+only `.py` files under that package root, sorts them by manifest-relative path,
+and compares the manifest `sha256` to that package digest. Multi-file modules
+are imported from the verified in-memory snapshot under a synthetic package
+name, so bundled helpers should use package-relative imports such as
+`from .helper import make_tool`. The manifest directory is not added to
+`sys.path`, and local helpers are not imported through their original absolute
+package name.
+
+The package reader rejects symlinks, hard links, non-regular files, path
+escapes, cache or VCS paths, and likely secret material. Run
+`uv run agent-libos modules verify <module.yaml>` after authoring a module to
+get the current `source_sha256` and the file list covered by the digest.
 
 YAML and JSON manifests both reject duplicate mapping keys. Treat duplicate-key
 errors as authoring bugs rather than relying on parser-specific overwrite
@@ -93,7 +110,12 @@ rolls back the newly loaded module.
 
 `ctx.register_image(image)` registers an `AgentImage` through the image
 primitive validation path. Image `required_capabilities` are applied only by
-normal process bootstrap rules and never by module loading itself.
+normal process bootstrap rules and never by module loading itself. Image
+`required_modules` can declare startup module prerequisites as
+`{module_id, source_sha256}` pairs; process spawn and exec fail closed unless
+the current runtime has already loaded those exact module ids and source
+hashes. The image declaration does not load modules and does not grant any
+process authority.
 
 `ctx.register_syscall(name, handler)` adds a module syscall to the syscall
 router. The handler receives the `LibOSSyscallSession` and syscall args. It
@@ -169,7 +191,7 @@ uv run agent-libos \
 ```
 
 The weaker `--trusted-module-sha256 <sha256>` trusts any module id with that
-source hash and is intended for local development only.
+entry-file or package digest and is intended for local development only.
 
 Every command that needs module-provided images, tools, or syscalls must pass
 the same startup module configuration, or use an application-level config that
@@ -187,3 +209,8 @@ Checkpoint snapshots record the currently loaded module summaries. Restore and
 fork fail if the current Python runtime has not loaded the same required module
 ids and source hashes. Checkpoint restore does not load Python modules and does
 not roll back the module environment.
+
+Checkpoint-committed AgentImages also copy those module summaries into image
+`required_modules`, so the committed image itself records the same startup
+module prerequisite. Use `modules verify <module.yaml>` to get the
+`source_sha256` value for hand-authored image manifests and packages.

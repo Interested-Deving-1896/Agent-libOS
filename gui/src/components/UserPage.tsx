@@ -2,6 +2,7 @@ import { AlertTriangle, Bot, Database, MessageSquare, Pause, Play, RefreshCw, Se
 import { useMemo, useState } from "react";
 import type { GuiConnection, HumanRequest, ImageSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import { useI18n } from "../i18n";
+import { parseOptionalQuanta } from "../quanta";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
 import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
@@ -15,18 +16,20 @@ type UserPageProps = {
   maxQuanta: number | null;
   spawnGoal: string;
   spawnImage: string;
+  spawnWorkingDirectory: string;
   message: string;
   images: ImageSummary[];
   onSelectPid(pid: string): void;
   onMaxQuantaChange(value: number | null): void;
   onSpawnGoalChange(value: string): void;
   onSpawnImageChange(value: string): void;
+  onSpawnWorkingDirectoryChange(value: string): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
   onImportImage(): void;
   onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
   onSend(kind: "message" | "interrupt"): void;
-  onRespond(request: HumanRequest, approved: boolean, answer?: string): void;
+  onRespond(request: HumanRequest, approved: boolean, answer?: string): Promise<boolean>;
   onRun(): void;
   onPause(): void;
   onRefresh(): void;
@@ -43,12 +46,14 @@ export function UserPage({
   maxQuanta,
   spawnGoal,
   spawnImage,
+  spawnWorkingDirectory,
   message,
   images,
   onSelectPid,
   onMaxQuantaChange,
   onSpawnGoalChange,
   onSpawnImageChange,
+  onSpawnWorkingDirectoryChange,
   onMessageChange,
   onSpawn,
   onImportImage,
@@ -64,6 +69,7 @@ export function UserPage({
 }: UserPageProps) {
   const { t } = useI18n();
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [submittingAnswers, setSubmittingAnswers] = useState<Record<string, boolean>>({});
   const [commitImageId, setCommitImageId] = useState("");
   const [commitName, setCommitName] = useState("");
   const [commitVersion, setCommitVersion] = useState("v0");
@@ -81,14 +87,26 @@ export function UserPage({
     setAnswers((current) => ({ ...current, [requestId]: value }));
   }
 
-  function submitAnswer(request: HumanRequest, approved: boolean) {
+  async function submitAnswer(request: HumanRequest, approved: boolean) {
+    if (submittingAnswers[request.request_id]) return;
     const answer = answerFor(request.request_id);
-    onRespond(request, approved, answer);
-    setAnswers((current) => {
-      const next = { ...current };
-      delete next[request.request_id];
-      return next;
-    });
+    setSubmittingAnswers((current) => ({ ...current, [request.request_id]: true }));
+    try {
+      const ok = await onRespond(request, approved, answer).catch(() => false);
+      if (ok) {
+        setAnswers((current) => {
+          const next = { ...current };
+          delete next[request.request_id];
+          return next;
+        });
+      }
+    } finally {
+      setSubmittingAnswers((current) => {
+        const next = { ...current };
+        delete next[request.request_id];
+        return next;
+      });
+    }
   }
 
   return (
@@ -176,6 +194,12 @@ export function UserPage({
         {!hasProcess ? (
           <section className="userStart">
             <h1>{t("user.startTask")}</h1>
+            <input
+              value={spawnWorkingDirectory}
+              onChange={(event) => onSpawnWorkingDirectoryChange(event.currentTarget.value)}
+              placeholder={t("user.initialCwdPlaceholder")}
+              aria-label={t("user.initialCwd")}
+            />
             <textarea value={spawnGoal} onChange={(event) => onSpawnGoalChange(event.currentTarget.value)} />
             <button className="primary" disabled={!spawnGoal.trim()} onClick={onSpawn}>{t("user.start")}</button>
           </section>
@@ -191,11 +215,11 @@ export function UserPage({
                   value={answerFor(request.request_id)}
                   onChange={(event) => updateAnswer(request.request_id, event.currentTarget.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") submitAnswer(request, true);
+                    if (event.key === "Enter") void submitAnswer(request, true);
                   }}
                 />
-                <button onClick={() => submitAnswer(request, true)}>{t("user.submit")}</button>
-                <button className="secondary" onClick={() => submitAnswer(request, false)}>{t("user.reject")}</button>
+                <button disabled={Boolean(submittingAnswers[request.request_id])} onClick={() => void submitAnswer(request, true)}>{t("user.submit")}</button>
+                <button disabled={Boolean(submittingAnswers[request.request_id])} className="secondary" onClick={() => void submitAnswer(request, false)}>{t("user.reject")}</button>
               </div>
             ))}
           </section>
@@ -230,12 +254,6 @@ export function UserPage({
   );
 }
 
-function parseOptionalQuanta(value: string): number | null {
-  if (value.trim() === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-}
-
 function ConversationBubble({ item }: { item: UserConversationItem }) {
   const { formatTime, t } = useI18n();
   if (item.role === "request") {
@@ -243,6 +261,16 @@ function ConversationBubble({ item }: { item: UserConversationItem }) {
       <article className="conversationBubble request">
         <span className="bubbleRole">{t("user.needsInput")}</span>
         <p>{humanRequestPrompt(item.request)}</p>
+        <time>{formatTime(item.time)}</time>
+      </article>
+    );
+  }
+  if (item.role === "decision") {
+    const fallback = item.status === "rejected" ? t("user.requestRejected") : t("user.requestApproved");
+    return (
+      <article className="conversationBubble user">
+        <span className="bubbleRole">{t("user.you")}</span>
+        <p>{item.text || fallback}</p>
         <time>{formatTime(item.time)}</time>
       </article>
     );

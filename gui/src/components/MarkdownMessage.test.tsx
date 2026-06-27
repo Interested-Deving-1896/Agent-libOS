@@ -85,18 +85,20 @@ describe("MarkdownMessage", () => {
           maxQuanta={null}
           spawnGoal="goal"
           spawnImage="coding-agent:v0"
+          spawnWorkingDirectory=""
           message=""
           images={[]}
           onSelectPid={() => undefined}
           onMaxQuantaChange={() => undefined}
           onSpawnGoalChange={() => undefined}
           onSpawnImageChange={() => undefined}
+          onSpawnWorkingDirectoryChange={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
           onImportImage={() => undefined}
           onCommitImage={() => undefined}
           onSend={() => undefined}
-          onRespond={() => undefined}
+          onRespond={async () => true}
           onRun={() => undefined}
           onPause={() => undefined}
           onRefresh={() => undefined}

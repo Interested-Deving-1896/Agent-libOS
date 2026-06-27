@@ -1,0 +1,69 @@
+import { describe, expect, it } from "vitest";
+import type { RuntimeSnapshot } from "./api/types";
+import { reconcileSelectedPid } from "./selection";
+
+describe("reconcileSelectedPid", () => {
+  it("preserves an existing selected process", () => {
+    expect(reconcileSelectedPid(snapshot(["pid_1", "pid_2"]), "pid_2")).toBe("pid_2");
+  });
+
+  it("falls back to the first process when selection is stale", () => {
+    expect(reconcileSelectedPid(snapshot(["pid_1", "pid_2"]), "missing")).toBe("pid_1");
+  });
+
+  it("resets selection when preserving is disabled", () => {
+    expect(reconcileSelectedPid(snapshot(["pid_1", "pid_2"]), "pid_2", { preserveExisting: false })).toBe("pid_1");
+  });
+
+  it("returns null when no process exists", () => {
+    expect(reconcileSelectedPid(snapshot([]), "pid_1")).toBeNull();
+  });
+});
+
+function snapshot(pids: string[]): RuntimeSnapshot {
+  return {
+    db: "local",
+    scheduler: {
+      auto_run: true,
+      running: false,
+      paused: false,
+      task_id: null,
+      reason: null,
+      last_result: [],
+      last_error: null,
+      started_at: null,
+      finished_at: null,
+      default_max_quanta: null
+    },
+    processes: pids.map((pid) => ({
+      pid,
+      parent_pid: null,
+      image_id: "coding-agent:v0",
+      llm_profile_id: "default",
+      status: "runnable",
+      goal_oid: null,
+      checkpoint_head: null,
+      working_directory: ".",
+      status_message: null,
+      loaded_skills: {},
+      tool_table: {},
+      capabilities: [],
+      terminal: false,
+      unread_message_count: 0,
+      interrupt_count: 0,
+      messages: [],
+      llm_call_count: 0,
+      token_total: 0
+    })),
+    human_requests: [],
+    events: [],
+    audit: [],
+    llm_calls: [],
+    object_tasks: [],
+    tools: [],
+    images: [],
+    skills: [],
+    jsonrpc_endpoints: [],
+    modules: []
+  };
+}

@@ -141,6 +141,11 @@ class LLMProfile:
     store: bool | None = None
     reasoning_effort: str | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
+    safety_identifier: str | None = None
+    safety_identifier_env: str | None = None
+    prompt_cache_key: str | None = None
+    prompt_cache_retention: Literal["in-memory", "24h"] | None = None
+    responses_previous_response_id: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     allow_custom_base_url: bool = False
@@ -156,6 +161,10 @@ class LLMDefaults:
     max_retries: int = 2
     api_mode: Literal["auto", "responses", "chat"] = "auto"
     store: bool = False
+    safety_identifier: str | None = None
+    prompt_cache_key: str | None = None
+    prompt_cache_retention: Literal["in-memory", "24h"] | None = None
+    responses_previous_response_id: bool = False
     compatibility_retry_attempts: int = 8
     action_repair_attempts: int = 2
     content_preview_chars: int = 500
@@ -337,6 +346,7 @@ class ImageDefaults:
     structured_field_hard_limit_bytes: int = 262_144
     max_default_tools: int = 128
     max_required_capabilities: int = 64
+    max_required_modules: int = 64
     package_manifest_name: str = "IMAGE.yaml"
     package_workspace_dir: str = "workspace"
     package_tools_dir: str = "tools"
@@ -447,6 +457,8 @@ class ModuleDefaults:
     manifest_max_bytes: int = 262_144
     manifest_hard_limit_bytes: int = 1_048_576
     source_max_bytes: int = 1_048_576
+    package_max_bytes: int = 8_388_608
+    max_package_files: int = 256
     load_policy: Literal["fail", "warn"] = "fail"
     discover_limit: int = 100
     id_max_chars: int = 128
@@ -615,10 +627,17 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         _require_non_empty(f"llm.profiles[{profile_id!r}].api_key_env", profile.api_key_env)
         if profile.api_mode is not None and profile.api_mode not in {"auto", "responses", "chat"}:
             raise ValueError(f"llm.profiles[{profile_id!r}].api_mode is not supported: {profile.api_mode}")
+        _optional_non_empty(f"llm.profiles[{profile_id!r}].safety_identifier", profile.safety_identifier)
+        _optional_max_chars(f"llm.profiles[{profile_id!r}].safety_identifier", profile.safety_identifier, 64)
+        _optional_non_empty(f"llm.profiles[{profile_id!r}].safety_identifier_env", profile.safety_identifier_env)
+        _optional_non_empty(f"llm.profiles[{profile_id!r}].prompt_cache_key", profile.prompt_cache_key)
         _positive_optional(f"llm.profiles[{profile_id!r}].timeout_s", profile.timeout_s)
         _nonnegative_optional(f"llm.profiles[{profile_id!r}].max_retries", profile.max_retries)
         _nonnegative_optional(f"llm.profiles[{profile_id!r}].temperature", profile.temperature)
         _positive_optional(f"llm.profiles[{profile_id!r}].max_tokens", profile.max_tokens)
+    _optional_non_empty("llm.safety_identifier", llm.safety_identifier)
+    _optional_max_chars("llm.safety_identifier", llm.safety_identifier, 64)
+    _optional_non_empty("llm.prompt_cache_key", llm.prompt_cache_key)
     _nonnegative("llm.temperature", llm.temperature)
     _positive("llm.max_tokens", llm.max_tokens)
     _positive("llm.timeout_s", llm.timeout_s)
@@ -744,6 +763,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "structured_field_hard_limit_bytes",
         "max_default_tools",
         "max_required_capabilities",
+        "max_required_modules",
         "package_manifest_name",
         "package_workspace_dir",
         "package_tools_dir",
@@ -829,6 +849,8 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "manifest_max_bytes",
         "manifest_hard_limit_bytes",
         "source_max_bytes",
+        "package_max_bytes",
+        "max_package_files",
         "discover_limit",
         "id_max_chars",
         "name_max_chars",
@@ -845,6 +867,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_non_empty_items("modules.trusted_modules", modules.trusted_modules)
     _require_non_empty_items("modules.trusted_sha256", modules.trusted_sha256)
     _require_at_least("modules.manifest_hard_limit_bytes", modules.manifest_hard_limit_bytes, "modules.manifest_max_bytes", modules.manifest_max_bytes)
+    _require_at_least("modules.package_max_bytes", modules.package_max_bytes, "modules.source_max_bytes", modules.source_max_bytes)
 
     launcher = config.launcher
     _require_non_empty_items("launcher.permission_presets", launcher.permission_presets)
@@ -927,6 +950,16 @@ def _require_number(name: str, value: object) -> None:
 def _require_non_empty(name: str, value: object) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+
+
+def _optional_non_empty(name: str, value: object | None) -> None:
+    if value is not None:
+        _require_non_empty(name, value)
+
+
+def _optional_max_chars(name: str, value: object | None, max_chars: int) -> None:
+    if value is not None and isinstance(value, str) and len(value) > max_chars:
+        raise ValueError(f"{name} must be at most {max_chars} characters")
 
 
 def _require_non_empty_items(name: str, values: tuple[str, ...]) -> None:

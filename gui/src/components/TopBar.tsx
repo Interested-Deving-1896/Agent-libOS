@@ -1,6 +1,7 @@
 import { Database, Pause, Play, RefreshCw, Square, StepForward } from "lucide-react";
 import type { SchedulerStatus } from "../api/types";
 import { useI18n } from "../i18n";
+import { parseOptionalQuanta } from "../quanta";
 import { LanguageSwitch } from "./LanguageSwitch";
 
 export function TopBar({
@@ -71,10 +72,4 @@ export function TopBar({
       <span className={`scheduler ${scheduler?.running ? "running" : ""}`}><Square size={11} />{scheduler?.running ? t("top.running") : scheduler?.paused ? t("top.paused") : t("top.idle")}</span>
     </header>
   );
-}
-
-function parseOptionalQuanta(value: string): number | null {
-  if (value.trim() === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }

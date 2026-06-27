@@ -45,6 +45,7 @@ from agent_libos.utils.serde import dumps, loads
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _IMAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _WINDOWS_FORBIDDEN_PATH_CHARS = set('<>:"|?*')
 _WINDOWS_RESERVED_PATH_NAMES = {
     "CON",
@@ -107,6 +108,7 @@ class ImageRegistryPrimitive:
         "safety_profile",
         "llm_profile_id",
         "required_capabilities",
+        "required_modules",
         "metadata",
         "signature",
         "boot",
@@ -178,6 +180,7 @@ class ImageRegistryPrimitive:
                 "version": candidate.version,
                 "default_tools": list(candidate.default_tools),
                 "required_capabilities": len(candidate.required_capabilities),
+                "required_modules": len(candidate.required_modules),
                 "replaced": existing is not None,
                 "source": source,
                 "boot_kind": candidate.boot.get("kind", "fresh"),
@@ -271,6 +274,7 @@ class ImageRegistryPrimitive:
             safety_profile=image.safety_profile,
             llm_profile_id=image.llm_profile_id,
             required_capabilities=list(image.required_capabilities),
+            required_modules=list(image.required_modules),
             metadata={
                 **dict(image.metadata),
                 "package_sha256": artifact["package_sha256"],
@@ -304,6 +308,7 @@ class ImageRegistryPrimitive:
                     "artifact_bytes": artifact_bytes,
                     "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
                     "jit_tools": len(artifact.get("jit_tools", [])),
+                    "required_modules": len(image.required_modules),
                 },
             )
         result = self.register(
@@ -325,6 +330,7 @@ class ImageRegistryPrimitive:
                 "files": artifact.get("counts", {}).get("files", 0),
                 "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
                 "jit_tools": len(artifact.get("jit_tools", [])),
+                "required_modules": len(image.required_modules),
                 "jit_tool_exposure": image.jit_tool_exposure,
                 "replaced": result.replaced,
             },
@@ -341,6 +347,7 @@ class ImageRegistryPrimitive:
             "jit_tool_exposure": image.jit_tool_exposure,
             "default_tools": list(image.default_tools),
             "default_skills": list(image.default_skills),
+            "required_modules": list(image.required_modules),
             "jit_tools": [tool["name"] for tool in artifact.get("jit_tools", [])],
             "workspace": artifact.get("workspace", {}),
             "counts": artifact.get("counts", {}),
@@ -600,6 +607,7 @@ class ImageRegistryPrimitive:
             safety_profile=self._optional_string(image_data.get("safety_profile"), "safety_profile") or "default",
             llm_profile_id=self._optional_string(image_data.get("llm_profile"), "llm_profile"),
             required_capabilities=self._capability_specs(image_data.get("required_capabilities")),
+            required_modules=self._module_specs(image_data.get("required_modules")),
             metadata=self._mapping(image_data.get("metadata"), "metadata"),
             signature=self._optional_string(image_data.get("signature"), "signature"),
             boot={"kind": "fresh"},
@@ -619,6 +627,7 @@ class ImageRegistryPrimitive:
             "package_sha256": package_sha256,
             "manifest_path": manifest_name,
             "prompt_path": prompt_path,
+            "required_modules": list(image.required_modules),
             "files": file_records,
             "jit_tools": [self._jit_tool_to_artifact(tool) for tool in jit_tools],
             "workspace": workspace,
@@ -647,6 +656,7 @@ class ImageRegistryPrimitive:
             "safety_profile",
             "llm_profile",
             "required_capabilities",
+            "required_modules",
             "metadata",
             "signature",
             "jit_tools",
@@ -1011,6 +1021,7 @@ class ImageRegistryPrimitive:
                         "package_sha256": artifact_data.get("package_sha256"),
                         "counts": artifact_data.get("counts", {}),
                         "workspace": artifact_data.get("workspace", {}),
+                        "required_modules": artifact_data.get("required_modules", []),
                         "jit_tools": [tool.get("name") for tool in artifact_data.get("jit_tools", [])],
                     }
         return {
@@ -1094,6 +1105,7 @@ class ImageRegistryPrimitive:
             safety_profile=source_image.safety_profile if source_image is not None else "default",
             llm_profile_id=source_image.llm_profile_id if source_image is not None else None,
             required_capabilities=self._dedupe_capability_specs(artifact.get("required_capabilities", [])),
+            required_modules=self._module_specs(artifact.get("modules", [])),
             metadata={
                 **(metadata or {}),
                 "committed_from_checkpoint": checkpoint_id,
@@ -1141,6 +1153,7 @@ class ImageRegistryPrimitive:
                 "artifact_sha256": artifact_sha256,
                 "artifact_bytes": artifact_bytes,
                 "required_capabilities": len(image.required_capabilities),
+                "required_modules": len(image.required_modules),
             },
         )
         return result
@@ -1193,6 +1206,7 @@ class ImageRegistryPrimitive:
             safety_profile=self._optional_string(image.get("safety_profile"), "safety_profile") or "default",
             llm_profile_id=self._optional_string(image.get("llm_profile_id"), "llm_profile_id"),
             required_capabilities=self._capability_specs(image.get("required_capabilities")),
+            required_modules=self._module_specs(image.get("required_modules")),
             metadata=self._mapping(image.get("metadata"), "metadata"),
             signature=self._optional_string(image.get("signature"), "signature"),
             boot=self._boot_mapping(image.get("boot")),
@@ -1232,6 +1246,11 @@ class ImageRegistryPrimitive:
                 "required_capabilities exceeds "
                 f"max_required_capabilities={self.config.image.max_required_capabilities}"
             )
+        if len(image.required_modules) > self.config.image.max_required_modules:
+            raise ValidationError(
+                "required_modules exceeds "
+                f"max_required_modules={self.config.image.max_required_modules}"
+            )
         for skill_id in image.default_skills:
             self._validate_identifier(skill_id, "default_skills[]", self.config.skills.id_max_chars)
         for tool_name in image.default_tools:
@@ -1244,6 +1263,7 @@ class ImageRegistryPrimitive:
                 raise ValidationError(f"unknown tool in AgentImage default_tools: {tool_name}") from exc
         for spec in image.required_capabilities:
             self._validate_capability_spec(spec)
+        self._validate_module_specs(image.required_modules)
         self._validate_boot(image.boot)
 
     def _validate_identifier(self, value: str, field: str, max_chars: int) -> None:
@@ -1347,6 +1367,24 @@ class ImageRegistryPrimitive:
             specs.append(normalized)
         return specs
 
+    def _module_specs(self, value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValidationError("required_modules must be a list")
+        specs: list[dict[str, Any]] = []
+        for spec in value:
+            if not isinstance(spec, dict):
+                raise ValidationError("required_modules entries must be mappings")
+            normalized = {
+                "module_id": self._require_string(spec.get("module_id"), "required_modules[].module_id"),
+                "source_sha256": self._require_string(spec.get("source_sha256"), "required_modules[].source_sha256").lower(),
+            }
+            self._validate_module_spec(normalized)
+            specs.append(normalized)
+        self._validate_module_specs(specs)
+        return specs
+
     def _validate_capability_spec(self, spec: dict[str, Any]) -> None:
         resource = spec.get("resource")
         if not isinstance(resource, str) or not resource:
@@ -1366,6 +1404,26 @@ class ImageRegistryPrimitive:
         constraints = spec.get("constraints")
         if constraints is not None and not isinstance(constraints, dict):
             raise ValidationError("capability spec constraints must be a mapping")
+
+    def _validate_module_specs(self, specs: list[dict[str, Any]]) -> None:
+        seen: set[str] = set()
+        for spec in specs:
+            self._validate_module_spec(spec)
+            module_id = str(spec["module_id"])
+            if module_id in seen:
+                raise ValidationError(f"duplicate required module: {module_id}")
+            seen.add(module_id)
+
+    def _validate_module_spec(self, spec: dict[str, Any]) -> None:
+        module_id = spec.get("module_id")
+        source_sha256 = spec.get("source_sha256")
+        if not isinstance(module_id, str) or not module_id:
+            raise ValidationError("module spec requires a non-empty module_id")
+        self._validate_identifier(module_id, "required_modules[].module_id", self.config.modules.id_max_chars)
+        if not isinstance(source_sha256, str) or not source_sha256:
+            raise ValidationError("module spec requires a non-empty source_sha256")
+        if not _SHA256_PATTERN.fullmatch(source_sha256):
+            raise ValidationError("required_modules[].source_sha256 must be a 64-character hex sha256")
 
     def _build_commit_artifact(self, snapshot: dict[str, Any], *, checkpoint_id: str) -> dict[str, Any]:
         source_pid = str(snapshot["pid"])
@@ -1463,6 +1521,7 @@ class ImageRegistryPrimitive:
                 "required_capabilities": len(required_capabilities),
                 "tools": len(tool_table),
                 "jit_sources": len(jit_sources),
+                "modules": len(snapshot.get("modules", [])),
             },
         }
 
@@ -1578,6 +1637,7 @@ class ImageRegistryPrimitive:
             "safety_profile": image.safety_profile,
             "llm_profile_id": image.llm_profile_id,
             "required_capabilities": list(image.required_capabilities),
+            "required_modules": list(image.required_modules),
             "metadata": dict(image.metadata),
             "signature": image.signature,
             "boot": dict(image.boot),
@@ -1595,5 +1655,6 @@ class ImageRegistryPrimitive:
             "default_tools": list(image.default_tools),
             "default_skills": list(image.default_skills),
             "required_capabilities_count": len(image.required_capabilities),
+            "required_modules_count": len(image.required_modules),
             **metadata,
         }

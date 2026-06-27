@@ -1,0 +1,5 @@
+modules:
+  manifest_paths:
+    - modules/pty/module.yaml
+  trusted_modules:
+    - agent-libos-pty:v0:19a986a1e20a4f2b91abbcbf3056d7ceeecefbe5cc0db9e68b4d173efdaf4b63

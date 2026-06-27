@@ -14,6 +14,35 @@ in-memory. A filesystem path creates or opens a persistent SQLite database.
 uv run agent-libos --db .agent_libos.sqlite <command>
 ```
 
+## Configuration File
+
+`agent-libos` and `agent-libos-gui-server` read `config.yaml` from the current
+working directory when it exists. Pass `--config <path>` before the command name
+to use an explicit YAML overlay instead:
+
+```bash
+uv run agent-libos --config ./agent-config.yaml spawn --goal "Inspect README.md"
+```
+
+The file is a strict overlay on `agent_libos.config.DEFAULT_CONFIG`. Mapping
+fields are merged recursively, so adding `llm.profiles.coding` keeps the default
+profile. Scalar fields and list/tuple fields replace the default value. Unknown
+fields, invalid types, and unsafe numeric limits fail at startup.
+
+```yaml
+runtime:
+  local_store_target: .agent_libos.sqlite
+  run_until_idle_max_quanta: 10
+llm:
+  default_profile_id: coding
+  profiles:
+    coding:
+      model: gpt-4.1
+```
+
+Explicit CLI options still win over config defaults. For example `--db` uses the
+configured `runtime.local_store_target` only when `--db` is omitted.
+
 Use `--module-manifest` and `--trusted-module` before the command name to load
 trusted Runtime Modules before the runtime is used:
 
@@ -23,6 +52,9 @@ uv run agent-libos --db .agent_libos.sqlite \
   --trusted-module agent-libos-pty:v0:<source_sha256> \
   <command>
 ```
+
+For multi-file modules, `<source_sha256>` is the package digest reported by
+`modules verify`; for single-file modules it is the entrypoint file hash.
 
 ## Top-Level Commands
 
@@ -165,6 +197,10 @@ bounded observability envelopes for prompts, visible tools, output, tool calls,
 reasoning, and raw responses. The envelopes contain preview, byte count, hash,
 and truncation metadata; raw prompt and provider payloads are not persisted by
 default.
+For OpenAI Responses requests, request options may show strict tool-schema
+counts, whether prompt-cache or safety identifiers were configured, and any
+non-secret `previous_response_id` chain; configured cache keys and safety
+identifier values are not persisted there.
 Set `config.llm.persist_full_io=True` only when the operator explicitly wants
 complete LLM input/output persistence in SQLite for debugging or forensics.
 
@@ -244,7 +280,9 @@ Useful exec options:
 
 Exec never grants target-image `required_capabilities` automatically. If the
 target is an image package, its `workspace/` seed is materialized into a private
-per-process directory under `agent_outputs/image_workspaces/`.
+per-process directory under `agent_outputs/image_workspaces/`. For any target
+image, `required_modules` are checked before boot; the runtime must already
+have loaded each declared `(module_id, source_sha256)` pair.
 
 Exit accepts either `--payload` or `--result-oid`, not both. Non-JSON payload
 text is wrapped as `{"content": "<text>"}`.
@@ -278,6 +316,9 @@ llm_profile: review-fast
 default_tools:
   - read_memory_object
   - human_output
+required_modules:
+  - module_id: example-module:v0
+    source_sha256: "<source_sha256 from modules verify>"
 jit_tools: tools/jit-tools.json
 workspace:
   source: workspace
@@ -306,6 +347,12 @@ names or schemas into prompt context.
 root process is spawned from the image. It is only an id; provider API keys stay
 in the host environment and are not packaged into the image.
 
+`required_modules` is optional. Each entry must contain a `module_id` and the
+64-character lowercase `source_sha256` reported by
+`uv run agent-libos modules verify <module.yaml>`. Spawn and exec check that
+the current runtime has already loaded the exact trusted module source; image
+boot never loads modules automatically.
+
 `default_tools` is exact. The runtime does not add `process_exit`,
 `create_memory_object`, or any other builtin automatically. List every
 LLM-facing builtin the image should be able to call; package JIT tools can still
@@ -327,7 +374,9 @@ owner root process. It captures internal Object Memory, loaded Skills,
 process-local JIT tools, tool visibility, and cwd. It does not package
 filesystem/provider state. External capabilities from the checkpoint are stored
 as `required_capabilities` declarations and are not granted automatically when
-the committed image is spawned or execed.
+the committed image is spawned or execed. Loaded startup module summaries from
+the checkpoint are copied into the committed image's `required_modules`, so the
+image cannot boot unless those same module sources are loaded again.
 
 Passing `--actor-pid <pid>` makes the CLI enforce that process's checkpoint
 read and image write capabilities. Without it, the command runs as audited
@@ -424,8 +473,10 @@ uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module
 ```
 
 `modules verify` resolves the entrypoint and computes the source hash without
-loading the module. `modules list` and `modules inspect` show persisted module
-load records for the opened runtime database.
+loading the module. For single-file modules this is the entry file hash; for
+multi-file modules it is the inferred Python source package digest and includes
+the covered `source_files` list. `modules list` and `modules inspect` show
+persisted module load records for the opened runtime database.
 
 ## Benchmark Scripts
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.llm.client import LLMCompletion
+from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
 from agent_libos.models import (
     AgentImage,
@@ -396,6 +396,72 @@ class TestLLMContextMemory:
                 assert persisted.raw_response['provider'] == 'fake'
             finally:
                 reopened.close()
+
+    def test_openai_responses_state_chaining_is_opt_in_and_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            config = replace(
+                DEFAULT_CONFIG,
+                llm=replace(
+                    DEFAULT_CONFIG.llm,
+                    store=True,
+                    responses_previous_response_id=True,
+                    safety_identifier='safe-session',
+                    prompt_cache_key='cache-secret',
+                    prompt_cache_retention='24h',
+                ),
+            )
+            client = LLMClient(
+                model='gpt-test',
+                api_key='key',
+                api_mode='responses',
+                store=True,
+                responses_previous_response_id=True,
+                safety_identifier='safe-session',
+                prompt_cache_key='cache-secret',
+                prompt_cache_retention='24h',
+                defaults=config.llm,
+            )
+            fake = FakeAsyncOpenAIResponses(
+                [
+                    _responses_tool_call(
+                        'resp_first',
+                        'create_memory_object',
+                        {'type': 'note', 'name': 'step', 'payload': {'ok': True}},
+                    ),
+                    _responses_tool_call('resp_second', 'process_exit', {'payload': {'done': True}}),
+                ]
+            )
+            client._async_client = fake
+            runtime = Runtime.open(db, config=config)
+            try:
+                runtime.llm.client = client
+                pid = runtime.process.spawn(image='base-agent:v0', goal='chain responses state')
+                first = runtime.run_next_process_once()
+                second = runtime.run_next_process_once()
+
+                assert first['action']['action'] == 'create_memory_object'
+                assert second['action']['action'] == 'process_exit'
+                assert 'previous_response_id' not in fake.responses.payloads[0]
+                assert fake.responses.payloads[1]['previous_response_id'] == 'resp_first'
+                assert fake.responses.payloads[0]['safety_identifier'] == 'safe-session'
+                assert fake.responses.payloads[0]['prompt_cache_key'] == 'cache-secret'
+                assert fake.responses.payloads[0]['prompt_cache_retention'] == '24h'
+
+                calls = runtime.store.list_llm_calls(pid)
+                assert [call.response_id for call in calls] == ['resp_first', 'resp_second']
+                assert calls[0].request_options['openai_responses_previous_response_id_enabled'] is True
+                assert calls[0].request_options['openai_previous_response_id'] is None
+                assert calls[1].request_options['openai_previous_response_id'] == 'resp_first'
+                assert calls[0].request_options['openai_prompt_cache_key_configured'] is True
+                assert calls[0].request_options['openai_safety_identifier_configured'] is True
+                assert calls[0].request_options['openai_prompt_cache_retention'] == '24h'
+                assert calls[0].request_options['openai_tool_schema']['strict'] > 0
+                serialized_options = json.dumps([call.request_options for call in calls], sort_keys=True)
+                assert 'cache-secret' not in serialized_options
+                assert 'safe-session' not in serialized_options
+            finally:
+                runtime.close()
 
     def test_pending_human_llm_action_survives_runtime_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -816,6 +882,40 @@ class ExplodingClient:
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         raise AssertionError('LLM client should not be called when the process image is missing')
+
+
+class FakeAsyncOpenAIResponses:
+    def __init__(self, responses: list[Any]):
+        self.responses = SequencedResponses(responses)
+
+
+class SequencedResponses:
+    def __init__(self, responses: list[Any]):
+        self.responses = list(responses)
+        self.payloads: list[dict[str, Any]] = []
+
+    async def create(self, **payload: Any) -> Any:
+        self.payloads.append(payload)
+        return self.responses.pop(0)
+
+
+def _responses_tool_call(response_id: str, name: str, arguments: dict[str, Any]) -> Any:
+    return SimpleNamespace(
+        id=response_id,
+        _request_id=f'req_{response_id}',
+        model='gpt-test',
+        usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+        output_text='',
+        output=[
+            SimpleNamespace(
+                type='function_call',
+                id=f'fc_{response_id}',
+                call_id=f'call_{response_id}',
+                name=name,
+                arguments=json.dumps(arguments),
+            )
+        ],
+    )
 
 
 def _compact_summary(goal: str) -> dict[str, Any]:

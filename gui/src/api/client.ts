@@ -1,7 +1,7 @@
 import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
+import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
-export type OptionalQuanta = number | null;
 
 export class LibOSClient {
   constructor(private connection: GuiConnection) {}
@@ -80,11 +80,24 @@ export class LibOSClient {
     return this.request("POST", "/api/scheduler/pause", {});
   }
 
-  async spawn(goal: string, image: string, maxQuanta: OptionalQuanta, autoRun: boolean, llmProfile?: string) {
+  async spawn(
+    goal: string,
+    image: string,
+    maxQuanta: OptionalQuanta,
+    autoRun: boolean,
+    options: { llmProfile?: string; workingDirectory?: string } = {}
+  ) {
+    const workingDirectory = options.workingDirectory?.trim();
     return this.request(
       "POST",
       "/api/processes",
-      withOptionalQuanta({ goal, image, auto_run: autoRun, ...(llmProfile ? { llm_profile: llmProfile } : {}) }, maxQuanta)
+      withOptionalQuanta({
+        goal,
+        image,
+        auto_run: autoRun,
+        ...(options.llmProfile ? { llm_profile: options.llmProfile } : {}),
+        ...(workingDirectory ? { working_directory: workingDirectory } : {})
+      }, maxQuanta)
     );
   }
 
@@ -243,26 +256,26 @@ export class LibOSClient {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/cd`, { path });
   }
 
-  async execProcess(pid: string, image: string, goal: string, confirmed: boolean, autoRun: boolean, llmProfile?: string) {
-    return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/exec`, {
+  async execProcess(pid: string, image: string, goal: string, confirmed: boolean, autoRun: boolean, maxQuanta: OptionalQuanta, llmProfile?: string) {
+    return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/exec`, withOptionalQuanta({
       image,
       goal,
       confirmed,
       auto_run: autoRun,
       ...(llmProfile ? { llm_profile: llmProfile } : {})
-    });
+    }, maxQuanta));
   }
 
   async exitProcess(pid: string, message: string, failed: boolean, confirmed: boolean) {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/exit`, { message, failed, confirmed });
   }
 
-  async respondHumanRequest(requestId: string, approved: boolean, answer: string) {
-    return this.request("POST", `/api/human-requests/${encodeURIComponent(requestId)}/respond`, {
+  async respondHumanRequest(requestId: string, approved: boolean, answer: string, autoRun: boolean, maxQuanta: OptionalQuanta) {
+    return this.request("POST", `/api/human-requests/${encodeURIComponent(requestId)}/respond`, withOptionalQuanta({
       approved,
       answer,
-      auto_run: true
-    });
+      auto_run: autoRun
+    }, maxQuanta));
   }
 
   async request<T = unknown>(method: string, path: string, body?: JsonBody): Promise<T> {
@@ -286,26 +299,48 @@ export class LibOSClient {
   }
 
   async stream(onMessage: (message: SseMessage) => void, signal: AbortSignal, cursor = "0") {
+    let nextCursor = cursor;
+    while (!signal.aborted) {
+      try {
+        nextCursor = await this.readStreamUntilClosed(onMessage, signal, nextCursor);
+      } catch (error) {
+        if (signal.aborted) return;
+        if (error instanceof SseHttpError) throw error;
+      }
+      await waitForReconnect(signal);
+    }
+  }
+
+  private async readStreamUntilClosed(onMessage: (message: SseMessage) => void, signal: AbortSignal, cursor: string) {
     const response = await fetch(`${this.connection.url}/api/events/stream?cursor=${encodeURIComponent(cursor)}`, {
       headers: { Authorization: `Bearer ${this.connection.token}` },
       signal
     });
-    if (!response.ok || !response.body) throw new Error(`SSE connection failed: ${response.status}`);
+    if (!response.ok || !response.body) throw new SseHttpError(response.status);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    while (!signal.aborted) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const frame = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const parsed = parseSseFrame(frame);
-        if (parsed) onMessage(parsed);
-        boundary = buffer.indexOf("\n\n");
+    let nextCursor = cursor;
+    try {
+      while (!signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const parsed = parseSseFrame(frame);
+          if (parsed) {
+            if (parsed.id) nextCursor = parsed.id;
+            onMessage(parsed);
+          }
+          boundary = buffer.indexOf("\n\n");
+        }
       }
+      return nextCursor;
+    } finally {
+      reader.releaseLock();
     }
   }
 }
@@ -326,5 +361,28 @@ export function parseSseFrame(frame: string): SseMessage | null {
     if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
   }
   if (data.length === 0) return { id, event, data: null };
-  return { id, event, data: JSON.parse(data.join("\n")) };
+  try {
+    return { id, event, data: JSON.parse(data.join("\n")) };
+  } catch {
+    return null;
+  }
+}
+
+function waitForReconnect(signal: AbortSignal, delayMs = 500): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, delayMs);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+class SseHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`SSE connection failed: ${status}`);
+  }
 }

@@ -26,6 +26,16 @@ class ModuleManifest:
 
 
 @dataclass(frozen=True)
+class ModuleSourceFile:
+    path: str
+    module_path: str
+    absolute_path: str
+    size_bytes: int
+    sha256: str
+    content: bytes = b""
+
+
+@dataclass(frozen=True)
 class ModuleSource:
     manifest: ModuleManifest
     manifest_path: str
@@ -34,6 +44,9 @@ class ModuleSource:
     source_sha256: str
     entrypoint_object: str
     source_bytes: bytes = b""
+    source_kind: str = "file"
+    source_root: str = ""
+    source_files: tuple[ModuleSourceFile, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

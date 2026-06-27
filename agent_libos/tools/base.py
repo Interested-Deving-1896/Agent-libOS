@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Generic, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.llm.openai_schema import openai_chat_tool_schema
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -161,14 +162,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
 
     def to_openai_chat_tool(self, *, config: AgentLibOSConfig | None = None) -> dict[str, Any]:
         spec = self.spec(config=config)
-        return {
-            "type": "function",
-            "function": {
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.input_schema,
-            },
-        }
+        return openai_chat_tool_schema(spec.name, spec.description, spec.input_schema)
 
     def to_mcp_tool(self, *, config: AgentLibOSConfig | None = None) -> dict[str, Any]:
         spec = self.spec(config=config)

@@ -81,6 +81,21 @@ class TestImageRegistration:
         finally:
             runtime.close()
 
+    def test_register_image_rejects_invalid_required_module_spec(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(ValidationError, match='source_sha256'):
+                runtime.register_image(
+                    {
+                        'image_id': 'bad-module-image:v0',
+                        'name': 'bad-module-image',
+                        'required_modules': [{'module_id': 'module:v0', 'source_sha256': 'not-a-sha'}],
+                    },
+                    actor='cli',
+                )
+        finally:
+            runtime.close()
+
     def test_register_image_rejects_unknown_jit_tool_exposure(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -159,6 +174,23 @@ class TestImageRegistration:
                 assert image.metadata['role'] == 'test'
                 assert image.metadata['package_kind'] == 'image_package'
                 assert package.exists()
+            finally:
+                runtime.close()
+
+    def test_image_package_required_modules_round_trips_and_boot_requires_loaded_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            required_module = {'module_id': 'missing-module:v0', 'source_sha256': '0' * 64}
+            _write_image_package(Path(temp_dir) / 'package-agent', required_modules=[required_module])
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                result = runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                inspected = runtime.image_registry.inspect('package-agent:v0')
+
+                assert result.image.required_modules == [required_module]
+                assert inspected['image']['required_modules'] == [required_module]
+                assert inspected['artifact']['required_modules'] == [required_module]
+                with pytest.raises(ValidationError, match='image requires startup modules'):
+                    runtime.process.spawn(image='package-agent:v0', goal='missing module')
             finally:
                 runtime.close()
 
@@ -579,6 +611,7 @@ def _write_image_package(
     prompt_mode: str | None = None,
     jit_tool_exposure: str | None = None,
     llm_profile: str | None = None,
+    required_modules: list[dict[str, str]] | None = None,
 ) -> Path:
     root.mkdir(parents=True)
     grants = """
@@ -591,12 +624,19 @@ def _write_image_package(
     prompt_mode_line = f"prompt_mode: {prompt_mode}\n" if prompt_mode else ""
     jit_tool_exposure_line = f"jit_tool_exposure: {jit_tool_exposure}\n" if jit_tool_exposure else ""
     llm_profile_line = f"llm_profile: {llm_profile}\n" if llm_profile else ""
+    required_modules_block = ""
+    if required_modules:
+        lines = ["required_modules:"]
+        for module in required_modules:
+            lines.append(f"  - module_id: {module['module_id']}")
+            lines.append(f"    source_sha256: \"{module['source_sha256']}\"")
+        required_modules_block = "\n".join(lines) + "\n"
     root.joinpath('IMAGE.yaml').write_text(f"""
 image_id: package-agent:v0
 name: package-agent
 version: v0
 prompt: prompt.md
-{prompt_mode_line}{jit_tool_exposure_line}{llm_profile_line}default_tools:
+{prompt_mode_line}{jit_tool_exposure_line}{llm_profile_line}{required_modules_block}default_tools:
   - human_output
   - read_memory_object
 context_policy: evidence_first

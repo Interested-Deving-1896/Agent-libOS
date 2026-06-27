@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -13,6 +14,7 @@ from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.api.cli import main as cli_main
+from agent_libos.models import AgentImage
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.runtime.syscalls import LibOSSyscallSession
@@ -39,6 +41,68 @@ class TestRuntimeModule:
                 syscall_result = asyncio.run(LibOSSyscallSession(runtime, pid).handle('module.ping', {'value': 'ok'}))
                 assert syscall_result['value'] == 'ok'
                 assert syscall_result['pid'] == pid
+            finally:
+                runtime.close()
+
+    def test_image_required_modules_rejects_spawn_when_module_is_not_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _manifest, source_sha = _write_module(Path(temp_dir))
+            runtime = Runtime.open()
+            try:
+                runtime.register_image(
+                    AgentImage(
+                        image_id='needs-module:v0',
+                        name='needs-module',
+                        required_modules=[{'module_id': 'test-module:v0', 'source_sha256': source_sha}],
+                    ),
+                    actor='cli',
+                )
+
+                with pytest.raises(ValidationError, match='image requires startup modules'):
+                    runtime.process.spawn(image='needs-module:v0', goal='blocked')
+            finally:
+                runtime.close()
+
+    def test_image_required_modules_allows_spawn_when_module_hash_is_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            try:
+                runtime.register_image(
+                    AgentImage(
+                        image_id='needs-module:v0',
+                        name='needs-module',
+                        default_tools=['module_echo'],
+                        required_modules=[{'module_id': 'test-module:v0', 'source_sha256': source_sha}],
+                    ),
+                    actor='cli',
+                )
+
+                pid = runtime.process.spawn(image='needs-module:v0', goal='allowed')
+                result = runtime.tools.call(pid, 'module_echo', {'text': 'hello'})
+                assert result.ok
+                assert result.payload['echo'] == 'hello'
+            finally:
+                runtime.close()
+
+    def test_image_required_modules_rejects_loaded_module_with_different_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            try:
+                runtime.register_image(
+                    AgentImage(
+                        image_id='needs-other-module:v0',
+                        name='needs-other-module',
+                        required_modules=[{'module_id': 'test-module:v0', 'source_sha256': '1' * 64}],
+                    ),
+                    actor='cli',
+                )
+
+                with pytest.raises(ValidationError, match='image requires startup modules'):
+                    runtime.process.spawn(image='needs-other-module:v0', goal='wrong hash')
             finally:
                 runtime.close()
 
@@ -215,6 +279,117 @@ sha256: {source_sha}
 
             assert not sentinel.exists()
 
+    def test_multifile_module_package_relative_import_registers_runtime_surfaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_multifile_module(root)
+            verified = ModuleLoader().verify(manifest)
+            assert verified['source_kind'] == 'package'
+            assert verified['source_sha256'] == package_sha
+            assert [item['path'] for item in verified['source_files']] == [
+                'pkg/__init__.py',
+                'pkg/helper.py',
+                'pkg/main.py',
+            ]
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+            try:
+                loaded = runtime.modules.inspect_module('multi-module:v0')
+                assert loaded['status'] == 'loaded'
+                assert loaded['source_sha256'] == package_sha
+                pid = runtime.process.spawn(image='multi-agent:v0', goal='multi module')
+                result = runtime.tools.call(pid, 'multi_echo', {'text': 'hello'})
+                assert result.ok
+                assert result.payload['helper_marker'] == 'helper-v1'
+                syscall_result = asyncio.run(LibOSSyscallSession(runtime, pid).handle('multi.ping', {'value': 'ok'}))
+                assert syscall_result['helper_marker'] == 'helper-v1'
+            finally:
+                runtime.close()
+
+    def test_multifile_module_helper_change_rejects_old_package_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_multifile_module(root)
+            (root / 'pkg' / 'helper.py').write_text("HELPER_MARKER = 'helper-v2'\n", encoding='utf-8')
+            with pytest.raises(ValidationError, match='source sha256 mismatch'):
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+
+    def test_multifile_module_source_swap_after_trust_does_not_execute_swapped_helper(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_multifile_module(root)
+            helper = root / 'pkg' / 'helper.py'
+            sentinel = root / 'swapped_helper_executed.txt'
+            original_resolve = ModuleLoader.resolve
+
+            def swapping_resolve(loader: ModuleLoader, manifest_path: str | Path):
+                resolved = original_resolve(loader, manifest_path)
+                helper.write_text(
+                    f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+                    "HELPER_MARKER = 'helper-swapped'\n",
+                    encoding='utf-8',
+                )
+                return resolved
+
+            monkeypatch.setattr(ModuleLoader, 'resolve', swapping_resolve)
+            with pytest.raises(ValidationError, match='source changed after verification'):
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+
+            assert not sentinel.exists()
+
+    def test_multifile_module_cli_verify_outputs_package_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            manifest, package_sha = _write_multifile_module(root)
+            verified = _run_cli_json(['--db', str(db), 'modules', 'verify', str(manifest)])
+            assert verified['source_kind'] == 'package'
+            assert verified['source_sha256'] == package_sha
+            assert any(item['path'] == 'pkg/helper.py' for item in verified['source_files'])
+
+    def test_multifile_module_package_file_count_limit_fails_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_multifile_module(root)
+            config = replace(
+                DEFAULT_CONFIG,
+                modules=replace(DEFAULT_CONFIG.modules, max_package_files=2),
+            )
+            with pytest.raises(ValidationError, match='max_package_files'):
+                Runtime.open(
+                    config=config,
+                    module_manifests=(str(manifest),),
+                    trusted_modules=(f'multi-module:v0:{package_sha}',),
+                )
+
+    def test_multifile_module_package_total_size_limit_fails_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_tiny_multifile_module(root)
+            config = replace(
+                DEFAULT_CONFIG,
+                modules=replace(DEFAULT_CONFIG.modules, source_max_bytes=128, package_max_bytes=200),
+            )
+            with pytest.raises(ValidationError, match='package_max_bytes'):
+                Runtime.open(
+                    config=config,
+                    module_manifests=(str(manifest),),
+                    trusted_modules=(f'tiny-module:v0:{package_sha}',),
+                )
+
+    def test_multifile_module_package_hardlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_multifile_module(root)
+            try:
+                os.link(root / 'pkg' / 'helper.py', root / 'pkg' / 'linked_helper.py')
+            except OSError as exc:
+                pytest.skip(f'hard links are not available on this filesystem: {exc}')
+            with pytest.raises(ValidationError, match='hard links'):
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+
     def test_module_source_size_limit_fails_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -325,6 +500,35 @@ sha256: {source_sha}
             finally:
                 reopened_without_module.close()
 
+    def test_checkpoint_committed_image_carries_required_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            manifest, source_sha = _write_module(root)
+            runtime = Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            try:
+                pid = runtime.process.spawn(image='module-agent:v0', goal='commit module image')
+                checkpoint_id = runtime.checkpoint.create(pid, 'module image checkpoint', actor=pid)
+                runtime.image_registry.grant_register(pid, 'module-committed:v0', issued_by='test')
+                result = runtime.image_registry.commit_from_checkpoint(
+                    actor=pid,
+                    checkpoint_id=checkpoint_id,
+                    image_id='module-committed:v0',
+                    name='module-committed',
+                )
+                assert {'module_id': 'test-module:v0', 'source_sha256': source_sha} in result.image.required_modules
+            finally:
+                runtime.close()
+
+            reopened_without_module = Runtime.open(db)
+            try:
+                inspected = reopened_without_module.image_registry.inspect('module-committed:v0')
+                assert {'module_id': 'test-module:v0', 'source_sha256': source_sha} in inspected['image']['required_modules']
+                with pytest.raises(ValidationError, match='image requires startup modules'):
+                    reopened_without_module.process.spawn(image='module-committed:v0', goal='blocked commit')
+            finally:
+                reopened_without_module.close()
+
     def test_cli_modules_verify_list_and_spawn_with_module_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -381,6 +585,113 @@ def _write_module(root: Path, *, expose_read_tool: bool=False, invalid_registrat
     manifest = root / 'module.yaml'
     manifest.write_text(f"\nschema_version: 1\nmodule_id: test-module:v0\nname: Test startup module\nversion: v0\nentrypoint: {entrypoint}\nprovides:\n  tools: ['module_echo']\n  images: ['module-agent:v0']\n  syscalls: {syscalls.rstrip()}\n  provider_hooks: {(['test_hook'] if provider_hook else [])!r}\n  startup_hooks: ['mark_startup']\nsha256: {source_sha}\nmetadata:\n  test: true\n".lstrip(), encoding='utf-8')
     return (manifest, source_sha)
+
+
+def _write_multifile_module(root: Path) -> tuple[Path, str]:
+    package = root / 'pkg'
+    package.mkdir()
+    (package / '__init__.py').write_text(
+        "raise RuntimeError('package init should not run for module entrypoint')\n",
+        encoding='utf-8',
+    )
+    (package / 'helper.py').write_text(
+        "HELPER_MARKER = 'helper-v1'\n\n"
+        "def helper_payload(value):\n"
+        "    return {'helper_marker': HELPER_MARKER, 'value': value}\n",
+        encoding='utf-8',
+    )
+    (package / 'main.py').write_text(
+        """
+from pydantic import BaseModel
+
+from agent_libos.models import AgentImage
+from agent_libos.tools.base import SyncAgentTool, ToolContext
+
+from .helper import HELPER_MARKER, helper_payload
+
+
+class EchoArgs(BaseModel):
+    text: str
+
+
+class MultiEchoTool(SyncAgentTool[EchoArgs]):
+    name = "multi_echo"
+    description = "Echo text through a multi-file startup module."
+    args_schema = EchoArgs
+
+    def run(self, args: EchoArgs, ctx: ToolContext):
+        payload = helper_payload(args.text)
+        payload["pid"] = ctx.pid
+        return payload
+
+
+def multi_ping(session, args):
+    payload = helper_payload(args.get("value"))
+    payload["pid"] = session.pid
+    return payload
+
+
+def register_module(ctx):
+    assert HELPER_MARKER == "helper-v1"
+    ctx.register_tool(MultiEchoTool())
+    ctx.register_syscall("multi.ping", multi_ping)
+    ctx.register_image(AgentImage(
+        image_id="multi-agent:v0",
+        name="multi-agent",
+        default_tools=["multi_echo"],
+    ))
+""".lstrip(),
+        encoding='utf-8',
+    )
+    package_sha = _module_package_sha(root, package)
+    manifest = root / 'module.yaml'
+    manifest.write_text(
+        f"""
+schema_version: 1
+module_id: multi-module:v0
+name: Multi-file startup module
+version: v0
+entrypoint: pkg.main:register_module
+provides:
+  tools: ['multi_echo']
+  images: ['multi-agent:v0']
+  syscalls: ['multi.ping']
+  provider_hooks: []
+  startup_hooks: []
+sha256: {package_sha}
+""".lstrip(),
+        encoding='utf-8',
+    )
+    return manifest, package_sha
+
+
+def _write_tiny_multifile_module(root: Path) -> tuple[Path, str]:
+    package = root / 'tiny'
+    package.mkdir()
+    (package / '__init__.py').write_text('', encoding='utf-8')
+    (package / 'main.py').write_text('from .a import A\n\ndef register_module(ctx):\n    _ = A\n', encoding='utf-8')
+    (package / 'a.py').write_text(f"A = {('a' * 70)!r}\n", encoding='utf-8')
+    (package / 'b.py').write_text(f"B = {('b' * 70)!r}\n", encoding='utf-8')
+    package_sha = _module_package_sha(root, package)
+    manifest = root / 'module.yaml'
+    manifest.write_text(
+        f"""
+schema_version: 1
+module_id: tiny-module:v0
+name: Tiny multi-file startup module
+entrypoint: tiny.main:register_module
+provides: {{}}
+sha256: {package_sha}
+""".lstrip(),
+        encoding='utf-8',
+    )
+    return manifest, package_sha
+
+
+def _module_package_sha(manifest_dir: Path, source_root: Path) -> str:
+    loader = ModuleLoader()
+    return loader._package_sha256(loader._read_package_source_files(manifest_dir.resolve(), source_root.resolve()))
+
 
 def _run_cli_json(argv: list[str]) -> object:
     buffer = io.StringIO()

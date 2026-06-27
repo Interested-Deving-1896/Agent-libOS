@@ -4,6 +4,7 @@ export type ImageManifestPreview = {
   version: string | null;
   default_tools_count: number | null;
   required_capabilities_count: number | null;
+  required_modules_count: number | null;
   bytes: number;
 };
 
@@ -17,6 +18,7 @@ export function previewImageManifest(text: string): ImageManifestPreview {
     version: yamlValue(text, "version"),
     default_tools_count: yamlListCount(text, "default_tools"),
     required_capabilities_count: yamlListCount(text, "required_capabilities"),
+    required_modules_count: yamlListCount(text, "required_modules"),
     bytes
   };
 }
@@ -31,7 +33,8 @@ function parseJsonPreview(text: string): Omit<ImageManifestPreview, "bytes"> | n
       name: stringValue(image.name),
       version: stringValue(image.version),
       default_tools_count: Array.isArray(image.default_tools) ? image.default_tools.length : null,
-      required_capabilities_count: Array.isArray(image.required_capabilities) ? image.required_capabilities.length : null
+      required_capabilities_count: Array.isArray(image.required_capabilities) ? image.required_capabilities.length : null,
+      required_modules_count: Array.isArray(image.required_modules) ? image.required_modules.length : null
     };
   } catch {
     return null;

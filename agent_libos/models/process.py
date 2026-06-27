@@ -157,6 +157,7 @@ class AgentImage:
     safety_profile: str = "default"
     llm_profile_id: str | None = None
     required_capabilities: list[dict[str, Any]] = field(default_factory=list)
+    required_modules: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     signature: str | None = None
     boot: dict[str, Any] = field(default_factory=lambda: {"kind": "fresh"})

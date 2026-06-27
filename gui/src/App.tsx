@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Send } from "lucide-react";
-import { LibOSClient, type OptionalQuanta } from "./api/client";
+import { LibOSClient } from "./api/client";
 import type { GuiConnection, HumanRequest, RuntimeSnapshot } from "./api/types";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
@@ -11,6 +11,8 @@ import { TopBar } from "./components/TopBar";
 import { UserPage } from "./components/UserPage";
 import { previewImageManifest } from "./imagePreview";
 import { useI18n } from "./i18n";
+import type { OptionalQuanta } from "./quanta";
+import { reconcileSelectedPid } from "./selection";
 
 type PendingConfirm = {
   title: string;
@@ -29,11 +31,13 @@ export function App() {
   const [maxQuanta, setMaxQuanta] = useState<OptionalQuanta>(null);
   const [spawnGoal, setSpawnGoal] = useState("Summarize the current project state.");
   const [spawnImage, setSpawnImage] = useState("coding-agent:v0");
+  const [spawnWorkingDirectory, setSpawnWorkingDirectory] = useState("");
   const [message, setMessage] = useState("");
   const [cwd, setCwd] = useState("");
   const [execImage, setExecImage] = useState("base-agent:v0");
   const [execGoal, setExecGoal] = useState("");
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -52,7 +56,7 @@ export function App() {
         const next = (message.data as { snapshot?: RuntimeSnapshot }).snapshot;
         if (next) {
           setSnapshot(next);
-          setSelectedPid((current) => current ?? next.processes[0]?.pid ?? null);
+          setSelectedPid((current) => reconcileSelectedPid(next, current));
         }
       }
     }, controller.signal).catch((reason) => {
@@ -71,81 +75,99 @@ export function App() {
       const conn = await window.libosApi?.getConnection();
       if (!conn) throw new Error(t("app.preloadMissing"));
       const nextClient = new LibOSClient(conn);
+      const nextSnapshot = await nextClient.snapshot();
       setConnection(conn);
       setClient(nextClient);
-      const nextSnapshot = await nextClient.snapshot();
       setSnapshot(nextSnapshot);
-      setSelectedPid(nextSnapshot.processes[0]?.pid ?? null);
+      setSelectedPid(reconcileSelectedPid(nextSnapshot, null));
       setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
     } catch (reason) {
-      setError(String(reason));
+      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
     }
   }
 
-  async function refresh() {
-    if (!client) return;
-    const next = await client.snapshot();
-    setSnapshot(next);
-    setSelectedPid((current) => current ?? next.processes[0]?.pid ?? null);
+  async function refresh(): Promise<boolean> {
+    if (!client) return false;
+    try {
+      const next = await client.snapshot();
+      setSnapshot(next);
+      setSelectedPid((current) => reconcileSelectedPid(next, current));
+      return true;
+    } catch (reason) {
+      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      return false;
+    }
   }
 
   async function reconnect(next: GuiConnection | null) {
     if (!next) return;
+    if (connection && sameConnection(connection, next)) return;
     const nextClient = new LibOSClient(next);
+    const nextSnapshot = await nextClient.snapshot();
     setConnection(next);
     setClient(nextClient);
-    const nextSnapshot = await nextClient.snapshot();
     setSnapshot(nextSnapshot);
+    setSelectedPid(reconcileSelectedPid(nextSnapshot, null, { preserveExisting: false }));
     setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
   }
 
-  async function safe(action: () => Promise<void>) {
+  async function openDatabase() {
+    try {
+      setError(null);
+      const next = await window.libosApi?.chooseDatabase();
+      await reconnect(next ?? null);
+    } catch (reason) {
+      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+    }
+  }
+
+  async function safe(action: () => Promise<void>): Promise<boolean> {
     try {
       setError(null);
       await action();
-      await refresh();
+      return refresh();
     } catch (reason) {
-      const err = reason as Error & { payload?: { error?: { confirmation_required?: boolean; preview?: Record<string, unknown>; action?: string } } };
-      if (err.payload?.error?.confirmation_required) {
-        setError(`${err.message}. ${t("app.confirmationRequiredSuffix")}`);
-      } else {
-        setError(err.message ?? String(reason));
-      }
+      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      return false;
     }
   }
 
   async function spawnProcess() {
     if (!client) return;
     await safe(async () => {
-      const result = await client.spawn(spawnGoal, spawnImage, maxQuanta, Boolean(snapshot?.scheduler.auto_run));
+      const result = await client.spawn(spawnGoal, spawnImage, maxQuanta, Boolean(snapshot?.scheduler.auto_run), {
+        workingDirectory: spawnWorkingDirectory
+      });
       const pid = (result as { pid?: string }).pid;
       if (pid) setSelectedPid(pid);
     });
   }
 
-  async function send(kind: "message" | "interrupt") {
-    if (!client || !selectedPid || !message.trim()) return;
-    await safe(async () => {
-      await client.sendMessage(selectedPid, message.trim(), kind, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
+  async function send(kind: "message" | "interrupt"): Promise<boolean> {
+    if (!client || !selectedProcess || !message.trim()) return false;
+    const pid = selectedProcess.pid;
+    return safe(async () => {
+      await client.sendMessage(pid, message.trim(), kind, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
       setMessage("");
     });
   }
 
-  async function respond(request: HumanRequest, approved: boolean, answer = "") {
-    if (!client) return;
-    await safe(async () => {
-      await client.respondHumanRequest(request.request_id, approved, answer);
+  async function respond(request: HumanRequest, approved: boolean, answer = ""): Promise<boolean> {
+    if (!client) return false;
+    return safe(async () => {
+      await client.respondHumanRequest(request.request_id, approved, answer, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
     });
   }
 
   function confirmExec() {
-    if (!client || !selectedPid) return;
+    if (!client || !selectedProcess) return;
+    const pid = selectedProcess.pid;
     setPendingConfirm({
       title: t("app.exec.title"),
       message: t("app.exec.message"),
-      details: { pid: selectedPid, image: execImage, goal: execGoal, auto_run: snapshot?.scheduler.auto_run },
+      details: { pid, image: execImage, goal: execGoal, auto_run: snapshot?.scheduler.auto_run, max_quanta: maxQuanta },
       action: async () => {
-        await client.execProcess(selectedPid, execImage, execGoal, true, Boolean(snapshot?.scheduler.auto_run));
+        await client.execProcess(pid, execImage, execGoal, true, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
         setPendingConfirm(null);
         await refresh();
       }
@@ -153,13 +175,14 @@ export function App() {
   }
 
   function confirmExit() {
-    if (!client || !selectedPid) return;
+    if (!client || !selectedProcess) return;
+    const pid = selectedProcess.pid;
     setPendingConfirm({
       title: t("app.exit.title"),
       message: t("app.exit.message"),
-      details: { pid: selectedPid },
+      details: { pid },
       action: async () => {
-        await client.exitProcess(selectedPid, "Exited from GUI", false, true);
+        await client.exitProcess(pid, "Exited from GUI", false, true);
         setPendingConfirm(null);
         await refresh();
       }
@@ -182,6 +205,7 @@ export function App() {
           version: preview.version,
           default_tools_count: preview.default_tools_count,
           required_capabilities_count: preview.required_capabilities_count,
+          required_modules_count: preview.required_modules_count,
           files: Object.keys(imagePackage.files).length,
           bytes: JSON.stringify(imagePackage.files).length,
           replace
@@ -200,8 +224,8 @@ export function App() {
   }
 
   function confirmCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }) {
-    if (!client || !selectedPid) return;
-    const pid = selectedPid;
+    if (!client || !selectedProcess) return;
+    const pid = selectedProcess.pid;
     setPendingConfirm({
       title: t("image.commit.title"),
       message: t("image.commit.message"),
@@ -232,6 +256,19 @@ export function App() {
     });
   }
 
+  async function confirmPendingAction() {
+    if (!pendingConfirm || confirmBusy) return;
+    setConfirmBusy(true);
+    setError(null);
+    try {
+      await pendingConfirm.action();
+    } catch (reason) {
+      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+    } finally {
+      setConfirmBusy(false);
+    }
+  }
+
   return (
     <div className={view === "user" ? "userAppShell" : "appShell"}>
       {view === "user" ? (
@@ -243,22 +280,24 @@ export function App() {
           maxQuanta={maxQuanta}
           spawnGoal={spawnGoal}
           spawnImage={spawnImage}
+          spawnWorkingDirectory={spawnWorkingDirectory}
           message={message}
           images={snapshot?.images ?? []}
           onSelectPid={setSelectedPid}
           onMaxQuantaChange={setMaxQuanta}
           onSpawnGoalChange={setSpawnGoal}
           onSpawnImageChange={setSpawnImage}
+          onSpawnWorkingDirectoryChange={setSpawnWorkingDirectory}
           onMessageChange={setMessage}
           onSpawn={() => void spawnProcess()}
           onImportImage={() => void chooseAndConfirmImageImport(false)}
           onCommitImage={confirmCommitImage}
           onSend={(kind) => void send(kind)}
-          onRespond={(request, approved, answer = "") => void respond(request, approved, answer)}
-          onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
+          onRespond={(request, approved, answer = "") => respond(request, approved, answer)}
+          onRun={() => selectedProcess && client && void safe(() => client.run(selectedProcess.pid, maxQuanta).then(() => undefined))}
           onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
           onRefresh={() => void refresh()}
-          onOpenDb={() => void window.libosApi?.chooseDatabase().then(reconnect)}
+          onOpenDb={() => void openDatabase()}
           onShowOperator={() => setView("operator")}
           onStop={confirmExit}
         />
@@ -268,12 +307,12 @@ export function App() {
             db={connection?.db ?? t("app.defaultDb")}
             scheduler={snapshot?.scheduler ?? null}
             maxQuanta={maxQuanta}
-            selectedPid={selectedPid}
+            selectedPid={selectedProcess?.pid ?? null}
             onMaxQuantaChange={setMaxQuanta}
-            onOpenDb={() => void window.libosApi?.chooseDatabase().then(reconnect)}
+            onOpenDb={() => void openDatabase()}
             onSpawn={() => void spawnProcess()}
-            onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
-            onStep={() => selectedPid && client && void safe(() => client.step(selectedPid).then(() => undefined))}
+            onRun={() => selectedProcess && client && void safe(() => client.run(selectedProcess.pid, maxQuanta).then(() => undefined))}
+            onStep={() => selectedProcess && client && void safe(() => client.step(selectedProcess.pid).then(() => undefined))}
             onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
             onAutoRunChange={(value) => client && void safe(() => client.setAutoRun(value).then(() => undefined))}
             onRefresh={() => void refresh()}
@@ -288,6 +327,12 @@ export function App() {
               </div>
               <div className="spawnBox">
                 <ImageSelect images={snapshot?.images ?? []} value={spawnImage} label={t("operator.spawnImage")} onChange={setSpawnImage} />
+                <input
+                  value={spawnWorkingDirectory}
+                  onChange={(event) => setSpawnWorkingDirectory(event.currentTarget.value)}
+                  placeholder={t("operator.initialCwdPlaceholder")}
+                  aria-label={t("operator.initialCwd")}
+                />
                 <textarea value={spawnGoal} onChange={(event) => setSpawnGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
               </div>
               <ProcessTree processes={snapshot?.processes ?? []} selectedPid={selectedPid} onSelect={setSelectedPid} />
@@ -316,7 +361,7 @@ export function App() {
               </div>
 
               <Timeline
-                pid={selectedPid}
+                pid={selectedProcess?.pid ?? null}
                 messages={selectedProcess?.messages ?? []}
                 humanRequests={snapshot?.human_requests ?? []}
                 llmCalls={snapshot?.llm_calls ?? []}
@@ -326,19 +371,19 @@ export function App() {
 
               <div className="composer">
                 <input value={message} onChange={(event) => setMessage(event.currentTarget.value)} placeholder={t("operator.messagePlaceholder")} />
-                <button disabled={!selectedPid || !message.trim()} onClick={() => void send("message")}><Send size={16} />{t("operator.message")}</button>
-                <button disabled={!selectedPid || !message.trim()} className="warning" onClick={() => void send("interrupt")}>{t("operator.interrupt")}</button>
+                <button disabled={!selectedProcess || !message.trim()} onClick={() => void send("message")}><Send size={16} />{t("operator.message")}</button>
+                <button disabled={!selectedProcess || !message.trim()} className="warning" onClick={() => void send("interrupt")}>{t("operator.interrupt")}</button>
               </div>
             </section>
 
             <section className="rightPane">
               <div className="quickActions">
                 <input value={cwd} placeholder={t("operator.newCwdPlaceholder")} onChange={(event) => setCwd(event.currentTarget.value)} />
-                <button disabled={!client || !selectedPid || !cwd.trim()} onClick={() => selectedPid && void safe(() => client!.changeDirectory(selectedPid, cwd).then(() => undefined))}>cd</button>
+                <button disabled={!client || !selectedProcess || !cwd.trim()} onClick={() => selectedProcess && void safe(() => client!.changeDirectory(selectedProcess.pid, cwd).then(() => undefined))}>cd</button>
                 <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} onChange={setExecImage} />
                 <input value={execGoal} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
-                <button disabled={!selectedPid} className="warning" onClick={confirmExec}>{t("operator.exec")}</button>
-                <button disabled={!selectedPid} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
+                <button disabled={!selectedProcess} className="warning" onClick={confirmExec}>{t("operator.exec")}</button>
+                <button disabled={!selectedProcess} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
               </div>
               <DetailTabs
                 process={selectedProcess}
@@ -363,10 +408,24 @@ export function App() {
           title={pendingConfirm.title}
           message={pendingConfirm.message}
           details={pendingConfirm.details}
+          busy={confirmBusy}
           onCancel={() => setPendingConfirm(null)}
-          onConfirm={() => void pendingConfirm.action()}
+          onConfirm={() => void confirmPendingAction()}
         />
       ) : null}
     </div>
   );
+}
+
+function sameConnection(left: GuiConnection, right: GuiConnection): boolean {
+  return left.url === right.url && left.token === right.token && left.db === right.db;
+}
+
+function describeError(reason: unknown, confirmationSuffix: string): string {
+  const err = reason as Error & { payload?: { error?: { confirmation_required?: boolean } } };
+  const message = err.message ?? String(reason);
+  if (err.payload?.error?.confirmation_required) {
+    return `${message}. ${confirmationSuffix}`;
+  }
+  return message;
 }

@@ -21,6 +21,14 @@ export type UserConversationItem =
       time: string;
       text: string;
       request: HumanRequest;
+    }
+  | {
+      id: string;
+      role: "decision";
+      time: string;
+      text: string;
+      status: string;
+      request: HumanRequest;
     };
 
 export function deriveUserConversation(snapshot: RuntimeSnapshot | null, pid: string | null): UserConversationItem[] {
@@ -60,6 +68,17 @@ export function deriveUserConversation(snapshot: RuntimeSnapshot | null, pid: st
         text: humanRequestPrompt(request),
         request
       });
+      continue;
+    }
+    if (isHumanDecision(request)) {
+      items.push({
+        id: `decision:${request.request_id}`,
+        role: "decision",
+        time: request.updated_at || request.created_at,
+        text: humanRequestDecisionText(request),
+        status: request.status,
+        request
+      });
     }
   }
 
@@ -72,6 +91,17 @@ export function isHumanOutput(request: HumanRequest): boolean {
 
 export function isHumanUserMessage(message: ProcessMessage): boolean {
   return message.sender.startsWith("human:") || message.payload?.source === "human_input";
+}
+
+export function isHumanDecision(request: HumanRequest): boolean {
+  return request.status === "approved" || request.status === "rejected" || request.status === "edited";
+}
+
+export function humanRequestDecisionText(request: HumanRequest): string {
+  const decision = request.decision ?? {};
+  const answer = decision.answer;
+  if (answer !== undefined && answer !== null) return String(answer);
+  return "";
 }
 
 export function humanRequestPrompt(request: HumanRequest): string {

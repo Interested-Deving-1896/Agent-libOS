@@ -164,12 +164,44 @@ class LLMProfileRegistry:
                 else _optional_env(legacy_env, "OPENAI_REASONING_EFFORT")
             ),
             verbosity=profile.verbosity if profile.verbosity is not None else _verbosity_env(legacy_env),
+            safety_identifier=self._profile_safety_identifier(profile, legacy_env, env),
+            prompt_cache_key=(
+                profile.prompt_cache_key
+                if profile.prompt_cache_key is not None
+                else _optional_env(legacy_env, "OPENAI_PROMPT_CACHE_KEY") or self.config.llm.prompt_cache_key
+            ),
+            prompt_cache_retention=(
+                profile.prompt_cache_retention
+                if profile.prompt_cache_retention is not None
+                else _prompt_cache_retention_env(legacy_env) or self.config.llm.prompt_cache_retention
+            ),
+            responses_previous_response_id=(
+                profile.responses_previous_response_id
+                if profile.responses_previous_response_id is not None
+                else _bool_env(
+                    legacy_env,
+                    "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
+                    self.config.llm.responses_previous_response_id,
+                )
+            ),
             allow_custom_base_url=(
                 profile.allow_custom_base_url
                 or _bool_env(env, "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", False)
             ),
             defaults=self.config.llm,
         )
+
+    def _profile_safety_identifier(
+        self,
+        profile: LLMProfile,
+        legacy_env: dict[str, str],
+        env: dict[str, str],
+    ) -> str | None:
+        if profile.safety_identifier is not None:
+            return profile.safety_identifier
+        if profile.safety_identifier_env is not None:
+            return _optional_env(env, profile.safety_identifier_env)
+        return _optional_env(legacy_env, "OPENAI_SAFETY_IDENTIFIER") or self.config.llm.safety_identifier
 
     def _validate_profile(self, profile_id: str, profile: LLMProfile) -> None:
         if profile.kind != "openai_compatible":
@@ -282,6 +314,16 @@ def _verbosity_env(env: dict[str, str]) -> str | None:
     selected = value.lower()
     if selected not in {"low", "medium", "high"}:
         raise LLMError("OPENAI_VERBOSITY must be one of low, medium, high")
+    return selected
+
+
+def _prompt_cache_retention_env(env: dict[str, str]) -> str | None:
+    value = _optional_env(env, "OPENAI_PROMPT_CACHE_RETENTION")
+    if value is None:
+        return None
+    selected = value.lower()
+    if selected not in {"in-memory", "24h"}:
+        raise LLMError("OPENAI_PROMPT_CACHE_RETENTION must be one of in-memory, 24h")
     return selected
 
 
