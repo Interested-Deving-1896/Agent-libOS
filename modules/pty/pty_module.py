@@ -613,6 +613,7 @@ class _PtyRuntimeSession:
     dropped_chars: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock)
     stop_event: threading.Event = field(default_factory=threading.Event)
+    close_complete: threading.Event = field(default_factory=threading.Event)
     reader_thread: threading.Thread | None = None
     closing: bool = False
     closed: bool = False
@@ -620,6 +621,9 @@ class _PtyRuntimeSession:
     last_wall_seconds: float = 0.0
     last_cpu_seconds: float = 0.0
     last_peak_memory_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        self.close_complete.set()
 
 
 class PtyAdapter:
@@ -647,6 +651,8 @@ class PtyAdapter:
         self._pending_session_creates = 0
         self._pending_session_creates_by_process: dict[str, int] = {}
         self._lock = threading.RLock()
+        self._reader_condition = threading.Condition(self._lock)
+        self._active_reader_threads: set[threading.Thread] = set()
 
     def create(
         self,
@@ -977,7 +983,14 @@ class PtyAdapter:
     def close_for_object_release(self, oid: str, *, actor: str, reason: str) -> None:
         if oid not in self._sessions:
             return
-        self._close_session(oid, actor=actor, reason=f"object_release:{reason}", force=True, timeout_s=self.config.pty.close_timeout_s)
+        self._close_session(
+            oid,
+            actor=actor,
+            reason=f"object_release:{reason}",
+            force=True,
+            timeout_s=self.config.pty.close_timeout_s,
+            wait_if_closing=True,
+        )
 
     def release_stale_session_objects(self) -> list[str]:
         released: list[str] = []
@@ -1001,17 +1014,28 @@ class PtyAdapter:
         return released
 
     def shutdown(self) -> bool:
+        ok = True
         with self._lock:
             session_oids = list(self._sessions)
         for oid in session_oids:
-            self._close_session(
-                oid,
-                actor="runtime",
-                reason="runtime.shutdown",
-                force=True,
-                timeout_s=self.config.pty.close_timeout_s,
-            )
-        return True
+            try:
+                self._close_session(
+                    oid,
+                    actor="runtime",
+                    reason="runtime.shutdown",
+                    force=True,
+                    timeout_s=self.config.pty.close_timeout_s,
+                    wait_if_closing=True,
+                )
+            except Exception as exc:
+                ok = False
+                self.audit.record(
+                    actor="runtime.pty",
+                    action="primitive.pty.shutdown_close_failed",
+                    target=f"pty:{oid}",
+                    decision={"error_type": type(exc).__name__, "error": str(exc)},
+                )
+        return self._wait_for_reader_threads(self.config.pty.close_timeout_s) and ok
 
     def _create_session_object(
         self,
@@ -1064,32 +1088,49 @@ class PtyAdapter:
             daemon=True,
         )
         session.reader_thread = thread
-        thread.start()
+        with self._reader_condition:
+            self._active_reader_threads.add(thread)
+            try:
+                thread.start()
+            except Exception:
+                self._active_reader_threads.discard(thread)
+                self._reader_condition.notify_all()
+                session.reader_thread = None
+                raise
 
     def _reader_loop(self, session: _PtyRuntimeSession, resource: str) -> None:
-        exited = False
-        while not session.stop_event.is_set():
-            try:
-                chunk = session.handle.read(timeout_s=0.05)
-                if chunk:
-                    self._append_output(session, chunk)
-                self._sample_and_charge(session, resource)
-                if not session.handle.is_alive() and not chunk:
-                    exited = True
-                    break
-            except Exception as exc:
-                self.audit.record(
-                    actor="runtime.pty",
-                    action="primitive.pty.reader_failed",
-                    target=f"pty:{session.session_oid}",
-                    decision={"error_type": type(exc).__name__, "error": str(exc)},
-                )
+        try:
+            exited = False
+            while not session.stop_event.is_set():
+                try:
+                    chunk = session.handle.read(timeout_s=0.05)
+                    if session.stop_event.is_set():
+                        break
+                    if chunk:
+                        self._append_output(session, chunk)
+                    if session.stop_event.is_set():
+                        break
+                    self._sample_and_charge(session, resource)
+                    if not session.handle.is_alive() and not chunk:
+                        exited = True
+                        break
+                except Exception as exc:
+                    if session.stop_event.is_set() or self._session_is_closing_or_closed(session):
+                        return
+                    self.audit.record(
+                        actor="runtime.pty",
+                        action="primitive.pty.reader_failed",
+                        target=f"pty:{session.session_oid}",
+                        decision={"error_type": type(exc).__name__, "error": str(exc)},
+                    )
+                    return
+            if session.stop_event.is_set():
+                session.exit_code = session.handle.exit_code()
                 return
-        if session.stop_event.is_set():
-            session.exit_code = session.handle.exit_code()
-            return
-        if exited:
-            self._mark_session_exited(session, resource=resource)
+            if exited:
+                self._mark_session_exited(session, resource=resource)
+        finally:
+            self._reader_finished(threading.current_thread())
 
     def _append_output(self, session: _PtyRuntimeSession, output: str) -> None:
         with session.lock:
@@ -1121,7 +1162,7 @@ class PtyAdapter:
         if self.resources is None or session.handle.pid is None:
             return
         with session.lock:
-            if session.closed:
+            if session.stop_event.is_set() or session.closing or session.closed:
                 return
         try:
             proc = psutil.Process(session.handle.pid)
@@ -1142,14 +1183,20 @@ class PtyAdapter:
                     continue
         except psutil.Error:
             return
-        wall_delta = max(0.0, wall_seconds - session.last_wall_seconds)
-        cpu_delta = max(0.0, cpu_seconds - session.last_cpu_seconds)
-        peak_delta_changed = peak_memory > session.last_peak_memory_bytes
-        session.last_wall_seconds = wall_seconds
-        session.last_cpu_seconds = cpu_seconds
-        session.last_peak_memory_bytes = max(session.last_peak_memory_bytes, peak_memory)
+        with session.lock:
+            if session.stop_event.is_set() or session.closing or session.closed:
+                return
+            wall_delta = max(0.0, wall_seconds - session.last_wall_seconds)
+            cpu_delta = max(0.0, cpu_seconds - session.last_cpu_seconds)
+            peak_delta_changed = peak_memory > session.last_peak_memory_bytes
+            session.last_wall_seconds = wall_seconds
+            session.last_cpu_seconds = cpu_seconds
+            session.last_peak_memory_bytes = max(session.last_peak_memory_bytes, peak_memory)
         if wall_delta == 0 and cpu_delta == 0 and not peak_delta_changed:
             return
+        with session.lock:
+            if session.stop_event.is_set() or session.closing or session.closed:
+                return
         try:
             self.resources.charge(
                 session.owner_pid,
@@ -1171,6 +1218,7 @@ class PtyAdapter:
                     reason="resource_limit_exceeded",
                     force=True,
                     timeout_s=self.config.pty.close_timeout_s,
+                    wait_if_closing=True,
                 )
             finally:
                 self.audit.record(
@@ -1188,28 +1236,42 @@ class PtyAdapter:
         reason: str,
         force: bool,
         timeout_s: float,
+        wait_if_closing: bool = False,
     ) -> int | None:
         with self._lock:
             session = self._sessions.get(session_oid)
         if session is None:
             return None
+        wait_for_close: threading.Event | None = None
         with session.lock:
             if session.closing:
-                raise ValidationError(f"PTY session close is already in progress: {session_oid}")
+                if not wait_if_closing:
+                    raise ValidationError(f"PTY session close is already in progress: {session_oid}")
+                wait_for_close = session.close_complete
             if session.closed:
                 exit_code = session.exit_code
                 remove_only = True
-            else:
+            elif wait_for_close is None:
                 session.closing = True
+                session.close_complete.clear()
+                session.stop_event.set()
                 remove_only = False
+            else:
+                remove_only = True
+                exit_code = session.exit_code
+        if wait_for_close is not None:
+            if session.reader_thread is not threading.current_thread():
+                wait_for_close.wait(timeout=max(0.0, timeout_s))
+            with session.lock:
+                return session.exit_code
         if not remove_only:
             try:
                 exit_code = session.handle.close(force=force, timeout_s=timeout_s)
             except Exception:
                 with session.lock:
                     session.closing = False
+                    session.close_complete.set()
                 raise
-            session.stop_event.set()
             if (
                 session.reader_thread is not None
                 and session.reader_thread.is_alive()
@@ -1220,6 +1282,7 @@ class PtyAdapter:
                 session.closed = True
                 session.closing = False
                 session.exit_code = exit_code
+                session.close_complete.set()
         with self._lock:
             self._sessions.pop(session_oid, None)
         self.events.emit(
@@ -1236,6 +1299,31 @@ class PtyAdapter:
             decision={"reason": reason, "force": force, "exit_code": exit_code},
         )
         return exit_code
+
+    def _session_is_closing_or_closed(self, session: _PtyRuntimeSession) -> bool:
+        with session.lock:
+            return session.closing or session.closed
+
+    def _reader_finished(self, thread: threading.Thread) -> None:
+        with self._reader_condition:
+            self._active_reader_threads.discard(thread)
+            self._reader_condition.notify_all()
+
+    def _wait_for_reader_threads(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        current = threading.current_thread()
+        with self._reader_condition:
+            while True:
+                self._active_reader_threads = {
+                    thread for thread in self._active_reader_threads if thread.is_alive()
+                }
+                waiting = [thread for thread in self._active_reader_threads if thread is not current]
+                if not waiting:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._reader_condition.wait(timeout=min(remaining, 0.05))
 
     def _require_session(self, session_oid: str) -> _PtyRuntimeSession:
         with self._lock:

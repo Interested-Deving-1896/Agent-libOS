@@ -463,6 +463,75 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_shutdown_waits_for_removed_pty_reader_before_closing_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_pid=os.getpid())
+            runtime = _open_pty_runtime(temp_dir, provider)
+            release_blocked_audit = threading.Event()
+            audit_blocked = threading.Event()
+            close_called = threading.Event()
+            shutdown_thread: threading.Thread | None = None
+            try:
+                original_record = runtime.audit.record
+
+                def record_spy(*args: Any, **kwargs: Any) -> Any:
+                    action = kwargs.get("action")
+                    if action is None and len(args) >= 2:
+                        action = args[1]
+                    if action == "primitive.pty.resource_limit_exceeded":
+                        audit_blocked.set()
+                        release_blocked_audit.wait(timeout=2.0)
+                    return original_record(*args, **kwargs)
+
+                original_close = runtime.store.close
+
+                def close_spy() -> None:
+                    close_called.set()
+                    original_close()
+
+                monkeypatch.setattr(runtime.audit, "record", record_spy)
+                monkeypatch.setattr(runtime.store, "close", close_spy)
+
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pty shutdown waits for reader",
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                )
+                created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                assert created.ok, created.error
+                assert audit_blocked.wait(timeout=2.0)
+                assert provider.sessions[0].closed
+                assert not _pty_adapter(runtime)._sessions
+
+                shutdown_result: dict[str, Any] = {}
+
+                def shutdown_runtime() -> None:
+                    try:
+                        shutdown_result["value"] = runtime.shutdown(actor="test", reason="blocked_pty_reader")
+                    except Exception as exc:
+                        shutdown_result["error"] = exc
+
+                shutdown_thread = threading.Thread(target=shutdown_runtime, name="test-pty-shutdown")
+                shutdown_thread.start()
+                time.sleep(0.1)
+
+                assert shutdown_thread.is_alive()
+                assert not close_called.is_set()
+
+                release_blocked_audit.set()
+                shutdown_thread.join(timeout=2.0)
+
+                assert not shutdown_thread.is_alive()
+                assert "error" not in shutdown_result
+                assert shutdown_result["value"]["ok"] is True
+                assert close_called.is_set()
+            finally:
+                release_blocked_audit.set()
+                if shutdown_thread is not None and shutdown_thread.is_alive():
+                    shutdown_thread.join(timeout=2.0)
+                if not getattr(runtime, "_closed", False):
+                    runtime.close()
+
     def test_pty_reader_drops_old_output_when_buffer_limit_is_reached(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider(initial_outputs=[])
