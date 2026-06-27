@@ -153,6 +153,43 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_spawn_honors_exact_authority_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="exact pty authority")
+                argv = ["python3", "-c", "print(1)"]
+                runtime.capability.issue_trusted(
+                    pid,
+                    "shell:python3",
+                    [CapabilityRight.EXECUTE],
+                    issued_by="test",
+                    constraints={
+                        AUTHORITY_RULES_KEY: [
+                            {
+                                "rule_id": "test.pty.spawn.exact",
+                                "operation": "pty.spawn",
+                                "effect": "allow",
+                                "risk": "high",
+                                "conditions": {
+                                    "argv": argv,
+                                    "match": "exact",
+                                    "cwd": ".",
+                                    "continuous_session": True,
+                                },
+                            }
+                        ]
+                    },
+                )
+
+                created = runtime.tools.call(pid, "pty_create", {"argv": argv, "startup_timeout_s": 0})
+
+                assert created.ok, created.error
+                assert provider.spawned[0]["argv"] == argv
+            finally:
+                runtime.close()
+
     def test_pty_spawn_does_not_reuse_shell_run_timeout_scoped_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider()
@@ -383,10 +420,34 @@ class TestPtyModule:
             runtime = _open_pty_runtime(temp_dir, LocalPtyProvider(temp_dir))
             try:
                 pid = runtime.process.spawn(image="pty-agent:v0", goal="pty exit cleanup")
+                argv = ["python3", "-c", parent_script]
+                runtime.capability.issue_trusted(
+                    pid,
+                    "shell:python3",
+                    [CapabilityRight.EXECUTE],
+                    issued_by="test",
+                    constraints={
+                        AUTHORITY_RULES_KEY: [
+                            {
+                                "rule_id": "test.pty.exit-cleanup.spawn",
+                                "operation": "pty.spawn",
+                                "effect": "allow",
+                                "risk": "high",
+                                "conditions": {
+                                    "argv": argv,
+                                    "match": "exact",
+                                    "cwd": ".",
+                                    "continuous_session": True,
+                                },
+                                "description": "Allow the exact PTY cleanup regression spawn.",
+                            }
+                        ]
+                    },
+                )
                 created = runtime.tools.call(
                     pid,
                     "pty_create",
-                    {"argv": ["python3", "-c", parent_script], "startup_timeout_s": 0.2},
+                    {"argv": argv, "startup_timeout_s": 0.2},
                 )
                 assert created.ok, created.error
 
