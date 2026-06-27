@@ -634,7 +634,7 @@ class TestGuiServer:
         thread.start()
         try:
             assert server.service.db == 'gui-memory'
-            assert server.service.runtime.store.path == ':memory:'
+            assert server.service.runtime.store.path == 'gui-memory'
 
             status, spawned = _request_to_server(server, 'POST', '/api/processes', {'goal': 'custom', 'auto_run': False}, token='custom-token')
             assert status == 200

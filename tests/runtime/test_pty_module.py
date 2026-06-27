@@ -386,7 +386,7 @@ class TestPtyModule:
                 created = runtime.tools.call(
                     pid,
                     "pty_create",
-                    {"argv": [sys.executable, "-c", parent_script], "startup_timeout_s": 0.2},
+                    {"argv": ["python3", "-c", parent_script], "startup_timeout_s": 0.2},
                 )
                 assert created.ok, created.error
 

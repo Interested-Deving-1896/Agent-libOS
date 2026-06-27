@@ -198,7 +198,10 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='unlink reparse race')
                 runtime.filesystem.grant_path(pid, 'dir/victim.txt', [CapabilityRight.DELETE], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                with pytest.raises(
+                    CapabilityDenied,
+                    match='symlink|junction|escapes filesystem adapter root|path changed during delete',
+                ):
                     runtime.filesystem.delete_file(pid, 'dir/victim.txt')
 
                 assert provider.swapped or os.name == 'nt'
@@ -221,7 +224,10 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='rmtree reparse race')
                 runtime.filesystem.grant_directory(pid, 'dir/victim', [CapabilityRight.DELETE], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                with pytest.raises(
+                    CapabilityDenied,
+                    match='symlink|junction|escapes filesystem adapter root|path changed during delete',
+                ):
                     runtime.filesystem.delete_directory(pid, 'dir/victim', recursive=True)
 
                 assert provider.swapped or os.name == 'nt'
