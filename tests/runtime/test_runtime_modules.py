@@ -139,6 +139,37 @@ class TestRuntimeModule:
             with pytest.raises(CapabilityDenied):
                 Runtime.open(module_manifests=(str(manifest),))
 
+    def test_configured_startup_module_paths_resolve_from_project_root_not_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project_root = tmp_path / 'project'
+        cwd_root = tmp_path / 'cwd'
+        project_root.mkdir()
+        cwd_root.mkdir()
+        project_manifest, source_sha = _write_module(project_root, marker='project')
+        _write_module(cwd_root, marker='cwd')
+        config = replace(
+            DEFAULT_CONFIG,
+            modules=replace(
+                DEFAULT_CONFIG.modules,
+                manifest_paths=('module.yaml',),
+                trusted_modules=(f'test-module:v0:{source_sha}',),
+            ),
+        )
+        monkeypatch.setattr('agent_libos.modules.registry.get_project_root', lambda: project_root)
+        monkeypatch.chdir(cwd_root)
+
+        runtime = Runtime.open(config=config)
+        try:
+            loaded = runtime.modules.inspect_module('test-module:v0')
+            assert Path(loaded['manifest_path']) == project_manifest.resolve()
+            assert any(record.action == 'module.load' for record in runtime.audit.trace())
+            pid = runtime.process.spawn(image='module-agent:v0', goal='project-root module')
+            result = runtime.tools.call(pid, 'module_echo', {'text': 'hello'})
+            assert result.payload['marker'] == 'project'
+        finally:
+            runtime.close()
+
     def test_import_string_entrypoint_loads_from_manifest_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

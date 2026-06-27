@@ -8,12 +8,13 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ProcessMessageKind, ProcessStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 class TestCLIBuiltinCommand:
 
-    def test_cli_loads_config_yaml_from_cwd_for_default_image(self) -> None:
+    def test_cli_ignores_config_yaml_from_cwd_for_default_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'
@@ -21,13 +22,14 @@ class TestCLIBuiltinCommand:
                 'runtime:\n  default_image_id: configured-base:v0\n',
                 encoding='utf-8',
             )
+            monkeypatch.setattr('agent_libos.api.cli.load_config_from_project_root', lambda: DEFAULT_CONFIG)
 
             with _temporary_cwd(root):
                 result = _run_cli_json(['--db', str(db), 'spawn', '--goal', 'configured default'])
 
-            assert result['image'] == 'configured-base:v0'
+            assert result['image'] == DEFAULT_CONFIG.runtime.default_image_id
 
-    def test_cli_config_argument_overrides_cwd_config_yaml(self) -> None:
+    def test_cli_config_argument_overrides_default_project_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'

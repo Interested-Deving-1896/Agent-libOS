@@ -13,6 +13,17 @@ from agent_libos.config.defaults import DEFAULT_CONFIG, AgentLibOSConfig
 _CONFIG_ADAPTER = TypeAdapter(AgentLibOSConfig)
 
 
+def get_project_root(start: str | Path | None = None) -> Path:
+    """Return the repository root that owns the installed ``agent_libos`` tree."""
+
+    selected = Path(start).expanduser().resolve() if start is not None else Path(__file__).resolve()
+    base = selected if selected.is_dir() else selected.parent
+    for candidate in (base, *base.parents):
+        if (candidate / "pyproject.toml").is_file() and (candidate / "agent_libos").is_dir():
+            return candidate
+    return Path(__file__).resolve().parents[2]
+
+
 def load_config_file(path: str | Path, *, base: AgentLibOSConfig = DEFAULT_CONFIG) -> AgentLibOSConfig:
     """Load a YAML config file as a strict overlay on top of ``base``."""
 
@@ -32,6 +43,22 @@ def load_config_file(path: str | Path, *, base: AgentLibOSConfig = DEFAULT_CONFI
 
     merged = _deep_merge(asdict(base), overlay)
     return _CONFIG_ADAPTER.validate_python(merged)
+
+
+def load_config_from_project_root(
+    filename: str | Path = "config.yaml",
+    *,
+    base: AgentLibOSConfig = DEFAULT_CONFIG,
+    root: str | Path | None = None,
+) -> AgentLibOSConfig:
+    """Load ``filename`` from the project root when it exists."""
+
+    selected_root = Path(root).expanduser().resolve() if root is not None else get_project_root()
+    requested = Path(filename).expanduser()
+    selected = requested if requested.is_absolute() else selected_root / requested
+    if not selected.exists():
+        return base
+    return load_config_file(selected, base=base)
 
 
 def load_config_from_cwd(

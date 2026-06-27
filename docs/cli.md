@@ -16,9 +16,10 @@ uv run agent-libos --db .agent_libos.sqlite <command>
 
 ## Configuration File
 
-`agent-libos` and `agent-libos-gui-server` read `config.yaml` from the current
-working directory when it exists. Pass `--config <path>` before the command name
-to use an explicit YAML overlay instead:
+`agent-libos` and `agent-libos-gui-server` read `config.yaml` from the project
+root when it exists. They do not auto-load a `config.yaml` from the current
+working directory. Pass `--config <path>` before the command name to use an
+explicit YAML overlay instead:
 
 ```bash
 uv run agent-libos --config ./agent-config.yaml spawn --goal "Inspect README.md"
@@ -42,6 +43,8 @@ llm:
 
 Explicit CLI options still win over config defaults. For example `--db` uses the
 configured `runtime.local_store_target` only when `--db` is omitted.
+Relative `modules.manifest_paths` entries in the selected config resolve from
+the project root, not the shell's current working directory.
 
 Use `--module-manifest` and `--trusted-module` before the command name to load
 trusted Runtime Modules before the runtime is used:

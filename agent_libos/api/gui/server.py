@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_cwd
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
 from agent_libos.models import CapabilityRight, CapabilitySpec, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -39,7 +39,7 @@ def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParse
     try:
         if config_path:
             return load_config_file(config_path)
-        return load_config_from_cwd()
+        return load_config_from_project_root()
     except (OSError, ValueError, PydanticValidationError) as exc:
         parser.error(str(exc))
     raise AssertionError("argparse parser.error should exit")
@@ -1333,7 +1333,7 @@ def serve(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="agent-libos-gui-server")
-    parser.add_argument("--config", help="YAML config overlay. Defaults to ./config.yaml when present.")
+    parser.add_argument("--config", help="YAML config overlay. Defaults to the project-root config.yaml when present.")
     parser.add_argument("--db")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--token")

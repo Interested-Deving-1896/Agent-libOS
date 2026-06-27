@@ -24,7 +24,12 @@ from agent_libos.config.defaults import (
     SkillDefaults,
     ToolDefaults,
 )
-from agent_libos.config.loader import load_config_file, load_config_from_cwd
+from agent_libos.config.loader import (
+    get_project_root,
+    load_config_file,
+    load_config_from_cwd,
+    load_config_from_project_root,
+)
 
 __all__ = [
     "DEFAULT_CONFIG",
@@ -51,6 +56,8 @@ __all__ = [
     "ScriptDefaults",
     "SkillDefaults",
     "ToolDefaults",
+    "get_project_root",
     "load_config_file",
     "load_config_from_cwd",
+    "load_config_from_project_root",
 ]

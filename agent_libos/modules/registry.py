@@ -4,7 +4,7 @@ import inspect
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, get_project_root
 from agent_libos.models import EventType
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.context import ModuleContext, StartupHook
@@ -59,12 +59,12 @@ class RuntimeModuleRegistry:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
-        selected = list(self.config.modules.manifest_paths)
-        selected.extend(str(item) for item in (manifests or ()))
+        selected = [self._resolve_config_manifest_path(item) for item in self.config.modules.manifest_paths]
+        selected.extend(self._resolve_explicit_manifest_path(item) for item in (manifests or ()))
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
         for manifest_path in selected:
-            resolved = str(Path(manifest_path).expanduser().resolve())
+            resolved = str(manifest_path)
             if resolved in seen:
                 raise ValidationError(f"duplicate startup module manifest: {resolved}")
             seen.add(resolved)
@@ -76,6 +76,15 @@ class RuntimeModuleRegistry:
                 )
             )
         return results
+
+    def _resolve_config_manifest_path(self, manifest_path: str | Path) -> Path:
+        path = Path(manifest_path).expanduser()
+        if not path.is_absolute():
+            path = get_project_root() / path
+        return path.resolve()
+
+    def _resolve_explicit_manifest_path(self, manifest_path: str | Path) -> Path:
+        return Path(manifest_path).expanduser().resolve()
 
     def load_module_manifest(
         self,

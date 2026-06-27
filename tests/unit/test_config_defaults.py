@@ -12,6 +12,7 @@ from agent_libos.config import (
     LLMDefaults,
     LLMProfile,
     RuntimeDefaults,
+    load_config_from_project_root,
     load_config_file,
     load_config_from_cwd,
 )
@@ -29,6 +30,30 @@ class TestConfigDefaults:
         monkeypatch.chdir(tmp_path)
 
         assert load_config_from_cwd() is DEFAULT_CONFIG
+
+    def test_load_config_from_project_root_returns_default_when_file_is_missing(self, tmp_path: Path) -> None:
+        assert load_config_from_project_root(root=tmp_path) is DEFAULT_CONFIG
+
+    def test_load_config_from_project_root_ignores_cwd_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project_root = tmp_path / "project"
+        cwd_root = tmp_path / "cwd"
+        project_root.mkdir()
+        cwd_root.mkdir()
+        project_root.joinpath("config.yaml").write_text(
+            "runtime:\n  default_image_id: project-base:v0\n",
+            encoding="utf-8",
+        )
+        cwd_root.joinpath("config.yaml").write_text(
+            "runtime:\n  default_image_id: cwd-base:v0\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(cwd_root)
+        config = load_config_from_project_root(root=project_root)
+
+        assert config.runtime.default_image_id == "project-base:v0"
 
     def test_load_config_file_overlays_partial_defaults(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'

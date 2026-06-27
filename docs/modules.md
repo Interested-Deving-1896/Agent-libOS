@@ -195,7 +195,9 @@ entry-file or package digest and is intended for local development only.
 
 Every command that needs module-provided images, tools, or syscalls must pass
 the same startup module configuration, or use an application-level config that
-sets `AgentLibOSConfig.modules.manifest_paths` and trusted hashes.
+sets `AgentLibOSConfig.modules.manifest_paths` and trusted hashes. Relative
+paths in `modules.manifest_paths` are resolved from the project root, not from
+the process current working directory.
 
 ## Persistence And Checkpoints
 

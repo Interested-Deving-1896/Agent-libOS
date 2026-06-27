@@ -170,11 +170,13 @@ user data, object memory excerpts, and provider payloads in SQLite.
 Non-secret runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`.
 `AgentLibOSConfig` uses Pydantic dataclass validation and fails fast when
 numeric limits are negative, non-finite, inverted, or otherwise unsafe.
-Product entrypoints read `config.yaml` from the current working directory when
-present, or an explicit `--config <path>` overlay when provided. The loader
-starts from `DEFAULT_CONFIG`, recursively merges mapping fields, replaces
-scalar/list/tuple fields, and then constructs a fresh `AgentLibOSConfig`; it
-does not mutate `DEFAULT_CONFIG`.
+Product entrypoints read `config.yaml` from the project root when present, or
+an explicit `--config <path>` overlay when provided. They do not auto-load a
+`config.yaml` from the current working directory. Relative startup Runtime
+Module paths in `config.modules.manifest_paths` resolve from the project root.
+The loader starts from `DEFAULT_CONFIG`, recursively merges mapping fields,
+replaces scalar/list/tuple fields, and then constructs a fresh
+`AgentLibOSConfig`; it does not mutate `DEFAULT_CONFIG`.
 
 Library and test code should keep passing explicit config objects when a custom
 runtime is required:

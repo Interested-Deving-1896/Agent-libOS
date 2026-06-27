@@ -400,6 +400,7 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_untrusted_module_is_rejected",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_configured_startup_module_paths_resolve_from_project_root_not_cwd",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_source_hash_mismatch_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_source_swap_after_trust_does_not_execute_swapped_bytes",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_package_relative_import_registers_runtime_surfaces",
