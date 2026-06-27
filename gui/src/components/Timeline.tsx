@@ -15,8 +15,16 @@ export type TimelineItem =
   | { kind: "event"; time: string; item: RuntimeEvent }
   | { kind: "audit"; time: string; item: AuditRecord };
 
-const timelineItemKinds: TimelineItemKind[] = ["message", "human", "llm", "event", "audit"];
-const timelineFilters: TimelineFilter[] = ["all", ...timelineItemKinds];
+const timelineItemKinds = ["message", "human", "llm", "event", "audit"] as const satisfies readonly TimelineItemKind[];
+const timelineFilters = ["all", ...timelineItemKinds] as const satisfies readonly TimelineFilter[];
+const timelineFilterLabels: Record<TimelineFilter, TranslationKey> = {
+  all: "timeline.filter.all",
+  message: "timeline.filter.message",
+  human: "timeline.filter.human",
+  llm: "timeline.filter.llm",
+  event: "timeline.filter.event",
+  audit: "timeline.filter.audit"
+};
 
 export function Timeline({
   pid,
@@ -127,7 +135,7 @@ export function filterTimelineItems(items: TimelineItem[], filter: TimelineFilte
 }
 
 function timelineFilterLabel(filter: TimelineFilter): TranslationKey {
-  return `timeline.filter.${filter}` as TranslationKey;
+  return timelineFilterLabels[filter];
 }
 
 function icon(entry: TimelineItem) {

@@ -64,10 +64,7 @@ include GUI screenshots for visible frontend changes.
 ## Security & Configuration Tips
 
 Never commit local/real `.env`, credentials, benchmark outputs, generated
-`agent_outputs/`, or GUI build artifacts. Synthetic benchmark fixtures under
-`benchmarks/runtime_safety/fixtures/` intentionally include fake secrets and
-injection payloads; do not replace them with real credentials or remove them as
-cleanup.
+`agent_outputs/`, or GUI build artifacts.
 Remote access must go through registered JSON-RPC endpoints, not model-supplied
 URLs. Checkpoint restore and image commit do not roll back or package external
 provider state; provider-classified effects remain append-only audit records.
