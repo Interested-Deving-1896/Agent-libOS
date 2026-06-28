@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_libos.storage.factory import _sqlite_target
 from agent_libos.storage.postgres import _PostgresCursor, _PostgresDialect
 from agent_libos.storage import PostgresStore, SQLRuntimeStore, SQLiteStore
 
@@ -66,6 +67,10 @@ class TestStorageBackendBoundaries:
 
         assert "def _postgres_sql" not in text
         assert "class PostgresStore(SQLRuntimeStore)" in text
+
+    def test_sqlite_uri_normalizes_posix_absolute_paths(self) -> None:
+        assert _sqlite_target("sqlite:////tmp/agent-libos.sqlite") == "/tmp/agent-libos.sqlite"
+        assert _sqlite_target("sqlite:///C:/agent-libos/runtime.sqlite") == "C:/agent-libos/runtime.sqlite"
 
     def test_postgres_cursor_does_not_pass_empty_params_for_percent_literals(self) -> None:
         class FakeCursor:

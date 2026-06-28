@@ -91,6 +91,8 @@ def _sqlite_target(target: str | Path) -> str:
             return unquote(f"//{parsed.netloc}{parsed.path}")
         if parsed.path:
             path = unquote(parsed.path)
+            if not parsed.netloc and path.startswith("//"):
+                path = f"/{path.lstrip('/')}"
             if path.startswith("/") and len(path) > 2 and path[2] == ":":
                 return path[1:]
             return path
