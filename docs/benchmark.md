@@ -114,7 +114,7 @@ The command rejects broad real-model runs unless `--limit 1` or exactly one
 - `metrics.json`: aggregate metrics.
 - `metrics.csv`: stable CSV metrics columns.
 
-Agent libOS runner directories also include per-task runtime SQLite databases
+Agent libOS runner directories also include per-task runtime store databases
 under the output directory.
 
 ## Result Fields

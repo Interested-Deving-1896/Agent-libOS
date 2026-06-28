@@ -25,7 +25,7 @@ from agent_libos.runtime.external_effects import (
     record_external_effect,
     require_external_effect_classifier,
 )
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import HumanProvider
 from agent_libos.utils.serde import dumps, to_jsonable
 
@@ -76,7 +76,7 @@ class HumanObjectManager:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
@@ -461,9 +461,7 @@ class HumanObjectManager:
         channel: str | None = None,
     ) -> dict[str, Any]:
         selected_human = human or self.config.runtime.default_human
-        selected_channel = channel or self.config.runtime.terminal_channel
-        if selected_channel != self.config.runtime.terminal_channel:
-            selected_channel = self.config.runtime.terminal_channel
+        selected_channel = self._normalize_output_channel(channel)
         if len(message) > self.config.tools.human_output_max_chars:
             raise ValidationError(
                 f"human output message exceeds max characters={self.config.tools.human_output_max_chars}"
@@ -490,6 +488,14 @@ class HumanObjectManager:
             "channel": selected_channel,
             "chars": len(message),
         }
+
+    def _normalize_output_channel(self, channel: str | None) -> str:
+        selected = (channel or self.config.runtime.terminal_channel).strip()
+        if not selected:
+            raise ValidationError("human output channel must be non-empty")
+        if len(selected) > 128:
+            raise ValidationError("human output channel is too long")
+        return selected
 
     def get(self, request_id: str) -> HumanRequest:
         request = self.store.get_human_request(request_id)

@@ -30,6 +30,8 @@ class ShellCommandRule:
 class RuntimeDefaults:
     local_store_target: str = "local"
     runtime_db_filename: str = ".agent_libos.sqlite"
+    store_backend: Literal["sqlite", "postgres"] = "sqlite"
+    store_dsn: str | None = None
     workspace_namespace: str = "workspace"
     default_image_id: str = "base-agent:v0"
     coding_image_id: str = "coding-agent:v0"
@@ -71,6 +73,7 @@ class GuiDefaults:
     snapshot_collection_max_items: int = 200
     snapshot_string_max_chars: int = 8_192
     sse_payload_max_bytes: int = 262_144
+    agent_rating_comment_max_chars: int = 2_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -147,6 +150,7 @@ class LLMProfile:
     prompt_cache_retention: Literal["in-memory", "24h"] | None = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
+    auto_wait_on_empty_tool_calls: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     allow_custom_base_url: bool = False
@@ -167,6 +171,7 @@ class LLMDefaults:
     prompt_cache_retention: Literal["in-memory", "24h"] | None = None
     responses_previous_response_id: bool = False
     parallel_tool_calls: bool = False
+    auto_wait_on_empty_tool_calls: bool = False
     compatibility_retry_attempts: int = 8
     action_repair_attempts: int = 2
     content_preview_chars: int = 500
@@ -174,7 +179,7 @@ class LLMDefaults:
     call_record_preview_chars: int = 1_000
     call_record_list_limit: int = 100
     call_record_hard_limit: int = 1_000
-    persist_full_io: bool = False
+    persist_full_io: bool = True
     json_instruction: str = "You must respond with a valid JSON object."
     fallback_status_codes: tuple[int, ...] = (404, 405)
 
@@ -536,6 +541,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     for name in (
         "local_store_target",
         "runtime_db_filename",
+        "store_backend",
         "workspace_namespace",
         "default_image_id",
         "coding_image_id",
@@ -543,6 +549,10 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "terminal_channel",
     ):
         _require_non_empty(name, getattr(runtime, name))
+    if runtime.store_backend == "postgres":
+        if runtime.store_dsn is None:
+            raise ValueError("runtime.store_dsn is required when runtime.store_backend is postgres")
+        _require_non_empty("store_dsn", runtime.store_dsn)
     _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
 
@@ -559,6 +569,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "snapshot_collection_max_items",
         "snapshot_string_max_chars",
         "sse_payload_max_bytes",
+        "agent_rating_comment_max_chars",
     ):
         _positive(f"gui.{name}", getattr(gui, name))
     _nonnegative("gui.scheduler_shutdown_join_timeout_s", gui.scheduler_shutdown_join_timeout_s)

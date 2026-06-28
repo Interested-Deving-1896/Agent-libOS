@@ -12,12 +12,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
+from agent_libos.llm.user_profiles import (
+    UserLLMProfileStore,
+    default_user_llm_profiles_path,
+    normalize_user_llm_profile_id,
+    summarize_llm_profile,
+)
 from agent_libos.models import CapabilityRight, CapabilitySpec, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -28,6 +35,7 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.runtime.runtime import Runtime
+from agent_libos.storage import display_store_target
 from agent_libos.utils.serde import to_jsonable
 
 _GUI_DEFAULTS = DEFAULT_CONFIG.gui
@@ -292,10 +300,17 @@ class GuiRuntimeService:
         token: str | None = None,
         auto_run: bool = True,
         max_quanta: int | None | object = _CONFIG_DEFAULT,
+        llm_profiles_file: str | Path | None = None,
     ) -> None:
         selected_config = config or getattr(runtime, "config", DEFAULT_CONFIG)
-        self.db = selected_config.runtime.local_store_target if db is None else db
-        self.runtime = runtime or Runtime.open(self.db, config=selected_config)
+        self._db_target = db
+        if runtime is None:
+            self.db = display_store_target(db, config=selected_config)
+            self.runtime = Runtime.open(db, config=selected_config)
+        else:
+            display_target = db if db is not None else runtime.store.path
+            self.db = display_store_target(display_target, config=selected_config)
+            self.runtime = runtime
         self.owns_runtime = runtime is None
         self.token = token or secrets.token_urlsafe(32)
         self.broadcaster = GuiEventBroadcaster(max_events=self.runtime.config.gui.event_buffer_limit)
@@ -310,6 +325,8 @@ class GuiRuntimeService:
         self._seen_human_request_ids: set[str] = set()
         self._seen_message_ids: set[str] = set()
         self._seen_llm_call_ids: set[str] = set()
+        self.user_llm_profiles = UserLLMProfileStore(llm_profiles_file, config=self.runtime.config)
+        self._user_llm_profile_cache = self._load_user_llm_profiles()
         self.publish_runtime_changes("startup")
 
     def shutdown(self) -> None:
@@ -320,7 +337,7 @@ class GuiRuntimeService:
         self.broadcaster.close()
         # A Python thread blocked inside a model/tool quantum cannot be safely
         # interrupted. In that case the Electron parent will terminate the
-        # process tree; closing SQLite underneath the live quantum would be a
+        # process tree; closing a database handle underneath the live quantum would be a
         # worse race than letting process teardown reclaim the handle.
         if self.owns_runtime and scheduler_stopped:
             self.runtime.shutdown(actor="gui-server", reason="gui-server.shutdown")
@@ -398,12 +415,13 @@ class GuiRuntimeService:
                 "skills": to_jsonable(self.runtime.skills.discover_skills(require_capability=False)),
                 "jsonrpc_endpoints": to_jsonable(self.runtime.jsonrpc.list_endpoints(require_capability=False)),
                 "modules": to_jsonable(self.runtime.modules.loaded_module_summaries()),
+                "llm_profiles": self._llm_profile_summaries(),
             }
             self._static_snapshot_dirty = False
         return dict(self._static_snapshot_cache)
 
     def _reason_changes_static_snapshot(self, reason: str) -> bool:
-        return reason.startswith(("image.", "skill.", "jsonrpc.", "module.", "process.exec"))
+        return reason.startswith(("image.", "skill.", "jsonrpc.", "module.", "process.exec", "llm_profile."))
 
     def _process_summary(self, pid: str, *, include_messages: bool = False) -> dict[str, Any]:
         process = self.runtime.process.get(pid)
@@ -423,6 +441,7 @@ class GuiRuntimeService:
             "llm_call_count": len(calls),
             "token_total": sum(int((call.usage or {}).get("total_tokens", 0) or 0) for call in calls),
             "resource_remaining": to_jsonable(self.runtime.resources.remaining_budget(pid)),
+            "rating": to_jsonable(self.runtime.ratings.get(pid)),
         }
 
     def _bounded_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -452,6 +471,86 @@ class GuiRuntimeService:
                 }
             )
         return summaries
+
+    def _load_user_llm_profiles(self) -> dict[str, Any]:
+        profiles = self.user_llm_profiles.load()
+        config_ids = set(self.runtime.config.llm.profiles)
+        conflicts = sorted(set(profiles) & config_ids)
+        if conflicts:
+            raise ValidationError(f"user LLM profiles cannot override config profiles: {', '.join(conflicts)}")
+        for profile_id, profile in profiles.items():
+            self.runtime.llms.register_profile(profile_id, profile)
+        return profiles
+
+    def _llm_profile_summaries(self) -> list[dict[str, Any]]:
+        default_profile_id = self.runtime.config.llm.default_profile_id
+        summaries: list[dict[str, Any]] = []
+        for profile_id, profile in sorted(self.runtime.config.llm.profiles.items()):
+            summaries.append(
+                summarize_llm_profile(
+                    profile_id,
+                    profile,
+                    source="config",
+                    editable=False,
+                    default_profile_id=default_profile_id,
+                )
+            )
+        for profile_id, profile in sorted(self._user_llm_profile_cache.items()):
+            summaries.append(
+                summarize_llm_profile(
+                    profile_id,
+                    profile,
+                    source="user",
+                    editable=True,
+                    default_profile_id=default_profile_id,
+                )
+            )
+        return summaries
+
+    def require_llm_profile_id(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        selected = str(value).strip()
+        if not selected:
+            return None
+        try:
+            return self.runtime.llms.require_profile_id(selected)
+        except ValidationError as exc:
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def save_user_llm_profile(self, profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        selected_id = normalize_user_llm_profile_id(profile_id)
+        if selected_id in self.runtime.config.llm.profiles:
+            raise GuiServerError(HTTPStatus.CONFLICT, f"config LLM profile is read-only: {selected_id}")
+        profile = self.user_llm_profiles.upsert(selected_id, payload)
+        self._user_llm_profile_cache[selected_id] = profile
+        self.runtime.llms.register_profile(selected_id, profile)
+        return summarize_llm_profile(
+            selected_id,
+            profile,
+            source="user",
+            editable=True,
+            default_profile_id=self.runtime.config.llm.default_profile_id,
+        )
+
+    def delete_user_llm_profile(self, profile_id: str) -> dict[str, Any]:
+        selected_id = normalize_user_llm_profile_id(profile_id)
+        if selected_id in self.runtime.config.llm.profiles:
+            raise GuiServerError(HTTPStatus.CONFLICT, f"config LLM profile is read-only: {selected_id}")
+        in_use = [process.pid for process in self.runtime.process.list() if process.llm_profile_id == selected_id]
+        if in_use:
+            raise GuiServerError(
+                HTTPStatus.CONFLICT,
+                f"LLM profile is in use by existing processes: {selected_id}",
+                details={"profile_id": selected_id, "pids": in_use},
+            )
+        self.user_llm_profiles.delete(selected_id)
+        self._user_llm_profile_cache.pop(selected_id, None)
+        try:
+            self.runtime.llms.unregister_profile(selected_id)
+        except ValidationError:
+            pass
+        return {"ok": True, "profile_id": selected_id}
 
 
 class GuiHTTPServer(ThreadingHTTPServer):
@@ -485,6 +584,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         self._handle("POST")
 
+    def do_PUT(self) -> None:  # noqa: N802
+        self._handle("PUT")
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._handle("DELETE")
+
     def _handle(self, method: str) -> None:
         parsed = urlparse(self.path)
         self._body_cached = False
@@ -494,7 +599,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if method == "GET" and parsed.path == "/api/events/stream":
                 self._handle_sse(parsed)
                 return
-            if method == "POST":
+            if method in {"POST", "PUT", "DELETE"}:
                 self._cached_json_body = self._read_body(optional=True)
                 self._body_cached = True
             if _is_object_task_wait_request(method, parsed.path):
@@ -589,11 +694,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and route == ["processes"]:
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
+            llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
             pid = service.runtime.process.spawn(
                 image=str(body["image"]) if body.get("image") is not None else None,
                 goal=body.get("goal", ""),
                 working_directory=body.get("working_directory"),
-                llm_profile_id=str(body["llm_profile"]) if body.get("llm_profile") is not None else None,
+                llm_profile_id=llm_profile_id,
             )
             service.publish_runtime_changes("process.spawn")
             if body.get("auto_run", True):
@@ -623,6 +729,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return self._dispatch_capabilities(method, route[1:], query)
         if len(route) >= 1 and route[0] == "images":
             return self._dispatch_images(method, route[1:])
+        if len(route) >= 1 and route[0] == "llm-profiles":
+            return self._dispatch_llm_profiles(method, route[1:])
         if len(route) >= 1 and route[0] == "jsonrpc":
             return self._dispatch_jsonrpc(method, route[1:], query)
         if len(route) >= 1 and route[0] == "modules":
@@ -748,6 +856,17 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return to_jsonable(service.runtime.human.list(pid=pid))
         if method == "GET" and route == ["llm-calls"]:
             return to_jsonable(service.runtime.store.list_llm_calls(pid=pid, limit=_query_int(query, "limit")))
+        if method == "GET" and route == ["rating"]:
+            return to_jsonable(service.runtime.ratings.get(pid))
+        if method == "POST" and route == ["rating"]:
+            body = self._read_body()
+            rating = service.runtime.ratings.upsert(
+                pid,
+                score=body.get("score"),
+                comment=body.get("comment", ""),
+            )
+            service.publish_runtime_changes("rating.upsert")
+            return to_jsonable(rating)
         if method == "GET" and route == ["audit"]:
             return to_jsonable(
                 service.runtime.audit.trace(
@@ -819,10 +938,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and route == ["exec"]:
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
+            llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
             self._require_confirmed(
                 "process.exec",
                 body,
-                {"pid": pid, "image": body.get("image"), "goal": body.get("goal"), "llm_profile": body.get("llm_profile")},
+                {"pid": pid, "image": body.get("image"), "goal": body.get("goal"), "llm_profile": llm_profile_id},
             )
             process = service.runtime.exec_process(
                 pid,
@@ -831,7 +951,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 goal=body.get("goal"),
                 preserve_memory=bool(body.get("preserve_memory", True)),
                 preserve_capabilities=bool(body.get("preserve_capabilities", False)),
-                llm_profile_id=str(body["llm_profile"]) if body.get("llm_profile") is not None else None,
+                llm_profile_id=llm_profile_id,
             )
             service.publish_runtime_changes("process.exec")
             if body.get("auto_run", True):
@@ -1097,6 +1217,29 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             }
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown image endpoint")
 
+    def _dispatch_llm_profiles(self, method: str, route: list[str]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service._llm_profile_summaries()
+        if method == "POST" and not route:
+            body = self._read_body()
+            profile_id = str(body.get("profile_id") or "").strip()
+            if not profile_id:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "profile_id is required")
+            summary = service.save_user_llm_profile(profile_id, body)
+            service.publish_runtime_changes("llm_profile.upsert")
+            return summary
+        if len(route) == 1 and method == "PUT":
+            body = self._read_body()
+            summary = service.save_user_llm_profile(route[0], body)
+            service.publish_runtime_changes("llm_profile.upsert")
+            return summary
+        if len(route) == 1 and method == "DELETE":
+            result = service.delete_user_llm_profile(route[0])
+            service.publish_runtime_changes("llm_profile.delete")
+            return result
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown LLM profile endpoint")
+
     def _coerce_image_package_files(self, value: Any) -> dict[str, bytes | str]:
         if not isinstance(value, dict) or not value:
             raise GuiServerError(HTTPStatus.BAD_REQUEST, "image registration requires non-empty package files")
@@ -1271,7 +1414,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         if self.close_connection:
             self.send_header("Connection", "close")
 
@@ -1286,6 +1429,7 @@ def create_gui_http_server(
     max_quanta: int | None | object = _CONFIG_DEFAULT,
     runtime: Runtime | None = None,
     config: AgentLibOSConfig | None = None,
+    llm_profiles_file: str | Path | None = None,
 ) -> GuiHTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("GUI server is local-only and must bind 127.0.0.1")
@@ -1296,6 +1440,7 @@ def create_gui_http_server(
         token=token,
         auto_run=auto_run,
         max_quanta=max_quanta,
+        llm_profiles_file=llm_profiles_file,
     )
     return GuiHTTPServer(("127.0.0.1", int(port)), service)
 
@@ -1308,6 +1453,7 @@ def serve(
     auto_run: bool,
     max_quanta: int | None | object,
     config: AgentLibOSConfig | None = None,
+    llm_profiles_file: str | Path | None = None,
     ready: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     server = create_gui_http_server(
@@ -1317,6 +1463,7 @@ def serve(
         auto_run=auto_run,
         max_quanta=max_quanta,
         config=config,
+        llm_profiles_file=llm_profiles_file,
     )
     host, selected_port = server.server_address
     payload = {"url": f"http://{host}:{selected_port}", "token": server.service.token, "db": server.service.db}
@@ -1337,6 +1484,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--db")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--token")
+    parser.add_argument(
+        "--llm-profiles-file",
+        default=None,
+        help=f"User-level GUI LLM profile JSON file. Defaults to {default_user_llm_profiles_path()}.",
+    )
     parser.add_argument("--no-auto-run", action="store_true")
     parser.add_argument(
         "--max-quanta",
@@ -1355,6 +1507,7 @@ def main(argv: list[str] | None = None) -> None:
         auto_run=not args.no_auto_run,
         max_quanta=args.max_quanta,
         config=selected_config,
+        llm_profiles_file=args.llm_profiles_file,
     )
 
 

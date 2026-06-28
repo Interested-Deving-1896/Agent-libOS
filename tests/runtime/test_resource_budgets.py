@@ -127,7 +127,8 @@ class TestResourceBudgets:
             runtime.close()
 
     def test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record(self) -> None:
-        runtime = Runtime.open("local")
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False))
+        runtime = Runtime.open("local", config=config)
         try:
             runtime.llm.client = FailingClient()
             pid = runtime.process.spawn(

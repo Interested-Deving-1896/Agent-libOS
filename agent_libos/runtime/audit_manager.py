@@ -4,11 +4,11 @@ from typing import Any
 
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import AuditRecord
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 
 
 class AuditManager:
-    def __init__(self, store: SQLiteStore):
+    def __init__(self, store: RuntimeStore):
         self.store = store
 
     def record(

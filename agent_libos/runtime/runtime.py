@@ -45,12 +45,13 @@ from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.object_tasks import ObjectTaskManager
 from agent_libos.runtime.process_manager import ProcessManager
+from agent_libos.runtime.ratings import AgentRatingManager
 from agent_libos.runtime.resource_manager import ResourceManager
 from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.runtime.syscall_router import SyscallRouter
 from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES
 from agent_libos.skills.manager import SkillManager
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore, open_store
 from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.utils.ids import new_id, utc_now
@@ -67,7 +68,7 @@ class Runtime:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         llm_client: LLMClient | None = None,
         substrate: ResourceProviderSubstrate | None = None,
         config: AgentLibOSConfig | None = None,
@@ -86,6 +87,7 @@ class Runtime:
         self.llms = LLMProfileRegistry(self, config=self.config)
         self.audit = AuditManager(store)
         self.events = EventBus(store)
+        self.ratings = AgentRatingManager(store, self.audit, config=self.config)
         self.resources = ResourceManager(store, self.audit, self.events)
         self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
         self.provider_hooks: dict[str, list[Any]] = {}
@@ -231,10 +233,7 @@ class Runtime:
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> "Runtime":
         selected_config = config or DEFAULT_CONFIG
-        selected_target = selected_config.runtime.local_store_target if target is None else target
-        selected_target_text = str(selected_target)
-        store_target = ":memory:" if selected_target_text in {"local", ":memory:"} else selected_target_text
-        store = SQLiteStore(store_target, config=selected_config)
+        store = open_store(target, config=selected_config)
         try:
             return cls(
                 store,
@@ -1211,11 +1210,7 @@ class Runtime:
                     order_by="parent_pid, child_pid",
                 ),
             },
-            "object_payloads": {
-                oid: deepcopy(self.store._object_payloads[oid])
-                for oid in object_oids
-                if oid in self.store._object_payloads
-            },
+            "object_payloads": self.store.snapshot_object_payloads(object_oids),
             "tool_ids": tool_ids,
             "tool_handles": {
                 tool_id: deepcopy(getattr(self.tools, "_handles", {}).get(tool_id))
@@ -1281,9 +1276,12 @@ class Runtime:
                 self.checkpoint._insert_row(cur, "object_namespaces", row)
             for row in tables["objects"]:
                 item = dict(row)
-                item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
-                self.checkpoint._insert_row(cur, "objects", item)
                 oid = str(item["oid"])
+                if oid in state["object_payloads"]:
+                    item["payload_json"] = dumps(state["object_payloads"][oid])
+                else:
+                    item["payload_json"] = dumps(self.store.payload_marker(present=False))
+                self.checkpoint._insert_row(cur, "objects", item)
                 if oid in state["object_payloads"]:
                     self.store.set_object_payload(oid, deepcopy(state["object_payloads"][oid]))
             for table in [
@@ -1796,7 +1794,7 @@ class Runtime:
         provenance = loads(item.get("provenance_json"), {})
         provenance["parent_oids"] = [oid_map.get(oid, oid) for oid in provenance.get("parent_oids", [])]
         item["provenance_json"] = dumps(provenance)
-        item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
+        item["payload_json"] = dumps(self.store.payload_marker(present=False))
         item["created_at"] = now
         item["updated_at"] = now
         return item
@@ -1834,31 +1832,32 @@ class Runtime:
         return item
 
     def _insert_committed_memory_rows(self, remapped: dict[str, Any]) -> None:
-        with self.store._lock:
-            cur = self.store.conn.cursor()
+        with self.store.transaction(include_object_payloads=True) as cur:
             for row in remapped["object_namespaces"]:
                 exists = cur.execute("SELECT 1 FROM object_namespaces WHERE namespace = ?", (row["namespace"],)).fetchone()
                 if exists is None:
                     self.checkpoint._insert_row(cur, "object_namespaces", row)
             for row in remapped["objects"]:
-                self.checkpoint._insert_row(cur, "objects", row)
-                self.store.set_object_payload(row["oid"], deepcopy(remapped["object_payloads"][row["oid"]]))
+                item = dict(row)
+                oid = str(item["oid"])
+                if oid in remapped["object_payloads"]:
+                    item["payload_json"] = dumps(remapped["object_payloads"][oid])
+                self.checkpoint._insert_row(cur, "objects", item)
+                if oid in remapped["object_payloads"]:
+                    self.store.set_object_payload(oid, deepcopy(remapped["object_payloads"][oid]))
             for table in ["object_links", "capabilities"]:
                 for row in remapped[table]:
                     self.checkpoint._insert_row(cur, table, row)
-            self.store.conn.commit()
 
     def _restore_committed_registry_rows(self, artifact: dict[str, Any]) -> None:
         rows = artifact.get("rows", {})
-        with self.store._lock:
-            cur = self.store.conn.cursor()
+        with self.store.transaction() as cur:
             for row in rows.get("skills", []):
                 self.checkpoint._upsert_row(cur, "skills", row, "skill_id")
             # Checkpoint-derived images restore only internal process runtime
             # state. External/provider registries and global trust decisions are
             # host state, so even legacy artifacts carrying those rows must not
             # resurrect them during image boot.
-            self.store.conn.commit()
 
     def _restore_committed_tool_table(self, pid: str, artifact: dict[str, Any]) -> dict[str, str]:
         tool_rows = {row["tool_id"]: row for row in artifact.get("rows", {}).get("tools", [])}

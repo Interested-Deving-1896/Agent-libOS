@@ -38,7 +38,7 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.tools.observability import ensure_json_size
 
 
@@ -123,7 +123,7 @@ class ObjectMemoryManager:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
@@ -164,7 +164,7 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         obj_type = ObjectType(object_type)
         self._validate_payload_size(payload, "object payload")
-        with self.store._lock:
+        with self.store.locked():
             now = utc_now()
             oid = new_id("obj")
             object_namespace = self.resolve_namespace(pid, namespace)
@@ -273,7 +273,7 @@ class ObjectMemoryManager:
         parent_namespace: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ObjectNamespace:
-        with self.store._lock:
+        with self.store.locked():
             namespace_name = self._normalize_namespace(namespace)
             if self.store.namespace_exists(namespace_name):
                 raise ValidationError(f"Object Memory namespace already exists: {namespace_name}")
@@ -464,7 +464,7 @@ class ObjectMemoryManager:
         return handle
 
     def update_object(self, pid: str, handle: ObjectHandle, patch: ObjectPatch) -> ObjectHandle:
-        with self.store._lock:
+        with self.store.locked():
             write_decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.WRITE)
             if not write_decision.allowed:
                 raise CapabilityDenied(write_decision.reason)
@@ -563,7 +563,7 @@ class ObjectMemoryManager:
         *,
         issued_by: str = "memory.append",
     ) -> tuple[AgentObject, str | None, int]:
-        with self.store._lock:
+        with self.store.locked():
             object_namespace = self.resolve_namespace(pid, namespace)
             object_name = self._normalize_name(name)
             namespace_decision = self._require_namespace_right(pid, object_namespace, "read")

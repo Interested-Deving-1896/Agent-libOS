@@ -5,6 +5,7 @@ import type { GuiConnection, HumanRequest, RuntimeSnapshot } from "./api/types";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
 import { ImageSelect } from "./components/ImageSelect";
+import { LLMProfileSelect } from "./components/LLMProfileSelect";
 import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
 import { TopBar } from "./components/TopBar";
@@ -13,6 +14,7 @@ import { previewImageManifest } from "./imagePreview";
 import { useI18n } from "./i18n";
 import type { OptionalQuanta } from "./quanta";
 import { reconcileSelectedPid } from "./selection";
+import type { LLMProfileInput } from "./api/types";
 
 type PendingConfirm = {
   title: string;
@@ -31,10 +33,12 @@ export function App() {
   const [maxQuanta, setMaxQuanta] = useState<OptionalQuanta>(null);
   const [spawnGoal, setSpawnGoal] = useState("Summarize the current project state.");
   const [spawnImage, setSpawnImage] = useState("coding-agent:v0");
+  const [spawnLlmProfile, setSpawnLlmProfile] = useState("");
   const [spawnWorkingDirectory, setSpawnWorkingDirectory] = useState("");
   const [message, setMessage] = useState("");
   const [cwd, setCwd] = useState("");
   const [execImage, setExecImage] = useState("base-agent:v0");
+  const [execLlmProfile, setExecLlmProfile] = useState("");
   const [execGoal, setExecGoal] = useState("");
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -136,7 +140,8 @@ export function App() {
     if (!client) return;
     await safe(async () => {
       const result = await client.spawn(spawnGoal, spawnImage, maxQuanta, Boolean(snapshot?.scheduler.auto_run), {
-        workingDirectory: spawnWorkingDirectory
+        workingDirectory: spawnWorkingDirectory,
+        llmProfile: spawnLlmProfile || undefined
       });
       const pid = (result as { pid?: string }).pid;
       if (pid) setSelectedPid(pid);
@@ -159,15 +164,45 @@ export function App() {
     });
   }
 
+  async function rateProcess(pid: string, score: number, comment: string): Promise<boolean> {
+    if (!client) return false;
+    return safe(async () => {
+      await client.submitAgentRating(pid, score, comment);
+    });
+  }
+
+  async function createLlmProfile(profile: LLMProfileInput): Promise<boolean> {
+    if (!client) return false;
+    return safe(async () => {
+      await client.createLLMProfile(profile);
+    });
+  }
+
+  async function updateLlmProfile(profileId: string, profile: LLMProfileInput): Promise<boolean> {
+    if (!client) return false;
+    return safe(async () => {
+      await client.updateLLMProfile(profileId, profile);
+    });
+  }
+
+  async function deleteLlmProfile(profileId: string): Promise<boolean> {
+    if (!client) return false;
+    return safe(async () => {
+      await client.deleteLLMProfile(profileId);
+      if (spawnLlmProfile === profileId) setSpawnLlmProfile("");
+      if (execLlmProfile === profileId) setExecLlmProfile("");
+    });
+  }
+
   function confirmExec() {
     if (!client || !selectedProcess) return;
     const pid = selectedProcess.pid;
     setPendingConfirm({
       title: t("app.exec.title"),
       message: t("app.exec.message"),
-      details: { pid, image: execImage, goal: execGoal, auto_run: snapshot?.scheduler.auto_run, max_quanta: maxQuanta },
+      details: { pid, image: execImage, goal: execGoal, llm_profile: execLlmProfile || null, auto_run: snapshot?.scheduler.auto_run, max_quanta: maxQuanta },
       action: async () => {
-        await client.execProcess(pid, execImage, execGoal, true, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
+        await client.execProcess(pid, execImage, execGoal, true, Boolean(snapshot?.scheduler.auto_run), maxQuanta, execLlmProfile || undefined);
         setPendingConfirm(null);
         await refresh();
       }
@@ -280,13 +315,16 @@ export function App() {
           maxQuanta={maxQuanta}
           spawnGoal={spawnGoal}
           spawnImage={spawnImage}
+          spawnLlmProfile={spawnLlmProfile}
           spawnWorkingDirectory={spawnWorkingDirectory}
           message={message}
           images={snapshot?.images ?? []}
+          llmProfiles={snapshot?.llm_profiles ?? []}
           onSelectPid={setSelectedPid}
           onMaxQuantaChange={setMaxQuanta}
           onSpawnGoalChange={setSpawnGoal}
           onSpawnImageChange={setSpawnImage}
+          onSpawnLlmProfileChange={setSpawnLlmProfile}
           onSpawnWorkingDirectoryChange={setSpawnWorkingDirectory}
           onMessageChange={setMessage}
           onSpawn={() => void spawnProcess()}
@@ -294,6 +332,10 @@ export function App() {
           onCommitImage={confirmCommitImage}
           onSend={(kind) => void send(kind)}
           onRespond={(request, approved, answer = "") => respond(request, approved, answer)}
+          onRate={rateProcess}
+          onCreateLlmProfile={createLlmProfile}
+          onUpdateLlmProfile={updateLlmProfile}
+          onDeleteLlmProfile={deleteLlmProfile}
           onRun={() => selectedProcess && client && void safe(() => client.run(selectedProcess.pid, maxQuanta).then(() => undefined))}
           onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
           onRefresh={() => void refresh()}
@@ -327,6 +369,15 @@ export function App() {
               </div>
               <div className="spawnBox">
                 <ImageSelect images={snapshot?.images ?? []} value={spawnImage} label={t("operator.spawnImage")} onChange={setSpawnImage} />
+                <LLMProfileSelect
+                  profiles={snapshot?.llm_profiles ?? []}
+                  value={spawnLlmProfile}
+                  label={t("llmProfile.spawnLabel")}
+                  onChange={setSpawnLlmProfile}
+                  onCreate={createLlmProfile}
+                  onUpdate={updateLlmProfile}
+                  onDelete={deleteLlmProfile}
+                />
                 <input
                   value={spawnWorkingDirectory}
                   onChange={(event) => setSpawnWorkingDirectory(event.currentTarget.value)}
@@ -342,7 +393,7 @@ export function App() {
               <div className="paneHeader">
                 <div>
                   <h1>{selectedProcess?.pid ?? t("operator.noProcessSelected")}</h1>
-                  {selectedProcess ? <span>{selectedProcess.image_id} · {selectedProcess.status} · {t("operator.cwd")} {selectedProcess.working_directory}</span> : null}
+                  {selectedProcess ? <span>{selectedProcess.image_id} · {selectedProcess.status} · {selectedProcess.llm_profile_id} · {t("operator.cwd")} {selectedProcess.working_directory}</span> : null}
                 </div>
                 {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={16} /> {t("operator.interruptPending")}</span> : null}
               </div>
@@ -381,6 +432,16 @@ export function App() {
                 <input value={cwd} placeholder={t("operator.newCwdPlaceholder")} onChange={(event) => setCwd(event.currentTarget.value)} />
                 <button disabled={!client || !selectedProcess || !cwd.trim()} onClick={() => selectedProcess && void safe(() => client!.changeDirectory(selectedProcess.pid, cwd).then(() => undefined))}>cd</button>
                 <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} onChange={setExecImage} />
+                <LLMProfileSelect
+                  profiles={snapshot?.llm_profiles ?? []}
+                  value={execLlmProfile}
+                  label={t("llmProfile.execLabel")}
+                  disabled={!selectedProcess}
+                  onChange={setExecLlmProfile}
+                  onCreate={createLlmProfile}
+                  onUpdate={updateLlmProfile}
+                  onDelete={deleteLlmProfile}
+                />
                 <input value={execGoal} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
                 <button disabled={!selectedProcess} className="warning" onClick={confirmExec}>{t("operator.exec")}</button>
                 <button disabled={!selectedProcess} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
@@ -392,6 +453,7 @@ export function App() {
                 onCommitImage={confirmCommitImage}
                 onUseImageForSpawn={setSpawnImage}
                 onUseImageForExec={setExecImage}
+                onRate={rateProcess}
                 onInspectImage={(imageId) => {
                   if (!client) throw new Error(t("app.clientUnavailable"));
                   return client.inspectImage(imageId);

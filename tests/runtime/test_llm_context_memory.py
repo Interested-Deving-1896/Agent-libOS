@@ -1,6 +1,7 @@
 from __future__ import annotations
 import pytest
 import json
+import sqlite3
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -334,7 +335,8 @@ class TestLLMContextMemory:
             assert tool_calls[:2] == ['create_memory_object', 'process_exit']
             llm_call = runtime.store.list_llm_calls(pid)[0]
             assert llm_call.request_options['openai_parallel_tool_calls_enabled'] is True
-            assert llm_call.tool_calls['sha256']
+            assert llm_call.tool_calls[0]['name'] == 'create_memory_object'
+            assert llm_call.observability['tool_calls']['sha256']
             batches = [record for record in runtime.audit.trace() if record.action == 'llm.action_batch']
             assert len(batches) == 1
             assert batches[0].decision['executed_count'] == 2
@@ -640,13 +642,13 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
-    def test_llm_call_records_persist_sanitized_prompt_output_usage_and_reasoning(self) -> None:
+    def test_llm_call_records_persist_full_io_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
             runtime = Runtime.open(db)
             try:
                 runtime.llm.client = MetadataActionClient()
-                pid = runtime.process.spawn(image='base-agent:v0', goal='persist llm calls')
+                pid = runtime.process.spawn(image='base-agent:v0', goal='persist full llm calls by default')
                 runtime.run_next_process_once()
                 calls = runtime.store.list_llm_calls(pid)
                 assert len(calls) == 1
@@ -660,15 +662,16 @@ class TestLLMContextMemory:
                 assert call.response_id == 'resp_123'
                 assert call.response_content == 'visible assistant text'
                 assert call.usage['total_tokens'] == 17
-                assert call.messages['sha256']
-                assert call.tools['sha256']
-                assert call.tool_calls['sha256']
-                assert call.raw_response['sha256']
-                assert call.reasoning['sha256']
+                assert call.messages[1]['content']
+                assert 'persist full llm calls by default' in call.messages[1]['content']
+                assert any((tool['function']['name'] == 'process_exit' for tool in call.tools))
+                assert call.tool_calls[0]['name'] == 'process_exit'
+                assert call.tool_calls[0]['arguments'] == json.dumps({'payload': {'done': True}})
+                assert call.raw_response['id'] == 'raw_resp'
+                assert call.reasoning == {'summary': 'selected process_exit'}
                 assert call.observability['response_content']['sha256']
                 serialized = json.dumps(call.__dict__, sort_keys=True)
-                assert 'persist llm calls' not in serialized
-                assert '"payload": {"done": true}' not in serialized
+                assert 'persist full llm calls by default' in serialized
             finally:
                 runtime.close()
             reopened = Runtime.open(db)
@@ -676,39 +679,41 @@ class TestLLMContextMemory:
                 persisted = reopened.store.list_llm_calls()
                 assert len(persisted) == 1
                 assert persisted[0].usage['prompt_tokens'] == 13
+                assert 'persist full llm calls by default' in persisted[0].messages[1]['content']
+                assert persisted[0].raw_response['provider'] == 'fake'
                 assert persisted[0].observability['messages']['bytes'] > 0
             finally:
                 reopened.close()
 
-    def test_llm_call_records_can_persist_full_io_when_configured(self) -> None:
+    def test_llm_call_records_can_opt_out_of_full_io_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
-            config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, persist_full_io=True))
+            config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False))
             runtime = Runtime.open(db, config=config)
             try:
                 runtime.llm.client = MetadataActionClient()
-                pid = runtime.process.spawn(image='base-agent:v0', goal='persist full llm calls')
-
+                pid = runtime.process.spawn(image='base-agent:v0', goal='do not persist full llm calls')
                 runtime.run_next_process_once()
-                call = runtime.store.list_llm_calls(pid)[0]
 
-                assert call.messages[1]['content']
-                assert 'persist full llm calls' in call.messages[1]['content']
-                assert any((tool['function']['name'] == 'process_exit' for tool in call.tools))
+                call = runtime.store.list_llm_calls(pid)[0]
                 assert call.response_content == 'visible assistant text'
-                assert call.tool_calls[0]['name'] == 'process_exit'
-                assert call.tool_calls[0]['arguments'] == json.dumps({'payload': {'done': True}})
-                assert call.reasoning == {'summary': 'selected process_exit'}
-                assert call.raw_response['id'] == 'raw_resp'
+                assert call.messages['sha256']
+                assert call.tools['sha256']
+                assert call.tool_calls['sha256']
+                assert call.raw_response['sha256']
+                assert call.reasoning['sha256']
                 assert call.observability['messages']['sha256']
+                serialized = json.dumps(call.__dict__, sort_keys=True)
+                assert 'do not persist full llm calls' not in serialized
+                assert '"payload": {"done": true}' not in serialized
             finally:
                 runtime.close()
 
             reopened = Runtime.open(db, config=config)
             try:
                 persisted = reopened.store.list_llm_calls(pid)[0]
-                assert 'persist full llm calls' in persisted.messages[1]['content']
-                assert persisted.raw_response['provider'] == 'fake'
+                assert persisted.messages['sha256']
+                assert persisted.raw_response['sha256']
             finally:
                 reopened.close()
 
@@ -777,6 +782,161 @@ class TestLLMContextMemory:
                 assert 'safe-session' not in serialized_options
             finally:
                 runtime.close()
+
+    def test_empty_tool_calls_without_auto_wait_still_fail_action_selection(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=1))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = TextOnlyActionClient(['I will wait for more instructions.'])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='empty tool calls disabled')
+
+            result = runtime.run_next_process_once()
+
+            assert not result['ok']
+            assert 'no valid tool call or fallback JSON action found' in result['error']
+            assert runtime.process.get(pid).status == ProcessStatus.FAILED
+            assert not any(record.action == 'llm.empty_tool_calls_auto_wait' for record in runtime.audit.trace())
+            call = runtime.store.list_llm_calls(pid)[0]
+            assert call.tool_calls == []
+            assert call.request_options['agent_libos_auto_wait_on_empty_tool_calls_enabled'] is False
+        finally:
+            runtime.close()
+
+    def test_empty_tool_calls_auto_waits_for_any_process_message(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = TextOnlyActionClient(['Waiting for the next message.'])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='empty tool calls auto wait')
+
+            result = runtime.run_next_process_once()
+
+            assert result['waiting_message']
+            assert result['filters'] == {
+                'kind': None,
+                'sender': None,
+                'channel': None,
+                'correlation_id': None,
+                'reply_to': None,
+                'message_ids': None,
+            }
+            assert runtime.process.get(pid).status == ProcessStatus.WAITING_EVENT
+            pending = runtime.store.get_llm_pending_action(pid)
+            assert pending['wait_type'] == 'message'
+            assert pending['action'] == {'action': 'receive_process_messages'}
+            call = runtime.store.list_llm_calls(pid)[0]
+            assert call.tool_calls == []
+            assert call.request_options['agent_libos_auto_wait_on_empty_tool_calls_enabled'] is True
+            auto_waits = [record for record in runtime.audit.trace() if record.action == 'llm.empty_tool_calls_auto_wait']
+            assert auto_waits[0].decision['action'] == {'action': 'receive_process_messages'}
+        finally:
+            runtime.close()
+
+    def test_empty_tool_calls_auto_wait_reads_existing_unread_message(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = TextOnlyActionClient(['Waiting for any message.'])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='read queued message')
+            queued = runtime.human.send_process_message(pid, 'queued input', subject='queued')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['action']['action'] == 'receive_process_messages'
+            assert result['result']['payload']['messages'][0]['message_id'] == queued.message_id
+            assert result['result']['payload']['acked_message_ids'] == [queued.message_id]
+            assert runtime.messages.unread(pid) == []
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_empty_tool_calls_auto_wait_preserves_json_action_fallback(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = TextOnlyActionClient(['{"action":"process_exit","payload":{"done":true}}'])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='json fallback')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['action']['action'] == 'process_exit'
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            assert not any(record.action == 'llm.empty_tool_calls_auto_wait' for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
+    def test_empty_tool_calls_auto_wait_does_not_bypass_tool_table(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id='no-message-wait:v0',
+                    name='no-message-wait',
+                    system_prompt='Use only the configured tools.',
+                    default_tools=['process_exit'],
+                ),
+                actor='test',
+            )
+            runtime.llm.client = TextOnlyActionClient(['Standing by.'])
+            pid = runtime.process.spawn(image='no-message-wait:v0', goal='no receive tool')
+
+            result = runtime.run_next_process_once()
+
+            assert not result['ok']
+            assert 'receive_process_messages' in result['error']
+            assert runtime.process.get(pid).status == ProcessStatus.FAILED
+            assert any(record.action == 'llm.empty_tool_calls_auto_wait' for record in runtime.audit.trace())
+            assert not any(
+                record.action == 'tool.call' and record.decision.get('tool') == 'receive_process_messages'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_empty_tool_calls_auto_wait_pending_action_survives_runtime_reopen(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db, config=config)
+            try:
+                runtime.llm.client = TextOnlyActionClient(['Waiting across restart.'])
+                pid = runtime.process.spawn(image='base-agent:v0', goal='persist auto wait')
+                waiting = runtime.run_next_process_once()
+                assert waiting['waiting_message']
+                assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'message'
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db, config=config)
+            try:
+                reopened.llm.client = ExplodingClient()
+                message = reopened.human.send_process_message(pid, 'resume now', subject='resume')
+                resumed = reopened.run_next_process_once()
+
+                assert resumed['resumed_after_message']
+                assert resumed['action']['action'] == 'receive_process_messages'
+                assert resumed['result']['payload']['messages'][0]['message_id'] == message.message_id
+                assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
+            finally:
+                reopened.close()
 
     def test_pending_human_llm_action_survives_runtime_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1108,7 +1268,8 @@ class TestLLMContextMemory:
     def test_reopen_after_compressor_exit_reruns_missing_result_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
-            runtime = Runtime.open(db)
+            config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False))
+            runtime = Runtime.open(db, config=config)
             try:
                 runtime.llm.client = RecordingActionClient([
                     {
@@ -1125,11 +1286,22 @@ class TestLLMContextMemory:
                 child_pid = waiting['child_pid']
                 child_exit = runtime.run_process_once(child_pid)
                 assert child_exit['result']['ok']
+                result_oid = child_exit['result']['payload']['result_oid']
                 assert runtime.store.get_llm_pending_action(pid)['status'] == 'pending'
             finally:
                 runtime.close()
 
-            reopened = Runtime.open(db)
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    "UPDATE objects SET payload_json = ? WHERE oid = ?",
+                    (json.dumps({"storage": "runtime_memory", "present": True}), result_oid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            reopened = Runtime.open(db, config=config)
             try:
                 reopened.llm.client = RecordingActionClient([
                     {'action': 'process_exit', 'payload': _compact_summary('rerun result')},
@@ -1191,6 +1363,29 @@ class MetadataActionClient:
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         return LLMCompletion(content='visible assistant text', tool_calls=[{'id': 'tool_123', 'name': 'process_exit', 'arguments': json.dumps({'payload': {'done': True}})}], raw=SimpleNamespace(id='raw_resp', provider='fake'), api='chat', response_id='resp_123', request_id='req_123', model='test-model', usage={'prompt_tokens': 13, 'completion_tokens': 4, 'total_tokens': 17}, reasoning={'summary': 'selected process_exit'})
+
+
+class TextOnlyActionClient:
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = list(contents)
+        self.user_prompts: list[str] = []
+        self.tool_batches: list[list[dict[str, Any]]] = []
+
+    def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
+        if not self.contents:
+            raise AssertionError('no text-only response remains')
+        self.user_prompts.append(str(messages[-1]['content']))
+        self.tool_batches.append(tools)
+        index = len(self.user_prompts)
+        return LLMCompletion(
+            content=self.contents.pop(0),
+            tool_calls=[],
+            api='chat',
+            response_id=f'text_only_resp_{index}',
+            request_id=f'text_only_req_{index}',
+            model='text-only-test-model',
+            usage={'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8},
+        )
 
 
 class MultiToolActionClient:

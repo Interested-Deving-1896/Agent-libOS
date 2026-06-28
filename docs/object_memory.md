@@ -113,7 +113,7 @@ explicitly writes JSON `null` as the payload.
 
 An Object can own background tool tasks. A task records its owner oid, creator
 pid, dedicated runner pid, tool, status, result oid, wait information, and
-notification state in SQLite, but it does not persist full tool arguments.
+notification state in the runtime store, but it does not persist full tool arguments.
 Arguments continue through the existing bounded, redacted tool audit path.
 
 The runner is a child process whose tool table is narrowed to the requested
@@ -200,13 +200,17 @@ known gap for future audit explain work.
 
 ## Persistence Invariant
 
-Object metadata and namespace directories are stored in SQLite. Ordinary object
-payloads are not stored as durable `objects.payload_json` rows; they live in
-runtime memory.
+Object metadata and namespace directories are stored in the runtime store.
+Ordinary object payloads are runtime-only; `objects.payload_json` stores a
+runtime-memory marker rather than the user payload for both SQLite and
+PostgreSQL backends.
 
-Scoped checkpoint snapshots are the explicit exception. A checkpoint can
-capture object payloads needed to reconstruct a process subtree, subject to
-configured snapshot limits.
+If a reopen cannot materialize a live payload cache for a marker row, the object
+is released fail-closed instead of treating the marker as user payload.
+
+Scoped checkpoint snapshots and image artifacts can explicitly capture object
+payloads needed to reconstruct a process subtree, subject to configured
+snapshot limits.
 
 Root process-owned memory is released on process exit unless retained as the
 final process result. Non-root terminal process memory is held only until the

@@ -290,6 +290,57 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_fork_child_process_tool_allows_authorized_cross_image_fork(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='review-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            _grant_image_read(runtime, parent, 'coding-agent:v0')
+            parent_note = runtime.memory.create_object(
+                pid=parent,
+                object_type='observation',
+                name='parent.fork.note',
+                payload={'visible_to_parent': True},
+            )
+
+            forked = runtime.tools.call(
+                parent,
+                'fork_child_process',
+                {'goal': 'cross image fork', 'image': 'coding-agent:v0', 'include_parent_roots': False},
+            )
+
+            assert forked.ok, forked.error
+            child = runtime.process.get(forked.payload['child_pid'])
+            assert child.parent_pid == parent
+            assert child.image_id == 'coding-agent:v0'
+            assert 'read_text_file' in child.tool_table
+            assert parent_note.oid not in [handle.oid for handle in child.memory_view.roots]
+            assert [handle.oid for handle in child.memory_view.roots] == [child.goal_oid]
+            read_resource = runtime.filesystem.resource_for_path('README.md')
+            assert not runtime.capability.check(child.pid, read_resource, CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_fork_child_process_tool_requires_cross_image_read_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='review-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            before = len(runtime.process.list())
+
+            denied = runtime.tools.call(
+                parent,
+                'fork_child_process',
+                {'goal': 'denied cross image fork', 'image': 'coding-agent:v0'},
+            )
+
+            assert not denied.ok
+            assert 'image:coding-agent:v0' in (denied.error or '')
+            assert len(runtime.process.list()) == before
+            assert runtime.process.list_children(parent) == []
+        finally:
+            runtime.close()
+
     def test_spawn_child_process_requires_process_spawn_authority(self) -> None:
         runtime = Runtime.open('local')
         try:

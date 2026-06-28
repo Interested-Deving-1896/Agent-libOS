@@ -3,9 +3,11 @@ import type { ImageInspectResult, RuntimeProcess, RuntimeSnapshot } from "../api
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
 import { ImagePanel } from "./ImagePanel";
+import { RatingPanel } from "./RatingPanel";
 
 const tabs = [
   { key: "overview", label: "details.overview" },
+  { key: "rating", label: "details.rating" },
   { key: "capabilities", label: "details.capabilities" },
   { key: "toolsSkills", label: "details.toolsSkills" },
   { key: "checkpoints", label: "details.checkpoints" },
@@ -25,6 +27,7 @@ export function DetailTabs({
   onCommitImage,
   onUseImageForSpawn,
   onUseImageForExec,
+  onRate,
   onInspectImage
 }: {
   process: RuntimeProcess | null;
@@ -33,6 +36,7 @@ export function DetailTabs({
   onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
   onUseImageForSpawn(imageId: string): void;
   onUseImageForExec(imageId: string): void;
+  onRate(pid: string, score: number, comment: string): Promise<boolean>;
   onInspectImage(imageId: string): Promise<ImageInspectResult>;
 }) {
   const { t } = useI18n();
@@ -52,6 +56,7 @@ export function DetailTabs({
         onCommitImage,
         onUseImageForSpawn,
         onUseImageForExec,
+        onRate,
         onInspectImage
       })}</div>
     </aside>
@@ -68,11 +73,13 @@ function renderTab(
     onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
     onUseImageForSpawn(imageId: string): void;
     onUseImageForExec(imageId: string): void;
+    onRate(pid: string, score: number, comment: string): Promise<boolean>;
     onInspectImage(imageId: string): Promise<ImageInspectResult>;
   }
 ) {
   if (!process && !["jsonRpc", "toolsSkills", "images"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
   if (tab === "overview") return <JsonBlock value={process} />;
+  if (tab === "rating") return <RatingPanel process={process} onSave={imageActions.onRate} />;
   if (tab === "capabilities") return <JsonBlock value={{ capability_ids: process?.capabilities }} />;
   if (tab === "toolsSkills") return <JsonBlock value={{ process_tools: process?.tool_table, loaded_skills: process?.loaded_skills, registry: snapshot.skills, tools: snapshot.tools }} />;
   if (tab === "checkpoints") return <JsonBlock value={{ checkpoint_head: process?.checkpoint_head }} />;

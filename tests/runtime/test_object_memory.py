@@ -757,6 +757,8 @@ class TestObjectMemoryName:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='sqlite payload boundary')
                 handle = runtime.memory.create_object(pid=pid, object_type=ObjectType.ARTIFACT, payload={'secret': secret}, name='volatile.secret')
                 assert runtime.memory.get_object(pid, handle).payload == {'secret': secret}
+                rows = runtime.store.select_table_rows('objects', 'oid = ?', (handle.oid,))
+                assert json.loads(rows[0]['payload_json']) == {'storage': 'runtime_memory', 'present': True}
             finally:
                 runtime.close()
             conn = sqlite3.connect(db_path)
@@ -804,6 +806,16 @@ class TestObjectMemoryName:
                 )
             finally:
                 runtime.close()
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    'UPDATE objects SET payload_json = ? WHERE oid = ?',
+                    (json.dumps({'storage': 'runtime_memory', 'present': True}), old.oid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             reopened = Runtime.open(db_path)
             try:

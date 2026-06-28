@@ -54,7 +54,7 @@ uv run python scripts/test_matrix.py --lane runtime --workers auto
 
 `--workers` applies only to Python lanes. The `runtime` and `all` lanes default
 to bounded parallel execution with at most four workers and `--dist worksteal`,
-which keeps CI runtime below the lane budget while balancing long SQLite and
+which keeps CI runtime below the lane budget while balancing long persistence and
 runtime-reopen tests. Pass `--workers 1` for serial failure diagnosis, or set
 `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to override defaults in CI.
 Run the `gui` lane separately because it writes shared frontend build artifacts;
@@ -141,6 +141,13 @@ Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
 provider return multiple tool calls in one action-selection response. Agent
 libOS dispatches that batch sequentially in one quantum; it does not run tools
 concurrently.
+Set `llm.auto_wait_on_empty_tool_calls: true` globally or on a specific LLM
+profile only for providers that sometimes answer action-selection requests
+without tool calls. When enabled, Agent libOS first preserves the existing
+fallback JSON action parser; if the response still contains no valid action, it
+synthesizes a `receive_process_messages` action with default arguments. The raw
+LLM call record still stores the provider response with an empty `tool_calls`
+list, and the synthetic wait listens for any unread process message.
 
 Run a script smoke:
 
@@ -155,10 +162,11 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 ```
 
 Every runtime LLM action-selection call must persist an `llm_calls` row with
-provider ids, model/API mode, usage, errors, and bounded observability envelopes
-for prompt, visible tools, output, tool calls, reasoning metadata, and raw
-responses. Full prompt and raw provider payloads are intentionally not persisted
-by default.
+provider ids, model/API mode, usage, errors, full prompt, visible tools,
+output, tool calls, reasoning metadata, raw responses, and bounded
+observability envelopes. This default supports self-evolution training and
+fine-tuning pipelines; deployments should disclose that retention and use in
+their user agreement.
 
 LLM providers are selected through host-configured named profiles. Processes
 persist only `llm_profile_id`; the Runtime resolves that id for each quantum and
@@ -168,12 +176,50 @@ behavior. Other named profiles do not inherit ambient provider/model
 environment variables; set their profile fields explicitly when they should use
 a non-default model or endpoint.
 
-Set `llm.persist_full_io: true` in a config overlay, or construct a replacement
-`AgentLibOSConfig`, to opt into full prompt, visible tool schema, model output,
-tool call, reasoning, and raw response persistence. The config dataclasses are
-frozen, so do not mutate `DEFAULT_CONFIG` in place. Full I/O persistence is
-intended for explicit local debugging or forensic runs because it can store
-user data, object memory excerpts, and provider payloads in SQLite.
+The GUI can also create user-level profiles without editing the project config.
+Those profiles are host configuration, not runtime database state. Electron
+stores them at `app.getPath("userData")/llm-profiles.json`; direct Python GUI
+server runs use `%APPDATA%/Agent libOS/llm-profiles.json` on Windows,
+`~/Library/Application Support/Agent libOS/llm-profiles.json` on macOS, and
+`${XDG_CONFIG_HOME:-~/.config}/agent-libos/llm-profiles.json` on Linux unless
+`agent-libos-gui-server --llm-profiles-file <path>` is provided. The file stores
+only non-secret routing fields and the `api_key_env` variable name; never put
+the API key value in it.
+
+Example user/config profile fields for common OpenAI-compatible providers:
+
+```yaml
+llm:
+  profiles:
+    gpt-5.5:
+      model: gpt-5.5
+      api_key_env: OPENAI_API_KEY
+    qwen3.7-max:
+      base_url: https://dashscope-compatible.example/v1
+      model: qwen3.7-max
+      api_key_env: QWEN_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+    glm-5.2:
+      base_url: https://open.bigmodel.example/api/paas/v4
+      model: glm-5.2
+      api_key_env: GLM_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+    kimi-k2.7-code:
+      base_url: https://api.moonshot.example/v1
+      model: kimi-k2.7-code
+      api_key_env: KIMI_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+```
+
+Set `llm.persist_full_io: false` in a config overlay, or construct a replacement
+`AgentLibOSConfig`, to opt out of full prompt, visible tool schema, model
+output, tool call, reasoning, and raw response persistence. The config
+dataclasses are frozen, so do not mutate `DEFAULT_CONFIG` in place. When full
+I/O persistence is disabled, the durable row keeps bounded previews, byte
+counts, truncation flags, and hashes instead of the raw values.
 
 ## Configuration Defaults
 

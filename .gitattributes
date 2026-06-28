@@ -1,1 +1,15 @@
-modules/pty/pty_module.py text eol=lf
+# Keep text files normalized to LF across platforms.
+* text=auto eol=lf
+
+# Avoid line-ending filters for binary assets and local database files.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary

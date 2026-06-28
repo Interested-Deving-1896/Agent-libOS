@@ -199,9 +199,11 @@ async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
   const previousConnection = connection;
   const serverCommand = resolveRuntimeServerCommand();
   smokeLog("server.command", { command: serverCommand.command, args: serverCommand.args });
+  const llmProfilesFile = path.join(app.getPath("userData"), "llm-profiles.json");
+  fs.mkdirSync(path.dirname(llmProfilesFile), { recursive: true });
   const serverArgs = db === undefined
-    ? [...serverCommand.args, "--port", "0"]
-    : [...serverCommand.args, "--db", db, "--port", "0"];
+    ? [...serverCommand.args, "--port", "0", "--llm-profiles-file", llmProfilesFile]
+    : [...serverCommand.args, "--db", db, "--port", "0", "--llm-profiles-file", llmProfilesFile];
   const child = spawn(serverCommand.command, serverArgs, {
     cwd: repoRoot,
     env: runtimeServerEnv(repoRoot),

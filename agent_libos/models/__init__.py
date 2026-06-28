@@ -100,6 +100,7 @@ from agent_libos.models.process import (
     ResourceReservation,
     ResourceUsage,
 )
+from agent_libos.models.ratings import AgentRating
 from agent_libos.models.tools import (
     JIT_MULTIPLEXER_TOOL_NAME,
     OPENAI_TOOL_NAME_MAX_CHARS,
@@ -118,6 +119,7 @@ __all__ = [
     "AgentImage",
     "AgentObject",
     "AgentProcess",
+    "AgentRating",
     "AuditID",
     "AuditRecord",
     "AuthorityRisk",

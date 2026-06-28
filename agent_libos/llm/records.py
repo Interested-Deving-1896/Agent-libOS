@@ -20,9 +20,9 @@ def observable_llm_call_fields(
 
     LLM prompts, tool arguments, reasoning traces, and raw provider responses
     often contain user data or materialized object content. By default, the
-    durable call row stores bounded previews plus hashes, not the raw values.
-    Operators can explicitly set ``config.llm.persist_full_io`` when they need
-    forensic-grade full prompt/response persistence.
+    durable call row stores full values for self-evolution training and
+    fine-tuning pipelines. Operators can set ``config.llm.persist_full_io`` to
+    ``False`` to retain only bounded previews plus hashes.
     """
 
     selected = config or DEFAULT_CONFIG

@@ -86,6 +86,72 @@ class TestCLIBuiltinCommand:
             assert stdout.getvalue().strip() == f'initialized {configured.as_posix()}'
             assert configured.exists()
 
+    def test_cli_uses_configured_postgres_dsn_when_db_is_omitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / 'config.yaml'
+            config.write_text(
+                'runtime:\n'
+                '  store_backend: postgres\n'
+                '  store_dsn: "postgresql://agent:secret@localhost/agent_libos"\n',
+                encoding='utf-8',
+            )
+            calls: dict[str, object] = {}
+
+            class DummyRuntime:
+                def shutdown(self, *, actor: str, reason: str) -> None:
+                    calls['shutdown'] = (actor, reason)
+
+            def fake_open(target: object = None, **kwargs: object) -> DummyRuntime:
+                calls['target'] = target
+                calls['config'] = kwargs.get('config')
+                return DummyRuntime()
+
+            monkeypatch.setattr(Runtime, 'open', staticmethod(fake_open))
+
+            with _temporary_cwd(root):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cli_main(['--config', str(config), 'init'])
+
+            assert calls['target'] is None
+            assert stdout.getvalue().strip() == 'initialized postgresql://agent:***@localhost/agent_libos'
+
+    def test_cli_rejects_postgres_backend_without_store_dsn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / 'config.yaml'
+            config.write_text('runtime:\n  store_backend: postgres\n', encoding='utf-8')
+
+            with _temporary_cwd(root):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as raised:
+                    cli_main(['--config', str(config), 'init'])
+
+            assert raised.value.code == 2
+            assert 'runtime.store_dsn is required' in stderr.getvalue()
+
+    def test_cli_passes_explicit_postgres_db_to_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        dsn = 'postgresql://agent:secret@localhost/agent_libos'
+        calls: dict[str, object] = {}
+
+        class DummyRuntime:
+            def shutdown(self, *, actor: str, reason: str) -> None:
+                calls['shutdown'] = (actor, reason)
+
+        def fake_open(target: object = None, **kwargs: object) -> DummyRuntime:
+            calls['target'] = target
+            calls['config'] = kwargs.get('config')
+            return DummyRuntime()
+
+        monkeypatch.setattr(Runtime, 'open', staticmethod(fake_open))
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cli_main(['--db', dsn, 'init'])
+
+        assert calls['target'] == dsn
+        assert stdout.getvalue().strip() == 'initialized postgresql://agent:***@localhost/agent_libos'
+
     def test_cli_cd_changes_process_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

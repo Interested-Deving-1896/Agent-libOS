@@ -1,12 +1,14 @@
 import { AlertTriangle, Bot, Database, MessageSquare, Pause, Play, RefreshCw, Send, Settings, Square } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { GuiConnection, HumanRequest, ImageSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
+import type { GuiConnection, HumanRequest, ImageSummary, LLMProfileInput, LLMProfileSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import { useI18n } from "../i18n";
 import { parseOptionalQuanta } from "../quanta";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
 import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
+import { LLMProfileSelect } from "./LLMProfileSelect";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { RatingPanel } from "./RatingPanel";
 
 type UserPageProps = {
   connection: GuiConnection | null;
@@ -16,13 +18,16 @@ type UserPageProps = {
   maxQuanta: number | null;
   spawnGoal: string;
   spawnImage: string;
+  spawnLlmProfile: string;
   spawnWorkingDirectory: string;
   message: string;
   images: ImageSummary[];
+  llmProfiles: LLMProfileSummary[];
   onSelectPid(pid: string): void;
   onMaxQuantaChange(value: number | null): void;
   onSpawnGoalChange(value: string): void;
   onSpawnImageChange(value: string): void;
+  onSpawnLlmProfileChange(value: string): void;
   onSpawnWorkingDirectoryChange(value: string): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
@@ -30,6 +35,10 @@ type UserPageProps = {
   onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
   onSend(kind: "message" | "interrupt"): void;
   onRespond(request: HumanRequest, approved: boolean, answer?: string): Promise<boolean>;
+  onRate(pid: string, score: number, comment: string): Promise<boolean>;
+  onCreateLlmProfile(profile: LLMProfileInput): Promise<boolean>;
+  onUpdateLlmProfile(profileId: string, profile: LLMProfileInput): Promise<boolean>;
+  onDeleteLlmProfile(profileId: string): Promise<boolean>;
   onRun(): void;
   onPause(): void;
   onRefresh(): void;
@@ -46,13 +55,16 @@ export function UserPage({
   maxQuanta,
   spawnGoal,
   spawnImage,
+  spawnLlmProfile,
   spawnWorkingDirectory,
   message,
   images,
+  llmProfiles,
   onSelectPid,
   onMaxQuantaChange,
   onSpawnGoalChange,
   onSpawnImageChange,
+  onSpawnLlmProfileChange,
   onSpawnWorkingDirectoryChange,
   onMessageChange,
   onSpawn,
@@ -60,6 +72,10 @@ export function UserPage({
   onCommitImage,
   onSend,
   onRespond,
+  onRate,
+  onCreateLlmProfile,
+  onUpdateLlmProfile,
+  onDeleteLlmProfile,
   onRun,
   onPause,
   onRefresh,
@@ -145,6 +161,7 @@ export function UserPage({
           {selectedProcess ? (
             <div className="userProcessMeta">
               <span>{selectedProcess.image_id}</span>
+              <span>{selectedProcess.llm_profile_id}</span>
               <span>{selectedProcess.status}</span>
               <span>{t("user.llmCalls", { count: selectedProcess.llm_call_count })}</span>
               <span>{t("user.tokens", { count: selectedProcess.token_total })}</span>
@@ -191,6 +208,8 @@ export function UserPage({
           </button>
         </section>
 
+        {hasProcess ? <RatingPanel process={selectedProcess} onSave={onRate} /> : null}
+
         {!hasProcess ? (
           <section className="userStart">
             <h1>{t("user.startTask")}</h1>
@@ -199,6 +218,15 @@ export function UserPage({
               onChange={(event) => onSpawnWorkingDirectoryChange(event.currentTarget.value)}
               placeholder={t("user.initialCwdPlaceholder")}
               aria-label={t("user.initialCwd")}
+            />
+            <LLMProfileSelect
+              profiles={llmProfiles}
+              value={spawnLlmProfile}
+              label={t("llmProfile.spawnLabel")}
+              onChange={onSpawnLlmProfileChange}
+              onCreate={onCreateLlmProfile}
+              onUpdate={onUpdateLlmProfile}
+              onDelete={onDeleteLlmProfile}
             />
             <textarea value={spawnGoal} onChange={(event) => onSpawnGoalChange(event.currentTarget.value)} />
             <button className="primary" disabled={!spawnGoal.trim()} onClick={onSpawn}>{t("user.start")}</button>

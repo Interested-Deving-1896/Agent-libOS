@@ -12,7 +12,7 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
 )
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import new_id, utc_now
 
 
@@ -45,7 +45,7 @@ def classify_external_effect(
 
 
 def record_external_effect(
-    store: SQLiteStore,
+    store: RuntimeStore,
     *,
     pid: str,
     provider: str,

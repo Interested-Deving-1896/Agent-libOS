@@ -67,10 +67,11 @@ The implementation currently includes:
   resource authority.
 - A direct workflow entrypoint for users to run one image-visible tool through
   ToolBroker without invoking the LLM scheduler.
-- SQLite persistence for process/object metadata, capabilities, messages,
-  human requests, LLM calls, events, audit records, tools, Skill/JIT metadata,
-  object tasks, JSON-RPC endpoints, image definitions/artifacts, Runtime Module
-  load records, external effects, and scoped checkpoints.
+- Runtime store persistence, backed by SQLite by default and optionally
+  PostgreSQL, for process/object metadata, capabilities, messages, human
+  requests, LLM calls, events, audit records, tools, Skill/JIT metadata, object
+  tasks, JSON-RPC endpoints, image definitions/artifacts, Runtime Module load
+  records, external effects, and scoped checkpoints.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
   candidates without granting resource authority.
@@ -185,7 +186,8 @@ Real-model benchmark smoke is opt-in and must be scoped with `--llm real
 
 ## Persistent Runtime
 
-Use `--db` to keep runtime state in SQLite:
+Use `--db` to keep runtime state in a persistent store. A filesystem path uses
+SQLite and remains the default local option:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite init
@@ -196,6 +198,24 @@ uv run agent-libos --db .agent_libos.sqlite resources <pid>
 uv run agent-libos --db .agent_libos.sqlite audit
 uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
+
+PostgreSQL is opt-in. Install the extra dependency and either pass a DSN with
+`--db` or configure `runtime.store_backend: postgres` together with
+`runtime.store_dsn`; keep DSNs in environment-specific config or environment
+variables so credentials are not committed. A PostgreSQL backend without
+`runtime.store_dsn` is rejected at config load time:
+
+```bash
+uv sync --frozen --all-groups --extra postgres
+uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
+```
+
+Both backends implement the same runtime store contract. Process metadata,
+capabilities, audit/events, messages, human requests, LLM call records,
+checkpoints, and registered tools/images/skills are durable store records.
+Ordinary Object Memory payloads remain runtime-only; the object table stores a
+runtime-memory marker, and rows whose payload cache cannot be reconstructed are
+released fail-closed on reopen instead of being treated as real payloads.
 
 Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
 you want a bounded run.
@@ -208,9 +228,13 @@ primitive capability checks, resource budgets, human approval, or audit.
 Every LLM action-selection call is persisted as an `llm_calls` row with
 provider ids, model/API mode, token usage when available, errors, and bounded
 observability envelopes for prompts, visible tool schemas, model output, tool
-calls, reasoning metadata, and raw provider responses. Raw prompts and provider
-payloads are not stored by default; set `config.llm.persist_full_io=True` only
-for explicit local debugging or forensic runs.
+calls, reasoning metadata, and raw provider responses. Full prompts, visible
+tool schemas, model outputs, tool calls, reasoning metadata, and raw provider
+payloads are stored by default for self-evolution training and fine-tuning
+pipelines. Deployments that rely on this default should disclose that use in
+the user agreement because it may include sensitive prompt, tool, reasoning, and
+provider payload data; set `llm.persist_full_io: false` in the runtime config
+when a user or operator opts out of full LLM input/output retention.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>

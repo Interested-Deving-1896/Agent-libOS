@@ -83,7 +83,11 @@ but v1 does not apply external compensation.
 
 `agent_libos.runtime.runtime.Runtime` wires the runtime together:
 
-- `SQLiteStore` persists metadata and append-only records.
+- `RuntimeStore` persists metadata and append-only records through a backend
+  abstraction. SQLite is the default backend; PostgreSQL is available through
+  an optional extra. Both SQL backends share the same `SQLRuntimeStore`
+  repository contract while backend classes own connection setup and dialect
+  behavior.
 - `RuntimeModuleRegistry` loads the internal core module and configured trusted
   startup modules before processes, tools, or LLM execution can run.
 - `CapabilityManager` grants, checks, revokes, and consumes one-shot authority.
@@ -121,7 +125,7 @@ first stops scheduler work and ObjectTask runner work, then releases host
 resources and emits runtime lifecycle audit/event records. If a synchronous
 quantum or ObjectTask tool thread cannot be joined safely, shutdown reports the
 component that did not stop and leaves owned storage open so a live worker is
-not racing a closed SQLite connection. Host shutdown never marks AgentProcess
+not racing a closed runtime store connection. Host shutdown never marks AgentProcess
 records as exited.
 
 ## Tool Boundary
@@ -167,7 +171,7 @@ pid and must call primitives for protected effects.
 
 ## Persistence And Audit
 
-SQLite stores durable runtime metadata and append-only records:
+The runtime store keeps durable metadata and append-only records:
 
 - processes, working directories, loaded Skills, and tool tables,
 - Object Memory metadata and namespace directories,
@@ -182,12 +186,18 @@ SQLite stores durable runtime metadata and append-only records:
 - provider-decided external effect records,
 - events and audit records,
 - LLM call records with provider ids, model/API mode, usage, errors, and
-  bounded observability envelopes for prompt, visible tools, output, tool
-  calls, reasoning metadata, and raw response. Full LLM input/output
-  persistence is an explicit `llm.persist_full_io` opt-in.
+  full prompt, visible tools, output, tool calls, reasoning metadata, raw
+  response, and bounded observability envelopes. Full LLM input/output
+  persistence is enabled by default for self-evolution training and
+  fine-tuning pipelines; this may include sensitive prompt, tool, reasoning,
+  and provider payload fields. Set `llm.persist_full_io: false` to opt out and
+  store only previews plus hashes for those fields.
 
 Object payloads are not ordinary durable object rows. They live in runtime
-memory. Checkpoint payloads are the explicit durable snapshot exception.
+memory, while SQL object rows store only a runtime-memory marker. Rows whose
+live payload cache cannot be reconstructed are released fail-closed on reopen.
+Checkpoint and image artifact payloads are explicit durable snapshot
+exceptions.
 
 Audit and events are append-only. Checkpoint restore must not delete them.
 Limited audit views select the latest matching records first and return that
@@ -214,7 +224,7 @@ agent_libos/
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations
-  storage/         SQLite persistence
+  storage/         runtime store backends
   tools/           tool base classes, ToolBroker, sandbox, and built-in tools
   utils/           shared validation, YAML loading, and helper utilities
 benchmarks/        deterministic runtime-safety benchmark harness and fixtures

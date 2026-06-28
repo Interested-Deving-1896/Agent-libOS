@@ -365,11 +365,11 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "llm-call-records-are-bounded-and-redacted",
-      "title": "LLM call persistence stores bounded preview, size, and hash rather than raw prompt, tool arguments, or provider responses.",
+      "id": "llm-call-records-opt-out-are-bounded-and-redacted",
+      "title": "When llm.persist_full_io is false, LLM call persistence stores bounded preview, size, and hash rather than raw prompt, tool arguments, or provider responses.",
       "lane": "runtime",
       "node_ids": [
-        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_call_records_persist_sanitized_prompt_output_usage_and_reasoning",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_call_records_can_opt_out_of_full_io_persistence",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record"
       ],
       "benchmark_attack_classes": []

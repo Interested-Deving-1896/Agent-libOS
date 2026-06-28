@@ -28,7 +28,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import new_id, utc_now
 
 
@@ -55,7 +55,7 @@ class CapabilityManager:
         AUTHORITY_RULES_KEY,
     }
 
-    def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
+    def __init__(self, store: RuntimeStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
         self.config = config or DEFAULT_CONFIG
         self.store = store
         self.audit = audit

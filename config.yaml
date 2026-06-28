@@ -1,3 +1,6 @@
+runtime:
+  local_store_target: .agent_libos.sqlite
+
 modules:
   manifest_paths:
     - modules/pty/module.yaml

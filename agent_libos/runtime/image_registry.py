@@ -38,7 +38,7 @@ from agent_libos.models.exceptions import CapabilityDenied, NotFound, Validation
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.skills.schema import JitToolSpec
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
@@ -121,7 +121,7 @@ class ImageRegistryPrimitive:
         audit: AuditManager,
         events: EventBus,
         tool_exists: Any,
-        store: SQLiteStore | None = None,
+        store: RuntimeStore | None = None,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
@@ -242,7 +242,7 @@ class ImageRegistryPrimitive:
         source: str | None = None,
     ) -> ImageRegistrationResult:
         if self.store is None:
-            raise ValidationError("image package registration requires SQLiteStore artifact persistence")
+            raise ValidationError("image package registration requires runtime store artifact persistence")
         normalized_files = self._normalize_package_files(files)
         image, artifact = self._image_package_from_files(normalized_files, source=source)
         if require_capability:
@@ -1050,7 +1050,7 @@ class ImageRegistryPrimitive:
         require_capability: bool = True,
     ) -> ImageRegistrationResult:
         if self.runtime is None or self.store is None:
-            raise ValidationError("checkpoint image commit requires a bound Runtime and SQLiteStore")
+            raise ValidationError("checkpoint image commit requires a bound Runtime and runtime store")
         found = self.store.get_checkpoint_snapshot(checkpoint_id)
         if found is None:
             raise NotFound(f"checkpoint not found: {checkpoint_id}")

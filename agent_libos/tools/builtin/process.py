@@ -96,7 +96,7 @@ class ForkChildProcessArgs(BaseModel):
     mode: str = Field(default=ForkMode.WORKER.value, description="Fork mode: copy, restricted, speculative, or worker.")
     image: str | None = Field(
         default=None,
-        description="Optional image id. MVP tool only allows the current process image.",
+        description="Optional child image id. Defaults to the parent image.",
     )
     include_parent_roots: bool = Field(
         default=True,
@@ -394,12 +394,6 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         parent = runtime.process.get(ctx.pid)
         image = args.image or parent.image_id
-        if image != parent.image_id:
-            raise ToolExecutionError(
-                "Forking into a different image is not exposed to processes yet.",
-                code=ToolErrorCode.PERMISSION_DENIED,
-                details={"requested_image": image, "parent_image": parent.image_id},
-            )
         try:
             fork_mode = ForkMode(args.mode)
         except ValueError as exc:
@@ -420,16 +414,23 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             if args.working_directory is not None
             else parent.working_directory
         )
-        child_pid = runtime.fork_child_process(
-            parent=ctx.pid,
-            goal=args.goal,
-            memory_view=view_spec,
-            inherit_capabilities=inherit_specs,
-            resource_budget=_resource_budget_from_spec(args.resource_budget),
-            image=image,
-            mode=fork_mode,
-            working_directory=child_cwd,
-        )
+        try:
+            child_pid = runtime.fork_child_process(
+                parent=ctx.pid,
+                goal=args.goal,
+                memory_view=view_spec,
+                inherit_capabilities=inherit_specs,
+                resource_budget=_resource_budget_from_spec(args.resource_budget),
+                image=image,
+                mode=fork_mode,
+                working_directory=child_cwd,
+            )
+        except NotFound as exc:
+            raise ToolExecutionError(
+                "Target image does not exist.",
+                code=ToolErrorCode.VALIDATION_ERROR,
+                details={"image": image},
+            ) from exc
         child = runtime.process.get(child_pid)
         return ForkChildProcessOutput(
             child_pid=child.pid,

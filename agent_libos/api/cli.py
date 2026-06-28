@@ -14,6 +14,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
+from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
@@ -31,6 +32,7 @@ from agent_libos.models import (
     ViewMode,
 )
 from agent_libos.runtime.runtime import Runtime
+from agent_libos.storage import display_store_target
 from agent_libos.utils.serde import to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -59,8 +61,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--db",
         help=(
-            "SQLite DB path. If omitted, uses runtime.local_store_target from the selected config "
-            f"(default '{_RUNTIME_DEFAULTS.local_store_target}' is in-memory)."
+            "Runtime store target. Paths/local use SQLite; postgresql:// DSNs use PostgreSQL. "
+            "If omitted, uses the selected config runtime store settings "
+            f"(default '{_RUNTIME_DEFAULTS.local_store_target}' is in-memory SQLite)."
         ),
     )
     parser.add_argument(
@@ -83,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Initialize a runtime database")
-    sub.add_parser("demo", help="Run the coding-agent MVP demo")
+    sub.add_parser("demo", help="Run the deterministic coding-agent demo")
     sub.add_parser("audit", help="Print audit trace")
     llm_calls_parser = sub.add_parser("llm-calls", help="Print persisted LLM call records")
     llm_calls_parser.add_argument("--pid", help="Filter by process id.")
@@ -159,18 +162,21 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     selected_config = _load_runtime_config(args.config, parser)
-    selected_db = args.db or selected_config.runtime.local_store_target
     load_module_manifests = [] if args.command == "modules" and args.modules_command == "verify" else args.module_manifest
-    runtime = Runtime.open(
-        selected_db,
-        config=selected_config,
-        module_manifests=load_module_manifests,
-        trusted_modules=args.trusted_module,
-        trusted_module_sha256=args.trusted_module_sha256,
-    )
+    try:
+        selected_db_display = display_store_target(args.db, config=selected_config)
+        runtime = Runtime.open(
+            args.db,
+            config=selected_config,
+            module_manifests=load_module_manifests,
+            trusted_modules=args.trusted_module,
+            trusted_module_sha256=args.trusted_module_sha256,
+        )
+    except LibOSValidationError as exc:
+        parser.error(str(exc))
     try:
         if args.command == "init":
-            print(f"initialized {selected_db}")
+            print(f"initialized {selected_db_display}")
         elif args.command == "demo":
             print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
         elif args.command == "audit":

@@ -17,11 +17,11 @@ describe("parseSseFrame", () => {
 });
 
 describe("LibOSClient", () => {
-  it("passes initial working directory through spawn requests", async () => {
+  it("passes initial working directory and LLM profile through spawn requests", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
-    await client.spawn("goal", "coding-agent:v0", 4, false, { workingDirectory: " src/app " });
+    await client.spawn("goal", "coding-agent:v0", 4, false, { workingDirectory: " src/app ", llmProfile: "qwen3.7-max" });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:1/api/processes",
@@ -30,6 +30,7 @@ describe("LibOSClient", () => {
           goal: "goal",
           image: "coding-agent:v0",
           auto_run: false,
+          llm_profile: "qwen3.7-max",
           working_directory: "src/app",
           max_quanta: 4
         })
@@ -37,11 +38,11 @@ describe("LibOSClient", () => {
     );
   });
 
-  it("passes max_quanta through exec requests", async () => {
+  it("passes max_quanta and LLM profile through exec requests", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
-    await client.execProcess("pid_1", "base-agent:v0", "goal", true, false, 7);
+    await client.execProcess("pid_1", "base-agent:v0", "goal", true, false, 7, "glm-5.2");
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:1/api/processes/pid_1/exec",
@@ -51,9 +52,41 @@ describe("LibOSClient", () => {
           goal: "goal",
           confirmed: true,
           auto_run: false,
+          llm_profile: "glm-5.2",
           max_quanta: 7
         })
       })
+    );
+  });
+
+  it("manages user LLM profiles through the GUI API", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.createLLMProfile({ profile_id: "kimi-k2.7-code", model: "kimi-k2.7-code", api_key_env: "KIMI_API_KEY" });
+    await client.updateLLMProfile("kimi-k2.7-code", { model: "kimi-k2.7-code", api_key_env: "KIMI_API_KEY", api_mode: "chat" });
+    await client.deleteLLMProfile("kimi-k2.7-code");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:1/api/llm-profiles",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ profile_id: "kimi-k2.7-code", model: "kimi-k2.7-code", api_key_env: "KIMI_API_KEY" })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:1/api/llm-profiles/kimi-k2.7-code",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ model: "kimi-k2.7-code", api_key_env: "KIMI_API_KEY", api_mode: "chat" })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://127.0.0.1:1/api/llm-profiles/kimi-k2.7-code",
+      expect.objectContaining({ method: "DELETE" })
     );
   });
 
@@ -71,6 +104,23 @@ describe("LibOSClient", () => {
           answer: "answer",
           auto_run: false,
           max_quanta: 3
+        })
+      })
+    );
+  });
+
+  it("submits agent ratings for the selected process", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.submitAgentRating("pid_1", 4, "good result");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/processes/pid_1/rating",
+      expect.objectContaining({
+        body: JSON.stringify({
+          score: 4,
+          comment: "good result"
         })
       })
     );

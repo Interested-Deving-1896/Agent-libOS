@@ -20,7 +20,7 @@ from agent_libos.llm.client import LLMCompletion
 from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.runtime.runtime import Runtime
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import SQLiteStore, display_store_target, open_store, redact_store_target
 
 class TestConfigDefaults:
 
@@ -103,6 +103,10 @@ class TestConfigDefaults:
         assert config.llm.profiles['coding'].model == 'coding-model'
         assert config.llm.profiles['default'].api_key_env == DEFAULT_CONFIG.llm.profiles['default'].api_key_env
 
+    def test_default_llm_config_persists_full_io(self) -> None:
+        assert DEFAULT_CONFIG.llm.persist_full_io is True
+        assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
+
     def test_load_config_file_accepts_openai_llm_options(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
         path.write_text(
@@ -114,11 +118,14 @@ class TestConfigDefaults:
                     '  prompt_cache_retention: 24h',
                     '  responses_previous_response_id: true',
                     '  parallel_tool_calls: true',
+                    '  auto_wait_on_empty_tool_calls: true',
+                    '  persist_full_io: false',
                     '  profiles:',
                     '    default:',
                     '      model: gpt-test',
                     '      safety_identifier_env: OPENAI_SAFE_ID',
                     '      parallel_tool_calls: false',
+                    '      auto_wait_on_empty_tool_calls: false',
                 ]
             ),
             encoding='utf-8',
@@ -131,9 +138,12 @@ class TestConfigDefaults:
         assert config.llm.prompt_cache_retention == '24h'
         assert config.llm.responses_previous_response_id is True
         assert config.llm.parallel_tool_calls is True
+        assert config.llm.auto_wait_on_empty_tool_calls is True
+        assert config.llm.persist_full_io is False
         assert config.llm.profiles['default'].model == 'gpt-test'
         assert config.llm.profiles['default'].safety_identifier_env == 'OPENAI_SAFE_ID'
         assert config.llm.profiles['default'].parallel_tool_calls is False
+        assert config.llm.profiles['default'].auto_wait_on_empty_tool_calls is False
 
     def test_load_config_file_rejects_invalid_yaml_shape(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
@@ -167,6 +177,11 @@ class TestConfigDefaults:
         bad_parallel.write_text('llm:\n  parallel_tool_calls: []\n', encoding='utf-8')
         with pytest.raises(PydanticValidationError, match='parallel_tool_calls'):
             load_config_file(bad_parallel)
+
+        bad_auto_wait = tmp_path / 'bad-auto-wait.yaml'
+        bad_auto_wait.write_text('llm:\n  auto_wait_on_empty_tool_calls: []\n', encoding='utf-8')
+        with pytest.raises(PydanticValidationError, match='auto_wait_on_empty_tool_calls'):
+            load_config_file(bad_auto_wait)
 
     def test_llm_profiles_validate_default_profile_reference(self) -> None:
         config = AgentLibOSConfig(
@@ -259,6 +274,56 @@ class TestConfigDefaults:
         finally:
             runtime.close()
 
+    def test_runtime_store_defaults_to_sqlite_backend(self) -> None:
+        assert DEFAULT_CONFIG.runtime.store_backend == 'sqlite'
+        assert DEFAULT_CONFIG.runtime.store_dsn is None
+        assert DEFAULT_CONFIG.gui.agent_rating_comment_max_chars > 0
+
+    def test_runtime_open_accepts_sqlite_uri(self, tmp_path: Path) -> None:
+        db = tmp_path / 'uri.sqlite'
+        runtime = Runtime.open(f'sqlite:///{db.as_posix()}')
+        try:
+            assert Path(runtime.store.path) == db
+            assert db.exists()
+        finally:
+            runtime.close()
+
+    def test_postgres_backend_requires_configured_store_dsn(self) -> None:
+        with pytest.raises(ValueError, match='runtime.store_dsn is required'):
+            AgentLibOSConfig(runtime=RuntimeDefaults(store_backend='postgres'))
+
+    def test_configured_postgres_backend_uses_store_dsn_when_target_is_omitted(self) -> None:
+        dsn = 'postgresql://agent:secret@localhost/agent_libos'
+        config = AgentLibOSConfig(
+            runtime=RuntimeDefaults(
+                store_backend='postgres',
+                store_dsn=dsn,
+            )
+        )
+
+        assert display_store_target(config=config) == 'postgresql://agent:***@localhost/agent_libos'
+
+    def test_explicit_local_store_target_overrides_configured_postgres_backend(self) -> None:
+        config = AgentLibOSConfig(
+            runtime=RuntimeDefaults(
+                store_backend='postgres',
+                store_dsn='postgresql://agent:secret@localhost/agent_libos',
+            )
+        )
+        store = open_store('local', config=config)
+        try:
+            assert isinstance(store, SQLiteStore)
+            assert store.path == ':memory:'
+        finally:
+            store.close()
+
+    def test_postgres_store_target_display_redacts_password(self) -> None:
+        dsn = 'postgresql://agent:secret@localhost:5432/agent_libos?sslmode=disable'
+        config = AgentLibOSConfig(runtime=RuntimeDefaults(store_backend='postgres', store_dsn=dsn))
+
+        assert redact_store_target(dsn) == 'postgresql://agent:***@localhost:5432/agent_libos?sslmode=disable'
+        assert display_store_target(dsn, config=config) == 'postgresql://agent:***@localhost:5432/agent_libos?sslmode=disable'
+
     def test_spawn_without_image_uses_configured_default_image(self) -> None:
         config = AgentLibOSConfig(
             runtime=RuntimeDefaults(default_image_id='custom-base:v0', coding_image_id='custom-coding:v0')
@@ -277,6 +342,8 @@ class TestConfigDefaults:
             AgentLibOSConfig(runtime=RuntimeDefaults(), process=replace(DEFAULT_CONFIG.process, fork_budget_divisor=0))
         with pytest.raises(PydanticValidationError, match='object_task_wait_max_timeout_s'):
             AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, object_task_wait_default_timeout_s=5, object_task_wait_max_timeout_s=4))
+        with pytest.raises(PydanticValidationError, match='agent_rating_comment_max_chars'):
+            AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, agent_rating_comment_max_chars=0))
         with pytest.raises(PydanticValidationError, match='trusted_issuer_prefixes'):
             AgentLibOSConfig(capability=replace(DEFAULT_CONFIG.capability, trusted_issuer_prefixes=('',)))
 

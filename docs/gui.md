@@ -2,8 +2,8 @@
 
 Agent libOS includes a local desktop management console for supervising
 processes, messages, human approvals, AgentImage selection/registration/commit,
-checkpoints, capabilities, Skills, JSON-RPC endpoints, audit records, and
-persisted LLM calls.
+checkpoints, capabilities, Skills, JSON-RPC endpoints, audit records, persisted
+LLM calls, and human Agent ratings.
 
 The GUI is a local-only Electron app. Electron starts
 `agent-libos-gui-server`, receives a random session bearer token, and connects
@@ -49,9 +49,9 @@ audit attribution aligned with the capability decision.
 Closing the GUI server pauses auto-run and asks the scheduler to stop before it
 calls `Runtime.shutdown()` on an owned runtime. If no scheduler worker or
 ObjectTask tool thread is still inside synchronous work, shutdown closes owned
-runtime resources, including the SQLite store. If a worker cannot be joined
+runtime resources, including the runtime store. If a worker cannot be joined
 safely, the GUI server leaves the runtime store open and relies on process
-teardown instead of closing SQLite underneath the live worker. Host shutdown
+teardown instead of closing a database handle underneath the live worker. Host shutdown
 does not mark AgentProcess records as exited; process lifecycle changes still
 go through the runtime `process.exit` primitive/tool path.
 
@@ -69,6 +69,10 @@ Run the Python server directly:
 ```bash
 uv run agent-libos-gui-server --db .agent_libos.sqlite --port 0
 ```
+
+The GUI server accepts the same runtime store targets as the CLI. SQLite paths
+are the default local store; PostgreSQL DSNs require installing the `postgres`
+extra and are redacted in startup and health payloads.
 
 The server prints one JSON line containing the selected local URL and bearer
 token:
@@ -113,7 +117,8 @@ The first screen is process-centered:
 - center pane: selected process timeline with type filters and human request
   cards,
 - right pane: details for overview, capabilities, tools/Skills, checkpoints,
-  audit, LLM calls, Images, JSON-RPC, and Object Memory summary,
+  audit, LLM calls, Images, JSON-RPC, Object Memory summary, and selected
+  process ratings,
 - top bar: database, spawn, auto-run, quanta budget, run, step, pause, refresh.
 
 The default user page exposes the image workflow without opening raw runtime
@@ -123,9 +128,27 @@ derived image. Import and commit both require explicit confirmation. Saving as
 an image creates a checkpoint only after that confirmation, then commits the
 checkpoint into an immutable image artifact.
 
+Users can also score the selected AgentProcess from 1 to 5 and add an optional
+comment. The GUI stores one current rating per process, default human, and GUI
+source. Re-rating updates that current record while the audit log records each
+change.
+
 The operator console provides the fuller registry view: image list, inspect,
 spawn/exec selection, package registration, checkpoint commit, and explicit
 replace controls.
+
+Manual spawn and exec controls include an LLM profile selector. Leaving it blank
+uses the image default and then the runtime default; choosing a profile writes
+only that profile id to the process. The selector can add, edit, and delete
+user profiles for OpenAI-compatible providers. GUI-created profiles are stored
+outside the runtime database in the operating system's user application config
+area: Electron passes `app.getPath("userData")/llm-profiles.json` to the Python
+server, while direct `agent-libos-gui-server` runs default to `%APPDATA%/Agent
+libOS/llm-profiles.json` on Windows, `~/Library/Application Support/Agent
+libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
+file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model routing fields such
+as profile id, model, base URL, API mode, tuning options, and the `api_key_env`
+name. It never stores the API key value.
 
 The scheduler defaults to automatic mode. Users can pause auto-run, step a
 selected process, or run the selected process with an optional quantum budget.
@@ -133,15 +156,19 @@ Leaving the budget blank runs until the process/runtime becomes idle; entering a
 number bounds that run. Automatic runs after spawn/message/exec may advance all
 runnable processes, but `POST /api/processes/{pid}/run` is intentionally scoped
 to that pid. Real LLM calls are still persisted in `llm_calls`, so the GUI can
-show token usage, errors, and bounded prompt/output observability metadata
-without exposing raw prompt or provider payloads by default.
-If the host runtime is configured with `llm.persist_full_io=True`, the same
-`llm_calls` API returns full stored LLM inputs and outputs.
+show token usage, errors, full stored LLM inputs and outputs, and bounded
+prompt/output observability metadata. This default supports self-evolution
+training and fine-tuning pipelines under the deployment's user agreement. If
+the host runtime is configured with `llm.persist_full_io=False`, the same
+`llm_calls` API returns only bounded previews and hashes for sensitive prompt,
+tool, reasoning, and provider payload fields.
 
 `POST /api/processes` and `POST /api/processes/{pid}/exec` accept optional
-`llm_profile` fields for host-selected per-process LLM routing. Snapshots expose
-each process `llm_profile_id`; profile secrets stay in the host process
-environment and are not returned by the GUI API.
+`llm_profile` fields for host-selected per-process LLM routing. The GUI server
+validates those ids before writing a process record. Snapshots expose each
+process `llm_profile_id` and a non-secret `llm_profiles` summary list; profile
+secrets stay in the host process environment and are not returned by the GUI
+API.
 
 Process snapshots include `resource_budget`, `resource_usage`, and
 `resource_remaining` so the GUI can show quota state without treating it as a
@@ -189,12 +216,19 @@ Important endpoints:
 - `GET /api/snapshot`
 - `GET /api/events/stream?cursor=<id>`
 - `GET /api/tools`
+- `GET /api/llm-profiles`,
+  `POST /api/llm-profiles`,
+  `PUT /api/llm-profiles/{profile_id}`, and
+  `DELETE /api/llm-profiles/{profile_id}` for user-level GUI model profiles.
 - `GET /api/processes`, `POST /api/processes`
 - `POST /api/workflows/run`
 - `POST /api/scheduler/auto`, `POST /api/scheduler/pause`
 - `GET /api/processes/{pid}`
 - `POST /api/processes/{pid}/run|step|pause|resume|signal|message|interrupt|cd|exec|exit`
 - `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`
+- `GET /api/processes/{pid}/rating` and
+  `POST /api/processes/{pid}/rating` for the selected process's 1-5 human
+  score and optional comment.
 - `GET /api/object-tasks`, `POST /api/object-tasks/start`,
   `GET /api/object-tasks/{task_id}`, and
   `POST /api/object-tasks/{task_id}/cancel|wait|watch-owner`

@@ -145,7 +145,7 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             namespace=args.namespace,
         )
         obj = runtime.memory.get_object(ctx.pid, handle)
-        with runtime.store._lock:
+        with runtime.store.locked():
             process = runtime.process.get(ctx.pid)
             if process.memory_view is None:
                 process.memory_view = runtime.memory.create_view(ctx.pid, [handle], mode=ViewMode.READ_ONLY)

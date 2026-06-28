@@ -23,7 +23,7 @@ from agent_libos.models.exceptions import CapabilityDenied, NotFound, Validation
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import external_effect_summary, external_effect_to_json
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
 
@@ -51,7 +51,7 @@ class CheckpointManager:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         audit: AuditManager,
         events: EventBus,
         capabilities: CapabilityManager | None = None,
@@ -499,9 +499,12 @@ class CheckpointManager:
                 self._insert_row(cur, "object_namespaces", row)
             for row in rows.get("objects", []):
                 item = dict(row)
-                item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
-                self._insert_row(cur, "objects", item)
                 oid = str(item["oid"])
+                if oid in snapshot["object_payloads"]:
+                    item["payload_json"] = dumps(snapshot["object_payloads"][oid])
+                else:
+                    item["payload_json"] = dumps(self.store.payload_marker(present=False))
+                self._insert_row(cur, "objects", item)
                 if oid in snapshot["object_payloads"]:
                     self.store.set_object_payload(oid, deepcopy(snapshot["object_payloads"][oid]))
             for row in rows.get("object_links", []):
@@ -744,7 +747,7 @@ class CheckpointManager:
                     self._insert_row(cur, "object_namespaces", row)
             for row in rows.get("objects", []):
                 item = dict(row)
-                item["payload_json"] = dumps(self.store._memory_payload_marker(present=True))
+                item["payload_json"] = dumps(remapped["object_payloads"][item["oid"]])
                 self._insert_row(cur, "objects", item)
                 self.store.set_object_payload(item["oid"], deepcopy(remapped["object_payloads"][item["oid"]]))
             for table in [
@@ -849,7 +852,7 @@ class CheckpointManager:
             for owner_kind in (ObjectOwnerKind.PROCESS, ObjectOwnerKind.PROCESS_RESULT):
                 for obj in self.store.list_objects_owned_by(owner_kind, pid):
                     oids.add(obj.oid)
-        return sorted(oid for oid in oids if oid in self.store._object_payloads)
+        return sorted(oid for oid in oids if self.store.has_object_payload(oid))
 
     def _current_scoped_object_oids(self, pids: list[str]) -> list[str]:
         process_rows = self._rows_by_ids("processes", "pid", pids)
@@ -878,6 +881,8 @@ class CheckpointManager:
         selected = list(dict.fromkeys(values))
         if not selected:
             return []
+        table = self.store.validate_table_identifier(table)
+        column = self.store.validate_column_identifier(table, column)
         placeholders = ", ".join("?" for _ in selected)
         return self.store.select_table_rows(table, f"{column} IN ({placeholders})", selected, order_by=column)
 
@@ -1024,7 +1029,7 @@ class CheckpointManager:
         payloads: dict[str, Any] = {}
         limit = self.config.checkpoint.payload_capture_limit_bytes
         for oid in object_oids:
-            if oid not in self.store._object_payloads:
+            if not self.store.has_object_payload(oid):
                 continue
             payload = deepcopy(self.store.object_payload(oid))
             payload_bytes = len(dumps(payload).encode("utf-8"))
@@ -1281,6 +1286,8 @@ class CheckpointManager:
         selected = list(dict.fromkeys(values))
         if not selected:
             return
+        table = self.store.validate_table_identifier(table)
+        column = self.store.validate_column_identifier(table, column)
         placeholders = ", ".join("?" for _ in selected)
         cur.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", selected)
 
@@ -1307,8 +1314,11 @@ class CheckpointManager:
         )
 
     def _insert_row(self, cur: Any, table: str, row: dict[str, Any]) -> None:
+        table = self.store.validate_table_identifier(table)
         item = self._object_row_with_lifecycle_defaults(row) if table == "objects" else row
         columns = list(item)
+        for column in columns:
+            self.store.validate_column_identifier(table, column)
         placeholders = ", ".join("?" for _ in columns)
         cur.execute(
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
@@ -1339,7 +1349,11 @@ class CheckpointManager:
         return item
 
     def _upsert_row(self, cur: Any, table: str, row: dict[str, Any], key: str) -> None:
+        table = self.store.validate_table_identifier(table)
+        key = self.store.validate_column_identifier(table, key)
         columns = list(row)
+        for column in columns:
+            self.store.validate_column_identifier(table, column)
         assignments = ", ".join(f"{column} = excluded.{column}" for column in columns if column != key)
         placeholders = ", ".join("?" for _ in columns)
         cur.execute(

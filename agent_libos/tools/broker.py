@@ -41,7 +41,7 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 from agent_libos.tools.base import BaseAgentTool, SyncAgentTool, ToolContext
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
@@ -115,7 +115,7 @@ class ToolBroker:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         memory: ObjectMemoryManager,
         capabilities: CapabilityManager,
         human: HumanObjectManager,

@@ -141,7 +141,7 @@ The manual lifecycle is:
    tool table.
 
 Registered JIT tools are process-local but persistent: when a runtime reopens an
-existing SQLite store, it reloads executable TypeScript sources only for JIT
+existing runtime store, it reloads executable TypeScript sources only for JIT
 tool ids still referenced by a process tool table. Stale ephemeral tool
 references with no recoverable registered source are removed from the process
 tool table fail-closed instead of being shown to the model as broken tools.

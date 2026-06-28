@@ -45,7 +45,7 @@ from agent_libos.runtime.external_effects import (
     record_external_effect,
     require_external_effect_classifier,
 )
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import JsonRpcProvider
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
@@ -68,7 +68,7 @@ class JsonRpcPrimitive:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,

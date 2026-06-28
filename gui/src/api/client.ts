@@ -1,4 +1,4 @@
-import type { GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
+import type { AgentRating, GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -24,6 +24,22 @@ export class LibOSClient {
 
   async images(): Promise<ImageSummary[]> {
     return this.request<ImageSummary[]>("GET", "/api/images");
+  }
+
+  async llmProfiles(): Promise<LLMProfileSummary[]> {
+    return this.request<LLMProfileSummary[]>("GET", "/api/llm-profiles");
+  }
+
+  async createLLMProfile(profile: LLMProfileInput): Promise<LLMProfileSummary> {
+    return this.request<LLMProfileSummary>("POST", "/api/llm-profiles", profile as unknown as JsonBody);
+  }
+
+  async updateLLMProfile(profileId: string, profile: LLMProfileInput): Promise<LLMProfileSummary> {
+    return this.request<LLMProfileSummary>("PUT", `/api/llm-profiles/${encodeURIComponent(profileId)}`, profile as unknown as JsonBody);
+  }
+
+  async deleteLLMProfile(profileId: string): Promise<{ ok: boolean; profile_id: string }> {
+    return this.request("DELETE", `/api/llm-profiles/${encodeURIComponent(profileId)}`);
   }
 
   async inspectImage(imageId: string): Promise<ImageInspectResult> {
@@ -254,6 +270,14 @@ export class LibOSClient {
 
   async changeDirectory(pid: string, path: string) {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/cd`, { path });
+  }
+
+  async getAgentRating(pid: string) {
+    return this.request<AgentRating | null>("GET", `/api/processes/${encodeURIComponent(pid)}/rating`);
+  }
+
+  async submitAgentRating(pid: string, score: number, comment: string) {
+    return this.request<AgentRating>("POST", `/api/processes/${encodeURIComponent(pid)}/rating`, { score, comment });
   }
 
   async execProcess(pid: string, image: string, goal: string, confirmed: boolean, autoRun: boolean, maxQuanta: OptionalQuanta, llmProfile?: string) {

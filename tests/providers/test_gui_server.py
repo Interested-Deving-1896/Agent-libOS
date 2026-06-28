@@ -17,7 +17,15 @@ from tests.support.skills import write_skill_package
 class TestGuiServer:
 
     def setup_method(self) -> None:
-        self.server = create_gui_http_server(db='local', port=0, token='test-token', auto_run=False)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.llm_profiles_file = Path(self.temp_dir.name) / 'llm-profiles.json'
+        self.server = create_gui_http_server(
+            db='local',
+            port=0,
+            token='test-token',
+            auto_run=False,
+            llm_profiles_file=self.llm_profiles_file,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.host, self.port = self.server.server_address
@@ -27,6 +35,7 @@ class TestGuiServer:
         self.thread.join(timeout=5)
         self.server.service.shutdown()
         self.server.server_close()
+        self.temp_dir.cleanup()
 
     def request(
         self,
@@ -90,6 +99,12 @@ class TestGuiServer:
         assert health['ok']
         assert not health['scheduler']['auto_run']
         assert health['scheduler']['default_max_quanta'] is None
+        status, _profile = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {'profile_id': 'gui-spawn', 'model': 'gui-spawn-model', 'api_key_env': 'GUI_SPAWN_API_KEY'},
+        )
+        assert status == 200
         status, spawned = self.request(
             'POST',
             '/api/processes',
@@ -111,7 +126,153 @@ class TestGuiServer:
         assert snapshot['processes'][0]['unread_message_count'] >= 2
         assert 'tools' in snapshot
         assert 'images' in snapshot
+        assert any((profile['profile_id'] == 'gui-spawn' for profile in snapshot['llm_profiles']))
         assert any((image['image_id'] == 'base-agent:v0' for image in snapshot['images']))
+
+    def test_llm_profile_endpoints_persist_user_profiles_and_reject_secrets(self, monkeypatch) -> None:
+        monkeypatch.setenv('KIMI_API_KEY', 'secret')
+
+        status, profiles = self.request('GET', '/api/llm-profiles')
+        assert status == 200
+        assert any(profile['profile_id'] == 'default' and profile['source'] == 'config' for profile in profiles)
+
+        status, created = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {
+                'profile_id': 'kimi-k2.7-code',
+                'model': 'kimi-k2.7-code',
+                'base_url': 'https://kimi.example/v1',
+                'api_key_env': 'KIMI_API_KEY',
+                'api_mode': 'chat',
+                'temperature': 0.1,
+            },
+        )
+        assert status == 200
+        assert created['profile_id'] == 'kimi-k2.7-code'
+        assert created['source'] == 'user'
+        assert created['editable'] is True
+        assert created['api_key_env_present'] is True
+        assert created['allow_custom_base_url'] is True
+
+        status, updated = self.request(
+            'PUT',
+            '/api/llm-profiles/kimi-k2.7-code',
+            {
+                'model': 'kimi-k2.7-code',
+                'base_url': 'https://kimi.example/v1/',
+                'api_key_env': 'KIMI_API_KEY',
+                'api_mode': 'chat',
+                'max_tokens': 4096,
+            },
+        )
+        assert status == 200
+        assert updated['max_tokens'] == 4096
+        assert 'secret' not in self.llm_profiles_file.read_text(encoding='utf-8')
+
+        status, rejected = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {'profile_id': 'bad-secret', 'model': 'bad', 'api_key_env': 'BAD_API_KEY', 'api_key': 'secret'},
+        )
+        assert status == 400
+        assert 'API keys are not accepted' in rejected['error']['message']
+
+        self.server.service.shutdown()
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+        self.server = create_gui_http_server(
+            db='local',
+            port=0,
+            token='test-token',
+            auto_run=False,
+            llm_profiles_file=self.llm_profiles_file,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.host, self.port = self.server.server_address
+        status, profiles = self.request('GET', '/api/llm-profiles')
+        assert status == 200
+        assert any(profile['profile_id'] == 'kimi-k2.7-code' and profile['max_tokens'] == 4096 for profile in profiles)
+
+    def test_llm_profile_spawn_exec_validation_and_delete_in_use(self) -> None:
+        status, body = self.request('POST', '/api/processes', {'goal': 'bad profile', 'auto_run': False, 'llm_profile': 'missing'})
+        assert status == 400
+        assert 'unknown LLM profile' in body['error']['message']
+
+        status, _profile = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {'profile_id': 'glm-5.2', 'model': 'glm-5.2', 'api_key_env': 'GLM_API_KEY'},
+        )
+        assert status == 200
+        status, spawned = self.request('POST', '/api/processes', {'goal': 'profile', 'auto_run': False, 'llm_profile': 'glm-5.2'})
+        assert status == 200
+        pid = spawned['pid']
+        status, body = self.request('DELETE', '/api/llm-profiles/glm-5.2')
+        assert status == 409
+        assert pid in body['error']['pids']
+
+        status, bad_exec = self.request(
+            'POST',
+            f'/api/processes/{pid}/exec',
+            {'image': 'base-agent:v0', 'goal': 'new', 'llm_profile': 'missing', 'confirmed': True},
+        )
+        assert status == 400
+        assert 'unknown LLM profile' in bad_exec['error']['message']
+
+        self.server.service.runtime.process.exit(pid, message='done')
+        status, deleted = self.request('DELETE', '/api/llm-profiles/glm-5.2')
+        assert status == 409
+        assert deleted['error']['profile_id'] == 'glm-5.2'
+
+    def test_process_rating_endpoint_updates_snapshot_and_audit(self) -> None:
+        status, spawned = self.request('POST', '/api/processes', {'goal': 'rate agent', 'auto_run': False})
+        assert status == 200
+        pid = spawned['pid']
+
+        status, empty = self.request('GET', f'/api/processes/{pid}/rating')
+        assert status == 200
+        assert empty is None
+
+        status, rating = self.request('POST', f'/api/processes/{pid}/rating', {'score': 5, 'comment': 'strong result'})
+        assert status == 200
+        assert rating['pid'] == pid
+        assert rating['score'] == 5
+        assert rating['comment'] == 'strong result'
+        assert rating['rater'] == DEFAULT_CONFIG.runtime.default_human
+        assert rating['source'] == 'gui'
+
+        status, updated = self.request('POST', f'/api/processes/{pid}/rating', {'score': 3, 'comment': 'missed detail'})
+        assert status == 200
+        assert updated['rating_id'] == rating['rating_id']
+        assert updated['score'] == 3
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+        assert status == 200
+        process = next(item for item in snapshot['processes'] if item['pid'] == pid)
+        assert process['rating']['score'] == 3
+        assert process['rating']['comment'] == 'missed detail'
+        assert any(
+            record.action == 'agent.rating.upsert'
+            and record.target == f'process:{pid}'
+            for record in self.server.service.runtime.audit.trace()
+        )
+
+    def test_process_rating_endpoint_rejects_invalid_requests(self) -> None:
+        status, spawned = self.request('POST', '/api/processes', {'goal': 'bad rating', 'auto_run': False})
+        assert status == 200
+        pid = spawned['pid']
+
+        status, body = self.request('POST', f'/api/processes/{pid}/rating', {'score': 0})
+        assert status == 400
+        assert 'between 1 and 5' in body['error']['message']
+
+        status, body = self.request('GET', '/api/processes/missing/rating')
+        assert status == 404
+        assert 'process not found' in body['error']['message']
 
     def test_encoded_route_segments_are_decoded(self) -> None:
         status, inspected = self.request('GET', '/api/images/base-agent%3Av0')
@@ -221,6 +382,12 @@ class TestGuiServer:
         assert [record['action'] for record in records] == ['process.audit.target']
 
     def test_high_risk_exec_requires_confirmation(self) -> None:
+        status, _profile = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {'profile_id': 'gui-exec', 'model': 'gui-exec-model', 'api_key_env': 'GUI_EXEC_API_KEY'},
+        )
+        assert status == 200
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'goal', 'auto_run': False})
         pid = spawned['pid']
         status, denied = self.request(
@@ -647,6 +814,48 @@ class TestGuiServer:
         finally:
             server.shutdown()
             thread.join(timeout=5)
+            server.service.shutdown()
+            server.server_close()
+
+    def test_gui_runtime_service_redacts_postgres_dsn_in_status_payloads(self) -> None:
+        dsn = 'postgresql://agent:secret@localhost:5432/agent_libos'
+        runtime = Runtime.open('local')
+        server = create_gui_http_server(runtime=runtime, db=dsn, port=0, token='custom-token', auto_run=False)
+        try:
+            redacted = 'postgresql://agent:***@localhost:5432/agent_libos'
+            assert server.service.db == redacted
+            assert server.service.health()['db'] == redacted
+            assert server.service.snapshot()['db'] == redacted
+        finally:
+            server.service.shutdown()
+            server.server_close()
+            runtime.close()
+
+    def test_gui_runtime_service_uses_configured_postgres_dsn_when_db_is_omitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = AgentLibOSConfig(
+            runtime=RuntimeDefaults(
+                store_backend='postgres',
+                store_dsn='postgresql://agent:secret@localhost:5432/agent_libos',
+            )
+        )
+        calls: dict[str, object] = {}
+        original_open = Runtime.open
+
+        def fake_open(target: object = None, **kwargs: object) -> Runtime:
+            calls['target'] = target
+            calls['config'] = kwargs.get('config')
+            return original_open('local')
+
+        monkeypatch.setattr(Runtime, 'open', staticmethod(fake_open))
+        server = create_gui_http_server(config=config, port=0, token='custom-token', auto_run=False)
+        try:
+            redacted = 'postgresql://agent:***@localhost:5432/agent_libos'
+
+            assert calls['target'] is None
+            assert server.service.db == redacted
+            assert server.service.health()['db'] == redacted
+            assert server.service.snapshot()['db'] == redacted
+        finally:
             server.service.shutdown()
             server.server_close()
 

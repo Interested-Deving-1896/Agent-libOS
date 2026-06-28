@@ -832,11 +832,22 @@ class LLMProcessExecutor:
         tool_calls: list[dict[str, Any]],
         *,
         parallel_tool_calls: bool,
-    ) -> list[dict[str, Any]]:
+        auto_wait_on_empty_tool_calls: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
         if not parallel_tool_calls:
-            return [self._completion_to_action(content, tool_calls)]
+            if not tool_calls and auto_wait_on_empty_tool_calls:
+                try:
+                    return [parse_json_action(content)], False
+                except Exception:
+                    return [self._auto_wait_message_action()], True
+            return [self._completion_to_action(content, tool_calls)], False
         if not tool_calls:
-            return [parse_json_action(content)]
+            try:
+                return [parse_json_action(content)], False
+            except Exception:
+                if auto_wait_on_empty_tool_calls:
+                    return [self._auto_wait_message_action()], True
+                raise
 
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
@@ -849,7 +860,11 @@ class LLMProcessExecutor:
             raise ValueError(f"invalid parallel tool calls: {errors}")
         if not actions:
             raise ValueError("parallel tool call response did not include any function calls")
-        return actions
+        return actions, False
+
+    @staticmethod
+    def _auto_wait_message_action() -> dict[str, Any]:
+        return {"action": "receive_process_messages"}
 
     async def _complete_valid_action(
         self,
@@ -862,7 +877,7 @@ class LLMProcessExecutor:
         last_error: Exception | None = None
         selected_max_attempts = max_attempts or self.config.llm.action_repair_attempts
         for attempt in range(selected_max_attempts):
-            completion, parallel_tool_calls = await self._complete_action_recorded(
+            completion, parallel_tool_calls, auto_wait_on_empty_tool_calls, profile_id = await self._complete_action_recorded(
                 pid=pid,
                 messages=attempt_messages,
                 tools=tools,
@@ -870,13 +885,28 @@ class LLMProcessExecutor:
                 max_attempts=selected_max_attempts,
             )
             try:
+                raw_actions, auto_wait_used = self._completion_to_actions(
+                    completion.content,
+                    completion.tool_calls,
+                    parallel_tool_calls=parallel_tool_calls,
+                    auto_wait_on_empty_tool_calls=auto_wait_on_empty_tool_calls,
+                )
+                if auto_wait_used:
+                    self.runtime.audit.record(
+                        actor=pid,
+                        action="llm.empty_tool_calls_auto_wait",
+                        target=f"process:{pid}",
+                        decision={
+                            "attempt": attempt + 1,
+                            "llm_profile_id": profile_id,
+                            "action": self._auto_wait_message_action(),
+                            "content_preview": completion.content[: self.config.llm.content_preview_chars],
+                            "tool_call_count": len(completion.tool_calls),
+                        },
+                    )
                 actions = [
                     self.runtime.tools.normalize_model_action(pid, action)
-                    for action in self._completion_to_actions(
-                        completion.content,
-                        completion.tool_calls,
-                        parallel_tool_calls=parallel_tool_calls,
-                    )
+                    for action in raw_actions
                 ]
                 for action in actions:
                     self._validate_dispatchable_action(pid, action)
@@ -978,7 +1008,7 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         attempt: int,
         max_attempts: int,
-    ) -> tuple[Any, bool]:
+    ) -> tuple[Any, bool, bool, str]:
         call_id = new_id("llmcall")
         process = self.runtime.process.get(pid)
         created_at = utc_now()
@@ -995,6 +1025,7 @@ class LLMProcessExecutor:
             client = resolved.client
             previous_response_id = self._previous_response_id_for_state(pid, resolved.profile_id, client)
             parallel_tool_calls = bool(resolved.parallel_tool_calls)
+            auto_wait_on_empty_tool_calls = bool(resolved.auto_wait_on_empty_tool_calls)
             request_options.update(
                 {
                     "llm_profile_id": resolved.profile_id,
@@ -1015,6 +1046,7 @@ class LLMProcessExecutor:
                         isinstance(client, LLMClient) and client.safety_identifier
                     ),
                     "openai_parallel_tool_calls_enabled": parallel_tool_calls,
+                    "agent_libos_auto_wait_on_empty_tool_calls_enabled": auto_wait_on_empty_tool_calls,
                 }
             )
             completion = await self._complete_action(
@@ -1086,7 +1118,7 @@ class LLMProcessExecutor:
             )
         )
         self._charge_llm_completion(pid, completion)
-        return completion, parallel_tool_calls
+        return completion, parallel_tool_calls, auto_wait_on_empty_tool_calls, str(request_options["llm_profile_id"])
 
     def _preflight_llm_call(self, pid: str) -> None:
         resources = getattr(self.runtime, "resources", None)

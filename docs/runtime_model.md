@@ -198,7 +198,7 @@ ObjectTask runners to drain their tool executor for up to
 `config.object_tasks.shutdown_join_timeout_s`. If a synchronous quantum or
 ObjectTask tool thread cannot stop safely, shutdown reports `ok: false` with
 `scheduler_stopped: false` or `object_tasks_stopped: false` and leaves the
-SQLite store open rather than closing it underneath a live worker. Once the
+runtime store open rather than closing it underneath a live worker. Once the
 worker finishes, a later shutdown can complete normal resource cleanup.
 
 ## Resource Budgets

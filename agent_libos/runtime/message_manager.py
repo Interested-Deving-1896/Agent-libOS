@@ -8,7 +8,7 @@ from agent_libos.models import EventPriority, EventType, ProcessMessage, Process
 from agent_libos.models.exceptions import NotFound, ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 
@@ -21,7 +21,7 @@ class ProcessMessageManager:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         audit: AuditManager,
         events: EventBus,
         config: AgentLibOSConfig | None = None,

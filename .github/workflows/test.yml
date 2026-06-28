@@ -97,6 +97,45 @@ jobs:
       - name: Run security shard
         run: uv run python -m pytest ${{ matrix.shard.paths }}
 
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_libos
+          POSTGRES_PASSWORD: agent_libos
+          POSTGRES_DB: agent_libos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_libos -d agent_libos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups --extra postgres
+
+      - name: Run PostgreSQL store integration tests
+        env:
+          AGENT_LIBOS_POSTGRES_DSN: postgresql://agent_libos:agent_libos@127.0.0.1:5432/agent_libos
+        run: uv run python -m pytest -m postgres --run-postgres
+
   gui:
     runs-on: ubuntu-latest
 

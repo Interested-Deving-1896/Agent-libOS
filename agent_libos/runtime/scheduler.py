@@ -14,7 +14,7 @@ from agent_libos.utils.ids import utc_now
 from agent_libos.models import ProcessStatus, ResourceUsage
 from agent_libos.models.exceptions import ResourceLimitExceeded
 from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 
 
 Quantum = Callable[[str], Any | Awaitable[Any]]
@@ -34,7 +34,7 @@ class AsyncProcessScheduler:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         audit: AuditManager,
         poll_interval_s: float = _SCHEDULER_DEFAULTS.poll_interval_s,
         max_workers: int = _SCHEDULER_DEFAULTS.max_workers,
@@ -348,21 +348,7 @@ class AsyncProcessScheduler:
             loop.close()
 
     def _claim_runnable_process(self, pid: str) -> Any | None:
-        now = utc_now()
-        with self.store._lock:
-            cur = self.store.conn.execute(
-                """
-                UPDATE processes
-                   SET status = ?, updated_at = ?
-                 WHERE pid = ? AND status = ?
-                """,
-                (ProcessStatus.RUNNING.value, now, pid, ProcessStatus.RUNNABLE.value),
-            )
-            self.store.conn.commit()
-            if cur.rowcount != 1:
-                return None
-            rows = list(self.store.conn.execute("SELECT * FROM processes WHERE pid = ?", (pid,)))
-            return self.store._row_to_process(rows[0]) if rows else None
+        return self.store.claim_runnable_process(pid)
 
     def _submit(self, pid: str, operation: Callable[[], Any], *, unblock: bool = False) -> Future[Any]:
         with self._executor_lock:

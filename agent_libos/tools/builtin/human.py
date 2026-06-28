@@ -17,7 +17,7 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 class HumanOutputArgs(BaseModel):
     message: str = Field(description="Message to present to the human operator.")
-    channel: str = Field(default=_RUNTIME_DEFAULTS.terminal_channel, description="Output channel. MVP supports terminal.")
+    channel: str = Field(default=_RUNTIME_DEFAULTS.terminal_channel, description="Human output channel.")
 
 
 class HumanOutputResult(BaseModel):
@@ -44,7 +44,7 @@ class AskHumanResult(BaseModel):
 class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     name = "human_output"
     description = (
-        "Present a message to the human operator. MVP implementation writes to the terminal. "
+        "Present a message to the human operator through the configured human provider. "
         "This is a Skills/Tools Layer wrapper around the libOS HumanObject output primitive; "
         "the primitive enforces human write capability, audit, and events."
     )

@@ -29,7 +29,7 @@ from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequire
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillPackage, SkillResource
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
@@ -56,7 +56,7 @@ class SkillManager:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,

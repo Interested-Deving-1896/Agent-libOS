@@ -38,9 +38,11 @@ class TestHumanLLMChatScript:
                 assert len(calls) == 1
                 assert calls[0].response_content == 'model reply'
                 assert calls[0].usage['total_tokens'] == 6
-                assert calls[0].reasoning['sha256']
-                assert calls[0].messages['sha256']
-                assert 'hello' not in json.dumps(calls[0].__dict__, sort_keys=True)
+                assert calls[0].reasoning == {'summary': 'fake text response'}
+                assert calls[0].messages[1]['content'] == 'hello'
+                assert calls[0].observability['reasoning']['sha256']
+                assert calls[0].observability['messages']['sha256']
+                assert 'hello' in json.dumps(calls[0].__dict__, sort_keys=True)
             finally:
                 runtime.close()
 

@@ -40,15 +40,15 @@ substrate for capability-controlled self-evolution.
    capability-controlled primitives.
 
 2. Implementation.
-   The current prototype implements the model in Python with Capability,
-   Resource Provider Substrate, SQLite persistence, audit/events, scoped
+   The current implementation realizes the model in Python with Capability,
+   Resource Provider Substrate, runtime store persistence, audit/events, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
    image registry/exec/commit primitives, standard `SKILL.md` packages, JSON-RPC over
    HTTP client endpoints, and Deno/TypeScript JIT tools that can reach libOS
    only through syscall RPC.
 
 3. Benchmark suite.
-   The current prototype includes an M1 deterministic runtime-safety harness
+   The current implementation includes an M1 deterministic runtime-safety harness
    with adversarial tasks, wrapper baselines, ablations, declared
    allowed/forbidden side effects, a side-effect oracle, and stable metrics
    output. The suite now includes a first self-evolution subset covering Skill

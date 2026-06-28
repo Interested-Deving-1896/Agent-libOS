@@ -7,9 +7,10 @@ Electron desktop console described in [docs/gui.md](gui.md).
 Both entrypoints are implemented under `agent_libos.api`, because they are
 host-facing control surfaces over the same runtime boundary.
 
-Use `--db` to select a runtime database. The sentinel target `local` is
-in-memory. Any other filesystem path creates or opens a persistent SQLite
-database.
+Use `--db` to select a runtime store. The sentinel target `local` is in-memory
+SQLite. Any other filesystem path creates or opens a persistent SQLite
+database. A `postgresql://` or `postgres://` DSN opens a PostgreSQL runtime
+store.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite <command>
@@ -34,25 +35,42 @@ fields, invalid types, and unsafe numeric limits fail at startup.
 ```yaml
 runtime:
   local_store_target: .agent_libos.sqlite
+  store_backend: sqlite
   run_until_idle_max_quanta: 10
 llm:
   parallel_tool_calls: false
+  auto_wait_on_empty_tool_calls: false
   default_profile_id: coding
   profiles:
     coding:
       model: gpt-4.1
       parallel_tool_calls: true
+      auto_wait_on_empty_tool_calls: true
 ```
 
-Explicit CLI options still win over config defaults. When `--db` is omitted,
-the CLI uses `runtime.local_store_target`: `local` means in-memory, while a path
-such as `.agent_libos.sqlite` is persistent SQLite.
+Explicit CLI options still win over config defaults. Passing `--db local`,
+`--db :memory:`, or a filesystem path selects SQLite even when the config
+default backend is PostgreSQL. When `--db` is omitted, the CLI uses
+`runtime.local_store_target` for SQLite or `runtime.store_dsn` for PostgreSQL.
+If `runtime.store_backend: postgres` is selected without `runtime.store_dsn`,
+config loading fails. Prefer environment variables or environment-specific
+config so DSN credentials are not committed. SQLite and PostgreSQL implement
+the same runtime store contract. Ordinary
+Object Memory payloads are runtime-only; SQL object rows store a
+runtime-memory marker, and rows whose live payload cache cannot be reconstructed
+are released fail-closed on reopen.
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
 is enabled, OpenAI may return multiple tool calls in one action-selection
 response; Agent libOS dispatches them sequentially in the same quantum rather
 than running tools concurrently.
+`llm.auto_wait_on_empty_tool_calls` is also opt-in and can be overridden per
+profile. It helps weaker tool-calling models by synthesizing
+`receive_process_messages` only when a response has no provider tool calls and
+no valid fallback JSON action. The synthesized wait uses the tool defaults, so
+it waits for any unread process message and does not change the raw stored LLM
+response.
 
 Use `--module-manifest` and `--trusted-module` before the command name to load
 trusted Runtime Modules before the runtime is used:
@@ -134,6 +152,42 @@ overridden. Only the configured default profile inherits legacy `OPENAI_*`
 provider/model environment variables. Other named profiles should declare their
 model and endpoint explicitly.
 
+The CLI reads profiles from `config.yaml` or `--config`; it does not read the
+GUI's user-level profile file. The GUI stores profiles created from its model
+manager in the operating system's user application config directory and passes
+that file to `agent-libos-gui-server --llm-profiles-file`. Both surfaces still
+persist only `llm_profile_id` on processes, and both read real API keys from
+environment variables named by `api_key_env`.
+
+Example config entries:
+
+```yaml
+llm:
+  default_profile_id: gpt-5.5
+  profiles:
+    gpt-5.5:
+      model: gpt-5.5
+      api_key_env: OPENAI_API_KEY
+    qwen3.7-max:
+      base_url: https://dashscope-compatible.example/v1
+      model: qwen3.7-max
+      api_key_env: QWEN_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+    glm-5.2:
+      base_url: https://open.bigmodel.example/api/paas/v4
+      model: glm-5.2
+      api_key_env: GLM_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+    kimi-k2.7-code:
+      base_url: https://api.moonshot.example/v1
+      model: kimi-k2.7-code
+      api_key_env: KIMI_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+```
+
 ## Workflow Run
 
 `workflow run` is a direct user entrypoint for tools. It spawns a fresh
@@ -210,17 +264,19 @@ uv run agent-libos --db .agent_libos.sqlite llm-calls --limit 20
 ```
 
 Records include provider ids, model/API mode, token usage when available, and
-bounded observability envelopes for prompts, visible tools, output, tool calls,
-reasoning, and raw responses. The envelopes contain preview, byte count, hash,
-and truncation metadata; raw prompt and provider payloads are not persisted by
-default.
+full prompts, visible tools, output, tool calls, reasoning, raw responses, and
+bounded observability envelopes. The envelopes contain preview, byte count,
+hash, and truncation metadata.
 For OpenAI Responses requests, request options may show strict tool-schema
 counts, whether prompt-cache or safety identifiers were configured, and any
 non-secret `previous_response_id` chain; configured cache keys and safety
 identifier values are not persisted there. They also show whether
 `parallel_tool_calls` was enabled for the action-selection request.
-Set `config.llm.persist_full_io=True` only when the operator explicitly wants
-complete LLM input/output persistence in SQLite for debugging or forensics.
+Full LLM input/output persistence is enabled by default for self-evolution
+training and fine-tuning pipelines under the deployment's user agreement. Set
+`config.llm.persist_full_io=False` when a user or operator opts out of storing
+sensitive prompt, tool, reasoning, and provider payload fields; the runtime
+then persists only bounded previews and hashes for those fields.
 
 ## Process Resources
 

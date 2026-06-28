@@ -26,6 +26,7 @@ class ResolvedLLMProfile:
     temperature: float
     max_tokens: int
     parallel_tool_calls: bool
+    auto_wait_on_empty_tool_calls: bool
 
 
 class LLMProfileRegistry:
@@ -50,6 +51,17 @@ class LLMProfileRegistry:
         self._profiles[selected_id] = selected_profile
         stale = self._clients.pop(selected_id, None)
         self._shutdown_client(stale)
+
+    def unregister_profile(self, profile_id: str) -> None:
+        selected_id = self._normalize_profile_id(profile_id)
+        if selected_id not in self._profiles:
+            raise ValidationError(f"LLM profile is not dynamically registered: {selected_id}")
+        self._profiles.pop(selected_id)
+        stale_client = self._clients.pop(selected_id, None)
+        stale_test_client = self._test_clients.pop(selected_id, None)
+        self._shutdown_client(stale_client)
+        if stale_test_client is not stale_client:
+            self._shutdown_client(stale_test_client)
 
     def set_test_client(self, profile_id: str, client: Any) -> None:
         selected_id = self.require_profile_id(profile_id)
@@ -87,6 +99,7 @@ class LLMProfileRegistry:
             temperature=self.config.llm.temperature if profile.temperature is None else profile.temperature,
             max_tokens=self.config.llm.max_tokens if profile.max_tokens is None else profile.max_tokens,
             parallel_tool_calls=self._resolved_parallel_tool_calls(profile, client),
+            auto_wait_on_empty_tool_calls=self._resolved_auto_wait_on_empty_tool_calls(profile),
         )
 
     @property
@@ -209,6 +222,11 @@ class LLMProfileRegistry:
         if client_value is not None:
             return bool(client_value)
         return bool(self.config.llm.parallel_tool_calls)
+
+    def _resolved_auto_wait_on_empty_tool_calls(self, profile: LLMProfile) -> bool:
+        if profile.auto_wait_on_empty_tool_calls is not None:
+            return bool(profile.auto_wait_on_empty_tool_calls)
+        return bool(self.config.llm.auto_wait_on_empty_tool_calls)
 
     def _profile_safety_identifier(
         self,

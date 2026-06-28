@@ -217,7 +217,7 @@ or raw wire methods.
 
 ## Persistence And Checkpoints
 
-Endpoint specs are stored in SQLite as registry rows. Resolved header secret
+Endpoint specs are stored as runtime store registry rows. Resolved header secret
 values are not persisted.
 
 Checkpoint snapshots preserve process capabilities that reference JSON-RPC

@@ -14,6 +14,7 @@ from agent_libos.models import (
     AgentObject,
     AgentImage,
     AgentProcess,
+    AgentRating,
     AuditRecord,
     Capability,
     CapabilityEffect,
@@ -82,28 +83,62 @@ def _persisted_bool(value: Any, label: str) -> bool:
     return value
 
 
-class SQLiteStore:
-    """Small SQLite repository used by the MVP runtime.
+_MISSING_OBJECT_PAYLOAD = object()
+
+
+class SQLRuntimeStore:
+    """Shared SQL repository used by runtime store backends.
 
     The store is intentionally thin: policy, permissions, and process semantics
     live in managers. This layer only owns durable shape and reconstruction.
     """
 
     SYSTEM_NAMESPACE = "system"
+    ALLOWED_TABLES = frozenset(
+        {
+            "objects",
+            "object_namespaces",
+            "object_links",
+            "processes",
+            "process_resource_reservations",
+            "events",
+            "capabilities",
+            "audit_records",
+            "external_effects",
+            "checkpoints",
+            "human_requests",
+            "llm_calls",
+            "llm_pending_actions",
+            "process_messages",
+            "object_tasks",
+            "agent_ratings",
+            "skills",
+            "skill_trust",
+            "jsonrpc_endpoints",
+            "images",
+            "image_artifacts",
+            "tools",
+            "tool_candidates",
+            "runtime_modules",
+        }
+    )
 
-    def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
+    def _init_store(self, path: str | Path, *, config: AgentLibOSConfig | None, conn: Any) -> None:
         self.config = config or DEFAULT_CONFIG
         self.path = str(path)
-        if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = conn
         self._lock = threading.RLock()
-        # Object payloads are runtime memory, not durable database state. SQLite
-        # stores only metadata plus a marker saying whether a payload was present
-        # in this process.
+        # Object payloads are runtime memory, not durable database state. SQL
+        # rows store only metadata plus a marker saying whether a payload was
+        # present in this process.
         self._object_payloads: dict[str, Any] = {}
+        self._transaction_depth = 0
         self.initialize()
+
+    @contextmanager
+    def locked(self):
+        with self._lock:
+            yield
 
     def close(self) -> None:
         self.conn.close()
@@ -398,6 +433,22 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_object_tasks_runner
                   ON object_tasks(runner_pid);
 
+                CREATE TABLE IF NOT EXISTS agent_ratings (
+                  rating_id TEXT PRIMARY KEY,
+                  pid TEXT NOT NULL,
+                  score INTEGER NOT NULL,
+                  comment TEXT NOT NULL,
+                  rater TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(pid, rater, source)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agent_ratings_pid
+                  ON agent_ratings(pid, updated_at);
+
                 CREATE TABLE IF NOT EXISTS skills (
                   skill_id TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
@@ -502,6 +553,7 @@ class SQLiteStore:
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_object_task_schema()
+            self._ensure_agent_rating_schema()
             self._ensure_checkpoint_schema()
             self._ensure_external_effect_schema()
             self._ensure_skill_schema()
@@ -511,13 +563,14 @@ class SQLiteStore:
             self._release_missing_runtime_object_payloads()
             self.conn.commit()
 
-    def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
+    def _execute(self, sql: str, params: Iterable[Any] = ()) -> Any:
         with self._lock:
             cur = self.conn.execute(sql, tuple(params))
-            self.conn.commit()
+            if self._transaction_depth == 0:
+                self.conn.commit()
             return cur
 
-    def _query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+    def _query(self, sql: str, params: Iterable[Any] = ()) -> list[Any]:
         with self._lock:
             return list(self.conn.execute(sql, tuple(params)))
 
@@ -532,6 +585,7 @@ class SQLiteStore:
         with self._lock:
             payloads = deepcopy(self._object_payloads) if include_object_payloads else None
             try:
+                self._transaction_depth += 1
                 self.conn.execute("BEGIN")
                 yield self.conn.cursor()
             except Exception:
@@ -541,6 +595,22 @@ class SQLiteStore:
                 raise
             else:
                 self.conn.commit()
+            finally:
+                self._transaction_depth -= 1
+
+    def validate_table_identifier(self, table: str) -> str:
+        if table not in self.ALLOWED_TABLES:
+            raise ValidationError(f"unsupported runtime store table: {table}")
+        return table
+
+    def validate_column_identifier(self, table: str, column: str) -> str:
+        self.validate_table_identifier(table)
+        if not column or not column.replace("_", "").isalnum() or not column[0].isalpha():
+            raise ValidationError(f"unsupported runtime store column: {table}.{column}")
+        columns = {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            raise ValidationError(f"unsupported runtime store column: {table}.{column}")
+        return column
 
     def insert_object(self, obj: AgentObject) -> None:
         with self.transaction(include_object_payloads=True) as cur:
@@ -559,7 +629,7 @@ class SQLiteStore:
                     obj.name,
                     obj.type.value,
                     obj.schema_version,
-                    dumps(self._memory_payload_marker(present=True)),
+                    dumps(self.payload_marker(present=True)),
                     dumps(obj.metadata),
                     dumps(obj.provenance),
                     obj.version,
@@ -591,7 +661,7 @@ class SQLiteStore:
                     obj.name,
                     obj.type.value,
                     obj.schema_version,
-                    dumps(self._memory_payload_marker(present=True)),
+                    dumps(self.payload_marker(present=True)),
                     dumps(obj.metadata),
                     dumps(obj.provenance),
                     obj.version,
@@ -612,9 +682,7 @@ class SQLiteStore:
             "SELECT * FROM objects WHERE oid = ? AND lifecycle_state = ?",
             (oid, ObjectLifecycleState.LIVE.value),
         )
-        # A row without an in-memory payload is a directory remnant from a prior
-        # runtime instance or checkpoint restore, not a materializable Object.
-        if not rows or oid not in self._object_payloads:
+        if not rows or not self.has_object_payload(oid, row=rows[0]):
             return None
         return self._row_to_object(rows[0])
 
@@ -623,7 +691,7 @@ class SQLiteStore:
             "SELECT * FROM objects WHERE namespace = ? AND name = ? AND lifecycle_state = ?",
             (namespace, name, ObjectLifecycleState.LIVE.value),
         )
-        if not rows or rows[0]["oid"] not in self._object_payloads:
+        if not rows or not self.has_object_payload(str(rows[0]["oid"]), row=rows[0]):
             return None
         return self._row_to_object(rows[0])
 
@@ -652,7 +720,7 @@ class SQLiteStore:
         return [
             self._row_to_object(row)
             for row in rows
-            if row["oid"] in self._object_payloads
+            if self.has_object_payload(str(row["oid"]), row=row)
         ]
 
     def list_object_oids_created_by(self, created_by: str) -> list[str]:
@@ -670,7 +738,7 @@ class SQLiteStore:
         return [
             self._row_to_object(row)
             for row in rows
-            if row["oid"] in self._object_payloads
+            if self.has_object_payload(str(row["oid"]), row=row)
         ]
 
     def list_object_oids_owned_by(self, owner_kind: str | ObjectOwnerKind, owner_id: str) -> list[str]:
@@ -696,7 +764,7 @@ class SQLiteStore:
         return [
             self._row_to_object(row)
             for row in rows
-            if row["oid"] in self._object_payloads
+            if self.has_object_payload(str(row["oid"]), row=row)
         ]
 
     def delete_object(self, oid: str) -> None:
@@ -711,7 +779,7 @@ class SQLiteStore:
                  WHERE oid = ?
                 """,
                 (
-                    dumps(self._memory_payload_marker(present=False)),
+                    dumps(self.payload_marker(present=False)),
                     ObjectLifecycleState.RELEASED.value,
                     now,
                     now,
@@ -852,6 +920,23 @@ class SQLiteStore:
         )
         return [self._row_to_process(row) for row in rows]
 
+    def claim_runnable_process(self, pid: str) -> AgentProcess | None:
+        now = utc_now()
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                UPDATE processes
+                   SET status = ?, updated_at = ?
+                 WHERE pid = ? AND status = ?
+                """,
+                (ProcessStatus.RUNNING.value, now, pid, ProcessStatus.RUNNABLE.value),
+            )
+            self.conn.commit()
+            if cur.rowcount != 1:
+                return None
+            rows = list(self.conn.execute("SELECT * FROM processes WHERE pid = ?", (pid,)))
+            return self._row_to_process(rows[0]) if rows else None
+
     def upsert_resource_reservation(self, reservation: ResourceReservation) -> None:
         self._execute(
             """
@@ -918,6 +1003,7 @@ class SQLiteStore:
         *,
         order_by: str | None = None,
     ) -> list[dict[str, Any]]:
+        table = self.validate_table_identifier(table)
         sql = f"SELECT * FROM {table}"
         if where_sql:
             sql += f" WHERE {where_sql}"
@@ -926,7 +1012,10 @@ class SQLiteStore:
         return [self._row_to_dict(row) for row in self._query(sql, params)]
 
     def insert_table_row(self, table: str, row: dict[str, Any]) -> None:
+        table = self.validate_table_identifier(table)
         columns = list(row)
+        for column in columns:
+            self.validate_column_identifier(table, column)
         placeholders = ", ".join("?" for _ in columns)
         col_sql = ", ".join(columns)
         self._execute(
@@ -935,16 +1024,55 @@ class SQLiteStore:
         )
 
     def delete_table_rows(self, table: str, where_sql: str, params: Iterable[Any] = ()) -> None:
+        table = self.validate_table_identifier(table)
         self._execute(f"DELETE FROM {table} WHERE {where_sql}", params)
 
+    def payload_marker(self, *, present: bool) -> dict[str, Any]:
+        return {"storage": "runtime_memory", "present": present}
+
     def object_payload(self, oid: str) -> Any:
-        return deepcopy(self._object_payloads[oid])
+        if oid in self._object_payloads:
+            return deepcopy(self._object_payloads[oid])
+        rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
+        if not rows:
+            raise KeyError(oid)
+        payload = self._decode_stored_object_payload(rows[0]["payload_json"])
+        if payload is _MISSING_OBJECT_PAYLOAD:
+            raise KeyError(oid)
+        self._object_payloads[oid] = deepcopy(payload)
+        return deepcopy(payload)
 
     def set_object_payload(self, oid: str, payload: Any) -> None:
         self._object_payloads[oid] = deepcopy(payload)
+        self._execute(
+            "UPDATE objects SET payload_json = ? WHERE oid = ?",
+            (dumps(self.payload_marker(present=True)), oid),
+        )
 
     def forget_object_payload(self, oid: str) -> None:
         self._object_payloads.pop(oid, None)
+
+    def has_object_payload(self, oid: str, *, row: Any | None = None) -> bool:
+        if oid in self._object_payloads:
+            return True
+        selected_row = row
+        if selected_row is None:
+            rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
+            selected_row = rows[0] if rows else None
+        if selected_row is None:
+            return False
+        payload = self._decode_stored_object_payload(selected_row["payload_json"])
+        if payload is _MISSING_OBJECT_PAYLOAD:
+            return False
+        self._object_payloads[oid] = deepcopy(payload)
+        return True
+
+    def snapshot_object_payloads(self, oids: Iterable[str]) -> dict[str, Any]:
+        payloads: dict[str, Any] = {}
+        for oid in oids:
+            if self.has_object_payload(oid):
+                payloads[oid] = self.object_payload(oid)
+        return payloads
 
     def insert_event(self, event: Event) -> None:
         self._execute(
@@ -1164,7 +1292,10 @@ class SQLiteStore:
             f"SELECT audit_records.*, rowid AS _audit_rowid FROM audit_records{where} "
             "ORDER BY timestamp DESC, rowid DESC LIMIT ?"
         )
-        rows = self._query(f"SELECT * FROM ({limited}) ORDER BY timestamp, _audit_rowid", [*params, selected_limit])
+        rows = self._query(
+            f"SELECT * FROM ({limited}) AS limited_audit ORDER BY timestamp, _audit_rowid",
+            [*params, selected_limit],
+        )
         return [self._row_to_audit(row) for row in rows]
 
     def insert_external_effect(self, record: ExternalEffectRecord) -> None:
@@ -1583,6 +1714,59 @@ class SQLiteStore:
             params.append(max(0, int(limit)))
         rows = self._query(f"SELECT * FROM object_tasks{where} ORDER BY updated_at DESC, created_at DESC, task_id ASC{limit_sql}", params)
         return [self._row_to_object_task(row) for row in rows]
+
+    def upsert_agent_rating(self, rating: AgentRating) -> AgentRating:
+        self._execute(
+            """
+            INSERT INTO agent_ratings (
+                rating_id, pid, score, comment, rater, source,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pid, rater, source) DO UPDATE SET
+                score = excluded.score,
+                comment = excluded.comment,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                rating.rating_id,
+                rating.pid,
+                rating.score,
+                rating.comment,
+                rating.rater,
+                rating.source,
+                dumps(rating.metadata),
+                rating.created_at,
+                rating.updated_at,
+            ),
+        )
+        saved = self.get_agent_rating(rating.pid, rating.rater, rating.source)
+        if saved is None:
+            raise ValidationError(f"failed to persist agent rating for process {rating.pid}")
+        return saved
+
+    def get_agent_rating(self, pid: str, rater: str, source: str = "gui") -> AgentRating | None:
+        rows = self._query(
+            "SELECT * FROM agent_ratings WHERE pid = ? AND rater = ? AND source = ?",
+            (pid, rater, source),
+        )
+        return self._row_to_agent_rating(rows[0]) if rows else None
+
+    def list_agent_ratings(self, pid: str | None = None, limit: int | None = None) -> list[AgentRating]:
+        params: list[Any] = []
+        where = ""
+        if pid is not None:
+            where = " WHERE pid = ?"
+            params.append(pid)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self._query(
+            f"SELECT * FROM agent_ratings{where} ORDER BY updated_at DESC, rating_id ASC{limit_sql}",
+            params,
+        )
+        return [self._row_to_agent_rating(row) for row in rows]
 
     def mark_object_tasks_abandoned(self, reason: str) -> list[str]:
         active = self.list_object_tasks(include_terminal=False)
@@ -2268,6 +2452,30 @@ class SQLiteStore:
             """
         )
 
+    def _ensure_agent_rating_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_ratings (
+              rating_id TEXT PRIMARY KEY,
+              pid TEXT NOT NULL,
+              score INTEGER NOT NULL,
+              comment TEXT NOT NULL,
+              rater TEXT NOT NULL,
+              source TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(pid, rater, source)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_agent_ratings_pid
+              ON agent_ratings(pid, updated_at)
+            """
+        )
+
     def _ensure_checkpoint_schema(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(checkpoints)")}
         if "created_by" not in columns:
@@ -2548,11 +2756,18 @@ class SQLiteStore:
         parts = namespace.split("/")
         return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
 
-    def _memory_payload_marker(self, present: bool) -> dict[str, Any]:
-        return {"storage": "runtime_memory", "present": present}
+    def _decode_stored_object_payload(self, payload_json: str) -> Any:
+        payload = loads(payload_json, {})
+        if (
+            isinstance(payload, dict)
+            and set(payload) == {"storage", "present"}
+            and payload.get("storage") == "runtime_memory"
+        ):
+            return _MISSING_OBJECT_PAYLOAD
+        return payload
 
     def _release_missing_runtime_object_payloads(self) -> None:
-        """Release Object Memory rows whose runtime-only payload cannot exist after reopen."""
+        """Release legacy Object Memory rows whose runtime-only payload cannot exist after reopen."""
 
         stale_oids: list[str] = []
         rows = self.conn.execute(
@@ -2569,6 +2784,7 @@ class SQLiteStore:
                 continue
             if (
                 isinstance(marker, dict)
+                and set(marker) == {"storage", "present"}
                 and marker.get("storage") == "runtime_memory"
                 and marker.get("present") is True
                 and row["oid"] not in self._object_payloads
@@ -2586,7 +2802,7 @@ class SQLiteStore:
              WHERE oid IN ({placeholders})
             """,
             (
-                dumps(self._memory_payload_marker(present=False)),
+                dumps(self.payload_marker(present=False)),
                 ObjectLifecycleState.RELEASED.value,
                 now,
                 now,
@@ -2692,7 +2908,7 @@ class SQLiteStore:
                 name=row["name"],
                 type=ObjectType(row["type"]),
                 schema_version=row["schema_version"],
-                payload=deepcopy(self._object_payloads[row["oid"]]),
+                payload=self.object_payload(str(row["oid"])),
                 metadata=metadata,
                 provenance=provenance,
                 version=row["version"],
@@ -2938,6 +3154,20 @@ class SQLiteStore:
                 completed_at=row["completed_at"],
             )
 
+    def _row_to_agent_rating(self, row: sqlite3.Row) -> AgentRating:
+        with _persisted_model_decode(f"agent rating {row['rating_id']}"):
+            return AgentRating(
+                rating_id=row["rating_id"],
+                pid=row["pid"],
+                score=int(row["score"]),
+                comment=row["comment"],
+                rater=row["rater"],
+                source=row["source"],
+                metadata=loads(row["metadata_json"], {}),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+
     def _llm_call_limit(self, limit: int | None) -> int:
         selected = self.config.llm.call_record_list_limit if limit is None else int(limit)
         if selected <= 0:
@@ -3093,3 +3323,19 @@ class SQLiteStore:
             capability_id=data["capability_id"],
             expires_at=data.get("expires_at"),
         )
+
+
+class SQLiteStore(SQLRuntimeStore):
+    """SQLite runtime store backend.
+
+    This public class is kept for compatibility; shared repository behavior
+    lives in SQLRuntimeStore so non-SQLite backends do not inherit SQLite setup.
+    """
+
+    def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
+        selected_path = str(path)
+        if selected_path != ":memory:":
+            Path(selected_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(selected_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        self._init_store(selected_path, config=config, conn=conn)

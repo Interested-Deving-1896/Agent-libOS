@@ -33,6 +33,19 @@ export type RuntimeProcess = {
   resource_budget?: Record<string, unknown>;
   resource_usage?: Record<string, unknown>;
   resource_remaining?: Record<string, unknown>;
+  rating: AgentRating | null;
+};
+
+export type AgentRating = {
+  rating_id: string;
+  pid: string;
+  score: number;
+  comment: string;
+  rater: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+  metadata: Record<string, unknown>;
 };
 
 export type ProcessMessage = {
@@ -106,6 +119,46 @@ export type ToolSummary = {
   tags: string[];
   policy: Record<string, unknown>;
   ephemeral: boolean;
+};
+
+export type LLMProfileSummary = {
+  profile_id: string;
+  model: string | null;
+  base_url: string | null;
+  api_key_env: string;
+  api_key_env_present: boolean;
+  api_mode: "auto" | "responses" | "chat" | null;
+  timeout_s: number | null;
+  max_retries: number | null;
+  store: boolean | null;
+  reasoning_effort: string | null;
+  verbosity: "low" | "medium" | "high" | null;
+  parallel_tool_calls: boolean | null;
+  auto_wait_on_empty_tool_calls: boolean | null;
+  temperature: number | null;
+  max_tokens: number | null;
+  allow_custom_base_url: boolean;
+  source: "config" | "user";
+  editable: boolean;
+  is_default: boolean;
+};
+
+export type LLMProfileInput = {
+  profile_id?: string;
+  model: string;
+  base_url?: string | null;
+  api_key_env: string;
+  api_mode?: "auto" | "responses" | "chat" | null;
+  timeout_s?: number | null;
+  max_retries?: number | null;
+  store?: boolean | null;
+  reasoning_effort?: string | null;
+  verbosity?: "low" | "medium" | "high" | null;
+  parallel_tool_calls?: boolean | null;
+  auto_wait_on_empty_tool_calls?: boolean | null;
+  temperature?: number | null;
+  max_tokens?: number | null;
+  allow_custom_base_url?: boolean | null;
 };
 
 export type WorkflowRunResult = {
@@ -200,6 +253,7 @@ export type RuntimeSnapshot = {
   llm_calls: LlmCall[];
   object_tasks: ObjectTask[];
   tools: ToolSummary[];
+  llm_profiles: LLMProfileSummary[];
   images: ImageSummary[];
   skills: Record<string, unknown>[];
   jsonrpc_endpoints: Record<string, unknown>[];

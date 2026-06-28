@@ -39,6 +39,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="run tests that spend real LLM/provider calls",
     )
     parser.addoption(
+        "--run-postgres",
+        action="store_true",
+        default=False,
+        help="run PostgreSQL runtime store integration tests",
+    )
+    parser.addoption(
         "--keep-agent-outputs",
         action="store_true",
         default=False,
@@ -67,6 +73,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     root = Path(config.rootpath)
     skip_real_deno = bool(config.getoption("--skip-real-deno"))
     run_real_llm = bool(config.getoption("--run-real-llm"))
+    run_postgres = bool(config.getoption("--run-postgres"))
     invariant_marks = _load_invariant_marks(root)
 
     for item in items:
@@ -83,6 +90,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 item.add_marker(pytest.mark.skip(reason="real LLM tests require --run-real-llm"))
             elif not _has_real_llm_environment():
                 item.add_marker(pytest.mark.skip(reason="real LLM environment is not configured"))
+        if "postgres" in item.keywords:
+            if not run_postgres:
+                item.add_marker(pytest.mark.skip(reason="PostgreSQL tests require --run-postgres"))
+            elif not os.getenv("AGENT_LIBOS_POSTGRES_DSN"):
+                item.add_marker(pytest.mark.skip(reason="AGENT_LIBOS_POSTGRES_DSN is not configured"))
 
 
 def _skip_agent_outputs_cleanup(config: pytest.Config) -> bool:

@@ -105,6 +105,47 @@ button.secondary {
   min-width: 0;
 }
 
+.llmProfileSelect {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: #52606d;
+  font-size: 12px;
+}
+
+.llmProfileSelect label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.llmProfileSelectRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+}
+
+.llmProfileSelectRow select {
+  min-width: 0;
+}
+
+.iconTextButton {
+  white-space: nowrap;
+}
+
+.iconOnly {
+  width: 32px;
+  padding: 0;
+}
+
+.llmProfileWarning {
+  color: #8a4b00;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 input, textarea, select {
   border: 1px solid #cbd2d9;
   border-radius: 6px;
@@ -230,6 +271,10 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.userStart .llmProfileSelect {
+  grid-column: 1 / -1;
+}
+
 .userStart h1 {
   grid-column: 1 / -1;
   margin: 0;
@@ -260,6 +305,75 @@ textarea {
 }
 
 .userImageControls input {
+  min-width: 0;
+}
+
+.agentRatingPanel {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.75fr) auto minmax(220px, 1.25fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid #d9e2ec;
+  background: #ffffff;
+}
+
+.tabPanel .agentRatingPanel {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  padding: 0;
+  border-bottom: 0;
+  background: transparent;
+}
+
+.ratingHeader {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ratingHeader strong {
+  font-size: 13px;
+}
+
+.ratingHeader span,
+.ratingActions span {
+  color: #627d98;
+  font-size: 12px;
+}
+
+.ratingStars {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  white-space: nowrap;
+}
+
+.ratingStars button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: #8a6f19;
+}
+
+.ratingStars button.active {
+  border-color: #c49a19;
+  background: #fff7d7;
+}
+
+.agentRatingPanel textarea {
+  min-height: 42px;
+  max-height: 96px;
+  min-width: 0;
+  resize: vertical;
+}
+
+.ratingActions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -619,6 +733,8 @@ textarea {
 }
 
 .spawnBox .imageSelect,
+.spawnBox .llmProfileSelect,
+.quickActions > .llmProfileSelect,
 .quickActions > .imageSelect {
   grid-template-columns: 1fr;
 }
@@ -837,6 +953,7 @@ textarea {
 }
 
 .quickActions > .imageSelect,
+.quickActions > .llmProfileSelect,
 .quickActions > input[aria-label] {
   grid-column: 1 / -1;
 }
@@ -962,4 +1079,70 @@ textarea {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
+}
+
+.llmProfileModal {
+  width: min(920px, calc(100vw - 48px));
+}
+
+.llmProfileManager {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.7fr) minmax(320px, 1.3fr);
+  gap: 14px;
+  min-width: 0;
+}
+
+.llmProfileList,
+.llmProfileForm {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.llmProfileListItem {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.llmProfileListItem > button:first-child {
+  height: auto;
+  min-height: 34px;
+  justify-content: flex-start;
+  display: grid;
+  gap: 1px;
+  text-align: left;
+}
+
+.llmProfileList button.active {
+  background: #d9eee9;
+  border-color: #8fc4b7;
+}
+
+.llmProfileListItem span,
+.llmProfileListItem small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llmProfileListItem small {
+  color: #7b8794;
+  font-size: 11px;
+}
+
+.llmProfileForm label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: #52606d;
+  font-size: 12px;
+}
+
+.llmProfileFormGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }

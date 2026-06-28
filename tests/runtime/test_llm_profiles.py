@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
+from pathlib import Path
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
+from agent_libos.llm.user_profiles import UserLLMProfileStore, default_user_llm_profiles_path
 from agent_libos.models import AgentImage, CapabilityRight, ProcessStatus
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.storage import SQLiteStore
 from tests.support.fakes import RecordingActionClient
 
@@ -21,6 +25,7 @@ def _profile_config() -> AgentLibOSConfig:
                 "image-default": LLMProfile(model="image-model"),
                 "override": LLMProfile(model="override-model"),
                 "parallel": LLMProfile(model="parallel-model", parallel_tool_calls=True),
+                "auto-wait": LLMProfile(model="auto-wait-model", auto_wait_on_empty_tool_calls=True),
             },
         )
     )
@@ -139,6 +144,34 @@ class TestLLMProfiles:
         finally:
             runtime.close()
 
+    def test_llm_profile_can_override_auto_wait_on_empty_tool_calls(self) -> None:
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            default = runtime.llms.resolve("default")
+            auto_wait = runtime.llms.resolve("auto-wait")
+
+            assert default.auto_wait_on_empty_tool_calls is False
+            assert auto_wait.auto_wait_on_empty_tool_calls is True
+        finally:
+            runtime.close()
+
+    def test_dynamic_llm_profile_can_be_unregistered(self) -> None:
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            runtime.llms.register_profile("temporary", LLMProfile(model="temporary-model"))
+            assert runtime.llms.resolve("temporary").profile.model == "temporary-model"
+
+            runtime.llms.unregister_profile("temporary")
+
+            try:
+                runtime.llms.resolve("temporary")
+            except ValidationError as exc:
+                assert "unknown LLM profile" in str(exc)
+            else:
+                raise AssertionError("temporary profile should be removed")
+        finally:
+            runtime.close()
+
     def test_only_default_profile_inherits_legacy_openai_environment(self, monkeypatch) -> None:
         monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.example/v1")
         monkeypatch.setenv("OPENAI_MODEL", "ambient-model")
@@ -202,6 +235,63 @@ class TestLLMProfiles:
             return client.closed
 
         assert asyncio.run(run()) is True
+
+
+class TestUserLLMProfileStore:
+    def test_default_user_llm_profile_paths_follow_platform_conventions(self) -> None:
+        home = Path("/home/example")
+        assert default_user_llm_profiles_path(platform="win32", env={"APPDATA": "C:/Users/example/AppData/Roaming"}, home=home) == Path("C:/Users/example/AppData/Roaming") / "Agent libOS" / "llm-profiles.json"
+        assert default_user_llm_profiles_path(platform="darwin", env={}, home=home) == home / "Library" / "Application Support" / "Agent libOS" / "llm-profiles.json"
+        assert default_user_llm_profiles_path(platform="linux", env={"XDG_CONFIG_HOME": "/tmp/config"}, home=home) == Path("/tmp/config") / "agent-libos" / "llm-profiles.json"
+
+    def test_user_llm_profile_store_round_trips_non_secret_profile_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "llm-profiles.json"
+            store = UserLLMProfileStore(path)
+
+            saved = store.upsert(
+                "qwen3.7-max",
+                {
+                    "profile_id": "qwen3.7-max",
+                    "model": "qwen3.7-max",
+                    "base_url": "https://qwen.example/v1/",
+                    "api_key_env": "QWEN_API_KEY",
+                    "api_mode": "chat",
+                    "temperature": 0.1,
+                    "max_tokens": 8192,
+                    "auto_wait_on_empty_tool_calls": True,
+                },
+            )
+            loaded = UserLLMProfileStore(path).load()
+
+            assert saved.model == "qwen3.7-max"
+            assert loaded["qwen3.7-max"].base_url == "https://qwen.example/v1"
+            assert loaded["qwen3.7-max"].api_key_env == "QWEN_API_KEY"
+            assert loaded["qwen3.7-max"].allow_custom_base_url is True
+            assert loaded["qwen3.7-max"].auto_wait_on_empty_tool_calls is True
+            assert "secret" not in path.read_text(encoding="utf-8")
+            assert "api_key" not in json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
+
+    def test_user_llm_profile_store_rejects_invalid_json_and_secret_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "llm-profiles.json"
+            path.write_text("{bad", encoding="utf-8")
+            store = UserLLMProfileStore(path)
+
+            try:
+                store.load()
+            except ValidationError as exc:
+                assert "invalid LLM profiles JSON" in str(exc)
+            else:
+                raise AssertionError("bad JSON should fail closed")
+
+            path.unlink()
+            try:
+                store.upsert("bad", {"model": "bad", "api_key_env": "BAD_API_KEY", "api_key": "secret"})
+            except ValidationError as exc:
+                assert "API keys are not accepted" in str(exc)
+            else:
+                raise AssertionError("raw API keys should be rejected")
 
     def test_runtime_ashutdown_closes_async_llm_clients(self) -> None:
         async def run() -> bool:

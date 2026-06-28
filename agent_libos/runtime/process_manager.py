@@ -32,7 +32,7 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 
 class ProcessManager:
     """Process lifecycle primitive."""
@@ -41,7 +41,7 @@ class ProcessManager:
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: RuntimeStore,
         memory: ObjectMemoryManager,
         capabilities: CapabilityManager,
         audit: AuditManager,
@@ -418,7 +418,7 @@ class ProcessManager:
         )
 
     def wait(self, pid: str, child: str, timeout: float | None = None) -> ProcessResult:
-        with self.store._lock:
+        with self.store.locked():
             parent = self._get(pid)
             child_proc = self._require_child(parent.pid, child)
             if child_proc.status not in self.TERMINAL_STATUSES:
@@ -605,7 +605,7 @@ class ProcessManager:
         if process.status in self.TERMINAL_STATUSES:
             self._release_rejected_exit_result(pid, result)
             raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
-        with self.store._lock:
+        with self.store.locked():
             process = self._get(pid)
             if process.status in self.TERMINAL_STATUSES:
                 self._release_rejected_exit_result(pid, result)

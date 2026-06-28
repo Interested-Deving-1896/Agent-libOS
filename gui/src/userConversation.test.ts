@@ -103,6 +103,7 @@ function snapshot(): RuntimeSnapshot {
         interrupt_count: 0,
         llm_call_count: 1,
         token_total: 12,
+        rating: null,
         messages: [
           {
             message_id: "pmsg_user",
@@ -220,6 +221,7 @@ function snapshot(): RuntimeSnapshot {
     ],
     tools: [],
     object_tasks: [],
+    llm_profiles: [],
     images: [],
     skills: [],
     jsonrpc_endpoints: [],

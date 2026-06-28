@@ -53,7 +53,8 @@ function snapshot(pids: string[]): RuntimeSnapshot {
       interrupt_count: 0,
       messages: [],
       llm_call_count: 0,
-      token_total: 0
+      token_total: 0,
+      rating: null
     })),
     human_requests: [],
     events: [],
@@ -61,6 +62,7 @@ function snapshot(pids: string[]): RuntimeSnapshot {
     llm_calls: [],
     object_tasks: [],
     tools: [],
+    llm_profiles: [],
     images: [],
     skills: [],
     jsonrpc_endpoints: [],

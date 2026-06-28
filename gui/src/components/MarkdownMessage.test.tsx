@@ -85,13 +85,16 @@ describe("MarkdownMessage", () => {
           maxQuanta={null}
           spawnGoal="goal"
           spawnImage="coding-agent:v0"
+          spawnLlmProfile=""
           spawnWorkingDirectory=""
           message=""
           images={[]}
+          llmProfiles={[]}
           onSelectPid={() => undefined}
           onMaxQuantaChange={() => undefined}
           onSpawnGoalChange={() => undefined}
           onSpawnImageChange={() => undefined}
+          onSpawnLlmProfileChange={() => undefined}
           onSpawnWorkingDirectoryChange={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
@@ -99,6 +102,10 @@ describe("MarkdownMessage", () => {
           onCommitImage={() => undefined}
           onSend={() => undefined}
           onRespond={async () => true}
+          onRate={async () => true}
+          onCreateLlmProfile={async () => true}
+          onUpdateLlmProfile={async () => true}
+          onDeleteLlmProfile={async () => true}
           onRun={() => undefined}
           onPause={() => undefined}
           onRefresh={() => undefined}
@@ -162,7 +169,8 @@ function userPageSnapshot(): RuntimeSnapshot {
           }
         ],
         llm_call_count: 0,
-        token_total: 0
+        token_total: 0,
+        rating: null
       }
     ],
     human_requests: [
@@ -183,6 +191,7 @@ function userPageSnapshot(): RuntimeSnapshot {
     llm_calls: [],
     object_tasks: [],
     tools: [],
+    llm_profiles: [],
     images: [],
     skills: [],
     jsonrpc_endpoints: [],

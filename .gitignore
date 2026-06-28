@@ -21,4 +21,5 @@ gui/.vite/
 gui/.smoke-log.jsonl
 gui/.smoke-user-data/
 gui/release/
+gui-memory
 !benchmarks/runtime_safety/fixtures/basic_repo/.env

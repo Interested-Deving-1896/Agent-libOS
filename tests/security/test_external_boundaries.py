@@ -2,7 +2,7 @@ from __future__ import annotations
 import pytest
 from uuid import uuid4
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, ForkMode, HumanRequestStatus, ProcessStatus
+from agent_libos.models import CapabilityRight, EventType, ForkMode, HumanRequestStatus, ProcessStatus
 
 class TestExternalBoundary:
 
@@ -68,6 +68,39 @@ class TestExternalBoundary:
         assert self.human_output == ['allowed']
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
         assert 'human.output' in self._audit_actions()
+
+    def test_human_output_preserves_non_terminal_channel_in_observability(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='speak on gui channel')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+
+        allowed = self.runtime.tools.call(pid, 'human_output', {'message': 'allowed', 'channel': 'gui'})
+
+        assert allowed.ok, allowed.error
+        assert allowed.payload['channel'] == 'gui'
+        assert self.human_output == ['allowed']
+        request = self.runtime.human.list(pid)[0]
+        assert request.status == HumanRequestStatus.DELIVERED
+        assert request.payload['channel'] == 'gui'
+        event = next(event for event in self.runtime.events.list(target='human:owner') if event.type == EventType.HUMAN_OUTPUT)
+        assert event.payload['channel'] == 'gui'
+        audit = next(record for record in self.runtime.audit.trace() if record.action == 'human.output')
+        assert audit.decision['channel'] == 'gui'
+        effect = self.runtime.store.list_external_effects()[0]
+        assert effect.provider_metadata['context']['channel'] == 'gui'
+
+    def test_human_output_rejects_empty_or_too_long_channel(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='bad human channel')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+
+        empty = self.runtime.tools.call(pid, 'human_output', {'message': 'empty channel', 'channel': '   '})
+        too_long = self.runtime.tools.call(pid, 'human_output', {'message': 'long channel', 'channel': 'x' * 129})
+
+        assert not empty.ok
+        assert 'human output channel must be non-empty' in (empty.error or '')
+        assert not too_long.ok
+        assert 'human output channel is too long' in (too_long.error or '')
+        assert self.human_output == []
+        assert self.runtime.human.list(pid) == []
 
     def test_one_time_human_output_capability_is_consumed_after_delivery(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='speak once')

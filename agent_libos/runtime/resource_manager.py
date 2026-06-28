@@ -9,7 +9,7 @@ from agent_libos.models import AgentProcess, EventPriority, EventType, ProcessSt
 from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 
@@ -50,7 +50,7 @@ class ResourceManager:
     can bound the total consumption of all descendants.
     """
 
-    def __init__(self, store: SQLiteStore, audit: AuditManager, events: EventBus) -> None:
+    def __init__(self, store: RuntimeStore, audit: AuditManager, events: EventBus) -> None:
         self.store = store
         self.audit = audit
         self.events = events
@@ -70,7 +70,7 @@ class ResourceManager:
         usage = self._coerce_usage(request)
         if self._is_zero(usage):
             return
-        with self.store._lock:
+        with self.store.locked():
             self._preflight_locked(pid, usage, source=source, context=context)
 
     def charge(
@@ -86,7 +86,7 @@ class ResourceManager:
         delta = self._coerce_usage(usage)
         if self._is_zero(delta):
             return
-        with self.store._lock:
+        with self.store.locked():
             chain = self._process_chain(pid)
             relevant_fields = self._nonzero_fields(delta)
             if not allow_overage:
@@ -138,7 +138,7 @@ class ResourceManager:
         owner_pid: str | None = None,
         limit: dict[str, Any] | None = None,
     ) -> None:
-        with self.store._lock:
+        with self.store.locked():
             killed: list[str] = []
             for process in self._descendant_tree(pid):
                 if process.status in _TERMINAL_STATUSES:
@@ -197,7 +197,7 @@ class ResourceManager:
     def remaining_cumulative(self, pid: str, budget_field: str, usage_field: str) -> float | None:
         if budget_field not in _BUDGET_USAGE_MAP or usage_field not in _USAGE_FIELD_NAMES:
             raise ValidationError(f"unknown resource remaining query: {budget_field}/{usage_field}")
-        with self.store._lock:
+        with self.store.locked():
             return self._remaining_budget_field_locked(pid, budget_field, (usage_field,))
 
     def peak_limit(self, pid: str, budget_field: str) -> int | None:
@@ -221,7 +221,7 @@ class ResourceManager:
     ) -> None:
         reserve = reserved_usage or ResourceUsage()
         self._coerce_usage(reserve)
-        with self.store._lock:
+        with self.store.locked():
             if not self._is_zero(reserve):
                 self._preflight_locked(
                     parent_pid,
@@ -260,7 +260,7 @@ class ResourceManager:
                     )
 
     def remaining_budget(self, pid: str) -> ResourceBudget:
-        with self.store._lock:
+        with self.store.locked():
             values: dict[str, Any] = {
                 "max_context_materialization_tokens": self.context_materialization_window_limit(pid),
             }
@@ -276,7 +276,7 @@ class ResourceManager:
             return ResourceBudget(**values)
 
     def reserve_child_budget(self, parent_pid: str, child_pid: str, child_budget: ResourceBudget) -> None:
-        with self.store._lock:
+        with self.store.locked():
             self.validate_child_budget(parent_pid, child_budget, reserved_usage=ResourceUsage(child_processes=1))
             reserved = self._reservation_from_budget(child_budget)
             if not reserved:
@@ -299,7 +299,7 @@ class ResourceManager:
             )
 
     def release_process_reservations(self, pid: str) -> None:
-        with self.store._lock:
+        with self.store.locked():
             reservations = self.store.list_resource_reservations(child_pid=pid)
             reservations.extend(self.store.list_resource_reservations(parent_pid=pid))
             self.store.delete_resource_reservations_for_process(pid)

@@ -76,9 +76,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   from the LLM scheduler; terminal/cancel reconciliation must not leave active
   pins behind, and owner-watch resumes only replay tools with explicitly safe
   message-receive semantics.
-- `llm-call-records-are-bounded-and-redacted`: LLM call persistence stores
-  bounded preview, size, hash, and truncation metadata instead of raw prompts,
-  tool arguments, reasoning, or provider responses.
+- `llm-call-records-opt-out-are-bounded-and-redacted`: when
+  `llm.persist_full_io` is false, LLM call persistence stores bounded preview,
+  size, hash, and truncation metadata instead of raw prompts, tool arguments,
+  reasoning, or provider responses.
 - `llm-profile-selection-is-process-local`: host-selected LLM profiles are
   stored as process-local ids, resolved at LLM-call time, inherited by child
   processes, preserved by image-package defaults, isolated from non-default
