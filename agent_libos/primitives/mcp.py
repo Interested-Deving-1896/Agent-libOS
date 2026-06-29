@@ -114,9 +114,12 @@ class McpPrimitive:
             required_right = CapabilityRight.ADMIN if existing is not None else CapabilityRight.WRITE
             self.capabilities.require(actor, self.server_resource(spec.server_id), required_right)
         now = utc_now()
-        self.store.upsert_mcp_server(spec, registered_by=actor, created_at=now)
         if existing is not None:
-            self._disable_replaced_server_tool_capabilities(spec.server_id, actor=actor)
+            with self.store.transaction():
+                self.store.upsert_mcp_server(spec, registered_by=actor, created_at=now)
+                self._disable_replaced_server_tool_capabilities(spec.server_id, actor=actor)
+        else:
+            self.store.upsert_mcp_server(spec, registered_by=actor, created_at=now)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=actor,
@@ -236,8 +239,9 @@ class McpPrimitive:
         self._load_server(server_id)
         if require_capability:
             self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.ADMIN)
-        self._disable_replaced_server_tool_capabilities(server_id, actor=actor)
-        self.store.delete_mcp_server(server_id)
+        with self.store.transaction():
+            self._disable_replaced_server_tool_capabilities(server_id, actor=actor)
+            self.store.delete_mcp_server(server_id)
         self.audit.record(
             actor=actor,
             action="mcp.server.unregister",
@@ -932,10 +936,12 @@ class McpPrimitive:
     def _disable_replaced_server_tool_capabilities(self, server_id: str, *, actor: str) -> None:
         prefix = f"mcp:{server_id}:"
         for cap in self.store.list_capabilities():
+            if not cap.active or cap.revoked:
+                continue
             if cap.resource == f"mcp:{server_id}:*" or cap.resource.startswith(prefix):
-                self.capabilities.revoke(
+                self.capabilities.disable_subject_capability(
                     cap.cap_id,
-                    revoked_by=actor,
+                    actor=actor,
                     reason="MCP server spec replaced; tool authority must be reissued",
                 )
 

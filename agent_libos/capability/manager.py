@@ -727,6 +727,7 @@ class CapabilityManager:
             expires_at=expires_at,
             uses_remaining=uses_remaining,
             delegable=False,
+            metadata={"object_handle": True},
         )
         return ObjectHandle(oid=oid, rights=normalized, capability_id=cap.cap_id, expires_at=expires_at)
 
@@ -1228,7 +1229,21 @@ class CapabilityManager:
         operation = str(context.get("authority_operation") or context.get("operation") or "")
         if not operation:
             return {"ok": False, "reason": "authority rule requires operation context"}
-        matched = [rule for rule in rules if rule.operation == operation and self._authority_rule_matches(rule, context)]
+        operation_rules = [rule for rule in rules if rule.operation == operation]
+        matched = []
+        for rule in operation_rules:
+            unknown_conditions = self._unknown_authority_rule_conditions(rule)
+            if unknown_conditions:
+                return {
+                    "ok": False,
+                    "effect": CapabilityEffect.DENY.value,
+                    "reason": "malformed authority rule condition",
+                    "operation": operation,
+                    "rule_id": rule.rule_id,
+                    "unknown_conditions": unknown_conditions,
+                }
+            if self._authority_rule_matches(rule, context):
+                matched.append(rule)
         if not matched:
             return {
                 "ok": False,
@@ -1264,7 +1279,7 @@ class CapabilityManager:
             "operation": operation,
         }
 
-    def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
+    def _unknown_authority_rule_conditions(self, rule: Any) -> list[str]:
         conditions = dict(rule.conditions or {})
         allowed_conditions = {
             "argv",
@@ -1292,8 +1307,10 @@ class CapabilityManager:
             "parents",
             "exist_ok",
         }
-        if any(key not in allowed_conditions for key in conditions):
-            return False
+        return sorted(key for key in conditions if key not in allowed_conditions)
+
+    def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
+        conditions = dict(rule.conditions or {})
         if "operation" in conditions and str(context.get("operation")) != str(conditions["operation"]):
             return False
         if "authority_operation" in conditions and str(context.get("authority_operation")) != str(conditions["authority_operation"]):

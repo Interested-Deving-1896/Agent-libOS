@@ -750,6 +750,16 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             raw_args = body.get("args") if "args" in body else {}
             if not isinstance(raw_args, dict):
                 raise GuiServerError(HTTPStatus.BAD_REQUEST, "workflow args must be a JSON object")
+            if self._workflow_requires_confirmation(service, tool, body):
+                self._require_confirmed(
+                    "workflow.run",
+                    body,
+                    {
+                        "tool": tool,
+                        "image": body.get("image"),
+                        "working_directory": body.get("working_directory"),
+                    },
+                )
             result = service.runtime.run_workflow(
                 tool,
                 raw_args,
@@ -908,7 +918,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route == ["signal"]:
             body = self._read_body()
-            service.runtime.process.signal(pid, ProcessSignal(str(body.get("signal") or ProcessSignal.INTERRUPT.value)), payload=body.get("payload"))
+            signal = ProcessSignal(str(body.get("signal") or ProcessSignal.INTERRUPT.value))
+            if signal in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
+                self._require_confirmed("process.signal", body, {"pid": pid, "signal": signal.value})
+            service.runtime.process.signal(pid, signal, payload=body.get("payload"))
             service.publish_runtime_changes("process.signal")
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route in (["message"], ["interrupt"]):
@@ -1450,6 +1463,15 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             f"{action} requires explicit confirmation",
             details={"confirmation_required": True, "action": action, "preview": preview},
         )
+
+    def _workflow_requires_confirmation(self, service: GuiRuntimeService, tool: str, body: dict[str, Any]) -> bool:
+        if body.get("image") is not None or body.get("working_directory") is not None:
+            return True
+        try:
+            handle = service.runtime.tools.resolve(tool)
+        except NotFound:
+            return False
+        return service.runtime.tools._tool_has_side_effects(handle)
 
     def _write_json(self, value: Any, *, status: int = HTTPStatus.OK) -> None:
         payload = json.dumps(to_jsonable(value), ensure_ascii=False, default=str).encode("utf-8")

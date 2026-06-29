@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
-from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessStatus
+from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessSignal, ProcessStatus
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
 
@@ -416,6 +416,31 @@ class TestGuiServer:
         assert allowed['process']['image_id'] == 'base-agent:v0'
         assert allowed['process']['llm_profile_id'] == 'gui-exec'
 
+    def test_destructive_process_signal_requires_confirmation(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'signal target', 'auto_run': False})
+        pid = spawned['pid']
+
+        status, denied = self.request('POST', f'/api/processes/{pid}/signal', {'signal': ProcessSignal.TERMINATE.value})
+        assert status == 409
+        assert denied['error']['confirmation_required']
+        assert denied['error']['preview']['signal'] == ProcessSignal.TERMINATE.value
+
+        status, string_confirmed = self.request(
+            'POST',
+            f'/api/processes/{pid}/signal',
+            {'signal': ProcessSignal.TERMINATE.value, 'confirmed': 'true'},
+        )
+        assert status == 409
+        assert string_confirmed['error']['confirmation_required']
+
+        status, allowed = self.request(
+            'POST',
+            f'/api/processes/{pid}/signal',
+            {'signal': ProcessSignal.TERMINATE.value, 'confirmed': True},
+        )
+        assert status == 200
+        assert allowed['status'] == ProcessStatus.KILLED.value
+
     def test_high_risk_image_commit_requires_confirmation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'commit source', 'auto_run': False})
         pid = spawned['pid']
@@ -607,6 +632,14 @@ class TestGuiServer:
         assert status == 200
         processes = {process['pid']: process for process in snapshot['processes']}
         assert processes[result['pid']]['status'] == 'exited'
+
+    def test_side_effect_workflow_requires_confirmation(self) -> None:
+        status, denied = self.request('POST', '/api/workflows/run', {'tool': 'ask_human', 'args': {'question': 'Continue?'}})
+
+        assert status == 409
+        assert denied['error']['confirmation_required']
+        assert denied['error']['action'] == 'workflow.run'
+        assert denied['error']['preview']['tool'] == 'ask_human'
 
     def test_object_task_endpoint_runs_task_and_exposes_snapshot(self) -> None:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'object task', 'auto_run': False})

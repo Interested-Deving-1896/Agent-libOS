@@ -394,27 +394,30 @@ class ObjectMemoryManager:
         issued_by: str = "memory.name",
         namespace: str | None = None,
     ) -> ObjectHandle:
-        object_namespace = self.resolve_namespace(pid, namespace)
-        object_name = self._normalize_name(name)
-        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
-        self._require_namespace_exists(object_namespace)
-        obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
-        if obj is None:
-            raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-        requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
-        # A name can be resolved only into rights the process already has.
-        decisions = []
-        for right in requested:
-            decisions.append(self.capabilities.require(pid, f"object:{obj.oid}", right))
-        one_time = any(decision.consume_capability_id is not None for decision in decisions)
-        handle = self.capabilities.handle_for_object(
-            pid,
-            obj.oid,
-            requested,
-            issued_by=issued_by,
-            uses_remaining=1 if one_time else None,
-        )
-        self._consume_one_time_decisions(decisions)
+        with self.store.locked():
+            object_namespace = self.resolve_namespace(pid, namespace)
+            object_name = self._normalize_name(name)
+            namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+            self._require_namespace_exists(object_namespace)
+            obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
+            if obj is None:
+                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+            requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
+            # A name can be resolved only into rights the process already has.
+            decisions = []
+            for right in requested:
+                decision = self._authorize_object_right_for_derivation(pid, f"object:{obj.oid}", right)
+                if not decision.allowed:
+                    raise CapabilityDenied(decision.reason)
+                decisions.append(decision)
+            handle = self._issue_handle_and_consume_one_time_decisions(
+                pid,
+                obj.oid,
+                requested,
+                issued_by=issued_by,
+                one_time_decisions=decisions,
+                consume_decisions=[*decisions, namespace_decision],
+            )
         self.audit.record(
             actor=pid,
             action="memory.handle_for_name",
@@ -423,7 +426,6 @@ class ObjectMemoryManager:
             capability_refs=[handle.capability_id],
             decision={"namespace": obj.namespace, "name": obj.name, "rights": sorted(requested)},
         )
-        self._consume_one_time_decision(namespace_decision)
         return handle
 
     def handle_for_oid(
@@ -435,24 +437,26 @@ class ObjectMemoryManager:
         optional_rights: Iterable[str | ObjectRight] | None = None,
         issued_by: str = "memory.oid",
     ) -> ObjectHandle:
-        if self.store.get_object(oid) is None:
-            raise NotFound(f"object not found: {oid}")
-        required = {str(right) for right in (required_rights or {ObjectRight.READ.value})}
-        optional = {str(right) for right in (optional_rights or set())} - required
-        rights, decisions = self._authorized_object_rights(
-            pid,
-            oid,
-            required_rights=required,
-            optional_rights=optional,
-        )
-        handle = self.capabilities.handle_for_object(
-            pid,
-            oid,
-            rights,
-            issued_by=issued_by,
-            uses_remaining=1 if self._has_one_time_decision(decisions) else None,
-        )
-        self._consume_one_time_decisions(decisions)
+        with self.store.locked():
+            if self.store.get_object(oid) is None:
+                raise NotFound(f"object not found: {oid}")
+            required = {str(right) for right in (required_rights or {ObjectRight.READ.value})}
+            optional = {str(right) for right in (optional_rights or set())} - required
+            rights, decisions = self._authorized_object_rights(
+                pid,
+                oid,
+                required_rights=required,
+                optional_rights=optional,
+                allow_one_time_handle_sources=False,
+            )
+            handle = self._issue_handle_and_consume_one_time_decisions(
+                pid,
+                oid,
+                rights,
+                issued_by=issued_by,
+                one_time_decisions=decisions,
+                consume_decisions=decisions,
+            )
         self.audit.record(
             actor=pid,
             action="memory.handle_for_oid",
@@ -773,25 +777,32 @@ class ObjectMemoryManager:
             decisions: list[Any]
             rights: set[str]
             try:
-                rights, decisions = self._authorized_object_rights(
-                    pid,
-                    obj.oid,
-                    required_rights={ObjectRight.READ.value},
-                    optional_rights=set(),
-                )
+                with self.store.locked():
+                    rights, decisions = self._authorized_object_rights(
+                        pid,
+                        obj.oid,
+                        required_rights={ObjectRight.READ.value},
+                        optional_rights=set(),
+                        allow_one_time_handle_sources=False,
+                    )
+                    handle = self._issue_handle_and_consume_one_time_decisions(
+                        pid,
+                        obj.oid,
+                        rights,
+                        issued_by="memory.query",
+                        one_time_decisions=decisions,
+                        consume_decisions=decisions,
+                    )
             except CapabilityDenied:
                 continue
-            handle = self.capabilities.handle_for_object(
-                pid,
-                obj.oid,
-                rights,
-                issued_by="memory.query",
-                uses_remaining=1 if self._has_one_time_decision(decisions) else None,
-            )
-            self._consume_one_time_decisions(decisions)
             results.append(handle)
             if len(results) >= limit:
                 break
+        try:
+            self._consume_one_time_decision(namespace_decision)
+        except Exception:
+            self._revoke_derived_handles(pid, results, reason="query namespace permission consume failed")
+            raise
         self.audit.record(
             actor=pid,
             action="memory.query_objects",
@@ -799,7 +810,6 @@ class ObjectMemoryManager:
             output_refs=[handle.oid for handle in results],
             decision={"count": len(results), "namespace": namespace},
         )
-        self._consume_one_time_decision(namespace_decision)
         return results
 
     def create_view(
@@ -1322,6 +1332,44 @@ class ObjectMemoryManager:
             consumed.add(cap_id)
             self._consume_one_time_decision(decision)
 
+    def _issue_handle_and_consume_one_time_decisions(
+        self,
+        pid: str,
+        oid: str,
+        rights: Iterable[str | ObjectRight],
+        *,
+        issued_by: str,
+        one_time_decisions: Iterable[Any],
+        consume_decisions: Iterable[Any],
+    ) -> ObjectHandle:
+        one_time_decisions = list(one_time_decisions)
+        consume_decisions = list(consume_decisions)
+        handle = self.capabilities.handle_for_object(
+            pid,
+            oid,
+            rights,
+            issued_by=issued_by,
+            uses_remaining=1 if self._has_one_time_decision(one_time_decisions) else None,
+        )
+        try:
+            self._consume_one_time_decisions(consume_decisions)
+        except Exception:
+            self._revoke_derived_handles(pid, [handle], reason="one-time handle derivation rolled back")
+            raise
+        return handle
+
+    def _revoke_derived_handles(self, pid: str, handles: Iterable[ObjectHandle], *, reason: str) -> None:
+        for handle in handles:
+            try:
+                self.capabilities.revoke(
+                    handle.capability_id,
+                    revoked_by=pid,
+                    reason=reason,
+                    require_authority=False,
+                )
+            except Exception:
+                continue
+
     def _has_one_time_decision(self, decisions: Iterable[Any]) -> bool:
         return any(decision.consume_capability_id is not None for decision in decisions)
 
@@ -1332,24 +1380,62 @@ class ObjectMemoryManager:
         *,
         required_rights: Iterable[str | ObjectRight],
         optional_rights: Iterable[str | ObjectRight] = (),
+        allow_one_time_handle_sources: bool = True,
     ) -> tuple[set[str], list[Any]]:
         rights: set[str] = set()
         decisions: list[Any] = []
         resource = f"object:{oid}"
         for right in sorted({str(item) for item in required_rights}):
-            decision = self.capabilities.authorize(pid, resource, right)
+            decision = self._authorize_object_right(
+                pid,
+                resource,
+                right,
+                allow_one_time_handle_sources=allow_one_time_handle_sources,
+            )
             if not decision.allowed:
                 raise CapabilityDenied(decision.reason)
             rights.add(right)
             decisions.append(decision)
         for right in sorted({str(item) for item in optional_rights} - rights):
-            decision = self.capabilities.authorize(pid, resource, right)
+            decision = self._authorize_object_right(
+                pid,
+                resource,
+                right,
+                allow_one_time_handle_sources=allow_one_time_handle_sources,
+            )
             if decision.allowed:
                 rights.add(right)
                 decisions.append(decision)
         if not rights:
             raise CapabilityDenied(f"{pid} lacks object rights on {oid}")
         return rights, decisions
+
+    def _authorize_object_right_for_derivation(self, pid: str, resource: str, right: str | ObjectRight) -> Any:
+        return self._authorize_object_right(pid, resource, right, allow_one_time_handle_sources=False)
+
+    def _authorize_object_right(
+        self,
+        pid: str,
+        resource: str,
+        right: str | ObjectRight,
+        *,
+        allow_one_time_handle_sources: bool,
+    ) -> Any:
+        if allow_one_time_handle_sources:
+            return self.capabilities.authorize(pid, resource, right)
+        matches = [
+            cap
+            for cap in self.capabilities.matching_capabilities(pid, resource, right)
+            if not (cap.metadata.get("object_handle") is True and cap.uses_remaining is not None)
+        ]
+        return self.capabilities._decision_from_matches(
+            subject=pid,
+            resource=resource,
+            requested_right=str(right),
+            matches=matches,
+            selected_context={},
+            audit=False,
+        )
 
     def _authorized_handle_rights(
         self,

@@ -17,6 +17,8 @@ from agent_libos.models import (
     ObjectOwnerKind,
     ProcessMessageStatus,
     ProcessStatus,
+    ResourceBudget,
+    ResourceUsage,
     ToolHandle,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
@@ -327,11 +329,19 @@ class CheckpointManager:
         self._require_snapshot_modules(snapshot)
         if require_capability:
             self._require_snapshot_image_restore_rights(actor, snapshot, overwrite_existing=False)
-        remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid)
-        self._insert_fork_rows(remapped)
-        self._restore_images(snapshot, overwrite_existing=False)
-        self._restore_jit_sources(snapshot)
+        remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid, root_pid=checkpoint.pid)
         root_pid = remapped["pid_map"][checkpoint.pid]
+        inserted = False
+        try:
+            self._insert_fork_rows(remapped, fork_parent_pid=parent_pid, fork_root_pid=root_pid)
+            inserted = True
+            self._restore_images(snapshot, overwrite_existing=False)
+            self._restore_jit_sources(snapshot)
+            self._charge_fork_parent_child_create(parent_pid)
+        except Exception:
+            if inserted:
+                self._delete_fork_rows(remapped)
+            raise
         self.events.emit(
             EventType.PROCESS_FORKED,
             source=actor,
@@ -530,7 +540,7 @@ class CheckpointManager:
             self._reconcile_restored_wait_states(cur, [str(row["pid"]) for row in rows.get("processes", [])])
         return cancelled_human_requests, superseded_messages
 
-    def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None) -> dict[str, Any]:
+    def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None, root_pid: str) -> dict[str, Any]:
         original_pids = list(snapshot["subtree_pids"])
         pid_map = {pid: new_id("pid") for pid in original_pids}
         object_map = {oid: new_id("obj") for oid in snapshot.get("object_oids", [])}
@@ -542,7 +552,7 @@ class CheckpointManager:
         rows["capabilities"] = self._fork_capability_rows(rows.get("capabilities", []))
         capability_map = {row["cap_id"]: new_id("cap") for row in rows.get("capabilities", [])}
         rows["processes"] = [
-            self._remap_process_row(row, pid_map, object_map, capability_map, parent_pid)
+            self._remap_process_row(row, pid_map, object_map, capability_map, parent_pid, root_pid)
             for row in rows.get("processes", [])
         ]
         rows["object_namespaces"] = [
@@ -739,9 +749,17 @@ class CheckpointManager:
             return left_pattern.body.startswith(right_pattern.body) or right_pattern.body.startswith(left_pattern.body)
         return False
 
-    def _insert_fork_rows(self, remapped: dict[str, Any]) -> None:
+    def _insert_fork_rows(
+        self,
+        remapped: dict[str, Any],
+        *,
+        fork_parent_pid: str | None = None,
+        fork_root_pid: str | None = None,
+    ) -> None:
         rows = remapped["rows"]
         with self.store.transaction(include_object_payloads=True) as cur:
+            if fork_parent_pid is not None and fork_root_pid is not None:
+                self._reserve_fork_parent_child_budget(fork_parent_pid, fork_root_pid, remapped)
             for row in rows.get("object_namespaces", []):
                 if cur.execute("SELECT 1 FROM object_namespaces WHERE namespace = ?", (row["namespace"],)).fetchone() is None:
                     self._insert_row(cur, "object_namespaces", row)
@@ -768,6 +786,65 @@ class CheckpointManager:
                     self._insert_row(cur, "tools", row)
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
+
+    def _reserve_fork_parent_child_budget(self, parent_pid: str, fork_root_pid: str, remapped: dict[str, Any]) -> None:
+        resources = getattr(self.runtime, "resources", None) if self.runtime is not None else None
+        if resources is None:
+            return
+        resources.reserve_child_budget(parent_pid, fork_root_pid, self._fork_root_resource_budget(fork_root_pid, remapped))
+
+    def _charge_fork_parent_child_create(self, parent_pid: str | None) -> None:
+        if parent_pid is None:
+            return
+        resources = getattr(self.runtime, "resources", None) if self.runtime is not None else None
+        if resources is None:
+            return
+        resources.charge(
+            parent_pid,
+            ResourceUsage(child_processes=1),
+            source="process.child_create",
+            context={"parent_pid": parent_pid},
+            allow_overage=False,
+            kill_on_exceed=False,
+        )
+
+    def _fork_root_resource_budget(self, fork_root_pid: str, remapped: dict[str, Any]) -> ResourceBudget:
+        for row in remapped["rows"].get("processes", []):
+            if row["pid"] == fork_root_pid:
+                return ResourceBudget(**loads(row.get("resource_budget_json"), {}))
+        raise NotFound(f"fork root process not found in remapped snapshot: {fork_root_pid}")
+
+    def _delete_fork_rows(self, remapped: dict[str, Any]) -> None:
+        rows = remapped["rows"]
+        pids = list(remapped["pid_map"].values())
+        object_oids = set(remapped["object_map"].values())
+        fork_namespaces = self._fork_inserted_namespaces(remapped)
+        with self.store.transaction(include_object_payloads=True) as cur:
+            self._delete_object_links(cur, object_oids)
+            self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
+            self._delete_object_capabilities(cur, object_oids)
+            self._delete_rows_by_ids(cur, "object_namespaces", "namespace", fork_namespaces)
+            self._delete_non_checkpoint_capabilities(cur, pids)
+            self._delete_resource_reservations(cur, pids)
+            self._delete_rows_by_ids(cur, "process_messages", "message_id", [row["message_id"] for row in rows.get("process_messages", [])])
+            self._delete_rows_by_ids(cur, "llm_pending_actions", "pid", pids)
+            self._delete_rows_by_ids(cur, "tool_candidates", "candidate_id", [row["candidate_id"] for row in rows.get("tool_candidates", [])])
+            self._delete_rows_by_ids(cur, "processes", "pid", pids)
+            for oid in object_oids:
+                self.store.forget_object_payload(oid)
+
+    def _fork_inserted_namespaces(self, remapped: dict[str, Any]) -> list[str]:
+        pids = set(remapped["pid_map"].values())
+        prefix = f"{self.config.memory.process_namespace_prefix}:"
+        namespaces = []
+        for row in remapped["rows"].get("object_namespaces", []):
+            namespace = str(row["namespace"])
+            if namespace.startswith("checkpoint_fork/"):
+                namespaces.append(namespace)
+                continue
+            if namespace.startswith(prefix) and namespace[len(prefix) :] in pids:
+                namespaces.append(namespace)
+        return namespaces
 
     def _load_checkpoint(self, checkpoint_id: str) -> tuple[Checkpoint, dict[str, Any]]:
         found = self.store.get_checkpoint_snapshot(checkpoint_id)
@@ -1381,12 +1458,14 @@ class CheckpointManager:
         object_map: dict[str, str],
         capability_map: dict[str, str],
         parent_pid: str | None,
+        root_pid: str,
     ) -> dict[str, Any]:
         item = dict(row)
         old_pid = item["pid"]
         item["pid"] = pid_map[old_pid]
         old_parent = item.get("parent_pid")
-        item["parent_pid"] = pid_map.get(old_parent) if old_parent else parent_pid
+        remapped_parent = pid_map.get(old_parent) if old_parent else None
+        item["parent_pid"] = remapped_parent if remapped_parent is not None else (parent_pid if old_pid == root_pid else None)
         if item.get("goal_oid") in object_map:
             item["goal_oid"] = object_map[item["goal_oid"]]
         item["checkpoint_head"] = None

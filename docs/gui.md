@@ -181,6 +181,9 @@ The GUI requires explicit confirmation for high-risk operations before sending
 the final request to the server:
 
 - process `exec` and `exit`,
+- process `signal` requests that cancel or terminate a process,
+- workflow runs for side-effecting tools, custom images, or custom working
+  directories,
 - image package registration and checkpoint-to-image commit,
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,

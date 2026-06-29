@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 
 from agent_libos import AgentImage, Runtime
-from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectType, ProcessStatus
-from agent_libos.models.exceptions import CapabilityDenied, ProcessWaitRequired
+from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models.exceptions import CapabilityDenied, ProcessWaitRequired, ResourceLimitExceeded
 
 
 class TestCheckpointFork:
@@ -176,5 +176,44 @@ class TestCheckpointFork:
             runtime.capability.grant(owner, runtime.checkpoint.process_resource(other), [CapabilityRight.ADMIN], issued_by='test')
             forked = runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id, parent_pid=other)
             assert runtime.process.get(forked['fork_root_pid']).parent_pid == other
+        finally:
+            runtime.close()
+
+    def test_checkpoint_fork_child_root_attaches_to_requested_parent(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            source_parent = runtime.process.spawn(image='base-agent:v0', goal='source parent')
+            runtime.capability.grant(source_parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            source_child = runtime.spawn_child_process(source_parent, 'source child')
+            target_parent = runtime.process.spawn(image='base-agent:v0', goal='target parent')
+            checkpoint_id = runtime.checkpoint.create(source_child, 'child root fork', actor=source_child)
+            runtime.capability.grant(source_child, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.capability.grant(source_child, runtime.checkpoint.process_resource(target_parent), [CapabilityRight.ADMIN], issued_by='test')
+
+            forked = runtime.checkpoint.fork_from_checkpoint(source_child, checkpoint_id, parent_pid=target_parent)
+
+            assert runtime.process.get(forked['fork_root_pid']).parent_pid == target_parent
+        finally:
+            runtime.close()
+
+    def test_checkpoint_fork_parent_child_budget_exhaustion_rolls_back(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+            exhausted_parent = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='exhausted parent',
+                resource_budget=ResourceBudget(max_child_processes=0),
+            )
+            checkpoint_id = runtime.checkpoint.create(owner, 'budgeted fork', actor=owner)
+            runtime.capability.grant(owner, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.capability.grant(owner, runtime.checkpoint.process_resource(exhausted_parent), [CapabilityRight.ADMIN], issued_by='test')
+            before_pids = {process.pid for process in runtime.process.list()}
+
+            with pytest.raises(ResourceLimitExceeded):
+                runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id, parent_pid=exhausted_parent)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+            assert runtime.process.get(exhausted_parent).resource_usage.child_processes == 0
         finally:
             runtime.close()

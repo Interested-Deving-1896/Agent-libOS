@@ -234,6 +234,44 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_malformed_authority_rule_condition_fails_closed_over_allow(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='malformed authority rule')
+            runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.git.push.deny.typo',
+                            'operation': 'shell.run',
+                            'effect': 'deny',
+                            'risk': 'high',
+                            'conditions': {'argv_typo': ['git', 'push']},
+                        }
+                    ]
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push']},
+            )
+
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.DENY
+            assert decision.constraint_results['authority_rules']['rule_id'] == 'test.git.push.deny.typo'
+            assert decision.constraint_results['authority_rules']['unknown_conditions'] == ['argv_typo']
+        finally:
+            runtime.close()
+
     def test_one_shot_grant_authority_is_consumed_after_successful_issue(self) -> None:
         runtime = Runtime.open('local')
         try:

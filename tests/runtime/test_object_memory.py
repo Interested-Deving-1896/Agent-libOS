@@ -497,6 +497,43 @@ class TestObjectMemoryName:
         assert len(consumes) == 1
         assert not self.runtime.store.get_capability(source_cap.cap_id).active
 
+    def test_concurrent_one_time_name_handle_authority_issues_one_active_handle(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner one-shot race')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='reader one-shot race')
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'read once'},
+            name='one.shot.handle.race',
+        )
+        owner_namespace = self.runtime.memory.resolve_namespace(owner)
+        self.runtime.capability.grant(subject=reader, resource=f'object_namespace:{owner_namespace}', rights=['read'], issued_by='test')
+        source_cap = self.runtime.capability.grant_once(reader, f'object:{handle.oid}', [CapabilityRight.READ], issued_by='test')
+        workers = 2
+        barrier = threading.Barrier(workers)
+
+        def lookup() -> ObjectHandle | None:
+            barrier.wait()
+            try:
+                return self.runtime.memory.handle_for_name(reader, 'one.shot.handle.race', namespace=owner_namespace)
+            except CapabilityDenied:
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            handles = [result for result in executor.map(lambda _index: lookup(), range(workers)) if result is not None]
+
+        assert len(handles) == 1
+        active_object_caps = [
+            cap
+            for cap in self.runtime.capability.capabilities_for(reader)
+            if cap.resource == f'object:{handle.oid}' and cap.active
+        ]
+        assert [cap.cap_id for cap in active_object_caps] == [handles[0].capability_id]
+        assert not self.runtime.store.get_capability(source_cap.cap_id).active
+        assert self.runtime.memory.get_object(reader, handles[0]).payload == {'secret': 'read once'}
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(reader, handles[0])
+
     def test_one_time_read_write_grant_allows_single_append_operation(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='one-shot append')
         handle = self.runtime.memory.create_object(

@@ -8,6 +8,7 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import (
+    CapabilityStatus,
     CapabilityRight,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -164,6 +165,54 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_replace_with_server_admin_disables_stale_tool_grants(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            actor = runtime.process.spawn(image="base-agent:v0", goal="mcp admin")
+            caller = runtime.process.spawn(image="base-agent:v0", goal="mcp caller")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+            runtime.capability.grant(actor, "mcp_server:demo", [CapabilityRight.ADMIN], issued_by="test")
+            tool_cap = runtime.capability.grant(caller, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
+
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("demo", mcp_name="demo.changed"),
+                actor=actor,
+                replace=True,
+                require_capability=True,
+            )
+
+            stored, _metadata = runtime.store.get_mcp_server("demo")
+            assert stored.tools[0].mcp_name == "demo.changed"
+            assert runtime.store.get_capability(tool_cap.cap_id).status == CapabilityStatus.DISABLED
+        finally:
+            runtime.close()
+
+    def test_replace_rolls_back_server_spec_when_stale_grant_disable_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open("local")
+        try:
+            actor = runtime.process.spawn(image="base-agent:v0", goal="mcp admin")
+            caller = runtime.process.spawn(image="base-agent:v0", goal="mcp caller")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+            runtime.capability.grant(actor, "mcp_server:demo", [CapabilityRight.ADMIN], issued_by="test")
+            runtime.capability.grant(caller, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
+
+            def fail_disable(*_args: Any, **_kwargs: Any) -> None:
+                raise RuntimeError("disable failed")
+
+            monkeypatch.setattr(runtime.capability, "disable_subject_capability", fail_disable)
+            with pytest.raises(RuntimeError, match="disable failed"):
+                runtime.mcp.register_server_from_yaml_text(
+                    _stdio_manifest("demo", mcp_name="demo.changed"),
+                    actor=actor,
+                    replace=True,
+                    require_capability=True,
+                )
+
+            stored, _metadata = runtime.store.get_mcp_server("demo")
+            assert stored.tools[0].mcp_name == "demo.echo"
+        finally:
+            runtime.close()
+
     def test_checkpoint_reports_mcp_effect_but_does_not_restore_server_registry(self) -> None:
         runtime = Runtime.open("local")
         provider = _RecordingMcpProvider()
@@ -194,6 +243,7 @@ def _stdio_manifest(
     server_id: str,
     *,
     command: str = "python3",
+    mcp_name: str = "demo.echo",
     duplicate_tool: bool = False,
     env_source: str | None = None,
     cwd: str | None = None,
@@ -221,7 +271,7 @@ stdio:
   args: ["-m", "demo_server"]{env_block}{cwd_line}
 tools:
   - tool_id: echo
-    mcp_name: demo.echo
+    mcp_name: {mcp_name}
     right: read
     rollback_class: no_rollback_required
     state_mutation: false
