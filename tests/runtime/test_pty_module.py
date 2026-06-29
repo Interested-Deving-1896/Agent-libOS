@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import sys
 import tempfile
@@ -759,11 +760,12 @@ def _open_pty_runtime(
         for line in manifest.read_text(encoding="utf-8").splitlines()
         if line.startswith("sha256:")
     )
+    manifest_sha = hashlib.sha256(manifest.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
     return Runtime.open(
         "local",
         substrate=substrate,
         module_manifests=(str(manifest),),
-        trusted_modules=(f"agent-libos-pty:v0:{source_sha}",),
+        trusted_modules=(f"agent-libos-pty:v0:{manifest_sha}:{source_sha}",),
     )
 
 

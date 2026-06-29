@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -19,6 +19,16 @@ StartupHook = Callable[["Runtime"], Any]
 ProviderHook = Callable[["Runtime"], Any]
 
 
+@dataclass(frozen=True)
+class ModuleRuntimeView:
+    """Read-only runtime surface exposed while a module buffers registrations."""
+
+    config: Any
+
+    def __getattr__(self, name: str) -> Any:
+        raise ValidationError(f"module entrypoint cannot access runtime.{name} before module preflight")
+
+
 @dataclass
 class ModuleContext:
     """Buffered registration API exposed to trusted startup modules.
@@ -28,7 +38,7 @@ class ModuleContext:
     applies the buffered registrations atomically enough for startup use.
     """
 
-    runtime: "Runtime"
+    runtime: ModuleRuntimeView
     manifest: ModuleManifest
     enforce_provides: bool = True
     tools: list[BaseAgentTool] = field(default_factory=list)
@@ -36,6 +46,18 @@ class ModuleContext:
     syscalls: dict[str, SyscallHandler] = field(default_factory=dict)
     provider_hooks: dict[str, list[ProviderHook]] = field(default_factory=lambda: defaultdict(list))
     startup_hooks: dict[str, StartupHook] = field(default_factory=dict)
+    _declared_tools: frozenset[str] = field(init=False, repr=False)
+    _declared_images: frozenset[str] = field(init=False, repr=False)
+    _declared_syscalls: frozenset[str] = field(init=False, repr=False)
+    _declared_provider_hooks: frozenset[str] = field(init=False, repr=False)
+    _declared_startup_hooks: frozenset[str] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._declared_tools = frozenset(self.manifest.provides.tools)
+        self._declared_images = frozenset(self.manifest.provides.images)
+        self._declared_syscalls = frozenset(self.manifest.provides.syscalls)
+        self._declared_provider_hooks = frozenset(self.manifest.provides.provider_hooks)
+        self._declared_startup_hooks = frozenset(self.manifest.provides.startup_hooks)
 
     @property
     def module_id(self) -> str:
@@ -47,21 +69,21 @@ class ModuleContext:
 
     def register_tool(self, tool: BaseAgentTool) -> None:
         spec = tool.spec()
-        self._require_declared(spec.name, self.manifest.provides.tools, "tool")
+        self._require_declared(spec.name, self._declared_tools, "tool")
         if any(existing.spec().name == spec.name for existing in self.tools):
             raise ValidationError(f"module registered duplicate tool: {spec.name}")
         self.tools.append(tool)
 
     def register_image(self, image: AgentImage | dict[str, Any]) -> None:
         candidate = image if isinstance(image, AgentImage) else AgentImage(**dict(image))
-        self._require_declared(candidate.image_id, self.manifest.provides.images, "image")
+        self._require_declared(candidate.image_id, self._declared_images, "image")
         if any(existing.image_id == candidate.image_id for existing in self.images):
             raise ValidationError(f"module registered duplicate image: {candidate.image_id}")
         self.images.append(candidate)
 
     def register_syscall(self, name: str, handler: SyscallHandler) -> None:
         normalized = self._normalize_name(name, "syscall")
-        self._require_declared(normalized, self.manifest.provides.syscalls, "syscall")
+        self._require_declared(normalized, self._declared_syscalls, "syscall")
         if normalized in self.syscalls:
             raise ValidationError(f"module registered duplicate syscall: {normalized}")
         if not callable(handler):
@@ -70,7 +92,7 @@ class ModuleContext:
 
     def register_provider_hook(self, kind: str, hook: ProviderHook) -> None:
         normalized = self._normalize_name(kind, "provider hook")
-        self._require_declared(normalized, self.manifest.provides.provider_hooks, "provider hook")
+        self._require_declared(normalized, self._declared_provider_hooks, "provider hook")
         if normalized in self.provider_hooks:
             raise ValidationError(f"module registered duplicate provider hook: {normalized}")
         if not callable(hook):
@@ -79,7 +101,7 @@ class ModuleContext:
 
     def add_startup_hook(self, hook: StartupHook, *, name: str | None = None) -> None:
         hook_name = self._normalize_name(name or getattr(hook, "__name__", ""), "startup hook")
-        self._require_declared(hook_name, self.manifest.provides.startup_hooks, "startup hook")
+        self._require_declared(hook_name, self._declared_startup_hooks, "startup hook")
         if hook_name in self.startup_hooks:
             raise ValidationError(f"module registered duplicate startup hook: {hook_name}")
         if not callable(hook):
@@ -95,7 +117,7 @@ class ModuleContext:
             "startup_hooks": sorted(self.startup_hooks),
         }
 
-    def _require_declared(self, value: str, declared: list[str], kind: str) -> None:
+    def _require_declared(self, value: str, declared: Container[str], kind: str) -> None:
         if self.enforce_provides and value not in declared:
             raise ValidationError(f"module {self.module_id} registered undeclared {kind}: {value}")
 

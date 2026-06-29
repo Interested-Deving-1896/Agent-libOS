@@ -27,6 +27,7 @@ from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
     NotFound,
+    ProcessError,
     ProcessMessageWaitRequired,
     ProcessWaitRequired,
     ValidationError,
@@ -141,6 +142,7 @@ class LibOSSyscallSession:
         normalized = name.strip()
         if not normalized:
             raise ValidationError("syscall name must be non-empty")
+        self._require_non_terminal_process()
         self._charge_syscall(normalized)
         self.runtime.audit.record(
             actor=self.pid,
@@ -210,6 +212,7 @@ class LibOSSyscallSession:
 
     async def _with_blocking(self, operation: Any) -> Any:
         while True:
+            self._require_non_terminal_process()
             try:
                 result = operation()
                 if inspect.isawaitable(result):
@@ -224,6 +227,13 @@ class LibOSSyscallSession:
             except ProcessMessageWaitRequired as exc:
                 self._remember_wait_state()
                 await self._wait_for_process_message(exc.recipient_pid, exc.filters)
+
+    def _require_non_terminal_process(self) -> None:
+        process = self.runtime.store.get_process(self.pid)
+        if process is None:
+            raise NotFound(f"process not found: {self.pid}")
+        if process.status in self.TERMINAL_STATUSES:
+            raise ProcessError(f"terminal process cannot issue syscalls: {self.pid} status={process.status.value}")
 
     def _remember_wait_state(self) -> None:
         process = self.runtime.store.get_process(self.pid)

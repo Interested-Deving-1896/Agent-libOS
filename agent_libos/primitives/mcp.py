@@ -98,6 +98,54 @@ class McpPrimitive:
     def tool_resource(self, server_id: str, tool_id: str) -> str:
         return f"mcp:{server_id}:{tool_id}"
 
+    @staticmethod
+    def stdio_resource_for_argv(
+        command: str,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> str:
+        payload = dumps(
+            {
+                "command": command,
+                "args": list(args),
+                "env": sorted((env or {}).items()),
+                "cwd": McpPrimitive._canonical_stdio_cwd(cwd),
+            }
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return f"mcp_stdio:{digest}"
+
+    @classmethod
+    def stdio_resource_for_server(cls, server: McpServerSpec) -> str | None:
+        if server.transport != "stdio" or server.stdio is None:
+            return None
+        return cls.stdio_resource_for_argv(
+            server.stdio.command,
+            list(server.stdio.args),
+            env=dict(server.stdio.env),
+            cwd=server.stdio.cwd,
+        )
+
+    @staticmethod
+    def _canonical_stdio_cwd(cwd: str | None) -> str | None:
+        if cwd is None:
+            return None
+        raw = cwd.replace("\\", "/").strip()
+        parts: list[str] = []
+        for part in raw.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        if not parts:
+            return None
+        return "/".join(parts)
+
     def register_server(
         self,
         server: McpServerSpec | dict[str, Any],
@@ -565,6 +613,25 @@ class McpPrimitive:
         if actor is None or server.transport != "stdio":
             return
         self.capabilities.require(actor, "process:spawn", CapabilityRight.WRITE)
+        if server.stdio is None:
+            raise ValidationError("MCP stdio transport is missing stdio configuration")
+        resource = self.stdio_resource_for_server(server)
+        if resource is None:
+            raise ValidationError("MCP stdio transport is missing stdio authority resource")
+        self.capabilities.require(
+            actor,
+            resource,
+            CapabilityRight.EXECUTE,
+            {
+                "adapter": "mcp",
+                "operation": "mcp.stdio.spawn",
+                "server_id": server.server_id,
+                "stdio_command": server.stdio.command,
+                "stdio_args": list(server.stdio.args),
+                "stdio_env": dict(server.stdio.env),
+                "stdio_cwd": self._canonical_stdio_cwd(server.stdio.cwd),
+            },
+        )
 
     def _call_result_from_provider(
         self,

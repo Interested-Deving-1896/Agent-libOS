@@ -7,7 +7,7 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessStatus
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import ProcessError, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
 
@@ -77,6 +77,27 @@ class TestProcessMessage:
             assert sent['subject'] == 'via syscall'
             assert read['messages'][0]['message_id'] == sent['message_id']
             assert read['messages'][0]['status'] == 'acked'
+            assert runtime.messages.unread(child) == []
+        finally:
+            runtime.close()
+
+    def test_terminated_process_syscall_session_cannot_send_messages(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'child')
+            parent_session = LibOSSyscallSession(runtime, parent)
+
+            runtime.process.exit(parent, message='done')
+
+            with pytest.raises(ProcessError, match='cannot issue syscalls'):
+                asyncio.run(
+                    parent_session.handle(
+                        'process.send_message',
+                        {'recipient_pid': child, 'kind': 'normal', 'subject': 'after exit', 'body': 'late'},
+                    )
+                )
             assert runtime.messages.unread(child) == []
         finally:
             runtime.close()

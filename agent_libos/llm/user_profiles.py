@@ -176,8 +176,6 @@ def validate_user_llm_profile_payload(profile_id: str, payload: Any) -> LLMProfi
     raw["temperature"] = _optional_float(raw.get("temperature"), "temperature")
     for key in ("store", "responses_previous_response_id", "parallel_tool_calls", "auto_wait_on_empty_tool_calls", "allow_custom_base_url"):
         raw[key] = _optional_bool(raw.get(key), key)
-    if raw["base_url"] is not None and raw["allow_custom_base_url"] is None:
-        raw["allow_custom_base_url"] = True
     cleaned = {key: value for key, value in raw.items() if value is not None}
     try:
         return LLMProfile(**cleaned)

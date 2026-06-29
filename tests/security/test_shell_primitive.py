@@ -481,6 +481,34 @@ class TestShellMatcher:
         finally:
             runtime.close()
 
+    def test_custom_deny_rule_overrides_builtin_harmless_allow(self) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                rules=(
+                    AuthorityRule(
+                        rule_id='custom.git.status.deny',
+                        operation='shell.run',
+                        effect=CapabilityEffect.DENY,
+                        risk=AuthorityRisk.HIGH,
+                        conditions={'argv': ['git', 'status', '--short'], 'match': 'exact'},
+                    ),
+                ),
+                whitelist=(),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='custom deny harmless')
+            runtime.shell.grant_policy(pid, config.shell.allowlist_auto_else_ask_level, issued_by='test')
+
+            with pytest.raises(CapabilityDenied, match='denied'):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
     def test_custom_allow_rule_with_shell_syntax_payload_requires_approval(self) -> None:
         config = AgentLibOSConfig(
             shell=ShellDefaults(

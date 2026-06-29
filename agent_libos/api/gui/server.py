@@ -1122,7 +1122,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             decision = body.get("decision") if isinstance(body.get("decision"), dict) else {}
             if body.get("answer") is not None:
                 decision = {**decision, "answer": str(body["answer"])}
-            if _json_bool(body, "approved", True):
+            if _json_bool(body, "approved", False):
                 request = service.runtime.human.approve(route[0], {"approved": True, "source": "gui", **decision})
             else:
                 request = service.runtime.human.reject(route[0], {"approved": False, "source": "gui", **decision})
@@ -1192,11 +1192,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     require_capability=True,
                 )
             else:
-                result = service.runtime.skills.register_skill_from_path(
-                    str(body["path"]),
-                    actor="gui",
-                    replace=replace,
-                    require_capability=False,
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "GUI skill path registration requires an actor and workspace filesystem authority",
                 )
             service.publish_runtime_changes("skill.register")
             return result

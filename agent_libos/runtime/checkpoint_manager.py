@@ -522,11 +522,7 @@ class CheckpointManager:
         object_oids = snapshot_object_oids | current_object_oids
         namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
         restored_capability_rows = self._filtered_restored_capability_rows(rows.get("capabilities", []))
-        self._run_object_release_finalizers(
-            current_object_oids - snapshot_object_oids,
-            actor="checkpoint.restore",
-            reason="checkpoint_restore",
-        )
+        release_finalizer_objects = self._object_release_finalizer_objects(current_object_oids - snapshot_object_oids)
         with self.store.transaction(include_object_payloads=True) as cur:
             # Pending human/message state belongs to the same reconstructable
             # restore boundary as process rows. If a later insert fails, these
@@ -578,6 +574,11 @@ class CheckpointManager:
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
             self._reconcile_restored_wait_states(cur, [str(row["pid"]) for row in rows.get("processes", [])])
+        self._run_object_release_finalizers_for_objects(
+            release_finalizer_objects,
+            actor="checkpoint.restore",
+            reason="checkpoint_restore",
+        )
         return cancelled_human_requests, superseded_messages
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None, root_pid: str) -> dict[str, Any]:
@@ -1468,16 +1469,31 @@ class CheckpointManager:
         )
 
     def _run_object_release_finalizers(self, object_oids: set[str], *, actor: str, reason: str) -> None:
-        if not object_oids or self.runtime is None:
+        self._run_object_release_finalizers_for_objects(
+            self._object_release_finalizer_objects(object_oids),
+            actor=actor,
+            reason=reason,
+        )
+
+    def _object_release_finalizer_objects(self, object_oids: set[str]) -> list[Any]:
+        if not object_oids:
+            return []
+        objects = []
+        for oid in sorted(object_oids):
+            obj = self.store.get_object(oid)
+            if obj is not None:
+                objects.append(obj)
+        return objects
+
+    def _run_object_release_finalizers_for_objects(self, objects: list[Any], *, actor: str, reason: str) -> None:
+        if not objects or self.runtime is None:
             return
         memory = getattr(self.runtime, "memory", None)
         run_finalizers = getattr(memory, "_run_object_release_finalizers", None)
         if not callable(run_finalizers):
             return
-        for oid in sorted(object_oids):
-            obj = self.store.get_object(oid)
-            if obj is not None:
-                run_finalizers(obj, actor, reason)
+        for obj in objects:
+            run_finalizers(obj, actor, reason)
 
     def _delete_object_capabilities(self, cur: Any, object_oids: set[str]) -> None:
         if not object_oids:

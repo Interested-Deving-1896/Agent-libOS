@@ -372,7 +372,12 @@ class ProcessManager:
                 if cap.resource.startswith("object:") or cap.resource == process_namespace_resource:
                     kept.append(cap.cap_id)
                 else:
-                    self.capabilities.revoke(cap.cap_id, revoked_by="process.exec", reason="exec capability shrink")
+                    self.capabilities.revoke(
+                        cap.cap_id,
+                        revoked_by="process.exec",
+                        reason="exec capability shrink",
+                        require_authority=False,
+                    )
             process = self._get(pid)
             process.capabilities = kept
         if goal_handle is not None:

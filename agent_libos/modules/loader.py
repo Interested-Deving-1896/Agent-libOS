@@ -159,10 +159,10 @@ class ModuleLoader:
 
     def load(self, manifest_path: str | Path) -> tuple[ModuleSource, Any]:
         source = self.resolve(manifest_path)
-        if not self.is_trusted(source.manifest.module_id, source.source_sha256):
+        if not self.is_trusted(source.manifest.module_id, source.source_sha256, source.manifest_sha256):
             raise CapabilityDenied(
                 "startup module is not trusted: "
-                f"{source.manifest.module_id}:{source.source_sha256}"
+                f"{source.manifest.module_id}:{source.manifest_sha256}:{source.source_sha256}"
             )
         return source, self.import_entrypoint(source)
 
@@ -180,7 +180,8 @@ class ModuleLoader:
             "source_kind": source.source_kind,
             "source_root": source.source_root,
             "source_files": self._source_file_summaries(source),
-            "trusted": self.is_trusted(source.manifest.module_id, source.source_sha256),
+            "trusted": self.is_trusted(source.manifest.module_id, source.source_sha256, source.manifest_sha256),
+            "trust_key": self.trust_key(source.manifest.module_id, source.manifest_sha256, source.source_sha256),
             "provides": {
                 "tools": list(source.manifest.provides.tools),
                 "images": list(source.manifest.provides.images),
@@ -315,12 +316,17 @@ class ModuleLoader:
         except ValueError:
             pass
 
-    def is_trusted(self, module_id: str, source_sha256: str) -> bool:
+    @staticmethod
+    def trust_key(module_id: str, manifest_sha256: str, source_sha256: str) -> str:
+        return f"{module_id}:{manifest_sha256}:{source_sha256}"
+
+    def is_trusted(self, module_id: str, source_sha256: str, manifest_sha256: str) -> bool:
         accepted = {
-            f"{module_id}:{source_sha256}",
-            f"{module_id}@{source_sha256}",
+            self.trust_key(module_id, manifest_sha256, source_sha256),
+            f"{module_id}@{manifest_sha256}:{source_sha256}",
         }
-        return bool(accepted & set(self.trusted_modules)) or source_sha256 in set(self.trusted_sha256)
+        accepted_hashes = {f"{manifest_sha256}:{source_sha256}"}
+        return bool(accepted & set(self.trusted_modules)) or bool(accepted_hashes & set(self.trusted_sha256))
 
     def _read_manifest(self, path: Path) -> str:
         size = path.stat().st_size

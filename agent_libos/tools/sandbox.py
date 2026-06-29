@@ -162,19 +162,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         if self._contains_runtime_code_generation(source_code):
             errors.append("runtime code generation is not allowed")
         for specifier in self._extract_imports(source_code):
-            parsed = self._jsr_package_and_version(specifier)
-            package = parsed[0] if parsed is not None else None
-            if package is None:
-                errors.append(f"import is not allowed: {specifier}")
-                continue
-            if package not in self.jsr_allowlist:
-                errors.append(f"JSR package is not in allowlist: {package}")
-                continue
-            if parsed[1] is None:
-                errors.append(f"JSR import must pin a package version: {specifier}")
-                continue
-            if not self._is_exact_jsr_version(parsed[1]):
-                errors.append(f"JSR import must use an exact semantic version: {specifier}")
+            errors.append(f"imports are not allowed in JIT tool source: {specifier}")
         return ValidationResult(ok=not errors, errors=errors, warnings=warnings)
 
     async def arun_source(

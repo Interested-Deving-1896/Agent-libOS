@@ -81,15 +81,17 @@ trusted Runtime Modules before the runtime is used:
 ```bash
 uv run agent-libos --db .agent_libos.sqlite \
   --module-manifest modules/pty/module.yaml \
-  --trusted-module agent-libos-pty:v0:<source_sha256> \
+  --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> \
   <command>
 ```
 
-For multi-file modules, `<source_sha256>` is the package digest reported by
-`modules verify`; for single-file modules it is the entrypoint file hash.
-For local development only, `--trusted-module-sha256 <sha256>` trusts a source
-or package digest regardless of module id. Prefer `--trusted-module
-<module_id>:<sha256>` when the module id is known.
+`modules verify` reports `manifest_sha256`, `source_sha256`, and `trust_key`;
+copy `trust_key` into `--trusted-module`. For multi-file modules,
+`source_sha256` is the package digest; for single-file modules it is the
+entrypoint file hash. For local development only,
+`--trusted-module-sha256 <manifest_sha256>:<source_sha256>` trusts that digest
+pair regardless of module id. Prefer `--trusted-module <trust_key>` when the
+module id is known.
 
 ## Top-Level Commands
 
@@ -574,17 +576,19 @@ global arguments before the selected command runs:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite modules verify modules/pty/module.yaml
-uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<source_sha256> modules list
-uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<source_sha256> modules inspect agent-libos-pty:v0
+uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> modules list
+uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> modules inspect agent-libos-pty:v0
 ```
 
-`modules verify` resolves the entrypoint and computes the source hash without
-loading the module. For single-file modules this is the entry file hash; for
-multi-file modules it is the inferred Python source package digest and includes
-the covered `source_files` list. `modules list` and `modules inspect` show
-persisted module load records for the opened runtime database.
-`--trusted-module-sha256 <sha256>` is accepted as a weaker local-development
-shortcut that trusts the digest for any module id.
+`modules verify` resolves the entrypoint and computes the manifest hash and
+source hash without loading the module. For single-file modules the source hash
+is the entry file hash; for multi-file modules it is the inferred Python source
+package digest and includes the covered `source_files` list. The returned
+`trust_key` is the copy-paste value for `--trusted-module`. `modules list` and
+`modules inspect` show persisted module load records for the opened runtime
+database. `--trusted-module-sha256 <manifest_sha256>:<source_sha256>` is
+accepted as a weaker local-development shortcut that trusts the digest pair for
+any module id.
 
 ## Benchmark Scripts
 

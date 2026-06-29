@@ -73,6 +73,9 @@ class RuntimeStore(Protocol):
     def get_object_by_name(self, name: str, namespace: str) -> Any | None:
         ...
 
+    def get_object_ref_by_name(self, name: str, namespace: str) -> dict[str, Any] | None:
+        ...
+
     def object_name_exists(self, name: str, namespace: str, except_oid: str | None = None) -> bool:
         ...
 

@@ -716,6 +716,17 @@ class SQLRuntimeStore:
             return None
         return self._row_to_object(rows[0])
 
+    def get_object_ref_by_name(self, name: str, namespace: str) -> dict[str, Any] | None:
+        rows = self._query(
+            """
+            SELECT oid, namespace, name
+              FROM objects
+             WHERE namespace = ? AND name = ? AND lifecycle_state = ?
+            """,
+            (namespace, name, ObjectLifecycleState.LIVE.value),
+        )
+        return self._row_to_dict(rows[0]) if rows else None
+
     def object_name_exists(self, name: str, namespace: str, except_oid: str | None = None) -> bool:
         rows = self._query(
             "SELECT oid FROM objects WHERE namespace = ? AND name = ? AND lifecycle_state = ?",

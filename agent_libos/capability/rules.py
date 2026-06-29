@@ -152,30 +152,6 @@ class ShellRuleEngine:
                 "network-capable shell command requires approval",
             )
 
-        if not path_qualified_argv0 and self._is_harmless(normalized):
-            return self._guard_auto_allow(
-                argv,
-                self._match(
-                    f"shell.harmless.{direct}",
-                    CapabilityEffect.ALLOW,
-                    AuthorityRisk.HARMLESS,
-                    tuple(normalized),
-                    "harmless read-only inspection command",
-                ),
-            )
-
-        if not path_qualified_argv0 and self._is_low_risk(normalized):
-            return self._guard_auto_allow(
-                argv,
-                self._match(
-                    f"shell.low.{direct}",
-                    CapabilityEffect.ALLOW,
-                    AuthorityRisk.LOW,
-                    tuple(normalized[: min(len(normalized), 3)]),
-                    "low-risk read-only project inspection command",
-                ),
-            )
-
         if self._is_medium_risk(normalized):
             return self._guard_auto_allow(
                 argv,
@@ -229,6 +205,30 @@ class ShellRuleEngine:
         for rule in self.custom_rules:
             if self._matches_rule(argv, normalized, rule):
                 return self._guard_auto_allow(argv, RuleMatch(rule=rule, matched_argv=self._rule_argv(rule)))
+
+        if not path_qualified_argv0 and self._is_harmless(normalized):
+            return self._guard_auto_allow(
+                argv,
+                self._match(
+                    f"shell.harmless.{direct}",
+                    CapabilityEffect.ALLOW,
+                    AuthorityRisk.HARMLESS,
+                    tuple(normalized),
+                    "harmless read-only inspection command",
+                ),
+            )
+
+        if not path_qualified_argv0 and self._is_low_risk(normalized):
+            return self._guard_auto_allow(
+                argv,
+                self._match(
+                    f"shell.low.{direct}",
+                    CapabilityEffect.ALLOW,
+                    AuthorityRisk.LOW,
+                    tuple(normalized[: min(len(normalized), 3)]),
+                    "low-risk read-only project inspection command",
+                ),
+            )
 
         return self._guard_auto_allow(
             argv,

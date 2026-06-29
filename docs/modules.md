@@ -12,9 +12,10 @@ Modules are part of the host trusted computing base:
 - They are loaded only from explicit manifests.
 - The entrypoint source file, or its inferred Python source package, must match
   the manifest `sha256`.
-- The `(module_id, source_sha256)` pair must be trusted by config or CLI for
-  normal use. The weaker digest-only trust list accepts any module id with that
-  source hash and is intended for local development.
+- The `(module_id, manifest_sha256, source_sha256)` trust key must be trusted
+  by config or CLI for normal use. The weaker digest-pair trust list accepts
+  any module id with that manifest/source hash pair and is intended for local
+  development.
 - Loading a module never grants filesystem, shell, Object Memory, human,
   process, checkpoint, Skill, image, or JSON-RPC capabilities to a process.
 - Import-string entrypoints are resolved to a concrete source file under the
@@ -78,7 +79,8 @@ package name.
 The package reader rejects symlinks, hard links, non-regular files, path
 escapes, cache or VCS paths, and likely secret material. Run
 `uv run agent-libos modules verify <module.yaml>` after authoring a module to
-get the current `source_sha256` and the file list covered by the digest.
+get the current `manifest_sha256`, `source_sha256`, `trust_key`, and the file
+list covered by the source digest.
 
 YAML and JSON manifests both reject duplicate mapping keys. Treat duplicate-key
 errors as authoring bugs rather than relying on parser-specific overwrite
@@ -198,12 +200,15 @@ Load a trusted module before a command:
 ```bash
 uv run agent-libos \
   --module-manifest modules/pty/module.yaml \
-  --trusted-module agent-libos-pty:v0:<source_sha256> \
+  --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> \
   modules list
 ```
 
-The weaker `--trusted-module-sha256 <sha256>` trusts any module id with that
-entry-file or package digest and is intended for local development only.
+`modules verify` returns the exact `trust_key` value accepted by
+`--trusted-module`. The weaker
+`--trusted-module-sha256 <manifest_sha256>:<source_sha256>` trusts any module id
+with that manifest/source digest pair and is intended for local development
+only.
 
 Every command that needs module-provided images, tools, or syscalls must pass
 the same startup module configuration, or use an application-level config that

@@ -76,13 +76,19 @@ def main(argv: list[str] | None = None) -> None:
         "--trusted-module",
         action="append",
         default=[],
-        help="Trusted startup module entry in the form '<module_id>:<source_sha256>' where the hash is the entry file or package digest.",
+        help=(
+            "Trusted startup module entry in the form "
+            "'<module_id>:<manifest_sha256>:<source_sha256>'. Use the trust_key from `modules verify`."
+        ),
     )
     parser.add_argument(
         "--trusted-module-sha256",
         action="append",
         default=[],
-        help="Trusted startup module source/package sha256, regardless of module id. Intended for local development only.",
+        help=(
+            "Trusted startup module digest pair in the form '<manifest_sha256>:<source_sha256>', "
+            "regardless of module id. Intended for local development only."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Initialize a runtime database")

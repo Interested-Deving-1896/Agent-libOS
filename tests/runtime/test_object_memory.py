@@ -856,6 +856,34 @@ class TestObjectMemoryName:
         assert len(results) == 1
         assert results[0].oid == handle.oid
 
+    def test_name_lookup_authorizes_object_before_payload_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner name lookup')
+        other = self.runtime.process.spawn(image='base-agent:v0', goal='unauthorized name lookup')
+        self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.CLAIM,
+            payload={'claim': 'payload must stay hidden'},
+            name='claim.hidden.payload',
+        )
+        owner_namespace = self.runtime.memory.resolve_namespace(owner)
+        self.runtime.capability.grant(
+            subject=other,
+            resource=f'object_namespace:{owner_namespace}',
+            rights=[CapabilityRight.READ],
+            issued_by='test',
+        )
+
+        def fail_if_payload_checked(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError('object payload should not be loaded before object capability check')
+
+        monkeypatch.setattr(self.runtime.store, 'has_object_payload', fail_if_payload_checked)
+
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object_by_name(other, 'claim.hidden.payload', namespace=owner_namespace)
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.handle_for_name(other, 'claim.hidden.payload', namespace=owner_namespace)
+        assert self.runtime.memory.query_objects(other, ObjectQuery(name='claim.hidden.payload', namespace=owner_namespace)) == []
+
     def test_query_limit_uses_deterministic_recent_first_order(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='ordered query')
         older = self.runtime.memory.create_object(

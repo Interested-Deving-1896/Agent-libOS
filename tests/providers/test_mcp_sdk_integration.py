@@ -20,15 +20,34 @@ from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
 pytestmark = pytest.mark.mcp
 
 
+def _grant_stdio_spawn(
+    runtime: Runtime,
+    pid: str,
+    command: str,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> None:
+    runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
+    runtime.capability.grant(
+        pid,
+        runtime.mcp.stdio_resource_for_argv(command, args, env=env, cwd=cwd),
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+
+
 class TestMcpSdkIntegration:
     def test_stdio_fastmcp_tool_call(self, tmp_path: Path) -> None:
         server_path = _write_fastmcp_stdio_server(tmp_path)
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio integration")
-            runtime.mcp.register_server(_server_spec("stdio-it", sys.executable, [str(server_path)]), actor="cli", require_capability=False)
+            args = [str(server_path)]
+            runtime.mcp.register_server(_server_spec("stdio-it", sys.executable, args), actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp:stdio-it:echo", [CapabilityRight.READ], issued_by="test")
-            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
+            _grant_stdio_spawn(runtime, pid, sys.executable, args)
 
             result = runtime.mcp.call_tool(pid, "stdio-it", "echo", {"text": "hello"})
 
@@ -51,13 +70,21 @@ class TestMcpSdkIntegration:
         runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(workspace))
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio env integration")
-            spec = _server_spec("stdio-env-it", sys.executable, [str(server_path)])
+            args = [str(server_path)]
+            spec = _server_spec("stdio-env-it", sys.executable, args)
             spec["stdio"]["cwd"] = "server-cwd"
             spec["stdio"]["env"] = {"DEMO_TOKEN": "AGENT_LIBOS_MCP_ALLOWED_TOKEN"}
             spec["tools"] = [_tool_spec(tool_id="envcwd", mcp_name="demo.envcwd")]
             runtime.mcp.register_server(spec, actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp:stdio-env-it:envcwd", [CapabilityRight.READ], issued_by="test")
-            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                sys.executable,
+                args,
+                env={"DEMO_TOKEN": "AGENT_LIBOS_MCP_ALLOWED_TOKEN"},
+                cwd="server-cwd",
+            )
 
             result = runtime.mcp.call_tool(pid, "stdio-env-it", "envcwd", {})
 

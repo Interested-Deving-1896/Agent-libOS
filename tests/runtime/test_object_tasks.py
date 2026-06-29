@@ -814,8 +814,15 @@ class TestObjectTasks:
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="cancel task")
             _grant_process_spawn(runtime, pid)
+            _grant_delegable_clock_sleep(runtime, pid)
             owner = _owner(runtime, pid)
-            task = runtime.object_tasks.start(pid, owner, "sleep", {"seconds": 1.0})
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "sleep",
+                {"seconds": 1.0},
+                inherit_capabilities=_inherit_clock_sleep(),
+            )
 
             cancelled = runtime.object_tasks.cancel(task.task_id, actor_pid=pid, reason="no longer needed")
 

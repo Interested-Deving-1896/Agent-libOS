@@ -902,8 +902,6 @@ class CapabilityManager:
         self.consume_use(decision.consume_capability_id, used_by=used_by, reason=reason)
 
     def _require_issue_authority(self, actor: str, spec: CapabilitySpec) -> _IssueAuthority:
-        if self._is_trusted_issuer(actor):
-            return _IssueAuthority()
         admin = self.authorize(actor, spec.resource, CapabilityRight.ADMIN)
         if admin.allowed:
             return _IssueAuthority(mutation_decision=admin)
@@ -915,7 +913,7 @@ class CapabilityManager:
         raise CapabilityDenied(f"{actor} lacks grant/admin authority to issue {sorted(spec.rights)} on {spec.resource}")
 
     def _require_revoke_authority(self, actor: str, cap: Capability) -> CapabilityDecision | None:
-        if self._is_trusted_issuer(actor) or actor == cap.issued_by:
+        if actor == cap.issued_by:
             return None
         if actor == cap.subject:
             if cap.effect == CapabilityEffect.ALLOW:

@@ -6,11 +6,18 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ModuleProvides:
-    tools: list[str] = field(default_factory=list)
-    images: list[str] = field(default_factory=list)
-    syscalls: list[str] = field(default_factory=list)
-    provider_hooks: list[str] = field(default_factory=list)
-    startup_hooks: list[str] = field(default_factory=list)
+    tools: tuple[str, ...] = field(default_factory=tuple)
+    images: tuple[str, ...] = field(default_factory=tuple)
+    syscalls: tuple[str, ...] = field(default_factory=tuple)
+    provider_hooks: tuple[str, ...] = field(default_factory=tuple)
+    startup_hooks: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tools", tuple(self.tools))
+        object.__setattr__(self, "images", tuple(self.images))
+        object.__setattr__(self, "syscalls", tuple(self.syscalls))
+        object.__setattr__(self, "provider_hooks", tuple(self.provider_hooks))
+        object.__setattr__(self, "startup_hooks", tuple(self.startup_hooks))
 
 
 @dataclass(frozen=True)

@@ -74,6 +74,28 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_trusted_actor_names_do_not_bypass_issue_or_revoke_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            subject = runtime.process.spawn(image='base-agent:v0', goal='trusted actor spoof subject')
+            resource = 'object:trusted-actor-spoof'
+
+            with pytest.raises(CapabilityDenied, match='lacks grant/admin authority'):
+                runtime.capability.issue(
+                    'human:owner',
+                    subject,
+                    {'resource': resource, 'rights': ['read']},
+                    require_authority=True,
+                )
+
+            cap = runtime.capability.grant(subject, resource, [CapabilityRight.READ], issued_by='test')
+            with pytest.raises(CapabilityDenied, match='lacks revoke/admin authority'):
+                runtime.capability.revoke(cap.cap_id, revoked_by='human:owner')
+
+            assert runtime.store.get_capability(cap.cap_id).active
+        finally:
+            runtime.close()
+
     def test_restrictive_capability_with_bad_constraint_fails_closed_over_allow(self) -> None:
         runtime = Runtime.open('local')
         try:

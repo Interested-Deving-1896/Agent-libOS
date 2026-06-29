@@ -161,7 +161,7 @@ class TestGuiServer:
         assert created['store'] is None
         assert created['parallel_tool_calls'] is None
         assert created['auto_wait_on_empty_tool_calls'] is None
-        assert created['allow_custom_base_url'] is True
+        assert created['allow_custom_base_url'] is False
 
         status, updated = self.request(
             'PUT',
@@ -172,10 +172,12 @@ class TestGuiServer:
                 'api_key_env': 'KIMI_API_KEY',
                 'api_mode': 'chat',
                 'max_tokens': 4096,
+                'allow_custom_base_url': True,
             },
         )
         assert status == 200
         assert updated['max_tokens'] == 4096
+        assert updated['allow_custom_base_url'] is True
         assert 'secret' not in self.llm_profiles_file.read_text(encoding='utf-8')
 
         status, rejected = self.request(
@@ -550,6 +552,20 @@ class TestGuiServer:
         )
         assert status == 403
         assert 'lacks grant/admin authority' in denied['error']['message']
+
+        status, spoofed = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-spoofed-human-grant',
+                'rights': ['read'],
+                'actor': DEFAULT_CONFIG.runtime.default_human_actor,
+                'confirmed': True,
+            },
+        )
+        assert status == 403
+        assert 'lacks grant/admin authority' in spoofed['error']['message']
 
         status, admin_granted = self.request(
             'POST',
@@ -1082,6 +1098,21 @@ class TestGuiServer:
             [CapabilityRight.WRITE],
             issued_by='test',
         )
+        stdio_status, stdio_denied = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': manifest, 'actor': pid, 'confirmed': True},
+        )
+
+        assert stdio_status == 403
+        assert 'mcp_stdio' in stdio_denied['error']['message']
+
+        self.server.service.runtime.capability.grant(
+            pid,
+            self.server.service.runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+            [CapabilityRight.EXECUTE],
+            issued_by='test',
+        )
         register_status, registered = self.request(
             'POST',
             '/api/mcp/register',
@@ -1119,6 +1150,19 @@ class TestGuiServer:
 
         assert status == 400
         assert 'arguments must be a JSON object' in body['error']['message']
+
+    def test_skill_register_without_actor_rejects_host_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(Path(temp_dir), 'gui-host-path-skill', allowed_tools=['echo'])
+
+            status, denied = self.request(
+                'POST',
+                '/api/skills/register',
+                {'path': str(skill_dir), 'confirmed': True},
+            )
+
+            assert status == 400
+            assert 'requires an actor' in denied['error']['message']
 
     def test_skill_register_actor_mode_requires_skill_write_capability(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
@@ -1188,6 +1232,37 @@ class TestGuiServer:
         assert approved['request']['status'] == 'approved'
         assert status_again == 409
         assert 'not pending' in conflict['error']['message']
+
+    def test_human_request_respond_without_approved_defaults_to_reject(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='gui human default reject')
+        request_id = runtime.human.query(
+            pid=pid,
+            human=DEFAULT_CONFIG.runtime.default_human,
+            request={
+                'type': 'permission_request',
+                'question': 'Allow object read?',
+                'requested_permission': {
+                    'subject': pid,
+                    'resource': 'object:gui-default-reject',
+                    'rights': ['read'],
+                },
+            },
+            blocking=True,
+        )
+
+        status, rejected = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'auto_run': False},
+        )
+
+        assert status == 200
+        assert rejected['request']['status'] == 'rejected'
+        assert (
+            runtime.capability.permission_policy(pid, 'object:gui-default-reject', CapabilityRight.READ)
+            == 'always_deny'
+        )
 
     def test_invalid_max_quanta_is_rejected(self) -> None:
         before_count = len(self.server.service.runtime.process.list())

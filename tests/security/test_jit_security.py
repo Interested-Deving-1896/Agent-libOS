@@ -412,30 +412,32 @@ class TestJitSecurity:
         assert computed_deno.ok, computed_deno.errors
         assert ordinary_export.ok, ordinary_export.errors
         assert not denied_import.ok
-        assert any(('import is not allowed: npm:left-pad' in error for error in denied_import.errors))
+        assert any(('imports are not allowed in JIT tool source: npm:left-pad' in error for error in denied_import.errors))
 
     def test_deno_static_check_import_allowlist(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
-        allowed = checker.static_check('import { join } from "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
+        pinned_jsr = checker.static_check('import { join } from "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
         denied = checker.static_check('import fs from "node:fs";\nimport x from "https://deno.land/std/path/mod.ts";\nimport y from "file:///tmp/tool.ts";\nimport z from "jsr:@bad/pkg@1.0.0";\nimport { join } from "jsr:@std/path";\nexport function run(args, libos) { return {}; }')
-        assert allowed.ok, allowed.errors
+        assert not pinned_jsr.ok
+        assert any(('imports are not allowed in JIT tool source: jsr:@std/path@1.0.0' in error for error in pinned_jsr.errors))
         assert not denied.ok
-        assert any(('import is not allowed: node:fs' in error for error in denied.errors))
-        assert any(('import is not allowed: https://deno.land/std/path/mod.ts' in error for error in denied.errors))
-        assert any(('import is not allowed: file:///tmp/tool.ts' in error for error in denied.errors))
-        assert any(('JSR package is not in allowlist: @bad/pkg' in error for error in denied.errors))
-        assert any(('JSR import must pin a package version: jsr:@std/path' in error for error in denied.errors))
+        assert any(('imports are not allowed in JIT tool source: node:fs' in error for error in denied.errors))
+        assert any(('imports are not allowed in JIT tool source: https://deno.land/std/path/mod.ts' in error for error in denied.errors))
+        assert any(('imports are not allowed in JIT tool source: file:///tmp/tool.ts' in error for error in denied.errors))
+        assert any(('imports are not allowed in JIT tool source: jsr:@bad/pkg@1.0.0' in error for error in denied.errors))
+        assert any(('imports are not allowed in JIT tool source: jsr:@std/path' in error for error in denied.errors))
 
     def test_deno_static_check_rejects_mutable_jsr_versions(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
-        allowed = checker.static_check('import { join } from "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
+        pinned = checker.static_check('import { join } from "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
         denied = checker.static_check('import { join } from "jsr:@std/path@1";\nimport { normalize } from "jsr:@std/path@latest";\nimport { dirname } from "jsr:@std/path@^1.0.0";\nexport function run(args, libos) { return {}; }')
 
-        assert allowed.ok, allowed.errors
+        assert not pinned.ok
+        assert any('imports are not allowed in JIT tool source: jsr:@std/path@1.0.0' in error for error in pinned.errors)
         assert not denied.ok
-        assert any('JSR import must use an exact semantic version: jsr:@std/path@1' in error for error in denied.errors)
-        assert any('JSR import must use an exact semantic version: jsr:@std/path@latest' in error for error in denied.errors)
-        assert any('JSR import must use an exact semantic version: jsr:@std/path@^1.0.0' in error for error in denied.errors)
+        assert any('imports are not allowed in JIT tool source: jsr:@std/path@1' in error for error in denied.errors)
+        assert any('imports are not allowed in JIT tool source: jsr:@std/path@latest' in error for error in denied.errors)
+        assert any('imports are not allowed in JIT tool source: jsr:@std/path@^1.0.0' in error for error in denied.errors)
 
     def test_deno_static_check_rejects_comment_split_imports(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
@@ -443,17 +445,18 @@ class TestJitSecurity:
         template_import = checker.static_check('export async function run(args, libos) { return `${await import("npm:left-pad")}`; }')
         npm_import = checker.static_check('import x from /*comment*/ "npm:left-pad";\nexport function run(args, libos) { return {}; }')
         exported_import = checker.static_check('export { join } from /*comment*/ "npm:left-pad";\nexport function run(args, libos) { return {}; }')
-        allowed = checker.static_check('import { join } from /*comment*/ "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
+        jsr_import = checker.static_check('import { join } from /*comment*/ "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
 
         assert not dynamic_import.ok
         assert any('dynamic import() is not allowed' in error for error in dynamic_import.errors)
         assert not template_import.ok
         assert any('dynamic import() is not allowed' in error for error in template_import.errors)
         assert not npm_import.ok
-        assert any('import is not allowed: npm:left-pad' in error for error in npm_import.errors)
+        assert any('imports are not allowed in JIT tool source: npm:left-pad' in error for error in npm_import.errors)
         assert not exported_import.ok
-        assert any('import is not allowed: npm:left-pad' in error for error in exported_import.errors)
-        assert allowed.ok, allowed.errors
+        assert any('imports are not allowed in JIT tool source: npm:left-pad' in error for error in exported_import.errors)
+        assert not jsr_import.ok
+        assert any('imports are not allowed in JIT tool source: jsr:@std/path@1.0.0' in error for error in jsr_import.errors)
 
     def test_deno_static_check_rejects_runtime_code_generation_import_bypasses(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')

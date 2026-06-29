@@ -263,12 +263,22 @@ class TestUserLLMProfileStore:
                     "allow_custom_base_url": False,
                 },
             )
+            implicit = store.upsert(
+                "compat-without-opt-in",
+                {
+                    "model": "compat-without-opt-in",
+                    "base_url": "https://compat.example/v1",
+                    "api_key_env": "COMPAT_API_KEY",
+                },
+            )
             loaded = UserLLMProfileStore(path).load()
 
             assert saved.model == "qwen3.7-max"
+            assert implicit.allow_custom_base_url is False
             assert loaded["qwen3.7-max"].base_url == "https://qwen.example/v1"
             assert loaded["qwen3.7-max"].api_key_env == "QWEN_API_KEY"
             assert loaded["qwen3.7-max"].allow_custom_base_url is False
+            assert loaded["compat-without-opt-in"].allow_custom_base_url is False
             assert loaded["qwen3.7-max"].auto_wait_on_empty_tool_calls is True
             persisted = json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
             assert persisted["allow_custom_base_url"] is False

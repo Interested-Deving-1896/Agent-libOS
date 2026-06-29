@@ -7,7 +7,7 @@ from typing import Any, TYPE_CHECKING
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, get_project_root
 from agent_libos.models import EventType
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.modules.context import ModuleContext, StartupHook
+from agent_libos.modules.context import ModuleContext, ModuleRuntimeView, StartupHook
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource
 from agent_libos.utils.ids import utc_now
@@ -101,10 +101,10 @@ class RuntimeModuleRegistry:
         )
         try:
             source = loader.resolve(manifest_path)
-            if not loader.is_trusted(source.manifest.module_id, source.source_sha256):
+            if not loader.is_trusted(source.manifest.module_id, source.source_sha256, source.manifest_sha256):
                 raise CapabilityDenied(
                     "startup module is not trusted: "
-                    f"{source.manifest.module_id}:{source.source_sha256}"
+                    f"{source.manifest.module_id}:{source.manifest_sha256}:{source.source_sha256}"
                 )
             self._require_module_id_available(source.manifest.module_id, source.source_sha256)
             entrypoint = loader.import_entrypoint(source)
@@ -178,7 +178,7 @@ class RuntimeModuleRegistry:
         enforce_provides: bool,
         import_cleanup: tuple[str, Any] | None = None,
     ) -> dict[str, Any]:
-        ctx = ModuleContext(self.runtime, source.manifest, enforce_provides=enforce_provides)
+        ctx = ModuleContext(ModuleRuntimeView(config=self.runtime.config), source.manifest, enforce_provides=enforce_provides)
         try:
             result = entrypoint(ctx)
             if inspect.isawaitable(result):

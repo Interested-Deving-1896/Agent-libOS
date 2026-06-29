@@ -372,6 +372,7 @@ class TestCheckpointRestore:
 
     def test_restore_rolls_back_rows_and_payloads_when_insert_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')
+        finalizer_calls: list[tuple[str, str, str]] = []
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='rollback restore')
             handle = runtime.memory.create_object(
@@ -384,6 +385,17 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before failed restore', actor=pid)
             runtime.memory.update_object(pid, handle, ObjectPatch(payload={'version': 2}))
+            temporary = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'temporary': True},
+                ObjectMetadata(title='temporary'),
+                immutable=False,
+                name='temporary.after.checkpoint',
+            )
+            runtime.memory.bind_object_release_finalizer(
+                lambda obj, actor, reason: finalizer_calls.append((obj.oid, actor, reason))
+            )
             message = runtime.human.send_process_message(pid, 'late message')
             request_id = runtime.human.query(
                 pid=pid,
@@ -404,6 +416,8 @@ class TestCheckpointRestore:
 
             restored = runtime.memory.get_object_by_name(pid, 'state')
             assert restored.payload == {'version': 2}
+            assert runtime.store.get_object(temporary.oid) is not None
+            assert finalizer_calls == []
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
             assert runtime.store.get_process_message(message.message_id).status == ProcessMessageStatus.UNREAD
             assert runtime.human.get(request_id).status == HumanRequestStatus.PENDING

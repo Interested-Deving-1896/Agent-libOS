@@ -381,11 +381,15 @@ class ObjectMemoryManager:
         object_name = self._normalize_name(name)
         namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
         self._require_namespace_exists(object_namespace)
-        obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
-        if obj is None:
+        obj_ref = self.store.get_object_ref_by_name(object_name, namespace=object_namespace)
+        if obj_ref is None:
             raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
         # Name lookup never bypasses the object capability model.
-        decision = self.capabilities.require(pid, f"object:{obj.oid}", ObjectRight.READ)
+        oid = str(obj_ref["oid"])
+        decision = self.capabilities.require(pid, f"object:{oid}", ObjectRight.READ)
+        obj = self.store.get_object(oid)
+        if obj is None:
+            raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
         self.audit.record(
             actor=pid,
             action="memory.get_object_by_name",
@@ -410,20 +414,24 @@ class ObjectMemoryManager:
             object_name = self._normalize_name(name)
             namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
             self._require_namespace_exists(object_namespace)
-            obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
-            if obj is None:
+            obj_ref = self.store.get_object_ref_by_name(object_name, namespace=object_namespace)
+            if obj_ref is None:
                 raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+            oid = str(obj_ref["oid"])
             requested = {str(right) for right in (rights or {ObjectRight.READ.value})}
             # A name can be resolved only into rights the process already has.
             decisions = []
             for right in requested:
-                decision = self._authorize_object_right_for_derivation(pid, f"object:{obj.oid}", right)
+                decision = self._authorize_object_right_for_derivation(pid, f"object:{oid}", right)
                 if not decision.allowed:
                     raise CapabilityDenied(decision.reason)
                 decisions.append(decision)
+            obj = self.store.get_object(oid)
+            if obj is None:
+                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
             handle = self._issue_handle_and_consume_one_time_decisions(
                 pid,
-                obj.oid,
+                oid,
                 requested,
                 issued_by=issued_by,
                 one_time_decisions=[*decisions, namespace_decision],
@@ -774,10 +782,29 @@ class ObjectMemoryManager:
             limit = self._validate_query_limit(query.limit)
             if query.name is None:
                 candidates = self.store.list_objects(namespace=namespace)
+                preauthorized: dict[str, tuple[set[str], list[Any]]] = {}
             else:
                 object_name = self._normalize_name(query.name)
-                obj = self.store.get_object_by_name(object_name, namespace=namespace)
-                candidates = [] if obj is None else [obj]
+                obj_ref = self.store.get_object_ref_by_name(object_name, namespace=namespace)
+                candidates = []
+                preauthorized = {}
+                if obj_ref is not None:
+                    oid = str(obj_ref["oid"])
+                    try:
+                        rights, decisions = self._authorized_object_rights(
+                            pid,
+                            oid,
+                            required_rights={ObjectRight.READ.value},
+                            optional_rights=set(),
+                            allow_one_time_handle_sources=False,
+                        )
+                    except CapabilityDenied:
+                        pass
+                    else:
+                        obj = self.store.get_object(oid)
+                        if obj is not None:
+                            candidates = [obj]
+                            preauthorized[oid] = (rights, decisions)
             query_text = query.text.lower() if query.text else None
             for obj in candidates:
                 if query.type is not None and obj.type.value != str(query.type):
@@ -789,13 +816,17 @@ class ObjectMemoryManager:
                 decisions: list[Any]
                 rights: set[str]
                 try:
-                    rights, decisions = self._authorized_object_rights(
-                        pid,
-                        obj.oid,
-                        required_rights={ObjectRight.READ.value},
-                        optional_rights=set(),
-                        allow_one_time_handle_sources=False,
-                    )
+                    preauthorized_rights = preauthorized.get(obj.oid)
+                    if preauthorized_rights is None:
+                        rights, decisions = self._authorized_object_rights(
+                            pid,
+                            obj.oid,
+                            required_rights={ObjectRight.READ.value},
+                            optional_rights=set(),
+                            allow_one_time_handle_sources=False,
+                        )
+                    else:
+                        rights, decisions = preauthorized_rights
                     handle = self._issue_handle_and_consume_one_time_decisions(
                         pid,
                         obj.oid,

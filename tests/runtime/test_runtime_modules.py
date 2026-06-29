@@ -26,7 +26,7 @@ class TestRuntimeModule:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root)
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 loaded = runtime.modules.inspect_module('test-module:v0')
                 assert loaded['status'] == 'loaded'
@@ -67,7 +67,7 @@ class TestRuntimeModule:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root)
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 runtime.register_image(
                     AgentImage(
@@ -90,7 +90,7 @@ class TestRuntimeModule:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root)
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 runtime.register_image(
                     AgentImage(
@@ -110,7 +110,7 @@ class TestRuntimeModule:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root, provider_hook=True)
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 actions = [record.action for record in runtime.audit.trace()]
                 assert 'test.provider_hook' in actions
@@ -123,7 +123,7 @@ class TestRuntimeModule:
             root = Path(temp_dir)
             (root / 'secret.txt').write_text('secret', encoding='utf-8')
             manifest, source_sha = _write_module(root, expose_read_tool=True)
-            runtime = Runtime.open(substrate=LocalResourceProviderSubstrate(root), module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(substrate=LocalResourceProviderSubstrate(root), module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 pid = runtime.process.spawn(image='module-agent:v0', goal='read')
                 assert 'read_text_file' in runtime.process.get(pid).tool_table
@@ -139,6 +139,111 @@ class TestRuntimeModule:
             with pytest.raises(CapabilityDenied):
                 Runtime.open(module_manifests=(str(manifest),))
 
+    def test_module_trust_binds_manifest_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            original_trust = _module_trust_key('test-module:v0', manifest, source_sha)
+            manifest.write_text(
+                manifest.read_text(encoding='utf-8').replace('  test: true', '  test: false'),
+                encoding='utf-8',
+            )
+
+            with pytest.raises(CapabilityDenied, match='not trusted'):
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(original_trust,))
+
+    def test_module_entrypoint_cannot_access_runtime_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            source = root / 'escape_module.py'
+            source.write_text(
+                "def register_module(ctx):\n"
+                "    ctx.runtime.audit.record(actor='module:escape-module:v0', action='preflight.escape', target='runtime')\n",
+                encoding='utf-8',
+            )
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            manifest = root / 'module.yaml'
+            manifest.write_text(
+                f"""
+schema_version: 1
+module_id: escape-module:v0
+name: Escape module
+entrypoint: ./escape_module.py:register_module
+provides: {{}}
+sha256: {source_sha}
+""".lstrip(),
+                encoding='utf-8',
+            )
+
+            with pytest.raises(ValidationError, match='cannot access runtime.audit before module preflight'):
+                Runtime.open(
+                    db,
+                    module_manifests=(str(manifest),),
+                    trusted_modules=(_module_trust_key('escape-module:v0', manifest, source_sha),),
+                )
+
+            runtime = Runtime.open(db)
+            try:
+                assert all(record.action != 'preflight.escape' for record in runtime.audit.trace())
+            finally:
+                runtime.close()
+
+    def test_module_entrypoint_cannot_mutate_provides_to_bypass_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / 'mutating_module.py'
+            source.write_text(
+                """
+from pydantic import BaseModel
+
+from agent_libos.tools.base import SyncAgentTool, ToolContext
+
+
+class HiddenArgs(BaseModel):
+    pass
+
+
+class HiddenTool(SyncAgentTool[HiddenArgs]):
+    name = "hidden_tool"
+    description = "Hidden undeclared tool."
+    args_schema = HiddenArgs
+
+    def run(self, args: HiddenArgs, ctx: ToolContext):
+        return {"hidden": True}
+
+
+def register_module(ctx):
+    try:
+        ctx.manifest.provides.tools.append("hidden_tool")
+    except AttributeError:
+        pass
+    ctx.register_tool(HiddenTool())
+""".lstrip(),
+                encoding='utf-8',
+            )
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            manifest = root / 'module.yaml'
+            manifest.write_text(
+                f"""
+schema_version: 1
+module_id: mutating-module:v0
+name: Mutating module
+version: v0
+entrypoint: ./mutating_module.py:register_module
+provides:
+  tools: []
+sha256: {source_sha}
+""".lstrip(),
+                encoding='utf-8',
+            )
+
+            with pytest.raises(ValidationError, match='registered undeclared tool: hidden_tool'):
+                Runtime.open(
+                    module_manifests=(str(manifest),),
+                    trusted_modules=(_module_trust_key('mutating-module:v0', manifest, source_sha),),
+                )
+
     def test_configured_startup_module_paths_resolve_from_project_root_not_cwd(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -153,7 +258,7 @@ class TestRuntimeModule:
             modules=replace(
                 DEFAULT_CONFIG.modules,
                 manifest_paths=('module.yaml',),
-                trusted_modules=(f'test-module:v0:{source_sha}',),
+                trusted_modules=(_module_trust_key('test-module:v0', project_manifest, source_sha),),
             ),
         )
         monkeypatch.setattr('agent_libos.modules.registry.get_project_root', lambda: project_root)
@@ -174,7 +279,7 @@ class TestRuntimeModule:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root, entrypoint='test_module:register_module')
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 assert 'test-module:v0' in [module['module_id'] for module in runtime.modules.list_modules()]
                 assert 'module-agent:v0' in runtime.images
@@ -211,7 +316,7 @@ sha256: {source_sha}
 
             assert resolved.source_path == str(source.resolve())
             assert not sentinel.exists()
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'package-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('package-module:v0', manifest, source_sha),))
             try:
                 loaded = runtime.modules.inspect_module('package-module:v0')
                 assert loaded['status'] == 'loaded'
@@ -223,7 +328,7 @@ sha256: {source_sha}
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root, entrypoint='test_module:register_module', marker='old')
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 pid = runtime.process.spawn(image='module-agent:v0', goal='old module')
                 assert runtime.tools.call(pid, 'module_echo', {'text': 'hello'}).payload['marker'] == 'old'
@@ -231,7 +336,7 @@ sha256: {source_sha}
                 runtime.close()
 
             manifest, source_sha = _write_module(root, entrypoint='test_module:register_module', marker='new')
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 pid = runtime.process.spawn(image='module-agent:v0', goal='new module')
                 assert runtime.tools.call(pid, 'module_echo', {'text': 'hello'}).payload['marker'] == 'new'
@@ -247,7 +352,7 @@ sha256: {source_sha}
             sentinel.marker = 'original'
             sys.modules['test_module'] = sentinel
             try:
-                runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+                runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
                 try:
                     assert 'test-module:v0' in [module['module_id'] for module in runtime.modules.list_modules()]
                     assert sys.modules['test_module'] is sentinel
@@ -267,7 +372,7 @@ sha256: {source_sha}
             try:
                 loaded = runtime.modules.load_module_manifest(
                     manifest,
-                    trusted_modules=(f'test-module:v0:{source_sha}',),
+                    trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),),
                 )
                 actions = [record.action for record in runtime.audit.trace()]
                 assert loaded['status'] == 'loaded'
@@ -285,7 +390,7 @@ sha256: {source_sha}
             text = manifest.read_text(encoding='utf-8').replace(source_sha, '0' * 64)
             manifest.write_text(text, encoding='utf-8')
             with pytest.raises(ValidationError):
-                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
 
     def test_module_source_swap_after_trust_does_not_execute_swapped_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -306,7 +411,7 @@ sha256: {source_sha}
 
             monkeypatch.setattr(ModuleLoader, 'resolve', swapping_resolve)
             with pytest.raises(ValidationError, match='source changed after verification'):
-                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
 
             assert not sentinel.exists()
 
@@ -322,7 +427,7 @@ sha256: {source_sha}
                 'pkg/helper.py',
                 'pkg/main.py',
             ]
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('multi-module:v0', manifest, package_sha),))
             try:
                 loaded = runtime.modules.inspect_module('multi-module:v0')
                 assert loaded['status'] == 'loaded'
@@ -400,7 +505,7 @@ sha256: {package_sha}
                 encoding='utf-8',
             )
 
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'lazy-module:v0:{package_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('lazy-module:v0', manifest, package_sha),))
             try:
                 pid = runtime.process.spawn(image='lazy-agent:v0', goal='lazy module')
                 result = runtime.tools.call(pid, 'lazy_echo', {'text': 'hello'})
@@ -422,7 +527,7 @@ sha256: {package_sha}
 
             assert verified['source_sha256'] == package_sha
             assert all('__pycache__' not in item['path'] for item in verified['source_files'])
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('multi-module:v0', manifest, package_sha),))
             try:
                 assert runtime.modules.inspect_module('multi-module:v0')['status'] == 'loaded'
             finally:
@@ -434,7 +539,7 @@ sha256: {package_sha}
             manifest, package_sha = _write_multifile_module(root)
             (root / 'pkg' / 'helper.py').write_text("HELPER_MARKER = 'helper-v2'\n", encoding='utf-8')
             with pytest.raises(ValidationError, match='source sha256 mismatch'):
-                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('multi-module:v0', manifest, package_sha),))
 
     def test_multifile_module_reloads_fresh_with_same_package_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -464,9 +569,9 @@ sha256: {package_sha}
                 encoding='utf-8',
             )
 
-            first = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'fresh-module:v0:{package_sha}',))
+            first = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('fresh-module:v0', manifest, package_sha),))
             first.close()
-            second = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'fresh-module:v0:{package_sha}',))
+            second = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('fresh-module:v0', manifest, package_sha),))
             second.close()
 
             assert sentinel.read_text(encoding='utf-8') == 'imported\nimported\n'
@@ -478,7 +583,7 @@ sha256: {package_sha}
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, package_sha = _write_tiny_multifile_module(root)
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'tiny-module:v0:{package_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('tiny-module:v0', manifest, package_sha),))
             try:
                 loaded_module_names = {name for name in sys.modules if name.startswith('_agent_libos_module_pkg_')}
 
@@ -512,7 +617,7 @@ sha256: {package_sha}
 
             monkeypatch.setattr(ModuleLoader, 'resolve', swapping_resolve)
             with pytest.raises(ValidationError, match='source changed after verification'):
-                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('multi-module:v0', manifest, package_sha),))
 
             assert not sentinel.exists()
 
@@ -538,7 +643,7 @@ sha256: {package_sha}
                 Runtime.open(
                     config=config,
                     module_manifests=(str(manifest),),
-                    trusted_modules=(f'multi-module:v0:{package_sha}',),
+                    trusted_modules=(_module_trust_key('multi-module:v0', manifest, package_sha),),
                 )
 
     def test_multifile_module_package_total_size_limit_fails_before_import(self) -> None:
@@ -553,7 +658,7 @@ sha256: {package_sha}
                 Runtime.open(
                     config=config,
                     module_manifests=(str(manifest),),
-                    trusted_modules=(f'tiny-module:v0:{package_sha}',),
+                    trusted_modules=(_module_trust_key('tiny-module:v0', manifest, package_sha),),
                 )
 
     def test_multifile_module_package_hardlink_is_rejected(self) -> None:
@@ -565,7 +670,7 @@ sha256: {package_sha}
             except OSError as exc:
                 pytest.skip(f'hard links are not available on this filesystem: {exc}')
             with pytest.raises(ValidationError, match='hard links'):
-                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('multi-module:v0', manifest, package_sha),))
 
     def test_module_source_size_limit_fails_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -576,7 +681,7 @@ sha256: {package_sha}
                 modules=replace(DEFAULT_CONFIG.modules, source_max_bytes=32),
             )
             with pytest.raises(ValidationError, match='source_max_bytes'):
-                Runtime.open(config=config, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+                Runtime.open(config=config, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
 
     def test_failed_module_does_not_leave_partial_tool_registration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -585,7 +690,7 @@ sha256: {package_sha}
             runtime = Runtime.open()
             try:
                 with pytest.raises(ValidationError):
-                    runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
                 with pytest.raises(NotFound):
                     runtime.tools.resolve('module_echo')
                 failed = runtime.modules.inspect_module('test-module:v0')
@@ -605,7 +710,7 @@ sha256: {package_sha}
 
                 runtime.image_registry.register = fail_register
                 with pytest.raises(RuntimeError, match='image register exploded'):
-                    runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
                 assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
                 assert 'module-agent:v0' not in runtime.images
                 assert runtime.modules.inspect_module('test-module:v0')['status'] == 'failed'
@@ -620,7 +725,7 @@ sha256: {package_sha}
             runtime = Runtime.open()
             try:
                 with pytest.raises(ValidationError):
-                    runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
                 with pytest.raises(NotFound):
                     runtime.tools.resolve('module_echo')
             finally:
@@ -632,7 +737,7 @@ sha256: {package_sha}
             db = root / 'runtime.sqlite'
             manifest, source_sha = _write_module(root, failing_startup_hook=True)
             with pytest.raises(RuntimeError, match='startup hook failed'):
-                Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+                Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
 
             runtime = Runtime.open(db)
             try:
@@ -649,10 +754,10 @@ sha256: {package_sha}
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root)
-            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 with pytest.raises(ValidationError, match='already loaded'):
-                    runtime.modules.load_module_manifest(manifest, trusted_modules=(f'test-module:v0:{source_sha}',))
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
                 loaded = runtime.modules.inspect_module('test-module:v0')
                 assert loaded['status'] == 'loaded'
                 assert loaded['source_sha256'] == source_sha
@@ -664,7 +769,7 @@ sha256: {package_sha}
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'
             manifest, source_sha = _write_module(root)
-            runtime = Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 pid = runtime.process.spawn(image='module-agent:v0', goal='checkpoint')
                 checkpoint_id = runtime.checkpoint.create(pid, 'module checkpoint', actor=pid)
@@ -682,7 +787,7 @@ sha256: {package_sha}
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'
             manifest, source_sha = _write_module(root)
-            runtime = Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+            runtime = Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
             try:
                 pid = runtime.process.spawn(image='module-agent:v0', goal='commit module image')
                 checkpoint_id = runtime.checkpoint.create(pid, 'module image checkpoint', actor=pid)
@@ -711,13 +816,29 @@ sha256: {package_sha}
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'
             manifest, source_sha = _write_module(root)
-            trust = f'test-module:v0:{source_sha}'
+            trust = _module_trust_key('test-module:v0', manifest, source_sha)
             verified = _run_cli_json(['--db', str(db), 'modules', 'verify', str(manifest)])
             assert not verified['trusted']
+            assert verified['trust_key'] == trust
+            assert verified['source_sha256'] == source_sha
             listed = _run_cli_json(['--db', str(db), '--module-manifest', str(manifest), '--trusted-module', trust, 'modules', 'list'])
             assert 'test-module:v0' in [module['module_id'] for module in listed]
             spawned = _run_cli_json(['--db', str(db), '--module-manifest', str(manifest), '--trusted-module', trust, 'spawn', '--image', 'module-agent:v0', '--goal', 'cli module'])
             assert spawned['image'] == 'module-agent:v0'
+            digest_pair = f"{verified['manifest_sha256']}:{verified['source_sha256']}"
+            listed_by_digest_pair = _run_cli_json(
+                [
+                    '--db',
+                    str(root / 'runtime-digest-pair.sqlite'),
+                    '--module-manifest',
+                    str(manifest),
+                    '--trusted-module-sha256',
+                    digest_pair,
+                    'modules',
+                    'list',
+                ]
+            )
+            assert 'test-module:v0' in [module['module_id'] for module in listed_by_digest_pair]
 
     def test_json_manifest_duplicate_keys_are_rejected(self) -> None:
         with pytest.raises(ValidationError, match='duplicate module manifest JSON key'):
@@ -868,6 +989,11 @@ sha256: {package_sha}
 def _module_package_sha(manifest_dir: Path, source_root: Path) -> str:
     loader = ModuleLoader()
     return loader._package_sha256(loader._read_package_source_files(manifest_dir.resolve(), source_root.resolve()))
+
+
+def _module_trust_key(module_id: str, manifest: Path, source_sha: str) -> str:
+    manifest_sha = hashlib.sha256(manifest.read_text(encoding='utf-8').encode('utf-8')).hexdigest()
+    return ModuleLoader.trust_key(module_id, manifest_sha, source_sha)
 
 
 def _run_cli_json(argv: list[str]) -> object:

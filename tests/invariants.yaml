@@ -59,6 +59,7 @@
         "tests/security/test_capability.py::TestCapabilityManager::test_typed_resource_matching_rejects_prefix_collision",
         "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_matching_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_unordered_matching_capability_candidates",
+        "tests/security/test_capability.py::TestCapabilityManager::test_trusted_actor_names_do_not_bypass_issue_or_revoke_authority",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_explicit_deny_dominates_later_command_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_restrictive_capability_with_bad_constraint_fails_closed_over_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_malformed_known_authority_rule_condition_fails_closed_over_allow",
@@ -93,6 +94,7 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_start_requires_process_spawn_authority",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_inherits_only_explicit_capabilities",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exec_process_swaps_image_without_granting_target_image_capabilities",
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_terminated_process_syscall_session_cannot_send_messages",
         "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_shell_tool_runs_from_process_working_directory"
       ],
       "benchmark_attack_classes": ["process_authority_leakage", "self_evolution_process"]
@@ -107,6 +109,7 @@
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_namespace_write_and_list_rights_are_enforced",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_read_grant_is_consumed_after_successful_lookup",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_query_name_miss_and_filtered_read_do_not_consume_one_time_namespace_read",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_name_lookup_authorizes_object_before_payload_load",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_write_grant_is_consumed_after_successful_create",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_name_handle_does_not_become_persistent_handle",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_query_handle_does_not_become_persistent_handle",
@@ -214,6 +217,7 @@
         "tests/runtime/test_pty_module.py::TestPtyModule::test_high_risk_pty_spawn_requests_human_with_continuous_session_context",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_human_jsonrpc_approval_is_bound_to_params_hash",
         "tests/providers/test_gui_server.py::TestGuiServer::test_human_request_respond_rejects_non_pending_request",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_human_request_respond_without_approved_defaults_to_reject",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_runtime_human_primitive_uses_injected_provider"
       ],
       "benchmark_attack_classes": []
@@ -262,6 +266,7 @@
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_compileall_requires_approval_because_it_writes_artifacts",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_pytest_collect_only_requires_approval_because_collection_executes_project_code",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_request_permission_shell_command_class_is_rule_constrained",
+        "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_deny_rule_overrides_builtin_harmless_allow",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_cannot_override_script_interpreter_risk",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_destructive_command_is_denied_even_with_always_allow_policy",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_medium_project_code_execution_requires_approval"
@@ -462,6 +467,7 @@
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_skill_uses_activation_snapshot_after_registry_replace",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_jit_skill_validation_uses_broker_resource_limits_once",
         "tests/self_evolution/test_swe_agent_skill.py::TestSWEAgentSkill::test_swe_agent_skill_registers_and_loads_without_granting_resource_authority",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_skill_register_without_actor_rejects_host_path",
         "tests/providers/test_gui_server.py::TestGuiServer::test_skill_register_actor_mode_requires_skill_write_capability"
       ],
       "benchmark_attack_classes": ["self_evolution_skill"]
@@ -472,6 +478,8 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_untrusted_module_is_rejected",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_trust_binds_manifest_contents",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_entrypoint_cannot_access_runtime_before_preflight",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_configured_startup_module_paths_resolve_from_project_root_not_cwd",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_source_hash_mismatch_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_source_swap_after_trust_does_not_execute_swapped_bytes",
@@ -508,6 +516,7 @@
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_refuses_while_scheduler_quantum_is_active",
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_runs_release_finalizers_for_deleted_scoped_objects",
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_does_not_release_finalizers_for_restored_live_objects",
+        "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_rolls_back_rows_and_payloads_when_insert_fails",
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_does_not_replace_current_image_without_image_write",
         "tests/self_evolution/test_checkpoint_jit.py::TestCheckpointJit::test_checkpoint_restore_prunes_post_checkpoint_ephemeral_jit_tool",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
@@ -591,6 +600,7 @@
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_stdio_register_requires_process_spawn_in_actor_mode",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_requires_tool_capability_and_records_effect",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_stdio_call_requires_process_spawn_before_consuming_tool_capability",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_stdio_call_requires_exact_stdio_spawn_before_consuming_tool_capability",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_stdio_call_requires_process_spawn_before_runtime_env_validation",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_stdio_call_requires_process_spawn_before_argument_schema_validation",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_denies_before_loading_server_metadata_without_visibility",
