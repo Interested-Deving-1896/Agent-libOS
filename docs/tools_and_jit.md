@@ -5,7 +5,7 @@ schemas, validation, and model ergonomics. Primitives enforce authority.
 
 Tool visibility is not resource authority. A process can call only tools in its
 process tool table, but filesystem, shell, JSON-RPC, MCP, human, memory, image,
-and process effects are still authorized by the primitive path. `ToolPolicy`
+clock, and process effects are still authorized by the primitive path. `ToolPolicy`
 contains declaration metadata such as `declared_permissions` and
 `declared_confirmation_required`; it is shown in tool specs for humans and UI,
 but it does not grant permissions or approve execution.
@@ -20,7 +20,8 @@ The current built-in tool surface includes tools for:
 - Human I/O: ask questions, output messages, and request permission.
 - Capabilities: list, inspect, delegate, and revoke capabilities owned by the
   current process.
-- Clock: current time and async sleep.
+- Clock: current time and async sleep through `clock:now`/`clock:sleep` read
+  authority.
 - Process lifecycle: fork, spawn, wait, list children, signal, merge memory,
   exec, exit, cwd get/set, and process messages.
 - Context: `compact_process_context` compresses the caller's

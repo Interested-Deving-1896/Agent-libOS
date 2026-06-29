@@ -12,7 +12,7 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import ProcessStatus
+from agent_libos.models import CapabilityRight, ProcessStatus
 from scripts.llm_context_probe import last_tool_result, static_prefix
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -63,6 +63,8 @@ async def run_interleaved_clock_demo(
             image=_RUNTIME_DEFAULTS.default_image_id,
             goal=f"Process B: sleep {offset:.3f}s first, then output the current time {iterations} times.",
         )
+        for pid in (pid_a, pid_b):
+            runtime.capability.grant(pid, "clock:*", [CapabilityRight.READ], issued_by="script")
         client.configure(
             pid_a,
             label="A",

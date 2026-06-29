@@ -361,6 +361,7 @@ class TestProcessMessage:
         runtime.llm.client = client
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='handle normal messages')
+            runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
             runtime.messages.post(sender='test', recipient_pid=pid, kind=ProcessMessageKind.NORMAL, subject='later', body='read after current tool')
             result = runtime.run_process_once(pid)
             assert result['action']['action'] == 'get_current_time'

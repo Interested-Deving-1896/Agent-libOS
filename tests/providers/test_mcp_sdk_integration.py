@@ -28,6 +28,7 @@ class TestMcpSdkIntegration:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio integration")
             runtime.mcp.register_server(_server_spec("stdio-it", sys.executable, [str(server_path)]), actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp:stdio-it:echo", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
             result = runtime.mcp.call_tool(pid, "stdio-it", "echo", {"text": "hello"})
 
@@ -56,6 +57,7 @@ class TestMcpSdkIntegration:
             spec["tools"] = [_tool_spec(tool_id="envcwd", mcp_name="demo.envcwd")]
             runtime.mcp.register_server(spec, actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp:stdio-env-it:envcwd", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
             result = runtime.mcp.call_tool(pid, "stdio-env-it", "envcwd", {})
 

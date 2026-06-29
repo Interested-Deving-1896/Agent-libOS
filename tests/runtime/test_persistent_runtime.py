@@ -3,7 +3,7 @@ import pytest
 import tempfile
 from pathlib import Path
 from agent_libos import Runtime
-from agent_libos.models import ToolHandle, ToolSpec
+from agent_libos.models import CapabilityRight, ToolHandle, ToolSpec
 from tests.support.deno import COUNT_CHARS_SOURCE
 
 class TestPersistentRuntime:
@@ -14,6 +14,7 @@ class TestPersistentRuntime:
             runtime = Runtime.open(db_path)
             try:
                 pid = runtime.process.spawn(image='review-agent:v0', goal='persistent tool table')
+                runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
                 tool_id = runtime.process.get(pid).tool_table['get_current_time']
                 assert runtime.tools.call(pid, 'get_current_time', {}).ok
             finally:

@@ -53,6 +53,30 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_stdio_register_requires_process_spawn_in_actor_mode(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            actor = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio register")
+            runtime.capability.grant(actor, "mcp_server:stdio-register", [CapabilityRight.WRITE], issued_by="test")
+
+            with pytest.raises(CapabilityDenied, match="process:spawn"):
+                runtime.mcp.register_server_from_yaml_text(
+                    _stdio_manifest("stdio-register"),
+                    actor=actor,
+                    require_capability=True,
+                )
+
+            runtime.capability.grant(actor, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
+            registered = runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("stdio-register"),
+                actor=actor,
+                require_capability=True,
+            )
+
+            assert registered["server_id"] == "stdio-register"
+        finally:
+            runtime.close()
+
     def test_call_requires_tool_capability_and_records_effect(self) -> None:
         runtime = Runtime.open("local")
         provider = _RecordingMcpProvider()
@@ -65,6 +89,7 @@ class TestMcpPrimitive:
                 runtime.mcp.call_tool(pid, "demo", "echo", {"text": "hello"})
 
             runtime.capability.grant(pid, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             result = runtime.mcp.call_tool(pid, "demo", "echo", {"text": "hello"})
 
             assert result.ok
@@ -80,6 +105,66 @@ class TestMcpPrimitive:
             assert effect.rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
             assert not effect.state_mutation
             assert effect.information_flow
+        finally:
+            runtime.close()
+
+    def test_stdio_call_requires_process_spawn_before_consuming_tool_capability(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio spawn authority")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("stdio-spawn"), actor="cli", require_capability=False)
+            cap = runtime.capability.grant_once(pid, "mcp:stdio-spawn:echo", [CapabilityRight.READ], issued_by="test")
+
+            with pytest.raises(CapabilityDenied, match="process:spawn"):
+                runtime.mcp.call_tool(pid, "stdio-spawn", "echo", {"text": "hello"})
+
+            assert provider.list_calls == []
+            assert provider.call_args == []
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_stdio_call_requires_process_spawn_before_runtime_env_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        monkeypatch.delenv("AGENT_LIBOS_MCP_REVIEW_MISSING", raising=False)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio env authority")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("stdio-env-spawn", env_source="AGENT_LIBOS_MCP_REVIEW_MISSING"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(pid, "mcp:stdio-env-spawn:echo", [CapabilityRight.READ], issued_by="test")
+
+            with pytest.raises(CapabilityDenied, match="process:spawn"):
+                runtime.mcp.call_tool(pid, "stdio-env-spawn", "echo", {"text": "hello"})
+
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            runtime.close()
+
+    def test_stdio_call_requires_process_spawn_before_argument_schema_validation(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp stdio schema authority")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("stdio-schema-spawn"), actor="cli", require_capability=False)
+            runtime.capability.grant(pid, "mcp:stdio-schema-spawn:echo", [CapabilityRight.READ], issued_by="test")
+
+            with pytest.raises(CapabilityDenied, match="process:spawn"):
+                runtime.mcp.call_tool(pid, "stdio-schema-spawn", "echo", {"unexpected": "secret"})
+
+            assert provider.list_calls == []
+            assert provider.call_args == []
         finally:
             runtime.close()
 
@@ -150,6 +235,7 @@ class TestMcpPrimitive:
                     ]
                 },
             )
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
             result = runtime.mcp.call_tool(pid, "scoped-visibility", "echo", arguments)
 
@@ -168,6 +254,7 @@ class TestMcpPrimitive:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp schema mismatch")
             runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
             cap = runtime.capability.grant_once(pid, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
             with pytest.raises(ValidationError, match="schema changed"):
                 runtime.mcp.call_tool(pid, "demo", "echo", {"text": "hello"})
@@ -286,6 +373,7 @@ class TestMcpPrimitive:
 
             assert provider.list_calls == []
             runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.EXECUTE], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             result = runtime.mcp.list_tools("demo", actor=pid, refresh=True)
 
             assert result["refreshed"] is True
@@ -310,6 +398,7 @@ class TestMcpPrimitive:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp failed live list")
             runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ, CapabilityRight.EXECUTE], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
             with pytest.raises(RuntimeError, match="tools/list failed"):
                 runtime.mcp.list_tools("demo", actor=pid, refresh=True)
@@ -355,6 +444,7 @@ class TestMcpPrimitive:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp live classifier")
             runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ, CapabilityRight.EXECUTE], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
             with pytest.raises(ValueError, match="unsupported"):
                 runtime.mcp.list_tools("demo", actor=pid, refresh=True)
@@ -380,6 +470,7 @@ class TestMcpPrimitive:
                 asyncio.run(session.handle("mcp.call", {"server_id": "demo", "tool_id": "echo", "arguments": {}}))
 
             runtime.capability.grant(pid, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             result = asyncio.run(
                 session.handle("mcp.call", {"server_id": "demo", "tool_id": "echo", "arguments": {"text": "ok"}})
             )
@@ -396,6 +487,7 @@ class TestMcpPrimitive:
             caller = runtime.process.spawn(image="base-agent:v0", goal="mcp caller")
             runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
             runtime.capability.grant(actor, "mcp_server:demo", [CapabilityRight.ADMIN], issued_by="test")
+            runtime.capability.grant(actor, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             tool_cap = runtime.capability.grant(caller, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
 
             runtime.mcp.register_server_from_yaml_text(
@@ -418,6 +510,7 @@ class TestMcpPrimitive:
             caller = runtime.process.spawn(image="base-agent:v0", goal="mcp caller")
             runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
             runtime.capability.grant(actor, "mcp_server:demo", [CapabilityRight.ADMIN], issued_by="test")
+            runtime.capability.grant(actor, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             runtime.capability.grant(caller, "mcp:demo:echo", [CapabilityRight.READ], issued_by="test")
 
             def fail_disable(*_args: Any, **_kwargs: Any) -> None:
@@ -445,6 +538,7 @@ class TestMcpPrimitive:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp checkpoint")
             runtime.mcp.register_server_from_yaml_text(_stdio_manifest("ckpt"), actor="cli", require_capability=False)
             runtime.capability.grant(pid, "mcp:ckpt:echo", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             checkpoint_id = runtime.checkpoint.create(pid, "before mcp", actor=pid)
             runtime.mcp.call_tool(pid, "ckpt", "echo", {"text": "after"})
             runtime.mcp.unregister_server("ckpt", actor="cli", require_capability=False)

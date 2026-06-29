@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import threading
 import time
+from contextlib import contextmanager
 from collections.abc import Awaitable, Callable
 from concurrent.futures import FIRST_COMPLETED, CancelledError as FutureCancelledError, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.utils.ids import utc_now
 from agent_libos.models import ProcessStatus, ResourceUsage
-from agent_libos.models.exceptions import ResourceLimitExceeded
+from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.storage import RuntimeStore
 
@@ -82,6 +83,23 @@ class AsyncProcessScheduler:
 
     def _is_schedulable(self, pid: str) -> bool:
         return self._skip_pid is None or not self._skip_pid(pid)
+
+    @contextmanager
+    def quiescent_state(self, *, reason: str):
+        acquired = self._run_lock.acquire(blocking=False)
+        if not acquired:
+            raise ValidationError(f"{reason} refused while scheduler is running")
+        try:
+            active = self.active_pids()
+            if active:
+                raise ValidationError(f"{reason} refused while scheduler futures are active: {', '.join(active)}")
+            yield
+        finally:
+            self._run_lock.release()
+
+    def active_pids(self) -> list[str]:
+        with self._futures_lock:
+            return sorted({pid for future, pid in self._futures.items() if not future.done()})
 
     async def arun_once(self, quantum: Quantum) -> Any:
         return await asyncio.to_thread(self.run_once, quantum)

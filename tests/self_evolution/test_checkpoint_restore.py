@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -209,6 +210,95 @@ class TestCheckpointRestore:
             runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
             assert inspected['processes'][0]['status'] == ProcessStatus.RUNNABLE.value
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_restore_refuses_while_scheduler_quantum_is_active(self) -> None:
+        runtime = Runtime.open('local')
+        resume = threading.Event()
+        entered = threading.Event()
+        errors: list[BaseException] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='active restore')
+            checkpoint_id = runtime.checkpoint.create(pid, 'before active quantum', actor=pid)
+
+            def quantum(selected_pid: str) -> dict[str, object]:
+                entered.set()
+                assert selected_pid == pid
+                assert resume.wait(timeout=5)
+                return {'ok': True}
+
+            def run_scheduler() -> None:
+                try:
+                    runtime.scheduler.run_pid_until_idle(pid, quantum, max_quanta=1)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=run_scheduler)
+            thread.start()
+            assert entered.wait(timeout=5)
+
+            with pytest.raises(ValidationError, match='scheduler is running'):
+                runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            resume.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            assert errors == []
+        finally:
+            resume.set()
+            runtime.close()
+
+    def test_restore_runs_release_finalizers_for_deleted_scoped_objects(self) -> None:
+        runtime = Runtime.open('local')
+        calls: list[tuple[str, str, str]] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore finalizer')
+            checkpoint_id = runtime.checkpoint.create(pid, 'before temporary object', actor=pid)
+            handle = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'temp': True},
+                ObjectMetadata(title='temp'),
+                immutable=False,
+                name='temp',
+            )
+            runtime.memory.bind_object_release_finalizer(
+                lambda obj, actor, reason: calls.append((obj.oid, actor, reason))
+            )
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert (handle.oid, 'checkpoint.restore', 'checkpoint_restore') in calls
+            with pytest.raises(Exception):
+                runtime.memory.get_object_by_name(pid, 'temp')
+        finally:
+            runtime.close()
+
+    def test_restore_does_not_release_finalizers_for_restored_live_objects(self) -> None:
+        runtime = Runtime.open('local')
+        calls: list[tuple[str, str, str]] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore keeps object')
+            handle = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'keep': True},
+                ObjectMetadata(title='keep'),
+                immutable=False,
+                name='keep',
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'after persistent object', actor=pid)
+            runtime.memory.bind_object_release_finalizer(
+                lambda obj, actor, reason: calls.append((obj.oid, actor, reason))
+            )
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert calls == []
+            assert runtime.store.get_object(handle.oid) is not None
+            restored = runtime.memory.get_object_by_name(pid, 'keep')
+            assert restored.oid == handle.oid
         finally:
             runtime.close()
 

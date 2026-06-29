@@ -66,6 +66,7 @@ class TestPostgresStore:
             try:
                 pid = runtime.process.spawn(goal="postgres store smoke")
                 runtime.capability.grant(pid, "filesystem:workspace:*", [CapabilityRight.READ], issued_by="test")
+                runtime.capability.grant(pid, "clock:now", [CapabilityRight.READ], issued_by="test")
                 runtime.messages.post(sender="human:owner", recipient_pid=pid, subject="hello", body="postgres")
 
                 endpoint = JsonRpcEndpointSpec(

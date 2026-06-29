@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -3466,6 +3467,13 @@ class SQLRuntimeStore:
         )
 
 
+class _SQLiteRuntimeLease:
+    def __init__(self, handle: Any, path: Path, *, unlink_on_release: bool) -> None:
+        self.handle = handle
+        self.path = path
+        self.unlink_on_release = unlink_on_release
+
+
 class SQLiteStore(SQLRuntimeStore):
     """SQLite runtime store backend.
 
@@ -3494,10 +3502,17 @@ class SQLiteStore(SQLRuntimeStore):
         finally:
             self._release_runtime_lease()
 
-    def _acquire_runtime_lease(self, db_path: Path) -> Any | None:
-        if fcntl is None:
-            return None
+    def _acquire_runtime_lease(self, db_path: Path) -> _SQLiteRuntimeLease:
         lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        if fcntl is None:
+            try:
+                fd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError as exc:
+                raise ValidationError(f"runtime store is already open: {db_path}") from exc
+            handle = os.fdopen(fd, "w")
+            handle.write(f"{utc_now()}\n{os.getpid()}\n")
+            handle.flush()
+            return _SQLiteRuntimeLease(handle, lease_path, unlink_on_release=True)
         handle = lease_path.open("a+")
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3508,16 +3523,22 @@ class SQLiteStore(SQLRuntimeStore):
         handle.truncate()
         handle.write(utc_now())
         handle.flush()
-        return handle
+        return _SQLiteRuntimeLease(handle, lease_path, unlink_on_release=False)
 
     def _release_runtime_lease(self) -> None:
-        handle = getattr(self, "_lease_handle", None)
-        if handle is None:
+        lease = getattr(self, "_lease_handle", None)
+        if lease is None:
             return
         self._lease_handle = None
-        if fcntl is not None:
+        handle = lease.handle
+        if fcntl is not None and not lease.unlink_on_release:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
         handle.close()
+        if lease.unlink_on_release:
+            try:
+                os.unlink(lease.path)
+            except FileNotFoundError:
+                pass

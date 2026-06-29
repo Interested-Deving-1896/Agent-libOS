@@ -72,9 +72,9 @@ uv run agent-libos-gui-server --db .agent_libos.sqlite --port 0
 
 The GUI server accepts the same runtime store targets as the CLI. SQLite paths
 are the default local store; PostgreSQL DSNs require installing the `postgres`
-extra and are redacted in startup and health payloads. File-backed SQLite
-stores use an active-runtime lease, so a GUI server and a writable CLI Runtime
-cannot open the same SQLite database concurrently.
+extra and are redacted in startup and health payloads. Persistent stores use an
+active-runtime lease, so a GUI server and a writable CLI Runtime cannot open
+the same SQLite or PostgreSQL database concurrently.
 
 The server prints one JSON line containing the selected local URL and bearer
 token:
@@ -178,6 +178,9 @@ Process snapshots include `resource_budget`, `resource_usage`, and
 `resource_remaining` so the GUI can show quota state without treating it as a
 Capability grant. Budget exhaustion is still enforced by the runtime and
 providers, not by renderer visibility.
+Snapshot payloads keep field shapes stable when bounding large values: long
+strings are returned as truncated strings, and truncation metadata is reported
+under the snapshot-level `_truncated` map.
 
 ## High-Risk Operations
 
@@ -205,7 +208,9 @@ host file path; file/path based registration remains a CLI/admin workflow.
 
 Image package registration follows the same rule. Electron may read a package
 directory selected by the user and pass bounded package file payloads to the
-local GUI server, but the server rejects host file paths. Registering or
+local GUI server, but the server rejects host file paths. The default GUI
+request body limit is sized to carry the Electron 16 MiB raw package-file
+limit after base64 and JSON wrapping. Registering or
 committing an image changes image visibility and baked internal runtime state
 only; it does not grant the target image's declared capabilities. Package
 workspace grants apply only to the private materialized copy declared by the

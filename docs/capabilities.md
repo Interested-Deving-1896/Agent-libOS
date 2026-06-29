@@ -73,6 +73,7 @@ Important resource conventions include:
 - `shell:<executable>` for direct command authority; `shell:*` for shell
   policy records when paired with `shell_policy_level`.
 - `human:<name>` for human output, questions, and approvals.
+- `clock:now`, `clock:sleep`, and `clock:*` for clock reads and bounded sleep.
 - `object:<oid>` for Object Memory content.
 - `object_namespace:<namespace>` for Object Memory namespace listing and name
   lookup.
@@ -344,6 +345,11 @@ that manifest-declared tool, subject to argument schema validation, live tool
 schema checks, runtime DNS/secret policy for HTTP transports, provider
 classification, audit, and external-effect recording. MCP Resources and
 Prompts are not exposed in v1.
+
+For `stdio` MCP transports, actor-mode server registration, live tool refresh,
+and tool calls additionally require `process:spawn` `write`, because those
+operations can start a local child process. Host/admin paths that explicitly
+bypass actor capability checks remain audited host operations.
 
 ## Filesystem Authority
 

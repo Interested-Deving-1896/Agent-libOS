@@ -35,6 +35,14 @@ def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
     runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
 
 
+def _grant_delegable_clock_sleep(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(pid, "clock:sleep", [CapabilityRight.READ], issued_by="test", delegable=True)
+
+
+def _inherit_clock_sleep() -> list[dict[str, object]]:
+    return [{"resource": "clock:sleep", "rights": [CapabilityRight.READ.value]}]
+
+
 class EmptyArgs(BaseModel):
     pass
 
@@ -345,9 +353,17 @@ class TestObjectTasks:
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
             _grant_process_spawn(runtime, parent)
+            _grant_delegable_clock_sleep(runtime, parent)
             child = runtime.spawn_child_process(parent, "notify me")
             owner = _owner(runtime, parent)
-            task = runtime.object_tasks.start(parent, owner, "sleep", {"seconds": 0.05}, notify_pid=child)
+            task = runtime.object_tasks.start(
+                parent,
+                owner,
+                "sleep",
+                {"seconds": 0.05},
+                notify_pid=child,
+                inherit_capabilities=_inherit_clock_sleep(),
+            )
             runtime.process.exit(child, message="done")
 
             completed = runtime.object_tasks.wait(task.task_id, actor_pid=parent, timeout=2)
@@ -764,6 +780,7 @@ class TestObjectTasks:
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="owner exits")
             _grant_process_spawn(runtime, pid)
+            _grant_delegable_clock_sleep(runtime, pid)
             owner = _owner(runtime, pid)
             result = runtime.memory.create_object(
                 pid,
@@ -771,7 +788,13 @@ class TestObjectTasks:
                 {"kept": True},
                 metadata=ObjectMetadata(title="result"),
             )
-            task = runtime.object_tasks.start(pid, owner, "sleep", {"seconds": 0.05})
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "sleep",
+                {"seconds": 0.05},
+                inherit_capabilities=_inherit_clock_sleep(),
+            )
             runtime.process.exit(pid, result=result, message="creator exited")
 
             assert runtime.store.get_object(owner.oid) is not None

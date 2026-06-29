@@ -89,11 +89,14 @@ def _bounded_gui_value(
     if isinstance(jsonable, str):
         if len(jsonable) <= string_limit:
             return jsonable
-        return {
-            "truncated": True,
-            "chars": len(jsonable),
-            "preview": jsonable[:string_limit],
-        }
+        if truncated is not None:
+            truncated[path] = {
+                "kind": "string",
+                "returned": string_limit,
+                "chars": len(jsonable),
+                "omitted": len(jsonable) - string_limit,
+            }
+        return jsonable[:string_limit]
     if isinstance(jsonable, list):
         selected = [
             _bounded_gui_value(

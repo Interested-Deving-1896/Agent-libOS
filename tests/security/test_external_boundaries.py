@@ -92,6 +92,50 @@ class TestExternalBoundary:
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
         assert 'human.output' in self._audit_actions()
 
+    def test_human_output_does_not_write_provider_when_effect_commit_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='human effect failure')
+        cap = self.runtime.capability.grant_once(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+
+        def fail_insert_external_effect(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError('external effect unavailable')
+
+        monkeypatch.setattr(self.runtime.store, 'insert_external_effect', fail_insert_external_effect)
+
+        result = self.runtime.tools.call(pid, 'human_output', {'message': 'not visible'})
+
+        assert not result.ok
+        assert 'failed during execution' in (result.error or '')
+        assert self.human_output == []
+        assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.PENDING
+        assert self.runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+        assert 'human.output' not in self._audit_actions()
+
+    def test_human_output_visible_write_is_not_left_pending_if_final_status_update_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='human final update failure')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+        original_update = self.runtime.store.update_human_request
+        calls = 0
+
+        def fail_second_update(request: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError('late update failed')
+            original_update(request)
+
+        monkeypatch.setattr(self.runtime.store, 'update_human_request', fail_second_update)
+
+        result = self.runtime.tools.call(pid, 'human_output', {'message': 'visible'})
+
+        assert result.ok, result.error
+        assert self.human_output == ['visible']
+        assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
+        assert 'human.output' in self._audit_actions()
+        assert [item for item in self.runtime.store.list_external_effects() if item.provider == 'human']
+
     def test_human_output_preserves_non_terminal_channel_in_observability(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='speak on gui channel')
         self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')

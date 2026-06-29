@@ -112,6 +112,7 @@ class Runtime:
         self.messages = ProcessMessageManager(store, self.audit, self.events, config=self.config)
         self.human.bind_messages(self.messages)
         self.clock = ClockPrimitive(
+            self.capability,
             self.audit,
             self.events,
             max_sleep_seconds=self.config.tools.max_sleep_seconds,

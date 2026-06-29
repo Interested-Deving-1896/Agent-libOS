@@ -366,8 +366,15 @@ class TestGuiServer:
         serialized = json.dumps(snapshot)
         assert huge not in serialized
         event = snapshot['events'][-1]
-        assert event['payload']['blob']['truncated'] is True
-        assert len(event['payload']['blob']['preview']) == self.server.service.runtime.config.gui.snapshot_string_max_chars
+        assert isinstance(event['payload']['blob'], str)
+        assert len(event['payload']['blob']) == self.server.service.runtime.config.gui.snapshot_string_max_chars
+        truncation = {
+            path: meta
+            for path, meta in snapshot['_truncated'].items()
+            if path.endswith('.payload.blob')
+        }
+        assert list(truncation.values())[0]['kind'] == 'string'
+        assert list(truncation.values())[0]['chars'] == len(huge)
 
     def test_snapshot_array_truncation_uses_metadata_not_sentinel_items(self) -> None:
         self.server.service.runtime.config = replace(
@@ -1060,6 +1067,21 @@ class TestGuiServer:
             [CapabilityRight.WRITE],
             issued_by='test',
         )
+        spawn_status, spawn_denied = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': manifest, 'actor': pid, 'confirmed': True},
+        )
+
+        assert spawn_status == 403
+        assert 'process:spawn' in spawn_denied['error']['message']
+
+        self.server.service.runtime.capability.grant(
+            pid,
+            'process:spawn',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
         register_status, registered = self.request(
             'POST',
             '/api/mcp/register',
@@ -1192,7 +1214,11 @@ class TestGuiServer:
         assert runtime.process.get(pid).status == ProcessStatus.PAUSED
 
     def test_request_body_size_is_bounded(self) -> None:
-        status, body = self.request('POST', '/api/processes', {'goal': 'x' * 1100000})
+        self.server.service.runtime.config = replace(
+            self.server.service.runtime.config,
+            gui=replace(self.server.service.runtime.config.gui, request_body_max_bytes=1024),
+        )
+        status, body = self.request('POST', '/api/processes', {'goal': 'x' * 1100})
         assert status == 413
         assert 'exceeds' in body['error']['message']
 

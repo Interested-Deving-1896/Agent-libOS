@@ -221,9 +221,10 @@ checkpoints, and registered tools/images/skills are durable store records.
 Ordinary Object Memory payloads remain runtime-only; the object table stores a
 runtime-memory marker, and rows whose payload cache cannot be reconstructed are
 released fail-closed on reopen instead of being treated as real payloads.
-File-backed SQLite stores take an active-runtime lease, so two writable
-`Runtime` instances cannot concurrently open the same store. Closing the first
-runtime releases the lease and permits a later reopen.
+Persistent stores take an active-runtime lease: SQLite uses a lock file, and
+PostgreSQL uses a session advisory lock. Two writable `Runtime` instances
+cannot concurrently open the same store. Closing the first runtime releases the
+lease and permits a later reopen.
 
 Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
 you want a bounded run.

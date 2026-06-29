@@ -259,42 +259,56 @@ class CheckpointManager:
         *,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
-        if require_capability:
-            self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
-        self._require_snapshot_modules(snapshot)
-        current_pids = self._subtree_pids(checkpoint.pid)
-        snapshot_pids = list(snapshot.get("subtree_pids", []))
-        self._reject_active_object_tasks_for_restore(snapshot, current_pids)
-        self._validate_snapshot_restore_assets(snapshot)
-        if require_capability:
-            self._require_snapshot_image_restore_rights(actor, snapshot, overwrite_existing=True)
-        stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(snapshot, current_pids)
-        external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
-        external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
-        external_effect_summary = self._external_effect_summary_since(checkpoint, pids=external_effect_pids)
-        cancelled_human_requests, superseded_messages = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
-        self._restore_images(snapshot)
-        self._restore_jit_sources(snapshot)
-        self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=set(snapshot_pids) | set(current_pids))
-        self.events.emit(
-            EventType.ROLLBACK,
-            source=actor,
-            target=checkpoint.pid,
-            payload={
+        with self._runtime_quiescent_for_restore():
+            checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+            if require_capability:
+                self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
+            self._require_snapshot_modules(snapshot)
+            current_pids = self._subtree_pids(checkpoint.pid)
+            snapshot_pids = list(snapshot.get("subtree_pids", []))
+            self._reject_active_object_tasks_for_restore(snapshot, current_pids)
+            self._validate_snapshot_restore_assets(snapshot)
+            if require_capability:
+                self._require_snapshot_image_restore_rights(actor, snapshot, overwrite_existing=True)
+            stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(snapshot, current_pids)
+            external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
+            external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
+            external_effect_summary = self._external_effect_summary_since(checkpoint, pids=external_effect_pids)
+            cancelled_human_requests, superseded_messages = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
+            self._restore_images(snapshot)
+            self._restore_jit_sources(snapshot)
+            self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=set(snapshot_pids) | set(current_pids))
+            self.events.emit(
+                EventType.ROLLBACK,
+                source=actor,
+                target=checkpoint.pid,
+                payload={
+                    "checkpoint_id": checkpoint_id,
+                    "restored_pids": snapshot_pids,
+                    "external_effects_since_checkpoint": len(external_effects),
+                    "external_effect_summary": external_effect_summary,
+                    "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
+                },
+            )
+            self.audit.record(
+                actor=actor,
+                action="checkpoint.restore",
+                target=self.checkpoint_resource(checkpoint_id),
+                decision={
+                    "restored_for": checkpoint.pid,
+                    "restored_pids": snapshot_pids,
+                    "previous_pids": current_pids,
+                    "cancelled_human_requests": cancelled_human_requests,
+                    "superseded_messages": superseded_messages,
+                    "external_effects_since_checkpoint": external_effects,
+                    "external_effect_summary": external_effect_summary,
+                    "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
+                },
+            )
+            return {
                 "checkpoint_id": checkpoint_id,
-                "restored_pids": snapshot_pids,
-                "external_effects_since_checkpoint": len(external_effects),
-                "external_effect_summary": external_effect_summary,
-                "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
-            },
-        )
-        self.audit.record(
-            actor=actor,
-            action="checkpoint.restore",
-            target=self.checkpoint_resource(checkpoint_id),
-            decision={
-                "restored_for": checkpoint.pid,
+                "pid": checkpoint.pid,
+                "status": "restored",
                 "restored_pids": snapshot_pids,
                 "previous_pids": current_pids,
                 "cancelled_human_requests": cancelled_human_requests,
@@ -302,20 +316,7 @@ class CheckpointManager:
                 "external_effects_since_checkpoint": external_effects,
                 "external_effect_summary": external_effect_summary,
                 "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
-            },
-        )
-        return {
-            "checkpoint_id": checkpoint_id,
-            "pid": checkpoint.pid,
-            "status": "restored",
-            "restored_pids": snapshot_pids,
-            "previous_pids": current_pids,
-            "cancelled_human_requests": cancelled_human_requests,
-            "superseded_messages": superseded_messages,
-            "external_effects_since_checkpoint": external_effects,
-            "external_effect_summary": external_effect_summary,
-            "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
-        }
+            }
 
     def rollback(self, pid: str, checkpoint_id: str) -> dict[str, Any]:
         return self.restore(pid, checkpoint_id, require_capability=False)
@@ -483,6 +484,13 @@ class CheckpointManager:
         if missing:
             raise ValidationError(f"checkpoint requires startup modules that are not loaded: {missing}")
 
+    def _runtime_quiescent_for_restore(self):
+        scheduler = getattr(self.runtime, "scheduler", None) if self.runtime is not None else None
+        quiescent_state = getattr(scheduler, "quiescent_state", None)
+        if callable(quiescent_state):
+            return quiescent_state(reason="checkpoint restore")
+        return _NullContext()
+
     def _reject_active_object_tasks_for_restore(self, snapshot: dict[str, Any], current_pids: list[str]) -> None:
         scoped_pids = set(current_pids) | {str(pid) for pid in snapshot.get("subtree_pids", [])}
         scoped_oids = set(self._current_scoped_object_oids(current_pids)) | {str(oid) for oid in snapshot.get("object_oids", [])}
@@ -509,9 +517,16 @@ class CheckpointManager:
         checkpoint: Checkpoint,
     ) -> tuple[list[str], list[str]]:
         rows = snapshot["rows"]
-        object_oids = set(snapshot.get("object_oids", [])) | set(self._current_scoped_object_oids(current_pids))
+        snapshot_object_oids = {str(oid) for oid in snapshot.get("object_oids", [])}
+        current_object_oids = set(self._current_scoped_object_oids(current_pids))
+        object_oids = snapshot_object_oids | current_object_oids
         namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
         restored_capability_rows = self._filtered_restored_capability_rows(rows.get("capabilities", []))
+        self._run_object_release_finalizers(
+            current_object_oids - snapshot_object_oids,
+            actor="checkpoint.restore",
+            reason="checkpoint_restore",
+        )
         with self.store.transaction(include_object_payloads=True) as cur:
             # Pending human/message state belongs to the same reconstructable
             # restore boundary as process rows. If a later insert fails, these
@@ -844,6 +859,7 @@ class CheckpointManager:
         pids = list(remapped["pid_map"].values())
         object_oids = set(remapped["object_map"].values())
         fork_namespaces = self._fork_inserted_namespaces(remapped)
+        self._run_object_release_finalizers(object_oids, actor="checkpoint.fork", reason="checkpoint_fork_rollback")
         with self.store.transaction(include_object_payloads=True) as cur:
             self._delete_object_links(cur, object_oids)
             self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
@@ -1451,6 +1467,18 @@ class CheckpointManager:
             [*object_oids, *object_oids],
         )
 
+    def _run_object_release_finalizers(self, object_oids: set[str], *, actor: str, reason: str) -> None:
+        if not object_oids or self.runtime is None:
+            return
+        memory = getattr(self.runtime, "memory", None)
+        run_finalizers = getattr(memory, "_run_object_release_finalizers", None)
+        if not callable(run_finalizers):
+            return
+        for oid in sorted(object_oids):
+            obj = self.store.get_object(oid)
+            if obj is not None:
+                run_finalizers(obj, actor, reason)
+
     def _delete_object_capabilities(self, cur: Any, object_oids: set[str]) -> None:
         if not object_oids:
             return
@@ -1617,6 +1645,7 @@ class CheckpointManager:
         namespace_map: dict[str, str],
     ) -> dict[str, Any]:
         item = dict(row)
+        original_created_by = str(item.get("created_by") or "")
         item["oid"] = object_map[item["oid"]]
         item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
         if item.get("created_by") in pid_map:
@@ -1624,6 +1653,10 @@ class CheckpointManager:
         if item.get("owner_kind") in {ObjectOwnerKind.PROCESS.value, ObjectOwnerKind.PROCESS_RESULT.value}:
             if item.get("owner_id") in pid_map:
                 item["owner_id"] = pid_map[item["owner_id"]]
+        elif item.get("owner_kind") == ObjectOwnerKind.OBJECT_TASK.value:
+            if original_created_by in pid_map:
+                item["owner_kind"] = ObjectOwnerKind.PROCESS_RESULT.value
+                item["owner_id"] = pid_map[original_created_by]
         elif item.get("owner_kind") is None:
             item["owner_kind"] = ObjectOwnerKind.PROCESS.value
             item["owner_id"] = pid_map.get(str(item.get("created_by")), item.get("created_by"))
@@ -1696,3 +1729,11 @@ class CheckpointManager:
         item["created_at"] = utc_now()
         item["updated_at"] = utc_now()
         return item
+
+
+class _NullContext:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return False

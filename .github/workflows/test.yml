@@ -53,6 +53,9 @@ jobs:
             runtime)
               cmd+=(--max-lane-seconds 900)
               ;;
+            self-evolution)
+              cmd+=(-n 4 --max-lane-seconds 900)
+              ;;
             providers)
               cmd+=(-n 4 --dist worksteal --max-lane-seconds 900)
               ;;

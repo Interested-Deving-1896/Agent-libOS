@@ -496,7 +496,13 @@ class HumanObjectManager:
         except Exception:
             self._restore_one_time_decision(reserved_capability_id)
             raise
-        delivered = self._deliver_output_request(request)
+        try:
+            delivered = self._deliver_output_request(request)
+        except Exception:
+            latest = self.store.get_human_request(request.request_id)
+            if latest is None or latest.status == HumanRequestStatus.PENDING:
+                self._restore_one_time_decision(reserved_capability_id)
+            raise
         return {
             "delivered": True,
             "request_id": delivered.request_id,
@@ -1045,36 +1051,60 @@ class HumanObjectManager:
         channel = str(request.payload.get("channel", self.config.runtime.terminal_channel))
         effect_context = {"channel": channel, "chars": len(message), "request_id": request.request_id}
         require_external_effect_classifier(self.provider, "write")
-        self.provider.write(message)
         request.status = HumanRequestStatus.DELIVERED
-        request.decision = {"delivered": True}
+        request.decision = {"delivery_committed": True}
         request.updated_at = utc_now()
-        self.store.update_human_request(request)
         resource = f"human:{request.human}"
-        event = self.events.emit(
-            EventType.HUMAN_OUTPUT,
-            source=request.pid,
-            target=resource,
-            payload={"request_id": request.request_id, "channel": channel, "chars": len(message)},
-        )
-        audit_record = self.audit.record(
-            actor=request.pid,
-            action="human.output",
-            target=resource,
-            decision={"request_id": request.request_id, "channel": channel, "chars": len(message), "queued": True},
-        )
-        classification = classify_external_effect(self.provider, "write", effect_context, {"delivered": True})
-        record_external_effect(
-            self.store,
-            pid=request.pid,
-            provider="human",
-            operation="write",
-            target=resource,
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={"context": effect_context, "result": {"delivered": True}},
-        )
+        with self.store.transaction():
+            self.store.update_human_request(request)
+            event = self.events.emit(
+                EventType.HUMAN_OUTPUT,
+                source=request.pid,
+                target=resource,
+                payload={"request_id": request.request_id, "channel": channel, "chars": len(message)},
+            )
+            audit_record = self.audit.record(
+                actor=request.pid,
+                action="human.output",
+                target=resource,
+                decision={
+                    "request_id": request.request_id,
+                    "channel": channel,
+                    "chars": len(message),
+                    "delivery_committed": True,
+                },
+            )
+            classification = classify_external_effect(self.provider, "write", effect_context, {"delivery_committed": True})
+            record_external_effect(
+                self.store,
+                pid=request.pid,
+                provider="human",
+                operation="write",
+                target=resource,
+                classification=classification,
+                audit_record=audit_record,
+                event=event,
+                metadata={"context": effect_context, "result": {"delivery_committed": True}},
+            )
+        try:
+            self.provider.write(message)
+        except Exception as exc:
+            request.decision = {
+                "delivery_committed": True,
+                "provider_error": f"{type(exc).__name__}: {exc}",
+            }
+            request.updated_at = utc_now()
+            try:
+                self.store.update_human_request(request)
+            except Exception:
+                pass
+            raise
+        request.decision = {"delivery_committed": True, "delivered": True}
+        request.updated_at = utc_now()
+        try:
+            self.store.update_human_request(request)
+        except Exception:
+            pass
         return request
 
     def _default_message_subject(self, kind: ProcessMessageKind) -> str:

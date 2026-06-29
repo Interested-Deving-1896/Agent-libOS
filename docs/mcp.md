@@ -77,7 +77,9 @@ refresh require server metadata read authority when called by a process.
 `tools/list`, so it also requires `execute` on `mcp_server:<server_id>` and is
 recorded as an MCP external read effect. Host/admin refreshes that bypass
 process capability checks still record the external read attempt under a host
-actor. `call_mcp_tool` requires the right declared by the tool spec on
+actor. For `stdio` servers, actor-mode registration, live tool refresh, and tool
+calls also require `process:spawn` `write` because the provider starts a local
+child process. `call_mcp_tool` requires the right declared by the tool spec on
 `mcp:<server_id>:<tool_id>`.
 For tool calls, the primitive gates on `server_id` and `tool_id` before loading
 server metadata or input schemas. A process without tool invocation authority
@@ -109,7 +111,9 @@ environment-backed header secrets restricted by `mcp.header_env_allowlist`.
 
 stdio transport uses argv, not a shell string. The command must be a single
 argv token; args are separate strings. Environment injection is explicit and
-restricted by `mcp.stdio_env_allowlist`.
+restricted by `mcp.stdio_env_allowlist`. A stdio manifest is still a local
+process-launch surface, so process actors need explicit `process:spawn` `write`
+in addition to MCP server/tool authority.
 
 MCP call arguments and audit context are bounded and sanitized. MCP result
 payloads are JSON-serializable; binary-like content is represented by bounded

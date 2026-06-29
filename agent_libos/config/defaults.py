@@ -59,7 +59,7 @@ class GuiDefaults:
     """
 
     event_buffer_limit: int = 1_000
-    request_body_max_bytes: int = 1_048_576
+    request_body_max_bytes: int = 25_165_824
     scheduler_shutdown_join_timeout_s: float = 2.0
     http_shutdown_delay_s: float = 0.2
     object_task_wait_default_timeout_s: float = 30.0

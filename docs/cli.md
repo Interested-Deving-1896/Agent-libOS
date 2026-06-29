@@ -59,8 +59,9 @@ the same runtime store contract. Ordinary
 Object Memory payloads are runtime-only; SQL object rows store a
 runtime-memory marker, and rows whose live payload cache cannot be reconstructed
 are released fail-closed on reopen.
-File-backed SQLite stores also take an active-runtime lease. A second writable
-Runtime cannot open the same database until the first Runtime closes cleanly.
+Persistent stores also take an active-runtime lease. SQLite uses a lock file,
+and PostgreSQL uses a session advisory lock; a second writable Runtime cannot
+open the same database until the first Runtime closes cleanly.
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it

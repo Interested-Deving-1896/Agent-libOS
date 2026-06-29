@@ -59,6 +59,7 @@ class TestResourceProviderSubstrate:
             runtime = Runtime.open('local', substrate=substrate)
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='use fake clock')
+                runtime.capability.grant(pid, 'clock:*', [CapabilityRight.READ], issued_by='test')
                 now = runtime.tools.call(pid, 'get_current_time', {'timezone': 'UTC'})
                 slept = runtime.tools.call(pid, 'sleep', {'seconds': 0.1})
                 assert now.ok, now.error

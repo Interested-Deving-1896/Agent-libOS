@@ -278,6 +278,7 @@ class TestConfigDefaults:
         assert DEFAULT_CONFIG.runtime.store_backend == 'sqlite'
         assert DEFAULT_CONFIG.runtime.store_dsn is None
         assert DEFAULT_CONFIG.gui.agent_rating_comment_max_chars > 0
+        assert DEFAULT_CONFIG.gui.request_body_max_bytes > (16_777_216 * 4 // 3) + 1_024
 
     def test_runtime_open_accepts_sqlite_uri(self, tmp_path: Path) -> None:
         db = tmp_path / 'uri.sqlite'

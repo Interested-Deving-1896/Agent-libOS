@@ -128,7 +128,9 @@ capabilities. Omitting it runs as an audited admin CLI actor.
 ## Restore
 
 Restore applies at a runtime safe point and is scoped to the checkpoint owner
-subtree. Unrelated processes are not restored.
+subtree. If the scheduler is actively running a quantum or still has active
+futures, restore is rejected and the caller must retry after the runtime is
+quiescent. Unrelated processes are not restored.
 
 All post-checkpoint pending human requests for restored processes are cancelled.
 Post-checkpoint mailbox entries are kept in history but marked as superseded by
@@ -143,8 +145,9 @@ capability state. Other resolved human waits become paused with an explanatory
 status message. This keeps checkpoint state from preserving stale waits whose
 blocking condition has already resolved in the restored snapshot.
 
-The current tool call's result object can still be appended after restore so
-the process receives a coherent action result.
+Scoped Object Memory rows removed by restore run registered release finalizers
+before their rows and payloads are deleted, so host resources such as PTY
+sessions are not orphaned by a destructive restore.
 
 If irreversible provider effects exist after the checkpoint, restore still
 continues by default. The irreversible effects stay in append-only history and
@@ -211,7 +214,9 @@ resource it would reintroduce.
 
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result
-objects by reference.
+objects by reference. Checkpointed ObjectTask result objects are remapped to the
+forked process-result owner boundary rather than pointing back at the original
+task id.
 
 Fork capability copying is checked against current capability state before rows
 are remapped. Revoked or expired capabilities are not copied. If a current

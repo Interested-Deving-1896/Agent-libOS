@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+import agent_libos.storage.sqlite as sqlite_backend
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.storage.factory import _sqlite_target
 from agent_libos.storage.postgres import _PostgresCursor, _PostgresDialect
 from agent_libos.storage import PostgresStore, SQLRuntimeStore, SQLiteStore
@@ -67,6 +71,26 @@ class TestStorageBackendBoundaries:
 
         assert "def _postgres_sql" not in text
         assert "class PostgresStore(SQLRuntimeStore)" in text
+        assert "pg_try_advisory_lock" in text
+        assert "pg_advisory_unlock" in text
+
+    def test_sqlite_runtime_lease_uses_atomic_lockfile_without_fcntl(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(sqlite_backend, "fcntl", None)
+        db_path = tmp_path / "runtime.sqlite"
+        first = SQLiteStore(db_path)
+        try:
+            with pytest.raises(ValidationError, match="already open"):
+                SQLiteStore(db_path)
+        finally:
+            first.close()
+
+        assert not db_path.with_suffix(db_path.suffix + ".runtime.lock").exists()
+        second = SQLiteStore(db_path)
+        second.close()
 
     def test_sqlite_uri_normalizes_posix_absolute_paths(self) -> None:
         assert _sqlite_target("sqlite:////tmp/agent-libos.sqlite") == "/tmp/agent-libos.sqlite"

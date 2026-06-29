@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_libos import AgentImage, Runtime
-from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectOwnerKind, ObjectRight, ObjectType, ProcessStatus, ResourceBudget
 from agent_libos.models.exceptions import CapabilityDenied, ProcessWaitRequired, ResourceLimitExceeded
 
 
@@ -25,6 +25,39 @@ class TestCheckpointFork:
             assert fork_obj.namespace == runtime.memory.process_namespace(fork_pid)
             assert fork_obj.payload == {'value': 7}
             assert runtime.capability.check(fork_pid, 'filesystem:workspace:README.md', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_remaps_object_task_result_owner_to_forked_process_result(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork object task result')
+            result = runtime.memory.create_object(pid, ObjectType.SUMMARY, {'value': 7}, name='task-result')
+            runtime.memory.transfer_owner(
+                ObjectOwnerKind.PROCESS,
+                pid,
+                ObjectOwnerKind.OBJECT_TASK,
+                'otask_original',
+                [result.oid],
+                actor='test',
+                reason='simulate_object_task_result',
+            )
+            creator_handle = runtime.capability.handle_for_object(
+                pid,
+                result.oid,
+                [ObjectRight.READ.value, ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value],
+                issued_by='object_task:otask_original',
+            )
+            runtime._add_handle_to_process_view(pid, creator_handle)
+            checkpoint_id = runtime.checkpoint.create(pid, 'fork object task result', actor=pid)
+            runtime.capability.grant(pid, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            forked_obj = runtime.store.get_object(forked['object_map'][result.oid])
+            assert forked_obj is not None
+            assert forked_obj.owner_kind == ObjectOwnerKind.PROCESS_RESULT
+            assert forked_obj.owner_id == forked['pid_map'][pid]
         finally:
             runtime.close()
 

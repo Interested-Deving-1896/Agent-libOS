@@ -114,6 +114,7 @@ class McpPrimitive:
         if require_capability:
             required_right = CapabilityRight.ADMIN if existing is not None else CapabilityRight.WRITE
             self.capabilities.require(actor, self.server_resource(spec.server_id), required_right)
+            self._require_stdio_process_spawn(actor, spec)
         now = utc_now()
         if existing is not None:
             with self.store.transaction():
@@ -213,6 +214,7 @@ class McpPrimitive:
             usage_pid = self._resource_usage_pid(actor)
             if require_capability and actor is not None:
                 self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.EXECUTE)
+                self._require_stdio_process_spawn(actor, spec)
             self._require_runtime_environment(spec)
             if spec.transport == "streamable_http":
                 self._validate_runtime_resolution(spec)
@@ -338,6 +340,7 @@ class McpPrimitive:
             raise NotFound(f"MCP tool not found: {server_id}/{tool_id}")
         operation_context = self._operation_context(pid, spec, tool, selected_args)
         decision = self._authorize_call(pid, resource, tool.right, operation_context)
+        self._require_stdio_process_spawn(pid, spec)
         self._validate_arguments_against_schema(tool, selected_args)
         profile = self.capabilities.profiles.mcp(
             resource=resource,
@@ -557,6 +560,11 @@ class McpPrimitive:
             raise ValidationError(f"MCP server {server.server_id} no longer exposes tool {tool.mcp_name}")
         if tool.input_schema and live.input_schema and live.input_schema != tool.input_schema:
             raise ValidationError(f"MCP tool schema changed for {server.server_id}/{tool.tool_id}")
+
+    def _require_stdio_process_spawn(self, actor: str | None, server: McpServerSpec) -> None:
+        if actor is None or server.transport != "stdio":
+            return
+        self.capabilities.require(actor, "process:spawn", CapabilityRight.WRITE)
 
     def _call_result_from_provider(
         self,

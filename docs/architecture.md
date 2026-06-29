@@ -208,9 +208,10 @@ The runtime store keeps durable metadata and append-only records:
 Object payloads are not ordinary durable object rows. They live in runtime
 memory, while SQL object rows store only a runtime-memory marker. Rows whose
 live payload cache cannot be reconstructed are released fail-closed on reopen.
-File-backed SQLite stores take an active-runtime lease so two writable Runtime
-instances cannot concurrently open the same database; a clean close releases
-the lease and permits a later reopen.
+Persistent stores take an active-runtime lease so two writable Runtime
+instances cannot concurrently open the same database. SQLite uses a lock file,
+PostgreSQL uses a session advisory lock, and a clean close releases the lease
+and permits a later reopen.
 Checkpoint and image artifact payloads are explicit durable snapshot
 exceptions.
 

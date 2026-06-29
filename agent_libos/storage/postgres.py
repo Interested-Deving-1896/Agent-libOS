@@ -9,6 +9,9 @@ from agent_libos.models.exceptions import ValidationError
 from agent_libos.storage.sqlite import SQLRuntimeStore
 
 
+_POSTGRES_RUNTIME_LOCK_KEY = 0x4147454E544C4942
+
+
 class _PostgresDialect:
     def prepare(self, sql: str, *, with_params: bool = False) -> str:
         text = sql.strip()
@@ -128,7 +131,39 @@ class PostgresStore(SQLRuntimeStore):
         self.config = config or DEFAULT_CONFIG
         self.path = dsn
         self.dsn = dsn
-        self._init_store(dsn, config=config, conn=_PostgresConnection(dsn))
+        self._runtime_lease_acquired = False
+        conn = _PostgresConnection(dsn)
+        try:
+            self._acquire_runtime_lease(conn)
+            self._init_store(dsn, config=config, conn=conn)
+        except Exception:
+            self._release_runtime_lease(conn)
+            conn.close()
+            raise
+
+    def close(self) -> None:
+        try:
+            self._release_runtime_lease(getattr(self, "conn", None))
+        finally:
+            super().close()
+
+    def _acquire_runtime_lease(self, conn: _PostgresConnection) -> None:
+        row = conn.execute(
+            "SELECT pg_try_advisory_lock(?) AS acquired",
+            (_POSTGRES_RUNTIME_LOCK_KEY,),
+        ).fetchone()
+        if not row or not row.get("acquired"):
+            raise ValidationError("runtime store is already open: postgres")
+        self._runtime_lease_acquired = True
+
+    def _release_runtime_lease(self, conn: _PostgresConnection | None) -> None:
+        if conn is None or not getattr(self, "_runtime_lease_acquired", False):
+            return
+        self._runtime_lease_acquired = False
+        try:
+            conn.execute("SELECT pg_advisory_unlock(?)", (_POSTGRES_RUNTIME_LOCK_KEY,))
+        except Exception:
+            pass
 
 
 _PRAGMA_TABLE_INFO = re.compile(r"^\s*PRAGMA\s+table_info\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*$", re.IGNORECASE)
