@@ -288,7 +288,6 @@ class McpPrimitive:
             source="primitive.mcp.call",
             context={"server_id": server_id, "tool_id": tool_id, "request_bytes": request_bytes},
         )
-        self._validate_live_tool(spec, tool)
         effect_context = self._effect_context(spec, tool, operation_context, request_bytes=request_bytes)
         require_external_effect_classifier(self.provider, "call_tool")
         preflight_classification = classify_external_effect(self.provider, "call_tool", effect_context, {"preflight": True})
@@ -298,6 +297,43 @@ class McpPrimitive:
             reason="one-time MCP tool permission consumed",
         )
         started = time.monotonic()
+        try:
+            self._validate_live_tool(spec, tool)
+        except Exception as exc:
+            result = self._failure(
+                spec,
+                tool,
+                McpCallStatus.INVALID_RESPONSE,
+                f"MCP live tool metadata validation failed: {exc}",
+                McpProviderCallResult(
+                    error=f"{type(exc).__name__}: {exc}",
+                    duration_s=time.monotonic() - started,
+                ),
+            )
+            event = self._emit_call_event(pid, resource, result, tool)
+            audit_record = self._record_call_audit(pid, resource, result, tool, operation_context)
+            self._record_external_effect(
+                pid,
+                resource,
+                effect_context,
+                result,
+                event,
+                audit_record,
+                preflight_classification=preflight_classification,
+            )
+            self._charge_resource_usage(
+                pid,
+                ResourceUsage(mcp_request_bytes=request_bytes, mcp_response_bytes=result.response_bytes),
+                source="primitive.mcp.call",
+                context={
+                    "server_id": server_id,
+                    "tool_id": tool_id,
+                    "request_bytes": request_bytes,
+                    "response_bytes": result.response_bytes,
+                    "status": result.status.value,
+                },
+            )
+            raise
         try:
             provider_result = self.provider.call_tool(
                 spec,
@@ -825,6 +861,8 @@ class McpPrimitive:
                 raise ValidationError("MCP rollback_status is invalid") from exc
         if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED and tool.rollback_status is None:
             pass
+        if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED and tool.state_mutation:
+            raise ValidationError("MCP tool with state_mutation=true cannot use no_rollback_required")
         self._validate_json_schema(tool.input_schema, "input_schema")
         self._validate_json_value(tool.metadata, "tool metadata")
 
@@ -923,14 +961,7 @@ class McpPrimitive:
             return
         if allow_local:
             return
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
+        if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
             raise ValidationError("MCP HTTP IP address is not allowed")
 
     def _disable_replaced_server_tool_capabilities(self, server_id: str, *, actor: str) -> None:

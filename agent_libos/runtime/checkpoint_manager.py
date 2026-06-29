@@ -265,12 +265,18 @@ class CheckpointManager:
         self._require_snapshot_modules(snapshot)
         current_pids = self._subtree_pids(checkpoint.pid)
         snapshot_pids = list(snapshot.get("subtree_pids", []))
+        self._reject_active_object_tasks_for_restore(snapshot, current_pids)
+        self._validate_snapshot_restore_assets(snapshot)
+        if require_capability:
+            self._require_snapshot_image_restore_rights(actor, snapshot, overwrite_existing=True)
+        stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(snapshot, current_pids)
         external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
         external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
         external_effect_summary = self._external_effect_summary_since(checkpoint, pids=external_effect_pids)
         cancelled_human_requests, superseded_messages = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
         self._restore_images(snapshot)
         self._restore_jit_sources(snapshot)
+        self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=set(snapshot_pids) | set(current_pids))
         self.events.emit(
             EventType.ROLLBACK,
             source=actor,
@@ -476,6 +482,25 @@ class CheckpointManager:
                 missing.append({"module_id": module_id, "source_sha256": source_sha256})
         if missing:
             raise ValidationError(f"checkpoint requires startup modules that are not loaded: {missing}")
+
+    def _reject_active_object_tasks_for_restore(self, snapshot: dict[str, Any], current_pids: list[str]) -> None:
+        scoped_pids = set(current_pids) | {str(pid) for pid in snapshot.get("subtree_pids", [])}
+        scoped_oids = set(self._current_scoped_object_oids(current_pids)) | {str(oid) for oid in snapshot.get("object_oids", [])}
+        if not scoped_pids and not scoped_oids:
+            return
+        blocked: list[str] = []
+        for task in self.store.list_object_tasks(include_terminal=False):
+            if (
+                str(task.creator_pid) in scoped_pids
+                or (task.runner_pid is not None and str(task.runner_pid) in scoped_pids)
+                or str(task.owner_oid) in scoped_oids
+            ):
+                blocked.append(str(task.task_id))
+        if blocked:
+            raise ValidationError(
+                "checkpoint restore refused while scoped ObjectTasks are active: "
+                + ", ".join(sorted(blocked))
+            )
 
     def _restore_scoped_rows(
         self,
@@ -1029,7 +1054,7 @@ class CheckpointManager:
         artifacts: dict[str, Any] = {}
         for row in process_rows:
             image = runtime.images.get(row["image_id"])
-            if image is None or image.boot.get("kind") != "checkpoint_commit":
+            if image is None or image.boot.get("kind") not in {"checkpoint_commit", "image_package"}:
                 continue
             artifact_id = str(image.boot.get("artifact_id") or "")
             if not artifact_id:
@@ -1046,11 +1071,85 @@ class CheckpointManager:
         if runtime is None:
             return []
         image_ids: list[str] = []
-        for image_id in snapshot.get("images", {}):
-            if not overwrite_existing and image_id in runtime.images:
-                continue
+        for image_id, data in snapshot.get("images", {}).items():
+            if image_id in runtime.images:
+                if not overwrite_existing:
+                    continue
+                if to_jsonable(runtime.images[image_id]) == data:
+                    continue
             image_ids.append(str(image_id))
         return image_ids
+
+    def _validate_snapshot_restore_assets(self, snapshot: dict[str, Any]) -> None:
+        runtime = self.runtime
+        if runtime is None:
+            return
+        registry = getattr(runtime, "image_registry", None)
+        image_artifacts = snapshot.get("image_artifacts", {})
+        tool_rows = {str(row.get("tool_id")) for row in snapshot.get("rows", {}).get("tools", [])}
+        for image_id, data in snapshot.get("images", {}).items():
+            image = AgentImage(**data)
+            if registry is not None:
+                registry._validate_image(image, validate_tools=False)
+            boot_kind = str(image.boot.get("kind", "fresh"))
+            artifact_id = str(image.boot.get("artifact_id") or "")
+            if boot_kind in {"checkpoint_commit", "image_package"}:
+                if not artifact_id:
+                    raise ValidationError(f"checkpoint image {image_id} {boot_kind} boot is missing artifact_id")
+                if artifact_id not in image_artifacts and runtime.store.get_image_artifact(artifact_id) is None:
+                    raise ValidationError(f"checkpoint image {image_id} requires missing image artifact {artifact_id}")
+                artifact_entry = image_artifacts.get(artifact_id)
+                if artifact_entry is not None:
+                    artifact_kind = str(artifact_entry.get("kind", boot_kind))
+                    if artifact_kind != boot_kind:
+                        raise ValidationError(
+                            f"checkpoint image artifact {artifact_id} kind mismatch: expected {boot_kind}, found {artifact_kind}"
+                        )
+                    if not isinstance(artifact_entry.get("artifact", {}), dict):
+                        raise ValidationError(f"checkpoint image artifact {artifact_id} payload must be an object")
+        for tool_id, source in snapshot.get("jit_sources", {}).items():
+            if str(tool_id) not in tool_rows:
+                raise ValidationError(f"checkpoint JIT source references missing tool row: {tool_id}")
+            if not isinstance(source, str):
+                raise ValidationError(f"checkpoint JIT source must be text: {tool_id}")
+
+    def _stale_ephemeral_tool_ids_for_restore(self, snapshot: dict[str, Any], current_pids: list[str]) -> set[str]:
+        current_rows = self._rows_by_ids("processes", "pid", current_pids)
+        current_tool_ids = self._tool_ids_from_process_rows(current_rows)
+        snapshot_tool_ids = self._tool_ids_from_process_rows(snapshot.get("rows", {}).get("processes", []))
+        return current_tool_ids - snapshot_tool_ids
+
+    def _tool_ids_from_process_rows(self, process_rows: list[dict[str, Any]]) -> set[str]:
+        tool_ids: set[str] = set()
+        for row in process_rows:
+            for tool_id in loads(row.get("tool_table_json"), {}).values():
+                tool_ids.add(str(tool_id))
+        return tool_ids
+
+    def _prune_stale_ephemeral_jit_tools(self, tool_ids: set[str], *, scoped_pids: set[str]) -> None:
+        if not tool_ids or self.runtime is None:
+            return
+        tools = getattr(self.runtime, "tools", None)
+        tool_rows = {str(row.get("tool_id")): row for row in self.store.list_tools()}
+        for tool_id in sorted(tool_ids):
+            row = tool_rows.get(tool_id)
+            if row is None or not bool(row.get("ephemeral")):
+                continue
+            if self._tool_id_used_outside_scope(tool_id, scoped_pids):
+                continue
+            if tools is not None:
+                getattr(tools, "_handles", {}).pop(tool_id, None)
+                getattr(tools, "_jit_sources", {}).pop(tool_id, None)
+            self.store.delete_tool(tool_id)
+
+    def _tool_id_used_outside_scope(self, tool_id: str, scoped_pids: set[str]) -> bool:
+        for row in self.store.select_table_rows("processes", order_by="pid"):
+            pid = str(row.get("pid"))
+            if pid in scoped_pids:
+                continue
+            if tool_id in {str(value) for value in loads(row.get("tool_table_json"), {}).values()}:
+                return True
+        return False
 
     def _require_snapshot_image_restore_rights(
         self,

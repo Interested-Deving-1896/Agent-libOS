@@ -95,7 +95,15 @@ class FilesystemProvider(Protocol):
 
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes: ...
 
-    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = "\n") -> None: ...
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = "\n",
+        *,
+        overwrite: bool = True,
+    ) -> None: ...
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None: ...
 

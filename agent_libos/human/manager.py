@@ -242,6 +242,11 @@ class HumanObjectManager:
                 raise ValidationError(
                     "model permission requests cannot ask for root/global filesystem write/delete authority; request a workspace, concrete file, or directory subtree"
                 )
+        if kind == "filesystem" and CapabilityRight.DELETE.value in rights_set:
+            if resource == "filesystem:workspace:*" or (scope == "prefix" and body == "workspace"):
+                raise ValidationError(
+                    "model permission requests cannot ask for workspace-wide delete authority; request a concrete file or directory subtree"
+                )
 
     def _permission_constraints(self, kind: str, body: str, rights: list[str]) -> dict[str, Any]:
         if kind != "shell" or CapabilityRight.EXECUTE.value not in set(rights):
@@ -619,38 +624,39 @@ class HumanObjectManager:
         decision: dict[str, Any],
         responder: str,
     ) -> HumanRequest:
-        request = self.store.get_human_request(request_id)
-        if request is None:
-            raise NotFound(f"human request not found: {request_id}")
-        if request.status != HumanRequestStatus.PENDING:
-            raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
-        self._validate_decision_side_effects(request, status, decision)
-        self._apply_decision_side_effects(request, status, decision, responder)
-        permission_related = False
-        permission_spec = request.payload.get("requested_permission")
-        if isinstance(permission_spec, dict):
-            permission_related = True
+        with self.store.transaction():
+            request = self.store.get_human_request(request_id)
+            if request is None:
+                raise NotFound(f"human request not found: {request_id}")
+            if request.status != HumanRequestStatus.PENDING:
+                raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
+            self._validate_decision_side_effects(request, status, decision)
+            self._apply_decision_side_effects(request, status, decision, responder)
+            permission_related = False
+            permission_spec = request.payload.get("requested_permission")
+            if isinstance(permission_spec, dict):
+                permission_related = True
 
-        once_spec = request.payload.get("requested_once_capability")
-        if isinstance(once_spec, dict):
-            permission_related = True
-        request.status = status
-        request.decision = decision
-        request.updated_at = utc_now()
-        self.store.update_human_request(request)
-        process = self.store.get_process(request.pid)
-        if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
-            # Permission denials still wake the process so it can observe the
-            # failed operation and explain what happened. Generic rejected human
-            # approvals remain a pause/interruption signal.
-            process.status = (
-                ProcessStatus.RUNNABLE
-                if status == HumanRequestStatus.APPROVED or permission_related
-                else ProcessStatus.PAUSED
-            )
-            process.status_message = None if status == HumanRequestStatus.APPROVED else f"human rejected {request_id}"
-            process.updated_at = utc_now()
-            self.store.update_process(process)
+            once_spec = request.payload.get("requested_once_capability")
+            if isinstance(once_spec, dict):
+                permission_related = True
+            request.status = status
+            request.decision = decision
+            request.updated_at = utc_now()
+            self.store.update_human_request(request)
+            process = self.store.get_process(request.pid)
+            if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
+                # Permission denials still wake the process so it can observe the
+                # failed operation and explain what happened. Generic rejected human
+                # approvals remain a pause/interruption signal.
+                process.status = (
+                    ProcessStatus.RUNNABLE
+                    if status == HumanRequestStatus.APPROVED or permission_related
+                    else ProcessStatus.PAUSED
+                )
+                process.status_message = None if status == HumanRequestStatus.APPROVED else f"human rejected {request_id}"
+                process.updated_at = utc_now()
+                self.store.update_process(process)
         self.events.emit(
             EventType.HUMAN_RESPONSE,
             source=responder,
@@ -761,6 +767,10 @@ class HumanObjectManager:
             CapabilityManager.ASK_EACH_TIME,
         }:
             raise ValidationError(f"unknown permission policy: {policy}")
+        if status == HumanRequestStatus.REJECTED and policy == CapabilityManager.ALWAYS_ALLOW:
+            raise ValidationError("rejected permission requests cannot install always_allow policy")
+        if status == HumanRequestStatus.APPROVED and policy == CapabilityManager.ALWAYS_DENY:
+            raise ValidationError("approved permission requests cannot install always_deny policy")
         return subject, resource, rights, constraints, policy
 
     def _capability_request_spec(

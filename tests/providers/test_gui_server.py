@@ -8,7 +8,7 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from agent_libos.api.gui.server import create_gui_http_server
+from agent_libos.api.gui.server import _sse_payload_data, create_gui_http_server
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
 from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessSignal, ProcessStatus
 from agent_libos.runtime.runtime import Runtime
@@ -146,6 +146,11 @@ class TestGuiServer:
                 'api_key_env': 'KIMI_API_KEY',
                 'api_mode': 'chat',
                 'temperature': 0.1,
+                'store': None,
+                'responses_previous_response_id': None,
+                'parallel_tool_calls': None,
+                'auto_wait_on_empty_tool_calls': None,
+                'allow_custom_base_url': None,
             },
         )
         assert status == 200
@@ -153,6 +158,9 @@ class TestGuiServer:
         assert created['source'] == 'user'
         assert created['editable'] is True
         assert created['api_key_env_present'] is True
+        assert created['store'] is None
+        assert created['parallel_tool_calls'] is None
+        assert created['auto_wait_on_empty_tool_calls'] is None
         assert created['allow_custom_base_url'] is True
 
         status, updated = self.request(
@@ -361,6 +369,51 @@ class TestGuiServer:
         assert event['payload']['blob']['truncated'] is True
         assert len(event['payload']['blob']['preview']) == self.server.service.runtime.config.gui.snapshot_string_max_chars
 
+    def test_snapshot_array_truncation_uses_metadata_not_sentinel_items(self) -> None:
+        self.server.service.runtime.config = replace(
+            self.server.service.runtime.config,
+            gui=replace(
+                self.server.service.runtime.config.gui,
+                snapshot_collection_max_items=20,
+                snapshot_event_limit=25,
+            ),
+        )
+        for index in range(25):
+            self.server.service.runtime.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source='gui-test',
+                target='gui-test',
+                payload={'index': index},
+            )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        assert len(snapshot['events']) == 20
+        assert all('event_id' in event for event in snapshot['events'])
+        assert not any(event.get('truncated') is True for event in snapshot['events'])
+        assert snapshot['_truncated']['events']['kind'] == 'array'
+        assert snapshot['_truncated']['events']['omitted'] == 5
+
+    def test_oversized_snapshot_sse_payload_uses_explicit_truncated_event(self) -> None:
+        event_name, payload = _sse_payload_data(
+            'snapshot',
+            {'snapshot': {'events': [{'payload': 'x' * 100}]}},
+            max_bytes=50,
+            string_limit=200,
+            collection_limit=200,
+        )
+
+        assert event_name == 'snapshot_truncated'
+        assert payload['invalidated'] is True
+        assert payload['event'] == 'snapshot'
+
+    def test_strict_json_bool_rejects_string_false(self) -> None:
+        status, body = self.request('POST', '/api/processes', {'goal': 'strict bool', 'auto_run': 'false'})
+
+        assert status == 400
+        assert 'auto_run must be a JSON boolean' in body['error']['message']
+
     def test_process_audit_filters_before_limit(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'audit target', 'auto_run': False})
         pid = spawned['pid']
@@ -399,8 +452,8 @@ class TestGuiServer:
         assert denied['error']['confirmation_required']
         assert denied['error']['preview']['llm_profile'] == 'gui-exec'
         status, string_confirmed = self.request('POST', f'/api/processes/{pid}/exec', {'image': 'base-agent:v0', 'goal': 'new', 'confirmed': 'true'})
-        assert status == 409
-        assert string_confirmed['error']['confirmation_required']
+        assert status == 400
+        assert 'confirmed must be a JSON boolean' in string_confirmed['error']['message']
         status, allowed = self.request(
             'POST',
             f'/api/processes/{pid}/exec',
@@ -430,8 +483,8 @@ class TestGuiServer:
             f'/api/processes/{pid}/signal',
             {'signal': ProcessSignal.TERMINATE.value, 'confirmed': 'true'},
         )
-        assert status == 409
-        assert string_confirmed['error']['confirmation_required']
+        assert status == 400
+        assert 'confirmed must be a JSON boolean' in string_confirmed['error']['message']
 
         status, allowed = self.request(
             'POST',
@@ -576,8 +629,8 @@ class TestGuiServer:
         assert status == 409
         assert denied['error']['confirmation_required']
         status, string_confirmed = self.request('POST', '/api/images/register', {'files': files, 'source': 'gui-package-agent', 'confirmed': 'true'})
-        assert status == 409
-        assert string_confirmed['error']['confirmation_required']
+        assert status == 400
+        assert 'confirmed must be a JSON boolean' in string_confirmed['error']['message']
         status, path_rejected = self.request('POST', '/api/images/register', {'path': 'image-package', 'confirmed': True})
         assert status == 400
         assert 'package files' in path_rejected['error']['message']
@@ -598,6 +651,35 @@ class TestGuiServer:
         assert status == 200
         assert duplicate['running']
         self.server.service.scheduler.running = False
+
+    def test_scheduler_background_releases_runtime_lock_between_quanta(self) -> None:
+        calls: list[int | None] = []
+
+        def fake_run_until_idle(*, max_quanta: int | None = None) -> list[dict[str, int]]:
+            calls.append(max_quanta)
+            return [{'call': len(calls)}] if len(calls) == 1 else []
+
+        self.server.service.runtime.run_until_idle = fake_run_until_idle
+
+        status = self.server.service.scheduler.start(max_quanta=3, reason='test-batch')
+        assert status['running']
+        thread = self.server.service.scheduler._thread
+        assert thread is not None
+        thread.join(timeout=2)
+
+        assert calls == [1, 1]
+        assert self.server.service.scheduler.status()['last_result'] == [{'call': 1}]
+
+    def test_health_uses_fast_path_when_runtime_lock_is_busy(self) -> None:
+        self.server.service.runtime_lock.acquire()
+        try:
+            status, health = self.request('GET', '/api/health')
+        finally:
+            self.server.service.runtime_lock.release()
+
+        assert status == 200
+        assert health['runtime_busy'] is True
+        assert health['process_count'] is None
 
     def test_process_run_targets_selected_process(self) -> None:
         _first_status, first = self.request('POST', '/api/processes', {'goal': 'first', 'auto_run': False})
@@ -640,6 +722,13 @@ class TestGuiServer:
         assert denied['error']['confirmation_required']
         assert denied['error']['action'] == 'workflow.run'
         assert denied['error']['preview']['tool'] == 'ask_human'
+
+    def test_unknown_workflow_tool_requires_confirmation_fail_closed(self) -> None:
+        status, denied = self.request('POST', '/api/workflows/run', {'tool': 'missing_workflow_tool', 'args': {}})
+
+        assert status == 409
+        assert denied['error']['confirmation_required']
+        assert denied['error']['action'] == 'workflow.run'
 
     def test_object_task_endpoint_runs_task_and_exposes_snapshot(self) -> None:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'object task', 'auto_run': False})

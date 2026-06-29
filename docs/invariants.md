@@ -31,7 +31,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `object-memory-names-are-not-capabilities`: Object Memory names and
   namespaces do not bypass object capabilities.
 - `object-memory-materialization-budget-is-authoritative`: Object Memory
-  context materialization uses current payload token estimates.
+  context materialization is bounded by final rendered object text, not trusted
+  metadata token estimates.
 - `context-compaction-preserves-authority-and-fails-closed`: context compaction
   uses child-process summarizers without granting external authority, validates
   summaries, preserves process authority, and fails closed on races or invalid

@@ -63,6 +63,9 @@ export function App() {
           setSelectedPid((current) => reconcileSelectedPid(next, current));
         }
       }
+      if (message.event === "snapshot_truncated" || message.event === "event.invalidated") {
+        void refresh();
+      }
     }, controller.signal).catch((reason) => {
       if (!controller.signal.aborted) setError(String(reason));
     });

@@ -315,7 +315,7 @@ class LibOSSyscallSession:
             )
             return {"namespace": ns.namespace, "parent_namespace": ns.parent_namespace, "created": True}
         if name == "memory.list_namespace":
-            listing = self.runtime.memory.list_namespace(self.pid, args.get("namespace"))
+            listing = self.runtime.memory.list_namespace(self.pid, args.get("namespace"), limit=args.get("limit"))
             return {
                 "namespace": listing["namespace"],
                 "objects": [

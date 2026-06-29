@@ -183,10 +183,11 @@ The `compact_process_context` tool is the explicit exception to the append-only
 shape: after validation it atomically replaces older entries with one
 `context_compacted` summary plus the configured recent verbatim entries.
 
-Materialization budgets use each object's current `metadata.token_estimate`.
-Object creation, payload updates, file imports, and append-style writes refresh
-that estimate so enlarged payloads cannot slip into prompts under stale budget
-metadata.
+Materialization budgets use the final rendered object text, not stored
+`metadata.token_estimate`. Object creation, payload updates, file imports, and
+append-style writes still refresh that estimate as advisory metadata, but stale
+or attacker-supplied estimates cannot make enlarged rendered content fit under
+the prompt budget.
 
 For LLM execution, the append-only `llm_context:<pid>` render is the charged
 context. Source object materialization selects and records deltas without

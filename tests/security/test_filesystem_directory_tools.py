@@ -401,12 +401,20 @@ class SwappingSymlinkProvider(LocalFilesystemProvider):
         self.outside = outside
         self.swapped = False
 
-    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = '\n') -> None:
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = '\n',
+        *,
+        overwrite: bool = True,
+    ) -> None:
         if not self.swapped:
             shutil.rmtree(Path(self.root_display) / 'dir')
             os.symlink(self.outside, Path(self.root_display) / 'dir', target_is_directory=True)
             self.swapped = True
-        super().write_text(path, text, encoding=encoding, newline=newline)
+        super().write_text(path, text, encoding=encoding, newline=newline, overwrite=overwrite)
 
 
 class SinkSwapProvider(LocalFilesystemProvider):
@@ -441,7 +449,15 @@ class FallbackOpenSwapProvider(LocalFilesystemProvider):
 
 
 class FailingMutationProvider(LocalFilesystemProvider):
-    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = '\n') -> None:
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = '\n',
+        *,
+        overwrite: bool = True,
+    ) -> None:
         raise OSError('simulated write failure')
 
     def delete_file(self, path: ResolvedPath) -> None:
@@ -454,11 +470,19 @@ class SlowCountingMutationProvider(LocalFilesystemProvider):
         self._lock = threading.Lock()
         self.write_attempts = 0
 
-    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = '\n') -> None:
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = '\n',
+        *,
+        overwrite: bool = True,
+    ) -> None:
         with self._lock:
             self.write_attempts += 1
         time.sleep(0.05)
-        super().write_text(path, text, encoding=encoding, newline=newline)
+        super().write_text(path, text, encoding=encoding, newline=newline, overwrite=overwrite)
 
 
 def _remove_directory_for_swap(path: Path) -> None:

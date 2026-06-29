@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 from dataclasses import replace
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType
 
@@ -166,6 +167,26 @@ class TestObjectMemoryName:
         assert handle.oid in context.omitted_objects
         assert sentinel not in context.text
 
+    def test_materialization_budget_uses_rendered_text_not_stale_metadata_estimate(self) -> None:
+        sentinel = 'RENDERED_MEMORY_BUDGET_SENTINEL'
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory rendered budget')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'text': (sentinel + ' ') * 80},
+            metadata=ObjectMetadata(token_estimate=1),
+            name='budget.rendered',
+        )
+
+        context = self.runtime.memory.materialize_context(
+            pid,
+            self.runtime.memory.create_view(pid, [handle]),
+            budget_tokens=4,
+        )
+
+        assert handle.oid in context.omitted_objects
+        assert sentinel not in context.text
+
     def test_object_patch_distinguishes_unset_payload_from_json_null(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='patch null')
         handle = self.runtime.memory.create_object(
@@ -312,6 +333,41 @@ class TestObjectMemoryName:
         assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object_by_name(reader, 'evidence', namespace=namespace)
+
+    def test_query_name_miss_and_filtered_read_do_not_consume_one_time_namespace_read(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='query namespace owner')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='query namespace once')
+        namespace = 'shared-query-once'
+        self.runtime.memory.create_namespace(owner, namespace)
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'query should need object read too'},
+            name='evidence',
+            namespace=namespace,
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object_namespace:{namespace}',
+            ['read'],
+            issued_by='test',
+        )
+
+        assert self.runtime.memory.query_objects(reader, ObjectQuery(name='missing', namespace=namespace)) == []
+        assert self.runtime.store.get_capability(namespace_cap.cap_id).active
+        assert self.runtime.memory.query_objects(reader, ObjectQuery(name='evidence', namespace=namespace)) == []
+        assert self.runtime.store.get_capability(namespace_cap.cap_id).active
+
+        self.runtime.capability.grant(
+            subject=reader,
+            resource=f'object:{handle.oid}',
+            rights=[CapabilityRight.READ],
+            issued_by='test',
+        )
+        results = self.runtime.memory.query_objects(reader, ObjectQuery(name='evidence', namespace=namespace))
+
+        assert [result.oid for result in results] == [handle.oid]
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
 
     def test_one_time_namespace_write_grant_is_consumed_after_successful_create(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace write owner')
@@ -461,6 +517,128 @@ class TestObjectMemoryName:
         assert self.runtime.memory.get_object(handle_reader, one_shot_handle).payload == {'secret': 'read once'}
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object(handle_reader, one_shot_handle)
+
+    def test_one_time_namespace_name_handle_does_not_become_persistent_handle(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace handle owner')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='namespace handle reader')
+        namespace = 'shared-handle-read-once'
+        self.runtime.memory.create_namespace(owner, namespace)
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'namespace read once'},
+            name='evidence',
+            namespace=namespace,
+        )
+        self.runtime.capability.grant(
+            subject=reader,
+            resource=f'object:{handle.oid}',
+            rights=[CapabilityRight.READ],
+            issued_by='test',
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object_namespace:{namespace}',
+            ['read'],
+            issued_by='test',
+        )
+
+        one_shot_handle = self.runtime.memory.handle_for_name(reader, 'evidence', namespace=namespace)
+
+        derived_cap = self.runtime.store.get_capability(one_shot_handle.capability_id)
+        assert derived_cap.uses_remaining == 1
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+        assert self.runtime.memory.get_object(reader, one_shot_handle).payload == {'secret': 'namespace read once'}
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(reader, one_shot_handle)
+
+    def test_one_time_namespace_query_handle_does_not_become_persistent_handle(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace query owner')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='namespace query reader')
+        namespace = 'shared-query-handle-read-once'
+        self.runtime.memory.create_namespace(owner, namespace)
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'query namespace read once'},
+            name='evidence',
+            namespace=namespace,
+        )
+        self.runtime.capability.grant(
+            subject=reader,
+            resource=f'object:{handle.oid}',
+            rights=[CapabilityRight.READ],
+            issued_by='test',
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object_namespace:{namespace}',
+            ['read'],
+            issued_by='test',
+        )
+
+        results = self.runtime.memory.query_objects(reader, ObjectQuery(name='evidence', namespace=namespace))
+
+        assert [result.oid for result in results] == [handle.oid]
+        derived_cap = self.runtime.store.get_capability(results[0].capability_id)
+        assert derived_cap.uses_remaining == 1
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+        assert self.runtime.memory.get_object(reader, results[0]).payload == {'secret': 'query namespace read once'}
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(reader, results[0])
+
+    def test_concurrent_one_time_namespace_query_authority_issues_one_active_handle(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace query race owner')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='namespace query race reader')
+        namespace = 'shared-query-handle-race'
+        self.runtime.memory.create_namespace(owner, namespace)
+        handle = self.runtime.memory.create_object(
+            pid=owner,
+            object_type=ObjectType.EVIDENCE,
+            payload={'secret': 'query namespace race'},
+            name='evidence',
+            namespace=namespace,
+        )
+        self.runtime.capability.grant(
+            subject=reader,
+            resource=f'object:{handle.oid}',
+            rights=[CapabilityRight.READ],
+            issued_by='test',
+        )
+        namespace_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object_namespace:{namespace}',
+            ['read'],
+            issued_by='test',
+        )
+        workers = 2
+        barrier = threading.Barrier(workers)
+
+        def query() -> ObjectHandle | None:
+            barrier.wait()
+            try:
+                results = self.runtime.memory.query_objects(
+                    reader,
+                    ObjectQuery(name='evidence', namespace=namespace),
+                )
+                return results[0] if results else None
+            except CapabilityDenied:
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            handles = [result for result in executor.map(lambda _index: query(), range(workers)) if result is not None]
+
+        assert len(handles) == 1
+        active_handle_caps = [
+            cap
+            for cap in self.runtime.capability.capabilities_for(reader)
+            if cap.resource == f'object:{handle.oid}' and cap.active and cap.metadata.get('object_handle') is True
+        ]
+        assert [cap.cap_id for cap in active_handle_caps] == [handles[0].capability_id]
+        assert not self.runtime.store.get_capability(namespace_cap.cap_id).active
+        assert self.runtime.memory.get_object(reader, handles[0]).payload == {'secret': 'query namespace race'}
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(reader, handles[0])
 
     def test_one_time_multi_right_name_handle_consumes_source_capability_once(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner multi-right')
@@ -698,6 +876,53 @@ class TestObjectMemoryName:
         results = self.runtime.memory.query_objects(pid, ObjectQuery(type=ObjectType.OBSERVATION, limit=1))
 
         assert [handle.oid for handle in results] == [newer.oid]
+
+    def test_list_namespace_defaults_to_configured_query_limit_and_validates_explicit_limit(self) -> None:
+        config = replace(DEFAULT_CONFIG, memory=replace(DEFAULT_CONFIG.memory, query_limit=2))
+        runtime = Runtime.open('local', config=config)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='bounded namespace list')
+            for index in range(3):
+                runtime.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.OBSERVATION,
+                    payload={'index': index},
+                    name=f'bounded.{index}',
+                )
+
+            listing = runtime.memory.list_namespace(pid)
+            tool_listing = runtime.tools.call(pid, 'list_memory_namespace', {})
+
+            assert len(listing['objects']) + len(listing['namespaces']) == 2
+            assert tool_listing.ok
+            assert len(tool_listing.payload['objects']) + len(tool_listing.payload['namespaces']) == 2
+            with pytest.raises(ValidationError):
+                runtime.memory.list_namespace(pid, limit=3)
+            rejected = runtime.tools.call(pid, 'list_memory_namespace', {'limit': 3})
+            assert not rejected.ok
+        finally:
+            runtime.close()
+
+    def test_list_namespace_tool_uses_active_runtime_query_limit_above_default(self) -> None:
+        selected_limit = DEFAULT_CONFIG.memory.query_limit + 1
+        config = replace(DEFAULT_CONFIG, memory=replace(DEFAULT_CONFIG.memory, query_limit=selected_limit + 1))
+        runtime = Runtime.open('local', config=config)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='configured namespace list')
+            for index in range(selected_limit):
+                runtime.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.OBSERVATION,
+                    payload={'index': index},
+                    name=f'configured-limit.{index}',
+                )
+
+            tool_listing = runtime.tools.call(pid, 'list_memory_namespace', {'limit': selected_limit})
+
+            assert tool_listing.ok
+            assert len(tool_listing.payload['objects']) + len(tool_listing.payload['namespaces']) == selected_limit
+        finally:
+            runtime.close()
 
     def test_query_with_read_only_authority_does_not_grant_materialize_or_link(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query materialize')

@@ -194,10 +194,6 @@ class TestResourceManager:
             pid = runtime.process.spawn(
                 image="base-agent:v0",
                 goal="context budget",
-                resource_budget=ResourceBudget(
-                    max_context_materialization_tokens=10,
-                    max_context_materialization_total_tokens=5,
-                ),
             )
             first = runtime.memory.create_object(
                 pid=pid,
@@ -211,15 +207,32 @@ class TestResourceManager:
                 payload={"text": "second"},
                 metadata=ObjectMetadata(token_estimate=3),
             )
+            first_preview = runtime.memory.materialize_context(
+                pid,
+                runtime.memory.create_view(pid, [first]),
+                charge_resources=False,
+            )
+            second_preview = runtime.memory.materialize_context(
+                pid,
+                runtime.memory.create_view(pid, [second]),
+                charge_resources=False,
+            )
+            process = runtime.process.get(pid)
+            process.resource_budget = ResourceBudget(
+                max_context_materialization_tokens=max(first_preview.token_count, second_preview.token_count) + 1,
+                max_context_materialization_total_tokens=first_preview.token_count,
+            )
+            runtime.store.update_process(process)
 
             context = runtime.memory.materialize_context(pid, runtime.memory.create_view(pid, [first]))
-            assert context.token_count == 3
-            assert runtime.process.get(pid).resource_usage.context_materialized_tokens == 3
+            assert context.token_count == first_preview.token_count
+            assert context.token_count > 3
+            assert runtime.process.get(pid).resource_usage.context_materialized_tokens == first_preview.token_count
 
             exhausted = runtime.memory.materialize_context(pid, runtime.memory.create_view(pid, [second]))
             assert exhausted.token_count == 0
             assert second.oid in exhausted.omitted_objects
-            assert runtime.process.get(pid).resource_usage.context_materialized_tokens == 3
+            assert runtime.process.get(pid).resource_usage.context_materialized_tokens == first_preview.token_count
         finally:
             runtime.close()
 

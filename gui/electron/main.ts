@@ -5,7 +5,7 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { databaseTargetFromRenderer } from "./database.js";
-import { runtimeServerEnv } from "./env.js";
+import { requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
 
 type ServerConnection = {
@@ -26,6 +26,17 @@ const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
 const imageManifestMaxBytes = 1_048_576;
 const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
+const productionCsp = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "frame-ancestors 'none'"
+].join("; ");
 
 if (smokeMode) {
   const smokeUserDataPath = path.join(repoRoot, "gui", ".smoke-user-data");
@@ -144,10 +155,22 @@ async function killProcessTree(child: ChildProcessWithoutNullStreams, timeoutMs:
     });
     await waitForChildExit(killer, timeoutMs);
   } else {
-    child.kill();
+    signalProcessGroup(child, "SIGTERM");
   }
   await waitForExit(child, timeoutMs);
-  if (child.exitCode === null && !child.killed) child.kill();
+  if (child.exitCode === null && !child.killed) signalProcessGroup(child, "SIGKILL");
+}
+
+function signalProcessGroup(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
+  if (child.pid === undefined) {
+    child.kill(signal);
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    child.kill(signal);
+  }
 }
 
 function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
@@ -207,6 +230,7 @@ async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
   const child = spawn(serverCommand.command, serverArgs, {
     cwd: repoRoot,
     env: runtimeServerEnv(repoRoot),
+    detached: process.platform !== "win32",
     windowsHide: true
   });
   const startup = await new Promise<ServerConnection>((resolve, reject) => {
@@ -352,8 +376,9 @@ async function createWindow() {
       "renderer smoke loadURL"
     );
   } else if (process.env.VITE_DEV_SERVER_URL) {
-    await withTimeout(mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL), 15000, "renderer loadURL");
+    await withTimeout(mainWindow.loadURL(requireLoopbackDevServerUrl(process.env.VITE_DEV_SERVER_URL)), 15000, "renderer loadURL");
   } else {
+    installProductionCsp(mainWindow);
     await withTimeout(mainWindow.loadFile(path.join(repoRoot, "gui", "dist", "index.html")), 15000, "renderer loadFile");
   }
   smokeLog("window.loaded");
@@ -426,6 +451,17 @@ function isAllowedExternalUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+function installProductionCsp(window: BrowserWindow) {
+  window.webContents.session.webRequest.onHeadersReceived({ urls: ["file://*/*"] }, (details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        "Content-Security-Policy": [productionCsp]
+      }
+    });
+  });
 }
 
 app.whenReady().then(createWindow).catch((error) => {

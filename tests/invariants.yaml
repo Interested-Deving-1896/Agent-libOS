@@ -38,7 +38,9 @@
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_shell_execute_before_human_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_root_filesystem_write_before_human_prompt",
-        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_capability_admin_before_human_prompt"
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_capability_admin_before_human_prompt",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_workspace_wide_delete_before_human_prompt",
+        "tests/security/test_external_boundaries.py::TestExternalBoundary::test_overwrite_false_is_atomic_create_only_at_provider_sink"
       ],
       "benchmark_attack_classes": ["forbidden_file_write", "forbidden_file_delete"]
     },
@@ -91,20 +93,27 @@
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_name_lookup_does_not_bypass_object_capability",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_namespace_write_and_list_rights_are_enforced",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_read_grant_is_consumed_after_successful_lookup",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_query_name_miss_and_filtered_read_do_not_consume_one_time_namespace_read",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_write_grant_is_consumed_after_successful_create",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_name_handle_does_not_become_persistent_handle",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_namespace_query_handle_does_not_become_persistent_handle",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_concurrent_one_time_namespace_query_authority_issues_one_active_handle",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_multi_right_name_handle_consumes_source_capability_once",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_one_time_read_write_grant_allows_single_append_operation",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_list_namespace_defaults_to_configured_query_limit_and_validates_explicit_limit",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_list_namespace_tool_uses_active_runtime_query_limit_above_default",
         "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_copy_file_via_named_object_without_materializing_content_to_process"
       ],
       "benchmark_attack_classes": ["object_namespace_leakage"]
     },
     {
       "id": "object-memory-materialization-budget-is-authoritative",
-      "title": "Object Memory materialization uses current payload token estimates.",
+      "title": "Object Memory materialization is bounded by rendered object text.",
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_append_refreshes_token_estimate_for_materialization_budget",
+        "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_materialization_budget_uses_rendered_text_not_stale_metadata_estimate",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_memory_view_filters_apply_before_context_materialization",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call",
         "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_file_object_token_estimate_limits_prompt_materialization",
@@ -166,6 +175,10 @@
       "node_ids": [
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_llm_pending_per_use_approval_does_not_return_action_until_decision",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_llm_request_permission_rejected_policy_resumes_with_structured_result",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_rejected_permission_request_cannot_install_allow_policy",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_rejected_permission_request_can_keep_ask_each_time_policy",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_approved_permission_request_cannot_install_deny_policy",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_concurrent_permission_responses_commit_one_terminal_decision",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_cancelled_human_request_cannot_be_approved_later",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_requires_human_write_authority",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_async_runtime_resumes_human_question_with_answer",
@@ -320,6 +333,7 @@
         "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_workflow_request_permission_waits_instead_of_exiting_with_pending_request",
         "tests/runtime/test_workflow_entry.py::TestWorkflowEntry::test_workflow_does_not_auto_exit_process_exec_tool",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_workflow_run_cannot_bypass_image_tool_table",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_unknown_workflow_tool_requires_confirmation_fail_closed",
         "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_workflow_run_prints_result_and_persists_exited_process",
         "tests/providers/test_cli_builtin_commands.py::TestCLIBuiltinCommand::test_cli_workflow_run_failure_exits_nonzero_after_printing_json",
         "tests/providers/test_gui_server.py::TestGuiServer::test_workflow_run_endpoint_returns_result_and_snapshot_process"
@@ -440,6 +454,9 @@
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_preserves_append_only_history_and_reports_external_effects",
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_does_not_resurrect_revoked_or_currently_denied_capabilities",
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_replay_to_event_is_scoped_to_checkpoint_process_subtree",
+        "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_refuses_scoped_active_object_task",
+        "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_does_not_replace_current_image_without_image_write",
+        "tests/self_evolution/test_checkpoint_jit.py::TestCheckpointJit::test_checkpoint_restore_prunes_post_checkpoint_ephemeral_jit_tool",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_normalizes_waiting_process_state",
@@ -460,6 +477,8 @@
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_without_workspace_grants_cannot_read_materialized_workspace",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_tools_are_process_local_and_not_workspace_files",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_boot_validation_uses_broker_resource_limits_once",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_checkpoint_snapshot_captures_image_package_artifact",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_default_skill_failure_cleans_materialized_workspace_and_jit",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_required_modules_round_trips_and_boot_requires_loaded_module",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_image_default_skill_spawn_fails_closed_when_skill_missing",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_secret_or_cache_files",
@@ -512,7 +531,7 @@
       "node_ids": [
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_manifest_validation_rejects_unsafe_server_shapes",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_requires_tool_capability_and_records_effect",
-        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_live_schema_mismatch_denies_before_consuming_one_shot_capability",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_live_schema_mismatch_consumes_and_records_one_shot_attempt",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_http_dns_private_resolution_denies_before_provider_or_capability_use",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_checkpoint_reports_mcp_effect_but_does_not_restore_server_registry",

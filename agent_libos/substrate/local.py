@@ -257,7 +257,15 @@ class LocalFilesystemProvider:
                     return handle.read()
                 return handle.read(max(0, max_bytes))
 
-    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = "\n") -> None:
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = "\n",
+        *,
+        overwrite: bool = True,
+    ) -> None:
         with self._path_lock:
             target = self._target(path)
             self._before_path_sink("write_parent", target.parent)
@@ -266,7 +274,7 @@ class LocalFilesystemProvider:
             target = self._target(path)
             self._before_path_sink("write_text", target)
             target = self._target(path)
-            with self._open_write_file(target, encoding=encoding, newline=newline) as handle:
+            with self._open_write_file(target, encoding=encoding, newline=newline, overwrite=overwrite) as handle:
                 handle.write(text)
             self._target(path)
 
@@ -362,10 +370,12 @@ class LocalFilesystemProvider:
             os.close(fd)
             raise
 
-    def _open_write_file(self, target: Path, *, encoding: str, newline: str | None) -> Any:
+    def _open_write_file(self, target: Path, *, encoding: str, newline: str | None, overwrite: bool) -> Any:
         try:
             fd = self._open_under_root(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         except FileExistsError:
+            if not overwrite:
+                raise
             fd = self._open_under_root(target, os.O_WRONLY)
         try:
             self._validate_open_regular_file(fd, target)
@@ -1571,14 +1581,7 @@ def _validate_mcp_connect_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, 
         if ip.is_loopback:
             return
         raise ValidationError("MCP local HTTP host must resolve to loopback")
-    if (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    ):
+    if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
         raise ValidationError("MCP HTTP IP address is not allowed")
 
 

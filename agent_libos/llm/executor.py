@@ -15,6 +15,7 @@ from agent_libos.models.exceptions import (
     ResourceLimitExceeded,
 )
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.context_memory import LLMContextMemory
@@ -169,10 +170,18 @@ class LLMProcessExecutor:
             decision={"messages": len(messages), "policy": image.context_policy},
         )
         try:
+            openai_tools = self.runtime.tools.openai_tool_schemas(pid)
+            response_scope_fingerprint = self._responses_state_scope_fingerprint(
+                pid=pid,
+                process=prompt_process,
+                context=context,
+                tools=openai_tools,
+            )
             completion, actions, parallel_tool_calls = await self._complete_valid_action(
                 pid,
                 messages,
-                self.runtime.tools.openai_tool_schemas(pid),
+                openai_tools,
+                response_scope_fingerprint=response_scope_fingerprint,
             )
             action = actions[-1]
             if parallel_tool_calls and len(actions) > 1:
@@ -872,6 +881,7 @@ class LLMProcessExecutor:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         max_attempts: int | None = None,
+        response_scope_fingerprint: str | None = None,
     ) -> tuple[Any, list[dict[str, Any]], bool]:
         attempt_messages = messages
         last_error: Exception | None = None
@@ -883,6 +893,7 @@ class LLMProcessExecutor:
                 tools=tools,
                 attempt=attempt + 1,
                 max_attempts=selected_max_attempts,
+                response_scope_fingerprint=response_scope_fingerprint,
             )
             try:
                 raw_actions, auto_wait_used = self._completion_to_actions(
@@ -1008,6 +1019,7 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         attempt: int,
         max_attempts: int,
+        response_scope_fingerprint: str | None = None,
     ) -> tuple[Any, bool, bool, str]:
         call_id = new_id("llmcall")
         process = self.runtime.process.get(pid)
@@ -1023,7 +1035,12 @@ class LLMProcessExecutor:
         try:
             resolved = self.runtime.llms.resolve(profile_id)
             client = resolved.client
-            previous_response_id = self._previous_response_id_for_state(pid, resolved.profile_id, client)
+            previous_response_id = self._previous_response_id_for_state(
+                pid,
+                resolved.profile_id,
+                client,
+                response_scope_fingerprint=response_scope_fingerprint,
+            )
             parallel_tool_calls = bool(resolved.parallel_tool_calls)
             auto_wait_on_empty_tool_calls = bool(resolved.auto_wait_on_empty_tool_calls)
             request_options.update(
@@ -1036,6 +1053,7 @@ class LLMProcessExecutor:
                         isinstance(client, LLMClient) and client.responses_previous_response_id
                     ),
                     "openai_previous_response_id": previous_response_id,
+                    "openai_response_scope_fingerprint": response_scope_fingerprint,
                     "openai_prompt_cache_key_configured": bool(
                         isinstance(client, LLMClient) and client.prompt_cache_key
                     ),
@@ -1190,7 +1208,14 @@ class LLMProcessExecutor:
                 continue
         return 0
 
-    def _previous_response_id_for_state(self, pid: str, profile_id: str, client: Any) -> str | None:
+    def _previous_response_id_for_state(
+        self,
+        pid: str,
+        profile_id: str,
+        client: Any,
+        *,
+        response_scope_fingerprint: str | None = None,
+    ) -> str | None:
         if not isinstance(client, LLMClient):
             return None
         if not client.responses_previous_response_id or not client.store or not client._use_responses_api():
@@ -1200,8 +1225,43 @@ class LLMProcessExecutor:
                 continue
             if call.request_options.get("llm_profile_id") != profile_id:
                 continue
+            if call.request_options.get("openai_response_scope_fingerprint") != response_scope_fingerprint:
+                continue
             return call.response_id
         return None
+
+    def _responses_state_scope_fingerprint(
+        self,
+        *,
+        pid: str,
+        process: Any,
+        context: Any,
+        tools: list[dict[str, Any]],
+    ) -> str:
+        context_scope = self._context_scope_for_previous_response(context)
+        material = {
+            "pid": pid,
+            "image_id": getattr(process, "image_id", None),
+            "tool_table": getattr(process, "tool_table", {}),
+            "loaded_skills": getattr(process, "loaded_skills", {}),
+            "context_scope": context_scope,
+            "tools": to_jsonable(tools),
+        }
+        return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
+
+    def _context_scope_for_previous_response(self, context: Any) -> dict[str, Any]:
+        object_refs = list(getattr(context, "object_refs", []) or [])
+        context_oid = str(object_refs[0]) if object_refs else None
+        obj = self.runtime.store.get_object(context_oid) if context_oid else None
+        payload = obj.payload if obj is not None else None
+        cache_strategy = payload.get("cache_strategy") if isinstance(payload, dict) else None
+        if not isinstance(cache_strategy, dict):
+            cache_strategy = {}
+        return {
+            "context_oid": context_oid,
+            "cache_strategy_mode": cache_strategy.get("mode"),
+            "compacted_at": cache_strategy.get("compacted_at"),
+        }
 
     @staticmethod
     def _tool_schema_observation(tools: list[dict[str, Any]]) -> dict[str, int]:

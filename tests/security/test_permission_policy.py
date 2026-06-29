@@ -60,6 +60,82 @@ class TestPermissionPolicy:
         assert 'denied write' in (denied.error or '')
         assert not (self.runtime.workspace_root / path).exists()
 
+    def test_rejected_permission_request_cannot_install_allow_policy(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject cannot allow')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        request = self.runtime.human.pending()[0]
+
+        with pytest.raises(ValidationError, match='rejected permission requests cannot install always_allow'):
+            self.runtime.human.reject(request.request_id, {'approved': False, 'policy': CapabilityManager.ALWAYS_ALLOW})
+
+        assert self.runtime.human.pending()[0].request_id == request.request_id
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
+
+    def test_rejected_permission_request_can_keep_ask_each_time_policy(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject can ask again')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        request = self.runtime.human.pending()[0]
+
+        rejected = self.runtime.human.reject(
+            request.request_id,
+            {'approved': False, 'policy': CapabilityManager.ASK_EACH_TIME},
+        )
+
+        assert rejected.status == HumanRequestStatus.REJECTED
+        assert self.runtime.human.pending() == []
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ASK_EACH_TIME
+
+    def test_approved_permission_request_cannot_install_deny_policy(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='approve cannot deny')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        request = self.runtime.human.pending()[0]
+
+        with pytest.raises(ValidationError, match='approved permission requests cannot install always_deny'):
+            self.runtime.human.approve(request.request_id, {'approved': True, 'policy': CapabilityManager.ALWAYS_DENY})
+
+        assert self.runtime.human.pending()[0].request_id == request.request_id
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
+
+    def test_concurrent_permission_responses_commit_one_terminal_decision(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='permission response race')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write summary'})
+        request = self.runtime.human.pending()[0]
+        barrier = threading.Barrier(2)
+
+        def decide(approved: bool) -> HumanRequestStatus | str:
+            barrier.wait(timeout=2)
+            try:
+                if approved:
+                    return self.runtime.human.approve(request.request_id, {'approved': True}).status
+                return self.runtime.human.reject(request.request_id, {'approved': False}).status
+            except Exception as exc:
+                return type(exc).__name__
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(decide, [True, False]))
+
+        terminal = self.runtime.human.get(request.request_id).status
+        assert sum(isinstance(result, HumanRequestStatus) for result in results) == 1
+        assert terminal in {HumanRequestStatus.APPROVED, HumanRequestStatus.REJECTED}
+        expected_policy = (
+            CapabilityManager.ALWAYS_ALLOW
+            if terminal == HumanRequestStatus.APPROVED
+            else CapabilityManager.ALWAYS_DENY
+        )
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == expected_policy
+
     def test_request_permission_tool_rejects_unknown_right_before_human_prompt(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request invalid right')
         self._grant_human(pid)
@@ -117,6 +193,20 @@ class TestPermissionPolicy:
         assert context['resource_scope'] == 'prefix'
         assert processed[0].status == HumanRequestStatus.APPROVED
         assert self.runtime.capability.permission_policy(pid, self.runtime.filesystem.resource_for(self._path()), CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
+
+    def test_request_permission_rejects_workspace_wide_delete_before_human_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request workspace delete')
+        self._grant_human(pid)
+
+        request = self.runtime.tools.call(
+            pid,
+            'request_permission',
+            {'resource': self.runtime.filesystem.workspace_resource(), 'rights': ['delete'], 'reason': 'delete workspace'},
+        )
+
+        assert not request.ok
+        assert self.runtime.human.pending() == []
+        assert self.runtime.capability.permission_policy(pid, self.runtime.filesystem.resource_for(self._path()), CapabilityRight.DELETE) == CapabilityManager.MISSING
 
     def test_request_permission_requires_human_write_authority(self) -> None:
         image = self.runtime.get_image('base-agent:v0')

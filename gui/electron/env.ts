@@ -5,6 +5,19 @@ export function runtimeServerEnv(repoRoot: string, baseEnv: NodeJS.ProcessEnv = 
   return mergeDotenvIntoEnv(baseEnv, readDotenv(path.join(repoRoot, ".env")));
 }
 
+export function requireLoopbackDevServerUrl(rawUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch (error) {
+    throw new Error(`Invalid VITE_DEV_SERVER_URL: ${rawUrl}`, { cause: error });
+  }
+  if (!["http:", "https:"].includes(url.protocol) || !isLoopbackHost(url.hostname)) {
+    throw new Error("VITE_DEV_SERVER_URL must use a loopback HTTP(S) host.");
+  }
+  return url.toString();
+}
+
 export function readDotenv(filePath: string): Record<string, string> {
   if (!fs.existsSync(filePath)) return {};
   const values: Record<string, string> = {};
@@ -41,4 +54,9 @@ function hasEnvKey(env: NodeJS.ProcessEnv, key: string, platform: NodeJS.Platfor
 
 function stripOuterQuotes(value: string): string {
   return value.replace(/^"+|"+$/g, "").replace(/^'+|'+$/g, "");
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "[::1]";
 }

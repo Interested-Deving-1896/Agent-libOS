@@ -228,6 +228,25 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_checkpoint_snapshot_captures_image_package_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                result = runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(image='package-agent:v0', goal='checkpoint package artifact')
+                checkpoint_id = runtime.checkpoint.create(pid, 'package artifact', actor=pid)
+
+                snapshot = runtime.store.get_checkpoint_snapshot(checkpoint_id)[1]
+
+                artifact_id = result.image.boot['artifact_id']
+                assert snapshot['images']['package-agent:v0']['boot']['artifact_id'] == artifact_id
+                assert snapshot['image_artifacts'][artifact_id]['kind'] == 'image_package'
+                assert snapshot['image_artifacts'][artifact_id]['artifact']['manifest_path'] == 'IMAGE.yaml'
+                assert snapshot['image_artifacts'][artifact_id]['artifact']['workspace']['source'] == 'workspace'
+            finally:
+                runtime.close()
+
     def test_image_package_preserves_llm_profile_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', llm_profile='package-review')
@@ -309,6 +328,26 @@ class TestImageRegistration:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 with pytest.raises(ValidationError, match='package validation failed'):
                     runtime.process.spawn(image='package-agent:v0', goal='failed boot')
+
+                materialized = Path(temp_dir) / runtime.config.image.materialized_workspace_root
+                seed_files = list(materialized.rglob('seed.txt')) if materialized.exists() else []
+                assert seed_files == []
+                assert not [
+                    row for row in runtime.store.list_tools()
+                    if row['name'] == 'package_count' and row['ephemeral']
+                ]
+            finally:
+                runtime.close()
+
+    def test_image_package_default_skill_failure_cleans_materialized_workspace_and_jit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True, default_skills=['missing-package-skill'])
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = AcceptingValidationSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                with pytest.raises(Exception, match='missing-package-skill'):
+                    runtime.process.spawn(image='package-agent:v0', goal='failed default skill')
 
                 materialized = Path(temp_dir) / runtime.config.image.materialized_workspace_root
                 seed_files = list(materialized.rglob('seed.txt')) if materialized.exists() else []
@@ -612,6 +651,7 @@ def _write_image_package(
     jit_tool_exposure: str | None = None,
     llm_profile: str | None = None,
     required_modules: list[dict[str, str]] | None = None,
+    default_skills: list[str] | None = None,
 ) -> Path:
     root.mkdir(parents=True)
     grants = """
@@ -631,12 +671,18 @@ def _write_image_package(
             lines.append(f"  - module_id: {module['module_id']}")
             lines.append(f"    source_sha256: \"{module['source_sha256']}\"")
         required_modules_block = "\n".join(lines) + "\n"
+    default_skills_block = ""
+    if default_skills:
+        lines = ["default_skills:"]
+        for skill_id in default_skills:
+            lines.append(f"  - {skill_id}")
+        default_skills_block = "\n".join(lines) + "\n"
     root.joinpath('IMAGE.yaml').write_text(f"""
 image_id: package-agent:v0
 name: package-agent
 version: v0
 prompt: prompt.md
-{prompt_mode_line}{jit_tool_exposure_line}{llm_profile_line}{required_modules_block}default_tools:
+{prompt_mode_line}{jit_tool_exposure_line}{llm_profile_line}{required_modules_block}{default_skills_block}default_tools:
   - human_output
   - read_memory_object
 context_policy: evidence_first
@@ -686,3 +732,16 @@ class RecordingLimitDenoSandbox(DenoTypescriptSandbox):
         self.last_limits = limits
         self.last_return_metrics = return_metrics
         return super().run_tests(source_code, tests, timeout, limits=limits, return_metrics=return_metrics)
+
+
+class AcceptingValidationSandbox(DenoTypescriptSandbox):
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        return ValidationResult(ok=True, metadata={'language': 'typescript'})

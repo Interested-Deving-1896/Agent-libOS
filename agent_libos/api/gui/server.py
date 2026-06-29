@@ -41,6 +41,30 @@ from agent_libos.utils.serde import to_jsonable
 _GUI_DEFAULTS = DEFAULT_CONFIG.gui
 _TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _CONFIG_DEFAULT = object()
+_GUI_BOOL_FIELDS = {
+    "approved",
+    "allow_custom_base_url",
+    "auto_run",
+    "auto_wait_on_empty_tool_calls",
+    "confirmed",
+    "enabled",
+    "failed",
+    "grant_result_to_notify",
+    "owner_watch",
+    "parallel_tool_calls",
+    "preserve_capabilities",
+    "preserve_memory",
+    "replace",
+    "responses_previous_response_id",
+    "store",
+}
+_GUI_NULLABLE_BOOL_FIELDS = {
+    "allow_custom_base_url",
+    "auto_wait_on_empty_tool_calls",
+    "parallel_tool_calls",
+    "responses_previous_response_id",
+    "store",
+}
 
 
 def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParser) -> AgentLibOSConfig:
@@ -53,7 +77,14 @@ def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParse
     raise AssertionError("argparse parser.error should exit")
 
 
-def _bounded_gui_value(value: Any, *, string_limit: int, collection_limit: int) -> Any:
+def _bounded_gui_value(
+    value: Any,
+    *,
+    string_limit: int,
+    collection_limit: int,
+    truncated: dict[str, Any] | None = None,
+    path: str = "$",
+) -> Any:
     jsonable = to_jsonable(value)
     if isinstance(jsonable, str):
         if len(jsonable) <= string_limit:
@@ -64,32 +95,96 @@ def _bounded_gui_value(value: Any, *, string_limit: int, collection_limit: int) 
             "preview": jsonable[:string_limit],
         }
     if isinstance(jsonable, list):
-        selected = [_bounded_gui_value(item, string_limit=string_limit, collection_limit=collection_limit) for item in jsonable[:collection_limit]]
+        selected = [
+            _bounded_gui_value(
+                item,
+                string_limit=string_limit,
+                collection_limit=collection_limit,
+                truncated=truncated,
+                path=f"{path}[{index}]",
+            )
+            for index, item in enumerate(jsonable[:collection_limit])
+        ]
         if len(jsonable) > collection_limit:
-            selected.append({"truncated": True, "omitted": len(jsonable) - collection_limit})
+            if truncated is not None:
+                truncated[path] = {
+                    "kind": "array",
+                    "returned": collection_limit,
+                    "omitted": len(jsonable) - collection_limit,
+                }
         return selected
     if isinstance(jsonable, dict):
         items = list(jsonable.items())
         bounded = {
-            str(key): _bounded_gui_value(item, string_limit=string_limit, collection_limit=collection_limit)
+            str(key): _bounded_gui_value(
+                item,
+                string_limit=string_limit,
+                collection_limit=collection_limit,
+                truncated=truncated,
+                path=f"{path}.{key}" if path != "$" else str(key),
+            )
             for key, item in items[:collection_limit]
         }
         if len(items) > collection_limit:
-            bounded["_truncated"] = {"omitted": len(items) - collection_limit}
+            if truncated is not None:
+                truncated[path] = {
+                    "kind": "object",
+                    "returned": collection_limit,
+                    "omitted": len(items) - collection_limit,
+                }
         return bounded
     return jsonable
 
 
-def _sse_payload_data(data: dict[str, Any], *, max_bytes: int, string_limit: int, collection_limit: int) -> dict[str, Any]:
-    bounded = _bounded_gui_value(data, string_limit=string_limit, collection_limit=collection_limit)
+def _bounded_gui_payload(value: Any, *, string_limit: int, collection_limit: int) -> Any:
+    truncated: dict[str, Any] = {}
+    bounded = _bounded_gui_value(
+        value,
+        string_limit=string_limit,
+        collection_limit=collection_limit,
+        truncated=truncated,
+    )
+    if truncated and isinstance(bounded, dict):
+        bounded["_truncated"] = truncated
+    return bounded
+
+
+def _sse_payload_data(
+    event: str,
+    data: dict[str, Any],
+    *,
+    max_bytes: int,
+    string_limit: int,
+    collection_limit: int,
+) -> tuple[str, dict[str, Any]]:
+    bounded = _bounded_gui_payload(data, string_limit=string_limit, collection_limit=collection_limit)
     encoded = json.dumps(bounded, ensure_ascii=False, default=str).encode("utf-8")
     if len(encoded) <= max_bytes:
-        return bounded
-    return {
-        "truncated": True,
+        return event, bounded
+    invalidation_event = "snapshot_truncated" if event == "snapshot" else "event.invalidated"
+    return invalidation_event, {
+        "invalidated": True,
+        "event": event,
         "bytes": len(encoded),
         "reason": "gui event payload exceeds sse_payload_max_bytes",
     }
+
+
+def _json_bool(body: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in body:
+        return default
+    value = body[key]
+    if not isinstance(value, bool):
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{key} must be a JSON boolean")
+    return value
+
+
+def _validate_json_bool_fields(body: dict[str, Any]) -> None:
+    for key in sorted(_GUI_BOOL_FIELDS.intersection(body)):
+        if body[key] is None and key in _GUI_NULLABLE_BOOL_FIELDS:
+            continue
+        if not isinstance(body[key], bool):
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{key} must be a JSON boolean")
 
 
 class GuiServerError(Exception):
@@ -182,7 +277,7 @@ class SchedulerController:
 
     def set_auto_run(self, enabled: bool) -> dict[str, Any]:
         with self._lock:
-            self.auto_run = bool(enabled)
+            self.auto_run = enabled
             self.paused = not self.auto_run
         self.service.publish_scheduler_status()
         return self.status()
@@ -204,6 +299,7 @@ class SchedulerController:
             if self.running:
                 return self.status()
             self.running = True
+            self.paused = False
             self.task_id = f"scheduler-{int(time.time() * 1000)}"
             self.reason = reason
             self.started_at = time.time()
@@ -268,20 +364,36 @@ class SchedulerController:
             self.service.publish_scheduler_status()
 
     def _run_background(self, max_quanta: int | None, pid: str | None) -> None:
+        collected: list[Any] = []
+        remaining = max_quanta
         try:
-            with self.service.runtime_lock:
-                result = (
-                    self.service.runtime.run_process_until_idle(pid, max_quanta=max_quanta)
-                    if pid is not None
-                    else self.service.runtime.run_until_idle(max_quanta=max_quanta)
-                )
-            with self._lock:
-                self.last_result = result
+            while True:
+                with self._lock:
+                    if self.paused:
+                        break
+                if remaining is not None and remaining <= 0:
+                    break
+                batch_quanta = 1 if remaining is None else min(1, remaining)
+                with self.service.runtime_lock:
+                    result = (
+                        self.service.runtime.run_process_until_idle(pid, max_quanta=batch_quanta)
+                        if pid is not None
+                        else self.service.runtime.run_until_idle(max_quanta=batch_quanta)
+                    )
+                if not result:
+                    break
+                collected.extend(result)
+                with self._lock:
+                    self.last_result = list(collected)
+                self.service.publish_runtime_changes("scheduler.batch")
+                if remaining is not None:
+                    remaining -= len(result)
         except Exception as exc:  # pragma: no cover - covered through API status assertions
             with self._lock:
                 self.last_error = str(exc)
         finally:
             with self._lock:
+                self.last_result = list(collected)
                 self.running = False
                 self.finished_at = time.time()
             self.service.publish_runtime_changes("scheduler")
@@ -382,13 +494,20 @@ class GuiRuntimeService:
                 self.broadcaster.publish("llm_call.appended", call)
 
     def health(self) -> dict[str, Any]:
-        with self.runtime_lock:
-            return {
-                "ok": True,
-                "db": self.db,
-                "scheduler": self.scheduler.status(),
-                "process_count": len(self.runtime.process.list()),
-            }
+        process_count: int | None = None
+        runtime_busy = not self.runtime_lock.acquire(blocking=False)
+        if not runtime_busy:
+            try:
+                process_count = len(self.runtime.process.list())
+            finally:
+                self.runtime_lock.release()
+        return {
+            "ok": True,
+            "db": self.db,
+            "scheduler": self.scheduler.status(),
+            "process_count": process_count,
+            "runtime_busy": runtime_busy,
+        }
 
     def snapshot(self) -> dict[str, Any]:
         with self.runtime_lock:
@@ -446,7 +565,7 @@ class GuiRuntimeService:
         }
 
     def _bounded_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
-        return _bounded_gui_value(
+        return _bounded_gui_payload(
             snapshot,
             string_limit=self.runtime.config.gui.snapshot_string_max_chars,
             collection_limit=self.runtime.config.gui.snapshot_collection_max_items,
@@ -603,7 +722,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if method in {"POST", "PUT", "DELETE"}:
                 self._cached_json_body = self._read_body(optional=True)
                 self._body_cached = True
-            if _is_object_task_wait_request(method, parsed.path):
+            if _is_fast_gui_request(method, parsed.path) or _is_object_task_wait_request(method, parsed.path):
                 result = self._dispatch(method, parsed.path, parse_qs(parsed.query))
                 should_shutdown = method == "POST" and parsed.path == "/api/shutdown"
             else:
@@ -703,7 +822,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 llm_profile_id=llm_profile_id,
             )
             service.publish_runtime_changes("process.spawn")
-            if body.get("auto_run", True):
+            if _json_bool(body, "auto_run", True):
                 service.scheduler.maybe_start(
                     max_quanta=max_quanta,
                     reason=f"spawn:{pid}",
@@ -715,7 +834,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return self._dispatch_object_tasks(method, route[1:], query)
         if route[:2] == ["scheduler", "auto"] and method == "POST":
             body = self._read_body()
-            return service.scheduler.set_auto_run(bool(body.get("enabled", True)))
+            return service.scheduler.set_auto_run(_json_bool(body, "enabled", True))
         if route == ["scheduler", "pause"] and method == "POST":
             return service.scheduler.pause()
         if len(route) >= 2 and route[0] == "processes":
@@ -809,7 +928,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 notify_kind=str(body.get("notify_kind") or ProcessMessageKind.NORMAL.value),
                 notify_channel=str(body["notify_channel"]) if body.get("notify_channel") is not None else None,
                 inherit_capabilities=body.get("inherit_capabilities") if isinstance(body.get("inherit_capabilities"), list) else [],
-                grant_result_to_notify=bool(body.get("grant_result_to_notify", False)),
+                grant_result_to_notify=_json_bool(body, "grant_result_to_notify", False),
                 owner_watch=_object_task_owner_watch_body(body),
             )
             service.publish_runtime_changes("object_task.start")
@@ -850,7 +969,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             task = service.runtime.object_tasks.watch_owner(
                 route[0],
                 actor_pid=pid,
-                enabled=bool(body.get("enabled", True)),
+                enabled=_json_bool(body, "enabled", True),
                 events=[str(item) for item in raw_events] if raw_events is not None else None,
                 channel=str(body["watch_channel"]) if body.get("watch_channel") is not None else None,
                 kind=str(body["watch_kind"]) if body.get("watch_kind") is not None else None,
@@ -913,7 +1032,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             body = self._read_body(optional=True)
             service.runtime.process.resume(pid)
             service.publish_runtime_changes("process.resume")
-            if body.get("auto_run", False):
+            if _json_bool(body, "auto_run", False):
                 service.scheduler.maybe_start(reason=f"resume:{pid}")
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route == ["signal"]:
@@ -940,7 +1059,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
             )
             service.publish_runtime_changes(f"process.{kind.value}_message")
-            if body.get("auto_run", True):
+            if _json_bool(body, "auto_run", True):
                 service.scheduler.maybe_start(
                     max_quanta=max_quanta,
                     reason=f"message:{pid}",
@@ -965,12 +1084,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 str(body["image"]),
                 args=body.get("args") if isinstance(body.get("args"), dict) else {},
                 goal=body.get("goal"),
-                preserve_memory=bool(body.get("preserve_memory", True)),
-                preserve_capabilities=bool(body.get("preserve_capabilities", False)),
+                preserve_memory=_json_bool(body, "preserve_memory", True),
+                preserve_capabilities=_json_bool(body, "preserve_capabilities", False),
                 llm_profile_id=llm_profile_id,
             )
             service.publish_runtime_changes("process.exec")
-            if body.get("auto_run", True):
+            if _json_bool(body, "auto_run", True):
                 service.scheduler.maybe_start(
                     max_quanta=max_quanta,
                     reason=f"exec:{pid}",
@@ -979,7 +1098,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and route == ["exit"]:
             body = self._read_body()
             self._require_confirmed("process.exit", body, {"pid": pid, "failed": body.get("failed", False)})
-            service.runtime.process.exit(pid, failed=bool(body.get("failed", False)), message=body.get("message"))
+            service.runtime.process.exit(pid, failed=_json_bool(body, "failed", False), message=body.get("message"))
             service.publish_runtime_changes("process.exit")
             return service._process_summary(pid, include_messages=True)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown process endpoint")
@@ -1000,12 +1119,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             decision = body.get("decision") if isinstance(body.get("decision"), dict) else {}
             if body.get("answer") is not None:
                 decision = {**decision, "answer": str(body["answer"])}
-            if bool(body.get("approved", True)):
+            if _json_bool(body, "approved", True):
                 request = service.runtime.human.approve(route[0], {"approved": True, "source": "gui", **decision})
             else:
                 request = service.runtime.human.reject(route[0], {"approved": False, "source": "gui", **decision})
             service.publish_runtime_changes("human.respond")
-            if body.get("auto_run", True):
+            if _json_bool(body, "auto_run", True):
                 service.scheduler.maybe_start(max_quanta=max_quanta, reason=f"human:{route[0]}")
             return {"request": to_jsonable(request), "scheduler": service.scheduler.status()}
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown human endpoint")
@@ -1063,7 +1182,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             result = service.runtime.skills.register_skill_from_path(
                 str(body["path"]),
                 actor=str(body.get("actor") or "gui"),
-                replace=bool(body.get("replace", False)),
+                replace=_json_bool(body, "replace", False),
                 require_capability=body.get("actor") is not None,
             )
             service.publish_runtime_changes("skill.register")
@@ -1180,7 +1299,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             result = service.runtime.image_registry.register_from_package_files(
                 files,
                 actor=str(body.get("actor") or "gui"),
-                replace=bool(body.get("replace", False)),
+                replace=_json_bool(body, "replace", False),
                 require_capability=body.get("actor") is not None,
                 source=body.get("source"),
             )
@@ -1217,7 +1336,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 image_id=str(body["image_id"]),
                 name=str(body["name"]),
                 version=str(body.get("version") or "v0"),
-                replace=bool(body.get("replace", False)),
+                replace=_json_bool(body, "replace", False),
                 metadata=dict(body.get("metadata") or {}),
                 require_capability=body.get("actor") is not None,
             )
@@ -1295,7 +1414,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             result = service.runtime.jsonrpc.register_endpoint_from_yaml_text(
                 text,
                 actor=str(body.get("actor") or "gui"),
-                replace=bool(body.get("replace", False)),
+                replace=_json_bool(body, "replace", False),
                 require_capability=body.get("actor") is not None,
                 source=body.get("source"),
             )
@@ -1336,7 +1455,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             result = service.runtime.mcp.register_server_from_yaml_text(
                 text,
                 actor=str(body.get("actor") or "gui"),
-                replace=bool(body.get("replace", False)),
+                replace=_json_bool(body, "replace", False),
                 require_capability=body.get("actor") is not None,
                 source=body.get("source"),
             )
@@ -1399,14 +1518,15 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         threading.Thread(target=shutdown_after_response, name="agent-libos-gui-http-shutdown", daemon=True).start()
 
     def _write_sse(self, event: GuiEvent) -> None:
-        payload_data = _sse_payload_data(
+        event_name, payload_data = _sse_payload_data(
+            event.event,
             event.data,
             max_bytes=self.server.service.runtime.config.gui.sse_payload_max_bytes,
             string_limit=self.server.service.runtime.config.gui.snapshot_string_max_chars,
             collection_limit=self.server.service.runtime.config.gui.snapshot_collection_max_items,
         )
         payload = json.dumps(payload_data, ensure_ascii=False, default=str)
-        self.wfile.write(f"id: {event.seq}\nevent: {event.event}\ndata: {payload}\n\n".encode("utf-8"))
+        self.wfile.write(f"id: {event.seq}\nevent: {event_name}\ndata: {payload}\n\n".encode("utf-8"))
         self.wfile.flush()
 
     def _read_body(self, optional: bool = False) -> dict[str, Any]:
@@ -1441,6 +1561,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             raise GuiServerError(HTTPStatus.BAD_REQUEST, f"invalid JSON body: {exc}") from exc
         if not isinstance(value, dict):
             raise GuiServerError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
+        _validate_json_bool_fields(value)
         return value
 
     def _require_auth(self) -> None:
@@ -1470,7 +1591,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         try:
             handle = service.runtime.tools.resolve(tool)
         except NotFound:
-            return False
+            return True
         return service.runtime.tools._tool_has_side_effects(handle)
 
     def _write_json(self, value: Any, *, status: int = HTTPStatus.OK) -> None:
@@ -1661,6 +1782,19 @@ def _is_object_task_wait_request(method: str, path: str) -> bool:
     return len(parts) == 4 and parts[:2] == ["api", "object-tasks"] and parts[3] == "wait"
 
 
+def _is_fast_gui_request(method: str, path: str) -> bool:
+    parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if parts == ["api", "health"] and method == "GET":
+        return True
+    if parts == ["api", "shutdown"] and method == "POST":
+        return True
+    if parts == ["api", "scheduler", "pause"] and method == "POST":
+        return True
+    if parts == ["api", "scheduler", "auto"] and method == "POST":
+        return True
+    return False
+
+
 def _object_task_owner_handle(
     runtime: Runtime,
     pid: str,
@@ -1689,7 +1823,7 @@ def _object_task_owner_watch_body(body: dict[str, Any]) -> dict[str, Any] | bool
     if raw_events is not None and not isinstance(raw_events, list):
         raise GuiServerError(HTTPStatus.BAD_REQUEST, "watch_events must be a JSON array")
     events = [str(item) for item in raw_events] if raw_events is not None else []
-    enabled = bool(body.get("owner_watch", False) or events or body.get("watch_channel") or "watch_kind" in body)
+    enabled = _json_bool(body, "owner_watch", False) or bool(events or body.get("watch_channel") or "watch_kind" in body)
     if not enabled:
         return False
     selected: dict[str, Any] = {

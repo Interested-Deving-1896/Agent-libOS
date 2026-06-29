@@ -86,6 +86,11 @@ class CreateMemoryNamespaceOutput(BaseModel):
 
 class ListMemoryNamespaceArgs(BaseModel):
     namespace: str | None = Field(default=None, description="Namespace to list. Defaults to this process namespace.")
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of visible namespace entries to return. Defaults to the runtime memory query limit.",
+    )
 
 
 class MemoryNamespaceObjectEntry(BaseModel):
@@ -208,7 +213,7 @@ class ListMemoryNamespaceTool(SyncAgentTool[ListMemoryNamespaceArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        listing = runtime.memory.list_namespace(ctx.pid, args.namespace)
+        listing = runtime.memory.list_namespace(ctx.pid, args.namespace, limit=args.limit)
         objects = [
             MemoryNamespaceObjectEntry(
                 oid=obj.oid,

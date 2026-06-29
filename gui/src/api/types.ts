@@ -258,6 +258,7 @@ export type RuntimeSnapshot = {
   skills: Record<string, unknown>[];
   jsonrpc_endpoints: Record<string, unknown>[];
   modules: Record<string, unknown>[];
+  _truncated?: Record<string, unknown>;
 };
 
 export type GuiConnection = {

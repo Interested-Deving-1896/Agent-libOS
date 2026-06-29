@@ -296,9 +296,17 @@ class RecordingFilesystemProvider:
         self.calls.append('state')
         return self.inner.state(path)
 
-    def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None='\n') -> None:
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None='\n',
+        *,
+        overwrite: bool = True,
+    ) -> None:
         self.calls.append('write_text')
-        self.inner.write_text(path, text, encoding, newline)
+        self.inner.write_text(path, text, encoding, newline, overwrite=overwrite)
 
     def list_directory(self, path: ResolvedPath, *, limit: int | None = None):
         self.calls.append('list_directory')

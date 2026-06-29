@@ -783,6 +783,70 @@ class TestLLMContextMemory:
             finally:
                 runtime.close()
 
+    def test_openai_responses_state_chain_resets_after_context_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            config = replace(
+                DEFAULT_CONFIG,
+                llm=replace(DEFAULT_CONFIG.llm, store=True, responses_previous_response_id=True),
+            )
+            client = LLMClient(
+                model='gpt-test',
+                api_key='key',
+                api_mode='responses',
+                store=True,
+                responses_previous_response_id=True,
+                defaults=config.llm,
+            )
+            fake = FakeAsyncOpenAIResponses(
+                [
+                    _responses_tool_call(
+                        'resp_before_compact',
+                        'create_memory_object',
+                        {'type': 'note', 'name': 'step', 'payload': {'ok': True}},
+                    ),
+                    _responses_tool_call('resp_after_compact', 'process_exit', {'payload': {'done': True}}),
+                ]
+            )
+            client._async_client = fake
+            runtime = Runtime.open(db, config=config)
+            try:
+                runtime.llm.client = client
+                pid = runtime.process.spawn(image='base-agent:v0', goal='chain reset after compaction')
+                first = runtime.run_next_process_once()
+                context_obj = runtime.store.get_object_by_name(
+                    context_object_name(pid),
+                    namespace=runtime.memory.resolve_namespace(pid),
+                )
+                assert first['action']['action'] == 'create_memory_object'
+                assert context_obj is not None
+
+                runtime.llm.context_memory.replace_with_compacted_summary(
+                    pid,
+                    context_oid=context_obj.oid,
+                    expected_version=context_obj.version,
+                    summary=_compact_summary('chain reset after compaction'),
+                    compaction_method='test_compaction',
+                    preserve_recent_entries=0,
+                    source_tokens=100,
+                    target_tokens=10,
+                    compressor_pids=[pid],
+                )
+                second = runtime.run_next_process_once()
+
+                assert second['action']['action'] == 'process_exit'
+                assert 'previous_response_id' not in fake.responses.payloads[0]
+                assert 'previous_response_id' not in fake.responses.payloads[1]
+                calls = runtime.store.list_llm_calls(pid)
+                assert calls[0].request_options['openai_previous_response_id'] is None
+                assert calls[1].request_options['openai_previous_response_id'] is None
+                assert (
+                    calls[0].request_options['openai_response_scope_fingerprint']
+                    != calls[1].request_options['openai_response_scope_fingerprint']
+                )
+            finally:
+                runtime.close()
+
     def test_empty_tool_calls_without_auto_wait_still_fail_action_selection(self) -> None:
         config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=1))
         runtime = Runtime.open('local', config=config)

@@ -335,7 +335,7 @@ class FilesystemAdapter:
         )
         reservation = self._reserve_mutation_capability(consume_capability_id, right="write")
         try:
-            self.provider.write_text(target, text, encoding=encoding, newline="\n")
+            self.provider.write_text(target, text, encoding=encoding, newline="\n", overwrite=overwrite)
         except Exception as exc:
             self._restore_mutation_capability(reservation, right="write")
             self._record_mutation_failure(

@@ -38,8 +38,10 @@ class TestMcpPrimitive:
                 _http_manifest("bad-userinfo", "https://user:pass@example.test/mcp"),
                 _http_manifest("bad-fragment", "https://api.example.test/mcp#secret"),
                 _http_manifest("bad-private-ip", "https://10.0.0.10/mcp"),
+                _http_manifest("bad-nonpublic-ip", "https://100.64.0.1/mcp"),
                 _http_manifest("literal-header", "https://api.example.test/mcp", literal_header=True),
                 _http_manifest("bad-header-env", "https://api.example.test/mcp", header_env="OPENAI_API_KEY"),
+                _stdio_manifest("bad-effect", state_mutation=True),
             ]
             monkeypatch.setenv("AGENT_LIBOS_MCP_TEST_TOKEN", "token")
             for text in invalid_cases:
@@ -78,7 +80,7 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
-    def test_live_schema_mismatch_denies_before_consuming_one_shot_capability(self) -> None:
+    def test_live_schema_mismatch_consumes_and_records_one_shot_attempt(self) -> None:
         runtime = Runtime.open("local")
         provider = _RecordingMcpProvider(
             live_schema={"type": "object", "properties": {"other": {"type": "string"}}}
@@ -93,7 +95,12 @@ class TestMcpPrimitive:
                 runtime.mcp.call_tool(pid, "demo", "echo", {"text": "hello"})
 
             assert provider.call_args == []
-            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            effect = [item for item in runtime.store.list_external_effects() if item.provider == "mcp"][0]
+            assert effect.operation == "call_tool"
+            assert effect.target == "mcp:demo:echo"
+            assert effect.provider_metadata["result"]["ok"] is False
+            assert effect.provider_metadata["result"]["status"] == "invalid_response"
         finally:
             runtime.close()
 
@@ -107,7 +114,7 @@ class TestMcpPrimitive:
         monkeypatch.setenv("AGENT_LIBOS_MCP_TEST_TOKEN", "token")
 
         def fake_getaddrinfo(*_args: Any, **_kwargs: Any) -> list[Any]:
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 443))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))]
 
         monkeypatch.setattr("agent_libos.primitives.mcp.socket.getaddrinfo", fake_getaddrinfo)
         try:
@@ -133,7 +140,7 @@ class TestMcpPrimitive:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         def fake_getaddrinfo(*_args: Any, **_kwargs: Any) -> list[Any]:
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 443))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))]
 
         monkeypatch.setattr("agent_libos.substrate.local.socket.getaddrinfo", fake_getaddrinfo)
 
@@ -247,6 +254,7 @@ def _stdio_manifest(
     duplicate_tool: bool = False,
     env_source: str | None = None,
     cwd: str | None = None,
+    state_mutation: bool = False,
 ) -> str:
     cwd_line = f"\n  cwd: {cwd}" if cwd is not None else ""
     env_block = f"\n  env:\n    DEMO_TOKEN: {env_source}" if env_source is not None else ""
@@ -274,7 +282,7 @@ tools:
     mcp_name: {mcp_name}
     right: read
     rollback_class: no_rollback_required
-    state_mutation: false
+    state_mutation: {str(state_mutation).lower()}
     information_flow: true
     input_schema:
       type: object

@@ -323,32 +323,43 @@ class ObjectMemoryManager:
         self._consume_one_time_decision(namespace_decision)
         return ns
 
-    def list_namespace(self, pid: str, namespace: str | None = None) -> dict[str, Any]:
+    def list_namespace(self, pid: str, namespace: str | None = None, *, limit: int | None = None) -> dict[str, Any]:
         namespace_name = self.resolve_namespace(pid, namespace)
         namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
         self._require_namespace_exists(namespace_name)
-        objects = [
-            obj
-            for obj in self.store.list_objects(namespace=namespace_name)
-            if self.capabilities.check(pid, f"object:{obj.oid}", ObjectRight.READ)
-        ]
-        child_namespaces = [
-            ns
-            for ns in self.store.list_namespaces(parent_namespace=namespace_name)
-            if self._can_read_namespace(pid, ns.namespace)
-        ]
+        selected_limit = self._validate_query_limit(limit or self.config.memory.query_limit)
+        objects: list[AgentObject] = []
+        child_namespaces: list[ObjectNamespace] = []
+        for obj in self.store.list_objects(namespace=namespace_name):
+            if len(objects) >= selected_limit:
+                break
+            if self.capabilities.check(pid, f"object:{obj.oid}", ObjectRight.READ):
+                objects.append(obj)
+        remaining = selected_limit - len(objects)
+        if remaining > 0:
+            for ns in self.store.list_namespaces(parent_namespace=namespace_name):
+                if len(child_namespaces) >= remaining:
+                    break
+                if self._can_read_namespace(pid, ns.namespace):
+                    child_namespaces.append(ns)
         self.audit.record(
             actor=pid,
             action="memory.list_namespace",
             target=self._namespace_resource(namespace_name),
             output_refs=[obj.oid for obj in objects],
-            decision={"namespace": namespace_name, "objects": len(objects), "namespaces": len(child_namespaces)},
+            decision={
+                "namespace": namespace_name,
+                "objects": len(objects),
+                "namespaces": len(child_namespaces),
+                "limit": selected_limit,
+            },
         )
         self._consume_one_time_decision(namespace_decision)
         return {
             "namespace": namespace_name,
             "objects": objects,
             "namespaces": child_namespaces,
+            "limit": selected_limit,
         }
 
     def get_object(self, pid: str, handle: ObjectHandle) -> AgentObject:
@@ -415,7 +426,7 @@ class ObjectMemoryManager:
                 obj.oid,
                 requested,
                 issued_by=issued_by,
-                one_time_decisions=decisions,
+                one_time_decisions=[*decisions, namespace_decision],
                 consume_decisions=[*decisions, namespace_decision],
             )
         self.audit.record(
@@ -756,28 +767,28 @@ class ObjectMemoryManager:
 
     def query_objects(self, pid: str, query: ObjectQuery) -> list[ObjectHandle]:
         results: list[ObjectHandle] = []
-        namespace = self.resolve_namespace(pid, query.namespace)
-        namespace_decision = self._require_namespace_right(pid, namespace, "read")
-        self._require_namespace_exists(namespace)
-        limit = self._validate_query_limit(query.limit)
-        if query.name is None:
-            candidates = self.store.list_objects(namespace=namespace)
-        else:
-            object_name = self._normalize_name(query.name)
-            obj = self.store.get_object_by_name(object_name, namespace=namespace)
-            candidates = [] if obj is None else [obj]
-        query_text = query.text.lower() if query.text else None
-        for obj in candidates:
-            if query.type is not None and obj.type.value != str(query.type):
-                continue
-            if query.tags and not set(query.tags).issubset(set(obj.metadata.tags)):
-                continue
-            if query_text and query_text not in self._search_text(obj).lower():
-                continue
-            decisions: list[Any]
-            rights: set[str]
-            try:
-                with self.store.locked():
+        with self.store.locked():
+            namespace = self.resolve_namespace(pid, query.namespace)
+            namespace_decision = self._require_namespace_right(pid, namespace, "read")
+            self._require_namespace_exists(namespace)
+            limit = self._validate_query_limit(query.limit)
+            if query.name is None:
+                candidates = self.store.list_objects(namespace=namespace)
+            else:
+                object_name = self._normalize_name(query.name)
+                obj = self.store.get_object_by_name(object_name, namespace=namespace)
+                candidates = [] if obj is None else [obj]
+            query_text = query.text.lower() if query.text else None
+            for obj in candidates:
+                if query.type is not None and obj.type.value != str(query.type):
+                    continue
+                if query.tags and not set(query.tags).issubset(set(obj.metadata.tags)):
+                    continue
+                if query_text and query_text not in self._search_text(obj).lower():
+                    continue
+                decisions: list[Any]
+                rights: set[str]
+                try:
                     rights, decisions = self._authorized_object_rights(
                         pid,
                         obj.oid,
@@ -790,25 +801,27 @@ class ObjectMemoryManager:
                         obj.oid,
                         rights,
                         issued_by="memory.query",
-                        one_time_decisions=decisions,
+                        one_time_decisions=[*decisions, namespace_decision],
                         consume_decisions=decisions,
                     )
-            except CapabilityDenied:
-                continue
-            results.append(handle)
-            if len(results) >= limit:
-                break
-        try:
-            self._consume_one_time_decision(namespace_decision)
-        except Exception:
-            self._revoke_derived_handles(pid, results, reason="query namespace permission consume failed")
-            raise
+                except CapabilityDenied:
+                    continue
+                results.append(handle)
+                if len(results) >= limit:
+                    break
+            should_consume_namespace = query.name is None or bool(results)
+            if should_consume_namespace:
+                try:
+                    self._consume_one_time_decision(namespace_decision)
+                except Exception:
+                    self._revoke_derived_handles(pid, results, reason="query namespace permission consume failed")
+                    raise
         self.audit.record(
             actor=pid,
             action="memory.query_objects",
             target=f"object_namespace:{namespace}",
             output_refs=[handle.oid for handle in results],
-            decision={"count": len(results), "namespace": namespace},
+            decision={"count": len(results), "namespace": namespace, "namespace_grant_consumed": should_consume_namespace},
         )
         return results
 
@@ -1223,11 +1236,12 @@ class ObjectMemoryManager:
         refs: list[str] = []
         total = 0
         for obj in objects:
-            tokens = obj.metadata.token_estimate or estimate_tokens(obj.payload)
+            rendered = self._render_object(obj)
+            tokens = estimate_tokens(rendered)
             if total + tokens > selected_budget:
                 omitted.append(obj.oid)
                 continue
-            chunks.append(self._render_object(obj))
+            chunks.append(rendered)
             refs.append(obj.oid)
             total += tokens
         context = MaterializedContext(

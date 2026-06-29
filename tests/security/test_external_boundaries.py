@@ -40,6 +40,29 @@ class TestExternalBoundary:
         assert target.read_text(encoding='utf-8') == 'allowed'
         assert 'primitive.filesystem.write_text' in self._audit_actions()
 
+    def test_overwrite_false_is_atomic_create_only_at_provider_sink(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = f'agent_outputs/create_only_race_{uuid4().hex}.txt'
+        target = self.runtime.workspace_root / path
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='create only race')
+        self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by='test')
+        created_by_racer = False
+
+        def create_before_open(operation: str, sink_target: object) -> None:
+            nonlocal created_by_racer
+            if operation != 'write_text' or created_by_racer or sink_target != target:
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('racer', encoding='utf-8')
+            created_by_racer = True
+
+        monkeypatch.setattr(self.runtime.substrate.filesystem, '_before_path_sink', create_before_open)
+
+        denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
+
+        assert not denied.ok
+        assert 'already exists' in (denied.error or '')
+        assert target.read_text(encoding='utf-8') == 'racer'
+
     def test_write_precondition_does_not_leak_existing_file_without_capability(self) -> None:
         path = self._write_workspace_fixture('existing')
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='probe existing file')

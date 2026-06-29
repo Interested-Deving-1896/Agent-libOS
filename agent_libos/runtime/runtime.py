@@ -967,6 +967,7 @@ class Runtime:
             preserve_capabilities=preserve_capabilities,
             llm_profile_id=llm_profile_id,
         )
+        boot_kind = selected_image.boot.get("kind", "fresh")
         try:
             # Exec swaps the process image and tool table, but deliberately does
             # not apply image required_capabilities. Exec may preserve existing
@@ -974,13 +975,14 @@ class Runtime:
             # authority. Package workspaces are private materialized state, so
             # they are instantiated here just as they are during spawn.
             self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
-            boot_kind = selected_image.boot.get("kind", "fresh")
             if boot_kind == "checkpoint_commit":
                 self._instantiate_checkpoint_commit_image(pid, selected_image)
             elif boot_kind == "image_package":
                 self._instantiate_image_package(pid, selected_image)
             self._configure_process_skills_for_image(pid, image, assigned_by=f"process.exec:{image}")
         except Exception as exc:
+            if boot_kind == "image_package":
+                self._cleanup_image_package_boot_state(pid, selected_image, reason="image_package_exec_failed")
             self._restore_process_exec_state(previous_state)
             self.audit.record(
                 actor="runtime",
@@ -1112,6 +1114,12 @@ class Runtime:
         try:
             self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
         except Exception as exc:
+            if is_image_package:
+                self._cleanup_image_package_boot_state(
+                    pid,
+                    image,
+                    reason="image_package_default_skills_failed",
+                )
             self._fail_process_image_boot(pid, image_id, exc, phase="image.default_skills")
             raise
         if process is not None:
@@ -1525,6 +1533,47 @@ class Runtime:
             target=f"workspace:{workspace_root}",
             decision={"reason": reason},
         )
+
+    def _cleanup_image_package_boot_state(self, pid: str, image: AgentImage, *, reason: str) -> None:
+        process = self.store.get_process(pid)
+        if process is None:
+            return
+        tool_rows = {str(row.get("tool_id")): row for row in self.store.list_tools()}
+        handles: dict[str, ToolHandle] = {}
+        for name, tool_id in list(process.tool_table.items()):
+            row = tool_rows.get(str(tool_id))
+            if row is None or not bool(row.get("ephemeral")):
+                continue
+            if str(row.get("registered_by")) != f"image.package:{image.image_id}":
+                continue
+            handle = getattr(self.tools, "_handles", {}).get(tool_id)
+            handles[name] = handle or ToolHandle(
+                tool_id=tool_id,
+                name=name,
+                capability_id=None,
+                scope=str(row.get("scope") or "ephemeral_process"),
+            )
+        self._remove_registered_image_package_jit_tools(pid, handles)
+        workspace_root = self._materialized_workspace_root_for_cwd(process.working_directory)
+        self._cleanup_materialized_image_workspace(
+            workspace_root,
+            actor=f"image:{image.image_id}",
+            reason=reason,
+        )
+
+    def _materialized_workspace_root_for_cwd(self, cwd: str | None) -> str | None:
+        if not cwd:
+            return None
+        relative = Path(cwd)
+        materialized_root = Path(self.config.image.materialized_workspace_root)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        if relative.parts[: len(materialized_root.parts)] != materialized_root.parts:
+            return None
+        required_parts = len(materialized_root.parts) + 4
+        if len(relative.parts) < required_parts:
+            return None
+        return Path(*relative.parts[:required_parts]).as_posix()
 
     def _prune_empty_materialized_workspace_parents(self, start: Path) -> None:
         boundary = (self.workspace_root / self.config.image.materialized_workspace_root).resolve()

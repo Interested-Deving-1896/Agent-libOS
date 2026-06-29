@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_libos import Runtime
+from agent_libos import AgentImage, Runtime
 from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
 from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectType, ProcessMessageStatus, ProcessStatus
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
@@ -226,6 +226,57 @@ class TestCheckpointRestore:
             assert restored.status == ProcessStatus.RUNNABLE
             assert restored.status_message is None
             assert runtime.human.get(request_id).status == HumanRequestStatus.APPROVED
+        finally:
+            runtime.close()
+
+    def test_restore_refuses_scoped_active_object_task(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='object task restore')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            owner = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {'name': 'owner'},
+                metadata=ObjectMetadata(title='owner'),
+                immutable=False,
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'before task', actor=pid)
+            task = runtime.object_tasks.start(pid, owner, 'receive_process_messages', {'channel': 'never'})
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            with pytest.raises(ValidationError, match='ObjectTasks are active'):
+                runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert runtime.object_tasks.get(task.task_id, actor_pid=pid).status == waiting.status
+        finally:
+            runtime.close()
+
+    def test_restore_does_not_replace_current_image_without_image_write(self) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-restore-image:v0'
+        try:
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-restore-image', system_prompt='snapshot prompt'),
+                actor='test',
+            )
+            pid = runtime.process.spawn(image=image_id, goal='checkpoint image source')
+            checkpoint_id = runtime.checkpoint.create(pid, 'image restore point', actor=pid)
+            runtime.capability.grant(pid, f'checkpoint:{checkpoint_id}', [CapabilityRight.ADMIN], issued_by='test')
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-restore-image', system_prompt='current prompt'),
+                actor='test',
+                replace=True,
+            )
+
+            with pytest.raises(CapabilityDenied, match=f'image:{image_id}'):
+                runtime.checkpoint.restore(pid, checkpoint_id)
+
+            assert runtime.get_image(image_id).system_prompt == 'current prompt'
+            runtime.capability.grant(pid, runtime.image_registry.resource_for(image_id), [CapabilityRight.WRITE], issued_by='test')
+            restored = runtime.checkpoint.restore(pid, checkpoint_id)
+            assert restored['status'] == 'restored'
+            assert runtime.get_image(image_id).system_prompt == 'snapshot prompt'
         finally:
             runtime.close()
 
