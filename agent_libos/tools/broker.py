@@ -351,14 +351,7 @@ class ToolBroker:
             metadata=result.metadata,
         )
         metadata = self.sandbox.metadata_for_source(candidate.source_code)
-        candidate.validation = {
-            "ok": validation.ok,
-            "errors": validation.errors,
-            "warnings": validation.warnings,
-            "logs": validation.logs,
-            "metrics": validation.metadata.get("metrics"),
-            **metadata,
-        }
+        candidate.validation = self._validation_observation(validation, metadata)
         candidate.status = ToolCandidateStatus.VALIDATED if validation.ok else ToolCandidateStatus.REJECTED
         candidate.updated_at = utc_now()
         self.store.update_tool_candidate(candidate)
@@ -692,11 +685,12 @@ class ToolBroker:
             raise
         except ValueError as exc:
             error = str(exc)
+            observed_error = self._error_observation(error)
             self.events.emit(
                 EventType.TOOL_FAILED,
                 source=resource,
                 target=pid,
-                payload={"call_id": call_id, "error": error, "policy_decision": "validation_error"},
+                payload={"call_id": call_id, "error": observed_error, "policy_decision": "validation_error"},
             )
             self.audit.record(
                 actor=pid,
@@ -706,7 +700,7 @@ class ToolBroker:
                     "ok": False,
                     "tool": handle.name,
                     "policy_decision": "validation_error",
-                    "error": error,
+                    "error": observed_error,
                     "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
@@ -802,11 +796,12 @@ class ToolBroker:
                     await jit_session.apply_deferred_lifecycle(result_handle)
                 except Exception as exc:
                     error = str(exc)
+                    observed_error = self._error_observation(error)
                     self.events.emit(
                         EventType.TOOL_FAILED,
                         source=resource,
                         target=pid,
-                        payload={"call_id": call_id, "error": error, "policy_decision": "lifecycle_error"},
+                        payload={"call_id": call_id, "error": observed_error, "policy_decision": "lifecycle_error"},
                     )
                     self.audit.record(
                         actor=pid,
@@ -816,7 +811,7 @@ class ToolBroker:
                             "ok": False,
                             "tool": handle.name,
                             "policy_decision": "lifecycle_error",
-                            "error": sanitize_for_observability(error),
+                            "error": observed_error,
                             "tool_wall_seconds": self._elapsed(started_at),
                         },
                     )
@@ -1562,6 +1557,22 @@ class ToolBroker:
             "truncated": True,
             "preview": "[tool result omitted after size-limit failure]",
         }
+
+    def _validation_observation(self, validation: ValidationResult, metadata: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ok": validation.ok,
+            "errors": [self._error_observation(error) for error in validation.errors],
+            "warnings": [self._error_observation(warning) for warning in validation.warnings],
+            "logs": self._error_observation(validation.logs),
+            "metrics": validation.metadata.get("metrics"),
+            **metadata,
+        }
+
+    def _error_observation(self, text: str) -> dict[str, Any]:
+        return sanitize_for_observability(
+            text,
+            preview_chars=self.config.tools.tool_observability_preview_chars,
+        )
 
 
 def _stable_static_tool_id(name: str, digest_chars: int = _TOOL_DEFAULTS.static_tool_id_digest_chars) -> str:

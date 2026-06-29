@@ -184,6 +184,66 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
+    def test_write_file_rejects_reparse_swap_before_parent_mkdir_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            (root / 'dir').mkdir()
+            provider = SinkSwapProvider(root, outside_root, operation='write_parent')
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='write parent reparse race')
+                runtime.filesystem.grant_path(pid, 'dir/nested/payload.txt', [CapabilityRight.WRITE], issued_by='test')
+
+                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                    runtime.filesystem.write_text(pid, 'dir/nested/payload.txt', 'escaped')
+
+                assert provider.swapped
+                assert not (outside_root / 'nested').exists()
+                assert not (outside_root / 'payload.txt').exists()
+            finally:
+                runtime.close()
+
+    def test_list_directory_rejects_reparse_swap_before_iterdir_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            (root / 'dir').mkdir()
+            (root / 'dir' / 'inside.txt').write_text('inside', encoding='utf-8')
+            (outside_root / 'secret.txt').write_text('outside', encoding='utf-8')
+            provider = SinkSwapProvider(root, outside_root, operation='list_directory')
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='list reparse race')
+                runtime.filesystem.grant_directory(pid, 'dir', [CapabilityRight.READ], issued_by='test')
+
+                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                    runtime.filesystem.read_directory(pid, 'dir')
+
+                assert provider.swapped
+            finally:
+                runtime.close()
+
+    def test_descriptor_bound_parent_mkdir_closes_intermediate_directory_fds(self) -> None:
+        if os.open not in os.supports_dir_fd:
+            pytest.skip('descriptor-bound directory operations are not used on this platform')
+        before = _open_fd_count()
+        if before is None:
+            pytest.skip('open fd count is not available on this platform')
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace).resolve()
+            provider = LocalFilesystemProvider(root)
+            for index in range(20):
+                file_path = f'write/{index}/a/b/c/payload.txt'
+                dir_path = f'mkdir/{index}/a/b/c'
+                provider.write_text(ResolvedPath(display=str(root / file_path), relative=file_path), 'payload', 'utf-8')
+                provider.make_directory(ResolvedPath(display=str(root / dir_path), relative=dir_path), parents=True, exist_ok=True)
+
+        after = _open_fd_count()
+        if after is None:
+            pytest.skip('open fd count disappeared on this platform')
+        assert after <= before + 3
+
     def test_delete_file_rejects_reparse_swap_before_unlink_sink(self) -> None:
         with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
             root = Path(workspace)
@@ -511,3 +571,12 @@ def _create_directory_reparse_link(link: Path, target: Path) -> None:
     )
     if result.returncode != 0:
         pytest.skip(f'junction creation is not available in this environment: {result.stderr or result.stdout}')
+
+
+def _open_fd_count() -> int | None:
+    for candidate in (Path('/proc/self/fd'), Path('/dev/fd')):
+        try:
+            return len(list(candidate.iterdir()))
+        except OSError:
+            continue
+    return None

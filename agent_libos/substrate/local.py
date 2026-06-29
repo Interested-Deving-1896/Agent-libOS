@@ -268,9 +268,8 @@ class LocalFilesystemProvider:
     ) -> None:
         with self._path_lock:
             target = self._target(path)
-            self._before_path_sink("write_parent", target.parent)
-            target = self._target(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
+            self._before_path_sink_checked("write_parent", target.parent)
+            self._ensure_parent_dirs_under_root(target)
             target = self._target(path)
             self._before_path_sink("write_text", target)
             target = self._target(path)
@@ -281,19 +280,15 @@ class LocalFilesystemProvider:
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None:
         with self._path_lock:
             target = self._target(path)
-            self._before_path_sink("make_directory", target)
-            target = self._target(path)
-            target.mkdir(parents=parents, exist_ok=exist_ok)
+            self._before_path_sink_checked("make_directory", target)
+            self._make_directory_under_root(target, parents=parents, exist_ok=exist_ok)
             self._target(path)
 
     def list_directory(self, path: ResolvedPath, *, limit: int | None = None) -> list[DirectoryEntrySnapshot]:
         with self._path_lock:
             target = self._target(path)
-            if limit is not None and limit > 0:
-                children = heapq.nsmallest(limit, target.iterdir(), key=lambda item: item.name)
-            else:
-                children = sorted(target.iterdir(), key=lambda item: item.name)
-            return [self._directory_entry(child) for child in children]
+            self._before_path_sink_checked("list_directory", target)
+            return self._list_directory_under_root(target, limit=limit)
 
     def delete_file(self, path: ResolvedPath) -> None:
         with self._path_lock:
@@ -476,6 +471,113 @@ class LocalFilesystemProvider:
             os.close(dir_fd)
             raise
 
+    def _supports_dir_fd_directory_ops(self, *, require_list: bool = False) -> bool:
+        supported = (
+            os.open in os.supports_dir_fd
+            and os.mkdir in os.supports_dir_fd
+            and os.stat in os.supports_dir_fd
+        )
+        if require_list:
+            supported = supported and os.listdir in os.supports_fd
+        return supported
+
+    def _ensure_parent_dirs_under_root(self, target: Path) -> None:
+        parts = self._relative_parts(target)
+        if len(parts) <= 1:
+            return
+        if not self._supports_dir_fd_directory_ops():
+            self._fallback_create_parent_dirs(target)
+            return
+        dir_fd = self._open_root_dir_fd()
+        try:
+            for part in parts[:-1]:
+                next_fd = self._mkdir_or_open_dir_component(dir_fd, part, exist_ok=True)
+                os.close(dir_fd)
+                dir_fd = next_fd
+        finally:
+            os.close(dir_fd)
+
+    def _make_directory_under_root(self, target: Path, *, parents: bool, exist_ok: bool) -> None:
+        parts = self._relative_parts(target)
+        if not parts:
+            if exist_ok:
+                return
+            raise FileExistsError(os.fspath(target))
+        if not self._supports_dir_fd_directory_ops():
+            self._fallback_make_directory(target, parents=parents, exist_ok=exist_ok)
+            return
+        if parents:
+            dir_fd = self._open_root_dir_fd()
+            try:
+                for index, part in enumerate(parts):
+                    if index == len(parts) - 1:
+                        self._mkdir_component(dir_fd, part, target, exist_ok=exist_ok)
+                        next_fd = self._open_dir_component(dir_fd, part)
+                        os.close(dir_fd)
+                        dir_fd = next_fd
+                    else:
+                        next_fd = self._mkdir_or_open_dir_component(dir_fd, part, exist_ok=True)
+                        os.close(dir_fd)
+                        dir_fd = next_fd
+            finally:
+                os.close(dir_fd)
+            return
+        dir_fd, name = self._open_parent_dir_fd(target)
+        try:
+            self._mkdir_component(dir_fd, name, target, exist_ok=exist_ok)
+        finally:
+            os.close(dir_fd)
+
+    def _mkdir_or_open_dir_component(self, dir_fd: int, name: str, *, exist_ok: bool) -> int:
+        try:
+            return self._open_dir_component(dir_fd, name)
+        except FileNotFoundError:
+            self._mkdir_component(dir_fd, name, Path(name), exist_ok=False)
+            return self._open_dir_component(dir_fd, name)
+        except NotADirectoryError:
+            raise
+
+    def _mkdir_component(self, dir_fd: int, name: str, target: Path, *, exist_ok: bool) -> None:
+        try:
+            os.mkdir(name, mode=0o777, dir_fd=dir_fd)
+        except FileExistsError:
+            if not exist_ok:
+                raise
+            opened_fd = self._open_dir_component(dir_fd, name)
+            os.close(opened_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise CapabilityDenied(f"filesystem path contains a symlink or non-directory component: {target}") from exc
+            raise
+
+    def _list_directory_under_root(self, target: Path, *, limit: int | None) -> list[DirectoryEntrySnapshot]:
+        if not self._supports_dir_fd_directory_ops(require_list=True):
+            return self._fallback_list_directory(target, limit=limit)
+        dir_fd = self._open_directory_under_root(target)
+        try:
+            names = os.listdir(dir_fd)
+            selected_names = heapq.nsmallest(limit, names) if limit is not None and limit > 0 else sorted(names)
+            entries: list[DirectoryEntrySnapshot] = []
+            for name in selected_names:
+                stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                entries.append(self._directory_entry_from_stat(target, name, stat_result))
+            return entries
+        finally:
+            os.close(dir_fd)
+
+    def _open_directory_under_root(self, target: Path) -> int:
+        parts = self._relative_parts(target)
+        dir_fd = self._open_root_dir_fd()
+        try:
+            for part in parts:
+                next_fd = self._open_dir_component(dir_fd, part)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            return dir_fd
+        except Exception:
+            os.close(dir_fd)
+            raise
+
     def _require_file_component_for_delete(self, dir_fd: int, name: str, target: Path) -> None:
         try:
             stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -501,6 +603,46 @@ class LocalFilesystemProvider:
             raise CapabilityDenied(
                 f"filesystem path contains a symlink or junction, or changed before {operation}: {target}"
             ) from exc
+
+    def _fallback_create_parent_dirs(self, target: Path) -> None:
+        if target.parent == self.root:
+            return
+        guard = self._windows_parent_directory_guard(target)
+        if guard is not None:
+            guard.close()
+            return
+        raise CapabilityDenied("filesystem parent creation requires descriptor-bound directory operations")
+
+    def _fallback_make_directory(self, target: Path, *, parents: bool, exist_ok: bool) -> None:
+        guard = self._windows_parent_directory_guard(target)
+        try:
+            self._target(ResolvedPath(display=os.fspath(target), relative=target.relative_to(self.root).as_posix()))
+            if parents:
+                raise CapabilityDenied("recursive directory creation requires descriptor-bound directory operations")
+            target.mkdir(parents=False, exist_ok=exist_ok)
+        finally:
+            if guard is not None:
+                guard.close()
+
+    def _fallback_list_directory(self, target: Path, *, limit: int | None) -> list[DirectoryEntrySnapshot]:
+        guard = _WindowsDirectoryGuard.open(target) if os.name == "nt" else None
+        try:
+            if guard is None:
+                raise CapabilityDenied("directory listing requires descriptor-bound directory operations")
+            opened = self._windows_final_path_from_handle(guard.handle)
+            requested = Path(os.path.abspath(os.fspath(target)))
+            if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
+                raise CapabilityDenied(f"filesystem directory path changed during validation: {target}")
+            if self.root not in opened.parents and opened != self.root:
+                raise CapabilityDenied(f"filesystem directory path escapes adapter root: {target}")
+            if limit is not None and limit > 0:
+                children = heapq.nsmallest(limit, target.iterdir(), key=lambda item: item.name)
+            else:
+                children = sorted(target.iterdir(), key=lambda item: item.name)
+            return [self._directory_entry(child) for child in children]
+        finally:
+            if guard is not None:
+                guard.close()
 
     def _windows_parent_directory_guard(self, target: Path) -> _WindowsDirectoryGuard | None:
         if os.name != "nt":
@@ -623,6 +765,9 @@ class LocalFilesystemProvider:
 
     def _directory_entry(self, target: Path) -> DirectoryEntrySnapshot:
         stat_result = target.lstat()
+        return self._directory_entry_from_stat(target.parent, target.name, stat_result)
+
+    def _directory_entry_from_stat(self, parent: Path, name: str, stat_result: os.stat_result) -> DirectoryEntrySnapshot:
         mode = stat_result.st_mode
         kind = (
             "symlink"
@@ -633,8 +778,9 @@ class LocalFilesystemProvider:
             if stat.S_ISDIR(mode)
             else "other"
         )
+        target = parent / name
         return DirectoryEntrySnapshot(
-            name=target.name,
+            name=name,
             path=target.relative_to(self.root).as_posix(),
             kind=kind,
             size_bytes=stat_result.st_size if kind == "file" else None,
@@ -1435,6 +1581,19 @@ class SdkMcpProvider:
         context: dict[str, Any],
         result: Any,
     ) -> ExternalEffectClassification:
+        if operation == "list_tools":
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    "provider": "mcp",
+                    "server_id": context.get("server_id"),
+                    "transport": context.get("transport"),
+                    "operation": operation,
+                },
+            )
         if operation != "call_tool":
             raise ValueError(f"unsupported MCP external effect operation: {operation}")
         rollback_class = ExternalEffectRollbackClass(str(context["rollback_class"]))

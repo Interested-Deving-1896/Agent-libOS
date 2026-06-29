@@ -654,9 +654,9 @@ class DenoTypescriptSandbox(SandboxBackend):
                     return True
             if token == ("identifier", "constructor"):
                 previous_token = tokens[index - 1] if index > 0 else None
-                if previous_token == ("punct", ".") and self._token_is_call(tokens, index):
+                if previous_token == ("punct", "."):
                     return True
-            if token == ("string", "constructor") and self._token_is_bracketed_property_call(tokens, index):
+            if token == ("string", "constructor") and self._token_is_bracketed_property(tokens, index):
                 return True
         return False
 
@@ -691,6 +691,10 @@ class DenoTypescriptSandbox(SandboxBackend):
     def _token_is_bracketed_property_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
         property_name, _, close_index = self._constant_bracket_property_name_at(tokens, index)
         return property_name == "constructor" and self._token_is_call_after(tokens, close_index)
+
+    def _token_is_bracketed_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
+        property_name, open_index, _ = self._constant_bracket_property_name_at(tokens, index)
+        return property_name == "constructor" and open_index > 0
 
     def _token_starts_global_runtime_code_generation_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
         cursor = index + 1

@@ -195,6 +195,7 @@ function userPageSnapshot(): RuntimeSnapshot {
     images: [],
     skills: [],
     jsonrpc_endpoints: [],
+    mcp_servers: [],
     modules: []
   };
 }

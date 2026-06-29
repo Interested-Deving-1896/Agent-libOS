@@ -19,6 +19,7 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource, ModuleSourceFile
+from agent_libos.utils.ids import new_id
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _MODULE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
@@ -59,6 +60,7 @@ _SENSITIVE_PACKAGE_FILENAMES = {
 }
 _SENSITIVE_PACKAGE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _IMPORT_LOCK = threading.RLock()
+_IMPORT_CLEANUP_ATTR = "__agent_libos_package_cleanup__"
 
 
 class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
@@ -279,11 +281,39 @@ class ModuleLoader:
                     source.source_sha256,
                     source.source_bytes,
                 )
-        self._verify_imported_module_source(module, source)
-        entrypoint = getattr(module, object_name, None)
-        if not callable(entrypoint):
-            raise ValidationError(f"module entrypoint is not callable: {source.manifest.entrypoint}")
-        return entrypoint
+        try:
+            self._verify_imported_module_source(module, source)
+            entrypoint = getattr(module, object_name, None)
+            if not callable(entrypoint):
+                raise ValidationError(f"module entrypoint is not callable: {source.manifest.entrypoint}")
+            return entrypoint
+        except Exception:
+            self._cleanup_imported_package(module)
+            raise
+
+    @classmethod
+    def import_cleanup_for_entrypoint(cls, entrypoint: Any) -> tuple[str, Any] | None:
+        module_name = getattr(entrypoint, "__module__", None)
+        if not isinstance(module_name, str):
+            return None
+        module = sys.modules.get(module_name)
+        if module is None:
+            return None
+        cleanup = getattr(module, _IMPORT_CLEANUP_ATTR, None)
+        if isinstance(cleanup, tuple) and len(cleanup) == 2:
+            return cleanup
+        return None
+
+    @classmethod
+    def cleanup_imported_package(cls, cleanup: Any) -> None:
+        if not isinstance(cleanup, tuple) or len(cleanup) != 2:
+            return
+        package_name, importer = cleanup
+        cls._clear_import_namespace(str(package_name))
+        try:
+            sys.meta_path.remove(importer)
+        except ValueError:
+            pass
 
     def is_trusted(self, module_id: str, source_sha256: str) -> bool:
         accepted = {
@@ -589,6 +619,7 @@ class ModuleLoader:
         package_name = (
             "_agent_libos_module_pkg_"
             f"{hashlib.sha256((source.manifest.module_id + source.source_root + source.source_sha256).encode('utf-8')).hexdigest()}"
+            f"_{new_id('load')}"
         )
         entry_module_path = self._source_root_relative_path(Path(source.source_root).resolve(), Path(source.source_path).resolve())
         importer = _SnapshotPackageImporter(package_name, tuple(source.source_files), entry_module_path)
@@ -598,20 +629,28 @@ class ModuleLoader:
             entry_name = f"{package_name}.{entry_module_path[:-len('/__init__.py')].replace('/', '.')}"
         else:
             entry_name = f"{package_name}.{entry_module_path[:-3].replace('/', '.')}"
-        before_modules = set(sys.modules)
+        self._clear_import_namespace(package_name)
         sys.meta_path.insert(0, importer)
         try:
-            return importlib.import_module(entry_name)
+            module = importlib.import_module(entry_name)
+            setattr(module, _IMPORT_CLEANUP_ATTR, (package_name, importer))
+            return module
         except Exception:
-            for name in set(sys.modules) - before_modules:
-                if name == package_name or name.startswith(f"{package_name}."):
-                    sys.modules.pop(name, None)
-            raise
-        finally:
+            self._clear_import_namespace(package_name)
             try:
                 sys.meta_path.remove(importer)
             except ValueError:
                 pass
+            raise
+
+    def _cleanup_imported_package(self, module: ModuleType) -> None:
+        self.cleanup_imported_package(getattr(module, _IMPORT_CLEANUP_ATTR, None))
+
+    @staticmethod
+    def _clear_import_namespace(module_name: str) -> None:
+        for name in list(sys.modules):
+            if name == module_name or name.startswith(f"{module_name}."):
+                sys.modules.pop(name, None)
 
     def _exec_source_module(self, module_name: str, path: Path, source_bytes: bytes) -> ModuleType:
         spec = importlib.util.spec_from_loader(module_name, loader=None, origin=str(path))
@@ -624,9 +663,8 @@ class ModuleLoader:
         sys.modules[module_name] = module
         try:
             exec(compile(source_bytes, str(path), "exec"), module.__dict__)
-        except Exception:
+        finally:
             sys.modules.pop(module_name, None)
-            raise
         return module
 
     def _verify_imported_module_source(self, module: ModuleType, source: ModuleSource) -> None:

@@ -302,6 +302,7 @@ class CapabilityManager:
             and self._resource_matches(cap.resource, resource)
             and requested_right in cap.rights
         ]
+        matches = self._sort_matching_capabilities(matches)
         return self._decision_from_matches(
             subject=subject,
             resource=resource,
@@ -1037,6 +1038,10 @@ class CapabilityManager:
             if requested_right not in cap.rights:
                 continue
             matches.append(cap)
+        return self._sort_matching_capabilities(matches)
+
+    def _sort_matching_capabilities(self, capabilities: Iterable[Capability]) -> list[Capability]:
+        matches = list(capabilities)
         matches.sort(key=lambda cap: cap.cap_id)
         matches.sort(key=lambda cap: cap.issued_at, reverse=True)
         matches.sort(key=lambda cap: len(cap.resource), reverse=True)

@@ -390,6 +390,7 @@ class Runtime:
             except Exception as exc:
                 errors.append({"component": f"shutdown_finalizer:{index}", "error": str(exc), "error_type": type(exc).__name__})
         for name, component in [
+            ("modules", getattr(self, "modules", None)),
             ("llms", getattr(self, "llms", None)),
             ("substrate", self.substrate),
         ]:
@@ -463,6 +464,7 @@ class Runtime:
             except Exception as exc:
                 errors.append({"component": f"shutdown_finalizer:{index}", "error": str(exc), "error_type": type(exc).__name__})
         for name, component in [
+            ("modules", getattr(self, "modules", None)),
             ("llms", getattr(self, "llms", None)),
             ("substrate", self.substrate),
         ]:

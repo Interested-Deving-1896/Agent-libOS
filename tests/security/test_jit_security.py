@@ -441,6 +441,9 @@ class TestJitSecurity:
         bracket_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {})["constructor"]("return import(args.spec)")(); }')
         optional_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {}).constructor?.("return import(args.spec)")(); }')
         bracket_constructor_call_import = checker.static_check('export async function run(args, libos) { return await (async function() {})["constructor"].call(null, "return import(args.spec)")(); }')
+        constructor_alias_import = checker.static_check('export async function run(args, libos) { const C = (function(){}).constructor; return await C("return import(args.spec)")(); }')
+        bracket_constructor_alias_import = checker.static_check('export async function run(args, libos) { const C = (function(){})["constructor"]; return await C("return import(args.spec)")(); }')
+        optional_constructor_alias_import = checker.static_check('export async function run(args, libos) { const C = (function(){}).constructor; return await C?.("return import(args.spec)")(); }')
         local_methods = checker.static_check(
             'export function run(args, libos) { '
             'const obj = { eval() { return 1; }, Function() { return 2; } }; '
@@ -483,6 +486,12 @@ class TestJitSecurity:
         assert any('runtime code generation is not allowed' in error for error in optional_constructor_import.errors)
         assert not bracket_constructor_call_import.ok
         assert any('runtime code generation is not allowed' in error for error in bracket_constructor_call_import.errors)
+        assert not constructor_alias_import.ok
+        assert any('runtime code generation is not allowed' in error for error in constructor_alias_import.errors)
+        assert not bracket_constructor_alias_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_constructor_alias_import.errors)
+        assert not optional_constructor_alias_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_constructor_alias_import.errors)
         assert local_methods.ok, local_methods.errors
 
     def test_deno_executable_resolution_rejects_workspace_path_hijack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -616,6 +625,63 @@ class TestJitSecurity:
                 assert 'sha256' in observed
             finally:
                 runtime.close()
+
+    def test_jit_validation_observability_redacts_sensitive_errors(self) -> None:
+        secret = 'SECRET_JIT_VALIDATION_LEAK'
+        self.runtime.tools.sandbox = LeakyValidationSandbox(secret)
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='redact jit validation')
+        candidate = self.runtime.tools.propose(
+            pid,
+            {'name': 'leaky_validation', 'description': 'Leaky validation.', 'input_schema': {'type': 'object'}},
+            source_code='export function run(args, libos) { return {}; }',
+        )
+
+        validation = self.runtime.tools.validate(candidate)
+        persisted = self.runtime.store.get_tool_candidate(candidate).validation
+        observed = dumps(
+            {
+                'candidate': persisted,
+                'audit': [record.decision for record in self.runtime.audit.trace()],
+            }
+        )
+
+        assert not validation.ok
+        assert secret in validation.errors[0]
+        assert secret not in observed
+        assert 'sha256' in observed
+
+    def test_jit_schema_error_observability_redacts_sensitive_values(self) -> None:
+        secret = 'SECRET_JIT_SCHEMA_LEAK'
+        self.runtime.tools.sandbox = SecretOutputSandbox(secret)
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='redact jit schema')
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'bad_secret_output',
+                'description': 'Returns a sensitive invalid output.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {
+                    'type': 'object',
+                    'properties': {'token': {'type': 'number'}},
+                    'required': ['token'],
+                },
+            },
+            source_code='export function run(args, libos) { return {}; }',
+        )
+        self.runtime.tools.register(pid, candidate)
+
+        result = self.runtime.tools.call(pid, 'bad_secret_output', {})
+        observed = dumps(
+            {
+                'events': [event.payload for event in self.runtime.events.list(target=pid)],
+                'audit': [record.decision for record in self.runtime.audit.trace()],
+            }
+        )
+
+        assert not result.ok
+        assert secret in (result.error or '')
+        assert secret not in observed
+        assert 'sha256' in observed
 
     @pytest.mark.real_deno
     def test_real_deno_tool_runs_and_has_no_host_read_permission(self) -> None:
@@ -780,3 +846,35 @@ class PerCaseValidationSandbox(SandboxBackend):
                 "limit_kind": None,
             }
         return ValidationResult(ok=True, logs=f"case {self.calls}", metadata=metadata)
+
+
+class LeakyValidationSandbox(SandboxBackend):
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(self, source_code: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float | None = None) -> ValidationResult:
+        return ValidationResult(
+            ok=False,
+            errors=[f"validation failed with token={self.secret}"],
+            logs=f"Authorization: Bearer {self.secret}",
+        )
+
+
+class SecretOutputSandbox(SandboxBackend):
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(self, source_code: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        return {"token": self.secret}
+
+    def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float | None = None) -> ValidationResult:
+        return ValidationResult(ok=True)

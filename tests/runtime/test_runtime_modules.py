@@ -336,6 +336,80 @@ sha256: {source_sha}
             finally:
                 runtime.close()
 
+    def test_multifile_module_runtime_lazy_relative_imports_use_snapshot_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / 'lazypkg'
+            package.mkdir()
+            (package / '__init__.py').write_text('', encoding='utf-8')
+            (package / 'helper.py').write_text(
+                "def helper(value):\n"
+                "    return f'{value}-from-helper'\n",
+                encoding='utf-8',
+            )
+            (package / 'main.py').write_text(
+                """
+from pydantic import BaseModel
+
+from agent_libos.models import AgentImage
+from agent_libos.tools.base import SyncAgentTool, ToolContext
+
+
+class LazyEchoArgs(BaseModel):
+    text: str
+
+
+class LazyEchoTool(SyncAgentTool[LazyEchoArgs]):
+    name = "lazy_echo"
+    description = "Echo text through a runtime relative import."
+    args_schema = LazyEchoArgs
+
+    def run(self, args: LazyEchoArgs, ctx: ToolContext):
+        from .helper import helper
+
+        return {"value": helper(args.text), "pid": ctx.pid}
+
+
+def register_module(ctx):
+    ctx.register_tool(LazyEchoTool())
+    ctx.register_image(AgentImage(
+        image_id="lazy-agent:v0",
+        name="lazy-agent",
+        default_tools=["lazy_echo"],
+    ))
+""".lstrip(),
+                encoding='utf-8',
+            )
+            package_sha = _module_package_sha(root, package)
+            manifest = root / 'module.yaml'
+            manifest.write_text(
+                f"""
+schema_version: 1
+module_id: lazy-module:v0
+name: Lazy multi-file startup module
+version: v0
+entrypoint: lazypkg.main:register_module
+provides:
+  tools: ['lazy_echo']
+  images: ['lazy-agent:v0']
+  syscalls: []
+  provider_hooks: []
+  startup_hooks: []
+sha256: {package_sha}
+""".lstrip(),
+                encoding='utf-8',
+            )
+
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'lazy-module:v0:{package_sha}',))
+            try:
+                pid = runtime.process.spawn(image='lazy-agent:v0', goal='lazy module')
+                result = runtime.tools.call(pid, 'lazy_echo', {'text': 'hello'})
+
+                assert result.ok, result.error
+                assert result.payload['value'] == 'hello-from-helper'
+            finally:
+                runtime.close()
+
     def test_multifile_module_package_ignores_generated_cache_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -361,6 +435,60 @@ sha256: {source_sha}
             (root / 'pkg' / 'helper.py').write_text("HELPER_MARKER = 'helper-v2'\n", encoding='utf-8')
             with pytest.raises(ValidationError, match='source sha256 mismatch'):
                 Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'multi-module:v0:{package_sha}',))
+
+    def test_multifile_module_reloads_fresh_with_same_package_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sentinel = root / 'imports.txt'
+            package = root / 'freshpkg'
+            package.mkdir()
+            (package / '__init__.py').write_text('', encoding='utf-8')
+            (package / 'main.py').write_text(
+                f"from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).open('a', encoding='utf-8').write('imported\\n')\n\n"
+                "def register_module(ctx):\n"
+                "    pass\n",
+                encoding='utf-8',
+            )
+            package_sha = _module_package_sha(root, package)
+            manifest = root / 'module.yaml'
+            manifest.write_text(
+                f"""
+schema_version: 1
+module_id: fresh-module:v0
+name: Fresh multi-file module
+entrypoint: freshpkg.main:register_module
+provides: {{}}
+sha256: {package_sha}
+""".lstrip(),
+                encoding='utf-8',
+            )
+
+            first = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'fresh-module:v0:{package_sha}',))
+            first.close()
+            second = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'fresh-module:v0:{package_sha}',))
+            second.close()
+
+            assert sentinel.read_text(encoding='utf-8') == 'imported\nimported\n'
+
+    def test_multifile_module_package_import_state_is_cleaned_on_runtime_close(self) -> None:
+        before_meta_path = tuple(sys.meta_path)
+        before_module_names = {name for name in sys.modules if name.startswith('_agent_libos_module_pkg_')}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, package_sha = _write_tiny_multifile_module(root)
+            runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'tiny-module:v0:{package_sha}',))
+            try:
+                loaded_module_names = {name for name in sys.modules if name.startswith('_agent_libos_module_pkg_')}
+
+                assert len(sys.meta_path) == len(before_meta_path) + 1
+                assert loaded_module_names - before_module_names
+            finally:
+                runtime.close()
+
+        assert tuple(sys.meta_path) == before_meta_path
+        assert {name for name in sys.modules if name.startswith('_agent_libos_module_pkg_')} == before_module_names
 
     def test_multifile_module_source_swap_after_trust_does_not_execute_swapped_helper(
         self,

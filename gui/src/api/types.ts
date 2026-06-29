@@ -257,6 +257,7 @@ export type RuntimeSnapshot = {
   images: ImageSummary[];
   skills: Record<string, unknown>[];
   jsonrpc_endpoints: Record<string, unknown>[];
+  mcp_servers: Record<string, unknown>[];
   modules: Record<string, unknown>[];
   _truncated?: Record<string, unknown>;
 };

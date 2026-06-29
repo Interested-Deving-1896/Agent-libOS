@@ -110,9 +110,12 @@ class JsonRpcPrimitive:
             required_right = CapabilityRight.ADMIN if existing is not None else CapabilityRight.WRITE
             self.capabilities.require(actor, self.endpoint_resource(spec.endpoint_id), required_right)
         now = utc_now()
-        self.store.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
         if existing is not None:
-            self._disable_replaced_endpoint_method_capabilities(spec.endpoint_id, actor=actor)
+            with self.store.transaction():
+                self.store.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
+                self._disable_replaced_endpoint_method_capabilities(spec.endpoint_id, actor=actor)
+        else:
+            self.store.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=actor,

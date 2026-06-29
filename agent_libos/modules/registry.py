@@ -27,6 +27,7 @@ class RuntimeModuleRegistry:
         self._loaded_modules: dict[str, dict[str, Any]] = {}
         self._applied_contexts: dict[str, ModuleContext] = {}
         self._applied_sources: dict[str, ModuleSource] = {}
+        self._module_import_cleanups: dict[str, tuple[str, Any]] = {}
         self._startup_hooks_ran = False
 
     def load_core_module(self) -> dict[str, Any]:
@@ -107,7 +108,8 @@ class RuntimeModuleRegistry:
                 )
             self._require_module_id_available(source.manifest.module_id, source.source_sha256)
             entrypoint = loader.import_entrypoint(source)
-            return self._load_from_entrypoint(source, entrypoint, enforce_provides=True)
+            import_cleanup = loader.import_cleanup_for_entrypoint(entrypoint)
+            return self._load_from_entrypoint(source, entrypoint, enforce_provides=True, import_cleanup=import_cleanup)
         except Exception as exc:
             self._record_failed_manifest(manifest_path, exc)
             if self.config.modules.load_policy == "warn":
@@ -164,7 +166,18 @@ class RuntimeModuleRegistry:
                 raise
         self._startup_hooks_ran = True
 
-    def _load_from_entrypoint(self, source: ModuleSource, entrypoint: Any, *, enforce_provides: bool) -> dict[str, Any]:
+    def shutdown(self) -> bool:
+        self._cleanup_all_module_imports()
+        return True
+
+    def _load_from_entrypoint(
+        self,
+        source: ModuleSource,
+        entrypoint: Any,
+        *,
+        enforce_provides: bool,
+        import_cleanup: tuple[str, Any] | None = None,
+    ) -> dict[str, Any]:
         ctx = ModuleContext(self.runtime, source.manifest, enforce_provides=enforce_provides)
         try:
             result = entrypoint(ctx)
@@ -211,6 +224,8 @@ class RuntimeModuleRegistry:
             }
             self._applied_contexts[source.manifest.module_id] = ctx
             self._applied_sources[source.manifest.module_id] = source
+            if import_cleanup is not None:
+                self._module_import_cleanups[source.manifest.module_id] = import_cleanup
             self.runtime.events.emit(
                 EventType.MODULE_LOADED,
                 source="runtime",
@@ -235,6 +250,7 @@ class RuntimeModuleRegistry:
             return self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
         except Exception:
             self._rollback_context(ctx)
+            self._cleanup_module_import(source.manifest.module_id, fallback=import_cleanup)
             self._loaded_modules.pop(source.manifest.module_id, None)
             self._applied_contexts.pop(source.manifest.module_id, None)
             self._applied_sources.pop(source.manifest.module_id, None)
@@ -367,9 +383,18 @@ class RuntimeModuleRegistry:
         ctx = self._applied_contexts.get(module_id)
         if ctx is not None:
             self._rollback_context(ctx)
+        self._cleanup_module_import(module_id)
         self._loaded_modules.pop(module_id, None)
         self._applied_contexts.pop(module_id, None)
         self._applied_sources.pop(module_id, None)
+
+    def _cleanup_all_module_imports(self) -> None:
+        for module_id in reversed(list(self._module_import_cleanups)):
+            self._cleanup_module_import(module_id)
+
+    def _cleanup_module_import(self, module_id: str, *, fallback: tuple[str, Any] | None = None) -> None:
+        cleanup = self._module_import_cleanups.pop(module_id, None) or fallback
+        ModuleLoader.cleanup_imported_package(cleanup)
 
     def _rollback_context(self, ctx: ModuleContext) -> None:
         self._provider_hooks = [item for item in self._provider_hooks if item[0] != ctx.module_id]

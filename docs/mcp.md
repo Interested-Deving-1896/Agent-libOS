@@ -71,18 +71,24 @@ mcp:<server_id>:*
 mcp:*
 ```
 
-`list_mcp_servers`, `inspect_mcp_server`, and `list_mcp_tools` require server
-metadata read authority when called by a process. `call_mcp_tool` requires the
-right declared by the tool spec on `mcp:<server_id>:<tool_id>`.
+`list_mcp_servers`, `inspect_mcp_server`, and `list_mcp_tools` without live
+refresh require server metadata read authority when called by a process.
+`list_mcp_tools(refresh=true)` crosses the provider boundary to run
+`tools/list`, so it also requires `execute` on `mcp_server:<server_id>` and is
+recorded as an MCP external read effect. Host/admin refreshes that bypass
+process capability checks still record the external read attempt under a host
+actor. `call_mcp_tool` requires the right declared by the tool spec on
+`mcp:<server_id>:<tool_id>`.
 
 Tool visibility is not authority. Default images can see the MCP tools, but a
 process cannot call a registered MCP tool without the matching capability.
 
 ## Security Rules
 
-Only manifest-declared tools may be called. Before a call consumes one-shot
-tool authority, the primitive asks the provider for live tool metadata and
-fails closed if the server no longer exposes the tool or if a pinned
+Only manifest-declared tools may be called. Once a call crosses the external
+attempt boundary, one-shot tool authority is consumed even if live metadata
+validation later fails. The primitive asks the provider for live tool metadata
+and fails closed if the server no longer exposes the tool or if a pinned
 `input_schema` changed.
 
 HTTP transport follows the same default network posture as JSON-RPC: HTTPS for

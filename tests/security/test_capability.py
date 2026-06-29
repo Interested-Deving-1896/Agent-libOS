@@ -48,6 +48,32 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_deny_dominates_unordered_matching_capability_candidates(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='deny dominates unordered')
+            deny = runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+            )
+            allow = runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
+
+            decision = runtime.capability.authorize_matching_capabilities(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                [allow, deny],
+            )
+
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.DENY
+            assert decision.selected_capability_id == deny.cap_id
+        finally:
+            runtime.close()
+
     def test_restrictive_capability_with_bad_constraint_fails_closed_over_allow(self) -> None:
         runtime = Runtime.open('local')
         try:

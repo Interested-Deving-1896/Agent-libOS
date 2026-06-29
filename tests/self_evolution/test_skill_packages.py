@@ -94,6 +94,66 @@ class TestSkillPackageLoading:
             finally:
                 runtime.close()
 
+    def test_package_hash_binds_instructions_and_resource_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(
+                root,
+                'integrity-skill',
+                allowed_tools=['echo'],
+                extra_resources={'references/guide.md': 'resource-v1\n'},
+                body='# integrity-skill\n\ninstruction-v1\n',
+            )
+            runtime = Runtime.open('local')
+            try:
+                first = runtime.skills.validate_package_path(skill_dir)['package_sha256']
+
+                write_skill_package(
+                    root,
+                    'integrity-skill',
+                    allowed_tools=['echo'],
+                    extra_resources={'references/guide.md': 'resource-v1\n'},
+                    body='# integrity-skill\n\ninstruction-v2\n',
+                )
+                instruction_changed = runtime.skills.validate_package_path(skill_dir)['package_sha256']
+
+                write_skill_package(
+                    root,
+                    'integrity-skill',
+                    allowed_tools=['echo'],
+                    extra_resources={'references/guide.md': 'resource-v2\n'},
+                    body='# integrity-skill\n\ninstruction-v1\n',
+                )
+                resource_changed = runtime.skills.validate_package_path(skill_dir)['package_sha256']
+
+                assert first != instruction_changed
+                assert first != resource_changed
+                assert instruction_changed != resource_changed
+            finally:
+                runtime.close()
+
+    def test_loaded_skill_snapshot_hash_rejects_tampered_resource_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'tamper-skill',
+                allowed_tools=['echo'],
+                extra_resources={'references/guide.md': 'resource-v1\n'},
+            )
+            runtime = Runtime.open('local')
+            try:
+                package, _source = runtime.skills._load_package_from_host_path(skill_dir)
+                snapshot = runtime.skills._skill_snapshot(package)
+                for resource in snapshot['resources']:
+                    if resource['path'] == 'references/guide.md':
+                        resource['content'] = 'resource-v2\n'
+                        break
+
+                with pytest.raises(ValidationError, match='snapshot hash'):
+                    runtime.skills._package_from_snapshot(snapshot, context='tampered skill')
+            finally:
+                runtime.close()
+
     def test_skill_syscalls_use_primitive_capabilities_not_tool_table(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             write_skill_package(Path(temp_dir), 'syscall-skill', allowed_tools=['echo'])

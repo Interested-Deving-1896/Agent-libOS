@@ -192,7 +192,9 @@ the target pid and are authorized by that pid's method capability.
 
 Replacing an existing endpoint requires endpoint `admin` when an actor pid is
 used. A replace invalidates existing exact method grants for that endpoint so
-old authority cannot silently point at a new URL or wire method.
+old authority cannot silently point at a new URL or wire method. The endpoint
+row replacement and stale method-grant invalidation happen in one store
+transaction; if either part fails, the old endpoint spec remains active.
 Unregistering an endpoint also invalidates exact and wildcard method grants for
 that endpoint, so reusing the same endpoint id cannot revive stale method
 authority.

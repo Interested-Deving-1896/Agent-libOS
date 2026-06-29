@@ -95,7 +95,11 @@ class ListMcpToolsTool(BaseAgentTool[ListMcpToolsArgs]):
     description = "List allowed tools for a registered MCP server."
     args_schema = ListMcpToolsArgs
     output_schema = ListMcpToolsOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"mcp_server.read"})
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"mcp_server.read", "mcp_server.execute"},
+    )
     tags = ["mcp", "remote"]
 
     async def execute(self, args: ListMcpToolsArgs, ctx: ToolContext) -> ListMcpToolsOutput:

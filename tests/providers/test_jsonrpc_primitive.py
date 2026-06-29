@@ -405,6 +405,32 @@ class TestJsonRpcPrimitive:
             finally:
                 runtime.close()
 
+    def test_endpoint_replace_rolls_back_spec_when_stale_grant_disable_fails(self, monkeypatch: MonkeyPatch) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='endpoint caller')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('replace-rollback', server.url, with_header=False), actor='cli', require_capability=False)
+                cap = runtime.capability.grant(pid, 'jsonrpc:replace-rollback:echo', [CapabilityRight.READ], issued_by='test')
+
+                def fail_disable(endpoint_id: str, *, actor: str) -> None:
+                    raise RuntimeError(f'cannot disable grants for {endpoint_id}')
+
+                monkeypatch.setattr(runtime.jsonrpc, '_disable_replaced_endpoint_method_capabilities', fail_disable)
+                with pytest.raises(RuntimeError, match='cannot disable grants'):
+                    runtime.jsonrpc.register_endpoint_from_yaml_text(
+                        _manifest('replace-rollback', server.url, with_header=False, rpc_method='demo.replaced'),
+                        actor='cli',
+                        replace=True,
+                        require_capability=False,
+                    )
+
+                spec, _metadata = runtime.store.get_jsonrpc_endpoint('replace-rollback')
+                assert spec.methods[0].rpc_method == 'demo.echo'
+                assert runtime.store.get_capability(cap.cap_id).active
+            finally:
+                runtime.close()
+
     def test_endpoint_unregister_disables_existing_method_grants_before_reuse(self) -> None:
         with _jsonrpc_server() as server:
             runtime = Runtime.open('local')

@@ -184,7 +184,9 @@ server runs use `%APPDATA%/Agent libOS/llm-profiles.json` on Windows,
 `${XDG_CONFIG_HOME:-~/.config}/agent-libos/llm-profiles.json` on Linux unless
 `agent-libos-gui-server --llm-profiles-file <path>` is provided. The file stores
 only non-secret routing fields and the `api_key_env` variable name; never put
-the API key value in it.
+the API key value in it. If `base_url` is set and `allow_custom_base_url` is
+explicitly false, the false value is persisted so the profile does not start
+using a custom base URL after reload.
 
 Example user/config profile fields for common OpenAI-compatible providers:
 

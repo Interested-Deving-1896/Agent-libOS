@@ -260,6 +260,7 @@ class TestUserLLMProfileStore:
                     "temperature": 0.1,
                     "max_tokens": 8192,
                     "auto_wait_on_empty_tool_calls": True,
+                    "allow_custom_base_url": False,
                 },
             )
             loaded = UserLLMProfileStore(path).load()
@@ -267,10 +268,12 @@ class TestUserLLMProfileStore:
             assert saved.model == "qwen3.7-max"
             assert loaded["qwen3.7-max"].base_url == "https://qwen.example/v1"
             assert loaded["qwen3.7-max"].api_key_env == "QWEN_API_KEY"
-            assert loaded["qwen3.7-max"].allow_custom_base_url is True
+            assert loaded["qwen3.7-max"].allow_custom_base_url is False
             assert loaded["qwen3.7-max"].auto_wait_on_empty_tool_calls is True
+            persisted = json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
+            assert persisted["allow_custom_base_url"] is False
             assert "secret" not in path.read_text(encoding="utf-8")
-            assert "api_key" not in json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
+            assert "api_key" not in persisted
 
     def test_user_llm_profile_store_rejects_invalid_json_and_secret_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

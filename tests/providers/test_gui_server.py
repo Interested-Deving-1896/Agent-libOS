@@ -1099,15 +1099,33 @@ class TestGuiServer:
         assert 'arguments must be a JSON object' in body['error']['message']
 
     def test_skill_register_actor_mode_requires_skill_write_capability(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            skill_dir = write_skill_package(Path(temp_dir), 'gui-actor-skill', allowed_tools=['echo'])
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir).resolve()
+            skill_dir = write_skill_package(root, 'gui-actor-skill', allowed_tools=['echo'])
+            relative_skill = skill_dir.relative_to(Path.cwd().resolve()).as_posix()
+            skill_md = f'{relative_skill}/SKILL.md'
             _status, spawned = self.request('POST', '/api/processes', {'goal': 'skill actor', 'auto_run': False})
             pid = spawned['pid']
 
             status, denied = self.request(
                 'POST',
                 '/api/skills/register',
-                {'path': str(skill_dir), 'actor': pid, 'confirmed': True},
+                {'path': relative_skill, 'actor': pid, 'confirmed': True},
+            )
+
+            assert status == 403
+            assert 'filesystem:workspace' in denied['error']['message']
+
+            self.server.service.runtime.filesystem.grant_path(
+                pid,
+                skill_md,
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            status, denied = self.request(
+                'POST',
+                '/api/skills/register',
+                {'path': relative_skill, 'actor': pid, 'confirmed': True},
             )
 
             assert status == 409
@@ -1123,7 +1141,7 @@ class TestGuiServer:
             status, registered = self.request(
                 'POST',
                 '/api/skills/register',
-                {'path': str(skill_dir), 'actor': pid, 'confirmed': True},
+                {'path': relative_skill, 'actor': pid, 'confirmed': True},
             )
 
             assert status == 200

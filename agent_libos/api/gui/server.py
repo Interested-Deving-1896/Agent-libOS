@@ -1179,12 +1179,22 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and route == ["register"]:
             body = self._read_body()
             self._require_confirmed("skill.register", body, {"path": body.get("path")})
-            result = service.runtime.skills.register_skill_from_path(
-                str(body["path"]),
-                actor=str(body.get("actor") or "gui"),
-                replace=_json_bool(body, "replace", False),
-                require_capability=body.get("actor") is not None,
-            )
+            actor_value = body.get("actor")
+            replace = _json_bool(body, "replace", False)
+            if actor_value is not None:
+                result = service.runtime.skills.register_skill_from_workspace_path(
+                    str(actor_value),
+                    str(body["path"]),
+                    replace=replace,
+                    require_capability=True,
+                )
+            else:
+                result = service.runtime.skills.register_skill_from_path(
+                    str(body["path"]),
+                    actor="gui",
+                    replace=replace,
+                    require_capability=False,
+                )
             service.publish_runtime_changes("skill.register")
             return result
         if method == "POST" and len(route) == 2 and route[1] in {"activate", "unload"}:
@@ -1438,6 +1448,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             refresh_value = (_query_str(query, "refresh") or "").lower()
             return service.runtime.mcp.list_tools(
                 route[0],
+                actor="gui",
                 require_capability=False,
                 refresh=refresh_value in {"1", "true", "yes", "on"},
             )

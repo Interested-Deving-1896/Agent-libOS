@@ -32,7 +32,8 @@ a persistent object handle.
 `deny` records dominate matching allows. To create an exception, revoke the
 broad deny and issue narrower allow/deny records explicitly. The runtime does
 not implement hidden override precedence that could accidentally reopen a
-blocked resource.
+blocked resource, and primitive-specific candidate filtering must reapply the
+same deny-first ordering before making a decision.
 
 ## Rights
 

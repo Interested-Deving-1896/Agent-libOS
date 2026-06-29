@@ -20,6 +20,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate.local import _allowed_mcp_connect_addresses
+from agent_libos.utils.serde import dumps
 
 
 class TestMcpPrimitive:
@@ -146,6 +147,145 @@ class TestMcpPrimitive:
 
         with pytest.raises(ValidationError, match="IP address is not allowed"):
             _allowed_mcp_connect_addresses("mcp.example.test", 443)
+
+    def test_list_tools_without_refresh_uses_registered_metadata_only(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp metadata list")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+            runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ], issued_by="test")
+
+            result = runtime.mcp.list_tools("demo", actor=pid, refresh=False)
+
+            assert result["refreshed"] is False
+            assert result["response_bytes"] == 0
+            assert provider.list_calls == []
+            assert runtime.store.list_external_effects() == []
+        finally:
+            runtime.close()
+
+    def test_list_tools_refresh_without_process_actor_records_host_effect(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+
+            result = runtime.mcp.list_tools("demo", actor=None, require_capability=False, refresh=True)
+
+            assert result["refreshed"] is True
+            assert provider.list_calls == ["demo"]
+            effect = [item for item in runtime.store.list_external_effects() if item.provider == "mcp"][0]
+            assert effect.operation == "list_tools"
+            assert effect.pid == "runtime"
+            audit = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == "primitive.mcp.list_tools" and record.actor == "runtime"
+            ][0]
+            assert audit.decision["ok"] is True
+            event = [
+                item
+                for item in runtime.events.list(target="mcp_server:demo")
+                if item.payload.get("operation") == "list_tools"
+            ][0]
+            assert event.source == "runtime"
+        finally:
+            runtime.close()
+
+    def test_list_tools_refresh_requires_execute_and_records_effect(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp live list")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+            runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ], issued_by="test")
+
+            with pytest.raises(CapabilityDenied):
+                runtime.mcp.list_tools("demo", actor=pid, refresh=True)
+
+            assert provider.list_calls == []
+            runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.EXECUTE], issued_by="test")
+            result = runtime.mcp.list_tools("demo", actor=pid, refresh=True)
+
+            assert result["refreshed"] is True
+            assert result["response_bytes"] == 128
+            assert provider.list_calls == ["demo"]
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_request_bytes > 0
+            assert process.resource_usage.mcp_response_bytes >= 128
+            effect = [item for item in runtime.store.list_external_effects() if item.provider == "mcp"][0]
+            assert effect.operation == "list_tools"
+            assert effect.target == "mcp_server:demo"
+            assert not effect.state_mutation
+            assert effect.information_flow
+        finally:
+            runtime.close()
+
+    def test_list_tools_refresh_provider_failure_records_failed_attempt(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _FailingListMcpProvider("tools/list failed with token=SECRET_MCP_LIST_TOKEN")
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp failed live list")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+            runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ, CapabilityRight.EXECUTE], issued_by="test")
+
+            with pytest.raises(RuntimeError, match="tools/list failed"):
+                runtime.mcp.list_tools("demo", actor=pid, refresh=True)
+
+            assert provider.list_calls == ["demo"]
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_request_bytes > 0
+            assert process.resource_usage.mcp_response_bytes == 0
+            effect = [item for item in runtime.store.list_external_effects() if item.provider == "mcp"][0]
+            assert effect.operation == "list_tools"
+            assert effect.target == "mcp_server:demo"
+            assert effect.provider_metadata["result"]["ok"] is False
+            assert effect.provider_metadata["result"]["status"] == "transport_error"
+            audit = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == "primitive.mcp.list_tools" and record.actor == pid
+            ][0]
+            assert audit.decision["ok"] is False
+            event = [
+                item
+                for item in runtime.events.list(target="mcp_server:demo")
+                if item.payload.get("operation") == "list_tools"
+            ][0]
+            assert event.payload["ok"] is False
+            observed = dumps(
+                {
+                    "audit": audit.decision,
+                    "event": event.payload,
+                    "effect": effect.provider_metadata,
+                }
+            )
+            assert "SECRET_MCP_LIST_TOKEN" not in observed
+            assert "sha256" in observed
+        finally:
+            runtime.close()
+
+    def test_list_tools_refresh_requires_list_tools_classifier_before_provider_call(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _CallOnlyClassifierMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp live classifier")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("demo"), actor="cli", require_capability=False)
+            runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ, CapabilityRight.EXECUTE], issued_by="test")
+
+            with pytest.raises(ValueError, match="unsupported"):
+                runtime.mcp.list_tools("demo", actor=pid, refresh=True)
+
+            assert provider.list_calls == []
+            assert runtime.store.list_external_effects() == []
+        finally:
+            runtime.close()
 
     def test_syscall_bypasses_tool_table_but_not_capabilities(self) -> None:
         runtime = Runtime.open("local")
@@ -377,6 +517,14 @@ class _RecordingMcpProvider:
         context: dict[str, Any],
         result: Any,
     ) -> ExternalEffectClassification:
+        if operation == "list_tools":
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"operation": operation, "server_id": context["server_id"]},
+            )
         assert operation == "call_tool"
         return ExternalEffectClassification(
             rollback_class=ExternalEffectRollbackClass(str(context["rollback_class"])),
@@ -384,3 +532,25 @@ class _RecordingMcpProvider:
             state_mutation=bool(context["state_mutation"]),
             information_flow=bool(context["information_flow"]),
         )
+
+
+class _CallOnlyClassifierMcpProvider(_RecordingMcpProvider):
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation != "call_tool":
+            raise ValueError(f"unsupported operation: {operation}")
+        return super().classify_external_effect(operation, context, result)
+
+
+class _FailingListMcpProvider(_RecordingMcpProvider):
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def list_tools(self, server: Any, **_kwargs: Any) -> McpToolListResult:
+        self.list_calls.append(server.server_id)
+        raise RuntimeError(self.message)

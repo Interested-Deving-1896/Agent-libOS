@@ -148,7 +148,9 @@ libOS/llm-profiles.json` on Windows, `~/Library/Application Support/Agent
 libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
 file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model routing fields such
 as profile id, model, base URL, API mode, tuning options, and the `api_key_env`
-name. It never stores the API key value.
+name. It never stores the API key value. When a profile has a base URL,
+`allow_custom_base_url: false` is preserved explicitly rather than inferred
+away, so disabling custom-base-url use remains stable across GUI restarts.
 
 The scheduler defaults to automatic mode. Users can pause auto-run, step a
 selected process, or run the selected process with an optional quantum budget.

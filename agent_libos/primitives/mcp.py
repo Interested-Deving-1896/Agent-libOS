@@ -37,6 +37,7 @@ from agent_libos.models import (
     McpProviderTool,
     McpServerSpec,
     McpStdioTransportSpec,
+    McpToolListResult,
     McpToolSpec,
     ResourceUsage,
 )
@@ -208,16 +209,89 @@ class McpPrimitive:
         live_by_name: dict[str, McpProviderTool] = {}
         live_response_bytes = 0
         if refresh:
+            effect_actor = actor or "runtime"
+            usage_pid = self._resource_usage_pid(actor)
+            if require_capability and actor is not None:
+                self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.EXECUTE)
             self._require_runtime_environment(spec)
             if spec.transport == "streamable_http":
                 self._validate_runtime_resolution(spec)
-            result = self.provider.list_tools(
-                spec,
-                timeout_s=spec.timeout_s,
-                max_response_bytes=spec.max_response_bytes,
+            request_bytes = len(dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8"))
+            if request_bytes > spec.max_request_bytes:
+                raise ValidationError(f"MCP list_tools request exceeds max_request_bytes={spec.max_request_bytes}")
+            if usage_pid is not None:
+                self._preflight_resource_usage(
+                    usage_pid,
+                    ResourceUsage(mcp_request_bytes=request_bytes),
+                    source="primitive.mcp.list_tools",
+                    context={"server_id": server_id, "request_bytes": request_bytes},
+                )
+            effect_context = self._list_tools_effect_context(spec, request_bytes=request_bytes)
+            require_external_effect_classifier(self.provider, "list_tools")
+            preflight_classification = classify_external_effect(
+                self.provider,
+                "list_tools",
+                effect_context,
+                {"preflight": True},
             )
+            started = time.monotonic()
+            try:
+                result = self.provider.list_tools(
+                    spec,
+                    timeout_s=spec.timeout_s,
+                    max_response_bytes=spec.max_response_bytes,
+                )
+            except Exception as exc:
+                result_payload = self._list_tools_failure_payload(exc, duration_s=time.monotonic() - started)
+                event = self._emit_list_tools_event(effect_actor, spec, result_payload)
+                audit_record = self._record_list_tools_audit(effect_actor, spec, result_payload, effect_context)
+                self._record_list_tools_external_effect(
+                    effect_actor,
+                    spec,
+                    effect_context,
+                    result_payload,
+                    event,
+                    audit_record,
+                    preflight_classification=preflight_classification,
+                )
+                if usage_pid is not None:
+                    self._charge_resource_usage(
+                        usage_pid,
+                        ResourceUsage(mcp_request_bytes=request_bytes),
+                        source="primitive.mcp.list_tools",
+                        context={
+                            "server_id": server_id,
+                            "request_bytes": request_bytes,
+                            "response_bytes": 0,
+                            "status": result_payload["status"],
+                        },
+                    )
+                raise
             live_response_bytes = result.response_bytes
             live_by_name = {tool.name: tool for tool in result.tools}
+            result_payload = self._list_tools_success_payload(result)
+            event = self._emit_list_tools_event(effect_actor, spec, result_payload)
+            audit_record = self._record_list_tools_audit(effect_actor, spec, result_payload, effect_context)
+            self._record_list_tools_external_effect(
+                effect_actor,
+                spec,
+                effect_context,
+                result_payload,
+                event,
+                audit_record,
+                preflight_classification=preflight_classification,
+            )
+            if usage_pid is not None:
+                self._charge_resource_usage(
+                    usage_pid,
+                    ResourceUsage(mcp_request_bytes=request_bytes, mcp_response_bytes=live_response_bytes),
+                    source="primitive.mcp.list_tools",
+                    context={
+                        "server_id": server_id,
+                        "request_bytes": request_bytes,
+                        "response_bytes": live_response_bytes,
+                    },
+                )
         return {
             "server_id": spec.server_id,
             "transport": spec.transport,
@@ -526,6 +600,39 @@ class McpPrimitive:
             },
         )
 
+    def _emit_list_tools_event(self, pid: str, spec: McpServerSpec, result_payload: dict[str, Any]) -> Event:
+        return self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=self.server_resource(spec.server_id),
+            payload={
+                "adapter": "mcp",
+                "operation": "list_tools",
+                "server_id": spec.server_id,
+                "transport": spec.transport,
+                **result_payload,
+            },
+        )
+
+    def _record_list_tools_audit(
+        self,
+        pid: str,
+        spec: McpServerSpec,
+        result_payload: dict[str, Any],
+        context: dict[str, Any],
+    ) -> AuditRecord:
+        return self.audit.record(
+            actor=pid,
+            action="primitive.mcp.list_tools",
+            target=self.server_resource(spec.server_id),
+            decision={
+                "server_id": spec.server_id,
+                "transport": spec.transport,
+                "request_bytes": context["request_bytes"],
+                **result_payload,
+            },
+        )
+
     def _record_call_audit(
         self,
         pid: str,
@@ -554,6 +661,63 @@ class McpPrimitive:
             },
             capability_refs=list(operation_context.get("capability_ids") or []),
         )
+
+    def _record_list_tools_external_effect(
+        self,
+        pid: str,
+        spec: McpServerSpec,
+        context: dict[str, Any],
+        result_payload: dict[str, Any],
+        event: Event,
+        audit_record: AuditRecord,
+        *,
+        preflight_classification: ExternalEffectClassification,
+    ) -> None:
+        try:
+            classification = classify_external_effect(self.provider, "list_tools", context, result_payload)
+        except Exception as exc:
+            classification = ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    **dict(preflight_classification.metadata),
+                    "classification_error": f"{type(exc).__name__}: {exc}",
+                    "classification_fallback": "post_list_tools_failure",
+                },
+            )
+        record_external_effect(
+            self.store,
+            pid=pid,
+            provider="mcp",
+            operation="list_tools",
+            target=self.server_resource(spec.server_id),
+            classification=classification,
+            audit_record=audit_record,
+            event=event,
+            metadata={"context": context, "result": result_payload},
+        )
+
+    def _list_tools_success_payload(self, result: McpToolListResult) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "ok",
+            "response_bytes": result.response_bytes,
+            "duration_s": result.duration_s,
+            "tool_count": len(result.tools),
+        }
+
+    def _list_tools_failure_payload(self, exc: Exception, *, duration_s: float) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "transport_error",
+            "response_bytes": 0,
+            "duration_s": duration_s,
+            "tool_count": 0,
+            "error": sanitize_for_observability(str(exc)),
+            "error_type": type(exc).__name__,
+        }
 
     def _record_external_effect(
         self,
@@ -628,6 +792,22 @@ class McpPrimitive:
             allow_overage=True,
             kill_on_exceed=True,
         )
+
+    def _resource_usage_pid(self, actor: str | None) -> str | None:
+        if actor is None:
+            return None
+        return actor if self.store.get_process(actor) is not None else None
+
+    def _list_tools_effect_context(self, server: McpServerSpec, *, request_bytes: int) -> dict[str, Any]:
+        return {
+            "server_id": server.server_id,
+            "transport": server.transport,
+            "rollback_class": ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED.value,
+            "rollback_status": ExternalEffectRollbackStatus.NOT_REQUIRED.value,
+            "state_mutation": False,
+            "information_flow": True,
+            "request_bytes": request_bytes,
+        }
 
     def _operation_context(
         self,

@@ -14,6 +14,7 @@ const tabs = [
   { key: "audit", label: "details.audit" },
   { key: "llmCalls", label: "details.llmCalls" },
   { key: "jsonRpc", label: "details.jsonRpc" },
+  { key: "mcp", label: "details.mcp" },
   { key: "images", label: "details.images" },
   { key: "objectMemory", label: "details.objectMemory" }
 ] as const satisfies ReadonlyArray<{ key: string; label: TranslationKey }>;
@@ -77,7 +78,7 @@ function renderTab(
     onInspectImage(imageId: string): Promise<ImageInspectResult>;
   }
 ) {
-  if (!process && !["jsonRpc", "toolsSkills", "images"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
+  if (!process && !["jsonRpc", "mcp", "toolsSkills", "images"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
   if (tab === "overview") return <JsonBlock value={process} />;
   if (tab === "rating") return <RatingPanel process={process} onSave={imageActions.onRate} />;
   if (tab === "capabilities") return <JsonBlock value={{ capability_ids: process?.capabilities }} />;
@@ -86,6 +87,7 @@ function renderTab(
   if (tab === "audit") return <JsonBlock value={snapshot.audit.filter((item) => item.actor === process?.pid || item.target === `process:${process?.pid}`)} />;
   if (tab === "llmCalls") return <JsonBlock value={snapshot.llm_calls.filter((item) => item.pid === process?.pid)} />;
   if (tab === "jsonRpc") return <JsonBlock value={snapshot.jsonrpc_endpoints} />;
+  if (tab === "mcp") return <JsonBlock value={snapshot.mcp_servers} />;
   if (tab === "images") {
     return (
       <ImagePanel

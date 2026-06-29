@@ -24,6 +24,9 @@
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_rejects_workspace_hardlink_to_external_inode",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_concurrent_one_time_file_write_crosses_provider_once",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_write_directory_rejects_reparse_swap_before_mkdir_sink",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_write_file_rejects_reparse_swap_before_parent_mkdir_sink",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_list_directory_rejects_reparse_swap_before_iterdir_sink",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_descriptor_bound_parent_mkdir_closes_intermediate_directory_fds",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_delete_file_rejects_reparse_swap_before_unlink_sink",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_delete_directory_rejects_reparse_swap_before_recursive_delete_sink",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_write_file_rejects_reparse_swap_during_fallback_open_before_truncate",
@@ -51,6 +54,8 @@
       "node_ids": [
         "tests/security/test_capability.py::TestCapabilityManager::test_typed_resource_matching_rejects_prefix_collision",
         "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_matching_allow",
+        "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_unordered_matching_capability_candidates",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_explicit_deny_dominates_later_command_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_restrictive_capability_with_bad_constraint_fails_closed_over_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_authority_rules_are_enforced_against_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_scoped_deny_rule_only_denies_matching_operation_context",
@@ -274,6 +279,8 @@
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_common_credential_keys",
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_scalar_credential_patterns",
         "tests/security/test_jit_security.py::TestJitSecurity::test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_observability_redacts_sensitive_errors",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_schema_error_observability_redacts_sensitive_values",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_retries_malformed_empty_tool_name_once"
       ],
       "benchmark_attack_classes": []
@@ -398,6 +405,7 @@
         "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_unknown_profile_fails_closed_when_llm_quantum_runs",
         "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_process_llm_profile_persists_across_reopen",
         "tests/runtime/test_llm_profiles.py::TestLLMProfiles::test_only_default_profile_inherits_legacy_openai_environment",
+        "tests/runtime/test_llm_profiles.py::TestUserLLMProfileStore::test_user_llm_profile_store_round_trips_non_secret_profile_fields",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_preserves_llm_profile_default"
       ],
       "benchmark_attack_classes": []
@@ -410,6 +418,8 @@
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_existing_tool_visibility_does_not_grant_resource_authority",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_host_skill_package_rejects_hardlinked_resources",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_package_hash_binds_instructions_and_resource_content",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_skill_snapshot_hash_rejects_tampered_resource_content",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_skill_syscalls_use_primitive_capabilities_not_tool_table",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_skill_uses_activation_snapshot_after_registry_replace",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_jit_skill_validation_uses_broker_resource_limits_once",
@@ -428,7 +438,9 @@
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_source_hash_mismatch_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_source_swap_after_trust_does_not_execute_swapped_bytes",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_package_relative_import_registers_runtime_surfaces",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_runtime_lazy_relative_imports_use_snapshot_namespace",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_helper_change_rejects_old_package_hash",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_reloads_fresh_with_same_package_hash",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_multifile_module_source_swap_after_trust_does_not_execute_swapped_helper",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_json_manifest_duplicate_keys_are_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_manifest_schema_version_must_be_integer",
@@ -519,6 +531,7 @@
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_effectful_provider_without_classifier_fails_closed",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_checkpoint_reports_remote_effect_but_does_not_restore_endpoint_registry",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_endpoint_replace_requires_admin_and_disables_existing_method_grants",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_endpoint_replace_rolls_back_spec_when_stale_grant_disable_fails",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_post_call_classifier_failure_records_conservative_external_effect",
         "tests/providers/test_gui_server.py::TestGuiServer::test_jsonrpc_register_actor_mode_requires_endpoint_write_capability"
       ],
@@ -533,6 +546,11 @@
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_requires_tool_capability_and_records_effect",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_live_schema_mismatch_consumes_and_records_one_shot_attempt",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_http_dns_private_resolution_denies_before_provider_or_capability_use",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_without_refresh_uses_registered_metadata_only",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_without_process_actor_records_host_effect",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_requires_execute_and_records_effect",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_provider_failure_records_failed_attempt",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_requires_list_tools_classifier_before_provider_call",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_checkpoint_reports_mcp_effect_but_does_not_restore_server_registry",
         "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_register_actor_mode_requires_server_write_capability"

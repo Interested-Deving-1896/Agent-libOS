@@ -304,7 +304,7 @@ function formToInput(form: ProfileFormState): LLMProfileInput {
     store: formBoolToValue(form.store),
     parallel_tool_calls: formBoolToValue(form.parallel_tool_calls),
     auto_wait_on_empty_tool_calls: formBoolToValue(form.auto_wait_on_empty_tool_calls),
-    allow_custom_base_url: form.allow_custom_base_url || null
+    allow_custom_base_url: form.allow_custom_base_url
   };
 }
 

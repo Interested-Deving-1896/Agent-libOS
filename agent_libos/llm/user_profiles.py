@@ -194,8 +194,6 @@ def serialize_user_llm_profile(profile: LLMProfile) -> dict[str, Any]:
             continue
         if key == "kind" and value == "openai_compatible":
             continue
-        if key == "allow_custom_base_url" and value is False:
-            continue
         serialized[key] = value
     return serialized
 

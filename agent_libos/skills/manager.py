@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import errno
 import hashlib
 import json
@@ -908,6 +909,7 @@ class SkillManager:
             if resource.path in seen_paths:
                 raise ValidationError(f"duplicate skill resource path: {resource.path}")
             seen_paths.add(resource.path)
+            self._validate_resource_content(resource)
             total_bytes += resource.size_bytes
         if total_bytes > defaults.package_max_bytes:
             raise ValidationError(f"skill package exceeds package_max_bytes={defaults.package_max_bytes}")
@@ -1360,6 +1362,7 @@ class SkillManager:
             "skill_id": package.skill_id,
             "name": package.name,
             "description": package.description,
+            "instructions_sha256": self._hash_text(package.instructions),
             "version": package.version,
             "license": package.license,
             "compatibility": package.compatibility,
@@ -1386,6 +1389,7 @@ class SkillManager:
                     "sha256": resource.sha256,
                     "size_bytes": resource.size_bytes,
                     "kind": resource.kind,
+                    "content_sha256": self._resource_content_sha256(resource),
                 }
                 for resource in package.resources
             ],
@@ -1414,6 +1418,30 @@ class SkillManager:
 
     def _hash_text(self, text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _validate_resource_content(self, resource: SkillResource) -> None:
+        content = self._resource_content_bytes(resource)
+        if len(content) != resource.size_bytes:
+            raise ValidationError(f"skill resource size mismatch: {resource.path}")
+        if hashlib.sha256(content).hexdigest() != resource.sha256:
+            raise ValidationError(f"skill resource sha256 mismatch: {resource.path}")
+
+    def _resource_content_sha256(self, resource: SkillResource) -> str:
+        return hashlib.sha256(self._resource_content_bytes(resource)).hexdigest()
+
+    def _resource_content_bytes(self, resource: SkillResource) -> bytes:
+        if resource.kind == "text":
+            if resource.content is None:
+                raise ValidationError(f"text skill resource is missing content: {resource.path}")
+            return resource.content.encode("utf-8")
+        if resource.kind == "base64":
+            if resource.content_base64 is None:
+                raise ValidationError(f"base64 skill resource is missing content: {resource.path}")
+            try:
+                return base64.b64decode(resource.content_base64.encode("ascii"), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValidationError(f"base64 skill resource content is invalid: {resource.path}") from exc
+        raise ValidationError(f"unsupported skill resource kind: {resource.kind}")
 
     def _validate_source_type(self, source_type: str) -> str:
         if source_type not in _SOURCE_TYPES:

@@ -66,6 +66,7 @@ function snapshot(pids: string[]): RuntimeSnapshot {
     images: [],
     skills: [],
     jsonrpc_endpoints: [],
+    mcp_servers: [],
     modules: []
   };
 }

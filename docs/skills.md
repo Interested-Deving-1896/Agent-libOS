@@ -66,6 +66,10 @@ by `resource_read_max_bytes`, `package_max_bytes`, and `max_package_files`.
 Prompt instructions are clipped to `max_prompt_instruction_chars`; Skill JIT
 sources use `max_jit_source_chars`; tool, action, JIT, and
 required-capability counts use their corresponding `max_*` settings.
+The package SHA-256 binds the normalized Skill metadata, the prompt
+instructions, JIT source hashes, declared resource metadata, and the actual
+bundled resource bytes. A package snapshot whose stored resource content no
+longer matches its declared size/SHA is rejected.
 
 ## Progressive Disclosure
 

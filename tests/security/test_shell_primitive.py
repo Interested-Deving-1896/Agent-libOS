@@ -319,6 +319,27 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_shell_explicit_deny_dominates_later_command_allow(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='explicit deny dominates')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+            )
+            runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.capability.grant(pid, 'shell:git:*', [CapabilityRight.EXECUTE], issued_by='test')
+
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(pid, ['git', 'status'])
+
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
     def test_request_permission_shell_command_class_is_rule_constrained(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:

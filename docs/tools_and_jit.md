@@ -276,8 +276,9 @@ is a small `@std/*` subset. `npm:`, `node:`, `http:`, `https:`, `file:`,
 and dynamic imports are rejected. Static checking is lint, not the security
 boundary: it checks that the source exports `run(args, libos)`, blocks dynamic
 imports, rejects common runtime code generation forms such as `eval`,
-`Function`, `AsyncFunction`, `GeneratorFunction`, `.constructor(...)`, and
-`["constructor"](...)`, enforces source/test size limits, and restricts
+`Function`, `AsyncFunction`, `GeneratorFunction`, and member `constructor`
+access such as `.constructor` or `["constructor"]`, enforces source/test size
+limits, and restricts
 dependencies to the JSR allowlist. It intentionally does not try to blacklist
 every dangerous JavaScript spelling. Runtime safety comes from Deno
 no-permission execution, the libOS syscall protocol, primitive Capability
@@ -298,6 +299,9 @@ recorded as bounded observable envelopes: preview, SHA-256, byte size, and
 truncation status. Sensitive fields such as `content`, `body`, `payload`,
 `params`, `question`, `answer`, `source_code`, `tests`, `context`, `metadata`,
 `stdout`, and `stderr` are redacted before audit/event persistence.
+JIT validation errors, validation logs, and input/output schema failure details
+are persisted through the same bounded/redacted envelope; the direct tool call
+result can still return the original error to the caller.
 
 Full tool results are stored only as Tool Result Object Memory objects and are
 subject to a hard serialized payload limit. Larger content should be passed by

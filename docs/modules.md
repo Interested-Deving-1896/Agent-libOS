@@ -20,7 +20,11 @@ Modules are part of the host trusted computing base:
 - Import-string entrypoints are resolved to a concrete source file under the
   manifest directory without importing package code, then trusted source bytes
   are loaded fresh under an isolated module name so a previous `sys.modules`
-  entry cannot satisfy a newer trusted hash.
+  entry cannot satisfy a newer trusted hash. Multi-file packages use a unique
+  isolated namespace for each load, so repeated loads of the same trusted
+  package hash do not reuse module globals, while the namespace remains
+  available for registered tools and hooks that perform runtime relative
+  imports.
 - Module source files are hashed with a configured per-file size limit
   (`AgentLibOSConfig.modules.source_max_bytes`) before import. Multi-file
   package hashes also respect `package_max_bytes` and `max_package_files`.

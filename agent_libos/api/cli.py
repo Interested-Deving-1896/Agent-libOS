@@ -1242,7 +1242,7 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
     if command == "tools":
         return runtime.mcp.list_tools(
             args.server_id,
-            actor=actor if require_capability else None,
+            actor=actor,
             require_capability=require_capability,
             refresh=args.refresh,
         )
