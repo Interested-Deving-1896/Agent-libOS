@@ -603,9 +603,11 @@
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_requires_execute_and_records_effect",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_provider_failure_records_failed_attempt",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_requires_list_tools_classifier_before_provider_call",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_provider_connect_policy_rejects_rebound_private_dns",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_checkpoint_reports_mcp_effect_but_does_not_restore_server_registry",
-        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_register_actor_mode_requires_server_write_capability"
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_register_actor_mode_requires_server_write_capability",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_call_preserves_invalid_arguments_for_primitive_validation"
       ],
       "benchmark_attack_classes": []
     },
