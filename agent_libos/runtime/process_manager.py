@@ -699,6 +699,7 @@ class ProcessManager:
             max_external_read_bytes=defaults.max_external_read_bytes,
             max_external_write_bytes=defaults.max_external_write_bytes,
             max_jsonrpc_bytes=defaults.max_jsonrpc_bytes,
+            max_mcp_bytes=defaults.max_mcp_bytes,
             max_deno_syscalls=defaults.max_deno_syscalls,
         )
 
@@ -763,6 +764,7 @@ class ProcessManager:
             max_external_read_bytes=self._attenuate_int(budget.max_external_read_bytes, divisor, 0),
             max_external_write_bytes=self._attenuate_int(budget.max_external_write_bytes, divisor, 0),
             max_jsonrpc_bytes=self._attenuate_int(budget.max_jsonrpc_bytes, divisor, 0),
+            max_mcp_bytes=self._attenuate_int(budget.max_mcp_bytes, divisor, 0),
             max_deno_syscalls=self._attenuate_int(budget.max_deno_syscalls, divisor, 0),
         )
 

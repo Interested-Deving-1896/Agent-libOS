@@ -16,6 +16,9 @@ from agent_libos.models import (
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     LLMCallRecord,
+    McpServerSpec,
+    McpStdioTransportSpec,
+    McpToolSpec,
     ObjectType,
 )
 from agent_libos.runtime.runtime import Runtime
@@ -131,6 +134,26 @@ def test_runtime_store_contract_core_records(kind: str, tmp_path: Path) -> None:
             max_response_bytes=2048,
         )
         runtime.store.upsert_jsonrpc_endpoint(endpoint, registered_by="test", created_at=utc_now())
+        mcp_server = McpServerSpec(
+            schema_version=1,
+            server_id="contract-mcp",
+            transport="stdio",
+            stdio=McpStdioTransportSpec(command="python3", args=["-m", "demo_mcp"], env={}),
+            tools=[
+                McpToolSpec(
+                    tool_id="echo",
+                    mcp_name="demo.echo",
+                    right="read",
+                    rollback_class="no_rollback_required",
+                    state_mutation=False,
+                    information_flow=True,
+                )
+            ],
+            timeout_s=1.0,
+            max_request_bytes=1024,
+            max_response_bytes=2048,
+        )
+        runtime.store.upsert_mcp_server(mcp_server, registered_by="test", created_at=utc_now())
         runtime.store.insert_llm_call(
             LLMCallRecord(
                 call_id="contract-llm-call",
@@ -154,6 +177,7 @@ def test_runtime_store_contract_core_records(kind: str, tmp_path: Path) -> None:
         assert runtime.messages.list(pid)
         assert runtime.ratings.get(pid).score == 5
         assert runtime.store.get_jsonrpc_endpoint("contract-jsonrpc")[0].method_by_id("echo") is not None
+        assert runtime.store.get_mcp_server("contract-mcp")[0].tool_by_id("echo") is not None
         assert runtime.store.list_llm_calls(pid=pid)[0].call_id == "contract-llm-call"
         assert runtime.store.get_checkpoint_snapshot(checkpoint_id) is not None
 

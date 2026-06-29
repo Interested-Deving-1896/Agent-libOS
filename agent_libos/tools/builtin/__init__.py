@@ -38,6 +38,12 @@ from agent_libos.tools.builtin.memory import (
     ListMemoryNamespaceTool,
     ReadMemoryObjectTool,
 )
+from agent_libos.tools.builtin.mcp import (
+    CallMcpToolTool,
+    InspectMcpServerTool,
+    ListMcpServersTool,
+    ListMcpToolsTool,
+)
 from agent_libos.tools.builtin.messages import ReadProcessMessagesTool, ReceiveProcessMessagesTool, SendProcessMessageTool
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.object_tasks import (
@@ -77,6 +83,7 @@ __all__ = [
     "CreateCheckpointTool",
     "AppendMemoryObjectTool",
     "CallJsonRpcMethodTool",
+    "CallMcpToolTool",
     "CancelObjectTaskTool",
     "CompactProcessContextTool",
     "CommitCheckpointToImageTool",
@@ -94,6 +101,7 @@ __all__ = [
     "HumanOutputTool",
     "InspectCheckpointTool",
     "InspectJsonRpcEndpointTool",
+    "InspectMcpServerTool",
     "InspectCapabilityTool",
     "LoadImagePackageTool",
     "ForkChildProcessTool",
@@ -102,6 +110,8 @@ __all__ = [
     "ListCapabilitiesTool",
     "ListCheckpointsTool",
     "ListJsonRpcEndpointsTool",
+    "ListMcpServersTool",
+    "ListMcpToolsTool",
     "MergeChildMemoryTool",
     "ParsePytestLogTool",
     "ProcessExitTool",

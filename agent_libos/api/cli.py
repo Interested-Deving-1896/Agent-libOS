@@ -156,6 +156,8 @@ def main(argv: list[str] | None = None) -> None:
     _add_images_parser_args(images_parser)
     jsonrpc_parser = sub.add_parser("jsonrpc", help="Register, inspect, or call JSON-RPC over HTTP endpoints")
     _add_jsonrpc_parser_args(jsonrpc_parser)
+    mcp_parser = sub.add_parser("mcp", help="Register, inspect, or call MCP servers")
+    _add_mcp_parser_args(mcp_parser)
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
     _add_modules_parser_args(modules_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
@@ -234,6 +236,8 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(_run_images_command(runtime, args))
         elif args.command == "jsonrpc":
             _print_json(_run_jsonrpc_command(runtime, args))
+        elif args.command == "mcp":
+            _print_json(_run_mcp_command(runtime, args))
         elif args.command == "modules":
             _print_json(_run_modules_command(runtime, args))
         elif args.command == "human":
@@ -1160,6 +1164,98 @@ def _run_jsonrpc_command(runtime: Runtime, args: argparse.Namespace) -> dict[str
             require_capability=require_capability,
         )
     raise SystemExit(f"unknown jsonrpc command: {command}")
+
+
+def _add_mcp_parser_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--actor-pid",
+        help="If set, execute registry operations as this process and enforce MCP server capabilities.",
+    )
+    sub = parser.add_subparsers(dest="mcp_command", required=True)
+    register = sub.add_parser("register", help="Register an MCP server manifest from YAML or JSON")
+    register.add_argument("path")
+    register.add_argument("--replace", action="store_true")
+    list_parser = sub.add_parser("list", help="List registered MCP server metadata")
+    list_parser.add_argument("--text")
+    list_parser.add_argument("--limit", type=int)
+    inspect = sub.add_parser("inspect", help="Inspect one registered MCP server")
+    inspect.add_argument("server_id")
+    tools = sub.add_parser("tools", help="List allowed tools for one registered MCP server")
+    tools.add_argument("server_id")
+    tools.add_argument("--refresh", action="store_true", help="Query the live MCP server for current tool metadata.")
+    call = sub.add_parser("call", help="Call a registered MCP tool as a process")
+    call.add_argument("pid")
+    call.add_argument("server_id")
+    call.add_argument("tool_id")
+    call.add_argument("--arguments-json", help="MCP tool arguments object. Omit for {}.")
+    unregister = sub.add_parser("unregister", help="Delete a registered MCP server")
+    unregister.add_argument("server_id")
+
+
+def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+    actor = args.actor_pid or "cli"
+    require_capability = args.actor_pid is not None
+    command = args.mcp_command
+    if command == "register":
+        if require_capability:
+            cwd = runtime.process.working_directory(actor)
+            read = runtime.filesystem.read_text(
+                actor,
+                args.path,
+                max_bytes=runtime.config.mcp.manifest_max_bytes,
+                cwd=cwd,
+            )
+            return runtime.mcp.register_server_from_yaml_text(
+                read.content,
+                actor=actor,
+                replace=args.replace,
+                require_capability=True,
+                source=read.path,
+            )
+        path = Path(args.path).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        if not path.exists() or not path.is_file():
+            raise SystemExit(f"MCP server manifest does not exist: {path}")
+        return runtime.mcp.register_server_from_yaml_text(
+            path.read_text(encoding="utf-8"),
+            actor=actor,
+            replace=args.replace,
+            require_capability=False,
+            source=str(path),
+        )
+    if command == "list":
+        return runtime.mcp.list_servers(
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+            text=args.text,
+            limit=args.limit,
+        )
+    if command == "inspect":
+        return runtime.mcp.inspect_server(
+            args.server_id,
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+            include_sensitive_fields=not require_capability,
+        )
+    if command == "tools":
+        return runtime.mcp.list_tools(
+            args.server_id,
+            actor=actor if require_capability else None,
+            require_capability=require_capability,
+            refresh=args.refresh,
+        )
+    if command == "call":
+        arguments = _parse_json_value(args.arguments_json) if args.arguments_json is not None else {}
+        return to_jsonable(runtime.mcp.call_tool(args.pid, args.server_id, args.tool_id, arguments))
+    if command == "unregister":
+        return runtime.mcp.unregister_server(
+            args.server_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+    raise SystemExit(f"unknown mcp command: {command}")
 
 
 def _add_modules_parser_args(parser: argparse.ArgumentParser) -> None:

@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--skip-real-deno", action="store_true", help="exclude tests marked real_deno")
     parser.add_argument("--run-real-llm", action="store_true", help="include tests marked real_llm")
+    parser.add_argument("--run-mcp", action="store_true", help="include tests marked mcp")
     parser.add_argument(
         "--max-lane-seconds",
         type=float,
@@ -126,6 +127,10 @@ def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
         command.append("--run-real-llm")
     else:
         marker_filters.append("not real_llm")
+    if getattr(args, "run_mcp", False):
+        command.append("--run-mcp")
+    else:
+        marker_filters.append("not mcp")
     if marker_filters:
         command.extend(["-m", " and ".join(marker_filters)])
     return command

@@ -63,6 +63,7 @@ class ResourceBudget:
     max_external_read_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_external_read_bytes)
     max_external_write_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_external_write_bytes)
     max_jsonrpc_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_jsonrpc_bytes)
+    max_mcp_bytes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_mcp_bytes)
     max_deno_syscalls: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_deno_syscalls)
 
     def __post_init__(self) -> None:
@@ -89,6 +90,8 @@ class ResourceUsage:
     external_write_bytes: int = 0
     jsonrpc_request_bytes: int = 0
     jsonrpc_response_bytes: int = 0
+    mcp_request_bytes: int = 0
+    mcp_response_bytes: int = 0
     deno_syscalls: int = 0
 
     def __post_init__(self) -> None:

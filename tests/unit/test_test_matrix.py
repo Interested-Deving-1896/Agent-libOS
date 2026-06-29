@@ -13,6 +13,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "run_real_deno": False,
         "skip_real_deno": False,
         "run_real_llm": False,
+        "run_mcp": False,
         "workers": "1",
         "dist": "loadfile",
         "max_lane_seconds": test_matrix.DEFAULT_MAX_LANE_SECONDS,
@@ -35,7 +36,13 @@ class TestTestMatrix:
         command = test_matrix._pytest_args(("tests/security",), _args(skip_real_deno=True))
 
         assert "--skip-real-deno" in command
-        assert command[-2:] == ["-m", "not real_deno and not real_llm"]
+        assert command[-2:] == ["-m", "not real_deno and not real_llm and not mcp"]
+
+    def test_pytest_args_can_run_mcp_tests(self) -> None:
+        command = test_matrix._pytest_args(("tests/providers",), _args(run_mcp=True))
+
+        assert "--run-mcp" in command
+        assert command[-2:] == ["-m", "not real_llm"]
 
     def test_pytest_args_include_xdist_workers_when_requested(self) -> None:
         command = test_matrix._pytest_args(("tests",), _args(workers="4", dist="load"))

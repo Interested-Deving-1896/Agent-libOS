@@ -287,10 +287,10 @@ uv run agent-libos --db .agent_libos.sqlite resources <pid>
 ```
 
 Resource accounting is process-tree scoped. Tool calls, LLM calls/tokens,
-subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, Deno syscalls,
-and child-process creation are charged to the acting process and its ancestors.
-Capabilities, Skill activation, image exec, checkpoint restore, and human
-approval do not increase these budgets.
+subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, MCP bytes,
+Deno syscalls, and child-process creation are charged to the acting process and
+its ancestors. Capabilities, Skill activation, image exec, checkpoint restore,
+and human approval do not increase these budgets.
 
 ## Interactive Run
 
@@ -539,6 +539,26 @@ they run as audited admin registry operations.
 hold the method capability, such as
 `jsonrpc:demo-weather:forecast read`. The CLI cannot supply arbitrary URLs,
 headers, raw JSON-RPC method names, or request ids.
+
+## MCP Commands
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
+uv run agent-libos --db .agent_libos.sqlite mcp list
+uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
+uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
+uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
+uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
+```
+
+Registry commands accept `--actor-pid <pid>` to enforce that process's
+`mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
+audited admin registry operations.
+
+`mcp call` always runs as the target process pid and requires that pid to hold
+the tool capability, such as `mcp:demo-mcp:forecast read`. The CLI cannot
+supply arbitrary transports, commands, URLs, headers, or raw MCP tool names.
 
 ## Runtime Module Commands
 

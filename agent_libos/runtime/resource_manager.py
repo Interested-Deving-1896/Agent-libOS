@@ -35,6 +35,7 @@ _BUDGET_USAGE_MAP: dict[str, tuple[str, ...]] = {
     "max_external_read_bytes": ("external_read_bytes",),
     "max_external_write_bytes": ("external_write_bytes",),
     "max_jsonrpc_bytes": ("jsonrpc_request_bytes", "jsonrpc_response_bytes"),
+    "max_mcp_bytes": ("mcp_request_bytes", "mcp_response_bytes"),
     "max_deno_syscalls": ("deno_syscalls",),
 }
 

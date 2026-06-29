@@ -2,8 +2,8 @@
 
 Agent libOS includes a local desktop management console for supervising
 processes, messages, human approvals, AgentImage selection/registration/commit,
-checkpoints, capabilities, Skills, JSON-RPC endpoints, audit records, persisted
-LLM calls, and human Agent ratings.
+checkpoints, capabilities, Skills, JSON-RPC endpoints, MCP servers, audit
+records, persisted LLM calls, and human Agent ratings.
 
 The GUI is a local-only Electron app. Electron starts
 `agent-libos-gui-server`, receives a random session bearer token, and connects
@@ -117,7 +117,7 @@ The first screen is process-centered:
 - center pane: selected process timeline with type filters and human request
   cards,
 - right pane: details for overview, capabilities, tools/Skills, checkpoints,
-  audit, LLM calls, Images, JSON-RPC, Object Memory summary, and selected
+  audit, LLM calls, Images, JSON-RPC, MCP, Object Memory summary, and selected
   process ratings,
 - top bar: database, spawn, auto-run, quanta budget, run, step, pause, refresh.
 
@@ -185,15 +185,16 @@ the final request to the server:
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
 - JSON-RPC method calls,
+- MCP server registration and tool calls,
 - Skill registration, activation, and unload.
 
 The confirmation dialog shows the pid/resource/action summary. The server also
 rejects high-risk requests without `confirmed: true`, so accidental direct HTTP
 calls fail closed before invoking the runtime operation.
 
-JSON-RPC endpoint registration through the GUI accepts manifest text only. The
-renderer cannot ask the Python GUI server to read an arbitrary host file path;
-file/path based registration remains a CLI/admin workflow.
+JSON-RPC endpoint and MCP server registration through the GUI accept manifest
+text only. The renderer cannot ask the Python GUI server to read an arbitrary
+host file path; file/path based registration remains a CLI/admin workflow.
 
 Image package registration follows the same rule. Electron may read a package
 directory selected by the user and pass bounded package file payloads to the
@@ -254,6 +255,9 @@ Important endpoints:
 - `GET /api/jsonrpc`, `GET /api/jsonrpc/{endpoint_id}`,
   `POST /api/jsonrpc/register`, and
   `POST /api/jsonrpc/{endpoint_id}/call`
+- `GET /api/mcp`, `GET /api/mcp/{server_id}`,
+  `GET /api/mcp/{server_id}/tools`, `POST /api/mcp/register`, and
+  `POST /api/mcp/{server_id}/call`
 - `GET /api/modules`, `GET /api/modules/{module_id}`
 
 All endpoints require `Authorization: Bearer <session-token>`.

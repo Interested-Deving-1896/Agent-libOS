@@ -35,12 +35,14 @@ Agent personality / application
      - shell provider
      - human provider
      - JSON-RPC over HTTP provider
+     - MCP client provider
   -> host backend
      - local workspace filesystem
      - host clock
      - subprocess backend
      - terminal or UI human I/O
      - pre-registered remote JSON-RPC endpoints
+     - pre-registered MCP servers
      - future container, WASM, or service providers
 ```
 
@@ -94,8 +96,8 @@ but v1 does not apply external compensation.
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
 - `HumanObjectManager` owns questions, approvals, terminal queue processing,
   and human output.
-- `FilesystemAdapter`, `ShellAdapter`, `ClockPrimitive`, and
-  `JsonRpcPrimitive` expose protected primitive operations over provider
+- `FilesystemAdapter`, `ShellAdapter`, `ClockPrimitive`, `JsonRpcPrimitive`,
+  and `McpPrimitive` expose protected primitive operations over provider
   backends.
 - `ToolBroker` registers static tools and process-local JIT tools.
 - `SkillManager` registers standard Skill packages and activates them into
@@ -151,6 +153,12 @@ JSON-RPC primitive accepts only endpoint and method ids, resolves URLs and
 env-backed headers from the registry, then checks `jsonrpc:<endpoint>:<method>`
 capabilities before the provider performs a POST.
 
+The same split applies to MCP. `list_mcp_servers`, `inspect_mcp_server`,
+`list_mcp_tools`, and `call_mcp_tool` are stable generic wrappers over a
+registered MCP server registry. Remote MCP tools are not imported into the
+ToolBroker as first-class tools, and a visible `call_mcp_tool` entry still
+requires `mcp:<server>:<tool>` authority at primitive use.
+
 ## Primitive Boundary
 
 Primitives are the runtime boundary. They are responsible for:
@@ -182,6 +190,7 @@ The runtime store keeps durable metadata and append-only records:
 - loaded Runtime Module status, source hashes, and registration summaries,
 - image registry manifests and checkpoint-derived image artifacts,
 - JSON-RPC endpoint registry rows,
+- MCP server registry rows,
 - checkpoints and checkpoint payload snapshots,
 - provider-decided external effect records,
 - events and audit records,
@@ -220,7 +229,7 @@ agent_libos/
   memory/          typed Object Memory and MemoryView implementation
   models/          dataclass and enum models split by runtime domain
   modules/         trusted startup Runtime Module loader, registry, and core module
-  primitives/      libOS primitives for filesystem, clock, shell, and JSON-RPC
+  primitives/      libOS primitives for filesystem, clock, shell, JSON-RPC, and MCP
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations

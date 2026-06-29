@@ -408,6 +408,24 @@ class TestCLIBuiltinCommand:
         assert result['owner_watch']['channel'] == 'owner-watch'
         assert result['owner_watch']['kind'] == 'interrupt'
 
+    def test_cli_mcp_register_list_inspect_and_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            manifest = root / 'mcp.yaml'
+            manifest.write_text(_cli_mcp_manifest('cli-mcp'), encoding='utf-8')
+
+            registered = _run_cli_json(['--db', str(db), 'mcp', 'register', str(manifest)])
+            listed = _run_cli_json(['--db', str(db), 'mcp', 'list'])
+            inspected = _run_cli_json(['--db', str(db), 'mcp', 'inspect', 'cli-mcp'])
+            tools = _run_cli_json(['--db', str(db), 'mcp', 'tools', 'cli-mcp'])
+
+            assert registered['server_id'] == 'cli-mcp'
+            assert listed[0]['server_id'] == 'cli-mcp'
+            assert inspected['transport']['type'] == 'stdio'
+            assert tools['tools'][0]['tool_id'] == 'echo'
+            assert tools['tools'][0]['resource'] == 'mcp:cli-mcp:echo'
+
 @contextlib.contextmanager
 def _temporary_cwd(path: Path):
     previous = Path.cwd()
@@ -422,6 +440,27 @@ def _run_cli_json(argv: list[str]) -> dict[str, object]:
     with contextlib.redirect_stdout(stdout):
         cli_main(argv)
     return json.loads(stdout.getvalue())
+
+
+def _cli_mcp_manifest(server_id: str) -> str:
+    return f"""
+schema_version: 1
+server_id: {server_id}
+transport: stdio
+stdio:
+  command: python3
+  args: ["-m", "demo_mcp"]
+tools:
+  - tool_id: echo
+    mcp_name: demo.echo
+    right: read
+    rollback_class: no_rollback_required
+    state_mutation: false
+    information_flow: true
+timeout_s: 5
+max_request_bytes: 65536
+max_response_bytes: 1048576
+""".strip()
 
 
 def _write_cli_image_package(root: Path) -> None:

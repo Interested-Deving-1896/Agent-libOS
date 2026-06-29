@@ -112,6 +112,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC endpoint
   registration and calls use registered endpoint/method authority and
   classified provider effects.
+- `mcp-provider-effects-are-registered-and-classified`: MCP server registration
+  and tool calls use registered server/tool authority and classified provider
+  effects.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
   remain deterministic and token-free by default.
 
@@ -123,4 +126,5 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   complete paper evaluation suite.
 - Context materialization metadata is not complete enough to compute
   included/omitted/summarized/truncated object statistics for every LLM call.
-- Real MCP, Git worktree, and mock PR providers are planned but not implemented.
+- MCP Resources/Prompts, Git worktree, and mock PR providers are planned but not
+  implemented.

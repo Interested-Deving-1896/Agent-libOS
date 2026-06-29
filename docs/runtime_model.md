@@ -206,8 +206,8 @@ worker finishes, a later shutdown can complete normal resource cleanup.
 Resource limits are runtime constraints, not Capabilities. A process may have a
 `ResourceBudget` covering tool calls, child processes, runtime seconds, LLM
 calls and tokens, context materialization tokens, subprocess wall/CPU/RSS usage,
-external filesystem bytes, JSON-RPC bytes, and Deno syscalls. Observed
-consumption is stored as `ResourceUsage` on the process row.
+external filesystem bytes, JSON-RPC bytes, MCP bytes, and Deno syscalls.
+Observed consumption is stored as `ResourceUsage` on the process row.
 
 Every charge applies to the acting process and its parent chain, so a parent can
 bound an entire child tree. Fork and spawn may request a child budget, but it

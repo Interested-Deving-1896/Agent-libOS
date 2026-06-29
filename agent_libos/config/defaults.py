@@ -124,6 +124,7 @@ class ProcessDefaults:
     max_external_read_bytes: int | None = None
     max_external_write_bytes: int | None = None
     max_jsonrpc_bytes: int | None = None
+    max_mcp_bytes: int | None = None
     max_deno_syscalls: int | None = None
     default_goal_text: str = "Run agent process"
     default_working_directory: str = "."
@@ -345,6 +346,27 @@ class JsonRpcDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class McpDefaults:
+    registry_resource: str = "mcp_server:*"
+    server_id_max_chars: int = 96
+    tool_id_max_chars: int = 96
+    mcp_name_max_chars: int = 256
+    header_name_max_chars: int = 128
+    header_value_max_chars: int = 8_192
+    manifest_max_bytes: int = 262_144
+    timeout_s: float = 10.0
+    timeout_hard_limit_s: float = 60.0
+    max_request_bytes: int = 65_536
+    max_response_bytes: int = 1_048_576
+    max_request_hard_limit_bytes: int = 1_048_576
+    max_response_hard_limit_bytes: int = 8_388_608
+    list_limit: int = 100
+    audit_preview_chars: int = 512
+    header_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
+    stdio_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ImageDefaults:
     registry_resource: str = "image:*"
     id_max_chars: int = 128
@@ -521,6 +543,7 @@ class AgentLibOSConfig:
     tools: ToolDefaults = field(default_factory=ToolDefaults)
     shell: ShellDefaults = field(default_factory=ShellDefaults)
     jsonrpc: JsonRpcDefaults = field(default_factory=JsonRpcDefaults)
+    mcp: McpDefaults = field(default_factory=McpDefaults)
     image: ImageDefaults = field(default_factory=ImageDefaults)
     image_commit: ImageCommitDefaults = field(default_factory=ImageCommitDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
@@ -616,6 +639,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
             "max_external_read_bytes",
             "max_external_write_bytes",
             "max_jsonrpc_bytes",
+            "max_mcp_bytes",
             "max_deno_syscalls",
         ),
     )
@@ -767,6 +791,31 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_at_least("jsonrpc.max_request_hard_limit_bytes", jsonrpc.max_request_hard_limit_bytes, "jsonrpc.max_request_bytes", jsonrpc.max_request_bytes)
     _require_at_least("jsonrpc.max_response_hard_limit_bytes", jsonrpc.max_response_hard_limit_bytes, "jsonrpc.max_response_bytes", jsonrpc.max_response_bytes)
     _require_non_empty_items("jsonrpc.header_env_allowlist", jsonrpc.header_env_allowlist)
+
+    mcp = config.mcp
+    for name in (
+        "registry_resource",
+        "server_id_max_chars",
+        "tool_id_max_chars",
+        "mcp_name_max_chars",
+        "header_name_max_chars",
+        "header_value_max_chars",
+        "manifest_max_bytes",
+        "timeout_s",
+        "timeout_hard_limit_s",
+        "max_request_bytes",
+        "max_response_bytes",
+        "max_request_hard_limit_bytes",
+        "max_response_hard_limit_bytes",
+        "list_limit",
+        "audit_preview_chars",
+    ):
+        _positive_or_non_empty(f"mcp.{name}", getattr(mcp, name))
+    _require_at_least("mcp.timeout_hard_limit_s", mcp.timeout_hard_limit_s, "mcp.timeout_s", mcp.timeout_s)
+    _require_at_least("mcp.max_request_hard_limit_bytes", mcp.max_request_hard_limit_bytes, "mcp.max_request_bytes", mcp.max_request_bytes)
+    _require_at_least("mcp.max_response_hard_limit_bytes", mcp.max_response_hard_limit_bytes, "mcp.max_response_bytes", mcp.max_response_bytes)
+    _require_non_empty_items("mcp.header_env_allowlist", mcp.header_env_allowlist)
+    _require_non_empty_items("mcp.stdio_env_allowlist", mcp.stdio_env_allowlist)
 
     image = config.image
     for name in (

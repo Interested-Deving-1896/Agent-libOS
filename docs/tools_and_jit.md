@@ -4,8 +4,8 @@ LLM-facing tools are stable wrappers over libOS primitives. They provide names,
 schemas, validation, and model ergonomics. Primitives enforce authority.
 
 Tool visibility is not resource authority. A process can call only tools in its
-process tool table, but filesystem, shell, JSON-RPC, human, memory, image, and
-process effects are still authorized by the primitive path. `ToolPolicy`
+process tool table, but filesystem, shell, JSON-RPC, MCP, human, memory, image,
+and process effects are still authorized by the primitive path. `ToolPolicy`
 contains declaration metadata such as `declared_permissions` and
 `declared_confirmation_required`; it is shown in tool specs for humans and UI,
 but it does not grant permissions or approve execution.
@@ -27,6 +27,8 @@ The current built-in tool surface includes tools for:
   `llm_context:<pid>` object through a `context-compressor:v0` child process.
 - Shell: argv-only subprocess execution through policy.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
+- MCP: list/inspect registered servers, list manifest-allowed tools, and call
+  registered MCP tools.
 - Image registry: load workspace image packages and commit checkpoints into
   checkpoint-derived images.
 - Checkpoint: create, list, inspect, diff, restore, and fork.
@@ -50,12 +52,12 @@ standard compact summary contract, while the LLM context helper records
 and owns the schema validation, version check, and replacement.
 
 The tool does not grant external resource authority to the compressor. The
-compressor child receives only the current chunk, prior stage summary, and stage
-goal material needed for summarization; filesystem, shell, memory-write,
-JSON-RPC, human, Skill, checkpoint, and process-control access remain absent
-unless separately granted by normal primitives. The wrapper is visible to the
-model, but Object Memory and Process primitives still enforce reads, writes,
-child creation, waiting, resource budgets, audit, and lifecycle.
+compressor child receives only the current chunk, prior stage summary, and
+stage goal material needed for summarization; filesystem, shell, memory-write,
+JSON-RPC, MCP, human, Skill, checkpoint, and process-control access remain
+absent unless separately granted by normal primitives. The wrapper is visible
+to the model, but Object Memory and Process primitives still enforce reads,
+writes, child creation, waiting, resource budgets, audit, and lifecycle.
 
 Compaction is fail-closed. If the compressor fails or is killed, returns an
 invalid or empty schema, the source context version changes before final
@@ -249,6 +251,7 @@ The current syscall surface covers existing primitive areas:
 - process cwd/fork/spawn/wait/list/signal/merge/exec/exit/messages,
 - shell run,
 - JSON-RPC list/inspect/call,
+- MCP list/inspect/tools/call,
 - image list/inspect/load package/commit checkpoint,
 - checkpoint create/list/inspect/diff/restore/fork/replay,
 - Skill discover/inspect/register_path/activate/read_resource/unload.

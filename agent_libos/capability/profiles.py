@@ -91,6 +91,28 @@ class SandboxProfileBuilder:
             },
         )
 
+    def mcp(
+        self,
+        *,
+        resource: str,
+        effect: CapabilityEffect,
+        risk: AuthorityRisk = AuthorityRisk.HIGH,
+        server_id: str,
+        tool_id: str,
+    ) -> SandboxProfile:
+        return SandboxProfile(
+            operation="mcp.call",
+            resource=resource,
+            effect=effect,
+            risk=risk,
+            restrictions={
+                "registered_server_only": True,
+                "server_id": server_id,
+                "tool_id": tool_id,
+                "caller_supplied_transport": False,
+            },
+        )
+
     def _filesystem_intent(self, argv: list[str], risk: AuthorityRisk) -> str:
         if risk == AuthorityRisk.DESTRUCTIVE:
             return "delete_or_mutate"

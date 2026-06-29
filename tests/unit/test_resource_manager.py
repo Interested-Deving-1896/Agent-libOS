@@ -247,6 +247,30 @@ class TestResourceManager:
         finally:
             runtime.close()
 
+    def test_mcp_remaining_budget_counts_request_and_response_together(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="mcp budget",
+                resource_budget=ResourceBudget(max_mcp_bytes=100),
+            )
+            runtime.resources.charge(
+                pid,
+                ResourceUsage(mcp_request_bytes=30, mcp_response_bytes=50),
+                source="test",
+            )
+
+            assert runtime.resources.remaining_budget(pid).max_mcp_bytes == 20
+            with pytest.raises(ResourceLimitExceeded):
+                runtime.process.spawn_child(
+                    pid,
+                    goal="oversized mcp child",
+                    resource_budget=ResourceBudget(max_mcp_bytes=30),
+                )
+        finally:
+            runtime.close()
+
     def test_child_process_creation_is_hierarchical_usage(self) -> None:
         runtime = Runtime.open("local")
         try:

@@ -913,6 +913,69 @@ class TestGuiServer:
         assert status == 200
         assert registered['endpoint_id'] == 'gui-actor-jsonrpc'
 
+    def test_mcp_register_rejects_host_file_path(self) -> None:
+        status, body = self.request('POST', '/api/mcp/register', {'path': 'secrets.yaml', 'confirmed': True})
+        assert status == 400
+        assert 'manifest_text' in body['error']['message']
+
+    def test_mcp_register_actor_mode_requires_server_write_capability(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'mcp actor', 'auto_run': False})
+        pid = spawned['pid']
+        manifest = _gui_mcp_manifest('gui-actor-mcp')
+
+        status, denied = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': manifest, 'actor': pid, 'confirmed': True},
+        )
+
+        assert status == 403
+        assert 'mcp_server:gui-actor-mcp' in denied['error']['message']
+
+        self.server.service.runtime.capability.grant(
+            pid,
+            'mcp_server:gui-actor-mcp',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        register_status, registered = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': manifest, 'actor': pid, 'confirmed': True},
+        )
+        tools_status, tools = self.request('GET', '/api/mcp/gui-actor-mcp/tools')
+
+        assert register_status == 200
+        assert tools_status == 200
+        assert registered['server_id'] == 'gui-actor-mcp'
+        assert tools['tools'][0]['tool_id'] == 'echo'
+        assert tools['tools'][0]['resource'] == 'mcp:gui-actor-mcp:echo'
+
+    def test_mcp_call_preserves_invalid_arguments_for_primitive_validation(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'mcp invalid args', 'auto_run': False})
+        pid = spawned['pid']
+        manifest = _gui_mcp_manifest('gui-invalid-args-mcp')
+        self.server.service.runtime.mcp.register_server_from_yaml_text(
+            manifest,
+            actor='test',
+            require_capability=False,
+        )
+        self.server.service.runtime.capability.grant(
+            pid,
+            'mcp:gui-invalid-args-mcp:echo',
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+
+        status, body = self.request(
+            'POST',
+            '/api/mcp/gui-invalid-args-mcp/call',
+            {'pid': pid, 'tool_id': 'echo', 'arguments': [], 'confirmed': True},
+        )
+
+        assert status == 400
+        assert 'arguments must be a JSON object' in body['error']['message']
+
     def test_skill_register_actor_mode_requires_skill_write_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(Path(temp_dir), 'gui-actor-skill', allowed_tools=['echo'])
@@ -1054,4 +1117,25 @@ methods:
     rollback_class: no_rollback_required
     state_mutation: false
     information_flow: true
+""".lstrip()
+
+
+def _gui_mcp_manifest(server_id: str) -> str:
+    return f"""
+schema_version: 1
+server_id: {server_id}
+transport: stdio
+stdio:
+  command: python3
+  args: ["-m", "demo_mcp"]
+tools:
+  - tool_id: echo
+    mcp_name: demo.echo
+    right: read
+    rollback_class: no_rollback_required
+    state_mutation: false
+    information_flow: true
+timeout_s: 5
+max_request_bytes: 65536
+max_response_bytes: 1048576
 """.lstrip()

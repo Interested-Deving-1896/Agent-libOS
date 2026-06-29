@@ -36,8 +36,8 @@ The implementation currently includes:
 - Agent process lifecycle: `spawn`, `fork`, `exec`, `wait`, `signal`, `pause`,
   `resume`, and `exit`.
 - Hierarchical process resource budgets for tool calls, LLM token usage,
-  subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, and Deno
-  syscalls.
+  subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC/MCP bytes, and
+  Deno syscalls.
 - Thread-backed process scheduling through `Runtime.run_until_idle()` and the
   async host wrapper `Runtime.arun_until_idle()`, so blocked quanta do not
   monopolize scheduler progress.
@@ -59,7 +59,7 @@ The implementation currently includes:
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
-  human I/O backends, plus a JSON-RPC over HTTP client provider for
+  human I/O backends, plus JSON-RPC over HTTP and MCP client providers for
   pre-registered remote endpoints.
 - Trusted startup Runtime Modules loaded from manifest-declared Python
   entrypoints before `Runtime.open()` returns. Modules can register tools,
@@ -77,6 +77,9 @@ The implementation currently includes:
   candidates without granting resource authority.
 - Client-only JSON-RPC 2.0 over HTTP through registered endpoints, method
   capabilities, provider-classified external effects, audit, and checkpoints.
+- Client-only MCP Tools through registered stdio or Streamable HTTP servers,
+  tool capabilities, provider-classified external effects, audit, and resource
+  accounting.
 - A deterministic runtime-safety benchmark harness with 20+ checked-in tasks,
   including a self-evolution subset, baselines, side-effect oracle, and metrics
   collection.
@@ -99,6 +102,8 @@ Start here, then read the deeper references as needed:
   manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
 - [docs/jsonrpc.md](docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
+- [docs/mcp.md](docs/mcp.md): client-only MCP server registry, tools-only v1
+  scope, capability resources, tools, syscalls, and checkpoint behavior.
 - [docs/skills.md](docs/skills.md): standard `SKILL.md` packages,
   workspace/global sources, trust, activate/unload semantics, bundled JIT
   tools, and `swe-agent`.
@@ -307,6 +312,14 @@ uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:dem
 uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
 ```
 
+Register and call a preconfigured MCP tool:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-tools:forecast --rights read
+uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-tools forecast --arguments-json '{"city":"Beijing"}'
+```
+
 Inspect or change runtime authority:
 
 ```bash
@@ -340,7 +353,7 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   allow/deny/ask effects, issuer lineage, delegation depth, status, expiry, and
   optional use counts.
 - Skills and JIT tools do not grant filesystem, shell, human, object, process,
-  image, checkpoint, or JSON-RPC remote authority.
+  image, checkpoint, JSON-RPC, or MCP remote authority.
 - JIT syscalls bypass the LLM-facing tool table but not primitive capability
   checks, permission policy, human approval, or audit.
 - Human approval is part of a primitive/syscall. Callers see a final success or

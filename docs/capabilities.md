@@ -83,6 +83,10 @@ Important resource conventions include:
   endpoint registry metadata.
 - `jsonrpc:<endpoint_id>:<method_id>`, `jsonrpc:<endpoint_id>:*`, and
   `jsonrpc:*` for JSON-RPC method invocation.
+- `mcp_server:<server_id>` and `mcp_server:*` for MCP server registry
+  metadata.
+- `mcp:<server_id>:<tool_id>`, `mcp:<server_id>:*`, and `mcp:*` for MCP tool
+  invocation.
 
 Wildcard syntax is terminal only. `kind:*` is a typed prefix pattern and
 `kind:body/*` is a subtree pattern. Bare global `*` is rejected; authority must
@@ -124,8 +128,8 @@ policy language.
 
 Capabilities can carry deterministic `AuthorityRule` entries. A rule has:
 
-- `operation`, such as `filesystem.read`, `shell.run`, `jsonrpc.call`, or
-  `deno.syscall`;
+- `operation`, such as `filesystem.read`, `shell.run`, `jsonrpc.call`,
+  `mcp.call`, or `deno.syscall`;
 - `effect`: `allow`, `ask`, or `deny`;
 - `risk`: `harmless`, `low`, `medium`, `high`, or `destructive`;
 - structured `conditions`, such as argv tokens, match mode, path/cwd intent,
@@ -221,9 +225,9 @@ For example, a process can see `write_text_file` and still fail to write
 
 Loading a Skill can add instructions, existing tools, and Deno/TypeScript JIT
 tools to one process table. It does not grant filesystem, shell, human, object,
-process, image, checkpoint, JSON-RPC, or Skill source authority. JIT syscalls
-bypass the LLM-facing tool table, but they still enter the same primitive
-authorization path as built-in tools.
+process, image, checkpoint, JSON-RPC, MCP, or Skill source authority. JIT
+syscalls bypass the LLM-facing tool table, but they still enter the same
+primitive authorization path as built-in tools.
 
 Default images expose `list_capabilities` and `inspect_capability` so a process
 can understand its own authority. `delegate_capability` and `revoke_capability`
@@ -268,6 +272,8 @@ Deno/TypeScript JIT tools can use the syscall names:
 - `capability.request_permission`
 - `capability.delegate`
 - `capability.revoke`
+- `mcp.list`, `mcp.inspect`, `mcp.tools`, and `mcp.call` for registered MCP
+  servers and tools.
 
 Syscalls do not consult the process tool table. They are authorized by pid,
 capability records, primitive rules, human approval, and audit.
@@ -299,6 +305,35 @@ specific remote method, subject to primitive validation, human approval,
 runtime DNS policy, provider classification, audit, and external-effect
 recording. Agent-facing inspect paths do not expose endpoint URLs or header
 prefix/suffix values; those are host registry details.
+
+## MCP Authority
+
+MCP servers are pre-registered host provider resources. Agents cannot pass MCP
+server commands, URLs, environment variable names, credentials, or arbitrary
+remote tool names at call time.
+
+Registry inspection and mutation use server resources:
+
+```text
+mcp_server:demo-tools
+mcp_server:*
+```
+
+Tool calls use tool resources:
+
+```text
+mcp:demo-tools:echo
+mcp:demo-tools:*
+mcp:*
+```
+
+The required right comes from the server manifest's allowlisted tool spec:
+`read`, `write`, or `execute`. Granting `mcp_server:* read` allows server
+discovery, not tool invocation. Granting `mcp:demo-tools:echo read` allows only
+that manifest-declared tool, subject to argument schema validation, live tool
+schema checks, runtime DNS/secret policy for HTTP transports, provider
+classification, audit, and external-effect recording. MCP Resources and
+Prompts are not exposed in v1.
 
 ## Filesystem Authority
 

@@ -50,6 +50,18 @@ from agent_libos.models.jsonrpc import (
     JsonRpcTransportResult,
 )
 from agent_libos.models.llm import LLMCallRecord
+from agent_libos.models.mcp import (
+    McpCallResult,
+    McpCallStatus,
+    McpHeaderSpec,
+    McpHttpTransportSpec,
+    McpProviderCallResult,
+    McpProviderTool,
+    McpServerSpec,
+    McpStdioTransportSpec,
+    McpToolListResult,
+    McpToolSpec,
+)
 from agent_libos.models.memory import (
     AgentObject,
     MaterializedContext,
@@ -153,6 +165,16 @@ __all__ = [
     "JsonRpcHeaderSpec",
     "JsonRpcMethodSpec",
     "JsonRpcTransportResult",
+    "McpCallResult",
+    "McpCallStatus",
+    "McpHeaderSpec",
+    "McpHttpTransportSpec",
+    "McpProviderCallResult",
+    "McpProviderTool",
+    "McpServerSpec",
+    "McpStdioTransportSpec",
+    "McpToolListResult",
+    "McpToolSpec",
     "JIT_TOOL_EXPOSURE_DIRECT",
     "JIT_TOOL_EXPOSURE_MULTIPLEXED",
     "JIT_TOOL_EXPOSURES",

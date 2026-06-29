@@ -297,7 +297,8 @@ Current behavior must not claim:
 
 - Python JIT compatibility,
 - direct external framework adapters as trusted boundaries,
-- real MCP/GitHub/provider integrations that are not implemented,
+- MCP Resources/Prompts, real GitHub/provider integrations that are not
+  implemented,
 - provider-level compensation for rollbackable external side effects,
 - Skill activation as a capability grant.
 

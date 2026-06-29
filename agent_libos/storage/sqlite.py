@@ -33,6 +33,11 @@ from agent_libos.models import (
     JsonRpcMethodSpec,
     JIT_TOOL_EXPOSURES,
     LLMCallRecord,
+    McpHeaderSpec,
+    McpHttpTransportSpec,
+    McpServerSpec,
+    McpStdioTransportSpec,
+    McpToolSpec,
     MemoryView,
     ObjectFilter,
     ObjectHandle,
@@ -115,6 +120,7 @@ class SQLRuntimeStore:
             "skills",
             "skill_trust",
             "jsonrpc_endpoints",
+            "mcp_servers",
             "images",
             "image_artifacts",
             "tools",
@@ -484,6 +490,14 @@ class SQLRuntimeStore:
                   updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS mcp_servers (
+                  server_id TEXT PRIMARY KEY,
+                  spec_json TEXT NOT NULL,
+                  registered_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS images (
                   image_id TEXT PRIMARY KEY,
                   manifest_json TEXT NOT NULL,
@@ -559,6 +573,7 @@ class SQLRuntimeStore:
             self._ensure_skill_schema()
             self._ensure_tool_candidate_schema()
             self._ensure_jsonrpc_endpoint_schema()
+            self._ensure_mcp_server_schema()
             self._ensure_runtime_module_schema()
             self._release_missing_runtime_object_payloads()
             self.conn.commit()
@@ -2037,6 +2052,52 @@ class SQLRuntimeStore:
     def delete_jsonrpc_endpoint(self, endpoint_id: str) -> None:
         self._execute("DELETE FROM jsonrpc_endpoints WHERE endpoint_id = ?", (endpoint_id,))
 
+    def upsert_mcp_server(self, server: McpServerSpec, *, registered_by: str, created_at: str) -> None:
+        self._execute(
+            """
+            INSERT INTO mcp_servers (
+                server_id, spec_json, registered_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(server_id) DO UPDATE SET
+                spec_json = excluded.spec_json,
+                registered_by = excluded.registered_by,
+                updated_at = excluded.updated_at
+            """,
+            (
+                server.server_id,
+                dumps(server),
+                registered_by,
+                created_at,
+                created_at,
+            ),
+        )
+
+    def get_mcp_server(self, server_id: str) -> tuple[McpServerSpec, dict[str, Any]] | None:
+        rows = self._query("SELECT * FROM mcp_servers WHERE server_id = ?", (server_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        return self._dict_to_mcp_server(loads(row["spec_json"], {})), self._mcp_server_row_metadata(row)
+
+    def list_mcp_servers(self, text: str | None = None, limit: int | None = None) -> list[tuple[McpServerSpec, dict[str, Any]]]:
+        params: list[Any] = []
+        sql = "SELECT * FROM mcp_servers"
+        if text:
+            needle = f"%{text.lower()}%"
+            sql += " WHERE lower(server_id) LIKE ? OR lower(spec_json) LIKE ?"
+            params.extend([needle, needle])
+        sql += " ORDER BY server_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [
+            (self._dict_to_mcp_server(loads(row["spec_json"], {})), self._mcp_server_row_metadata(row))
+            for row in self._query(sql, params)
+        ]
+
+    def delete_mcp_server(self, server_id: str) -> None:
+        self._execute("DELETE FROM mcp_servers WHERE server_id = ?", (server_id,))
+
     def upsert_image(
         self,
         image: AgentImage,
@@ -2554,6 +2615,19 @@ class SQLRuntimeStore:
             """
             CREATE TABLE IF NOT EXISTS jsonrpc_endpoints (
               endpoint_id TEXT PRIMARY KEY,
+              spec_json TEXT NOT NULL,
+              registered_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _ensure_mcp_server_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+              server_id TEXT PRIMARY KEY,
               spec_json TEXT NOT NULL,
               registered_by TEXT NOT NULL,
               created_at TEXT NOT NULL,
@@ -3228,6 +3302,13 @@ class SQLRuntimeStore:
             "updated_at": row["updated_at"],
         }
 
+    def _mcp_server_row_metadata(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "registered_by": row["registered_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def _dict_to_jsonrpc_endpoint(self, data: dict[str, Any]) -> JsonRpcEndpointSpec:
         with _persisted_model_decode(
             f"JSON-RPC endpoint {data.get('endpoint_id', '<unknown>') if isinstance(data, dict) else '<unknown>'}"
@@ -3257,6 +3338,61 @@ class SQLRuntimeStore:
                         metadata=dict(item.get("metadata") or {}),
                     )
                     for item in list(data.get("methods") or [])
+                ],
+                timeout_s=float(data["timeout_s"]),
+                max_request_bytes=int(data["max_request_bytes"]),
+                max_response_bytes=int(data["max_response_bytes"]),
+                metadata=dict(data.get("metadata") or {}),
+            )
+
+    def _dict_to_mcp_server(self, data: dict[str, Any]) -> McpServerSpec:
+        with _persisted_model_decode(
+            f"MCP server {data.get('server_id', '<unknown>') if isinstance(data, dict) else '<unknown>'}"
+        ):
+            stdio_data = data.get("stdio")
+            http_data = data.get("http")
+            return McpServerSpec(
+                schema_version=int(data.get("schema_version", 1)),
+                server_id=data["server_id"],
+                transport=data["transport"],
+                stdio=(
+                    McpStdioTransportSpec(
+                        command=str(stdio_data["command"]),
+                        args=[str(item) for item in list(stdio_data.get("args") or [])],
+                        env={str(name): str(value) for name, value in dict(stdio_data.get("env") or {}).items()},
+                        cwd=str(stdio_data["cwd"]) if stdio_data.get("cwd") is not None else None,
+                    )
+                    if isinstance(stdio_data, dict)
+                    else None
+                ),
+                http=(
+                    McpHttpTransportSpec(
+                        url=str(http_data["url"]),
+                        headers={
+                            str(name): McpHeaderSpec(
+                                env=str(value["env"]),
+                                prefix=str(value.get("prefix", "")),
+                                suffix=str(value.get("suffix", "")),
+                            )
+                            for name, value in dict(http_data.get("headers") or {}).items()
+                        },
+                    )
+                    if isinstance(http_data, dict)
+                    else None
+                ),
+                tools=[
+                    McpToolSpec(
+                        tool_id=item["tool_id"],
+                        mcp_name=item["mcp_name"],
+                        right=item["right"],
+                        rollback_class=item["rollback_class"],
+                        rollback_status=item.get("rollback_status"),
+                        state_mutation=_persisted_bool(item["state_mutation"], "state_mutation"),
+                        information_flow=_persisted_bool(item["information_flow"], "information_flow"),
+                        input_schema=dict(item.get("input_schema") or {}),
+                        metadata=dict(item.get("metadata") or {}),
+                    )
+                    for item in list(data.get("tools") or [])
                 ],
                 timeout_s=float(data["timeout_s"]),
                 max_request_bytes=int(data["max_request_bytes"]),

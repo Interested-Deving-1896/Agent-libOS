@@ -4,8 +4,10 @@ import asyncio
 import contextlib
 import ctypes
 import errno
+import hashlib
 import http.client
 import heapq
+import ipaddress
 import os
 import signal
 import shutil
@@ -13,6 +15,7 @@ import socket
 import ssl
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +37,11 @@ from agent_libos.models import (
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     JsonRpcTransportResult,
+    McpProviderCallResult,
+    McpProviderTool,
+    McpServerSpec,
+    McpToolListResult,
+    McpToolSpec,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.substrate.base import (
@@ -46,10 +54,13 @@ from agent_libos.substrate.base import (
     SubprocessLimits,
     SubprocessTimeoutExpired,
 )
+from agent_libos.utils.serde import dumps, to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
+_MCP_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_MCP_FORBIDDEN_HOSTS = {"metadata.google.internal"}
 _SAFE_SHELL_ENV_KEYS = {
     "COMSPEC",
     "LANG",
@@ -1228,6 +1239,525 @@ class HttpJsonRpcProvider:
         return headers
 
 
+class SdkMcpProvider:
+    """MCP client provider backed by the optional official Python SDK."""
+
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
+
+    def list_tools(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> McpToolListResult:
+        return _run_mcp_async(self._alist_tools(server, timeout_s=timeout_s, max_response_bytes=max_response_bytes))
+
+    def call_tool(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> McpProviderCallResult:
+        return _run_mcp_async(
+            self._acall_tool(
+                server,
+                tool,
+                arguments,
+                timeout_s=timeout_s,
+                max_response_bytes=max_response_bytes,
+            )
+        )
+
+    async def _alist_tools(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> McpToolListResult:
+        started = time.monotonic()
+        async with self._session(server, timeout_s=timeout_s) as session:
+            result = await asyncio.wait_for(session.list_tools(), timeout=timeout_s)
+        tools = [
+            McpProviderTool(
+                name=str(getattr(item, "name", "")),
+                description=getattr(item, "description", None),
+                input_schema=dict(getattr(item, "inputSchema", None) or getattr(item, "input_schema", None) or {}),
+                metadata=_mcp_metadata(item),
+            )
+            for item in list(getattr(result, "tools", []) or [])
+        ]
+        encoded = dumps([to_jsonable(tool) for tool in tools]).encode("utf-8")
+        if len(encoded) > max_response_bytes:
+            raise RuntimeError(f"MCP tools/list response exceeded max_response_bytes={max_response_bytes}")
+        return McpToolListResult(
+            server_id=server.server_id,
+            tools=tools,
+            response_bytes=len(encoded),
+            duration_s=time.monotonic() - started,
+        )
+
+    async def _acall_tool(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> McpProviderCallResult:
+        started = time.monotonic()
+        async with self._session(server, timeout_s=timeout_s) as session:
+            result = await asyncio.wait_for(session.call_tool(tool.mcp_name, arguments), timeout=timeout_s)
+        content = _jsonable_mcp_value(getattr(result, "content", None))
+        structured = _jsonable_mcp_value(
+            getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
+        )
+        payload = {"content": _bounded_mcp_content(content), "structured_content": structured}
+        encoded = dumps(payload).encode("utf-8")
+        too_large = len(encoded) > max_response_bytes
+        if too_large:
+            payload = {"content": _mcp_oversize_observation(encoded), "structured_content": None}
+        return McpProviderCallResult(
+            content=payload["content"],
+            structured_content=payload["structured_content"],
+            is_error=bool(getattr(result, "isError", False) or getattr(result, "is_error", False)),
+            response_bytes=min(len(encoded), max_response_bytes),
+            duration_s=time.monotonic() - started,
+            too_large=too_large,
+        )
+
+    @contextlib.asynccontextmanager
+    async def _session(self, server: McpServerSpec, *, timeout_s: float):
+        try:
+            from mcp import ClientSession
+            from mcp.client.stdio import StdioServerParameters
+            from mcp.client.streamable_http import streamable_http_client
+        except ModuleNotFoundError as exc:
+            raise ValidationError(
+                "MCP provider requires the optional dependency; install with `uv sync --extra mcp --all-groups`"
+            ) from exc
+        if server.transport == "stdio":
+            if server.stdio is None:
+                raise RuntimeError("MCP stdio transport is missing stdio configuration")
+            params = StdioServerParameters(
+                command=server.stdio.command,
+                args=list(server.stdio.args),
+                env=self._resolved_stdio_env(server),
+                cwd=self._resolved_stdio_cwd(server),
+            )
+            async with _strict_stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=timeout_s)
+                    yield session
+            return
+        if server.transport == "streamable_http":
+            if server.http is None:
+                raise RuntimeError("MCP streamable_http transport is missing HTTP configuration")
+            async with self._http_client(server, timeout_s=timeout_s) as http_client:
+                async with streamable_http_client(
+                    server.http.url,
+                    http_client=http_client,
+                ) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await asyncio.wait_for(session.initialize(), timeout=timeout_s)
+                        yield session
+            return
+        raise RuntimeError(f"unsupported MCP transport: {server.transport}")
+
+    @contextlib.asynccontextmanager
+    async def _http_client(self, server: McpServerSpec, *, timeout_s: float):
+        try:
+            import httpx
+        except ModuleNotFoundError as exc:
+            raise ValidationError(
+                "MCP provider requires httpx from the optional MCP dependency; "
+                "install with `uv sync --extra mcp --all-groups`"
+            ) from exc
+        timeout = httpx.Timeout(timeout_s, read=timeout_s)
+        async with httpx.AsyncClient(
+            headers=self._resolved_http_headers(server),
+            follow_redirects=False,
+            timeout=timeout,
+            transport=_McpPolicyAsyncHTTPTransport(),
+            trust_env=False,
+        ) as client:
+            yield client
+
+    def _resolved_http_headers(self, server: McpServerSpec) -> dict[str, str]:
+        if server.http is None:
+            return {}
+        headers: dict[str, str] = {}
+        for name, spec in server.http.headers.items():
+            value = os.environ.get(spec.env)
+            if value is None:
+                raise RuntimeError(f"missing environment variable for MCP header {name}: {spec.env}")
+            headers[name] = f"{spec.prefix}{value}{spec.suffix}"
+        return headers
+
+    def _resolved_stdio_env(self, server: McpServerSpec) -> dict[str, str]:
+        if server.stdio is None:
+            return {}
+        env = _mcp_platform_env()
+        for child_name, host_name in server.stdio.env.items():
+            value = os.environ.get(host_name)
+            if value is None:
+                raise RuntimeError(f"missing environment variable for MCP stdio env {child_name}: {host_name}")
+            env[child_name] = value
+        return env
+
+    def _resolved_stdio_cwd(self, server: McpServerSpec) -> str:
+        if server.stdio is None or server.stdio.cwd is None:
+            return str(self.workspace_root)
+        target = (self.workspace_root / server.stdio.cwd).resolve()
+        if target != self.workspace_root and self.workspace_root not in target.parents:
+            raise ValidationError("MCP stdio cwd escapes workspace root")
+        return str(target)
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation != "call_tool":
+            raise ValueError(f"unsupported MCP external effect operation: {operation}")
+        rollback_class = ExternalEffectRollbackClass(str(context["rollback_class"]))
+        rollback_status = context.get("rollback_status")
+        if rollback_status is None:
+            rollback_status = (
+                ExternalEffectRollbackStatus.NOT_REQUIRED
+                if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+                else ExternalEffectRollbackStatus.NOT_SUPPORTED
+            )
+        return ExternalEffectClassification(
+            rollback_class=rollback_class,
+            rollback_status=ExternalEffectRollbackStatus(str(rollback_status)),
+            state_mutation=bool(context.get("state_mutation")),
+            information_flow=bool(context.get("information_flow")),
+            metadata={
+                "provider": "mcp",
+                "server_id": context.get("server_id"),
+                "tool_id": context.get("tool_id"),
+                "mcp_name": context.get("mcp_name"),
+            },
+        )
+
+
+class _McpPolicyAsyncHTTPTransport:
+    """httpx async transport with MCP address policy enforced at connect time."""
+
+    def __init__(self) -> None:
+        try:
+            import httpcore
+            import httpx
+        except ModuleNotFoundError as exc:
+            raise ValidationError(
+                "MCP HTTP transport requires httpx/httpcore from the optional MCP dependency; "
+                "install with `uv sync --extra mcp --all-groups`"
+            ) from exc
+        self._delegate = httpx.AsyncHTTPTransport(trust_env=False)
+        self._delegate._pool = httpcore.AsyncConnectionPool(  # type: ignore[attr-defined]
+            ssl_context=ssl.create_default_context(),
+            max_connections=8,
+            max_keepalive_connections=0,
+            keepalive_expiry=0,
+            http1=True,
+            http2=False,
+            retries=0,
+            network_backend=_McpPolicyNetworkBackend(),
+        )
+
+    async def __aenter__(self) -> "_McpPolicyAsyncHTTPTransport":
+        await self._delegate.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        await self._delegate.__aexit__(exc_type, exc_value, traceback)
+
+    async def handle_async_request(self, request: Any) -> Any:
+        return await self._delegate.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._delegate.aclose()
+
+
+class _McpPolicyNetworkBackend:
+    """Resolve, validate, then connect to the exact MCP HTTP address."""
+
+    def __init__(self) -> None:
+        try:
+            import httpcore
+        except ModuleNotFoundError as exc:
+            raise ValidationError(
+                "MCP HTTP transport requires httpcore from the optional MCP dependency; "
+                "install with `uv sync --extra mcp --all-groups`"
+            ) from exc
+        self._backend = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        host_text = host.decode("idna") if isinstance(host, bytes) else str(host)
+        addresses = _allowed_mcp_connect_addresses(host_text, port)
+        last_exc: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+        raise OSError(f"MCP host resolved no usable addresses: {host_text}")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        return await self._backend.connect_unix_socket(path, timeout=timeout, socket_options=socket_options)
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+def _allowed_mcp_connect_addresses(host: str, port: int) -> list[str]:
+    normalized = host.strip("[]").lower()
+    if normalized in _MCP_FORBIDDEN_HOSTS:
+        raise ValidationError("MCP HTTP host is not allowed")
+    allow_local = normalized in _MCP_LOCAL_HTTP_HOSTS
+    literal = _ip_address_or_none(host)
+    if literal is not None:
+        _validate_mcp_connect_ip(literal, allow_local=allow_local)
+        return [host.strip("[]")]
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValidationError(f"MCP host could not be resolved: {host}") from exc
+    addresses = sorted({info[4][0] for info in infos})
+    if not addresses:
+        raise ValidationError(f"MCP host resolved no addresses: {host}")
+    for address in addresses:
+        _validate_mcp_connect_ip(ipaddress.ip_address(address), allow_local=allow_local)
+    return addresses
+
+
+def _ip_address_or_none(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+
+
+def _validate_mcp_connect_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_local: bool) -> None:
+    if allow_local:
+        if ip.is_loopback:
+            return
+        raise ValidationError("MCP local HTTP host must resolve to loopback")
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
+        raise ValidationError("MCP HTTP IP address is not allowed")
+
+
+def _mcp_platform_env() -> dict[str, str]:
+    if os.name != "nt":
+        return {}
+    env: dict[str, str] = {}
+    for key in ("SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+@contextlib.asynccontextmanager
+async def _strict_stdio_client(server: Any):
+    try:
+        import anyio
+        import anyio.lowlevel
+        import mcp.types as mcp_types
+        from anyio.streams.text import TextReceiveStream
+        from mcp.os.posix.utilities import terminate_posix_process_tree
+        from mcp.os.win32.utilities import create_windows_process, get_windows_executable_command, terminate_windows_process_tree
+        from mcp.shared.message import SessionMessage
+    except ModuleNotFoundError as exc:
+        raise ValidationError(
+            "MCP stdio transport requires the optional MCP dependency; "
+            "install with `uv sync --extra mcp --all-groups`"
+        ) from exc
+    read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
+    write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
+    process = None
+    command = get_windows_executable_command(server.command) if sys.platform == "win32" else server.command
+    try:
+        if sys.platform == "win32":
+            process = await create_windows_process(command, list(server.args), dict(server.env or {}), sys.stderr, server.cwd)
+        else:
+            process = await anyio.open_process(
+                [command, *list(server.args)],
+                env=dict(server.env or {}),
+                stderr=sys.stderr,
+                cwd=server.cwd,
+                start_new_session=True,
+            )
+    except OSError:
+        await read_stream.aclose()
+        await write_stream.aclose()
+        await read_stream_writer.aclose()
+        await write_stream_reader.aclose()
+        raise
+
+    async def stdout_reader() -> None:
+        assert process is not None and process.stdout
+        try:
+            async with read_stream_writer:
+                buffer = ""
+                async for chunk in TextReceiveStream(
+                    process.stdout,
+                    encoding=server.encoding,
+                    errors=server.encoding_error_handler,
+                ):
+                    lines = (buffer + chunk).split("\n")
+                    buffer = lines.pop()
+                    for line in lines:
+                        try:
+                            message = mcp_types.JSONRPCMessage.model_validate_json(line)
+                        except Exception as exc:
+                            await read_stream_writer.send(exc)
+                            continue
+                        await read_stream_writer.send(SessionMessage(message))
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async def stdin_writer() -> None:
+        assert process is not None and process.stdin
+        try:
+            async with write_stream_reader:
+                async for session_message in write_stream_reader:
+                    raw = session_message.message.model_dump_json(by_alias=True, exclude_none=True)
+                    await process.stdin.send(
+                        (raw + "\n").encode(
+                            encoding=server.encoding,
+                            errors=server.encoding_error_handler,
+                        )
+                    )
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async with anyio.create_task_group() as task_group, process:
+        task_group.start_soon(stdout_reader)
+        task_group.start_soon(stdin_writer)
+        try:
+            yield read_stream, write_stream
+        finally:
+            if process.stdin:
+                with contextlib.suppress(Exception):
+                    await process.stdin.aclose()
+            try:
+                with anyio.fail_after(2.0):
+                    await process.wait()
+            except TimeoutError:
+                if sys.platform == "win32":
+                    await terminate_windows_process_tree(process)
+                else:
+                    await terminate_posix_process_tree(process)
+            except ProcessLookupError:
+                pass
+            await read_stream.aclose()
+            await write_stream.aclose()
+            await read_stream_writer.aclose()
+            await write_stream_reader.aclose()
+
+
+def _run_mcp_async(awaitable: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable)
+    raise RuntimeError("MCP provider cannot run inside an active event loop; use the async primitive wrapper")
+
+
+def _jsonable_mcp_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return to_jsonable(value.model_dump(mode="json"))
+    if isinstance(value, list):
+        return [_jsonable_mcp_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonable_mcp_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable_mcp_value(item) for key, item in value.items()}
+    return to_jsonable(value)
+
+
+def _mcp_metadata(item: Any) -> dict[str, Any]:
+    raw = _jsonable_mcp_value(item)
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: value
+        for key, value in raw.items()
+        if key not in {"name", "description", "inputSchema", "input_schema"}
+    }
+
+
+def _bounded_mcp_content(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    bounded: list[Any] = []
+    for item in value:
+        if not isinstance(item, dict):
+            bounded.append(item)
+            continue
+        item_type = item.get("type")
+        if item_type in {"image", "audio", "resource"}:
+            raw_data = item.get("data") or item.get("blob") or item.get("text") or ""
+            raw_text = str(raw_data)
+            bounded.append(
+                {
+                    "type": item_type,
+                    "mimeType": item.get("mimeType") or item.get("mime_type"),
+                    "bytes": len(raw_text.encode("utf-8")),
+                    "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+                }
+            )
+            continue
+        bounded.append(item)
+    return bounded
+
+
+def _mcp_oversize_observation(encoded: bytes) -> dict[str, Any]:
+    return {
+        "type": "oversize",
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 class LocalResourceProviderSubstrate:
     """Default Resource Provider Substrate backed by the host OS."""
 
@@ -1239,3 +1769,4 @@ class LocalResourceProviderSubstrate:
         self.shell = LocalShellProvider(self.workspace_root)
         self.human = LocalHumanProvider()
         self.jsonrpc = HttpJsonRpcProvider()
+        self.mcp = SdkMcpProvider(self.workspace_root)

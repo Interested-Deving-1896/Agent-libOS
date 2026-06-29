@@ -6,7 +6,15 @@ from datetime import datetime, tzinfo
 from typing import Any, Protocol
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import JsonRpcEndpointSpec, JsonRpcMethodSpec, JsonRpcTransportResult
+from agent_libos.models import (
+    JsonRpcEndpointSpec,
+    JsonRpcMethodSpec,
+    JsonRpcTransportResult,
+    McpProviderCallResult,
+    McpServerSpec,
+    McpToolListResult,
+    McpToolSpec,
+)
 from agent_libos.models.external_effect import ExternalEffectClassification
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -175,6 +183,33 @@ class JsonRpcProvider(Protocol):
     ) -> ExternalEffectClassification: ...
 
 
+class McpProvider(Protocol):
+    def list_tools(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> McpToolListResult: ...
+
+    def call_tool(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ) -> McpProviderCallResult: ...
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
+
+
 class ResourceProviderSubstrate(Protocol):
     """Collection of host-effect providers behind libOS primitives.
 
@@ -188,4 +223,5 @@ class ResourceProviderSubstrate(Protocol):
     shell: ShellProvider
     human: HumanProvider
     jsonrpc: JsonRpcProvider
+    mcp: McpProvider
     workspace_display: str

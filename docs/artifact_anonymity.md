@@ -82,8 +82,8 @@ real Deno installation skip with a clear message when `deno` is missing; use
 - `benchmarks/runtime_safety/schema.md` defines benchmark task shape for the M1
   runtime-safety harness.
 - Documentation must not describe Python JIT, direct external framework
-  adapters, real GitHub/MCP providers, or unsupported rollback semantics as
-  current behavior.
+  adapters, real GitHub providers, MCP Resources/Prompts, or unsupported
+  rollback semantics as current behavior.
 
 ## Submission Exit Gate
 

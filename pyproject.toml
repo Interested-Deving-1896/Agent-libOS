@@ -30,6 +30,9 @@ dependencies = [
 postgres = [
     "psycopg[binary]>=3.2",
 ]
+mcp = [
+    "mcp>=1.27,<2",
+]
 pty = [
     "pywinpty>=2.0.13; sys_platform == 'win32'",
 ]
@@ -72,4 +75,5 @@ markers = [
     "real_deno: runs by default when deno is installed; use --skip-real-deno to skip",
     "real_llm: requires --run-real-llm and OpenAI-compatible credentials",
     "postgres: requires --run-postgres and AGENT_LIBOS_POSTGRES_DSN",
+    "mcp: requires --run-mcp and the mcp optional dependency",
 ]

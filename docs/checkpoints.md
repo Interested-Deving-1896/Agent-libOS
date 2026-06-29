@@ -44,7 +44,7 @@ same startup Runtime Module ids and source hashes captured in the checkpoint.
 Checkpoint restore does not import Python modules, change module trust, restore
 global Skill trust rows, or roll back the host module environment.
 
-Host filesystem, shell, JSON-RPC remote calls, and provider effects are not
+Host filesystem, shell, JSON-RPC/MCP remote calls, and provider effects are not
 rolled back. Image registry rows are internal runtime metadata: snapshots capture
 the image definitions needed by the checkpointed subtree and any referenced
 checkpoint-derived image artifacts. Destructive restore re-upserts those captured
@@ -150,9 +150,10 @@ If irreversible provider effects exist after the checkpoint, restore still
 continues by default. The irreversible effects stay in append-only history and
 in the restore report.
 
-JSON-RPC endpoint registry rows are host provider configuration and are not
-captured or restored. Restored capabilities that reference a missing endpoint
-fail closed until a host operator registers that endpoint explicitly.
+JSON-RPC endpoint and MCP server registry rows are host provider configuration
+and are not captured or restored. Restored capabilities that reference a
+missing endpoint or server fail closed until a host operator registers that
+provider configuration explicitly.
 
 ## Commit To Image
 
@@ -167,14 +168,15 @@ The v1 commit captures only the checkpoint owner root process:
 - process cwd and image context settings,
 - required startup module summaries.
 
-It does not copy the real filesystem, shell state, remote JSON-RPC state, human
-UI output, network effects, resource budgets/usage, or any other provider-side
-state. It also does not restore JSON-RPC endpoint registrations or global Skill
-trust rows; those are host registry decisions, not image state. Provider effects
-remain append-only `external_effects` records. Resource limits for a process
-booted from the committed image must come from the caller that starts that
-process. Use an image package `workspace/` seed when an image needs filesystem
-content at boot time.
+It does not copy the real filesystem, shell state, remote JSON-RPC/MCP state,
+human UI output, network effects, resource budgets/usage, or any other
+provider-side state. It also does not restore JSON-RPC endpoint registrations,
+MCP server registrations, or global Skill trust rows; those are host registry
+decisions, not image state. Provider effects remain append-only
+`external_effects` records. Resource limits for a process booted from the
+committed image must come from the caller that starts that process. Use an
+image package `workspace/` seed when an image needs filesystem content at boot
+time.
 
 External capabilities in the checkpoint are converted into image
 `required_capabilities` declarations. They are not restored as live authority

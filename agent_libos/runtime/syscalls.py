@@ -78,6 +78,10 @@ BUILTIN_SYSCALL_NAMES = {
     "jsonrpc.call",
     "jsonrpc.inspect",
     "jsonrpc.list",
+    "mcp.call",
+    "mcp.inspect",
+    "mcp.list",
+    "mcp.tools",
     "memory.append_memory_object",
     "memory.append_object",
     "memory.create_namespace",
@@ -374,6 +378,18 @@ class LibOSSyscallSession:
             return self.runtime.jsonrpc.inspect_endpoint(str(args["endpoint_id"]), actor=self.pid)
         if name == "jsonrpc.call":
             return self._jsonrpc_call(args)
+        if name == "mcp.list":
+            return {"servers": self.runtime.mcp.list_servers(actor=self.pid)}
+        if name == "mcp.inspect":
+            return self.runtime.mcp.inspect_server(str(args["server_id"]), actor=self.pid)
+        if name == "mcp.tools":
+            return self.runtime.mcp.list_tools(
+                str(args["server_id"]),
+                actor=self.pid,
+                refresh=bool(args.get("refresh", False)),
+            )
+        if name == "mcp.call":
+            return self._mcp_call(args)
         if name in {"process.get_working_directory", "process.cwd"}:
             return {"working_directory": self.runtime.process.working_directory(self.pid)}
         if name in {"process.set_working_directory", "process.chdir"}:
@@ -666,6 +682,15 @@ class LibOSSyscallSession:
             endpoint_id=str(args["endpoint_id"]),
             method_id=str(args["method_id"]),
             params=args.get("params"),
+        )
+        return to_jsonable(result)
+
+    async def _mcp_call(self, args: dict[str, Any]) -> dict[str, Any]:
+        result = await self.runtime.mcp.acall_tool(
+            self.pid,
+            server_id=str(args["server_id"]),
+            tool_id=str(args["tool_id"]),
+            arguments=args.get("arguments"),
         )
         return to_jsonable(result)
 

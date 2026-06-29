@@ -12,7 +12,7 @@ from typing import Any
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, JsonRpcPrimitive, ShellAdapter
+from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, JsonRpcPrimitive, McpPrimitive, ShellAdapter
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.executor import LLMProcessExecutor
@@ -52,7 +52,7 @@ from agent_libos.runtime.syscall_router import SyscallRouter
 from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES
 from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import RuntimeStore, open_store
-from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate
+from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate, SdkMcpProvider
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
@@ -142,6 +142,16 @@ class Runtime:
             self.events,
             human=self.human,
             provider=getattr(self.substrate, "jsonrpc", HttpJsonRpcProvider()),
+            config=self.config,
+            resources=self.resources,
+        )
+        self.mcp = McpPrimitive(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            human=self.human,
+            provider=getattr(self.substrate, "mcp", SdkMcpProvider(self.workspace_root)),
             config=self.config,
             resources=self.resources,
         )

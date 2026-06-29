@@ -414,6 +414,7 @@ class GuiRuntimeService:
                 "images": to_jsonable(self.runtime.image_registry.list_images()),
                 "skills": to_jsonable(self.runtime.skills.discover_skills(require_capability=False)),
                 "jsonrpc_endpoints": to_jsonable(self.runtime.jsonrpc.list_endpoints(require_capability=False)),
+                "mcp_servers": to_jsonable(self.runtime.mcp.list_servers(require_capability=False)),
                 "modules": to_jsonable(self.runtime.modules.loaded_module_summaries()),
                 "llm_profiles": self._llm_profile_summaries(),
             }
@@ -421,7 +422,7 @@ class GuiRuntimeService:
         return dict(self._static_snapshot_cache)
 
     def _reason_changes_static_snapshot(self, reason: str) -> bool:
-        return reason.startswith(("image.", "skill.", "jsonrpc.", "module.", "process.exec", "llm_profile."))
+        return reason.startswith(("image.", "skill.", "jsonrpc.", "mcp.", "module.", "process.exec", "llm_profile."))
 
     def _process_summary(self, pid: str, *, include_messages: bool = False) -> dict[str, Any]:
         process = self.runtime.process.get(pid)
@@ -733,6 +734,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return self._dispatch_llm_profiles(method, route[1:])
         if len(route) >= 1 and route[0] == "jsonrpc":
             return self._dispatch_jsonrpc(method, route[1:], query)
+        if len(route) >= 1 and route[0] == "mcp":
+            return self._dispatch_mcp(method, route[1:], query)
         if len(route) >= 1 and route[0] == "modules":
             return self._dispatch_modules(method, route[1:])
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown endpoint")
@@ -1292,6 +1295,56 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes("jsonrpc.call")
             return to_jsonable(result)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown JSON-RPC endpoint")
+
+    def _dispatch_mcp(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
+        service = self.server.service
+        if method == "GET" and not route:
+            return service.runtime.mcp.list_servers(text=_query_str(query, "text"), require_capability=False)
+        if method == "GET" and len(route) == 1:
+            return service.runtime.mcp.inspect_server(route[0], require_capability=False)
+        if method == "GET" and len(route) == 2 and route[1] == "tools":
+            refresh_value = (_query_str(query, "refresh") or "").lower()
+            return service.runtime.mcp.list_tools(
+                route[0],
+                require_capability=False,
+                refresh=refresh_value in {"1", "true", "yes", "on"},
+            )
+        if method == "POST" and route == ["register"]:
+            body = self._read_body()
+            self._require_confirmed("mcp.register", body, {"source": body.get("source")})
+            if "path" in body:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "GUI MCP registration accepts manifest_text, not host file paths",
+                )
+            text = body.get("manifest_text")
+            if not isinstance(text, str) or not text.strip():
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "MCP registration requires non-empty manifest_text")
+            result = service.runtime.mcp.register_server_from_yaml_text(
+                text,
+                actor=str(body.get("actor") or "gui"),
+                replace=bool(body.get("replace", False)),
+                require_capability=body.get("actor") is not None,
+                source=body.get("source"),
+            )
+            service.publish_runtime_changes("mcp.register")
+            return result
+        if method == "POST" and len(route) == 2 and route[1] == "call":
+            body = self._read_body()
+            self._require_confirmed(
+                "mcp.call",
+                body,
+                {"pid": body.get("pid"), "server_id": route[0], "tool_id": body.get("tool_id")},
+            )
+            result = service.runtime.mcp.call_tool(
+                str(body["pid"]),
+                route[0],
+                str(body["tool_id"]),
+                arguments=body["arguments"] if "arguments" in body and body["arguments"] is not None else {},
+            )
+            service.publish_runtime_changes("mcp.call")
+            return to_jsonable(result)
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown MCP endpoint")
 
     def _dispatch_modules(self, method: str, route: list[str]) -> Any:
         service = self.server.service
