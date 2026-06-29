@@ -21,11 +21,12 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `tool-visibility-is-not-authority`: visible tools and endpoints do not grant
   protected resource authority.
 - `primitive-checks-before-effects`: primitives enforce capability, policy,
-  approval, and validation before side effects, including PTY spawn and write
-  limits.
+  approval, and validation before side effects, including hidden provider
+  metadata gates, PTY spawn cleanup, and write limits.
 - `capability-matching-and-delegation`: typed matching, deny dominance,
   one-shot grants, revocation, grant-as-transfer, parent-linked delegation
-  attenuation, and ISO-normalized leases.
+  attenuation, restrictive parent boundaries, malformed authority-rule
+  fail-closed behavior, and ISO-normalized leases.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
@@ -42,12 +43,16 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `object-memory-lifecycle-is-explicit`: Object Memory ownership, release, and
   RAII cleanup are explicit and revoke stale authority, including Object-bound
   PTY handles.
+- `runtime-store-single-active-writer`: a writable persistent runtime store has
+  at most one active Runtime opener, while normal reopen after close is still
+  allowed.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
-  resume, consume one-shot grants, are decided exactly once from pending state,
-  and route through primitives.
+  resume, reserve and consume one-shot grants exactly once, are decided exactly
+  once from pending state, and route through primitives.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
-  sandboxed, process-local, and syscall-mediated; PTY creation reuses shell
-  authorization and follow-on PTY access uses Object capabilities.
+  sandboxed, process-local, cached-only at runtime, and syscall-mediated; PTY
+  creation reuses shell authorization and follow-on PTY access uses Object
+  capabilities.
 - `command-risk-rules-are-deterministic`: command risk rules separate
   harmless, risky, and destructive shell operations without model judgment.
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
@@ -81,6 +86,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   `llm.persist_full_io` is false, LLM call persistence stores bounded preview,
   size, hash, and truncation metadata instead of raw prompts, tool arguments,
   reasoning, or provider responses.
+- `llm-responses-state-chain-is-lossless`: OpenAI Responses state chaining
+  preserves representable tool outputs and breaks the chain when persisted
+  tool-output history cannot be expressed losslessly.
 - `llm-profile-selection-is-process-local`: host-selected LLM profiles are
   stored as process-local ids, resolved at LLM-call time, inherited by child
   processes, preserved by image-package defaults, isolated from non-default
@@ -111,11 +119,11 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   lifecycle control actions; submission/exit must use explicit tool or syscall
   arguments.
 - `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC endpoint
-  registration and calls use registered endpoint/method authority and
-  classified provider effects.
+  registration and calls use registered endpoint/method authority, gate calls
+  before manifest metadata is exposed, and classify provider effects.
 - `mcp-provider-effects-are-registered-and-classified`: MCP server registration
-  and tool calls use registered server/tool authority and classified provider
-  effects.
+  and tool calls use registered server/tool authority, gate calls before server
+  metadata is exposed, and classify provider effects.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
   remain deterministic and token-free by default.
 

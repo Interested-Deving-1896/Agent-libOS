@@ -152,6 +152,10 @@ capability grant; the receiver still needs normal Object Memory authority to
 read or materialize any referenced object. Owner-watch messages can resume a
 task blocked in `receive_process_messages`; tools with arbitrary side effects
 before a message wait are not replayed automatically.
+The ObjectTask manager also watches ordinary process messages delivered to a
+runner and terminal child-process notices. Those events can resume waiting
+tasks only for tools with explicit replay-safe semantics, currently
+`receive_process_messages` and `wait_child_process`.
 
 ## File/Object Bridge
 

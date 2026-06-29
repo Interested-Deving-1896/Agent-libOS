@@ -58,6 +58,7 @@ _TERMINAL_STATUSES = {
 }
 _OWNER_WATCH_EVENTS = {"updated", "linked"}
 _MESSAGE_REPLAY_SAFE_TOOLS = {"receive_process_messages"}
+_PROCESS_REPLAY_SAFE_TOOLS = {"wait_child_process"}
 
 
 class ObjectTaskManager:
@@ -132,7 +133,7 @@ class ObjectTaskManager:
         selected_notify_pid = notify_pid or pid
         selected_owner_watch = self._normalize_owner_watch(owner_watch)
         self._require_related_notification_target(pid, selected_notify_pid)
-        self._assert_owner_rights(pid, owner, {ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value})
+        owner_decisions = self._assert_owner_rights(pid, owner, {ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value})
         if self.runtime.store.get_object(owner.oid) is None:
             raise NotFound(f"object not found: {owner.oid}")
         handle = self.runtime.tools.resolve(tool_name, pid=pid)
@@ -142,39 +143,59 @@ class ObjectTaskManager:
         self.runtime.capability.require(pid, "process:spawn", CapabilityRight.WRITE)
 
         task_id = new_id("otask")
-        runner_pid = self.runtime.process.spawn_child(
-            pid,
-            goal={"type": "object_task", "task_id": task_id, "owner_oid": owner.oid, "tool": tool_name},
-            inherit_capabilities=[dict(spec) if isinstance(spec, dict) else spec.__dict__ for spec in (inherit_capabilities or [])],
-            initial_status=ProcessStatus.WAITING_TOOL,
-        )
-        self.runtime.tools.configure_process_tools(runner_pid, [handle], assigned_by=f"object_task:{task_id}")
-        self.runtime.capability.handle_for_object(
-            runner_pid,
-            owner.oid,
-            {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value},
-            issued_by=f"object_task:{task_id}",
-        )
+        reserved_owner_capability_ids = self._reserve_owner_decisions(owner_decisions)
+        runner_pid: str | None = None
+        task_inserted = False
+        try:
+            runner_pid = self.runtime.process.spawn_child(
+                pid,
+                goal={"type": "object_task", "task_id": task_id, "owner_oid": owner.oid, "tool": tool_name},
+                inherit_capabilities=[dict(spec) if isinstance(spec, dict) else spec.__dict__ for spec in (inherit_capabilities or [])],
+                initial_status=ProcessStatus.WAITING_TOOL,
+            )
+            self.runtime.tools.configure_process_tools(runner_pid, [handle], assigned_by=f"object_task:{task_id}")
+            self.runtime.capability.handle_for_object(
+                runner_pid,
+                owner.oid,
+                {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value},
+                issued_by=f"object_task:{task_id}",
+            )
 
-        now = utc_now()
-        task = ObjectTask(
-            task_id=task_id,
-            owner_oid=owner.oid,
-            creator_pid=pid,
-            runner_pid=runner_pid,
-            tool=tool_name,
-            tool_id=handle.tool_id,
-            status=ObjectTaskStatus.QUEUED,
-            notification=ObjectTaskNotification(
-                recipient_pid=selected_notify_pid,
-                kind=selected_kind.value,
-                channel=notify_channel or self.config.object_tasks.notification_channel,
-            ),
-            owner_watch=selected_owner_watch,
-            created_at=now,
-            updated_at=now,
-        )
-        self.runtime.store.insert_object_task(task)
+            now = utc_now()
+            task = ObjectTask(
+                task_id=task_id,
+                owner_oid=owner.oid,
+                creator_pid=pid,
+                runner_pid=runner_pid,
+                tool=tool_name,
+                tool_id=handle.tool_id,
+                status=ObjectTaskStatus.QUEUED,
+                notification=ObjectTaskNotification(
+                    recipient_pid=selected_notify_pid,
+                    kind=selected_kind.value,
+                    channel=notify_channel or self.config.object_tasks.notification_channel,
+                ),
+                owner_watch=selected_owner_watch,
+                created_at=now,
+                updated_at=now,
+            )
+            self.runtime.store.insert_object_task(task)
+            task_inserted = True
+        except Exception:
+            if not task_inserted:
+                if runner_pid is None or self._cleanup_uncommitted_runner(runner_pid, task_id=task_id):
+                    self._restore_owner_decisions(reserved_owner_capability_ids)
+                else:
+                    self.runtime.audit.record(
+                        actor="object_task",
+                        action="object_task.owner_permission_restore_skipped",
+                        target=f"object_task:{task_id}",
+                        decision={
+                            "runner_pid": runner_pid,
+                            "reason": "runner cleanup was not confirmed",
+                        },
+                    )
+            raise
         with self._lock:
             self._grant_result_to_notify[task_id] = bool(grant_result_to_notify)
             self._pending_args[task_id] = task_args
@@ -645,6 +666,27 @@ class ObjectTaskManager:
             self._schedule_waiting_message_resume(task.task_id)
         return True
 
+    def notify_process_message(self, message: Any) -> None:
+        tasks = [
+            task
+            for task in self.runtime.store.list_object_tasks(include_terminal=False)
+            if task.status == ObjectTaskStatus.WAITING_MESSAGE
+        ]
+        for task in tasks:
+            if str(message.recipient_pid) != str(task.runner_pid):
+                continue
+            if self._message_matches_filters(message, task.wait.get("filters") or {}):
+                self._schedule_waiting_message_resume(task.task_id)
+
+    def notify_process_terminal(self, child_pid: str) -> None:
+        tasks = [
+            task
+            for task in self.runtime.store.list_object_tasks(include_terminal=False)
+            if task.status == ObjectTaskStatus.WAITING_PROCESS and str(task.wait.get("child_pid") or "") == child_pid
+        ]
+        for task in tasks:
+            self._schedule_waiting_process_resume(task.task_id)
+
     def _schedule_waiting_message_resume(self, task_id: str) -> None:
         with self._lock:
             latest = self.runtime.store.get_object_task(task_id)
@@ -674,6 +716,38 @@ class ObjectTaskManager:
                 action="object_task.owner_watch.resume",
                 target=f"object_task:{task_id}",
                 decision={"status": latest.status.value, "filters": latest.wait.get("filters")},
+            )
+            self._schedule_task_locked(task_id)
+
+    def _schedule_waiting_process_resume(self, task_id: str) -> None:
+        with self._lock:
+            latest = self.runtime.store.get_object_task(task_id)
+            if latest is None or latest.status != ObjectTaskStatus.WAITING_PROCESS:
+                return
+            future = self._futures.get(task_id)
+            if future is not None and not future.done():
+                return
+            if task_id not in self._pending_args:
+                self.runtime.audit.record(
+                    actor="object_task",
+                    action="object_task.process_resume_missing_pending",
+                    target=f"object_task:{task_id}",
+                    decision={"status": latest.status.value, "child_pid": latest.wait.get("child_pid")},
+                )
+                return
+            if latest.tool not in _PROCESS_REPLAY_SAFE_TOOLS:
+                self.runtime.audit.record(
+                    actor="object_task",
+                    action="object_task.process_resume_unsafe_replay_skipped",
+                    target=f"object_task:{task_id}",
+                    decision={"status": latest.status.value, "tool": latest.tool, "child_pid": latest.wait.get("child_pid")},
+                )
+                return
+            self.runtime.audit.record(
+                actor="object_task",
+                action="object_task.process_resume",
+                target=f"object_task:{task_id}",
+                decision={"status": latest.status.value, "child_pid": latest.wait.get("child_pid")},
             )
             self._schedule_task_locked(task_id)
 
@@ -1049,21 +1123,84 @@ class ObjectTaskManager:
         creator = self.runtime.store.get_process(task.creator_pid)
         if creator is None or creator.status not in self.runtime.process.TERMINAL_STATUSES:
             return
-        self.runtime.memory.release_process_owned(task.creator_pid)
+        self.runtime.memory.release_owner(
+            ObjectOwnerKind.PROCESS,
+            task.creator_pid,
+            actor="object_task",
+            reason="creator_process_owned_release_after_object_task_terminal",
+        )
 
-    def _assert_owner_rights(self, pid: str, owner: ObjectHandle, rights: set[str]) -> None:
+    def _assert_owner_rights(self, pid: str, owner: ObjectHandle, rights: set[str]) -> list[Any]:
         decisions = []
         for right in sorted(rights):
             decision = self.runtime.capability.authorize_handle(pid, owner, right)
             if not decision.allowed:
                 raise CapabilityDenied(f"capability lacks {right}: {owner.oid}")
             decisions.append(decision)
+        return decisions
+
+    def _reserve_owner_decisions(self, decisions: list[Any]) -> list[str]:
+        reserved: list[str] = []
+        try:
+            for decision in decisions:
+                if decision.consume_capability_id is None or decision.consume_capability_id in reserved:
+                    continue
+                self.runtime.capability.claim_decision_use(
+                    decision,
+                    used_by="object_task",
+                    reason="one-time object task owner permission reserved",
+                )
+                reserved.append(str(decision.consume_capability_id))
+        except Exception:
+            self._restore_owner_decisions(reserved)
+            raise
+        return reserved
+
+    def _restore_owner_decisions(self, cap_ids: list[str]) -> None:
+        for cap_id in cap_ids:
+            self.runtime.capability._restore_reserved_use(
+                cap_id,
+                restored_by="object_task",
+                reason="one-time object task owner permission restored before task commit",
+            )
+
+    def _cleanup_uncommitted_runner(self, runner_pid: str, *, task_id: str) -> bool:
+        release_error: str | None = None
+        self.runtime.process._cleanup_failed_launch(runner_pid)
+        try:
+            self.runtime.process._release_child_budget(runner_pid)
+        except Exception as exc:
+            release_error = f"{type(exc).__name__}: {exc}"
+        residual_process = self.runtime.store.get_process(runner_pid)
+        residual_caps = self.runtime.capability.list_subject(runner_pid, include_inactive=True)
+        if residual_process is not None or residual_caps or release_error is not None:
+            self.runtime.audit.record(
+                actor="object_task",
+                action="object_task.runner_cleanup_incomplete",
+                target=f"process:{runner_pid}",
+                decision={
+                    "task_id": task_id,
+                    "process_present": residual_process is not None,
+                    "capability_count": len(residual_caps),
+                    "release_error": release_error,
+                },
+            )
+            return False
+        self.runtime.audit.record(
+            actor="object_task",
+            action="object_task.runner_cleanup",
+            target=f"process:{runner_pid}",
+            decision={"task_id": task_id},
+        )
+        return True
+
+    def _consume_owner_decisions(self, decisions: list[Any]) -> None:
         consumed: set[str] = set()
         for decision in decisions:
             if decision.consume_capability_id is None or decision.consume_capability_id in consumed:
                 continue
-            self.runtime.capability.consume_use(
-                decision.consume_capability_id,
+            self.runtime.capability.claim_decision_use(
+                decision,
                 used_by="object_task",
                 reason="one-time object task owner permission consumed",
             )

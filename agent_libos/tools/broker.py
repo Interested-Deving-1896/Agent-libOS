@@ -892,6 +892,7 @@ class ToolBroker:
             "syscall_handler": syscall_handler,
             "limits": self._subprocess_limits(pid),
             "return_metrics": True,
+            "cached_only": True,
         }
         if kwargs["limits"] is not None:
             self._require_sandbox_resource_controls()
@@ -906,7 +907,7 @@ class ToolBroker:
     def _supported_sandbox_kwargs(self) -> set[str]:
         signature = inspect.signature(self.sandbox.arun_source)
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
-            return {"pid", "syscall_handler", "timeout", "limits", "return_metrics"}
+            return {"pid", "syscall_handler", "timeout", "limits", "return_metrics", "cached_only"}
         return set(signature.parameters)
 
     def _supported_run_tests_kwargs(self) -> set[str]:

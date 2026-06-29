@@ -4,6 +4,7 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
@@ -98,6 +99,39 @@ class TestJitSecurity:
         assert 'libos.syscall' in candidate.spec.side_effects
         assert 'filesystem.write' in candidate.spec.side_effects
         assert 'jsonrpc.call' in candidate.spec.side_effects
+
+    def test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        commands: list[list[str]] = []
+
+        async def fake_create_subprocess_exec(*command: str, **_kwargs: Any) -> Any:
+            commands.append(list(command))
+            return SimpleNamespace()
+
+        async def fake_monitor_process(_proc: Any, _limits: Any) -> CommandMetrics:
+            return CommandMetrics()
+
+        async def fake_serve_process(_proc: Any, _args: dict[str, Any], _syscall_handler: Any) -> dict[str, bool]:
+            return {'ok': True}
+
+        async def fake_kill_process(_proc: Any) -> None:
+            return None
+
+        sandbox = DenoTypescriptSandbox()
+        monkeypatch.setattr(sandbox, '_resolve_deno', lambda: 'deno')
+        monkeypatch.setattr(sandbox, 'deno_version', lambda: 'deno 2.0.0')
+        monkeypatch.setattr(asyncio, 'create_subprocess_exec', fake_create_subprocess_exec)
+        monkeypatch.setattr(sandbox, '_monitor_process', fake_monitor_process)
+        monkeypatch.setattr(sandbox, '_serve_process', fake_serve_process)
+        monkeypatch.setattr(sandbox, '_kill_process', fake_kill_process)
+
+        source = 'export function run(args, libos) { return {ok: true}; }'
+
+        assert sandbox.run_source(source, {}) == {'ok': True}
+        validation = sandbox.run_tests(source, [{'args': {}, 'expected': {'ok': True}}])
+
+        assert validation.ok, validation.errors
+        assert commands[0] == ['deno', 'run', '--no-prompt', '--cached-only', 'runner.ts']
+        assert commands[1] == ['deno', 'run', '--no-prompt', 'runner.ts']
 
     @pytest.mark.real_deno
     def test_jit_tool_names_are_process_local(self) -> None:

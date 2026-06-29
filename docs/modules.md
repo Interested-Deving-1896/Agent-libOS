@@ -151,6 +151,10 @@ values use `PtyModuleSettings` defaults such as `default_cols`,
 `default_rows`, `startup_timeout_s`, and `startup_output_max_chars`. It returns
 a mutable Object Memory `EXTERNAL_REF` object id as `session_oid`; the payload
 is descriptive metadata only and is not an authority source.
+If provider spawn succeeds but any later registration, reader startup,
+event/audit, or effect-recording step fails, the adapter closes the host handle,
+removes the in-memory session, and releases the object before returning
+failure.
 
 The local PTY backend resolves bare executables on a safe host PATH that
 excludes workspace entries, rejects workspace PATH hijacks, and gives child

@@ -23,11 +23,16 @@ Capability records are structured authority statements:
 - `rules`, `lease`, `delegation`, `constraints`, and `metadata`.
 
 One-shot authority is not encoded as a policy string. It is an `allow`
-capability with `uses_remaining=1`; successful primitive use consumes it and
+capability with `uses_remaining=1`; committed primitive use consumes it and
 revokes the capability when the count reaches zero. If one-shot Object Memory
 authority is resolved through a namespace/name lookup, any handle minted from
 that lookup remains one-shot; name lookup cannot turn temporary authority into
 a persistent object handle.
+For multi-step effects, primitives may reserve a one-shot use before creating
+human, Skill, ObjectTask, or provider side effects. They restore that reserved
+use only when the operation fails before the effect is committed; after the
+commit/provider boundary, the one-shot use remains consumed even if the remote
+or follow-on result is a failure.
 
 `deny` records dominate matching allows. To create an exception, revoke the
 broad deny and issue narrower allow/deny records explicitly. The runtime does
@@ -137,9 +142,10 @@ Capabilities can carry deterministic `AuthorityRule` entries. A rule has:
   network intent, and filesystem intent.
 
 Rules are not LLM judgments. They are local, deterministic policy facts. Unknown
-rule shapes or unknown constraint keys fail closed. The primitive converts the
-final capability decision into a sandbox profile and records that profile in
-approval context, audit, and external-effect metadata where applicable.
+rule shapes, unknown constraint keys, and malformed values for known conditions
+fail closed. The primitive converts the final capability decision into a sandbox
+profile and records that profile in approval context, audit, and external-effect
+metadata where applicable.
 
 ## Issue, Delegate, Revoke
 
@@ -150,13 +156,16 @@ All authority mutation goes through explicit operations:
   `allow` capabilities for every right being transferred. `grant` is not a
   capability-minting right: it can only transfer rights the actor already has,
   cannot create `deny`/`ask` policy records, and cannot transfer finite-use
-  capabilities onward.
+  capabilities onward. Overlapping `deny` or `ask` boundaries, or malformed
+  authority rules on the covering parent, fail closed before transfer.
 - `delegate(parent, child, spec)`: `parent` must hold a covering delegable
   `allow` capability. Delegation can only attenuate resource, rights, expiry,
   constraints, and delegation depth. Finite-use capabilities are consumed by
   direct use and cannot be delegated. Delegated records keep a parent link, so a
   later parent revocation or expiry stops the child record from authorizing.
   Child records cannot drop parent constraints such as `shell_policy_level`.
+  Delegation also cannot launder an overlapping parent `deny`/`ask` or malformed
+  authority rule by selecting a narrower allow.
 - `revoke(actor, cap_id)`: allowed for trusted issuers, the original issuer,
   the holder relinquishing its own capability, or an actor with covering
   `revoke`/`admin` authority.

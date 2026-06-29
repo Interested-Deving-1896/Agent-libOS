@@ -154,14 +154,17 @@ class HumanObjectManager:
         selected_human = human or self.config.runtime.default_human
         decision = self.capabilities.require(pid, f"human:{selected_human}", CapabilityRight.WRITE)
         request = self._permission_request_payload(pid, resource, rights, reason)
-        request_id = self.query(
-            pid=pid,
-            human=selected_human,
-            request=request,
-            blocking=blocking,
-        )
-        self._consume_one_time_decision(decision, used_by="human")
-        return request_id
+        reserved_capability_id = self._reserve_one_time_decision(decision, used_by="human")
+        try:
+            return self.query(
+                pid=pid,
+                human=selected_human,
+                request=request,
+                blocking=blocking,
+            )
+        except Exception:
+            self._restore_one_time_decision(reserved_capability_id)
+            raise
 
     def _permission_request_payload(self, pid: str, resource: str, rights: list[str], reason: str) -> dict[str, Any]:
         pattern = self.capabilities.parse_resource_pattern(resource)
@@ -329,18 +332,21 @@ class HumanObjectManager:
         selected_human = human or self.config.runtime.default_human
         resource = f"human:{selected_human}"
         decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
-        request_id = self.query(
-            pid=pid,
-            human=selected_human,
-            request={
-                "type": "question",
-                "question": question,
-                "context": context or {},
-            },
-            blocking=blocking,
-        )
-        self._consume_one_time_decision(decision, used_by="human")
-        return request_id
+        reserved_capability_id = self._reserve_one_time_decision(decision, used_by="human")
+        try:
+            return self.query(
+                pid=pid,
+                human=selected_human,
+                request={
+                    "type": "question",
+                    "question": question,
+                    "context": context or {},
+                },
+                blocking=blocking,
+            )
+        except Exception:
+            self._restore_one_time_decision(reserved_capability_id)
+            raise
 
     def answer_for_request(self, request_id: str) -> str:
         request = self.get(request_id)
@@ -473,6 +479,7 @@ class HumanObjectManager:
             )
         resource = f"human:{selected_human}"
         decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
+        reserved_capability_id = self._reserve_one_time_decision(decision, used_by="human")
         request = HumanRequest(
             request_id=new_id("hreq"),
             pid=pid,
@@ -484,9 +491,12 @@ class HumanObjectManager:
             created_at=utc_now(),
             updated_at=utc_now(),
         )
-        self.store.insert_human_request(request)
+        try:
+            self.store.insert_human_request(request)
+        except Exception:
+            self._restore_one_time_decision(reserved_capability_id)
+            raise
         delivered = self._deliver_output_request(request)
-        self._consume_one_time_decision(decision, used_by="human")
         return {
             "delivered": True,
             "request_id": delivered.request_id,
@@ -801,11 +811,30 @@ class HumanObjectManager:
             bool(spec.get("delegable", False)),
         )
 
+    def _reserve_one_time_decision(self, decision: Any, *, used_by: str) -> str | None:
+        if decision.consume_capability_id is None:
+            return None
+        self.capabilities.claim_decision_use(
+            decision,
+            used_by=used_by,
+            reason="one-time human permission reserved",
+        )
+        return str(decision.consume_capability_id)
+
+    def _restore_one_time_decision(self, cap_id: str | None) -> None:
+        if cap_id is None:
+            return
+        self.capabilities._restore_reserved_use(
+            cap_id,
+            restored_by="human",
+            reason="one-time human permission restored before request commit",
+        )
+
     def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
         if decision.consume_capability_id is None:
             return
-        self.capabilities.consume_use(
-            decision.consume_capability_id,
+        self.capabilities.claim_decision_use(
+            decision,
             used_by=used_by,
             reason="one-time human permission consumed",
         )

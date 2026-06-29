@@ -59,9 +59,13 @@ class ProcessManager:
         self.resources = resources
         self._llm_profile_resolver = llm_profile_resolver
         self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
+        self._object_task_terminal_notifier: Callable[[str], None] | None = None
 
     def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
         self._after_spawn_hooks.append(hook)
+
+    def bind_object_task_terminal_notifier(self, notifier: Callable[[str], None]) -> None:
+        self._object_task_terminal_notifier = notifier
 
     def spawn(
         self,
@@ -510,6 +514,7 @@ class ProcessManager:
         updated = self._get(child)
         if updated.status in self.TERMINAL_STATUSES:
             self._wake_parent_waiting_on_child(updated)
+            self._notify_object_task_process_terminal(updated.pid)
         return updated
 
     def merge_child_memory(
@@ -550,6 +555,7 @@ class ProcessManager:
         updated = self._get(target)
         if updated.status in self.TERMINAL_STATUSES:
             self._wake_parent_waiting_on_child(updated)
+            self._notify_object_task_process_terminal(updated.pid)
 
     def _apply_signal(
         self,
@@ -630,6 +636,7 @@ class ProcessManager:
         )
         self._finalize_terminal_process(process, preserve_oids={result.oid} if result is not None else set())
         self._wake_parent_waiting_on_child(process)
+        self._notify_object_task_process_terminal(process.pid)
 
     def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:
         for pid in pids:
@@ -643,6 +650,7 @@ class ProcessManager:
                 target=process.parent_pid,
                 payload={"pid": pid, "status": process.status.value, "result_oid": None, "reason": reason},
             )
+            self._notify_object_task_process_terminal(pid)
 
     def _finalize_terminal_process(self, process: AgentProcess, preserve_oids: set[str]) -> None:
         self._release_terminal_child_memory(process.pid, preserve_oids=preserve_oids)
@@ -961,3 +969,8 @@ class ProcessManager:
             target=f"process:{parent.pid}",
             decision={"child": child.pid, "child_status": child.status.value},
         )
+
+    def _notify_object_task_process_terminal(self, pid: str) -> None:
+        if self._object_task_terminal_notifier is None:
+            return
+        self._object_task_terminal_notifier(pid)

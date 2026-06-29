@@ -108,6 +108,11 @@ only ids/version/link metadata, and may resume a task that is blocked in
 `receive_process_messages`; it does not run the LLM scheduler. Tools that block
 after non-trivial side effects are not automatically replayed on owner-watch
 messages unless they are explicitly known to be safe.
+Ordinary process messages delivered to a waiting runner use the same
+message-wait resume path. Child-process termination can also resume a runner
+blocked in `wait_child_process`. Auto-resume is limited to tools with explicit
+safe replay semantics, currently `receive_process_messages` and
+`wait_child_process`.
 
 ## Writing Python Tools
 
@@ -264,7 +269,9 @@ pid.
 ## Sandbox Rules
 
 Deno is launched with `--no-prompt` and without read, write, net, env, run, or
-ffi host permissions. External effects must go through syscalls.
+ffi host permissions. Runtime JIT execution also uses Deno's cached-only mode,
+so a tool call cannot implicitly fetch remote modules. External effects must go
+through syscalls.
 
 When `tools.deno_executable` is a bare name such as `deno`, the sandbox resolves
 it from absolute safe PATH entries and rejects executables under the runtime
@@ -272,17 +279,18 @@ workspace/current root. Absolute executable paths are accepted only when they do
 not fall under configured forbidden roots.
 
 Static imports are limited to configured `jsr:` packages. The default allowlist
-is a small `@std/*` subset. `npm:`, `node:`, `http:`, `https:`, `file:`,
-and dynamic imports are rejected. Static checking is lint, not the security
+is a small `@std/*` subset. Validation is the phase that may resolve pinned,
+allowlisted JSR imports and account for that dependency surface; runtime
+execution is cached-only. `npm:`, `node:`, `http:`, `https:`, `file:`, and
+dynamic imports are rejected. Static checking is lint, not the security
 boundary: it checks that the source exports `run(args, libos)`, blocks dynamic
 imports, rejects common runtime code generation forms such as `eval`,
 `Function`, `AsyncFunction`, `GeneratorFunction`, and member `constructor`
 access such as `.constructor` or `["constructor"]`, enforces source/test size
-limits, and restricts
-dependencies to the JSR allowlist. It intentionally does not try to blacklist
-every dangerous JavaScript spelling. Runtime safety comes from Deno
-no-permission execution, the libOS syscall protocol, primitive Capability
-checks, human approval, and resource budgets.
+limits, and restricts dependencies to the JSR allowlist. It intentionally does
+not try to blacklist every dangerous JavaScript spelling. Runtime safety comes
+from Deno no-permission cached-only execution, the libOS syscall protocol,
+primitive Capability checks, human approval, and resource budgets.
 
 Validation and execution both use subprocess resource budgets when the process
 has them. A sandbox backend that cannot accept limits or return subprocess

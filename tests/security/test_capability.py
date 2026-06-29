@@ -298,6 +298,42 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_malformed_known_authority_rule_condition_fails_closed_over_allow(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='malformed known authority rule')
+            runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.git.regex.malformed',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'low',
+                            'conditions': {'regex_token': '['},
+                        }
+                    ]
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'status']},
+            )
+
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.DENY
+            assert decision.constraint_results['authority_rules']['malformed_conditions'] == ['regex_token']
+        finally:
+            runtime.close()
+
     def test_one_shot_grant_authority_is_consumed_after_successful_issue(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -470,6 +506,101 @@ class TestCapabilityManager:
             runtime.capability.issue_trusted(parent, 'object:finite', [CapabilityRight.GRANT], issued_by='test')
             with pytest.raises(CapabilityDenied):
                 runtime.capability.issue(parent, subject, CapabilitySpec(resource='object:finite', rights={CapabilityRight.READ.value}))
+        finally:
+            runtime.close()
+
+    def test_delegate_cannot_launder_restrictive_parent_boundary(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='restricted delegator')
+            child = runtime.process.spawn(image='base-agent:v0', goal='restricted child')
+            runtime.capability.grant(
+                parent,
+                'filesystem:workspace:*',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            runtime.capability.issue_trusted(
+                parent,
+                'filesystem:workspace:secret.txt',
+                [CapabilityRight.READ],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+            )
+
+            with pytest.raises(CapabilityDenied, match='restrictive capability'):
+                runtime.capability.delegate(
+                    parent,
+                    child,
+                    CapabilitySpec(resource='filesystem:workspace:*', rights={CapabilityRight.READ.value}),
+                )
+
+            assert not runtime.capability.check(child, 'filesystem:workspace:public.txt', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_delegate_cannot_use_malformed_allow_parent_authority_rules(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='malformed delegator')
+            child = runtime.process.spawn(image='base-agent:v0', goal='malformed child')
+            rules = [
+                {
+                    'rule_id': 'bad.regex.allow.parent',
+                    'operation': 'filesystem.read',
+                    'effect': 'allow',
+                    'risk': 'harmless',
+                    'conditions': {'regex_token': '['},
+                }
+            ]
+            runtime.capability.grant(
+                parent,
+                'filesystem:workspace:*',
+                [CapabilityRight.READ],
+                issued_by='test',
+                constraints={'authority_rules': rules},
+                delegable=True,
+            )
+
+            with pytest.raises(CapabilityDenied, match='malformed authority rule'):
+                runtime.capability.delegate(
+                    parent,
+                    child,
+                    CapabilitySpec(
+                        resource='filesystem:workspace:*',
+                        rights={CapabilityRight.READ.value},
+                        constraints={'authority_rules': rules},
+                    ),
+                )
+
+            assert not runtime.capability.check(child, 'filesystem:workspace:public.txt', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_grant_transfer_cannot_launder_ask_parent_boundary(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            issuer = runtime.process.spawn(image='base-agent:v0', goal='restricted issuer')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='restricted subject')
+            runtime.capability.grant(issuer, 'object:*', [CapabilityRight.GRANT], issued_by='test')
+            runtime.capability.grant(issuer, 'object:*', [CapabilityRight.READ], issued_by='test')
+            runtime.capability.issue_trusted(
+                issuer,
+                'object:needs-human',
+                [CapabilityRight.READ],
+                issued_by='test',
+                effect=CapabilityEffect.ASK,
+            )
+
+            with pytest.raises(CapabilityDenied, match='restrictive capability'):
+                runtime.capability.issue(
+                    issuer,
+                    subject,
+                    CapabilitySpec(resource='object:*', rights={CapabilityRight.READ.value}),
+                )
+
+            assert not runtime.capability.check(subject, 'object:public', CapabilityRight.READ)
         finally:
             runtime.close()
 

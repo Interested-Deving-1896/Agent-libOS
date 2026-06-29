@@ -19,6 +19,14 @@ audit/events, and writes a provider-classified external-effect row. The default
 HTTP provider may try another previously validated pinned address if connection
 setup fails before a response is received; endpoint methods must not rely on a
 single wire-level POST attempt for non-idempotency guarantees.
+For call attempts, the primitive first constructs the capability resource from
+`endpoint_id` and `method_id` and requires call authority before loading the
+endpoint manifest or method schema. A caller without invocation authority gets a
+generic denial and cannot use call errors to enumerate registered endpoint
+metadata. This early visibility gate does not consume a one-shot method grant;
+the exact method is then authorized after the method spec is known, and any
+one-shot use from that decision is consumed only after pre-provider validation
+has passed.
 
 ## Endpoint Manifest V1
 
@@ -94,8 +102,10 @@ The registry rejects:
 
 Headers are environment-backed. The registry stores the environment variable
 name and a small approved prefix such as `Bearer `, never the resolved secret
-value. Missing environment variables and runtime DNS policy failures happen
-before the HTTP attempt and before one-shot remote method authority is consumed.
+value. Missing environment variables, parameter schema failures, request-size
+failures, resource-budget preflight failures, external-effect classifier
+failures, and runtime DNS policy failures happen before the HTTP attempt and
+before one-shot remote method authority is consumed.
 For remote HTTPS calls, the primitive passes the validated address set to the
 default provider, which opens the socket to one of those exact addresses while
 preserving the original Host header and TLS server name. This prevents a host
@@ -162,6 +172,9 @@ are not persisted in audit or provider-effect context.
 `params_schema`, when present, is validated at registration time and enforced
 before each call. Parameter validation failures do not contact the provider and
 do not consume one-shot method authority.
+After those pre-provider checks pass, a one-shot method grant is consumed just
+before the provider call. Transport errors, non-2xx responses, or JSON-RPC
+error results after that boundary do not restore the use.
 
 ## CLI
 

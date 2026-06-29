@@ -136,7 +136,14 @@ privacy-preserving `safety_identifier`, prompt-cache routing fields, and
 opt-in `previous_response_id` chaining. The runtime keeps `llm.store=False` and
 Responses state chaining disabled by default; enable both only when retaining
 provider-side response state is acceptable. These OpenAI-specific fields are
-not sent to custom OpenAI-compatible endpoints.
+not sent to custom OpenAI-compatible endpoints. In the default stateless mode,
+prior tool messages are sent back as ordinary bounded context text. Only an
+active provider-side Responses chain sends tool outputs with a Responses
+`call_id` as `function_call_output`. If a persisted tool-output record cannot be
+expressed losslessly, Agent libOS omits `previous_response_id` for that request
+and uses the plain-context fallback rather than continuing a corrupted state
+chain.
+
 Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
 provider return multiple tool calls in one action-selection response. Agent
 libOS dispatches that batch sequentially in one quantum; it does not run tools
@@ -222,6 +229,9 @@ output, tool call, reasoning, and raw response persistence. The config
 dataclasses are frozen, so do not mutate `DEFAULT_CONFIG` in place. When full
 I/O persistence is disabled, the durable row keeps bounded previews, byte
 counts, truncation flags, and hashes instead of the raw values.
+
+The default remains `llm.persist_full_io: true` for deployments that use
+complete LLM call records for self-evolution training or fine-tuning.
 
 ## Configuration Defaults
 
@@ -317,6 +327,9 @@ Preserve the boundary:
 - primitives perform Capability authorization, policy, approval, events, and audit;
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
+- Deno JIT tool execution runs with cached dependencies only. Validation is the
+  phase that may resolve pinned allowlisted JSR imports and account for that
+  dependency surface;
 - Skills change visibility and prompt materialization only;
 - self-evolution mechanisms such as Skills, JIT tools, image registration,
   process exec, checkpoint forks, child processes, and JSON-RPC endpoint
@@ -325,7 +338,10 @@ Preserve the boundary:
   images, syscalls, and provider hooks but must not be treated as process
   capabilities;
 - JSON-RPC remote calls use registered endpoints and primitive capabilities
-  rather than model-supplied URLs or secrets;
+  rather than model-supplied URLs or secrets. Calls perform an exact
+  endpoint/method capability gate before loading manifest metadata or schemas;
+- MCP remote tool calls likewise gate on `server_id` and `tool_id` before
+  loading server metadata or input schemas;
 - checkpoint restore is scoped and append-only outside reconstructable state;
   provider-classified external effects are report-only in v1.
 

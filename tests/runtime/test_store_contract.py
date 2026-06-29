@@ -23,6 +23,7 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.utils.ids import utc_now
+from agent_libos.models.exceptions import ValidationError
 
 
 STORE_BACKENDS = [
@@ -180,6 +181,22 @@ def test_runtime_store_contract_core_records(kind: str, tmp_path: Path) -> None:
         assert runtime.store.get_mcp_server("contract-mcp")[0].tool_by_id("echo") is not None
         assert runtime.store.list_llm_calls(pid=pid)[0].call_id == "contract-llm-call"
         assert runtime.store.get_checkpoint_snapshot(checkpoint_id) is not None
+
+
+def test_sqlite_file_store_rejects_concurrent_active_runtime_and_reopens_after_close(tmp_path: Path) -> None:
+    db_path = tmp_path / "leased.sqlite"
+    runtime = Runtime.open(db_path)
+    try:
+        with pytest.raises(ValidationError, match="already open"):
+            Runtime.open(db_path)
+    finally:
+        runtime.close()
+
+    reopened = Runtime.open(db_path)
+    try:
+        assert reopened.store is not None
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)

@@ -200,6 +200,9 @@ ObjectTask tool thread cannot stop safely, shutdown reports `ok: false` with
 `scheduler_stopped: false` or `object_tasks_stopped: false` and leaves the
 runtime store open rather than closing it underneath a live worker. Once the
 worker finishes, a later shutdown can complete normal resource cleanup.
+File-backed SQLite stores also take an active-runtime lease, so another
+writable Runtime cannot open the same database until the active Runtime closes
+and releases the lease.
 
 ## Resource Budgets
 
@@ -249,8 +252,10 @@ Human interaction is modeled as runtime objects, not raw prompt text.
   privileged rights, `shell:*` execute, or root/global filesystem write such as
   `filesystem:/:*`; workspace write remains a human-approvable scope.
 - `human_output` writes through the HumanObject primitive and provider.
-- Per-use approvals can create one-shot capabilities that are consumed after
-  one successful primitive call.
+- Per-use approvals can create one-shot capabilities. Side-effectful primitives
+  reserve the use before commit, restore it if a pre-commit failure aborts the
+  operation, and leave it consumed once the operation crosses its commit or
+  provider boundary.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
@@ -296,9 +301,13 @@ converted into failure.
 ObjectTask owner-watch notices also use this queue. They are addressed to the
 runner process on `object-task-owner` by default and can resume a task that is
 blocked in `receive_process_messages`; the notice contains event metadata and
-object ids, not Object Memory read authority. ObjectTask runner processes are
-host-managed and skipped by the LLM scheduler; owner-watch auto-resume is
-limited to message receive tools that are safe to replay.
+object ids, not Object Memory read authority. The same ObjectTask resume hook
+also observes ordinary process messages delivered to a waiting runner, and
+child-process termination can resume a runner blocked in `wait_child_process`.
+ObjectTask runner processes are host-managed and skipped by the LLM scheduler;
+auto-resume is limited to tools with explicitly safe replay semantics, currently
+`receive_process_messages` for message waits and `wait_child_process` for child
+process waits.
 
 CLI examples:
 

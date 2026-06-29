@@ -214,6 +214,88 @@ class TestLLMClient:
         assert 'prompt_cache_key' not in custom_payload
         assert 'prompt_cache_retention' not in custom_payload
 
+    def test_openai_responses_payload_preserves_tool_outputs_or_breaks_state_chain(self) -> None:
+        response = SimpleNamespace(id='resp_tool_output', model='gpt-test', output_text='', output=[])
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model='gpt-test', api_key='key', api_mode='responses', store=True)
+        client._async_client = fake
+
+        asyncio.run(
+            client.acomplete_action(
+                messages=[
+                    {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'call_1'}]},
+                    {'role': 'tool', 'tool_call_id': 'call_1', 'content': '{"ok": true}'},
+                    {'role': 'user', 'content': 'continue'},
+                ],
+                tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}],
+                previous_response_id='resp_prev',
+            )
+        )
+
+        payload = fake.responses.payloads[0]
+        assert payload['previous_response_id'] == 'resp_prev'
+        assert {'type': 'function_call_output', 'call_id': 'call_1', 'output': '{"ok": true}'} in payload['input']
+
+        no_store_fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        no_store_client = LLMClient(model='gpt-test', api_key='key', api_mode='responses', store=False)
+        no_store_client._async_client = no_store_fake
+        asyncio.run(
+            no_store_client.acomplete_action(
+                messages=[
+                    {'role': 'tool', 'tool_call_id': 'call_1', 'content': '{"ok": true}'},
+                    {'role': 'user', 'content': 'continue'},
+                ],
+                tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}],
+                previous_response_id='resp_prev',
+            )
+        )
+        no_store_payload = no_store_fake.responses.payloads[0]
+        assert 'previous_response_id' not in no_store_payload
+        assert not any(item.get('type') == 'function_call_output' for item in no_store_payload['input'])
+        assert no_store_payload['input'][0] == {
+            'role': 'user',
+            'content': 'Tool output (call_id=call_1):\n{"ok": true}',
+        }
+
+        custom_fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        custom_client = LLMClient(
+            base_url='https://example.com/compatible/v1',
+            model='compat-model',
+            api_key='key',
+            api_mode='responses',
+            allow_custom_base_url=True,
+            store=True,
+        )
+        custom_client._async_client = custom_fake
+        asyncio.run(
+            custom_client.acomplete_action(
+                messages=[
+                    {'role': 'tool', 'tool_call_id': 'call_1', 'content': '{"ok": true}'},
+                    {'role': 'user', 'content': 'continue'},
+                ],
+                tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}],
+                previous_response_id='resp_prev',
+            )
+        )
+        custom_payload = custom_fake.responses.payloads[0]
+        assert 'previous_response_id' not in custom_payload
+        assert not any(item.get('type') == 'function_call_output' for item in custom_payload['input'])
+
+        missing_call_fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        missing_call_client = LLMClient(model='gpt-test', api_key='key', api_mode='responses', store=True)
+        missing_call_client._async_client = missing_call_fake
+        asyncio.run(
+            missing_call_client.acomplete_action(
+                messages=[{'role': 'tool', 'content': '{"ok": true}'}],
+                tools=[{'type': 'function', 'function': {'name': 'process_exit', 'description': 'Exit.', 'parameters': {'type': 'object', 'properties': {}}}}],
+                previous_response_id='resp_prev',
+            )
+        )
+        missing_call_payload = missing_call_fake.responses.payloads[0]
+        assert 'previous_response_id' not in missing_call_payload
+        assert not any(item.get('type') == 'function_call_output' for item in missing_call_payload['input'])
+        assert missing_call_payload['input'][0] == {'role': 'user', 'content': 'Tool output:\n{"ok": true}'}
+
     def test_auto_mode_uses_chat_for_custom_base_url(self) -> None:
         chat_completion = SimpleNamespace(id='chatcmpl_123', model='compat-model', usage=SimpleNamespace(prompt_tokens=7, completion_tokens=2, total_tokens=9), choices=[SimpleNamespace(finish_reason='tool_calls', message=SimpleNamespace(content='', reasoning_content='select process_exit', tool_calls=[SimpleNamespace(id='tool_1', function=SimpleNamespace(name='process_exit', arguments='{"payload":{"ok":true}}'))]))])
         fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(chat_completion)))

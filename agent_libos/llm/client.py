@@ -457,7 +457,17 @@ class LLMClient:
     ) -> dict[str, Any]:
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
-        instructions, input_items = _messages_to_responses_parts(messages)
+        will_use_previous_response_id = bool(
+            previous_response_id
+            and self.store
+            and self._use_openai_request_options()
+            and not _messages_have_unrepresentable_tool_output(messages)
+        )
+        instructions, input_items = _messages_to_responses_parts(
+            messages,
+            native_tool_outputs=will_use_previous_response_id,
+            tool_output_plain_context_chars=max(1, max_tokens * 4),
+        )
         payload: dict[str, Any] = {
             "model": self.model,
             "input": input_items,
@@ -469,7 +479,7 @@ class LLMClient:
             payload["instructions"] = instructions
         if temperature is not None:
             payload["temperature"] = temperature
-        if previous_response_id and self.store and self._use_openai_request_options():
+        if will_use_previous_response_id:
             payload["previous_response_id"] = previous_response_id
         if self.reasoning_effort:
             payload["reasoning"] = {"effort": self.reasoning_effort}
@@ -836,7 +846,12 @@ def _llm_defaults(config: AgentLibOSConfig | LLMDefaults | None) -> LLMDefaults:
     return config.llm
 
 
-def _messages_to_responses_parts(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
+def _messages_to_responses_parts(
+    messages: list[dict[str, Any]],
+    *,
+    native_tool_outputs: bool = False,
+    tool_output_plain_context_chars: int = 0,
+) -> tuple[str | None, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     for message in messages:
@@ -846,6 +861,28 @@ def _messages_to_responses_parts(messages: list[dict[str, Any]]) -> tuple[str | 
             if content:
                 instructions.append(content)
             continue
+        if role == "tool":
+            call_id = message.get("tool_call_id") or message.get("call_id")
+            if call_id and native_tool_outputs:
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(call_id),
+                        "output": content,
+                    }
+                )
+                continue
+            input_items.append(
+                {
+                    "role": "user",
+                    "content": _plain_tool_output_context(
+                        message,
+                        content,
+                        max_chars=tool_output_plain_context_chars,
+                    ),
+                }
+            )
+            continue
         input_items.append(
             {
                 "role": "assistant" if role == "assistant" else "user",
@@ -853,6 +890,36 @@ def _messages_to_responses_parts(messages: list[dict[str, Any]]) -> tuple[str | 
             }
         )
     return ("\n\n".join(instructions) if instructions else None), input_items
+
+
+def _plain_tool_output_context(message: dict[str, Any], content: str, *, max_chars: int) -> str:
+    call_id = message.get("tool_call_id") or message.get("call_id")
+    name = message.get("name") or message.get("tool_name")
+    labels: list[str] = []
+    if call_id:
+        labels.append(f"call_id={call_id}")
+    if name:
+        labels.append(f"name={name}")
+    header = "Tool output"
+    if labels:
+        header += f" ({', '.join(str(label) for label in labels)})"
+    return f"{header}:\n{_bounded_text(content, max_chars=max_chars)}"
+
+
+def _bounded_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}\n[truncated: original_chars={len(value)}]"
+
+
+def _messages_have_unrepresentable_tool_output(messages: list[dict[str, Any]]) -> bool:
+    for message in messages:
+        if str(message.get("role", "user")) != "tool":
+            continue
+        if message.get("tool_call_id") or message.get("call_id"):
+            continue
+        return True
+    return False
 
 
 def _is_openai_sdk_error(exc: Exception) -> bool:

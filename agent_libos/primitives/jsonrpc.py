@@ -216,16 +216,18 @@ class JsonRpcPrimitive:
         method_id: str,
         params: Any = None,
     ) -> JsonRpcCallResult:
+        resource = self.method_resource(endpoint_id, method_id)
+        self._validate_json_value(params, "params")
+        visibility_context = self._visibility_operation_context(pid, endpoint_id, method_id, params)
+        self._authorize_call_visibility(pid, resource, visibility_context)
         spec, _metadata = self._load_endpoint(endpoint_id)
         method = spec.method_by_id(method_id)
         if method is None:
             raise NotFound(f"JSON-RPC method not found: {endpoint_id}/{method_id}")
-        self._validate_json_value(params, "params")
-        self._validate_params_against_schema(method, params)
-        resource = self.method_resource(endpoint_id, method_id)
         request_id = new_id("jrpc")
         operation_context = self._operation_context(pid, spec, method, params, request_id=request_id)
         decision = self._authorize_call(pid, resource, method.right, operation_context)
+        self._validate_params_against_schema(method, params)
         profile = self.capabilities.profiles.jsonrpc(
             resource=resource,
             effect=decision.effect or CapabilityEffect.DENY,
@@ -358,6 +360,46 @@ class JsonRpcPrimitive:
                 message=f"{pid} is waiting for per-use human approval to call {resource}",
             )
         raise CapabilityDenied(decision.reason)
+
+    def _authorize_call_visibility(self, pid: str, resource: str, context: dict[str, Any]) -> None:
+        for right in (CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.EXECUTE):
+            decision = self.capabilities.authorize(pid, resource, right, {**context, "right": str(right)})
+            if decision.allowed:
+                return
+            if decision.policy == CapabilityManager.ASK_EACH_TIME:
+                self._request_visibility_approval(pid, resource, str(right), context)
+        raise CapabilityDenied(f"{pid} lacks JSON-RPC call authority on {resource}")
+
+    def _request_visibility_approval(self, pid: str, resource: str, right: str, context: dict[str, Any]) -> None:
+        if self.human is None:
+            raise CapabilityDenied(f"{pid} requires human approval for JSON-RPC call on {resource}")
+        profile = self.capabilities.profiles.jsonrpc(
+            resource=resource,
+            effect=CapabilityEffect.ASK,
+            endpoint_id=str(context["endpoint_id"]),
+            method_id=str(context["method_id"]),
+        )
+        approval_context = {**context, "right": right, "sandbox_profile": self._profile_json(profile)}
+        request_id = self.human.query(
+            pid=pid,
+            human=self.config.runtime.default_human,
+            request={
+                "type": "external_operation_approval",
+                "question": f"Allow this process to call remote JSON-RPC method {resource}?",
+                "requested_once_capability": {
+                    "subject": pid,
+                    "resource": resource,
+                    "rights": [right],
+                    "constraints": self._approval_constraints(context),
+                },
+                "context": approval_context,
+            },
+            blocking=True,
+        )
+        raise HumanApprovalRequired(
+            request_id=request_id,
+            message=f"{pid} is waiting for per-use human approval to call {resource}",
+        )
 
     def _request_body(self, method: JsonRpcMethodSpec, params: Any, request_id: str) -> bytes:
         payload = {
@@ -629,6 +671,18 @@ class JsonRpcPrimitive:
             "params_sha256": hashlib.sha256(params_json.encode("utf-8")).hexdigest(),
             "params_preview": params_observation["preview"],
             "params_observation": params_observation,
+        }
+
+    def _visibility_operation_context(self, pid: str, endpoint_id: str, method_id: str, params: Any) -> dict[str, Any]:
+        params_json = dumps(params)
+        return {
+            "pid": pid,
+            "primitive": "runtime.jsonrpc.call",
+            "operation": "jsonrpc.call",
+            "authority_operation": "jsonrpc.call",
+            "endpoint_id": endpoint_id,
+            "method_id": method_id,
+            "params_sha256": hashlib.sha256(params_json.encode("utf-8")).hexdigest(),
         }
 
     def _approval_constraints(self, context: dict[str, Any]) -> dict[str, Any]:

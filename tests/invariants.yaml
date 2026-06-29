@@ -57,15 +57,19 @@
         "tests/security/test_capability.py::TestCapabilityManager::test_deny_dominates_unordered_matching_capability_candidates",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_explicit_deny_dominates_later_command_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_restrictive_capability_with_bad_constraint_fails_closed_over_allow",
+        "tests/security/test_capability.py::TestCapabilityManager::test_malformed_known_authority_rule_condition_fails_closed_over_allow",
         "tests/security/test_capability.py::TestCapabilityManager::test_authority_rules_are_enforced_against_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_scoped_deny_rule_only_denies_matching_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_one_shot_grant_authority_is_consumed_after_successful_issue",
         "tests/security/test_capability.py::TestCapabilityManager::test_grant_authority_can_only_transfer_existing_allow_rights",
         "tests/security/test_capability.py::TestCapabilityManager::test_grant_transfer_inherits_parent_expiration",
+        "tests/security/test_capability.py::TestCapabilityManager::test_grant_transfer_cannot_launder_ask_parent_boundary",
         "tests/security/test_capability.py::TestCapabilityManager::test_one_time_capability_claim_is_conditional",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegate_can_only_attenuate_delegable_parent_capability",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegated_capability_stops_authorizing_when_parent_is_revoked",
         "tests/security/test_capability.py::TestCapabilityManager::test_finite_use_capability_cannot_be_delegated_or_granted_onward",
+        "tests/security/test_capability.py::TestCapabilityManager::test_delegate_cannot_launder_restrictive_parent_boundary",
+        "tests/security/test_capability.py::TestCapabilityManager::test_delegate_cannot_use_malformed_allow_parent_authority_rules",
         "tests/security/test_capability.py::TestCapabilityManager::test_capability_expiry_must_be_valid_iso_timestamp",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegation_cannot_increase_parent_max_depth",
         "tests/providers/test_gui_server.py::TestGuiServer::test_capability_actor_mode_enforces_process_authority",
@@ -167,9 +171,19 @@
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_parent_exit_releases_waited_child_result_memory",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_process_exit_releases_pty_session_object_and_closes_provider",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_direct_object_release_closes_pty_session",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_create_post_spawn_failure_closes_handle_and_removes_object",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_close_failure_keeps_session_registered_for_retry",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_exited_pty_session_does_not_consume_process_session_capacity",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runs_visible_tool_links_result_and_notifies_creator"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "runtime-store-single-active-writer",
+      "title": "A writable persistent runtime store has at most one active Runtime opener, and reopening after close is allowed.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_store_contract.py::test_sqlite_file_store_rejects_concurrent_active_runtime_and_reopens_after_close"
       ],
       "benchmark_attack_classes": []
     },
@@ -220,6 +234,7 @@
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_spawn_rejects_workspace_path_hijack",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_executable_resolution_rejects_workspace_path_hijack",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_fails_closed_without_budget_limit_support",
@@ -297,6 +312,7 @@
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_executable_resolution_rejects_workspace_path_hijack",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_specs_are_conservative_side_effects",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_validation_logs_are_bounded",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_validation_mismatch_errors_are_bounded"
@@ -358,10 +374,14 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runner_does_not_inherit_external_capability_unless_explicit",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runner_is_not_scheduled_by_llm_scheduler",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_completion_survives_one_time_owner_handle",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_start_cleans_runner_before_restoring_one_time_owner",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notification_can_interrupt_and_wake_message_waiter",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_result_oid_in_notification_does_not_grant_result_authority",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notify_result_consumes_one_time_grant_authority",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_waiting_message_state_does_not_repeat_tool_call",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_posted_process_message_resumes_waiting_object_task_runner",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_posted_process_message_only_resumes_recipient_object_task_runner",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_child_process_exit_resumes_waiting_object_task_runner",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_request_permission_resumes_after_human_decision",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_update_resumes_waiting_runner",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_does_not_replay_unsafe_waiting_tool",
@@ -396,6 +416,15 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "llm-responses-state-chain-is-lossless",
+      "title": "OpenAI Responses state chaining preserves representable tool outputs and breaks the chain when tool-output history cannot be expressed losslessly.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_llm_client.py::TestLLMClient::test_openai_responses_payload_preserves_tool_outputs_or_breaks_state_chain"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "llm-profile-selection-is-process-local",
       "title": "LLM profile selection is host-controlled, process-local, persisted, and fail-closed.",
       "lane": "runtime",
@@ -417,6 +446,7 @@
       "node_ids": [
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_existing_tool_visibility_does_not_grant_resource_authority",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_activate_failure_keeps_committed_write_one_shot_consumed",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_host_skill_package_rejects_hardlinked_resources",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_package_hash_binds_instructions_and_resource_content",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_skill_snapshot_hash_rejects_tampered_resource_content",
@@ -523,6 +553,9 @@
       "node_ids": [
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_manifest_validation_rejects_unsafe_endpoint_shapes",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_requires_method_capability_and_records_http_effect",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_denies_before_loading_endpoint_metadata_without_visibility",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_ask_visibility_prompts_before_loading_endpoint_metadata",
+        "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_visibility_honors_params_scoped_authority_rule",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_call_rejects_dns_resolution_to_private_address_before_provider_attempt",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_jsonrpc_params_are_sanitized_in_audit_and_external_effects",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_provider_secret_header_env_is_rejected_at_registration",
@@ -544,6 +577,9 @@
       "node_ids": [
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_manifest_validation_rejects_unsafe_server_shapes",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_requires_tool_capability_and_records_effect",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_denies_before_loading_server_metadata_without_visibility",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_ask_visibility_prompts_before_loading_server_metadata",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_call_visibility_honors_argument_scoped_authority_rule",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_live_schema_mismatch_consumes_and_records_one_shot_attempt",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_http_dns_private_resolution_denies_before_provider_or_capability_use",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_without_refresh_uses_registered_metadata_only",

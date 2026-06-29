@@ -30,6 +30,10 @@ class ProcessMessageManager:
         self.store = store
         self.audit = audit
         self.events = events
+        self._object_tasks: Any | None = None
+
+    def bind_object_tasks(self, object_tasks: Any) -> None:
+        self._object_tasks = object_tasks
 
     def post(
         self,
@@ -104,6 +108,8 @@ class ProcessMessageManager:
             },
         )
         self._wake_if_waiting_for_message(message)
+        if self._object_tasks is not None:
+            self._object_tasks.notify_process_message(message)
         return message
 
     def send_from_process(

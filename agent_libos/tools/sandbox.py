@@ -60,6 +60,7 @@ class SandboxBackend:
         timeout: float | None = None,
         limits: SubprocessLimits | None = None,
         return_metrics: bool = False,
+        cached_only: bool = True,
     ) -> Any:
         raise NotImplementedError
 
@@ -73,6 +74,7 @@ class SandboxBackend:
         timeout: float | None = None,
         limits: SubprocessLimits | None = None,
         return_metrics: bool = False,
+        cached_only: bool = True,
     ) -> Any:
         kwargs = self._arun_source_kwargs(
             pid=pid,
@@ -80,6 +82,7 @@ class SandboxBackend:
             timeout=timeout,
             limits=limits,
             return_metrics=return_metrics,
+            cached_only=cached_only,
         )
         try:
             asyncio.get_running_loop()
@@ -184,6 +187,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         timeout: float | None = None,
         limits: SubprocessLimits | None = None,
         return_metrics: bool = False,
+        cached_only: bool = True,
     ) -> Any:
         validation = self.static_check(source_code)
         if not validation.ok:
@@ -194,11 +198,12 @@ class DenoTypescriptSandbox(SandboxBackend):
             tmp_path = Path(tmp)
             (tmp_path / "candidate.ts").write_text(source_code, encoding="utf-8")
             (tmp_path / "runner.ts").write_text(self._runner_source(), encoding="utf-8")
+            command = [deno, "run", "--no-prompt"]
+            if cached_only:
+                command.append("--cached-only")
+            command.append("runner.ts")
             proc = await asyncio.create_subprocess_exec(
-                deno,
-                "run",
-                "--no-prompt",
-                "runner.ts",
+                *command,
                 cwd=tmp,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -297,6 +302,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                     timeout=timeout,
                     limits=limits,
                     return_metrics=True,
+                    cached_only=False,
                 )
                 if isinstance(result, SandboxExecutionResult):
                     metrics.append(result.metrics or CommandMetrics())

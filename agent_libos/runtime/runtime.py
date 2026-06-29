@@ -183,6 +183,9 @@ class Runtime:
         self.object_tasks = ObjectTaskManager(self, config=self.config)
         self.memory.bind_object_pin_checker(self.object_tasks.has_active_for_owner)
         self.memory.bind_object_change_notifier(self.object_tasks.notify_owner_changed)
+        self.messages.bind_object_tasks(self.object_tasks)
+        self.process.bind_object_task_terminal_notifier(self.object_tasks.notify_process_terminal)
+        self.resources.bind_object_task_terminal_notifier(self.object_tasks.notify_process_terminal)
         self.scheduler = SimpleScheduler(
             store,
             self.audit,

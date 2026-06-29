@@ -71,6 +71,11 @@ from agent_libos.models import (
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillPackage, SkillResource
 from agent_libos.utils.serde import dumps, loads
 
+try:  # pragma: no cover - Windows fallback is exercised only on non-POSIX hosts.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
 
 @contextmanager
 def _persisted_model_decode(label: str):
@@ -3470,8 +3475,49 @@ class SQLiteStore(SQLRuntimeStore):
 
     def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
         selected_path = str(path)
+        self._lease_handle: Any | None = None
         if selected_path != ":memory:":
-            Path(selected_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(selected_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        self._init_store(selected_path, config=config, conn=conn)
+            db_path = Path(selected_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._lease_handle = self._acquire_runtime_lease(db_path)
+        try:
+            conn = sqlite3.connect(selected_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            self._init_store(selected_path, config=config, conn=conn)
+        except Exception:
+            self._release_runtime_lease()
+            raise
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._release_runtime_lease()
+
+    def _acquire_runtime_lease(self, db_path: Path) -> Any | None:
+        if fcntl is None:
+            return None
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        handle = lease_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise ValidationError(f"runtime store is already open: {db_path}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(utc_now())
+        handle.flush()
+        return handle
+
+    def _release_runtime_lease(self) -> None:
+        handle = getattr(self, "_lease_handle", None)
+        if handle is None:
+            return
+        self._lease_handle = None
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()

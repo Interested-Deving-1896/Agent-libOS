@@ -1,6 +1,7 @@
 from __future__ import annotations
 import pytest
 import contextlib
+import hashlib
 import io
 import json
 import socket
@@ -13,6 +14,7 @@ from typing import Any
 from pytest import MonkeyPatch
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
@@ -26,6 +28,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate
+from agent_libos.utils.serde import dumps
 
 class TestJsonRpcPrimitive:
 
@@ -73,6 +76,84 @@ class TestJsonRpcPrimitive:
                 assert effect.rollback_class.value == 'no_rollback_required'
                 assert not effect.state_mutation
                 assert effect.information_flow
+            finally:
+                runtime.close()
+
+    def test_call_denies_before_loading_endpoint_metadata_without_visibility(self, monkeypatch: MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc hidden manifest')
+
+            def fail_if_manifest_loaded(_endpoint_id: str) -> Any:
+                raise AssertionError('endpoint manifest should stay hidden before capability gate')
+
+            monkeypatch.setattr(runtime.store, 'get_jsonrpc_endpoint', fail_if_manifest_loaded)
+
+            with pytest.raises(CapabilityDenied, match='JSON-RPC call authority'):
+                runtime.jsonrpc.call(pid, 'secret-endpoint', 'hidden-method', {'city': 'Beijing'})
+        finally:
+            runtime.close()
+
+    def test_call_ask_visibility_prompts_before_loading_endpoint_metadata(self, monkeypatch: MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc ask hidden manifest')
+            runtime.capability.set_permission_policy(
+                pid,
+                'jsonrpc:secret-endpoint:hidden-method',
+                [CapabilityRight.READ],
+                runtime.capability.ASK_EACH_TIME,
+                issued_by='test',
+            )
+
+            def fail_if_manifest_loaded(_endpoint_id: str) -> Any:
+                raise AssertionError('endpoint manifest should stay hidden before human approval')
+
+            monkeypatch.setattr(runtime.store, 'get_jsonrpc_endpoint', fail_if_manifest_loaded)
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.jsonrpc.call(pid, 'secret-endpoint', 'hidden-method', {'city': 'Beijing'})
+        finally:
+            runtime.close()
+
+    def test_call_visibility_honors_params_scoped_authority_rule(self) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc scoped visibility')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest('scoped-visibility', server.url, with_header=False),
+                    actor='cli',
+                    require_capability=False,
+                )
+                params = {'x': 1}
+                params_sha = hashlib.sha256(dumps(params).encode('utf-8')).hexdigest()
+                runtime.capability.grant(
+                    pid,
+                    'jsonrpc:scoped-visibility:echo',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    constraints={
+                        AUTHORITY_RULES_KEY: [
+                            {
+                                'rule_id': 'jsonrpc.scoped.visibility',
+                                'operation': 'jsonrpc.call',
+                                'effect': 'allow',
+                                'risk': 'low',
+                                'conditions': {
+                                    'endpoint_id': 'scoped-visibility',
+                                    'method_id': 'echo',
+                                    'params_sha256': params_sha,
+                                },
+                            }
+                        ]
+                    },
+                )
+
+                result = runtime.jsonrpc.call(pid, 'scoped-visibility', 'echo', params)
+
+                assert result.ok
+                assert server.requests[0]['body']['params'] == params
             finally:
                 runtime.close()
 

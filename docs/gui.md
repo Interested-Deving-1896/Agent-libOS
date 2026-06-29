@@ -72,7 +72,9 @@ uv run agent-libos-gui-server --db .agent_libos.sqlite --port 0
 
 The GUI server accepts the same runtime store targets as the CLI. SQLite paths
 are the default local store; PostgreSQL DSNs require installing the `postgres`
-extra and are redacted in startup and health payloads.
+extra and are redacted in startup and health payloads. File-backed SQLite
+stores use an active-runtime lease, so a GUI server and a writable CLI Runtime
+cannot open the same SQLite database concurrently.
 
 The server prints one JSON line containing the selected local URL and bearer
 token:

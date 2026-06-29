@@ -18,6 +18,7 @@ from jsonschema.validators import validator_for as jsonschema_validator_for
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
+    CapabilityDecision,
     CapabilityRight,
     EventType,
     JIT_MULTIPLEXER_TOOL_NAME,
@@ -122,22 +123,29 @@ class SkillManager:
         if selected_source_type == "global":
             self._require_trusted_global_source(selected_source, selected_sha)
         if require_capability:
-            self._require_skill_right(actor, spec.skill_id, CapabilityRight.WRITE)
+            decisions = self._require_skill_right(actor, spec.skill_id, CapabilityRight.WRITE)
+            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+        else:
+            reserved_capability_ids = []
         existing = self.store.get_skill(spec.skill_id)
         if existing is not None and not replace:
+            self._restore_skill_rights(reserved_capability_ids)
             raise ValidationError(f"skill already registered: {spec.skill_id}")
         now = utc_now()
         if spec.package_sha256 != selected_sha:
             spec = self._replace_package_hash(spec, selected_sha)
-        self.store.upsert_skill(
-            spec,
-            source_type=selected_source_type,
-            source=selected_source,
-            package_sha256=selected_sha,
-            registered_by=actor,
-            created_at=now,
-        )
-        self.capabilities.consume_allow_once(actor, self.resource_for(spec.skill_id), CapabilityRight.WRITE, "skill")
+        try:
+            self.store.upsert_skill(
+                spec,
+                source_type=selected_source_type,
+                source=selected_source,
+                package_sha256=selected_sha,
+                registered_by=actor,
+                created_at=now,
+            )
+        except Exception:
+            self._restore_skill_rights(reserved_capability_ids)
+            raise
         self.events.emit(
             EventType.SKILL_REGISTERED,
             source=actor,
@@ -222,18 +230,23 @@ class SkillManager:
     ) -> dict[str, Any]:
         package, source = self._load_package_from_workspace(pid, path)
         if require_capability:
-            self._require_skill_right(pid, package.skill_id, CapabilityRight.WRITE)
-        result = self.register_skill_package(
-            package,
-            actor=pid,
-            replace=replace,
-            require_capability=False,
-            source_type="workspace",
-            source=source,
-            package_sha256=package.package_sha256,
-        )
-        self.capabilities.consume_allow_once(pid, self.resource_for(package.skill_id), CapabilityRight.WRITE, "skill")
-        return result
+            decisions = self._require_skill_right(pid, package.skill_id, CapabilityRight.WRITE)
+            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+        else:
+            reserved_capability_ids = []
+        try:
+            return self.register_skill_package(
+                package,
+                actor=pid,
+                replace=replace,
+                require_capability=False,
+                source_type="workspace",
+                source=source,
+                package_sha256=package.package_sha256,
+            )
+        except Exception:
+            self._restore_skill_rights(reserved_capability_ids)
+            raise
 
     def activate_skill_from_workspace_path(
         self,
@@ -245,19 +258,36 @@ class SkillManager:
     ) -> dict[str, Any]:
         package, source = self._load_package_from_workspace(pid, path)
         if require_capability:
-            self._require_skill_rights(pid, package.skill_id, [CapabilityRight.WRITE, CapabilityRight.EXECUTE])
-        self.register_skill_package(
-            package,
-            actor=pid,
-            replace=replace,
-            require_capability=False,
-            source_type="workspace",
-            source=source,
-            package_sha256=package.package_sha256,
-        )
-        result = self.activate_skill(pid, package.skill_id, actor=pid, require_capability=False)
-        self.capabilities.consume_allow_once(pid, self.resource_for(package.skill_id), CapabilityRight.WRITE, "skill")
-        self.capabilities.consume_allow_once(pid, self.resource_for(package.skill_id), CapabilityRight.EXECUTE, "skill")
+            decisions = self._require_skill_rights(pid, package.skill_id, [CapabilityRight.WRITE, CapabilityRight.EXECUTE])
+            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+            committed_by_registration = self._decision_consume_ids(
+                decision for decision in decisions if decision.right == CapabilityRight.WRITE.value
+            )
+        else:
+            reserved_capability_ids = []
+            committed_by_registration = set()
+        try:
+            self.register_skill_package(
+                package,
+                actor=pid,
+                replace=replace,
+                require_capability=False,
+                source_type="workspace",
+                source=source,
+                package_sha256=package.package_sha256,
+            )
+        except Exception:
+            self._restore_skill_rights(reserved_capability_ids)
+            raise
+        try:
+            result = self.activate_skill(pid, package.skill_id, actor=pid, require_capability=False)
+        except Exception:
+            process = self.store.get_process(pid)
+            activation_committed = process is not None and package.skill_id in process.loaded_skills
+            if not activation_committed:
+                uncommitted = [cap_id for cap_id in reserved_capability_ids if cap_id not in committed_by_registration]
+                self._restore_skill_rights(uncommitted)
+            raise
         return {**result, "source": source, "registered": True}
 
     def discover_skills(
@@ -352,14 +382,21 @@ class SkillManager:
         selected_actor = actor or pid
         skill, metadata = self._get_skill(skill_id)
         if require_capability:
-            self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
+            decisions = self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
             self._require_process_admin_if_cross_actor(selected_actor, pid)
+            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+        else:
+            reserved_capability_ids = []
         process = self.store.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        self._validate_loadable(pid, skill, process.tool_table)
-        existing_handles = self._resolve_existing_tools(skill.allowed_tools)
-        jit_handles = self._register_jit_tools(pid, skill)
+        try:
+            if process is None:
+                raise NotFound(f"process not found: {pid}")
+            self._validate_loadable(pid, skill, process.tool_table)
+            existing_handles = self._resolve_existing_tools(skill.allowed_tools)
+            jit_handles = self._register_jit_tools(pid, skill)
+        except Exception:
+            self._restore_skill_rights(reserved_capability_ids)
+            raise
         tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
         jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
         updated_table = dict(process.tool_table)
@@ -380,8 +417,12 @@ class SkillManager:
         process.tool_table = updated_table
         process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
         process.updated_at = utc_now()
-        self.store.update_process(process)
-        self.capabilities.consume_allow_once(selected_actor, self.resource_for(skill_id), CapabilityRight.EXECUTE, "skill")
+        try:
+            self.store.update_process(process)
+        except Exception:
+            self._remove_registered_jit_tools(pid, jit_handles)
+            self._restore_skill_rights(reserved_capability_ids)
+            raise
         self.events.emit(
             EventType.SKILL_LOADED,
             source=selected_actor,
@@ -423,13 +464,18 @@ class SkillManager:
     ) -> dict[str, Any]:
         selected_actor = actor or pid
         if require_capability:
-            self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
+            decisions = self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
             self._require_process_admin_if_cross_actor(selected_actor, pid)
+            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+        else:
+            reserved_capability_ids = []
         process = self.store.get_process(pid)
         if process is None:
+            self._restore_skill_rights(reserved_capability_ids)
             raise NotFound(f"process not found: {pid}")
         loaded = process.loaded_skills.get(skill_id)
         if loaded is None:
+            self._restore_skill_rights(reserved_capability_ids)
             raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
         tool_ids = dict(loaded.get("tool_ids", {})) if isinstance(loaded, dict) else {}
         jit_tool_ids = dict(loaded.get("jit_tool_ids", {})) if isinstance(loaded, dict) else {}
@@ -440,8 +486,11 @@ class SkillManager:
                 removed.append(name)
         process.loaded_skills.pop(skill_id, None)
         process.updated_at = utc_now()
-        self.store.update_process(process)
-        self.capabilities.consume_allow_once(selected_actor, self.resource_for(skill_id), CapabilityRight.EXECUTE, "skill")
+        try:
+            self.store.update_process(process)
+        except Exception:
+            self._restore_skill_rights(reserved_capability_ids)
+            raise
         self.events.emit(
             EventType.SKILL_UNLOADED,
             source=selected_actor,
@@ -993,19 +1042,21 @@ class SkillManager:
             if names is not None and names.get(handle.name) == handle.tool_id:
                 names.pop(handle.name, None)
 
-    def _require_skill_right(self, actor: str, skill_id: str, right: CapabilityRight) -> None:
-        self._require_skill_rights(actor, skill_id, [right])
+    def _require_skill_right(self, actor: str, skill_id: str, right: CapabilityRight) -> list[CapabilityDecision]:
+        return self._require_skill_rights(actor, skill_id, [right])
 
-    def _require_skill_rights(self, actor: str, skill_id: str, rights: Iterable[CapabilityRight]) -> None:
+    def _require_skill_rights(self, actor: str, skill_id: str, rights: Iterable[CapabilityRight]) -> list[CapabilityDecision]:
         resource = self.resource_for(skill_id)
         missing: list[str] = []
+        decisions: list[CapabilityDecision] = []
         for right in rights:
-            policy = self.capabilities.permission_policy(actor, resource, right)
-            if policy in {CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALLOW_ONCE}:
+            decision = self.capabilities.authorize(actor, resource, right)
+            if decision.allowed:
+                decisions.append(decision)
                 continue
             missing.append(str(right))
         if not missing:
-            return
+            return decisions
         if self.human is None:
             raise CapabilityDenied(f"{actor} lacks {missing} on {resource}")
         request_id = self.human.query(
@@ -1024,6 +1075,34 @@ class SkillManager:
             blocking=True,
         )
         raise HumanApprovalRequired(request_id, f"human approval required for skill {skill_id}")
+
+    def _reserve_skill_rights(self, decisions: Iterable[CapabilityDecision], *, used_by: str) -> list[str]:
+        reserved: list[str] = []
+        try:
+            for decision in decisions:
+                if decision.consume_capability_id is None or str(decision.consume_capability_id) in reserved:
+                    continue
+                self.capabilities.claim_decision_use(
+                    decision,
+                    used_by=used_by,
+                    reason="one-time skill permission reserved",
+                )
+                reserved.append(str(decision.consume_capability_id))
+        except Exception:
+            self._restore_skill_rights(reserved)
+            raise
+        return reserved
+
+    def _restore_skill_rights(self, cap_ids: Iterable[str]) -> None:
+        for cap_id in cap_ids:
+            self.capabilities._restore_reserved_use(
+                cap_id,
+                restored_by="skill",
+                reason="one-time skill permission restored before commit",
+            )
+
+    def _decision_consume_ids(self, decisions: Iterable[CapabilityDecision]) -> set[str]:
+        return {str(decision.consume_capability_id) for decision in decisions if decision.consume_capability_id is not None}
 
     def _require_process_admin_if_cross_actor(self, actor: str, pid: str) -> None:
         if actor == pid:

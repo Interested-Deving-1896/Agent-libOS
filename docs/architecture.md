@@ -149,15 +149,18 @@ terminal/human I/O, Object Memory, image registration, checkpoints, or other
 resources.
 
 Likewise, `call_jsonrpc_method` visibility never grants network authority. The
-JSON-RPC primitive accepts only endpoint and method ids, resolves URLs and
-env-backed headers from the registry, then checks `jsonrpc:<endpoint>:<method>`
-capabilities before the provider performs a POST.
+JSON-RPC primitive accepts only endpoint and method ids, first gates on the
+derived `jsonrpc:<endpoint>:<method>` capability resource without loading the
+endpoint manifest, then resolves URLs and env-backed headers from the registry
+only for an authorized call.
 
 The same split applies to MCP. `list_mcp_servers`, `inspect_mcp_server`,
 `list_mcp_tools`, and `call_mcp_tool` are stable generic wrappers over a
 registered MCP server registry. Remote MCP tools are not imported into the
 ToolBroker as first-class tools, and a visible `call_mcp_tool` entry still
-requires `mcp:<server>:<tool>` authority at primitive use.
+requires `mcp:<server>:<tool>` authority at primitive use. The call path also
+checks that derived tool resource before loading server metadata or input
+schemas, so missing authority cannot be used to enumerate provider manifests.
 
 ## Primitive Boundary
 
@@ -205,6 +208,9 @@ The runtime store keeps durable metadata and append-only records:
 Object payloads are not ordinary durable object rows. They live in runtime
 memory, while SQL object rows store only a runtime-memory marker. Rows whose
 live payload cache cannot be reconstructed are released fail-closed on reopen.
+File-backed SQLite stores take an active-runtime lease so two writable Runtime
+instances cannot concurrently open the same database; a clean close releases
+the lease and permits a later reopen.
 Checkpoint and image artifact payloads are explicit durable snapshot
 exceptions.
 

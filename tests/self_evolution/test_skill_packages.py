@@ -75,6 +75,36 @@ class TestSkillPackageLoading:
             finally:
                 runtime.close()
 
+    def test_workspace_activate_failure_keeps_committed_write_one_shot_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_skill_package(Path(temp_dir), 'broken-skill', allowed_tools=['missing_workspace_tool'])
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='load broken workspace skill')
+                runtime.filesystem.grant_path(pid, 'broken-skill/SKILL.md', [CapabilityRight.READ], issued_by='test')
+                write_cap = runtime.capability.grant_once(
+                    pid,
+                    'skill:broken-skill',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                execute_cap = runtime.capability.grant_once(
+                    pid,
+                    'skill:broken-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(NotFound, match='tool not found'):
+                    runtime.skills.activate_skill_from_workspace_path(pid, 'broken-skill')
+
+                assert runtime.store.get_skill('broken-skill') is not None
+                assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 0
+                assert runtime.store.get_capability(execute_cap.cap_id).uses_remaining == 1
+                assert 'broken-skill' not in runtime.process.get(pid).loaded_skills
+            finally:
+                runtime.close()
+
     def test_host_skill_package_rejects_hardlinked_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside:
             root = Path(temp_dir)

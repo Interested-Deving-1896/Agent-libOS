@@ -930,6 +930,7 @@ class CapabilityManager:
         raise CapabilityDenied(f"{actor} lacks revoke/admin authority for capability {cap.cap_id}")
 
     def _find_delegation_parent(self, parent: str, spec: CapabilitySpec) -> Capability:
+        self._require_no_restrictive_parent_boundary(parent, spec, action="delegate")
         candidates = [
             cap
             for cap in self.capabilities_for(parent)
@@ -947,6 +948,7 @@ class CapabilityManager:
         return candidates[0]
 
     def _find_transfer_parent(self, actor: str, spec: CapabilitySpec) -> Capability:
+        self._require_no_restrictive_parent_boundary(actor, spec, action="grant")
         candidates = [
             cap
             for cap in self.capabilities_for(actor)
@@ -963,6 +965,56 @@ class CapabilityManager:
             )
         candidates.sort(key=lambda cap: (len(cap.resource), cap.issued_at, cap.cap_id), reverse=True)
         return candidates[0]
+
+    def _require_no_restrictive_parent_boundary(self, subject: str, spec: CapabilitySpec, *, action: str) -> None:
+        for cap in self.capabilities_for(subject):
+            if not cap.active or self._is_expired(cap):
+                continue
+            if not self._parent_chain_active(cap):
+                continue
+            if not spec.rights.intersection(cap.rights):
+                continue
+            if not self._resource_patterns_intersect(cap.resource, spec.resource):
+                continue
+            self._require_parent_authority_rules_well_formed(cap, subject=subject, spec=spec, action=action)
+            if cap.effect not in {CapabilityEffect.DENY, CapabilityEffect.ASK}:
+                continue
+            raise CapabilityDenied(
+                f"{subject} cannot {action} {sorted(spec.rights)} on {spec.resource}; "
+                f"restrictive capability {cap.cap_id} also covers that authority"
+            )
+
+    def _require_parent_authority_rules_well_formed(
+        self,
+        cap: Capability,
+        *,
+        subject: str,
+        spec: CapabilitySpec,
+        action: str,
+    ) -> None:
+        raw_rules = cap.constraints.get(AUTHORITY_RULES_KEY)
+        if raw_rules is None:
+            return
+        try:
+            rules = self.rule_codec.coerce_many(raw_rules)
+        except Exception as exc:
+            raise CapabilityDenied(
+                f"{subject} cannot {action} {sorted(spec.rights)} on {spec.resource}; "
+                f"capability {cap.cap_id} has malformed authority rules"
+            ) from exc
+        for rule in rules:
+            unknown_conditions = self._unknown_authority_rule_conditions(rule)
+            if unknown_conditions:
+                raise CapabilityDenied(
+                    f"{subject} cannot {action} {sorted(spec.rights)} on {spec.resource}; "
+                    f"capability {cap.cap_id} has unknown authority rule conditions"
+                )
+            malformed_conditions = self._malformed_authority_rule_conditions(rule)
+            if malformed_conditions:
+                raise CapabilityDenied(
+                    f"{subject} cannot {action} {sorted(spec.rights)} on {spec.resource}; "
+                    f"capability {cap.cap_id} has malformed authority rule conditions"
+                )
 
     def _validate_delegation_parent(self, parent_cap: Capability, selected: CapabilitySpec) -> None:
         if parent_cap.uses_remaining is not None:
@@ -1053,6 +1105,9 @@ class CapabilityManager:
 
     def _resource_covers(self, granted: str, requested_pattern: str) -> bool:
         return self.resources.covers(granted, requested_pattern)
+
+    def _resource_patterns_intersect(self, left: str, right: str) -> bool:
+        return self._resource_covers(left, right) or self._resource_covers(right, left)
 
     def _coerce_spec(self, spec: CapabilitySpec | dict[str, Any]) -> CapabilitySpec:
         if isinstance(spec, CapabilitySpec):
@@ -1238,6 +1293,7 @@ class CapabilityManager:
         matched = []
         for rule in operation_rules:
             unknown_conditions = self._unknown_authority_rule_conditions(rule)
+            malformed_conditions = self._malformed_authority_rule_conditions(rule)
             if unknown_conditions:
                 return {
                     "ok": False,
@@ -1246,6 +1302,15 @@ class CapabilityManager:
                     "operation": operation,
                     "rule_id": rule.rule_id,
                     "unknown_conditions": unknown_conditions,
+                }
+            if malformed_conditions:
+                return {
+                    "ok": False,
+                    "effect": CapabilityEffect.DENY.value,
+                    "reason": "malformed authority rule condition",
+                    "operation": operation,
+                    "rule_id": rule.rule_id,
+                    "malformed_conditions": malformed_conditions,
                 }
             if self._authority_rule_matches(rule, context):
                 matched.append(rule)
@@ -1297,7 +1362,13 @@ class CapabilityManager:
             "right",
             "endpoint_id",
             "method_id",
+            "rpc_method",
             "params_sha256",
+            "server_id",
+            "transport",
+            "tool_id",
+            "mcp_name",
+            "arguments_sha256",
             "content_sha256",
             "timeout_s",
             "timeout_max_s",
@@ -1313,6 +1384,62 @@ class CapabilityManager:
             "exist_ok",
         }
         return sorted(key for key in conditions if key not in allowed_conditions)
+
+    def _malformed_authority_rule_conditions(self, rule: Any) -> list[str]:
+        conditions = dict(rule.conditions or {})
+        malformed: list[str] = []
+        string_conditions = {
+            "operation",
+            "authority_operation",
+            "argv_sha256",
+            "cwd",
+            "path",
+            "resource",
+            "right",
+            "endpoint_id",
+            "method_id",
+            "rpc_method",
+            "params_sha256",
+            "server_id",
+            "transport",
+            "tool_id",
+            "mcp_name",
+            "arguments_sha256",
+            "content_sha256",
+            "network",
+            "filesystem_intent",
+        }
+        bool_conditions = {"continuous_session", "recursive", "missing_ok", "overwrite", "parents", "exist_ok"}
+        for key in string_conditions:
+            if key in conditions and not isinstance(conditions[key], str):
+                malformed.append(key)
+        for key in bool_conditions:
+            if key in conditions and not isinstance(conditions[key], bool):
+                malformed.append(key)
+        if "argv" in conditions and (
+            not isinstance(conditions["argv"], list) or not all(isinstance(item, str) for item in conditions["argv"])
+        ):
+            malformed.append("argv")
+        if "match" in conditions and conditions["match"] not in {"exact", "prefix"}:
+            malformed.append("match")
+        if "regex_token" in conditions:
+            import re
+
+            regex = conditions["regex_token"]
+            if not isinstance(regex, str):
+                malformed.append("regex_token")
+            else:
+                try:
+                    re.compile(regex)
+                except re.error:
+                    malformed.append("regex_token")
+        for key in ("timeout_s", "timeout_max_s"):
+            if key in conditions:
+                try:
+                    float(conditions[key])
+                except (TypeError, ValueError):
+                    malformed.append(key)
+        return sorted(set(malformed))
 
     def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
         conditions = dict(rule.conditions or {})
@@ -1341,7 +1468,13 @@ class CapabilityManager:
             "right",
             "endpoint_id",
             "method_id",
+            "rpc_method",
             "params_sha256",
+            "server_id",
+            "transport",
+            "tool_id",
+            "mcp_name",
+            "arguments_sha256",
             "content_sha256",
             "network",
             "filesystem_intent",

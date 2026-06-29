@@ -79,17 +79,28 @@ recorded as an MCP external read effect. Host/admin refreshes that bypass
 process capability checks still record the external read attempt under a host
 actor. `call_mcp_tool` requires the right declared by the tool spec on
 `mcp:<server_id>:<tool_id>`.
+For tool calls, the primitive gates on `server_id` and `tool_id` before loading
+server metadata or input schemas. A process without tool invocation authority
+gets a generic denial and cannot enumerate registered MCP server metadata
+through call errors. This early visibility gate does not consume a one-shot
+tool grant; the exact tool is then authorized after the server spec is loaded,
+and any one-shot use from that decision is consumed only after pre-provider
+validation has passed.
 
 Tool visibility is not authority. Default images can see the MCP tools, but a
 process cannot call a registered MCP tool without the matching capability.
 
 ## Security Rules
 
-Only manifest-declared tools may be called. Once a call crosses the external
-attempt boundary, one-shot tool authority is consumed even if live metadata
-validation later fails. The primitive asks the provider for live tool metadata
-and fails closed if the server no longer exposes the tool or if a pinned
-`input_schema` changed.
+Only manifest-declared tools may be called. Argument schema failures, missing
+runtime environment variables, HTTP runtime-resolution failures, request-size
+failures, resource-budget preflight failures, and external-effect classifier
+failures happen before the provider boundary and do not consume one-shot tool
+authority. After those checks pass, the one-shot tool grant is consumed just
+before live metadata or provider calls. The primitive asks the provider for live
+tool metadata and fails closed if the server no longer exposes the tool or if a
+pinned `input_schema` changed; those post-boundary failures do not restore the
+use.
 
 HTTP transport follows the same default network posture as JSON-RPC: HTTPS for
 remote hosts, plain HTTP only for local development hosts, no URL userinfo or

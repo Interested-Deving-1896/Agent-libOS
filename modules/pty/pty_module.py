@@ -781,60 +781,72 @@ class PtyAdapter:
             self._sessions[session_oid] = session
             self._release_session_capacity_locked(pid)
             reserved_capacity = False
-        self._start_reader(session, resource=resource)
-        if selected_startup_timeout > 0:
-            time.sleep(selected_startup_timeout)
-        output, output_truncated = self._take_output(session, selected_output_chars)
-        event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=f"pty:{session_oid}",
-            payload={"operation": "spawn", "argv": checked, "cwd": cwd, "backend": session.backend},
-            correlation_id=intent_record.record_id,
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.pty.spawn",
-            target=f"pty:{session_oid}",
-            output_refs=[session_oid],
-            decision={
-                "argv": checked,
-                "cwd": cwd,
-                "resource": resource,
-                "backend": session.backend,
-                "policy_level": decision.policy_level,
-                "policy_reason": decision.reason,
-                "risk": decision.risk.value,
-                "rule_id": decision.rule_id,
-                "cols": selected_cols,
-                "rows": selected_rows,
-            },
-            correlation_id=intent_record.record_id,
-            parent_record_id=intent_record.record_id,
-        )
-        classification = classify_external_effect(
-            self.provider,
-            "spawn",
-            {
-                "argv": checked,
-                "resource": resource,
-                "cwd": cwd,
-                "backend": session.backend,
-                "session_oid": session_oid,
-            },
-            {"session_oid": session_oid, "backend": session.backend},
-        )
-        record_external_effect(
-            self.runtime.store,
-            pid=pid,
-            provider="pty",
-            operation="spawn",
-            target=f"pty:{session_oid}",
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={"session_oid": session_oid, "resource": resource},
-        )
+        try:
+            self._start_reader(session, resource=resource)
+            if selected_startup_timeout > 0:
+                time.sleep(selected_startup_timeout)
+            output, output_truncated = self._take_output(session, selected_output_chars)
+            event = self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=pid,
+                target=f"pty:{session_oid}",
+                payload={"operation": "spawn", "argv": checked, "cwd": cwd, "backend": session.backend},
+                correlation_id=intent_record.record_id,
+            )
+            audit_record = self.audit.record(
+                actor=pid,
+                action="primitive.pty.spawn",
+                target=f"pty:{session_oid}",
+                output_refs=[session_oid],
+                decision={
+                    "argv": checked,
+                    "cwd": cwd,
+                    "resource": resource,
+                    "backend": session.backend,
+                    "policy_level": decision.policy_level,
+                    "policy_reason": decision.reason,
+                    "risk": decision.risk.value,
+                    "rule_id": decision.rule_id,
+                    "cols": selected_cols,
+                    "rows": selected_rows,
+                },
+                correlation_id=intent_record.record_id,
+                parent_record_id=intent_record.record_id,
+            )
+            classification = classify_external_effect(
+                self.provider,
+                "spawn",
+                {
+                    "argv": checked,
+                    "resource": resource,
+                    "cwd": cwd,
+                    "backend": session.backend,
+                    "session_oid": session_oid,
+                },
+                {"session_oid": session_oid, "backend": session.backend},
+            )
+            record_external_effect(
+                self.runtime.store,
+                pid=pid,
+                provider="pty",
+                operation="spawn",
+                target=f"pty:{session_oid}",
+                classification=classification,
+                audit_record=audit_record,
+                event=event,
+                metadata={"session_oid": session_oid, "resource": resource},
+            )
+        except Exception as exc:
+            self._cleanup_failed_started_session(session, actor=pid, reason="pty_create_post_spawn_failure")
+            self.audit.record(
+                actor=pid,
+                action="primitive.pty.failed",
+                target=resource,
+                decision={"argv": checked, "cwd": cwd, "error_type": type(exc).__name__, "error": str(exc)},
+                correlation_id=intent_record.record_id,
+                parent_record_id=intent_record.record_id,
+            )
+            raise
         return PtyCreateResult(
             session_oid=session_oid,
             namespace=namespace,
@@ -995,6 +1007,29 @@ class PtyAdapter:
             timeout_s=self.config.pty.close_timeout_s,
             wait_if_closing=True,
         )
+
+    def _cleanup_failed_started_session(self, session: _PtyRuntimeSession, *, actor: str, reason: str) -> None:
+        session.stop_event.set()
+        try:
+            self._close_session(
+                session.session_oid,
+                actor=actor,
+                reason=reason,
+                force=True,
+                timeout_s=self.config.pty.close_timeout_s,
+                wait_if_closing=True,
+            )
+        except Exception:
+            with self._lock:
+                self._sessions.pop(session.session_oid, None)
+            try:
+                session.handle.close(force=True, timeout_s=self.config.pty.close_timeout_s)
+            except Exception:
+                pass
+        try:
+            self.runtime.memory.delete_object_trusted("runtime.pty", session.session_oid, reason=reason)
+        except Exception:
+            pass
 
     def release_stale_session_objects(self) -> list[str]:
         released: list[str] = []

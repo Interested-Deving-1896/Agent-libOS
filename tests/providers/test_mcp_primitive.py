@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import socket
 from typing import Any
 
 import pytest
 
 from agent_libos import Runtime
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.models import (
     CapabilityStatus,
     CapabilityRight,
@@ -17,7 +19,7 @@ from agent_libos.models import (
     McpProviderTool,
     McpToolListResult,
 )
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate.local import _allowed_mcp_connect_addresses
 from agent_libos.utils.serde import dumps
@@ -78,6 +80,81 @@ class TestMcpPrimitive:
             assert effect.rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
             assert not effect.state_mutation
             assert effect.information_flow
+        finally:
+            runtime.close()
+
+    def test_call_denies_before_loading_server_metadata_without_visibility(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp hidden manifest")
+
+            def fail_if_manifest_loaded(_server_id: str) -> Any:
+                raise AssertionError("MCP server manifest should stay hidden before capability gate")
+
+            monkeypatch.setattr(runtime.store, "get_mcp_server", fail_if_manifest_loaded)
+
+            with pytest.raises(CapabilityDenied, match="MCP call authority"):
+                runtime.mcp.call_tool(pid, "secret-server", "hidden-tool", {"text": "hello"})
+        finally:
+            runtime.close()
+
+    def test_call_ask_visibility_prompts_before_loading_server_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp ask hidden manifest")
+            runtime.capability.set_permission_policy(
+                pid,
+                "mcp:secret-server:hidden-tool",
+                [CapabilityRight.READ],
+                runtime.capability.ASK_EACH_TIME,
+                issued_by="test",
+            )
+
+            def fail_if_manifest_loaded(_server_id: str) -> Any:
+                raise AssertionError("MCP server manifest should stay hidden before human approval")
+
+            monkeypatch.setattr(runtime.store, "get_mcp_server", fail_if_manifest_loaded)
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.mcp.call_tool(pid, "secret-server", "hidden-tool", {"text": "hello"})
+        finally:
+            runtime.close()
+
+    def test_call_visibility_honors_argument_scoped_authority_rule(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp scoped visibility")
+            runtime.mcp.register_server_from_yaml_text(_stdio_manifest("scoped-visibility"), actor="cli", require_capability=False)
+            arguments = {"text": "hello"}
+            arguments_sha = hashlib.sha256(dumps(arguments).encode("utf-8")).hexdigest()
+            runtime.capability.grant(
+                pid,
+                "mcp:scoped-visibility:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+                constraints={
+                    AUTHORITY_RULES_KEY: [
+                        {
+                            "rule_id": "mcp.scoped.visibility",
+                            "operation": "mcp.call",
+                            "effect": "allow",
+                            "risk": "low",
+                            "conditions": {
+                                "server_id": "scoped-visibility",
+                                "tool_id": "echo",
+                                "arguments_sha256": arguments_sha,
+                            },
+                        }
+                    ]
+                },
+            )
+
+            result = runtime.mcp.call_tool(pid, "scoped-visibility", "echo", arguments)
+
+            assert result.ok
+            assert provider.call_args == [("scoped-visibility", "echo", arguments)]
         finally:
             runtime.close()
 
@@ -380,7 +457,7 @@ class TestMcpPrimitive:
             assert restored["external_effect_summary"]["by_provider_operation"]["mcp.call_tool"] == 1
             with pytest.raises(NotFound):
                 runtime.mcp.inspect_server("ckpt", require_capability=False)
-            with pytest.raises(NotFound):
+            with pytest.raises(CapabilityDenied, match="MCP call authority"):
                 runtime.mcp.call_tool(pid, "ckpt", "echo", {"text": "again"})
         finally:
             runtime.close()

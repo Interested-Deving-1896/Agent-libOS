@@ -59,6 +59,8 @@ the same runtime store contract. Ordinary
 Object Memory payloads are runtime-only; SQL object rows store a
 runtime-memory marker, and rows whose live payload cache cannot be reconstructed
 are released fail-closed on reopen.
+File-backed SQLite stores also take an active-runtime lease. A second writable
+Runtime cannot open the same database until the first Runtime closes cleanly.
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
@@ -113,6 +115,7 @@ skills        Skill subcommands
 capabilities  capability list, inspect, grant, delegate, revoke, and explain
 images        AgentImage list, inspect, validate, register, and commit
 jsonrpc       JSON-RPC endpoint and call subcommands
+mcp           MCP server and tool-call subcommands
 modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
 ```
@@ -246,13 +249,14 @@ message-receive replay semantics, currently `receive_process_messages`.
 Running synchronous side-effect tools are not force-cancelled because Python
 cannot safely stop their worker thread after side effects may have started. A
 one-shot CLI invocation cannot keep detached in-memory tasks alive after the
-CLI Runtime shuts down, so `object-task start` requires `--wait`. A separate
-one-shot CLI process also opens a fresh Runtime; if it opens the same database
-as a live GUI or embedded host, unfinished ObjectTasks may be reconciled as
-abandoned. Use GUI server APIs or the embedding host for live ObjectTask
-supervision. The one-shot CLI `list|get|wait|cancel|watch-owner` commands are
-intended for the Runtime opened by that CLI invocation or for terminal task
-records after the live owner has stopped.
+CLI Runtime shuts down, so `object-task start` requires `--wait`. For
+file-backed SQLite, the active-runtime lease prevents a separate CLI process
+from opening the same database while a live GUI or embedded host owns it. After
+the live owner has stopped, reopening the store reconciles unfinished
+ObjectTasks as abandoned. Use GUI server APIs or the embedding host for live
+ObjectTask supervision. The one-shot CLI `list|get|wait|cancel|watch-owner`
+commands are intended for the Runtime opened by that CLI invocation or for
+terminal task records after the live owner has stopped.
 
 ## LLM Calls
 
@@ -270,7 +274,9 @@ hash, and truncation metadata.
 For OpenAI Responses requests, request options may show strict tool-schema
 counts, whether prompt-cache or safety identifiers were configured, and any
 non-secret `previous_response_id` chain; configured cache keys and safety
-identifier values are not persisted there. They also show whether
+identifier values are not persisted there. When no provider-side chain is used,
+historical tool outputs are plain bounded context instead of Responses-native
+`function_call_output` items. Request options also show whether
 `parallel_tool_calls` was enabled for the action-selection request.
 Full LLM input/output persistence is enabled by default for self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. Set

@@ -130,6 +130,32 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_create_post_spawn_failure_closes_handle_and_removes_object(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="post spawn failure")
+                adapter = _pty_adapter(runtime)
+
+                def fail_start_reader(*_args: Any, **_kwargs: Any) -> None:
+                    raise RuntimeError("reader setup failed")
+
+                monkeypatch.setattr(adapter, "_start_reader", fail_start_reader)
+
+                result = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+
+                assert not result.ok
+                assert provider.sessions[0].closed
+                assert adapter._sessions == {}
+                assert [
+                    obj
+                    for obj in runtime.store.list_objects()
+                    if isinstance(obj.payload, dict) and obj.payload.get("kind") == "pty_session"
+                ] == []
+            finally:
+                runtime.close()
+
     def test_high_risk_pty_spawn_requests_human_with_continuous_session_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider()

@@ -271,6 +271,45 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_start_cleans_runner_before_restoring_one_time_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="one time owner rollback parent")
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+                capability_id=cap.cap_id,
+            )
+            runner_pids: list[str] = []
+
+            def fail_insert(task: object) -> None:
+                runner_pids.append(str(getattr(task, "runner_pid")))
+                raise RuntimeError("object task insert failed")
+
+            monkeypatch.setattr(runtime.store, "insert_object_task", fail_insert)
+
+            with pytest.raises(RuntimeError, match="object task insert failed"):
+                runtime.object_tasks.start(child, one_time_owner, "get_working_directory", {})
+
+            assert len(runner_pids) == 1
+            assert runtime.store.get_process(runner_pids[0]) is None
+            assert runtime.capability.list_subject(runner_pids[0], include_inactive=True) == []
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+        finally:
+            runtime.close()
+
     def test_object_task_notification_can_interrupt_and_wake_message_waiter(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -419,6 +458,114 @@ class TestObjectTasks:
             assert waiting.wait["filters"]["channel"] == "never"
             assert runtime.process.get(str(waiting.runner_pid)).status == ProcessStatus.WAITING_EVENT
             assert len([record for record in runtime.audit.trace() if record.action == "tool.call_waiting_message"]) == 1
+        finally:
+            runtime.close()
+
+    def test_posted_process_message_resumes_waiting_object_task_runner(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="message resume task")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "resume-me"},
+            )
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            runtime.messages.post(
+                sender=pid,
+                recipient_pid=str(waiting.runner_pid),
+                channel="resume-me",
+                subject="ready",
+                body="continue",
+            )
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert any(record.action == "object_task.owner_watch.resume" for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
+    def test_posted_process_message_only_resumes_recipient_object_task_runner(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="message recipient isolation")
+            _grant_process_spawn(runtime, pid)
+            first_owner = _owner(runtime, pid)
+            second_owner = _owner(runtime, pid)
+            first = runtime.object_tasks.start(
+                pid,
+                first_owner,
+                "receive_process_messages",
+                {"channel": "shared-resume"},
+            )
+            second = runtime.object_tasks.start(
+                pid,
+                second_owner,
+                "receive_process_messages",
+                {"channel": "shared-resume"},
+            )
+            first_waiting = runtime.object_tasks.wait(first.task_id, actor_pid=pid, timeout=2)
+            second_waiting = runtime.object_tasks.wait(second.task_id, actor_pid=pid, timeout=2)
+            assert first_waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            assert second_waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            before_resumes = len([record for record in runtime.audit.trace() if record.action == "object_task.owner_watch.resume"])
+
+            runtime.messages.post(
+                sender=pid,
+                recipient_pid=str(first_waiting.runner_pid),
+                channel="shared-resume",
+                subject="ready",
+                body="continue",
+            )
+            first_completed = runtime.object_tasks.wait(first.task_id, actor_pid=pid, timeout=2)
+            second_still_waiting = runtime.object_tasks.wait(second.task_id, actor_pid=pid, timeout=0.05)
+            after_resumes = len([record for record in runtime.audit.trace() if record.action == "object_task.owner_watch.resume"])
+
+            assert first_completed.status == ObjectTaskStatus.SUCCEEDED
+            assert second_still_waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            assert after_resumes - before_resumes == 1
+            assert len([record for record in runtime.audit.trace() if record.action == "tool.call_waiting_message"]) == 2
+        finally:
+            runtime.close()
+
+    def test_child_process_exit_resumes_waiting_object_task_runner(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="process resume task")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            runner_pid = str(waiting.runner_pid)
+            _grant_process_spawn(runtime, runner_pid)
+            child_pid = runtime.spawn_child_process(runner_pid, "child waited by object task")
+            runtime.tools.configure_process_tools(runner_pid, ["wait_child_process"], assigned_by="test")
+            runtime.object_tasks._pending_args[task.task_id] = {"child_pid": child_pid}
+            runtime.store.update_object_task(
+                replace(
+                    waiting,
+                    status=ObjectTaskStatus.WAITING_PROCESS,
+                    tool="wait_child_process",
+                    wait={"child_pid": child_pid},
+                )
+            )
+
+            runtime.process.exit(child_pid, message="child done")
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert any(record.action == "object_task.process_resume" for record in runtime.audit.trace())
         finally:
             runtime.close()
 
@@ -618,14 +765,23 @@ class TestObjectTasks:
             pid = runtime.process.spawn(image="base-agent:v0", goal="owner exits")
             _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
+            result = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {"kept": True},
+                metadata=ObjectMetadata(title="result"),
+            )
             task = runtime.object_tasks.start(pid, owner, "sleep", {"seconds": 0.05})
-            runtime.process.exit(pid, message="creator exited")
+            runtime.process.exit(pid, result=result, message="creator exited")
 
             assert runtime.store.get_object(owner.oid) is not None
+            assert runtime.store.get_object(result.oid) is not None
             completed = runtime.object_tasks.wait(task.task_id, timeout=2)
 
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert runtime.store.get_object(owner.oid) is None
+            assert runtime.store.get_object(result.oid) is not None
+            assert runtime.store.get_object(result.oid).owner_kind == ObjectOwnerKind.PROCESS_RESULT
             assert completed.notification.status == ObjectTaskNotificationStatus.UNDELIVERED_TERMINAL
         finally:
             runtime.close()

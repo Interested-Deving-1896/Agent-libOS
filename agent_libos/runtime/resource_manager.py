@@ -56,9 +56,13 @@ class ResourceManager:
         self.audit = audit
         self.events = events
         self._process_kill_finalizer: Callable[..., None] | None = None
+        self._object_task_terminal_notifier: Callable[[str], None] | None = None
 
     def bind_process_kill_finalizer(self, finalizer: Callable[..., None]) -> None:
         self._process_kill_finalizer = finalizer
+
+    def bind_object_task_terminal_notifier(self, notifier: Callable[[str], None]) -> None:
+        self._object_task_terminal_notifier = notifier
 
     def preflight(
         self,
@@ -152,6 +156,7 @@ class ResourceManager:
                 killed.append(process.pid)
             for killed_pid in killed:
                 self._wake_parent_waiting_on_child(killed_pid)
+                self._notify_object_task_process_terminal(killed_pid)
             if killed and self._process_kill_finalizer is not None:
                 self._process_kill_finalizer(killed, reason=reason)
             self.events.emit(
@@ -189,6 +194,11 @@ class ResourceManager:
             target=f"process:{parent.pid}",
             decision={"child": child.pid, "child_status": child.status.value},
         )
+
+    def _notify_object_task_process_terminal(self, pid: str) -> None:
+        if self._object_task_terminal_notifier is None:
+            return
+        self._object_task_terminal_notifier(pid)
 
     def has_limit(self, pid: str, budget_field: str) -> bool:
         if budget_field not in _BUDGET_USAGE_MAP:

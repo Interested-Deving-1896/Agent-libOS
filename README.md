@@ -221,6 +221,9 @@ checkpoints, and registered tools/images/skills are durable store records.
 Ordinary Object Memory payloads remain runtime-only; the object table stores a
 runtime-memory marker, and rows whose payload cache cannot be reconstructed are
 released fail-closed on reopen instead of being treated as real payloads.
+File-backed SQLite stores take an active-runtime lease, so two writable
+`Runtime` instances cannot concurrently open the same store. Closing the first
+runtime releases the lease and permits a later reopen.
 
 Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
 you want a bounded run.
@@ -356,6 +359,12 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   image, checkpoint, JSON-RPC, or MCP remote authority.
 - JIT syscalls bypass the LLM-facing tool table but not primitive capability
   checks, permission policy, human approval, or audit.
+- Deno JIT validation may resolve pinned allowlisted JSR dependencies; runtime
+  execution uses cached dependencies only, so a tool call cannot implicitly
+  fetch remote code.
+- JSON-RPC and MCP calls gate on endpoint/method or server/tool capability
+  resources before loading provider metadata or input schemas, so missing call
+  authority cannot enumerate registered manifests.
 - Human approval is part of a primitive/syscall. Callers see a final success or
   final failure, not a pending/retry protocol.
 - When the optional PTY module is loaded, PTY sessions are host runtime
@@ -363,7 +372,9 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   authorizes creation; object read, write, and delete rights authorize read,
   resize, and close; and `pty_write` additionally requires the original session
   owner so delegated object write rights cannot drive an existing shell.
-  Runtime shutdown or object release closes the host PTY.
+  Runtime shutdown or object release closes the host PTY, and a failed
+  post-spawn setup closes the handle and removes the object before returning
+  failure.
 - `process.exit` and `process.exec` are ordinary syscalls from TypeScript. The
   runtime applies lifecycle changes after the JIT tool returns its normal tool
   result.
