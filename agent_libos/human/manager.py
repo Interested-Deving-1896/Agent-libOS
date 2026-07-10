@@ -9,7 +9,16 @@ from typing import TYPE_CHECKING, Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import AuthorityRisk, CapabilityEffect, CapabilityRight, ProcessMessage, ProcessMessageKind
+from agent_libos.models import (
+    AuthorityRisk,
+    CapabilityEffect,
+    CapabilityRight,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+    ProcessMessage,
+    ProcessMessageKind,
+)
 from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
@@ -22,12 +31,14 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
+    abandon_external_effect_intent,
+    begin_external_effect_intent,
     classify_external_effect,
     record_external_effect,
     require_external_effect_classifier,
 )
 from agent_libos.storage import RuntimeStore
-from agent_libos.substrate import HumanProvider
+from agent_libos.substrate import HumanProvider, ProviderEffectNotStarted
 from agent_libos.utils.serde import dumps, to_jsonable
 
 if TYPE_CHECKING:
@@ -74,6 +85,8 @@ def _redact_human_value(value: Any) -> Any:
 
 class HumanObjectManager:
     """HumanObject primitive: terminal queue, approvals, questions, and output."""
+
+    TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
     def __init__(
         self,
@@ -125,11 +138,15 @@ class HumanObjectManager:
         # commit. A caller may therefore safely restore a reserved one-shot
         # capability if this method raises: no pending request was left behind.
         with self.store.transaction():
+            process = self.store.get_process(pid)
+            if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
+                raise ValidationError(
+                    f"terminal process cannot create human requests: {pid} status={process.status.value}"
+                )
             self.store.insert_human_request(human_request)
             if blocking:
                 # Blocking human requests suspend scheduling for this process until
                 # a terminal queue decision moves it back to RUNNABLE.
-                process = self.store.get_process(pid)
                 if process is not None:
                     process.status = ProcessStatus.WAITING_HUMAN
                     process.status_message = f"waiting for human request {human_request.request_id}"
@@ -390,10 +407,13 @@ class HumanObjectManager:
         decision: dict[str, Any] | None = None,
         responder: str | None = None,
     ) -> HumanRequest:
+        selected_decision: Any = {"approved": True} if decision is None else decision
+        if not isinstance(selected_decision, dict):
+            raise ValidationError("human decision must be a JSON object")
         return self._decide(
             request_id,
             HumanRequestStatus.APPROVED,
-            decision or {"approved": True},
+            dict(selected_decision),
             responder or self.config.runtime.default_human_actor,
         )
 
@@ -403,10 +423,13 @@ class HumanObjectManager:
         decision: dict[str, Any] | None = None,
         responder: str | None = None,
     ) -> HumanRequest:
+        selected_decision: Any = {"approved": False} if decision is None else decision
+        if not isinstance(selected_decision, dict):
+            raise ValidationError("human decision must be a JSON object")
         return self._decide(
             request_id,
             HumanRequestStatus.REJECTED,
-            decision or {"approved": False},
+            dict(selected_decision),
             responder or self.config.runtime.default_human_actor,
         )
 
@@ -424,6 +447,12 @@ class HumanObjectManager:
         process.status_message = (payload or {}).get("reason")
         process.updated_at = utc_now()
         self.store.update_process(process)
+        if process.status in self.TERMINAL_PROCESS_STATUSES:
+            self.cancel_pending_for_process(
+                pid,
+                actor="human",
+                reason=(payload or {}).get("reason") or f"process interrupted with {sig.value}",
+            )
         event = self.events.emit(
             EventType.PROCESS_SIGNAL,
             source="human",
@@ -577,6 +606,38 @@ class HumanObjectManager:
             limit=self.config.tools.human_request_list_limit,
         )
 
+    def cancel_pending_for_process(self, pid: str, *, actor: str, reason: str) -> builtins.list[str]:
+        """Cancel every pending request owned by a terminal process."""
+        cancelled: builtins.list[str] = []
+        with self._terminal_lock:
+            with self.store.transaction():
+                for request in self.store.list_human_requests(
+                    pid=pid,
+                    status=HumanRequestStatus.PENDING,
+                ):
+                    request.status = HumanRequestStatus.CANCELLED
+                    request.decision = {"cancelled_by": actor, "reason": reason}
+                    request.updated_at = utc_now()
+                    self.store.update_human_request(request)
+                    cancelled.append(request.request_id)
+                    self.events.emit(
+                        EventType.HUMAN_RESPONSE,
+                        source=actor,
+                        target=pid,
+                        payload={
+                            "request_id": request.request_id,
+                            "status": HumanRequestStatus.CANCELLED.value,
+                            "reason": reason,
+                        },
+                    )
+                    self.audit.record(
+                        actor=actor,
+                        action="human.request_cancelled",
+                        target=f"human_request:{request.request_id}",
+                        decision={"pid": pid, "reason": reason},
+                    )
+        return cancelled
+
     def process_next_terminal(
         self,
         human: str | None = None,
@@ -598,6 +659,7 @@ class HumanObjectManager:
             question = self._terminal_question(request)
             if request_type == "question":
                 answer = self._select_text_answer(
+                    request=request,
                     question=question,
                     auto_answer=auto_answer,
                 )
@@ -607,6 +669,7 @@ class HumanObjectManager:
                 )
             if request_type == "permission_request":
                 policy = self._select_permission_policy(
+                    request=request,
                     question=question,
                     auto_policy=auto_policy,
                     auto_approve=auto_approve,
@@ -617,6 +680,7 @@ class HumanObjectManager:
                 return self.approve(request.request_id, {"approved": True, **decision})
 
             approved = self._select_boolean_approval(
+                request=request,
                 question=question,
                 auto_approve=auto_approve,
             )
@@ -691,6 +755,11 @@ class HumanObjectManager:
                     raise NotFound(f"human request not found: {request_id}")
                 if request.status != HumanRequestStatus.PENDING:
                     raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
+                process = self.store.get_process(request.pid)
+                if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
+                    raise ValidationError(
+                        f"terminal process cannot receive a human decision: {request.pid} status={process.status.value}"
+                    )
                 self._validate_decision_side_effects(request, status, decision)
                 self._apply_decision_side_effects(request, status, decision, responder)
                 permission_related = False
@@ -705,17 +774,33 @@ class HumanObjectManager:
                 request.decision = decision
                 request.updated_at = utc_now()
                 self.store.update_human_request(request)
-                process = self.store.get_process(request.pid)
                 if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
-                    # Permission denials still wake the process so it can observe the
-                    # failed operation and explain what happened. Generic rejected human
-                    # approvals remain a pause/interruption signal.
-                    process.status = (
-                        ProcessStatus.RUNNABLE
-                        if status == HumanRequestStatus.APPROVED or permission_related
-                        else ProcessStatus.PAUSED
-                    )
-                    process.status_message = None if status == HumanRequestStatus.APPROVED else f"human rejected {request_id}"
+                    remaining = [
+                        pending
+                        for pending in self.store.list_human_requests(
+                            pid=request.pid,
+                            status=HumanRequestStatus.PENDING,
+                        )
+                        if pending.blocking
+                    ]
+                    if remaining:
+                        process.status = ProcessStatus.WAITING_HUMAN
+                        process.status_message = "waiting for human requests " + ",".join(
+                            pending.request_id for pending in remaining[:8]
+                        )
+                    else:
+                        # Permission denials still wake the process so it can observe
+                        # the structured failed operation. Generic rejections pause.
+                        process.status = (
+                            ProcessStatus.RUNNABLE
+                            if status == HumanRequestStatus.APPROVED or permission_related
+                            else ProcessStatus.PAUSED
+                        )
+                        process.status_message = (
+                            None
+                            if status == HumanRequestStatus.APPROVED
+                            else f"human rejected {request_id}"
+                        )
                     process.updated_at = utc_now()
                     self.store.update_process(process)
                 self.events.emit(
@@ -742,6 +827,22 @@ class HumanObjectManager:
         status: HumanRequestStatus,
         decision: dict[str, Any],
     ) -> None:
+        approved = decision.get("approved")
+        expected_approved = status == HumanRequestStatus.APPROVED
+        if not isinstance(approved, bool):
+            raise ValidationError("human decision approved must be a JSON boolean")
+        if approved is not expected_approved:
+            raise ValidationError(
+                f"human decision approved={approved} conflicts with status={status.value}"
+            )
+        request_type = request.payload.get("type")
+        if request_type == "question" and status == HumanRequestStatus.APPROVED:
+            if "answer" not in decision:
+                raise ValidationError("approved human question requires an answer")
+            if not isinstance(decision["answer"], str):
+                raise ValidationError("human question answer must be a string")
+            if not decision["answer"].strip():
+                raise ValidationError("human question answer must be non-empty")
         permission_spec = request.payload.get("requested_permission")
         if isinstance(permission_spec, dict):
             self._permission_decision_spec(permission_spec, request.pid, status, decision)
@@ -820,12 +921,10 @@ class HumanObjectManager:
             default_subject,
             label="requested permission",
         )
-        policy = str(
-            decision.get(
-                "policy",
-                CapabilityManager.ALWAYS_ALLOW if status == HumanRequestStatus.APPROVED else CapabilityManager.ALWAYS_DENY,
-            )
-        )
+        policy_value = decision.get("policy")
+        if not isinstance(policy_value, str):
+            raise ValidationError("permission decisions require an explicit policy")
+        policy = policy_value
         if policy not in {
             CapabilityManager.ALWAYS_ALLOW,
             CapabilityManager.ALWAYS_DENY,
@@ -889,6 +988,7 @@ class HumanObjectManager:
 
     def _select_permission_policy(
         self,
+        request: HumanRequest,
         question: str,
         auto_policy: str | None,
         auto_approve: bool | None,
@@ -901,14 +1001,29 @@ class HumanObjectManager:
         if auto_policy is not None:
             if auto_policy not in choices:
                 raise ValueError(f"unknown permission policy: {auto_policy}")
-            self.provider.write(f"{question} [policy={auto_policy}]")
+            self._terminal_provider_io(
+                request,
+                operation="write",
+                text=f"{question} [policy={auto_policy}]",
+                purpose="permission_policy_auto",
+            )
             return auto_policy
         if auto_approve is not None:
             policy = CapabilityManager.ALWAYS_ALLOW if auto_approve else CapabilityManager.ALWAYS_DENY
-            self.provider.write(f"{question} [policy={policy}]")
+            self._terminal_provider_io(
+                request,
+                operation="write",
+                text=f"{question} [policy={policy}]",
+                purpose="permission_policy_auto",
+            )
             return policy
-        answer = self.provider.read(
-            f"{question} [a=always allow, d=always deny, e=ask each time; default=d]: "
+        answer = str(
+            self._terminal_provider_io(
+                request,
+                operation="read",
+                text=f"{question} [a=always allow, d=always deny, e=ask each time; default=d]: ",
+                purpose="permission_policy",
+            )
         ).strip().lower()
         return {
             "a": CapabilityManager.ALWAYS_ALLOW,
@@ -1067,31 +1182,254 @@ class HumanObjectManager:
             return "  <empty>"
         return "\n".join(f"  {line}" for line in text.splitlines() or [text])
 
+    def _terminal_provider_io(
+        self,
+        request: HumanRequest,
+        *,
+        operation: str,
+        text: str,
+        purpose: str,
+    ) -> str | None:
+        if operation not in {"read", "write"}:
+            raise ValidationError(f"unsupported terminal human provider operation: {operation}")
+        require_external_effect_classifier(self.provider, operation)
+        resource = f"human:{request.human}"
+        prompt_observation = self._terminal_text_observation(text)
+        request_kind = (
+            "approval"
+            if purpose.startswith(("permission_policy", "boolean_approval"))
+            else "question"
+            if purpose.startswith("text_answer")
+            else purpose
+        )
+        effect_context = {
+            "request_id": request.request_id,
+            "request_kind": request_kind,
+            "purpose": purpose,
+            "operation": operation,
+            "chars": prompt_observation["chars"],
+            "prompt_observation": prompt_observation,
+        }
+        effect_intent = begin_external_effect_intent(
+            self.store,
+            pid=request.pid,
+            provider="human",
+            operation=operation,
+            target=resource,
+            state_mutation=operation == "write",
+            information_flow=True,
+            metadata={"context": effect_context},
+        )
+        try:
+            result = self.provider.read(text) if operation == "read" else self.provider.write(text)
+        except ProviderEffectNotStarted:
+            with self.store.transaction():
+                abandon_external_effect_intent(self.store, effect_intent.effect_id)
+            raise
+        except BaseException as exc:
+            # The provider may have emitted the prompt or accepted input before
+            # failing. Preserve UNKNOWN evidence, but never persist prompt,
+            # answer, or exception text from this sensitive boundary.
+            try:
+                self._finalize_terminal_provider_failure(
+                    request,
+                    operation=operation,
+                    resource=resource,
+                    purpose=purpose,
+                    effect_context=effect_context,
+                    effect_intent_id=effect_intent.effect_id,
+                    error=exc,
+                )
+            except Exception:
+                pass
+            raise
+
+        result_observation = (
+            self._terminal_text_observation(result)
+            if isinstance(result, str)
+            else {"type": type(result).__name__}
+        )
+        try:
+            event = self.events.emit(
+                EventType.HUMAN_RESPONSE if operation == "read" else EventType.HUMAN_OUTPUT,
+                source=request.human if operation == "read" else request.pid,
+                target=resource,
+                payload={
+                    "request_id": request.request_id,
+                    "purpose": purpose,
+                    "operation": operation,
+                    "chars": result_observation.get("chars", prompt_observation["chars"]),
+                },
+            )
+            audit_record = self.audit.record(
+                actor=request.pid,
+                action=f"human.terminal.{operation}",
+                target=resource,
+                decision={
+                    "request_id": request.request_id,
+                    "purpose": purpose,
+                    "operation": operation,
+                    "prompt_observation": prompt_observation,
+                    "result_observation": result_observation,
+                },
+            )
+            classification = classify_external_effect(
+                self.provider,
+                operation,
+                effect_context,
+                {"completed": True, "result_observation": result_observation},
+            )
+            if not classification.information_flow:
+                classification = ExternalEffectClassification(
+                    rollback_class=classification.rollback_class,
+                    rollback_status=classification.rollback_status,
+                    state_mutation=classification.state_mutation,
+                    information_flow=True,
+                    metadata={**classification.metadata, "terminal_information_flow": True},
+                )
+            record_external_effect(
+                self.store,
+                pid=request.pid,
+                provider="human",
+                operation=operation,
+                target=resource,
+                classification=classification,
+                audit_record=audit_record,
+                event=event,
+                metadata={
+                    "context": effect_context,
+                    "result_observation": result_observation,
+                },
+                intent_effect_id=effect_intent.effect_id,
+            )
+        except Exception:
+            # The human interaction has already completed. Leave the durable
+            # pending intent and continue committing the chosen answer/policy
+            # so queue draining cannot repeat the prompt.
+            pass
+        return result
+
+    def _finalize_terminal_provider_failure(
+        self,
+        request: HumanRequest,
+        *,
+        operation: str,
+        resource: str,
+        purpose: str,
+        effect_context: dict[str, Any],
+        effect_intent_id: str,
+        error: BaseException,
+    ) -> None:
+        event = self.events.emit(
+            EventType.HUMAN_RESPONSE if operation == "read" else EventType.HUMAN_OUTPUT,
+            source=request.human if operation == "read" else request.pid,
+            target=resource,
+            payload={
+                "request_id": request.request_id,
+                "purpose": purpose,
+                "operation": operation,
+                "outcome": "unknown",
+                "error_type": type(error).__name__,
+            },
+        )
+        audit_record = self.audit.record(
+            actor=request.pid,
+            action=f"human.terminal.{operation}.failed",
+            target=resource,
+            decision={
+                "request_id": request.request_id,
+                "purpose": purpose,
+                "operation": operation,
+                "effect_outcome": "unknown",
+                "error_type": type(error).__name__,
+            },
+        )
+        record_external_effect(
+            self.store,
+            pid=request.pid,
+            provider="human",
+            operation=operation,
+            target=resource,
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=operation == "write",
+                information_flow=True,
+                metadata={"outcome": "unknown_after_provider_exception"},
+            ),
+            audit_record=audit_record,
+            event=event,
+            metadata={
+                "context": effect_context,
+                "error_type": type(error).__name__,
+            },
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _terminal_text_observation(self, text: str) -> dict[str, Any]:
+        encoded = text.encode("utf-8")
+        return {
+            "chars": len(text),
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
     def _select_boolean_approval(
         self,
+        request: HumanRequest,
         question: str,
         auto_approve: bool | None,
     ) -> bool:
         if auto_approve is None:
-            answer = self.provider.read(f"{question} [y/N]: ").strip().lower()
+            answer = str(
+                self._terminal_provider_io(
+                    request,
+                    operation="read",
+                    text=f"{question} [y/N]: ",
+                    purpose="boolean_approval",
+                )
+            ).strip().lower()
             return answer in {"y", "yes"}
-        self.provider.write(f"{question} [{'approved' if auto_approve else 'rejected'}]")
+        self._terminal_provider_io(
+            request,
+            operation="write",
+            text=f"{question} [{'approved' if auto_approve else 'rejected'}]",
+            purpose="boolean_approval_auto",
+        )
         return auto_approve
 
     def _select_text_answer(
         self,
+        request: HumanRequest,
         question: str,
         auto_answer: str | None,
     ) -> str:
         if auto_answer is not None:
-            self.provider.write(f"{question} [answer={auto_answer!r}]")
+            self._terminal_provider_io(
+                request,
+                operation="write",
+                text=f"{question} [answer={auto_answer!r}]",
+                purpose="text_answer_auto",
+            )
             return auto_answer
-        return self.provider.read(f"{question} ")
+        return str(
+            self._terminal_provider_io(
+                request,
+                operation="read",
+                text=f"{question} ",
+                purpose="text_answer",
+            )
+        )
 
     def _deliver_output_request(self, request: HumanRequest) -> HumanRequest:
         message = str(request.payload.get("message", ""))
         channel = str(request.payload.get("channel", self.config.runtime.terminal_channel))
-        effect_context = {"channel": channel, "chars": len(message), "request_id": request.request_id}
+        effect_context = {
+            "channel": channel,
+            "chars": len(message),
+            "request_id": request.request_id,
+            "request_kind": "output",
+        }
         require_external_effect_classifier(self.provider, "write")
         request.status = HumanRequestStatus.DELIVERED
         request.decision = {"delivery_committed": True}
@@ -1116,7 +1454,64 @@ class HumanObjectManager:
                     "delivery_committed": True,
                 },
             )
-            classification = classify_external_effect(self.provider, "write", effect_context, {"delivery_committed": True})
+            effect_intent = begin_external_effect_intent(
+                self.store,
+                pid=request.pid,
+                provider="human",
+                operation="write",
+                target=resource,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"context": effect_context, "result": {"delivery_committed": True}},
+            )
+        try:
+            self.provider.write(message)
+        except Exception as exc:
+            try:
+                record_external_effect(
+                    self.store,
+                    pid=request.pid,
+                    provider="human",
+                    operation="write",
+                    target=resource,
+                    classification=ExternalEffectClassification(
+                        rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                        rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                        state_mutation=True,
+                        information_flow=True,
+                        metadata={"outcome": "unknown_after_provider_exception"},
+                    ),
+                    audit_record=audit_record,
+                    event=event,
+                    metadata={
+                        "context": effect_context,
+                        "error_type": type(exc).__name__,
+                    },
+                    intent_effect_id=effect_intent.effect_id,
+                )
+            except Exception:
+                # The pre-provider pending intent remains durable.
+                pass
+            request.decision = {
+                "delivery_committed": True,
+                # Provider exceptions can echo terminal payloads or transport
+                # details.  Persist only the stable error class, matching the
+                # interactive terminal path's privacy boundary.
+                "provider_error_type": type(exc).__name__,
+            }
+            request.updated_at = utc_now()
+            try:
+                self.store.update_human_request(request)
+            except Exception:
+                pass
+            raise
+        try:
+            classification = classify_external_effect(
+                self.provider,
+                "write",
+                effect_context,
+                {"delivery_committed": True, "delivered": True},
+            )
             record_external_effect(
                 self.store,
                 pid=request.pid,
@@ -1126,21 +1521,17 @@ class HumanObjectManager:
                 classification=classification,
                 audit_record=audit_record,
                 event=event,
-                metadata={"context": effect_context, "result": {"delivery_committed": True}},
+                metadata={
+                    "context": effect_context,
+                    "result": {"delivery_committed": True, "delivered": True},
+                },
+                intent_effect_id=effect_intent.effect_id,
             )
-        try:
-            self.provider.write(message)
-        except Exception as exc:
-            request.decision = {
-                "delivery_committed": True,
-                "provider_error": f"{type(exc).__name__}: {exc}",
-            }
-            request.updated_at = utc_now()
-            try:
-                self.store.update_human_request(request)
-            except Exception:
-                pass
-            raise
+        except Exception:
+            # Delivery is at-most-once and already happened.  Do not surface a
+            # post-provider bookkeeping failure as retryable; the UNKNOWN
+            # pending intent is the fail-closed evidence.
+            pass
         request.decision = {"delivery_committed": True, "delivered": True}
         request.updated_at = utc_now()
         try:

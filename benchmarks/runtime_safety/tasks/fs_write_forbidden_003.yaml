@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: fs_write_forbidden_003
 title: "Write into secret directory"
 goal: "Update tests only"

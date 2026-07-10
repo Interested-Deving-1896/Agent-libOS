@@ -347,6 +347,70 @@ class TestSkillIntegration:
             finally:
                 runtime.close()
 
+    @pytest.mark.parametrize('operation', ['restore', 'fork'])
+    def test_checkpoint_operation_keeps_loaded_skill_snapshot_without_replacing_global_registry(
+        self,
+        operation: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(
+                root,
+                'checkpoint-registry-skill',
+                allowed_tools=['echo'],
+                body='# Checkpoint Registry Skill\n\nOriginal checkpoint instructions.\n',
+            )
+            runtime = Runtime.open('local')
+            try:
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                pid = runtime.process.spawn(image='base-agent:v0', goal=f'{operation} skill registry')
+                runtime.capability.grant(
+                    pid,
+                    'skill:checkpoint-registry-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                )
+                runtime.skills.activate_skill(pid, 'checkpoint-registry-skill', actor=pid)
+                checkpoint_id = runtime.checkpoint.create(pid, 'skill registry snapshot', actor=pid)
+
+                write_skill_package(
+                    root,
+                    'checkpoint-registry-skill',
+                    allowed_tools=['echo'],
+                    body='# Checkpoint Registry Skill\n\nCurrent global instructions.\n',
+                )
+                runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='cli',
+                    replace=True,
+                    require_capability=False,
+                )
+
+                if operation == 'restore':
+                    runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+                    target_pid = pid
+                else:
+                    runtime.capability.grant(
+                        pid,
+                        f'checkpoint:{checkpoint_id}',
+                        [CapabilityRight.EXECUTE],
+                        issued_by='test',
+                    )
+                    target_pid = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)['fork_root_pid']
+
+                assert 'Current global instructions.' in runtime.skills.inspect_skill(
+                    'checkpoint-registry-skill',
+                    require_capability=False,
+                )['instructions']
+                prompt_skill = next(
+                    item
+                    for item in runtime.skills.prompt_context(target_pid)
+                    if item['skill_id'] == 'checkpoint-registry-skill'
+                )
+                assert 'Original checkpoint instructions.' in prompt_skill['instructions']
+            finally:
+                runtime.close()
+
     def test_loaded_skill_instructions_are_materialized_into_llm_prompt_and_persisted_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(Path(temp_dir), 'prompt-skill', allowed_tools=['echo'], body='Always preserve the phrase skill-instruction-token in planning context.\n', actions=[{'name': 'prompt_action', 'use_cases': ['prompt testing']}])

@@ -73,6 +73,23 @@ export type HumanRequest = {
   updated_at: string;
 };
 
+export type HumanPermissionPolicy = "always_allow" | "ask_each_time" | "always_deny";
+
+export type HumanResponseInput =
+  | {
+      kind: "permission";
+      approved: true;
+      decision: { policy: Exclude<HumanPermissionPolicy, "always_deny"> };
+    }
+  | {
+      kind: "permission";
+      approved: false;
+      decision: { policy: Exclude<HumanPermissionPolicy, "always_allow"> };
+    }
+  | { kind: "question"; approved: true; answer: string }
+  | { kind: "question"; approved: false }
+  | { kind: "approval"; approved: boolean };
+
 export type AuditRecord = {
   record_id: string;
   timestamp: string;

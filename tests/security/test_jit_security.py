@@ -1,9 +1,13 @@
 from __future__ import annotations
+import contextlib
 import pytest
 import asyncio
 import os
 import signal
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,7 +25,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits
+from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits, WindowsJobObject
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 from agent_libos.utils.serde import dumps
 from tests.support.deno import (
@@ -33,6 +37,16 @@ from tests.support.deno import (
     READ_FILE_SOURCE,
     WRITE_FILE_SOURCE,
 )
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 class TestJitSecurity:
 
@@ -182,11 +196,23 @@ class TestJitSecurity:
     def test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
         commands: list[list[str]] = []
         launch_kwargs: list[dict[str, Any]] = []
+        jobs: list[Any] = []
+
+        class FakeJob:
+            def __init__(self) -> None:
+                self.assigned: list[int] = []
+                self.closed = False
+
+            def assign_pid(self, pid: int) -> None:
+                self.assigned.append(pid)
+
+            def close(self) -> None:
+                self.closed = True
 
         async def fake_create_subprocess_exec(*command: str, **kwargs: Any) -> Any:
             commands.append(list(command))
             launch_kwargs.append(dict(kwargs))
-            return SimpleNamespace()
+            return SimpleNamespace(pid=4242)
 
         async def fake_monitor_process(_proc: Any, _limits: Any) -> CommandMetrics:
             return CommandMetrics()
@@ -204,6 +230,13 @@ class TestJitSecurity:
         monkeypatch.setattr(sandbox, '_monitor_process', fake_monitor_process)
         monkeypatch.setattr(sandbox, '_serve_process', fake_serve_process)
         monkeypatch.setattr(sandbox, '_kill_process', fake_kill_process)
+        if os.name == 'nt':
+            def create_job() -> FakeJob:
+                job = FakeJob()
+                jobs.append(job)
+                return job
+
+            monkeypatch.setattr(WindowsJobObject, 'create', create_job)
 
         source = 'export function run(args, libos) { return {ok: true}; }'
 
@@ -211,10 +244,16 @@ class TestJitSecurity:
         validation = sandbox.run_tests(source, [{'args': {}, 'expected': {'ok': True}}])
 
         assert validation.ok, validation.errors
-        assert commands[0] == ['deno', 'run', '--no-prompt', '--cached-only', 'runner.ts']
-        assert commands[1] == ['deno', 'run', '--no-prompt', 'runner.ts']
+        assert Path(commands[0][2]).name == '_process_supervisor.py'
+        assert commands[0][-5:] == ['deno', 'run', '--no-prompt', '--cached-only', 'runner.ts']
+        assert commands[1][-4:] == ['deno', 'run', '--no-prompt', 'runner.ts']
         group_key = 'creationflags' if os.name == 'nt' else 'start_new_session'
         assert all(kwargs.get(group_key) for kwargs in launch_kwargs)
+        if os.name == 'posix':
+            assert all(kwargs.get('pass_fds') for kwargs in launch_kwargs)
+        else:
+            assert len(jobs) == 2
+            assert all(job.assigned == [4242] and job.closed for job in jobs)
 
     def test_cancelled_deno_execution_kills_process_and_drains_workers(
         self,
@@ -363,7 +402,7 @@ class TestJitSecurity:
                 owner,
                 {'action': JIT_MULTIPLEXER_TOOL_NAME, 'tool_name': 'process_exit', 'arguments': {}},
             )
-        with pytest.raises(ValueError, match='not in process tool table'):
+        with pytest.raises(ValueError, match='(?:not available in this process|not in process tool table)'):
             self.runtime.tools.normalize_model_action(
                 other,
                 {'action': JIT_MULTIPLEXER_TOOL_NAME, 'tool_name': 'owner_count', 'arguments': {'text': 'x'}},
@@ -456,11 +495,11 @@ class TestJitSecurity:
                 pid = runtime.process.spawn(image='toolmaker-agent:v0', goal='write with approval')
                 resource = runtime.filesystem.resource_for_path('out.txt')
                 runtime.capability.set_permission_policy(pid, resource, [CapabilityRight.WRITE], CapabilityManager.ASK_EACH_TIME, issued_by='test')
-                runtime._current_human_auto_approve = True
                 candidate = runtime.tools.propose(pid, {'name': 'write_via_syscall', 'description': 'Write file.', 'input_schema': {'type': 'object'}}, source_code=WRITE_FILE_SOURCE)
                 assert runtime.tools.validate(candidate).ok
                 runtime.tools.register(pid, candidate)
-                result = runtime.tools.call(pid, 'write_via_syscall', {'path': 'out.txt', 'content': 'ok'})
+                with runtime.human_run_context(human_auto_approve=True):
+                    result = runtime.tools.call(pid, 'write_via_syscall', {'path': 'out.txt', 'content': 'ok'})
                 assert result.ok, result.error
                 assert (root / 'out.txt').read_text(encoding='utf-8') == 'ok'
                 assert 'human.response' in [record.action for record in runtime.audit.trace()]
@@ -910,6 +949,66 @@ class TestJitSecurity:
             sandbox.run_source('export function run(args, libos) { const d = (globalThis as Record<string, any>)["De" + "no"]; return d.readTextFileSync("secret.txt"); }', {})
         assert result == {'doubled': 42}
         assert 'read' in str(raised.value).lower() or 'permission' in str(raised.value).lower()
+
+    @pytest.mark.real_deno
+    @pytest.mark.skipif(os.name != 'posix', reason='POSIX death-pipe integration')
+    def test_deno_supervisor_kills_untrusted_process_after_host_sigkill(self) -> None:
+        candidate = '''
+            export async function run(args, libos) {
+              const deno = (globalThis as Record<string, any>)["Deno"];
+              await libos.syscall("test.report_pid", { pid: deno.pid });
+              while (true) {}
+            }
+        '''
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_file = Path(temp_dir) / 'deno.pid'
+            helper_source = (
+                'from pathlib import Path\n'
+                'from agent_libos.substrate import CommandMetrics\n'
+                'from agent_libos.tools.sandbox import DenoTypescriptSandbox\n'
+                'class ParentDeathSandbox(DenoTypescriptSandbox):\n'
+                '    async def _monitor_process(self, proc, limits):\n'
+                '        await proc.wait()\n'
+                '        return CommandMetrics()\n'
+                f'pid_file = Path({str(pid_file)!r})\n'
+                'def handler(name, args):\n'
+                '    assert name == "test.report_pid"\n'
+                '    pid_file.write_text(str(args["pid"]), encoding="utf-8")\n'
+                '    return {}\n'
+                f'ParentDeathSandbox(deno_executable="deno", default_timeout_s=60.0).run_source({candidate!r}, {{}}, syscall_handler=handler, timeout=60.0)\n'
+            )
+            host = subprocess.Popen(
+                [sys.executable, '-c', helper_source],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deno_pid: int | None = None
+            try:
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    if host.poll() is not None:
+                        pytest.fail(f'Deno host exited before the parent-death check: {host.returncode}')
+                    if pid_file.exists():
+                        deno_pid = int(pid_file.read_text(encoding='utf-8'))
+                        break
+                    time.sleep(0.05)
+                assert deno_pid is not None, 'Deno child did not report its pid'
+
+                os.kill(host.pid, signal.SIGKILL)
+                host.wait(timeout=5.0)
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and _pid_is_alive(deno_pid):
+                    time.sleep(0.05)
+                assert not _pid_is_alive(deno_pid), f'Deno process survived host SIGKILL: {deno_pid}'
+            finally:
+                if host.poll() is None:
+                    host.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        host.wait(timeout=2.0)
+                if deno_pid is not None and _pid_is_alive(deno_pid):
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(deno_pid, signal.SIGKILL)
 
     @pytest.mark.real_deno
     def test_real_deno_result_frame_completes_even_with_live_handles(self) -> None:

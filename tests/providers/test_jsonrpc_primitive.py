@@ -27,10 +27,100 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate
+from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ProviderEffectNotStarted
 from agent_libos.utils.serde import dumps
 
 class TestJsonRpcPrimitive:
+
+    @pytest.mark.parametrize('operation', ['inspect', 'unregister', 'register', 'replace'])
+    @pytest.mark.parametrize('endpoint_id', ['secret-existing', 'secret-missing'])
+    def test_registry_item_authority_precedes_endpoint_metadata_load(
+        self,
+        monkeypatch: MonkeyPatch,
+        operation: str,
+        endpoint_id: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc registry oracle')
+
+            def fail_if_loaded(_endpoint_id: str) -> Any:
+                raise AssertionError('endpoint metadata must not load before authority')
+
+            monkeypatch.setattr(runtime.store, 'get_jsonrpc_endpoint', fail_if_loaded)
+            with pytest.raises(CapabilityDenied):
+                if operation == 'inspect':
+                    runtime.jsonrpc.inspect_endpoint(endpoint_id, actor=pid)
+                elif operation == 'unregister':
+                    runtime.jsonrpc.unregister_endpoint(endpoint_id, actor=pid)
+                else:
+                    runtime.jsonrpc.register_endpoint_from_yaml_text(
+                        _manifest(endpoint_id, 'https://safe.example.test/jsonrpc', with_header=False),
+                        actor=pid,
+                        replace=operation == 'replace',
+                    )
+        finally:
+            runtime.close()
+
+    def test_registry_register_audit_failure_rolls_back_endpoint(self, monkeypatch: MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        original_record = runtime.audit.record
+
+        def fail_register_audit(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get('action') == 'jsonrpc.endpoint.register':
+                raise RuntimeError('injected jsonrpc register audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.audit, 'record', fail_register_audit)
+        try:
+            with pytest.raises(RuntimeError, match='register audit failure'):
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest('register-rollback', 'https://safe.example.test/jsonrpc', with_header=False),
+                    actor='cli',
+                    require_capability=False,
+                )
+            assert runtime.store.get_jsonrpc_endpoint('register-rollback') is None
+        finally:
+            runtime.close()
+
+    def test_registry_unregister_audit_failure_rolls_back_endpoint_and_method_caps(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest('unregister-rollback', 'https://safe.example.test/jsonrpc', with_header=False),
+                actor='cli',
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc unregister rollback')
+            cap = runtime.capability.grant(
+                pid,
+                'jsonrpc:unregister-rollback:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            original_record = runtime.audit.record
+
+            def fail_unregister_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'jsonrpc.endpoint.unregister':
+                    raise RuntimeError('injected jsonrpc unregister audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_unregister_audit)
+            with pytest.raises(RuntimeError, match='unregister audit failure'):
+                runtime.jsonrpc.unregister_endpoint(
+                    'unregister-rollback',
+                    actor='cli',
+                    require_capability=False,
+                )
+
+            assert runtime.store.get_jsonrpc_endpoint('unregister-rollback') is not None
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.active and not persisted.revoked
+        finally:
+            runtime.close()
 
     def test_manifest_validation_rejects_unsafe_endpoint_shapes(self) -> None:
         runtime = Runtime.open('local')
@@ -78,6 +168,133 @@ class TestJsonRpcPrimitive:
                 assert effect.information_flow
             finally:
                 runtime.close()
+
+    @pytest.mark.parametrize('sink', ['event', 'audit'])
+    def test_call_post_provider_sink_failure_leaves_pending_effect_intent(
+        self,
+        monkeypatch: MonkeyPatch,
+        sink: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        resource = 'jsonrpc:pending-sink:echo'
+        monkeypatch.setattr(
+            'agent_libos.primitives.jsonrpc.socket.getaddrinfo',
+            lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))],
+        )
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'jsonrpc {sink} sink failure')
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest('pending-sink', 'https://safe.example.test/jsonrpc', with_header=False),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(pid, resource, [CapabilityRight.READ], issued_by='test')
+            if sink == 'event':
+                original_emit = runtime.events.emit
+
+                def fail_result_event(event_type: Any, *args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get('target') == resource:
+                        raise RuntimeError('injected jsonrpc event failure')
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_result_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_result_audit(*args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get('action') == 'primitive.jsonrpc.call':
+                        raise RuntimeError('injected jsonrpc audit failure')
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_result_audit)
+
+            with pytest.raises(RuntimeError, match=f'injected jsonrpc {sink} failure'):
+                runtime.jsonrpc.call(pid, 'pending-sink', 'echo', {'x': 1})
+
+            assert len(provider.calls) == 1
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].provider == 'jsonrpc'
+            assert effects[0].operation == 'call'
+            assert effects[0].effect_state == 'pending'
+            assert effects[0].provider_metadata['effect_state'] == 'pending'
+        finally:
+            runtime.close()
+
+    def test_call_provider_not_started_after_dns_finalizes_information_flow(self, monkeypatch: MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        provider = _NotStartedJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        monkeypatch.setattr(
+            'agent_libos.primitives.jsonrpc.socket.getaddrinfo',
+            lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))],
+        )
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc provider not started')
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest('not-started', 'https://safe.example.test/jsonrpc', with_header=False),
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'jsonrpc:not-started:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='before transport'):
+                runtime.jsonrpc.call(pid, 'not-started', 'echo', {'x': 1})
+
+            assert provider.calls == 1
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 0
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].effect_state == 'finalized'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].information_flow
+            assert effects[0].provider_metadata['phase'] == 'transport_not_started_after_dns'
+        finally:
+            runtime.close()
+
+    def test_resolution_certified_not_started_restores_one_shot_and_abandons_intent(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='jsonrpc resolution not started')
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest('resolution-not-started', 'https://safe.example.test/jsonrpc', with_header=False),
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'jsonrpc:resolution-not-started:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            monkeypatch.setattr(
+                runtime.jsonrpc,
+                '_validate_runtime_resolution',
+                lambda _spec: (_ for _ in ()).throw(ProviderEffectNotStarted('resolution did not start')),
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='resolution did not start'):
+                runtime.jsonrpc.call(pid, 'resolution-not-started', 'echo', {'x': 1})
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
+            assert provider.calls == []
+            assert runtime.store.list_external_effects(pid=pid) == []
+        finally:
+            runtime.close()
 
     def test_call_denies_before_loading_endpoint_metadata_without_visibility(self, monkeypatch: MonkeyPatch) -> None:
         runtime = Runtime.open('local')
@@ -172,7 +389,14 @@ class TestJsonRpcPrimitive:
             with pytest.raises(ValidationError, match='non-public|loopback|not allowed'):
                 runtime.jsonrpc.call(pid, 'dns-safe-name', 'echo', {'x': 1})
             assert provider.calls == []
-            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 0
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].effect_state == 'finalized'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].information_flow
+            assert effects[0].provider_metadata['phase'] == 'dns_resolution'
         finally:
             runtime.close()
 
@@ -656,6 +880,16 @@ class _RecordingJsonRpcProvider:
             information_flow=True,
             metadata={'operation': operation, 'endpoint_id': context.get('endpoint_id'), 'status': result.get('status') if isinstance(result, dict) else None},
         )
+
+
+class _NotStartedJsonRpcProvider(_RecordingJsonRpcProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def call(self, _endpoint: Any, _method: Any, request_body: bytes, **_kwargs: Any) -> JsonRpcTransportResult:
+        self.calls += 1
+        raise ProviderEffectNotStarted('jsonrpc failed before transport')
 
 class _PostCallClassifierFailsProvider(_RecordingJsonRpcProvider):
 

@@ -10,11 +10,120 @@ from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 
 
 class TestResourceManager:
+    def test_hierarchical_charge_rolls_back_every_process_when_parent_update_fails(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            child = runtime.process.spawn_child(parent, goal="child")
+            initial_charge_records = {
+                record.record_id for record in runtime.audit.trace() if record.action == "resource.charge"
+            }
+            original_update = runtime.store.update_process
+            updated: list[str] = []
+
+            def fail_parent_update(process: object) -> None:
+                pid = getattr(process, "pid")
+                updated.append(pid)
+                if pid == parent:
+                    raise RuntimeError("injected parent update failure")
+                original_update(process)
+
+            runtime.store.update_process = fail_parent_update  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError, match="injected parent update failure"):
+                runtime.resources.charge(child, ResourceUsage(tool_calls=1), source="test")
+            runtime.store.update_process = original_update  # type: ignore[method-assign]
+
+            assert updated == [child, parent]
+            assert runtime.process.get(child).resource_usage.tool_calls == 0
+            assert runtime.process.get(parent).resource_usage.tool_calls == 0
+            assert {
+                record.record_id for record in runtime.audit.trace() if record.action == "resource.charge"
+            } == initial_charge_records
+        finally:
+            runtime.close()
+
+    def test_resource_kill_notifies_terminal_hooks_after_releasing_store_lock(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='terminal lock order')
+            original = runtime.resources._object_task_terminal_notifier
+            lock_states: list[bool] = []
+
+            def notifier(selected_pid: str) -> None:
+                is_owned = getattr(runtime.store._lock, '_is_owned', lambda: False)
+                lock_states.append(bool(is_owned()))
+                if original is not None:
+                    original(selected_pid)
+
+            runtime.resources.bind_object_task_terminal_notifier(notifier)
+            runtime.resources.kill_if_exceeded(pid, reason='test terminal lock order')
+
+            assert lock_states == [False]
+        finally:
+            runtime.close()
+
+    def test_resource_kill_finalizes_remaining_processes_after_one_cleanup_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='failed parent cleanup')
+            child = runtime.process.spawn_child(parent, goal='remaining child cleanup')
+            original_finalize = runtime.process._finalize_terminal_process
+            finalized: list[str] = []
+
+            def fail_parent_once(process: object, preserve_oids: set[str]) -> None:
+                selected_pid = str(getattr(process, 'pid'))
+                finalized.append(selected_pid)
+                if selected_pid == parent:
+                    raise RuntimeError('injected parent cleanup failure')
+                original_finalize(process, preserve_oids)
+
+            monkeypatch.setattr(runtime.process, '_finalize_terminal_process', fail_parent_once)
+            runtime.resources.bind_process_kill_finalizer(runtime.process.finalize_killed_processes)
+
+            runtime.resources.kill_if_exceeded(parent, reason='test best-effort descendant cleanup')
+
+            assert finalized == [parent, child]
+            assert any(
+                record.action == 'resource.limit_finalize_failed'
+                and 'injected parent cleanup failure' in str(record.decision)
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
     def test_resource_models_reject_non_finite_numbers(self) -> None:
         with pytest.raises(ValueError, match="finite"):
             ResourceBudget(max_tool_calls=float("inf"))
         with pytest.raises(ValueError, match="finite"):
             ResourceUsage(tool_calls=float("nan"))
+
+    def test_resource_models_reject_fractional_discrete_counters(self) -> None:
+        with pytest.raises(ValueError, match="integer"):
+            ResourceBudget(max_tool_calls=0.5)
+        with pytest.raises(ValueError, match="integer"):
+            ResourceUsage(tool_calls=0.5)
+
+        budget = ResourceBudget(max_runtime_seconds=0.25, max_subprocess_cpu_seconds=0.5)
+        usage = ResourceUsage(runtime_seconds=0.25, subprocess_cpu_seconds=0.5)
+        assert budget.max_runtime_seconds == 0.25
+        assert budget.max_subprocess_cpu_seconds == 0.5
+        assert usage.runtime_seconds == 0.25
+        assert usage.subprocess_cpu_seconds == 0.5
+
+    def test_resource_manager_rejects_mutated_fractional_discrete_usage(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="integral resource usage")
+            usage = ResourceUsage(tool_calls=1)
+            usage.tool_calls = 0.5
+
+            with pytest.raises(ValidationError, match="integer"):
+                runtime.resources.charge(pid, usage, source="test")
+        finally:
+            runtime.close()
 
     def test_resource_manager_rejects_mutated_non_finite_usage(self) -> None:
         runtime = Runtime.open("local")

@@ -253,6 +253,58 @@ class TestImageCommit:
                 assert 'jsonrpc_endpoints' not in artifact['rows']
                 assert 'skill_trust' not in artifact['rows']
 
+    def test_committed_image_boot_keeps_loaded_skill_snapshot_without_overwriting_global_registry(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(
+                root,
+                'snapshot-skill',
+                allowed_tools=['human_output'],
+                body='# Snapshot Skill\n\nOriginal checkpoint instructions.\n',
+            )
+            with _runtime() as runtime:
+                runtime.skills.register_skill_from_path(skill_dir, actor='test', require_capability=False)
+                source = runtime.process.spawn(image='base-agent:v0', goal='capture skill snapshot')
+                runtime.capability.grant(source, 'skill:snapshot-skill', [CapabilityRight.EXECUTE], issued_by='test')
+                runtime.skills.activate_skill(source, 'snapshot-skill', actor=source)
+                checkpoint_id = runtime.checkpoint.create(source, 'skill snapshot ready', actor=source)
+                runtime.image_registry.grant_register(source, 'snapshot-skill-image:v0', issued_by='test')
+                runtime.image_registry.commit_from_checkpoint(
+                    actor=source,
+                    checkpoint_id=checkpoint_id,
+                    image_id='snapshot-skill-image:v0',
+                    name='snapshot-skill-image',
+                )
+
+                write_skill_package(
+                    root,
+                    'snapshot-skill',
+                    allowed_tools=['human_output'],
+                    body='# Snapshot Skill\n\nCurrent global instructions.\n',
+                )
+                runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='test',
+                    replace=True,
+                    require_capability=False,
+                )
+                assert 'Current global instructions.' in runtime.skills.inspect_skill(
+                    'snapshot-skill',
+                    require_capability=False,
+                )['instructions']
+
+                booted = runtime.process.spawn(image='snapshot-skill-image:v0', goal='boot captured skill')
+
+                assert 'Current global instructions.' in runtime.skills.inspect_skill(
+                    'snapshot-skill',
+                    require_capability=False,
+                )['instructions']
+                prompt_skill = next(
+                    item for item in runtime.skills.prompt_context(booted)
+                    if item['skill_id'] == 'snapshot-skill'
+                )
+                assert 'Original checkpoint instructions.' in prompt_skill['instructions']
+
     def test_duplicate_commit_requires_replace(self) -> None:
         with _runtime() as runtime:
             pid = runtime.process.spawn(image='base-agent:v0', goal='source')

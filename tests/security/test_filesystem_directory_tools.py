@@ -12,8 +12,15 @@ from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
-from agent_libos.models import CapabilityRight, ExternalEffectRollbackStatus, HumanRequestStatus
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.models import (
+    CapabilityRight,
+    EventType,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+    HumanRequestStatus,
+    ResourceBudget,
+)
 from agent_libos.substrate import (
     LocalFilesystemProvider,
     LocalResourceProviderSubstrate,
@@ -54,6 +61,143 @@ class TestFilesystemDirectoryTool:
         assert deleted_dir.ok, deleted_dir.error
         assert not (self.runtime.workspace_root / base / 'created').exists()
 
+    def test_filesystem_post_provider_event_failure_leaves_durable_unknown_effect_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = f'agent_outputs/effect_intent_{uuid4().hex}.txt'
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='durable filesystem effect intent')
+        self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by='test')
+        original_emit = self.runtime.events.emit
+
+        def fail_write_event(event_type: EventType | str, *args: object, **kwargs: object) -> object:
+            if EventType(event_type) == EventType.EXTERNAL_WRITE and kwargs.get('target') == self.runtime.filesystem.resource_for_path(path):
+                raise RuntimeError('injected filesystem result event failure')
+            return original_emit(event_type, *args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.events, 'emit', fail_write_event)
+        with pytest.raises(RuntimeError, match='injected filesystem result event failure'):
+            self.runtime.filesystem.write_text(pid, path, 'provider committed')
+
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'provider committed'
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effects[0].provider_metadata['effect_state'] == 'pending'
+
+    @pytest.mark.parametrize('operation', ['read_text', 'read_bytes', 'read_directory'])
+    def test_one_time_read_covers_missing_path_state_probe(self, operation: str) -> None:
+        path = f'agent_outputs/missing_probe_{uuid4().hex}'
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='one-shot state probe')
+        resource = (
+            self.runtime.filesystem.directory_resource_for_path(path)
+            if operation == 'read_directory'
+            else self.runtime.filesystem.resource_for_path(path)
+        )
+        cap = self.runtime.capability.grant_once(pid, resource, [CapabilityRight.READ], issued_by='test')
+
+        with pytest.raises(NotFound) as first_error:
+            getattr(self.runtime.filesystem, operation)(pid, path)
+        assert 'does not exist' in str(first_error.value)
+
+        persisted = self.runtime.store.get_capability(cap.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        with pytest.raises(CapabilityDenied):
+            getattr(self.runtime.filesystem, operation)(pid, path)
+
+    def test_validate_directory_consumes_one_time_read_and_records_state_effect(self) -> None:
+        path = f'agent_outputs/cwd_state_{uuid4().hex}'
+        (self.runtime.workspace_root / path).mkdir(parents=True)
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='validate cwd state')
+        resource = self.runtime.filesystem.directory_resource_for_path(path)
+        cap = self.runtime.capability.grant_once(pid, resource, [CapabilityRight.READ], issued_by='test')
+
+        assert self.runtime.filesystem.validate_directory(pid, path) == path
+
+        persisted = self.runtime.store.get_capability(cap.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        effect = effects[0]
+        assert effect.provider == 'filesystem'
+        assert effect.operation == 'state'
+        assert effect.target == resource
+        assert effect.effect_state == 'finalized'
+        assert effect.rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        assert effect.rollback_status == ExternalEffectRollbackStatus.NOT_REQUIRED
+        assert effect.information_flow
+        assert self.runtime.process.get(pid).resource_usage.external_read_bytes > 0
+
+    @pytest.mark.parametrize('outcome', ['not_found', 'not_directory'])
+    def test_validate_directory_finalizes_failed_state_observation(self, outcome: str) -> None:
+        path = f'agent_outputs/cwd_state_{outcome}_{uuid4().hex}'
+        if outcome == 'not_directory':
+            self._write_fixture(path, 'not a directory')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='validate invalid cwd state')
+        resource = self.runtime.filesystem.directory_resource_for_path(path)
+        cap = self.runtime.capability.grant_once(pid, resource, [CapabilityRight.READ], issued_by='test')
+
+        with pytest.raises(NotFound, match='working directory'):
+            self.runtime.filesystem.validate_directory(pid, path)
+
+        persisted = self.runtime.store.get_capability(cap.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.NOT_REQUIRED
+        assert effects[0].provider_metadata['result']['outcome'] == outcome
+
+    def test_validate_directory_not_started_restores_one_time_read_and_abandons_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = f'agent_outputs/cwd_state_not_started_{uuid4().hex}'
+        (self.runtime.workspace_root / path).mkdir(parents=True)
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='validate cwd provider failure')
+        resource = self.runtime.filesystem.directory_resource_for_path(path)
+        cap = self.runtime.capability.grant_once(pid, resource, [CapabilityRight.READ], issued_by='test')
+
+        def fail_before_state(_target: ResolvedPath) -> object:
+            raise ProviderEffectNotStarted('state provider did not start')
+
+        monkeypatch.setattr(self.runtime.filesystem.provider, 'state', fail_before_state)
+        with pytest.raises(ProviderEffectNotStarted, match='did not start'):
+            self.runtime.filesystem.validate_directory(pid, path)
+
+        persisted = self.runtime.store.get_capability(cap.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 1
+        assert self.runtime.store.list_external_effects(pid=pid) == []
+        assert self.runtime.process.get(pid).resource_usage.external_read_bytes == 0
+
+    def test_invalid_text_decode_finalizes_observed_read_and_consumes_one_time_authority(self) -> None:
+        path = f'agent_outputs/invalid_utf8_{uuid4().hex}.bin'
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'\xff')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='invalid text decoding')
+        cap = self.runtime.capability.grant_once(
+            pid,
+            self.runtime.filesystem.resource_for_path(path),
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+
+        with pytest.raises(UnicodeDecodeError):
+            self.runtime.filesystem.read_text(pid, path, encoding='utf-8')
+
+        assert self.runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].information_flow is True
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+
     def test_delete_requires_delete_capability_not_write_capability(self) -> None:
         path = self._write_fixture(f'agent_outputs/delete_denied_{uuid4().hex}.txt', 'keep')
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='delete denied')
@@ -80,6 +224,21 @@ class TestFilesystemDirectoryTool:
         with pytest.raises(CapabilityDenied):
             self.runtime.filesystem.read_text(pid, trailing_space)
 
+    def test_local_filesystem_resolve_is_lexical_and_enforces_containment(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace).resolve()
+            provider = LocalFilesystemProvider(root)
+            nested = root / 'nested'
+            nested.mkdir()
+
+            assert provider.resolve('nested/../target').relative == 'target'
+            assert provider.resolve(nested / '..' / 'target').relative == 'target'
+            assert provider.resolve('.').is_root
+            with pytest.raises(CapabilityDenied, match='escapes filesystem adapter root'):
+                provider.resolve('../outside')
+            with pytest.raises(CapabilityDenied, match='escapes filesystem adapter root'):
+                provider.resolve(Path(outside) / 'target')
+
     def test_delete_ask_each_time_uses_filesystem_primitive_context(self) -> None:
         path = self._write_fixture(f'agent_outputs/delete_prompt_{uuid4().hex}.txt', 'delete me')
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='delete with prompt')
@@ -93,7 +252,8 @@ class TestFilesystemDirectoryTool:
         assert request.payload['context']['primitive'] == 'runtime.filesystem.delete_file'
         assert request.payload['context']['operation'] == 'delete_file'
         assert request.payload['context']['right'] == 'delete'
-        assert 'target' in request.payload['context']
+        assert 'target' not in request.payload['context']
+        assert request.payload['context']['target_state_observation'] == 'deferred_until_authorized'
         assert processed[0].status == HumanRequestStatus.APPROVED
         assert retried.ok, retried.error
         assert not (self.runtime.workspace_root / path).exists()
@@ -106,6 +266,30 @@ class TestFilesystemDirectoryTool:
         assert result.truncated
         assert result.bytes_read == 1
         assert result.content == ''
+
+    def test_read_detects_growth_after_state_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            path = root / 'growing.txt'
+            path.write_text('a', encoding='utf-8')
+            provider = GrowingReadProvider(root, replacement=b'abcdefghij')
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='read growing file',
+                    resource_budget=ResourceBudget(max_external_read_bytes=4),
+                )
+                runtime.filesystem.grant_path(pid, 'growing.txt', [CapabilityRight.READ], issued_by='test')
+
+                result = runtime.filesystem.read_bytes(pid, 'growing.txt', max_bytes=4)
+
+                assert result.content == b'abcd'
+                assert result.bytes_read == 4
+                assert result.truncated
+                assert runtime.process.get(pid).resource_usage.external_read_bytes == 4
+            finally:
+                runtime.close()
 
     def test_one_time_read_capabilities_are_consumed_after_provider_read(self) -> None:
         base = f'agent_outputs/read_once_{uuid4().hex}'
@@ -397,6 +581,11 @@ class TestFilesystemDirectoryTool:
                 with pytest.raises(ProviderEffectNotStarted, match='simulated write failure'):
                     runtime.filesystem.write_text(pid, 'out.txt', 'content')
                 assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 1
+                write_effect = runtime.store.list_external_effects(pid=pid)[0]
+                assert write_effect.effect_state == 'finalized'
+                assert write_effect.state_mutation is False
+                assert write_effect.information_flow is True
+                assert write_effect.rollback_status == ExternalEffectRollbackStatus.NOT_REQUIRED
 
                 (root / 'delete.txt').write_text('delete me', encoding='utf-8')
                 delete_cap = runtime.capability.grant_once(
@@ -409,6 +598,11 @@ class TestFilesystemDirectoryTool:
                     runtime.filesystem.delete_file(pid, 'delete.txt')
                 assert runtime.store.get_capability(delete_cap.cap_id).uses_remaining == 1
                 assert (root / 'delete.txt').exists()
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 2
+                assert all(effect.effect_state == 'finalized' for effect in effects)
+                assert all(effect.state_mutation is False for effect in effects)
+                assert all(effect.information_flow is True for effect in effects)
             finally:
                 runtime.close()
 
@@ -582,6 +776,16 @@ class FailingMutationProvider(LocalFilesystemProvider):
 
     def delete_file(self, path: ResolvedPath) -> None:
         raise ProviderEffectNotStarted('simulated delete failure')
+
+
+class GrowingReadProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path, *, replacement: bytes):
+        super().__init__(root)
+        self.replacement = replacement
+
+    def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
+        Path(path.display).write_bytes(self.replacement)
+        return super().read_bytes(path, max_bytes=max_bytes)
 
 
 class CommitThenThrowMutationProvider(LocalFilesystemProvider):

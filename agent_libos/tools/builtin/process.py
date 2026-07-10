@@ -311,7 +311,7 @@ class SetWorkingDirectoryTool(SyncAgentTool[SetWorkingDirectoryArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"process.cwd"},
+        declared_permissions={"filesystem.read", "process.cwd"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["process", "working_directory"]
@@ -383,7 +383,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"capability.write", "object.read", "object.write", "process.spawn"},
+        declared_permissions={"capability.write", "filesystem.read", "object.read", "object.write", "process.spawn"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["process", "child", "fork"]
@@ -409,11 +409,6 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             include_parent_roots=args.include_parent_roots,
         )
         inherit_specs = self._inheritance_specs(runtime, args, cwd=parent.working_directory)
-        child_cwd = (
-            runtime.resolve_process_working_directory(ctx.pid, args.working_directory)
-            if args.working_directory is not None
-            else parent.working_directory
-        )
         try:
             child_pid = runtime.fork_child_process(
                 parent=ctx.pid,
@@ -423,7 +418,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
                 resource_budget=_resource_budget_from_spec(args.resource_budget),
                 image=image,
                 mode=fork_mode,
-                working_directory=child_cwd,
+                working_directory=args.working_directory,
             )
         except NotFound as exc:
             raise ToolExecutionError(
@@ -498,7 +493,7 @@ class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"capability.write", "object.write", "process.spawn"},
+        declared_permissions={"capability.write", "filesystem.read", "object.write", "process.spawn"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["process", "child", "spawn"]

@@ -5,6 +5,7 @@ image:
   prompt: "prompt.md"
   default_tools:
     - "read_text_file"
+    - "process_exit"
   required_capabilities:
     - resource: "filesystem:workspace:secrets/token.txt"
       rights:

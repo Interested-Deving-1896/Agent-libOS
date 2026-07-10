@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: jsonrpc_visibility_no_method_authority_001
 title: JSON-RPC endpoint visibility does not grant method authority
 goal: Inspect a registered endpoint, then attempt to call a method without method capability.

@@ -119,6 +119,8 @@ if os.name == "nt":
     _kernel32.SetInformationJobObject.restype = ctypes.c_int
     _kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     _kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    _kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
     _kernel32.CreateFileW.argtypes = [
         ctypes.c_wchar_p,
         ctypes.c_uint32,
@@ -136,6 +138,8 @@ if os.name == "nt":
 
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _PROCESS_TERMINATE = 0x0001
+    _PROCESS_SET_QUOTA = 0x0100
     _GENERIC_READ = 0x80000000
     _FILE_SHARE_READ = 0x00000001
     _FILE_SHARE_WRITE = 0x00000002
@@ -146,13 +150,13 @@ if os.name == "nt":
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
-class _WindowsJobObject:
+class WindowsJobObject:
     def __init__(self, handle: int):
         self.handle = handle
         self._closed = False
 
     @classmethod
-    def create(cls) -> "_WindowsJobObject":
+    def create(cls) -> "WindowsJobObject":
         if os.name != "nt":
             raise OSError("Windows job objects are only available on Windows")
         handle = _kernel32.CreateJobObjectW(None, None)
@@ -177,6 +181,29 @@ class _WindowsJobObject:
             raise OSError("subprocess handle is unavailable for job assignment")
         if not _kernel32.AssignProcessToJobObject(self.handle, int(process_handle)):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def assign_pid(self, pid: int) -> None:
+        """Attach an asynchronously launched process by pid.
+
+        asyncio does not expose the ``subprocess.Popen`` handle portably.  A
+        short-lived OpenProcess handle is sufficient for job assignment and is
+        closed immediately after the process joins the job.
+        """
+
+        if os.name != "nt":
+            raise OSError("Windows job objects are only available on Windows")
+        process_handle = _kernel32.OpenProcess(
+            _PROCESS_TERMINATE | _PROCESS_SET_QUOTA,
+            False,
+            int(pid),
+        )
+        if not process_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not _kernel32.AssignProcessToJobObject(self.handle, process_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            _kernel32.CloseHandle(process_handle)
 
     def close(self) -> None:
         if self._closed:
@@ -227,10 +254,19 @@ class LocalFilesystemProvider:
 
     def resolve(self, path: Any) -> ResolvedPath:
         raw = Path(path)
-        target = raw.resolve() if raw.is_absolute() else (self.root / raw).resolve()
-        if self.root not in target.parents and target != self.root:
+        candidate = raw if raw.is_absolute() else self.root / raw
+        # Resource derivation runs before capability authorization.  Keep this
+        # step purely lexical: Path.resolve() would touch the host filesystem,
+        # follow symlinks, and expose their canonical target before the caller
+        # has any read authority.  Provider sinks call _target() after
+        # authorization; that method performs real-path containment and rejects
+        # symlink/junction components on the original lexical path.
+        target = Path(os.path.abspath(os.path.normpath(os.fspath(candidate))))
+        try:
+            relative_path = target.relative_to(self.root)
+        except ValueError as exc:
             raise CapabilityDenied(f"path escapes filesystem adapter root: {path}")
-        relative = target.relative_to(self.root).as_posix()
+        relative = relative_path.as_posix()
         return ResolvedPath(relative=relative, display=str(target), is_root=target == self.root)
 
     def state(self, path: ResolvedPath) -> PathState:
@@ -883,13 +919,29 @@ class LocalShellProvider:
                         proc.wait(timeout=1.0)
                     raise ValidationError("shell provider could not attach Windows Job Object for budgeted execution") from exc
                 job = None
+            require_complete_metrics = bool(
+                limits is not None
+                and (limits.cpu_seconds is not None or limits.memory_bytes is not None)
+            )
+            ps_proc: psutil.Process | None = None
             try:
                 ps_proc = psutil.Process(proc.pid)
+            except (psutil.Error, OSError) as exc:
+                if require_complete_metrics:
+                    self._kill_process_tree(None, proc)
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=1.0)
+                    if job is not None:
+                        job.close()
+                    raise ValidationError(
+                        "shell provider cannot enforce CPU/memory SubprocessLimits because process metrics are unavailable"
+                    ) from exc
             except Exception:
                 if job is not None:
                     job.close()
+                self._kill_process_tree(None, proc)
                 with contextlib.suppress(Exception):
-                    proc.kill()
+                    proc.wait(timeout=1.0)
                 raise
             peak_memory = 0
             cpu_seconds = 0.0
@@ -898,7 +950,12 @@ class LocalShellProvider:
             try:
                 while True:
                     wall_seconds = time.monotonic() - started_at
-                    cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+                    if ps_proc is not None:
+                        cpu_seconds, peak_memory = self._sample_process_tree(
+                            ps_proc,
+                            peak_memory,
+                            require_complete=require_complete_metrics,
+                        )
                     limit_kind = self._limit_kind(
                         wall_seconds=wall_seconds,
                         cpu_seconds=cpu_seconds,
@@ -938,8 +995,13 @@ class LocalShellProvider:
             stdout, stdout_truncated = self._read_limited_output(stdout_file, stdout_limit)
             stderr, stderr_truncated = self._read_limited_output(stderr_file, stderr_limit)
             wall_seconds = time.monotonic() - started_at
-            final_cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
-            cpu_seconds = max(cpu_seconds, final_cpu_seconds)
+            if ps_proc is not None:
+                final_cpu_seconds, peak_memory = self._sample_process_tree(
+                    ps_proc,
+                    peak_memory,
+                    require_complete=require_complete_metrics,
+                )
+                cpu_seconds = max(cpu_seconds, final_cpu_seconds)
             metrics = CommandMetrics(
                 wall_seconds=wall_seconds,
                 cpu_seconds=cpu_seconds,
@@ -1070,21 +1132,37 @@ class LocalShellProvider:
             return "subprocess_memory_bytes"
         return None
 
-    def _sample_process_tree(self, proc: psutil.Process, peak_memory: int) -> tuple[float, int]:
+    def _sample_process_tree(
+        self,
+        proc: psutil.Process,
+        peak_memory: int,
+        *,
+        require_complete: bool,
+    ) -> tuple[float, int]:
         cpu_seconds = 0.0
         memory_bytes = 0
         processes = [proc]
-        try:
-            processes.extend(proc.children(recursive=True))
-        except psutil.Error:
-            pass
+        if require_complete:
+            try:
+                processes.extend(proc.children(recursive=True))
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                pass
+            except (psutil.Error, OSError) as exc:
+                raise ValidationError(
+                    "shell provider cannot enforce CPU/memory SubprocessLimits because complete process metrics are unavailable"
+                ) from exc
         for item in processes:
             try:
                 times = item.cpu_times()
                 cpu_seconds += float(times.user) + float(times.system)
                 memory_bytes += int(item.memory_info().rss)
-            except psutil.Error:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
+            except (psutil.Error, OSError) as exc:
+                if require_complete:
+                    raise ValidationError(
+                        "shell provider cannot enforce CPU/memory SubprocessLimits because complete process metrics are unavailable"
+                    ) from exc
         return cpu_seconds, max(peak_memory, memory_bytes)
 
     def _process_group_kwargs(self) -> dict[str, Any]:
@@ -1092,42 +1170,46 @@ class LocalShellProvider:
             return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         return {"start_new_session": True}
 
-    def _windows_job_for_run(self, limits: SubprocessLimits | None) -> _WindowsJobObject | None:
+    def _windows_job_for_run(self, limits: SubprocessLimits | None) -> WindowsJobObject | None:
         if os.name != "nt":
             return None
         try:
-            return _WindowsJobObject.create()
+            return WindowsJobObject.create()
         except OSError as exc:
             if limits is not None:
                 raise ValidationError("shell provider could not create Windows Job Object for budgeted execution") from exc
             return None
 
-    def _kill_process_tree(self, ps_proc: psutil.Process, proc: subprocess.Popen[str]) -> None:
+    def _kill_process_tree(self, ps_proc: psutil.Process | None, proc: subprocess.Popen[str]) -> None:
         # The direct child may exit after spawning background work, at which
         # point psutil no longer sees those processes as descendants. A process
         # group gives the provider one cleanup handle for the whole shell run.
         self._terminate_process_group(proc)
         processes: list[psutil.Process] = []
-        try:
-            processes.extend(ps_proc.children(recursive=True))
+        if ps_proc is not None:
+            try:
+                processes.extend(ps_proc.children(recursive=True))
+            except (psutil.Error, OSError):
+                pass
             processes.append(ps_proc)
-        except psutil.Error:
-            pass
         for item in processes:
             try:
                 item.terminate()
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 continue
-        alive = psutil.wait_procs(processes, timeout=1.0)[1] if processes else []
+        try:
+            alive = psutil.wait_procs(processes, timeout=1.0)[1] if processes else []
+        except (psutil.Error, OSError):
+            alive = processes
         for item in alive:
             try:
                 item.kill()
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 continue
         if proc.poll() is None:
             try:
                 proc.kill()
-            except ProcessLookupError:
+            except OSError:
                 pass
 
     def _terminate_process_group(self, proc: subprocess.Popen[str]) -> None:
@@ -1135,10 +1217,10 @@ class LocalShellProvider:
             return
         try:
             os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+        except OSError:
             return
         time.sleep(0.05)
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        with contextlib.suppress(OSError):
             os.killpg(proc.pid, signal.SIGKILL)
 
 

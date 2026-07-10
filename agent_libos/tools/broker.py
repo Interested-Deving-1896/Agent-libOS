@@ -288,7 +288,7 @@ class ToolBroker:
             created_at=now,
             updated_at=now,
         )
-        with self.store.transaction(include_object_payloads=True):
+        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
             self.store.insert_tool_candidate(candidate)
             candidate_obj = self.memory.create_object(
                 pid=pid,
@@ -448,7 +448,7 @@ class ToolBroker:
     ) -> bool:
         """Delete an unpublished candidate and its Object Memory descriptor."""
 
-        with self.store.transaction(include_object_payloads=True):
+        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
             candidate = self.store.get_tool_candidate(candidate_id)
             if candidate is not None:
                 self._require_candidate_owner(candidate, pid)
@@ -513,7 +513,45 @@ class ToolBroker:
         *,
         context_metadata: dict[str, Any] | None = None,
     ) -> ToolCallResult:
-        handle = self.resolve(tool, pid=pid)
+        try:
+            handle = self.resolve(tool, pid=pid)
+        except NotFound:
+            # Keep the tool-call API structured without falling back to a
+            # process-local JIT row owned by another process.  Direct resolve
+            # still raises NotFound; a process call receives only its own
+            # table-based denial and no foreign handle metadata.
+            process = self.store.get_process(pid)
+            selected_name = tool.name if isinstance(tool, ToolHandle) else str(tool)
+            if process is None or selected_name in process.tool_table:
+                raise
+            call_id = new_id("tcall")
+            error = f"tool is not in process tool table: {selected_name}"
+            source = f"tool:{selected_name}"
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=source,
+                target=pid,
+                payload={"call_id": call_id, "error": error, "policy_decision": "deny"},
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=source,
+                decision={
+                    "ok": False,
+                    "tool": selected_name,
+                    "policy_decision": "deny",
+                    "policy_reason": "tool_not_in_process_table",
+                },
+            )
+            return ToolCallResult(
+                call_id=call_id,
+                tool_id=selected_name,
+                result_handle=None,
+                payload=None,
+                ok=False,
+                error=error,
+            )
         resource = f"tool:{handle.tool_id}"
         process_status_error = self._process_status_error(pid)
         if process_status_error is not None:
@@ -1318,12 +1356,15 @@ class ToolBroker:
         if isinstance(tool, ToolHandle):
             return tool
         process_tool_id: str | None = None
+        process_tool_ids: set[str] = set()
         if pid is not None:
             process = self.store.get_process(pid)
-            if process is not None and tool in process.tool_table:
-                process_tool_id = process.tool_table[tool]
-                if process_tool_id in self._handles:
-                    return self._handles[process_tool_id]
+            if process is not None:
+                process_tool_ids = {str(value) for value in process.tool_table.values()}
+                if tool in process.tool_table:
+                    process_tool_id = str(process.tool_table[tool])
+                    if process_tool_id in self._handles:
+                        return self._handles[process_tool_id]
         if tool in self._handles:
             handle = self._handles[tool]
             if pid is None and handle.tool_id in self._jit_sources:
@@ -1336,9 +1377,16 @@ class ToolBroker:
             is_direct_id = row_tool_id == tool
             is_process_local_name = process_tool_id is not None and row_tool_id == process_tool_id
             is_name_match = row["name"] == tool
-            if not (is_direct_id or is_name_match):
-                continue
-            if bool(row["ephemeral"]) and pid is None:
+            if bool(row["ephemeral"]):
+                # Ephemeral JIT names and ids are process-local. Falling back
+                # to a global name scan here lets an unrelated process resolve
+                # another process' implementation after its own alias is
+                # removed (and is ambiguous when two processes reuse a name).
+                if pid is None or row_tool_id not in process_tool_ids:
+                    continue
+                if not (is_direct_id or is_process_local_name):
+                    continue
+            elif not (is_direct_id or is_name_match):
                 continue
             if row_tool_id not in self._tools and row_tool_id not in self._jit_sources:
                 raise NotFound(f"tool implementation not loaded: {row_tool_id}")

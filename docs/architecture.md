@@ -75,16 +75,57 @@ The Resource Provider Substrate owns concrete host calls. A provider is a
 backend, not a security bypass. Replacing the filesystem or shell provider must
 not change tool schemas or skip primitive authorization.
 
-Providers are also the source of truth for external-effect rollback
-classification. Effectful provider calls must return an external-effect
-classification to the primitive; missing classification fails closed instead of
-silently executing. The runtime persists those records for checkpoint reports,
-but v1 does not apply external compensation. Filesystem-mutation and clock
-adapters additionally use compensating one-shot reservations. Their providers
-may raise `ProviderEffectNotStarted` only when they can certify that no
-externally visible effect began. Any other exception after entering those
-provider calls is treated as an ambiguous outcome: one-shot authority stays
-consumed and the runtime records an `unknown` external-effect class/status.
+Providers are also the source of truth for successful external-effect rollback
+classification. Effectful provider calls must expose a classifier to the
+primitive; the runtime persists the result for checkpoint reports, but v1 does
+not apply external compensation. Filesystem mutation, clock, shell, and PTY
+spawn paths use explicit finite-use reservations around the provider boundary.
+A filesystem, clock, shell, human-output/terminal-I/O, PTY, JSON-RPC, or live
+MCP primitive also persists a conservative `unknown` external-effect intent
+immediately before entering that boundary. On a classified success or
+ambiguous failure, the store conditionally updates that same `effect_id` from
+`pending` to `finalized`, matching pid, provider, operation, and target. An
+already finalized, abandoned, or mismatched intent cannot be settled again. If
+capability commit, event/audit, classification, or final persistence fails after
+the provider may have run, the pending `unknown` row remains durable and is
+visible to checkpoint and benchmark consumers instead of creating a false
+absence of evidence.
+
+A provider may raise `ProviderEffectNotStarted` only when it can certify that
+its selected call did not begin. The primitive abandons the pending intent only
+when no earlier provider observation in the composite operation produced
+information flow. In that case it restores an exact reservation when one was
+reserved; filesystem/clock/shell and PTY spawn perform restoration and
+abandonment in one store transaction. If an earlier filesystem `state()` or MCP
+live-tool validation already returned information, the main mutation/call being
+not-started still finalizes an information-flow effect instead of erasing the
+intent.
+
+Human terminal reads and automatic writes persist only request/purpose and
+length/hash observations; raw prompts, answers, and provider exception text do
+not enter effect or audit metadata. JSON-RPC and non-local HTTP MCP persist the
+intent and reserve deduplicated finite authority before DNS. Once DNS observes
+the host, a later transport PENS cannot erase that information flow or restore
+the use. Endpoint/server registry item authority is checked before metadata
+lookup, and registry row, stale-grant, event, and audit mutations are atomic.
+
+Clock sleep/asleep similarly starts its intent before the first `monotonic()`
+measurement. Only a not-started result from that first observation may restore
+and abandon; every later sleep, cancellation, or measurement failure consumes
+the use and finalizes unknown. The successful elapsed-time result is also an
+information flow.
+
+Once the provider boundary is crossed, the reservation is committed. Timeout,
+cancellation, resource-limit, ordinary provider exception, or post-effect
+classifier failure cannot prove non-execution, so authority stays consumed and
+the primitive records or retains a conservative `unknown` effect. This makes a
+failed return value distinct from a proven absence of external effects.
+
+The PTY Runtime Module applies this pending-to-finalized protocol to spawn,
+write, resize, and close. Cleanup after a spawned session fails to publish its
+Object is containment, not evidence that spawn never occurred; classifier
+absence or failure after a PTY operation finalizes an `unknown` fallback, while
+post-provider sink failure leaves the pending row visible.
 
 ## Composition Root
 
@@ -185,6 +226,11 @@ Trusted startup modules may add new syscall names through the runtime syscall
 router, but module syscalls still execute as libOS syscalls under the caller
 pid and must call primitives for protected effects.
 
+Deno is released only after a dedicated supervisor establishes host-lifetime
+process-tree containment: an inherited death pipe plus isolated process group
+on POSIX, or a `KILL_ON_JOB_CLOSE` Job Object on Windows. Sandbox execution
+fails closed if that containment cannot be established.
+
 ## Persistence And Audit
 
 The runtime store keeps durable metadata and append-only records:
@@ -200,7 +246,9 @@ The runtime store keeps durable metadata and append-only records:
 - JSON-RPC endpoint registry rows,
 - MCP server registry rows,
 - checkpoints and checkpoint payload snapshots,
-- provider-decided external effect records,
+- durable LLM pending-action generations, Responses tool outputs, and context
+  generations used to validate opt-in provider chaining,
+- provider-decided finalized external effects and conservative pending intents,
 - events and audit records,
 - LLM call records with provider ids, model/API mode, usage, errors, and
   full prompt, visible tools, output, tool calls, reasoning metadata, raw
@@ -214,11 +262,22 @@ Object payloads are not ordinary durable object rows. They live in runtime
 memory, while SQL object rows store only a runtime-memory marker. Rows whose
 live payload cache cannot be reconstructed are released fail-closed on reopen.
 Persistent stores take an active-runtime lease so two writable Runtime
-instances cannot concurrently open the same database. SQLite uses a lock file,
-PostgreSQL uses a session advisory lock, and a clean close releases the lease
-and permits a later reopen.
+instances cannot concurrently open the same database. File-backed SQLite
+canonicalizes the database path for both the connection and lease. On systems
+with `fcntl` and `O_NOFOLLOW`, its sidecar is opened no-follow, regular-file and
+inode checked, and protected by `flock`; the fallback uses SQLite's
+kernel-managed exclusive database lock. PostgreSQL derives its advisory-lock
+key from the current database and schema. A clean close releases the lease and
+permits a later reopen.
 Checkpoint and image artifact payloads are explicit durable snapshot
 exceptions.
+
+Store transactions nest through savepoints, and repository helpers defer their
+commits to the outer lifecycle transaction. Commit or savepoint-release failure
+is followed by rollback, including restoration of an opted-in Object payload
+cache snapshot. If rollback or savepoint cleanup also fails, the store is
+poisoned and closed; every later operation fails closed. See
+[Runtime Storage](storage.md) for the complete recovery and lease contract.
 
 Audit and events are append-only. Checkpoint restore must not delete them.
 Limited audit views select the latest matching records first and return that

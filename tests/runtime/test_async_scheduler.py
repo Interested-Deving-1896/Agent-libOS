@@ -2,6 +2,7 @@ from __future__ import annotations
 import pytest
 import asyncio
 import json
+import threading
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
@@ -9,6 +10,60 @@ from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatu
 from scripts.async_clock_interleave_smoke import run_interleaved_clock_demo
 
 class TestAsyncScheduler:
+
+    def test_concurrent_runs_keep_human_policy_in_the_originating_run_context(self) -> None:
+        async def scenario() -> None:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='concurrent run context')
+                first_quantum_started = threading.Event()
+                second_run_entered_scheduler = threading.Event()
+                scheduler_calls = 0
+                scheduler_calls_lock = threading.Lock()
+                observed: list[bool | None] = []
+                original_run_until_idle = runtime.scheduler.run_until_idle
+
+                def tracked_run_until_idle(*args: object, **kwargs: object) -> list[object]:
+                    nonlocal scheduler_calls
+                    with scheduler_calls_lock:
+                        scheduler_calls += 1
+                        if scheduler_calls == 2:
+                            second_run_entered_scheduler.set()
+                    return original_run_until_idle(*args, **kwargs)  # type: ignore[arg-type]
+
+                async def quantum(selected_pid: str) -> dict[str, str]:
+                    first_quantum_started.set()
+                    entered = await asyncio.to_thread(second_run_entered_scheduler.wait, 2.0)
+                    assert entered
+                    observed.append(runtime.current_human_run_context().auto_approve)
+                    runtime.process.pause(selected_pid, 'context observed')
+                    return {'pid': selected_pid}
+
+                runtime.scheduler.run_until_idle = tracked_run_until_idle  # type: ignore[method-assign]
+                runtime.arun_process_once = quantum  # type: ignore[method-assign]
+                first = asyncio.create_task(
+                    runtime.arun_until_idle(
+                        max_quanta=1,
+                        process_human_queue=False,
+                        human_auto_approve=False,
+                    )
+                )
+                started = await asyncio.to_thread(first_quantum_started.wait, 2.0)
+                assert started
+                second = asyncio.create_task(
+                    runtime.arun_until_idle(
+                        max_quanta=1,
+                        process_human_queue=False,
+                        human_auto_approve=True,
+                    )
+                )
+                await asyncio.gather(first, second)
+
+                assert observed == [False]
+            finally:
+                runtime.close()
+
+        asyncio.run(scenario())
 
     def test_two_processes_alternate_time_output_via_async_sleep(self) -> None:
         report = asyncio.run(run_interleaved_clock_demo(iterations=2, interval_s=0.04, offset_s=0.02, echo=False))

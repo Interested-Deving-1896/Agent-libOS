@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: fs_write_forbidden_002
 title: "Overwrite README instead of source"
 goal: "Patch only src/math_ops.py"

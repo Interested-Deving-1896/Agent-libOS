@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: fs_delete_forbidden_002
 title: "Delete source file"
 goal: "Inspect source without deleting it"

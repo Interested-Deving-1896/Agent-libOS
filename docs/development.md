@@ -137,12 +137,40 @@ opt-in `previous_response_id` chaining. The runtime keeps `llm.store=False` and
 Responses state chaining disabled by default; enable both only when retaining
 provider-side response state is acceptable. These OpenAI-specific fields are
 not sent to custom OpenAI-compatible endpoints. In the default stateless mode,
-prior tool messages are sent back as ordinary bounded context text. Only an
-active provider-side Responses chain sends tool outputs with a Responses
-`call_id` as `function_call_output`. If a persisted tool-output record cannot be
-expressed losslessly, Agent libOS omits `previous_response_id` for that request
-and uses the plain-context fallback rather than continuing a corrupted state
+prior tool messages are sent back as ordinary bounded context text and no
+durable provider-chain tool-output row is written.
+
+A provider-side chain is eligible only for the official Responses API with
+`store=true`, `responses_previous_response_id=true`, and
+`persist_full_io=true`. The preceding call must use the same LLM profile and
+response-scope fingerprint (process, image, tool table, loaded Skill snapshot,
+and durable context generation). It must also match a non-secret,
+credential-keyed HMAC over the model, normalized official endpoint, API mode,
+API-key environment name, credential identity, and organization/project tenant.
+The credential is not stored; changing any provider/account identity input
+forces a stateless reset, while an unchanged identity remains comparable after
+restart. The preceding function-call manifest must contain unique non-empty
+`call_id` values, and durable outputs must exist for every call and no extra
+call. Only then does Agent libOS send the outputs as native
+`function_call_output` items and set `previous_response_id`. This includes
+sequentially executed parallel-tool batches and a wait result completed after a
+runtime reopen. Missing/redacted/conflicting/partial output, changed scope or
+provider identity, context compaction/restore, legacy ambiguous rows, or any
+unrepresentable tool message resets unconditionally to a stateless
+request/plain-context fallback; the runtime never continues a guessed provider
 chain.
+
+Blocking LLM-selected human, child, and message actions are durable. Each wait
+generation has a unique `resume_token`; resume atomically claims
+`pending -> resuming` by `(pid, token)`, and completion CASes that same
+generation to `completed`. A resume that blocks again publishes a new pending
+generation, so a stale worker cannot claim or complete it (ABA protection).
+Only one executor can cross the resumed primitive boundary. If the runtime
+reopens with a row already in `resuming`, or dispatch/output persistence/final
+completion raises after a claim, it immediately marks the process failed,
+retains the non-replayable state, and audits
+`llm.pending_action_resume_interrupted` instead of automatically replaying a
+tool whose external effect may already have happened.
 
 Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
 provider return multiple tool calls in one action-selection response. Agent
@@ -278,6 +306,19 @@ Current default groups include:
 - trusted startup Runtime Module manifests, hash trust, and registration limits,
 - launcher presets,
 - script defaults.
+
+Resource budgets use integer fields for discrete calls, tokens, bytes, and peak
+memory, while `max_runtime_seconds`, `max_subprocess_wall_seconds`, and
+`max_subprocess_cpu_seconds` accept finite non-negative fractional seconds.
+Booleans are not accepted as numbers.
+
+Shell policy labels are protocol semantics, not user-remappable aliases. A
+config may choose `shell.default_policy_level` and replace exact/prefix command
+rules, but it cannot redefine the meanings of `always_deny`,
+`allowlist_auto_else_ask`, `blocklist_ask_else_auto`, or `always_allow`.
+Checkpoint defaults contain snapshot/list/payload/diff limits only; the former
+`auto_high_risk_checkpoint` field was never wired to an operation and has been
+removed. Strict overlays reject these legacy fields instead of ignoring them.
 
 Do not scatter magic numbers in implementation code when a value affects
 runtime behavior, policy, persistence, or test reproducibility. Add a typed

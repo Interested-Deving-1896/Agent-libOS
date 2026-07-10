@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Send } from "lucide-react";
 import { LibOSClient } from "./api/client";
-import type { GuiConnection, HumanRequest, RuntimeSnapshot } from "./api/types";
+import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeSnapshot } from "./api/types";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
 import { ImageSelect } from "./components/ImageSelect";
+import { HumanRequestCard } from "./components/HumanRequestCard";
 import { LLMProfileSelect } from "./components/LLMProfileSelect";
 import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
@@ -160,10 +161,10 @@ export function App() {
     });
   }
 
-  async function respond(request: HumanRequest, approved: boolean, answer = ""): Promise<boolean> {
+  async function respond(request: HumanRequest, response: HumanResponseInput): Promise<boolean> {
     if (!client) return false;
     return safe(async () => {
-      await client.respondHumanRequest(request.request_id, approved, answer, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
+      await client.respondHumanRequest(request.request_id, response, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
     });
   }
 
@@ -334,7 +335,7 @@ export function App() {
           onImportImage={() => void chooseAndConfirmImageImport(false)}
           onCommitImage={confirmCommitImage}
           onSend={(kind) => void send(kind)}
-          onRespond={(request, approved, answer = "") => respond(request, approved, answer)}
+          onRespond={respond}
           onRate={rateProcess}
           onCreateLlmProfile={createLlmProfile}
           onUpdateLlmProfile={updateLlmProfile}
@@ -403,14 +404,7 @@ export function App() {
 
               <div className="humanRequests">
                 {(snapshot?.human_requests ?? []).filter((request) => request.status === "pending").map((request) => (
-                  <div className="humanCard" key={request.request_id}>
-                    <strong>{String(request.payload?.question ?? request.payload?.type ?? t("operator.humanRequestFallback"))}</strong>
-                    <input placeholder={t("operator.answerPlaceholder")} onKeyDown={(event) => {
-                      if (event.key === "Enter") void respond(request, true, event.currentTarget.value);
-                    }} />
-                    <button onClick={() => void respond(request, true)}>{t("operator.approve")}</button>
-                    <button className="danger" onClick={() => void respond(request, false)}>{t("operator.reject")}</button>
-                  </div>
+                  <HumanRequestCard key={request.request_id} request={request} onRespond={respond} />
                 ))}
               </div>
 

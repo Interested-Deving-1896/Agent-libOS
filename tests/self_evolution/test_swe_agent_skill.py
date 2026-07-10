@@ -3,6 +3,7 @@ import pytest
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight
+from agent_libos.tools.sandbox import DenoTypescriptSandbox
 
 class TestSWEAgentSkill:
 
@@ -25,3 +26,31 @@ class TestSWEAgentSkill:
             assert not runtime.capability.check(pid, 'shell:*', CapabilityRight.EXECUTE)
         finally:
             runtime.close()
+
+    @pytest.mark.real_deno
+    def test_swe_edit_refuses_truncated_source_before_write(self) -> None:
+        source = Path('skills/swe-agent/scripts/swe_edit.ts').read_text(encoding='utf-8')
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
+
+        validation = sandbox.run_tests(
+            source,
+            [
+                {
+                    'args': {'path': 'large.txt', 'old_text': 'needle', 'new_text': 'replacement'},
+                    'syscalls': [
+                        {
+                            'name': 'filesystem.read_text',
+                            'args': {'path': 'large.txt', 'max_bytes': 1048576},
+                            'result': {
+                                'path': 'large.txt',
+                                'content': 'needle and a partial file',
+                                'truncated': True,
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+
+        assert not validation.ok
+        assert any('truncated' in error.lower() for error in validation.errors)

@@ -9,7 +9,7 @@ from dataclasses import replace
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.models import CapabilityRight, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType
+from agent_libos.models import CapabilityRight, MemoryView, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType, ViewMode
 
 class TestObjectMemoryName:
 
@@ -926,6 +926,12 @@ class TestObjectMemoryName:
             assert len(tool_listing.payload['objects']) + len(tool_listing.payload['namespaces']) == 2
             with pytest.raises(ValidationError):
                 runtime.memory.list_namespace(pid, limit=3)
+            with pytest.raises(ValidationError):
+                runtime.memory.list_namespace(pid, limit=0)
+            with pytest.raises(ValidationError):
+                runtime.memory.list_namespace(pid, limit=True)
+            with pytest.raises(ValidationError):
+                runtime.memory.list_namespace(pid, limit=1.5)  # type: ignore[arg-type]
             rejected = runtime.tools.call(pid, 'list_memory_namespace', {'limit': 3})
             assert not rejected.ok
         finally:
@@ -951,6 +957,36 @@ class TestObjectMemoryName:
             assert len(tool_listing.payload['objects']) + len(tool_listing.payload['namespaces']) == selected_limit
         finally:
             runtime.close()
+
+    def test_list_namespace_consumes_finite_object_visibility_authority(self) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace owner')
+        viewer = self.runtime.process.spawn(image='base-agent:v0', goal='one-time namespace viewer')
+        handle = self.runtime.memory.create_object(
+            owner,
+            ObjectType.OBSERVATION,
+            {'secret': 'payload is not listed'},
+            name='finite.list.visibility',
+        )
+        namespace = self.runtime.memory.resolve_namespace(owner)
+        self.runtime.capability.grant(
+            viewer,
+            f'object_namespace:{namespace}',
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        once = self.runtime.capability.grant_once(
+            viewer,
+            f'object:{handle.oid}',
+            [ObjectRight.READ],
+            issued_by='test',
+        )
+
+        first = self.runtime.memory.list_namespace(viewer, namespace)
+        second = self.runtime.memory.list_namespace(viewer, namespace)
+
+        assert [obj.oid for obj in first['objects']] == [handle.oid]
+        assert second['objects'] == []
+        assert self.runtime.store.get_capability(once.cap_id).uses_remaining == 0
 
     def test_query_with_read_only_authority_does_not_grant_materialize_or_link(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query materialize')
@@ -1016,6 +1052,493 @@ class TestObjectMemoryName:
                 parent_view,
                 MemoryViewSpec(roots=[read_only], rights={'read', 'materialize'}),
             )
+
+    def test_merge_view_revokes_derived_handle_when_finite_use_consumption_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        parent = self.runtime.process.spawn(image='base-agent:v0', goal='merge parent')
+        child = self.runtime.process.spawn(image='base-agent:v0', goal='merge child')
+        original = self.runtime.memory.create_object(
+            child,
+            ObjectType.EVIDENCE,
+            {'value': 'finite'},
+            name='merge.finite',
+        )
+        self.runtime.capability.revoke(
+            original.capability_id,
+            revoked_by=child,
+            reason='replace with finite-use handle',
+            require_authority=False,
+        )
+        finite = self.runtime.capability.issue_trusted(
+            child,
+            f'object:{original.oid}',
+            [ObjectRight.READ],
+            issued_by='test',
+            uses_remaining=1,
+        )
+        finite_handle = ObjectHandle(
+            oid=original.oid,
+            rights={ObjectRight.READ.value},
+            capability_id=finite.cap_id,
+        )
+        child_view = MemoryView(
+            view_id='view_merge_finite_test',
+            owner_pid=child,
+            roots=[finite_handle],
+            filters=[],
+            rights_policy='attenuate',
+            created_from=None,
+            mode=ViewMode.READ_ONLY,
+        )
+
+        def fail_consume(*_args, **_kwargs):
+            raise RuntimeError('injected finite-use consumption failure')
+
+        monkeypatch.setattr(self.runtime.capability, 'consume_use', fail_consume)
+        with pytest.raises(RuntimeError, match='injected finite-use consumption failure'):
+            self.runtime.memory.merge_view(parent, child_view)
+
+        derived = [
+            cap
+            for cap in self.runtime.capability.list_subject(parent, include_inactive=True)
+            if cap.resource == f'object:{original.oid}'
+        ]
+        assert all(not cap.active for cap in derived)
+
+    def test_release_owner_does_not_delete_object_transferred_after_enumeration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = self.runtime.process.spawn(image='base-agent:v0', goal='release source')
+        destination = self.runtime.process.spawn(image='base-agent:v0', goal='release destination')
+        handle = self.runtime.memory.create_object(
+            source,
+            ObjectType.ARTIFACT,
+            {'value': 'keep'},
+            name='release.transfer.race',
+        )
+        enumerated = threading.Event()
+        transfer_done = threading.Event()
+        original_list = self.runtime.store.list_object_oids_owned_by
+
+        def pause_after_enumeration(owner_kind, owner_id):
+            oids = original_list(owner_kind, owner_id)
+            if owner_kind == ObjectOwnerKind.PROCESS and owner_id == source:
+                enumerated.set()
+                assert transfer_done.wait(timeout=2)
+            return oids
+
+        monkeypatch.setattr(self.runtime.store, 'list_object_oids_owned_by', pause_after_enumeration)
+        released: list[list[str]] = []
+        errors: list[BaseException] = []
+
+        def release() -> None:
+            try:
+                released.append(
+                    self.runtime.memory.release_owner(
+                        ObjectOwnerKind.PROCESS,
+                        source,
+                        preserve_oids={self.runtime.process.get(source).goal_oid},
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        release_thread = threading.Thread(target=release)
+        release_thread.start()
+        assert enumerated.wait(timeout=2)
+        transferred = self.runtime.memory.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            source,
+            ObjectOwnerKind.PROCESS,
+            destination,
+            [handle.oid],
+        )
+        transfer_done.set()
+        release_thread.join(timeout=3)
+
+        assert not release_thread.is_alive()
+        assert errors == []
+        assert transferred == [handle.oid]
+        assert released == [[]]
+        obj = self.runtime.store.get_object(handle.oid)
+        assert obj is not None
+        assert obj.owner_kind == ObjectOwnerKind.PROCESS
+        assert obj.owner_id == destination
+
+    def test_release_owner_version_condition_rejects_owner_aba(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = self.runtime.process.spawn(image='base-agent:v0', goal='release aba source')
+        temporary = self.runtime.process.spawn(image='base-agent:v0', goal='release aba temporary')
+        handle = self.runtime.memory.create_object(
+            source,
+            ObjectType.ARTIFACT,
+            {'value': 'keep'},
+            name='release.owner.aba',
+        )
+        delete_reached = threading.Event()
+        transfers_done = threading.Event()
+        original_delete = self.runtime.memory.delete_object_trusted
+
+        def pause_before_delete(actor, oid, *, reason, **conditions):
+            if oid == handle.oid:
+                delete_reached.set()
+                assert transfers_done.wait(timeout=2)
+            return original_delete(actor, oid, reason=reason, **conditions)
+
+        monkeypatch.setattr(self.runtime.memory, 'delete_object_trusted', pause_before_delete)
+        errors: list[BaseException] = []
+
+        def release() -> None:
+            try:
+                self.runtime.memory.release_owner(
+                    ObjectOwnerKind.PROCESS,
+                    source,
+                    preserve_oids={self.runtime.process.get(source).goal_oid},
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        release_thread = threading.Thread(target=release)
+        release_thread.start()
+        assert delete_reached.wait(timeout=2)
+        assert self.runtime.memory.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            source,
+            ObjectOwnerKind.PROCESS,
+            temporary,
+            [handle.oid],
+        ) == [handle.oid]
+        assert self.runtime.memory.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            temporary,
+            ObjectOwnerKind.PROCESS,
+            source,
+            [handle.oid],
+        ) == [handle.oid]
+        transfers_done.set()
+        release_thread.join(timeout=3)
+
+        assert not release_thread.is_alive()
+        assert errors == []
+        obj = self.runtime.store.get_object(handle.oid)
+        assert obj is not None
+        assert obj.owner_kind == ObjectOwnerKind.PROCESS
+        assert obj.owner_id == source
+
+    def test_delete_object_trusted_waits_for_ownership_transition_lock(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='delete ownership lock')
+        handle = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'value': 'delete'},
+            name='delete.ownership.lock',
+        )
+        started = threading.Event()
+        finished = threading.Event()
+        deleted: list[bool] = []
+
+        def delete() -> None:
+            started.set()
+            deleted.append(
+                self.runtime.memory.delete_object_trusted(
+                    'test',
+                    handle.oid,
+                    reason='ownership lock regression',
+                )
+            )
+            finished.set()
+
+        with self.runtime.memory.ownership_locked():
+            worker = threading.Thread(target=delete)
+            worker.start()
+            assert started.wait(timeout=2)
+            assert not finished.wait(timeout=0.2)
+
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert deleted == [True]
+        assert self.runtime.store.get_object(handle.oid) is None
+
+    def test_update_object_waits_for_ownership_transition_lock(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='update ownership lock')
+        handle = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'value': 'before'},
+            name='update.ownership.lock',
+            immutable=False,
+        )
+        started = threading.Event()
+        finished = threading.Event()
+
+        def update() -> None:
+            started.set()
+            self.runtime.memory.update_object(
+                pid,
+                handle,
+                ObjectPatch(payload={'value': 'after'}),
+            )
+            finished.set()
+
+        with self.runtime.memory.ownership_locked():
+            worker = threading.Thread(target=update)
+            worker.start()
+            assert started.wait(timeout=2)
+            assert not finished.wait(timeout=0.2)
+
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert self.runtime.store.get_object(handle.oid).payload == {'value': 'after'}
+
+    def test_transfer_owner_does_not_report_success_when_conditional_update_loses(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = self.runtime.process.spawn(image='base-agent:v0', goal='transfer source')
+        destination = self.runtime.process.spawn(image='base-agent:v0', goal='transfer destination')
+        handle = self.runtime.memory.create_object(
+            source,
+            ObjectType.ARTIFACT,
+            {'value': 'keep'},
+            name='transfer.conditional.update',
+        )
+
+        monkeypatch.setattr(self.runtime.store, 'update_object', lambda *_args, **_kwargs: False)
+
+        assert self.runtime.memory.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            source,
+            ObjectOwnerKind.PROCESS,
+            destination,
+            [handle.oid],
+        ) == []
+        obj = self.runtime.store.get_object(handle.oid)
+        assert obj is not None
+        assert obj.owner_id == source
+
+    def test_stale_store_update_cannot_resurrect_released_object(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='stale update')
+        handle = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'value': 'released'},
+            name='stale.update.release',
+            immutable=False,
+        )
+        stale = self.runtime.store.get_object(handle.oid)
+        assert stale is not None
+        assert self.runtime.memory.delete_object_trusted(
+            'test',
+            handle.oid,
+            reason='stale update regression',
+        )
+
+        assert not self.runtime.store.update_object(
+            replace(stale, payload={'value': 'resurrected'}, version=stale.version + 1)
+        )
+        assert self.runtime.store.get_object(handle.oid) is None
+        with pytest.raises(KeyError):
+            self.runtime.store.object_payload(handle.oid)
+
+    def test_transfer_owner_rolls_back_when_audit_write_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = self.runtime.process.spawn(image='base-agent:v0', goal='transfer rollback source')
+        destination = self.runtime.process.spawn(image='base-agent:v0', goal='transfer rollback destination')
+        handle = self.runtime.memory.create_object(
+            source,
+            ObjectType.ARTIFACT,
+            {'value': 'keep'},
+            name='transfer.audit.rollback',
+        )
+        before = self.runtime.store.get_object(handle.oid)
+        original_record = self.runtime.audit.record
+
+        def fail_transfer_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.transfer_owner':
+                raise RuntimeError('injected transfer audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_transfer_audit)
+
+        with pytest.raises(RuntimeError, match='injected transfer audit failure'):
+            self.runtime.memory.transfer_owner(
+                ObjectOwnerKind.PROCESS,
+                source,
+                ObjectOwnerKind.PROCESS,
+                destination,
+                [handle.oid],
+            )
+
+        after = self.runtime.store.get_object(handle.oid)
+        assert after is not None
+        assert after.owner_id == source
+        assert after.version == before.version
+
+    def test_create_object_rolls_back_payload_handle_and_event_when_audit_write_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='create object audit rollback')
+        namespace = self.runtime.memory.resolve_namespace(pid)
+        before_cap_ids = {cap.cap_id for cap in self.runtime.store.list_capabilities(subject=pid)}
+        before_events = list(self.runtime.events.list())
+        original_record = self.runtime.audit.record
+
+        def fail_create_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.create_object':
+                raise RuntimeError('injected create object audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_create_audit)
+
+        with pytest.raises(RuntimeError, match='injected create object audit failure'):
+            self.runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {'value': 'rollback'},
+                name='create.audit.rollback',
+            )
+
+        assert self.runtime.store.get_object_by_name('create.audit.rollback', namespace) is None
+        assert {cap.cap_id for cap in self.runtime.store.list_capabilities(subject=pid)} == before_cap_ids
+        assert self.runtime.events.list() == before_events
+
+    def test_create_namespace_rolls_back_namespace_and_grant_when_audit_write_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='create namespace audit rollback')
+        original_record = self.runtime.audit.record
+
+        def fail_namespace_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.create_namespace':
+                raise RuntimeError('injected create namespace audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_namespace_audit)
+
+        with pytest.raises(RuntimeError, match='injected create namespace audit failure'):
+            self.runtime.memory.create_namespace(pid, 'audit.rollback.namespace')
+
+        assert not self.runtime.store.namespace_exists('audit.rollback.namespace')
+        assert not any(
+            cap.resource == 'object_namespace:audit.rollback.namespace'
+            for cap in self.runtime.store.list_capabilities(subject=pid)
+        )
+
+    def test_update_object_rolls_back_payload_and_one_time_handle_when_audit_write_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='update object audit rollback')
+        permanent = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'value': 'before'},
+            name='update.audit.rollback',
+            immutable=False,
+        )
+        once = self.runtime.capability.handle_for_object(
+            pid,
+            permanent.oid,
+            [ObjectRight.READ, ObjectRight.WRITE],
+            issued_by='test',
+            uses_remaining=1,
+        )
+        before = self.runtime.store.get_object(permanent.oid)
+        original_record = self.runtime.audit.record
+
+        def fail_update_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.update_object':
+                raise RuntimeError('injected update object audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_update_audit)
+
+        with pytest.raises(RuntimeError, match='injected update object audit failure'):
+            self.runtime.memory.update_object(pid, once, ObjectPatch(payload={'value': 'after'}))
+
+        after = self.runtime.store.get_object(permanent.oid)
+        assert after is not None and before is not None
+        assert after.payload == before.payload
+        assert after.version == before.version
+        assert self.runtime.store.get_capability(once.capability_id).uses_remaining == 1
+
+    def test_link_objects_rolls_back_link_and_one_time_handles_when_audit_write_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='link audit rollback')
+        src = self.runtime.memory.create_object(pid, ObjectType.ARTIFACT, {'src': True}, name='link.src')
+        dst = self.runtime.memory.create_object(pid, ObjectType.ARTIFACT, {'dst': True}, name='link.dst')
+        src_once = self.runtime.capability.handle_for_object(
+            pid,
+            src.oid,
+            [ObjectRight.LINK],
+            issued_by='test',
+            uses_remaining=1,
+        )
+        dst_once = self.runtime.capability.handle_for_object(
+            pid,
+            dst.oid,
+            [ObjectRight.READ],
+            issued_by='test',
+            uses_remaining=1,
+        )
+        original_record = self.runtime.audit.record
+
+        def fail_link_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.link_objects':
+                raise RuntimeError('injected link audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_link_audit)
+
+        with pytest.raises(RuntimeError, match='injected link audit failure'):
+            self.runtime.memory.link_objects(pid, src_once, 'references', dst_once)
+
+        assert self.runtime.store.list_links(src=src.oid) == []
+        assert self.runtime.store.get_capability(src_once.capability_id).uses_remaining == 1
+        assert self.runtime.store.get_capability(dst_once.capability_id).uses_remaining == 1
+
+    def test_delete_object_trusted_rolls_back_when_audit_write_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='delete rollback')
+        handle = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'value': 'keep'},
+            name='delete.audit.rollback',
+        )
+        original_record = self.runtime.audit.record
+
+        def fail_delete_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.delete_object':
+                raise RuntimeError('injected delete audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_delete_audit)
+
+        with pytest.raises(RuntimeError, match='injected delete audit failure'):
+            self.runtime.memory.delete_object_trusted(
+                'test',
+                handle.oid,
+                reason='audit rollback regression',
+            )
+
+        assert self.runtime.store.get_object(handle.oid) is not None
+        capability = self.runtime.store.get_capability(handle.capability_id)
+        assert capability is not None
+        assert capability.active
 
     def test_object_handle_capability_cannot_be_retargeted_to_another_oid(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='retarget handle')

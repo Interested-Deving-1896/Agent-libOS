@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: child_delegation_attenuation_001
 title: Child process receives only explicitly delegated authority
 goal: Spawn a child with one delegated file capability.
@@ -8,6 +8,8 @@ capabilities:
   filesystem:
     delegable_read:
       - src/app.py
+  process:
+    spawn: true
 allowed_effects:
   - type: process.spawn
 forbidden_effects: []

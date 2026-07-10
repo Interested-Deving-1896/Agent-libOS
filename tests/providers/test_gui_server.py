@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any
 from agent_libos.api.gui.server import (
     GuiEventBroadcaster,
+    GuiRuntimeService,
+    GuiServerError,
     _BoundedSeenKeys,
     _sse_payload_data,
     create_gui_http_server,
 )
+from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
 from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessSignal, ProcessStatus
 from agent_libos.runtime.runtime import Runtime
@@ -749,10 +752,14 @@ class TestGuiServer:
         self.server.service.scheduler.running = False
 
     def test_scheduler_background_releases_runtime_lock_between_quanta(self) -> None:
-        calls: list[int | None] = []
+        calls: list[tuple[int | None, bool]] = []
 
-        def fake_run_until_idle(*, max_quanta: int | None = None) -> list[dict[str, int]]:
-            calls.append(max_quanta)
+        def fake_run_until_idle(
+            *,
+            max_quanta: int | None = None,
+            process_human_queue: bool = True,
+        ) -> list[dict[str, int]]:
+            calls.append((max_quanta, process_human_queue))
             return [{'call': len(calls)}] if len(calls) == 1 else []
 
         self.server.service.runtime.run_until_idle = fake_run_until_idle
@@ -763,7 +770,7 @@ class TestGuiServer:
         assert thread is not None
         thread.join(timeout=2)
 
-        assert calls == [1, 1]
+        assert calls == [(1, False), (1, False)]
         assert self.server.service.scheduler.status()['last_result'] == [{'call': 1}]
 
     def test_health_uses_fast_path_when_runtime_lock_is_busy(self) -> None:
@@ -776,6 +783,66 @@ class TestGuiServer:
         assert status == 200
         assert health['runtime_busy'] is True
         assert health['process_count'] is None
+
+    def test_gui_shutdown_waits_for_runtime_users_and_can_retry_after_timeout(self) -> None:
+        runtime = Runtime.open('local')
+        service = GuiRuntimeService(runtime=runtime, auto_run=False, token='lifecycle-test')
+        entered = threading.Event()
+        release = threading.Event()
+        worker_done = threading.Event()
+
+        def runtime_user() -> None:
+            with service.runtime_user():
+                entered.set()
+                release.wait(timeout=2.0)
+            worker_done.set()
+
+        worker = threading.Thread(target=runtime_user)
+        worker.start()
+        assert entered.wait(timeout=2.0)
+        try:
+            assert service.shutdown(timeout_s=0.01) is False
+            assert not service._closed
+            release.set()
+            assert worker_done.wait(timeout=2.0)
+            assert service.shutdown(timeout_s=1.0) is True
+            assert service._closed
+            assert runtime.process.list() == []
+        finally:
+            release.set()
+            worker.join(timeout=2.0)
+            service.shutdown(timeout_s=1.0)
+            runtime.close()
+
+    def test_owned_runtime_partial_shutdown_never_reopens_api(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = GuiRuntimeService(db='local', auto_run=False, token='partial-shutdown')
+        original_shutdown = service.runtime.shutdown
+        calls = 0
+
+        def fail_once(*, actor: str, reason: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {'ok': False, 'object_tasks_stopped': False}
+            return original_shutdown(actor=actor, reason=reason)
+
+        monkeypatch.setattr(service.runtime, 'shutdown', fail_once)
+        try:
+            assert service.shutdown(timeout_s=1.0) is False
+            assert service._closing is True
+            assert service._closed is False
+            with pytest.raises(GuiServerError, match='shutting down'):
+                with service.runtime_user():
+                    pass
+
+            assert service.shutdown(timeout_s=1.0) is True
+            assert service._closed is True
+            assert calls == 2
+        finally:
+            service.shutdown(timeout_s=1.0)
 
     def test_process_run_targets_selected_process(self) -> None:
         _first_status, first = self.request('POST', '/api/processes', {'goal': 'first', 'auto_run': False})
@@ -1330,6 +1397,98 @@ class TestGuiServer:
         assert status_again == 409
         assert 'not pending' in conflict['error']['message']
 
+    def test_permission_response_requires_explicit_valid_policy(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='typed gui permission')
+        resource = runtime.filesystem.resource_for('agent_outputs/typed-gui.txt')
+        request_id = runtime.human.query(
+            pid=pid,
+            human=DEFAULT_CONFIG.runtime.default_human,
+            request={
+                'type': 'permission_request',
+                'question': 'Allow write?',
+                'requested_permission': {
+                    'subject': pid,
+                    'resource': resource,
+                    'rights': ['write'],
+                    'constraints': {},
+                },
+            },
+            blocking=True,
+        )
+
+        missing_status, missing = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'auto_run': False},
+        )
+        invalid_status, invalid = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'decision': {'policy': 'sometimes'}, 'auto_run': False},
+        )
+
+        assert missing_status == 400
+        assert 'policy' in missing['error']['message']
+        assert invalid_status == 400
+        assert 'policy' in invalid['error']['message']
+        assert runtime.human.get(request_id).status.value == 'pending'
+
+        approved_status, approved = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {
+                'approved': True,
+                'decision': {'policy': CapabilityManager.ASK_EACH_TIME},
+                'auto_run': False,
+            },
+        )
+        assert approved_status == 200
+        assert approved['request']['decision']['policy'] == CapabilityManager.ASK_EACH_TIME
+        assert runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ASK_EACH_TIME
+
+    def test_question_response_requires_string_answer_before_commit(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='typed gui question')
+        request_id = runtime.human.query(
+            pid=pid,
+            human=DEFAULT_CONFIG.runtime.default_human,
+            request={'type': 'question', 'question': 'Which region?'},
+            blocking=True,
+        )
+
+        missing_status, missing = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'auto_run': False},
+        )
+        wrong_status, wrong = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 42, 'auto_run': False},
+        )
+        empty_status, empty = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': '   ', 'auto_run': False},
+        )
+
+        assert missing_status == 400
+        assert 'answer' in missing['error']['message']
+        assert wrong_status == 400
+        assert 'answer' in wrong['error']['message']
+        assert empty_status == 400
+        assert 'answer' in empty['error']['message']
+        assert runtime.human.get(request_id).status.value == 'pending'
+
+        accepted_status, accepted = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'eu-west', 'auto_run': False},
+        )
+        assert accepted_status == 200
+        assert accepted['request']['decision']['answer'] == 'eu-west'
+
     def test_human_request_delta_is_emitted_for_each_changed_version(self) -> None:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='gui human delta')
@@ -1347,7 +1506,7 @@ class TestGuiServer:
         assert pending_updates[0].data['status'] == 'pending'
         cursor = pending_events[-1].seq
 
-        runtime.human.approve(request_id, {'approved': True, 'source': 'test'})
+        runtime.human.approve(request_id, {'approved': True, 'answer': 'yes', 'source': 'test'})
         self.server.service.publish_runtime_changes('human.approved')
         approved_events = self.server.service.broadcaster.replay_after(cursor)
         approved_updates = [
@@ -1366,7 +1525,7 @@ class TestGuiServer:
             for event in unchanged
         )
 
-    def test_human_request_respond_without_approved_defaults_to_reject(self) -> None:
+    def test_permission_response_without_approved_uses_explicit_deny_policy(self) -> None:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='gui human default reject')
         request_id = runtime.human.query(
@@ -1387,7 +1546,10 @@ class TestGuiServer:
         status, rejected = self.request(
             'POST',
             f'/api/human-requests/{request_id}/respond',
-            {'auto_run': False},
+            {
+                'decision': {'policy': CapabilityManager.ALWAYS_DENY},
+                'auto_run': False,
+            },
         )
 
         assert status == 200

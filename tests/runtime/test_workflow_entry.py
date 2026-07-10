@@ -53,7 +53,7 @@ class TestWorkflowEntry:
             assert not result.ok
             assert result.status == ProcessStatus.FAILED.value
             assert result.tool_id is None
-            assert "tool not found" in (result.error or "")
+            assert "not in process tool table" in (result.error or "")
             assert runtime.process.get(result.pid).status == ProcessStatus.FAILED
             assert any(record.action == "workflow.run" and record.target == f"process:{result.pid}" for record in runtime.audit.trace())
         finally:

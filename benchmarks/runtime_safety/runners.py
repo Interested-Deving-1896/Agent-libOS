@@ -12,14 +12,29 @@ from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
-from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectRight, ObjectType, ProcessStatus
+from agent_libos.models import (
+    AuditRecord,
+    CapabilityRight,
+    ExternalEffectRecord,
+    ObjectMetadata,
+    ObjectOwnerKind,
+    ObjectRight,
+    ObjectType,
+    ProcessStatus,
+)
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 from agent_libos.models import ValidationResult
 from agent_libos.utils.serde import to_jsonable
 from benchmarks.runtime_safety.fixtures import prepare_workspace, safe_workspace_path
-from benchmarks.runtime_safety.models import BenchmarkResult, BenchmarkTask, EffectRecord, TaskRun
+from benchmarks.runtime_safety.models import (
+    BenchmarkResult,
+    BenchmarkTask,
+    BenchmarkValidationError,
+    EffectRecord,
+    TaskRun,
+)
 from benchmarks.runtime_safety.oracle import classify_effects, safety_summary
 
 RUNNER_NAMES = (
@@ -161,6 +176,7 @@ def _run_wrapper_task(
     workspace = prepare_workspace(task, suite_root, output_dir, runner)
     state: dict[str, Any] = {
         "exited": False,
+        "process_status": "running",
         "errors": [],
         "approvals": 0,
         "memory": _setup_wrapper_memory(task),
@@ -169,6 +185,7 @@ def _run_wrapper_task(
     for action in task.mock_actions:
         if action.get("action") == "process_exit":
             state["exited"] = True
+            state["process_status"] = ProcessStatus.EXITED.value
             continue
         action_effects = _effects_from_action(task, runner, action)
         if not action_effects:
@@ -191,7 +208,9 @@ def _run_wrapper_task(
                 effect.error = str(exc)
                 state["errors"].append(str(exc))
             effects.append(effect)
+    _finalize_wrapper_effects(task, runner, effects)
     classify_effects(task, effects)
+    invalid_reasons = _effect_invalid_reasons(effects)
     safety = safety_summary(task, effects)
     success = _evaluate_success(task, workspace, state)
     wall_time = time.perf_counter() - started
@@ -199,7 +218,7 @@ def _run_wrapper_task(
         task_id=task.id,
         runner=runner,
         attack_class=task.attack_class,
-        ok=success and safety["safety_passed"],
+        ok=not invalid_reasons and success and safety["safety_passed"],
         task_success=success,
         safety_passed=bool(safety["safety_passed"]),
         unknown_effects=int(safety["unknown_effects"]),
@@ -211,6 +230,8 @@ def _run_wrapper_task(
         wall_time_s=wall_time,
         audit_records=0,
         audit_completeness=0.0,
+        valid=not invalid_reasons,
+        invalid_reasons=invalid_reasons,
         errors=list(state["errors"]),
         workspace=str(workspace),
         metadata={
@@ -258,6 +279,10 @@ def _run_agent_libos_task(
         setup_state = _setup_runtime_benchmark_resources(task, runtime, workspace, pid)
         if isinstance(client, PlannedActionClient):
             client.actions = [_dispatch_action(action, setup_state) for action in task.mock_actions]
+        baseline_audit_ids = {record.record_id for record in runtime.audit.trace()}
+        baseline_external_effect_ids = {
+            effect.effect_id for effect in runtime.store.list_external_effects()
+        }
         selected_quanta = max_quanta if max_quanta is not None else max(len(task.mock_actions) + 4, 4)
         results = runtime.run_until_idle(
             max_quanta=selected_quanta,
@@ -266,24 +291,44 @@ def _run_agent_libos_task(
             human_auto_answer=task.policy.get("human_auto_answer"),
         )
         process = runtime.process.get(pid)
-        effects = _effects_from_runtime_results(task, runner, results)
+        audit = runtime.audit.trace()
+        action_audit = [
+            record for record in audit if record.record_id not in baseline_audit_ids
+        ]
+        external_effects = [
+            effect
+            for effect in runtime.store.list_external_effects()
+            if effect.effect_id not in baseline_external_effect_ids
+        ]
+        effects = _effects_from_runtime_results(
+            task,
+            runner,
+            results,
+            external_effects=external_effects,
+            audit_records=action_audit,
+            pid=pid,
+        )
         classify_effects(task, effects)
+        invalid_reasons = _effect_invalid_reasons(effects)
         safety = safety_summary(task, effects)
         llm_calls = runtime.store.list_llm_calls(pid=pid)
         tokens = sum(int(call.usage.get("total_tokens") or 0) for call in llm_calls)
-        audit = runtime.audit.trace()
         primitive_calls = len([record for record in audit if record.action.startswith("primitive.")])
         approvals = len([record for record in audit if record.action in {"human.query", "human.approve", "human.reject"}])
         audit_records = 0 if runner == "no_audit_linkage" else len(audit)
         audit_completeness = _audit_completeness(runner, effects, audit_records)
-        state = {"exited": process.status in _TERMINAL_STATUSES, "errors": errors}
+        state = {
+            "exited": process.status == ProcessStatus.EXITED,
+            "process_status": process.status.value,
+            "errors": errors,
+        }
         success = _evaluate_success(task, workspace, state)
         wall_time = time.perf_counter() - started
         result = BenchmarkResult(
             task_id=task.id,
             runner=runner,
             attack_class=task.attack_class,
-            ok=success and bool(safety["safety_passed"]),
+            ok=not invalid_reasons and success and bool(safety["safety_passed"]),
             task_success=success,
             safety_passed=bool(safety["safety_passed"]),
             unknown_effects=int(safety["unknown_effects"]),
@@ -295,6 +340,8 @@ def _run_agent_libos_task(
             wall_time_s=wall_time,
             audit_records=audit_records,
             audit_completeness=audit_completeness,
+            valid=not invalid_reasons,
+            invalid_reasons=invalid_reasons,
             errors=errors,
             workspace=str(workspace),
             metadata={
@@ -327,6 +374,8 @@ def _run_agent_libos_task(
             wall_time_s=wall_time,
             audit_records=_safe_audit_record_count(runtime),
             audit_completeness=0.0,
+            valid=False,
+            invalid_reasons=[f"runner failure: {type(exc).__name__}: {exc}"],
             errors=errors,
             workspace=str(workspace),
             metadata={
@@ -345,7 +394,11 @@ def _run_agent_libos_task(
                 task_run.result.ok = False
                 task_run.result.task_success = False
                 task_run.result.safety_passed = False
+                task_run.result.valid = False
                 task_run.result.errors.append(f"runtime shutdown failed: {exc}")
+                task_run.result.invalid_reasons.append(
+                    f"runner failure during shutdown: {type(exc).__name__}: {exc}"
+                )
                 if task_run.result.metadata.get("runner_failed"):
                     task_run.result.metadata["shutdown_failure_type"] = type(exc).__name__
                 else:
@@ -358,6 +411,10 @@ def _run_agent_libos_task(
                 if task_run is None:
                     raise
                 task_run.result.errors.append(f"runtime store close failed: {exc}")
+                task_run.result.valid = False
+                task_run.result.invalid_reasons.append(
+                    f"runner failure during store close: {type(exc).__name__}: {exc}"
+                )
                 if task_run.result.metadata.get("runner_failed"):
                     task_run.result.metadata["store_close_failure_type"] = type(exc).__name__
                 else:
@@ -410,6 +467,16 @@ def _setup_runtime_memory(
             payload=item.get("payload"),
             metadata=ObjectMetadata(title=f"benchmark setup object {task.id}", tags=["benchmark", "setup"]),
             immutable=bool(item.get("immutable", True)),
+            owner_kind=(
+                ObjectOwnerKind.PROCESS
+                if item.get("owner") == "target"
+                else ObjectOwnerKind.RUNTIME
+            ),
+            owner_id=(
+                target_pid
+                if item.get("owner") == "target"
+                else f"benchmark:{runner}:{task.id}"
+            ),
         )
         setup_objects.append({"oid": handle.oid, "namespace": namespace, "name": str(item.get("name") or "object")})
         if runner == "no_namespace_isolation" or bool(item.get("grant_to_process", False)):
@@ -472,6 +539,14 @@ def _grant_task_capabilities(
     human = capabilities.get("human") if isinstance(capabilities.get("human"), list) else []
     for right in human:
         runtime.capability.grant(pid, DEFAULT_CONFIG.runtime.default_human_resource, [str(right)], issued_by=f"benchmark:{task.id}")
+    process = capabilities.get("process") if isinstance(capabilities.get("process"), dict) else {}
+    if bool(process.get("spawn")):
+        runtime.capability.grant(
+            pid,
+            "process:spawn",
+            [CapabilityRight.WRITE],
+            issued_by=f"benchmark:{task.id}",
+        )
     skills = capabilities.get("skill") if isinstance(capabilities.get("skill"), dict) else {}
     for right in ("read", "write", "execute", "admin"):
         for skill_id in skills.get(right, []) or []:
@@ -589,8 +664,12 @@ def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dic
 
 def _filesystem_resource(runtime: Runtime, path: str) -> str:
     normalized = path.replace("\\", "/").strip()
+    if normalized.endswith("/*") and normalized.count("*") == 1:
+        return runtime.filesystem.directory_resource_for(normalized[:-2])
     if "*" in normalized:
-        return runtime.filesystem.resource_for(normalized)
+        raise BenchmarkValidationError(
+            f"benchmark filesystem capability wildcard must be a terminal subtree: {path!r}"
+        )
     return runtime.filesystem.resource_for_path(normalized)
 
 
@@ -651,9 +730,34 @@ def _perform_wrapper_action(
         effect.simulated = True
 
 
-def _effects_from_runtime_results(task: BenchmarkTask, runner: str, results: list[Any]) -> list[EffectRecord]:
-    effects: list[EffectRecord] = []
+def _effects_from_runtime_results(
+    task: BenchmarkTask,
+    runner: str,
+    results: list[Any],
+    *,
+    external_effects: list[ExternalEffectRecord] | None = None,
+    audit_records: list[AuditRecord] | None = None,
+    pid: str | None = None,
+) -> list[EffectRecord]:
+    """Normalize attempts using persisted evidence, never ``result.ok`` alone.
+
+    External-effect rows are the authoritative evidence for provider boundaries.
+    Successful in-runtime mutations require a matching append-only audit record.
+    A result without either kind of evidence is retained as an ``unknown``
+    attempt so the run is invalidated rather than scored as performed or safe.
+    """
+
+    persisted = [
+        _effect_from_external_record(task, runner, record)
+        for record in (external_effects or [])
+    ]
+    audit = list(audit_records or [])
+    used_persisted: set[int] = set()
+    used_audit: set[int] = set()
     used_source_indices: set[int] = set()
+    effects: list[EffectRecord] = []
+    generated_index = 0
+
     for item in results:
         if not isinstance(item, dict):
             continue
@@ -661,7 +765,7 @@ def _effects_from_runtime_results(task: BenchmarkTask, runner: str, results: lis
         if not isinstance(action, dict):
             continue
         source_action = _matching_source_action(task.mock_actions, action, used_source_indices)
-        action_effects = []
+        action_effects: list[EffectRecord] = []
         inferred = _effect_from_action(task, runner, action)
         if inferred is not None:
             if source_action is not None:
@@ -673,13 +777,264 @@ def _effects_from_runtime_results(task: BenchmarkTask, runner: str, results: lis
                     action_effects.append(_effect_from_spec(task, runner, spec))
         if not action_effects:
             continue
+
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
-        for effect in action_effects:
-            effect.performed = bool(result.get("ok"))
-            effect.denied = not effect.performed and _looks_like_denial(str(result.get("error") or ""))
-            effect.error = None if effect.performed else str(result.get("error") or "")
-            effects.append(effect)
+        error = str(result.get("error") or "")
+        denied = not bool(result.get("ok")) and _runtime_result_is_denial(result, error)
+        for expected in action_effects:
+            persisted_index = _matching_persisted_effect(expected, persisted, used_persisted)
+            if persisted_index is not None:
+                actual = persisted[persisted_index]
+                used_persisted.add(persisted_index)
+                if error:
+                    actual.error = error
+                    actual.metadata["runtime_result_error"] = error
+                effects.append(actual)
+                continue
+
+            audit_index = _matching_audit_record(expected, audit, used_audit, pid=pid)
+            if audit_index is not None:
+                record = audit[audit_index]
+                used_audit.add(audit_index)
+                suffix = (
+                    f":{expected.tool}"
+                    if expected.type == "jit.register" and expected.tool
+                    else ""
+                )
+                expected.effect_id = f"audit:{record.record_id}{suffix}"
+                expected.performed = True
+                expected.denied = False
+                expected.outcome = "performed"
+                expected.evidence = "runtime_audit"
+                expected.error = error or None
+                expected.metadata.update(
+                    {
+                        "audit_record_id": record.record_id,
+                        "audit_action": record.action,
+                        "audit_target": record.target,
+                    }
+                )
+                effects.append(expected)
+                continue
+
+            generated_index += 1
+            expected.effect_id = _generated_effect_id(task.id, runner, generated_index)
+            expected.performed = False
+            expected.error = error or None
+            if denied:
+                expected.denied = True
+                expected.outcome = "denied"
+                expected.evidence = "runtime_result_denial"
+            else:
+                expected.denied = False
+                expected.outcome = "unknown"
+                expected.evidence = "missing"
+                expected.metadata["evidence_missing"] = True
+                expected.metadata["runtime_result_ok"] = bool(result.get("ok"))
+            effects.append(expected)
+
+    for index, actual in enumerate(persisted):
+        if index not in used_persisted:
+            effects.append(actual)
     return effects
+
+
+_AUDIT_ACTIONS_BY_EFFECT: dict[str, set[str]] = {
+    "object.read": {"memory.get_object", "memory.get_object_by_name", "memory.query_objects"},
+    "object.write": {
+        "memory.create_object",
+        "memory.update_object",
+        "memory.append_object",
+        "memory.delete_object",
+    },
+    "process.spawn": {"process.spawn_child"},
+    "process.fork": {"process.fork"},
+    "process.exec": {"process.exec"},
+    "skill.activate": {"skill.activate"},
+    "jit.register": {"tool.register", "image.package_jit.register", "skill.activate"},
+    "image.register": {"image.package.register"},
+    "image.commit": {"image.commit"},
+    "checkpoint.create": {"checkpoint.create"},
+    "checkpoint.fork": {"checkpoint.fork"},
+    "human.request": {"human.query"},
+}
+
+
+def _effect_from_external_record(
+    task: BenchmarkTask,
+    runner: str,
+    record: ExternalEffectRecord,
+) -> EffectRecord:
+    metadata = dict(record.provider_metadata or {})
+    context = metadata.get("context") if isinstance(metadata.get("context"), dict) else {}
+    effect_type = "external.provider_call"
+    fields: dict[str, Any] = {"provider": record.provider, "operation": record.operation}
+    if record.provider == "filesystem":
+        effect_type = {
+            "read_bytes": "filesystem.read",
+            "list_directory": "filesystem.read",
+            "write_text": "filesystem.write",
+            "make_directory": "filesystem.write",
+            "delete_file": "filesystem.delete",
+            "delete_directory": "filesystem.delete",
+        }.get(record.operation, "external.provider_call")
+        fields = {"path": _external_filesystem_path(record, context)}
+    elif record.provider == "shell" and record.operation == "run":
+        effect_type = "shell.exec"
+        argv = context.get("argv")
+        fields = {"argv": [str(item) for item in argv] if isinstance(argv, list) else None}
+    elif record.provider == "jsonrpc" and record.operation == "call":
+        effect_type = "jsonrpc.call"
+        fields = {
+            "endpoint": _optional_string(context.get("endpoint_id")),
+            "method": _optional_string(context.get("method_id")),
+        }
+    elif record.provider == "human":
+        effect_type = "human.request"
+        fields = {"operation": _optional_string(context.get("request_kind")) or record.operation}
+
+    recorded_outcome = str(metadata.get("outcome") or "")
+    outcome = "unknown" if recorded_outcome.startswith("unknown") else "performed"
+    return EffectRecord(
+        task_id=task.id,
+        runner=runner,
+        type=effect_type,
+        performed=True,
+        denied=False,
+        effect_id=record.effect_id,
+        outcome=outcome,
+        evidence="runtime_external_effect",
+        metadata={
+            "external_effect_id": record.effect_id,
+            "audit_record_id": record.record_id,
+            "event_id": record.event_id,
+            "pid": record.pid,
+            "provider_operation": f"{record.provider}.{record.operation}",
+            "rollback_class": record.rollback_class.value,
+            "rollback_status": record.rollback_status.value,
+            "state_mutation": record.state_mutation,
+            "information_flow": record.information_flow,
+            "provider_metadata": metadata,
+        },
+        **fields,
+    )
+
+
+def _external_filesystem_path(record: ExternalEffectRecord, context: dict[str, Any]) -> str | None:
+    for value in (context.get("path"), record.provider_metadata.get("path")):
+        if isinstance(value, str) and value:
+            return value.replace("\\", "/")
+    target = record.target or ""
+    marker = "filesystem:workspace:"
+    if target.startswith(marker):
+        return target[len(marker):]
+    return None
+
+
+def _optional_string(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _matching_persisted_effect(
+    expected: EffectRecord,
+    persisted: list[EffectRecord],
+    used: set[int],
+) -> int | None:
+    for index, actual in enumerate(persisted):
+        if index in used or expected.type != actual.type:
+            continue
+        if _effect_identity_matches(expected, actual):
+            return index
+    return None
+
+
+def _effect_identity_matches(expected: EffectRecord, actual: EffectRecord) -> bool:
+    for field in (
+        "path",
+        "argv",
+        "namespace",
+        "name",
+        "skill_id",
+        "tool",
+        "image",
+        "resource",
+        "operation",
+        "endpoint",
+        "method",
+        "provider",
+    ):
+        selected = getattr(expected, field)
+        if selected is not None and selected != getattr(actual, field):
+            return False
+    return True
+
+
+def _matching_audit_record(
+    expected: EffectRecord,
+    records: list[AuditRecord],
+    used: set[int],
+    *,
+    pid: str | None,
+) -> int | None:
+    actions = _AUDIT_ACTIONS_BY_EFFECT.get(expected.type)
+    if not actions:
+        return None
+    for index, record in enumerate(records):
+        reusable_skill_activation = (
+            expected.type == "jit.register" and record.action == "skill.activate"
+        )
+        if (index in used and not reusable_skill_activation) or record.action not in actions:
+            continue
+        if (
+            pid is not None
+            and record.actor != pid
+            and not (expected.type == "jit.register" and record.actor.startswith("skill:"))
+        ):
+            continue
+        decision = record.decision if isinstance(record.decision, dict) else {}
+        if expected.type.startswith("object."):
+            audited_namespace = decision.get("namespace")
+            namespace_matches = (
+                expected.namespace is None
+                or str(audited_namespace) == expected.namespace
+                or (
+                    expected.namespace == "process"
+                    and pid is not None
+                    and str(audited_namespace) == f"process:{pid}"
+                )
+            )
+            if not namespace_matches:
+                continue
+            if expected.name is not None and str(decision.get("name")) != expected.name:
+                continue
+        if expected.skill_id is not None and str(decision.get("skill_id")) != expected.skill_id:
+            continue
+        if expected.tool is not None:
+            jit_tool_ids = decision.get("jit_tool_ids")
+            named_tool_matches = str(decision.get("name")) == expected.tool
+            activated_jit_matches = (
+                isinstance(jit_tool_ids, dict)
+                and expected.tool in jit_tool_ids
+            )
+            if not named_tool_matches and not activated_jit_matches:
+                continue
+        if expected.image is not None and expected.type.startswith("process."):
+            audited_image = (
+                decision.get("new_image")
+                if expected.type == "process.exec"
+                else decision.get("image")
+            )
+            # `current` is the mock-action placeholder for inheriting the
+            # caller's current image.  The audit row contains the concrete
+            # image id, so any concrete value is the matching evidence here.
+            if expected.image != "current" and str(audited_image) != expected.image:
+                continue
+        return index
+    return None
+
+
+def _generated_effect_id(task_id: str, runner: str, index: int) -> str:
+    return f"{runner}:{task_id}:effect:{index}"
 
 
 def _matching_source_action(
@@ -818,6 +1173,9 @@ def _effect_from_spec(task: BenchmarkTask, runner: str, spec: dict[str, Any]) ->
         performed=bool(spec.get("performed", True)),
         denied=bool(spec.get("denied", False)),
         simulated=bool(spec.get("simulated", False)),
+        effect_id=str(spec["effect_id"]) if spec.get("effect_id") is not None else None,
+        outcome=str(spec["outcome"]) if spec.get("outcome") is not None else None,
+        evidence=str(spec["evidence"]) if spec.get("evidence") is not None else None,
         path=str(spec["path"]) if spec.get("path") is not None else None,
         argv=[str(item) for item in spec["argv"]] if isinstance(spec.get("argv"), list) else None,
         namespace=str(spec["namespace"]) if spec.get("namespace") is not None else None,
@@ -842,6 +1200,8 @@ def _evaluate_success(task: BenchmarkTask, workspace: Path, state: dict[str, Any
         if check_type == "completed_actions":
             continue
         if check_type == "process_exited":
+            if state.get("process_status") not in {None, ProcessStatus.EXITED.value}:
+                return False
             if not state.get("exited"):
                 return False
             continue
@@ -891,9 +1251,68 @@ def _self_evolution_counts(effects: list[EffectRecord]) -> dict[str, int]:
     }
 
 
+def _finalize_wrapper_effects(
+    task: BenchmarkTask,
+    runner: str,
+    effects: list[EffectRecord],
+) -> None:
+    for index, effect in enumerate(effects, start=1):
+        effect.effect_id = effect.effect_id or _generated_effect_id(task.id, runner, index)
+        if effect.denied:
+            effect.performed = False
+            effect.outcome = "denied"
+            effect.evidence = effect.evidence or "wrapper_observed"
+        elif effect.simulated:
+            # Simulation is useful baseline metadata, but it is not evidence
+            # that a host-side effect actually occurred.
+            effect.performed = False
+            effect.outcome = "simulated"
+            effect.evidence = effect.evidence or "benchmark_simulation"
+        elif effect.performed:
+            effect.outcome = "performed"
+            effect.evidence = effect.evidence or "wrapper_observed"
+        else:
+            effect.outcome = "unknown"
+            effect.evidence = effect.evidence or "wrapper_observed"
+
+
+def _effect_invalid_reasons(effects: list[EffectRecord]) -> list[str]:
+    reasons: set[str] = set()
+    seen_ids: set[str] = set()
+    for index, effect in enumerate(effects, start=1):
+        label = effect.effect_id or f"row {index}"
+        if not effect.effect_id:
+            reasons.add(f"effect {label} is missing effect_id")
+        elif effect.effect_id in seen_ids:
+            reasons.add(f"duplicate effect id {effect.effect_id!r}")
+        else:
+            seen_ids.add(effect.effect_id)
+        if effect.classification == "unknown":
+            reasons.add(f"effect {label} has unknown effect classification")
+        if effect.outcome == "unknown":
+            reasons.add(f"effect {label} has unknown outcome")
+        if effect.evidence == "missing" or effect.metadata.get("evidence_missing"):
+            reasons.add(f"effect {label} is missing runtime effect evidence")
+        if effect.outcome is None:
+            reasons.add(f"effect {label} is missing outcome")
+        if not effect.evidence:
+            reasons.add(f"effect {label} is missing evidence source")
+        if effect.denied and effect.performed:
+            reasons.add(f"effect {label} is inconsistently both performed and denied")
+    return sorted(reasons)
+
+
 def _looks_like_denial(error: str) -> bool:
     lowered = error.lower()
     return any(fragment in lowered for fragment in ("lacks", "denied", "requires human", "not in process tool table", "permission"))
+
+
+def _runtime_result_is_denial(result: dict[str, Any], error: str) -> bool:
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    if error_payload.get("code") == "permission_denied":
+        return True
+    return _looks_like_denial(error)
 
 
 def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
@@ -905,6 +1324,7 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
         (effect.to_dict() for run in runs for effect in run.effects),
     )
     summary = {
+        "schema_version": 1,
         "results": len(runs),
         "effects": sum(len(run.effects) for run in runs),
         "runners": sorted({run.result.runner for run in runs}),
@@ -914,6 +1334,7 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
         "runner_failures": sum(
             1 for run in runs if run.result.metadata.get("runner_failed")
         ),
+        "invalid_runs": sum(1 for run in runs if not run.result.valid),
     }
     (output / "summary.json").write_text(json.dumps(to_jsonable(summary), indent=2, ensure_ascii=False), encoding="utf-8")
 

@@ -3,6 +3,7 @@ import json
 import os
 import pytest
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 from agent_libos import AgentImage, Runtime
@@ -36,14 +37,96 @@ class RejectingValidationSandbox(DenoTypescriptSandbox):
 
 class TestImageRegistration:
 
+    def test_concurrent_register_without_replace_has_single_winner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            barrier = threading.Barrier(2)
+            original_validate = runtime.image_registry._validate_image
+
+            def synchronized_validate(image: AgentImage) -> None:
+                original_validate(image)
+                if image.image_id == 'concurrent-image:v0':
+                    barrier.wait(timeout=5)
+
+            monkeypatch.setattr(runtime.image_registry, '_validate_image', synchronized_validate)
+            outcomes: list[object] = []
+
+            def register(version: str) -> None:
+                try:
+                    outcomes.append(
+                        runtime.image_registry.register(
+                            AgentImage(
+                                image_id='concurrent-image:v0',
+                                name='concurrent-image',
+                                version=version,
+                            ),
+                            actor=f'thread-{version}',
+                            replace=False,
+                        )
+                    )
+                except Exception as exc:
+                    outcomes.append(exc)
+
+            threads = [threading.Thread(target=register, args=(version,)) for version in ('v1', 'v2')]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert sum(not isinstance(outcome, Exception) for outcome in outcomes) == 1
+            assert sum(isinstance(outcome, ValidationError) for outcome in outcomes) == 1
+            assert len(
+                [record for record in runtime.audit.trace() if record.target == 'image:concurrent-image:v0']
+            ) == 1
+            persisted = runtime.store.get_image('concurrent-image:v0')
+            assert persisted is not None
+            assert runtime.get_image('concurrent-image:v0') == persisted[0]
+        finally:
+            runtime.close()
+
     def test_register_image_primitive_validates_tools_and_emits_audit(self) -> None:
         runtime = Runtime.open('local')
         try:
             image = AgentImage(image_id='custom-review:v0', name='custom-review', system_prompt='Custom review image.', default_tools=['read_memory_object', 'human_output'], safety_profile='review')
             runtime.register_image(image, actor='cli')
-            assert runtime.get_image('custom-review:v0') is image
+            assert runtime.get_image('custom-review:v0') == image
+            assert runtime.get_image('custom-review:v0') is not image
             assert 'image.register' in [record.action for record in runtime.audit.trace()]
             assert EventType.IMAGE_REGISTERED in [event.type for event in runtime.events.list()]
+        finally:
+            runtime.close()
+
+    def test_registered_image_isolated_from_caller_and_getter_mutation(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            source = AgentImage(
+                image_id='immutable-manifest:v0',
+                name='immutable-manifest',
+                default_tools=['human_output'],
+                metadata={'nested': {'version': 1}},
+            )
+            registration = runtime.image_registry.register(source, actor='test')
+
+            source.default_tools.append('read_memory_object')
+            source.metadata['nested']['version'] = 2
+            registration.image.default_tools.append('write_memory_object')
+            fetched = runtime.get_image('immutable-manifest:v0')
+            fetched.default_tools.append('read_text_file')
+            fetched.metadata['nested']['version'] = 3
+
+            canonical = runtime.get_image('immutable-manifest:v0')
+            persisted = runtime.store.get_image('immutable-manifest:v0')
+            pid = runtime.process.spawn(image='immutable-manifest:v0', goal='use canonical manifest')
+
+            assert canonical.default_tools == ['human_output']
+            assert canonical.metadata == {'nested': {'version': 1}}
+            assert persisted is not None
+            assert persisted[0].default_tools == ['human_output']
+            assert runtime.process.get(pid).tool_table.keys() == {'human_output'}
         finally:
             runtime.close()
 
@@ -73,7 +156,7 @@ class TestImageRegistration:
                 )
 
             persisted = runtime.store.get_image('atomic-image:v0')
-            assert runtime.get_image('atomic-image:v0') is original
+            assert runtime.get_image('atomic-image:v0') == original
             assert persisted is not None and persisted[0].version == 'v1'
             assert runtime.events.list() == before_events
             assert runtime.audit.trace() == before_audit

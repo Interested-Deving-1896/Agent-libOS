@@ -48,19 +48,35 @@ substrate for capability-controlled self-evolution.
    Deno/TypeScript JIT tools that can reach libOS only through syscall RPC.
 
 3. Benchmark suite.
-   The current implementation includes an M1 deterministic runtime-safety harness
-   with adversarial tasks, wrapper baselines, ablations, declared
-   allowed/forbidden side effects, a side-effect oracle, and stable metrics
-   output. The suite now includes a first self-evolution subset covering Skill
-   activation, JIT registration, image registration/exec/checkpoint commit, child-process
-   delegation, checkpoint fork, and JSON-RPC remote-resource visibility.
+   The current implementation includes an M1 deterministic runtime-safety
+   harness with 27 schema-v1 adversarial tasks, wrapper baselines, ablations,
+   declared allowed/forbidden side effects, evidence-backed outcome records,
+   explicit exact/prefix/glob oracle matching, and fail-closed stable metrics
+   output. The suite includes a first self-evolution subset covering Skill
+   activation, JIT registration, image registration/exec/checkpoint commit,
+   child-process delegation, checkpoint fork, and JSON-RPC remote-resource
+   visibility.
 
 4. Evaluation.
    The paper should compare Agent libOS against direct tool wrappers,
    confirmation-prompt wrappers, and host-isolation-only baselines. Metrics
    include unauthorized side-effect rate, task success, false denial, approval
    count, wall time, token/cost accounting, overhead, audit completeness, and
-   safety of self-evolution mechanisms.
+   safety of self-evolution mechanisms. Unauthorized side-effect rate uses
+   definitely performed effects as its denominator; false-denial rate uses only
+   allowed attempts with definite performed/denied outcomes. Unknown or missing
+   evidence invalidates the rate row rather than being inferred from tool
+   success/failure.
+
+The current repository-backed, token-free `agent_libos_full` validation is a
+27-task smoke/evaluation snapshot: 27/27 task success, 27/27 safety pass, zero
+unauthorized effects among 22 definitely performed effects, zero unknown
+effects, and zero false denials among 22 allowed performed-or-denied attempts
+(`0/22 = 0%`). Human approval and the authorized attenuated child spawn are
+both explicit effects. The earlier `3/43 = 7.0%` phrasing used an obsolete
+all-record denominator and must not be mixed with the schema-v1 metric. This
+snapshot supports implementation validation; it is not yet the complete paper
+evaluation.
 
 ## Non-Goals
 

@@ -45,12 +45,14 @@ from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequire
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
+    abandon_external_effect_intent,
+    begin_external_effect_intent,
     classify_external_effect,
     record_external_effect,
     require_external_effect_classifier,
 )
 from agent_libos.storage import RuntimeStore
-from agent_libos.substrate import McpProvider
+from agent_libos.substrate import McpProvider, ProviderEffectNotStarted
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
@@ -156,38 +158,36 @@ class McpPrimitive:
         source: str | None = None,
     ) -> dict[str, Any]:
         spec = self._coerce_server(server)
-        existing = self.store.get_mcp_server(spec.server_id)
-        if existing is not None and not replace:
-            raise ValidationError(f"MCP server already exists: {spec.server_id}")
         if require_capability:
-            required_right = CapabilityRight.ADMIN if existing is not None else CapabilityRight.WRITE
+            required_right = CapabilityRight.ADMIN if replace else CapabilityRight.WRITE
             self.capabilities.require(actor, self.server_resource(spec.server_id), required_right)
             self._require_stdio_process_spawn(actor, spec)
         now = utc_now()
-        if existing is not None:
-            with self.store.transaction():
-                self.store.upsert_mcp_server(spec, registered_by=actor, created_at=now)
-                self._disable_replaced_server_tool_capabilities(spec.server_id, actor=actor)
-        else:
+        with self.store.transaction():
+            existing = self.store.get_mcp_server(spec.server_id)
+            if existing is not None and not replace:
+                raise ValidationError(f"MCP server already exists: {spec.server_id}")
             self.store.upsert_mcp_server(spec, registered_by=actor, created_at=now)
-        self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=actor,
-            target=self.server_resource(spec.server_id),
-            payload={"adapter": "mcp", "operation": "server_register", "server_id": spec.server_id},
-        )
-        self.audit.record(
-            actor=actor,
-            action="mcp.server.register" if existing is None else "mcp.server.replace",
-            target=self.server_resource(spec.server_id),
-            decision={
-                "server_id": spec.server_id,
-                "transport": spec.transport,
-                "tools": [tool.tool_id for tool in spec.tools],
-                "replaced": existing is not None,
-                "source": source,
-            },
-        )
+            if existing is not None:
+                self._disable_replaced_server_tool_capabilities(spec.server_id, actor=actor)
+            self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=actor,
+                target=self.server_resource(spec.server_id),
+                payload={"adapter": "mcp", "operation": "server_register", "server_id": spec.server_id},
+            )
+            self.audit.record(
+                actor=actor,
+                action="mcp.server.register" if existing is None else "mcp.server.replace",
+                target=self.server_resource(spec.server_id),
+                decision={
+                    "server_id": spec.server_id,
+                    "transport": spec.transport,
+                    "tools": [tool.tool_id for tool in spec.tools],
+                    "replaced": existing is not None,
+                    "source": source,
+                },
+            )
         return self.inspect_server(spec.server_id, actor=actor, require_capability=False)
 
     def register_server_from_yaml_text(
@@ -239,9 +239,9 @@ class McpPrimitive:
         require_capability: bool = True,
         include_sensitive_fields: bool = False,
     ) -> dict[str, Any]:
-        spec, metadata = self._load_server(server_id)
         if require_capability and actor is not None:
             self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.READ)
+        spec, metadata = self._load_server(server_id)
         return self._server_to_json(spec, metadata, include_sensitive_fields=include_sensitive_fields)
 
     def list_tools(
@@ -252,20 +252,33 @@ class McpPrimitive:
         require_capability: bool = True,
         refresh: bool = False,
     ) -> dict[str, Any]:
-        spec, _metadata = self._load_server(server_id)
+        authority_decisions: list[Any] = []
         if require_capability and actor is not None:
-            self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.READ)
+            read_decision = self.capabilities.require(
+                actor,
+                self.server_resource(server_id),
+                CapabilityRight.READ,
+                consume=not refresh,
+            )
+            if refresh:
+                authority_decisions.append(read_decision)
+        spec, _metadata = self._load_server(server_id)
         live_by_name: dict[str, McpProviderTool] = {}
         live_response_bytes = 0
         if refresh:
             effect_actor = actor or "runtime"
             usage_pid = self._resource_usage_pid(actor)
             if require_capability and actor is not None:
-                self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.EXECUTE)
-                self._require_stdio_process_spawn(actor, spec)
+                authority_decisions.append(
+                    self.capabilities.require(
+                        actor,
+                        self.server_resource(server_id),
+                        CapabilityRight.EXECUTE,
+                        consume=False,
+                    )
+                )
+                authority_decisions.extend(self._require_stdio_process_spawn(actor, spec, consume=False))
             self._require_runtime_environment(spec)
-            if spec.transport == "streamable_http":
-                self._validate_runtime_resolution(spec)
             request_bytes = len(dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8"))
             if request_bytes > spec.max_request_bytes:
                 raise ValidationError(f"MCP list_tools request exceeds max_request_bytes={spec.max_request_bytes}")
@@ -284,6 +297,58 @@ class McpPrimitive:
                 effect_context,
                 {"preflight": True},
             )
+            with self.store.transaction():
+                reservation_ids = self._reserve_authority_decisions(
+                    authority_decisions,
+                    reason="one-time MCP list authority reserved before remote boundary",
+                )
+                effect_intent = begin_external_effect_intent(
+                    self.store,
+                    pid=effect_actor,
+                    provider="mcp",
+                    operation="list_tools",
+                    target=self.server_resource(spec.server_id),
+                    state_mutation=preflight_classification.state_mutation,
+                    information_flow=True,
+                    metadata={"context": effect_context},
+                )
+            information_flow_started = False
+            authority_committed = False
+            if spec.transport == "streamable_http":
+                resolution_observes_host = self._runtime_resolution_observes_host(spec)
+                try:
+                    self._validate_runtime_resolution(spec)
+                except ProviderEffectNotStarted:
+                    with self.store.transaction():
+                        self._restore_authority_reservations(
+                            reservation_ids,
+                            reason="MCP list authority restored after certified resolution pre-boundary failure",
+                        )
+                        abandon_external_effect_intent(self.store, effect_intent.effect_id)
+                    raise
+                except Exception as exc:
+                    with self.store.transaction():
+                        self._commit_authority_reservations(
+                            reservation_ids,
+                            reason="MCP list authority committed after DNS information flow",
+                        )
+                    self._record_list_tools_unknown_boundary_failure(
+                        effect_actor,
+                        spec,
+                        effect_context,
+                        effect_intent.effect_id,
+                        error=exc,
+                        phase="dns_resolution",
+                    )
+                    raise
+                if resolution_observes_host:
+                    with self.store.transaction():
+                        self._commit_authority_reservations(
+                            reservation_ids,
+                            reason="MCP list authority committed after DNS information flow",
+                        )
+                    information_flow_started = True
+                    authority_committed = True
             started = time.monotonic()
             try:
                 result = self.provider.list_tools(
@@ -291,7 +356,32 @@ class McpPrimitive:
                     timeout_s=spec.timeout_s,
                     max_response_bytes=spec.max_response_bytes,
                 )
+            except ProviderEffectNotStarted as exc:
+                if not information_flow_started:
+                    with self.store.transaction():
+                        self._restore_authority_reservations(
+                            reservation_ids,
+                            reason="MCP list authority restored after certified provider pre-boundary failure",
+                        )
+                        abandon_external_effect_intent(self.store, effect_intent.effect_id)
+                else:
+                    self._record_list_tools_unknown_boundary_failure(
+                        effect_actor,
+                        spec,
+                        effect_context,
+                        effect_intent.effect_id,
+                        error=exc,
+                        phase="provider_not_started_after_dns",
+                    )
+                raise
             except Exception as exc:
+                if not authority_committed:
+                    with self.store.transaction():
+                        self._commit_authority_reservations(
+                            reservation_ids,
+                            reason="MCP list authority committed after provider boundary began",
+                        )
+                    authority_committed = True
                 result_payload = self._list_tools_failure_payload(exc, duration_s=time.monotonic() - started)
                 event = self._emit_list_tools_event(effect_actor, spec, result_payload)
                 audit_record = self._record_list_tools_audit(effect_actor, spec, result_payload, effect_context)
@@ -303,6 +393,7 @@ class McpPrimitive:
                     event,
                     audit_record,
                     preflight_classification=preflight_classification,
+                    effect_intent_id=effect_intent.effect_id,
                 )
                 if usage_pid is not None:
                     self._charge_resource_usage(
@@ -317,6 +408,13 @@ class McpPrimitive:
                         },
                     )
                 raise
+            if not authority_committed:
+                with self.store.transaction():
+                    self._commit_authority_reservations(
+                        reservation_ids,
+                        reason="MCP list authority committed after provider boundary succeeded",
+                    )
+                authority_committed = True
             live_response_bytes = result.response_bytes
             live_by_name = {tool.name: tool for tool in result.tools}
             result_payload = self._list_tools_success_payload(result)
@@ -330,6 +428,7 @@ class McpPrimitive:
                 event,
                 audit_record,
                 preflight_classification=preflight_classification,
+                effect_intent_id=effect_intent.effect_id,
             )
             if usage_pid is not None:
                 self._charge_resource_usage(
@@ -360,18 +459,24 @@ class McpPrimitive:
         actor: str = "runtime",
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        self._load_server(server_id)
         if require_capability:
             self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.ADMIN)
         with self.store.transaction():
+            self._load_server(server_id)
             self._disable_replaced_server_tool_capabilities(server_id, actor=actor)
             self.store.delete_mcp_server(server_id)
-        self.audit.record(
-            actor=actor,
-            action="mcp.server.unregister",
-            target=self.server_resource(server_id),
-            decision={"server_id": server_id},
-        )
+            self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=actor,
+                target=self.server_resource(server_id),
+                payload={"adapter": "mcp", "operation": "server_unregister", "server_id": server_id},
+            )
+            self.audit.record(
+                actor=actor,
+                action="mcp.server.unregister",
+                target=self.server_resource(server_id),
+                decision={"server_id": server_id},
+            )
         return {"server_id": server_id, "deleted": True}
 
     def call_tool(self, pid: str, server_id: str, tool_id: str, arguments: Any = None) -> McpCallResult:
@@ -388,7 +493,7 @@ class McpPrimitive:
             raise NotFound(f"MCP tool not found: {server_id}/{tool_id}")
         operation_context = self._operation_context(pid, spec, tool, selected_args)
         decision = self._authorize_call(pid, resource, tool.right, operation_context)
-        self._require_stdio_process_spawn(pid, spec)
+        auxiliary_decisions = self._require_stdio_process_spawn(pid, spec, consume=False)
         self._validate_arguments_against_schema(tool, selected_args)
         profile = self.capabilities.profiles.mcp(
             resource=resource,
@@ -398,14 +503,23 @@ class McpPrimitive:
         )
         operation_context.update(
             {
-                "capability_ids": list(decision.matched_capability_ids),
+                "capability_ids": list(
+                    dict.fromkeys(
+                        [
+                            *decision.matched_capability_ids,
+                            *[
+                                cap_id
+                                for auxiliary in auxiliary_decisions
+                                for cap_id in auxiliary.matched_capability_ids
+                            ],
+                        ]
+                    )
+                ),
                 "selected_capability_id": decision.selected_capability_id,
                 "sandbox_profile": self._profile_json(profile),
             }
         )
         self._require_runtime_environment(spec)
-        if spec.transport == "streamable_http":
-            self._validate_runtime_resolution(spec)
         request_bytes = len(dumps({"name": tool.mcp_name, "arguments": selected_args}).encode("utf-8"))
         if request_bytes > spec.max_request_bytes:
             raise ValidationError(f"MCP request exceeds max_request_bytes={spec.max_request_bytes}")
@@ -418,15 +532,95 @@ class McpPrimitive:
         effect_context = self._effect_context(spec, tool, operation_context, request_bytes=request_bytes)
         require_external_effect_classifier(self.provider, "call_tool")
         preflight_classification = classify_external_effect(self.provider, "call_tool", effect_context, {"preflight": True})
-        self.capabilities.claim_decision_use(
-            decision,
-            used_by="mcp",
-            reason="one-time MCP tool permission consumed",
-        )
+        with self.store.transaction():
+            reservation_ids = self._reserve_authority_decisions(
+                [decision, *auxiliary_decisions],
+                reason="one-time MCP call authority reserved before remote boundary",
+            )
+            effect_intent = begin_external_effect_intent(
+                self.store,
+                pid=pid,
+                provider="mcp",
+                operation="call_tool",
+                target=resource,
+                state_mutation=bool(preflight_classification.state_mutation or tool.state_mutation),
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        information_flow_started = False
+        authority_committed = False
+        if spec.transport == "streamable_http":
+            resolution_observes_host = self._runtime_resolution_observes_host(spec)
+            try:
+                self._validate_runtime_resolution(spec)
+            except ProviderEffectNotStarted:
+                with self.store.transaction():
+                    self._restore_authority_reservations(
+                        reservation_ids,
+                        reason="MCP call authority restored after certified resolution pre-boundary failure",
+                    )
+                    abandon_external_effect_intent(self.store, effect_intent.effect_id)
+                raise
+            except Exception as exc:
+                with self.store.transaction():
+                    self._commit_authority_reservations(
+                        reservation_ids,
+                        reason="MCP call authority committed after DNS information flow",
+                    )
+                self._record_call_unknown_boundary_failure(
+                    pid,
+                    spec,
+                    tool,
+                    resource,
+                    operation_context,
+                    effect_context,
+                    preflight_classification,
+                    effect_intent.effect_id,
+                    error=exc,
+                    phase="dns_resolution",
+                )
+                raise
+            if resolution_observes_host:
+                with self.store.transaction():
+                    self._commit_authority_reservations(
+                        reservation_ids,
+                        reason="MCP call authority committed after DNS information flow",
+                    )
+                information_flow_started = True
+                authority_committed = True
         started = time.monotonic()
         try:
             self._validate_live_tool(spec, tool)
+        except ProviderEffectNotStarted as exc:
+            if not information_flow_started:
+                with self.store.transaction():
+                    self._restore_authority_reservations(
+                        reservation_ids,
+                        reason="MCP call authority restored after certified live-validation pre-boundary failure",
+                    )
+                    abandon_external_effect_intent(self.store, effect_intent.effect_id)
+            else:
+                self._record_call_unknown_boundary_failure(
+                    pid,
+                    spec,
+                    tool,
+                    resource,
+                    operation_context,
+                    effect_context,
+                    preflight_classification,
+                    effect_intent.effect_id,
+                    error=exc,
+                    phase="live_validation_not_started_after_dns",
+                )
+            raise
         except Exception as exc:
+            if not authority_committed:
+                with self.store.transaction():
+                    self._commit_authority_reservations(
+                        reservation_ids,
+                        reason="MCP call authority committed after live validation began",
+                    )
+                authority_committed = True
             result = self._failure(
                 spec,
                 tool,
@@ -447,6 +641,7 @@ class McpPrimitive:
                 event,
                 audit_record,
                 preflight_classification=preflight_classification,
+                effect_intent_id=effect_intent.effect_id,
             )
             self._charge_resource_usage(
                 pid,
@@ -461,6 +656,13 @@ class McpPrimitive:
                 },
             )
             raise
+        if not authority_committed:
+            with self.store.transaction():
+                self._commit_authority_reservations(
+                    reservation_ids,
+                    reason="MCP call authority committed after live validation succeeded",
+                )
+            authority_committed = True
         try:
             provider_result = self.provider.call_tool(
                 spec,
@@ -469,11 +671,33 @@ class McpPrimitive:
                 timeout_s=spec.timeout_s,
                 max_response_bytes=spec.max_response_bytes,
             )
+        except ProviderEffectNotStarted as exc:
+            # The high-level call intent already covered a successful live
+            # list_tools validation. The tool invocation itself did not start,
+            # but that preceding provider information flow means the intent
+            # cannot be abandoned as if no external boundary was crossed.
+            provider_result = McpProviderCallResult(
+                error=f"{type(exc).__name__}: {exc}",
+                duration_s=time.monotonic() - started,
+            )
+            classification_override = ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    "outcome": "call_tool_not_started_after_live_validation",
+                    "error_type": type(exc).__name__,
+                },
+            )
         except Exception as exc:
             provider_result = McpProviderCallResult(
                 error=f"{type(exc).__name__}: {exc}",
                 duration_s=time.monotonic() - started,
             )
+            classification_override = None
+        else:
+            classification_override = None
         result = self._call_result_from_provider(spec, tool, provider_result)
         event = self._emit_call_event(pid, resource, result, tool)
         audit_record = self._record_call_audit(pid, resource, result, tool, operation_context)
@@ -485,6 +709,8 @@ class McpPrimitive:
             event,
             audit_record,
             preflight_classification=preflight_classification,
+            effect_intent_id=effect_intent.effect_id,
+            classification_override=classification_override,
         )
         self._charge_resource_usage(
             pid,
@@ -609,29 +835,79 @@ class McpPrimitive:
         if tool.input_schema and live.input_schema and live.input_schema != tool.input_schema:
             raise ValidationError(f"MCP tool schema changed for {server.server_id}/{tool.tool_id}")
 
-    def _require_stdio_process_spawn(self, actor: str | None, server: McpServerSpec) -> None:
+    def _require_stdio_process_spawn(
+        self,
+        actor: str | None,
+        server: McpServerSpec,
+        *,
+        consume: bool = True,
+    ) -> list[Any]:
         if actor is None or server.transport != "stdio":
-            return
-        self.capabilities.require(actor, "process:spawn", CapabilityRight.WRITE)
+            return []
+        decisions = [
+            self.capabilities.require(
+                actor,
+                "process:spawn",
+                CapabilityRight.WRITE,
+                consume=consume,
+            )
+        ]
         if server.stdio is None:
             raise ValidationError("MCP stdio transport is missing stdio configuration")
         resource = self.stdio_resource_for_server(server)
         if resource is None:
             raise ValidationError("MCP stdio transport is missing stdio authority resource")
-        self.capabilities.require(
-            actor,
-            resource,
-            CapabilityRight.EXECUTE,
-            {
-                "adapter": "mcp",
-                "operation": "mcp.stdio.spawn",
-                "server_id": server.server_id,
-                "stdio_command": server.stdio.command,
-                "stdio_args": list(server.stdio.args),
-                "stdio_env": dict(server.stdio.env),
-                "stdio_cwd": self._canonical_stdio_cwd(server.stdio.cwd),
-            },
+        decisions.append(
+            self.capabilities.require(
+                actor,
+                resource,
+                CapabilityRight.EXECUTE,
+                {
+                    "adapter": "mcp",
+                    "operation": "mcp.stdio.spawn",
+                    "server_id": server.server_id,
+                    "stdio_command": server.stdio.command,
+                    "stdio_args": list(server.stdio.args),
+                    "stdio_env": dict(server.stdio.env),
+                    "stdio_cwd": self._canonical_stdio_cwd(server.stdio.cwd),
+                },
+                consume=consume,
+            )
         )
+        return decisions
+
+    def _reserve_authority_decisions(self, decisions: list[Any], *, reason: str) -> list[str]:
+        reservation_ids: list[str] = []
+        seen_capability_ids: set[str] = set()
+        for decision in decisions:
+            capability_id = getattr(decision, "consume_capability_id", None)
+            if capability_id is None or str(capability_id) in seen_capability_ids:
+                continue
+            seen_capability_ids.add(str(capability_id))
+            reservation_id = self.capabilities.reserve_decision_use(
+                decision,
+                used_by="mcp",
+                reason=reason,
+            )
+            if reservation_id is not None:
+                reservation_ids.append(reservation_id)
+        return reservation_ids
+
+    def _commit_authority_reservations(self, reservation_ids: list[str], *, reason: str) -> None:
+        for reservation_id in reservation_ids:
+            self.capabilities.commit_reserved_use(
+                reservation_id,
+                committed_by="mcp",
+                reason=reason,
+            )
+
+    def _restore_authority_reservations(self, reservation_ids: list[str], *, reason: str) -> None:
+        for reservation_id in reservation_ids:
+            self.capabilities._restore_reserved_use(
+                reservation_id,
+                restored_by="mcp",
+                reason=reason,
+            )
 
     def _call_result_from_provider(
         self,
@@ -789,6 +1065,7 @@ class McpPrimitive:
         audit_record: AuditRecord,
         *,
         preflight_classification: ExternalEffectClassification,
+        effect_intent_id: str,
     ) -> None:
         try:
             classification = classify_external_effect(self.provider, "list_tools", context, result_payload)
@@ -804,6 +1081,14 @@ class McpPrimitive:
                     "classification_fallback": "post_list_tools_failure",
                 },
             )
+        if not classification.information_flow:
+            classification = ExternalEffectClassification(
+                rollback_class=classification.rollback_class,
+                rollback_status=classification.rollback_status,
+                state_mutation=classification.state_mutation,
+                information_flow=True,
+                metadata={**classification.metadata, "remote_information_flow": True},
+            )
         record_external_effect(
             self.store,
             pid=pid,
@@ -814,6 +1099,52 @@ class McpPrimitive:
             audit_record=audit_record,
             event=event,
             metadata={"context": context, "result": result_payload},
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _record_list_tools_unknown_boundary_failure(
+        self,
+        pid: str,
+        spec: McpServerSpec,
+        context: dict[str, Any],
+        effect_intent_id: str,
+        *,
+        error: BaseException,
+        phase: str,
+    ) -> None:
+        result_payload = {
+            "ok": False,
+            "status": "transport_error",
+            "response_bytes": 0,
+            "duration_s": 0.0,
+            "tool_count": 0,
+            "error": sanitize_for_observability(str(error)),
+            "error_type": type(error).__name__,
+            "phase": phase,
+        }
+        event = self._emit_list_tools_event(pid, spec, result_payload)
+        audit_record = self._record_list_tools_audit(pid, spec, result_payload, context)
+        record_external_effect(
+            self.store,
+            pid=pid,
+            provider="mcp",
+            operation="list_tools",
+            target=self.server_resource(spec.server_id),
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"outcome": "unknown_remote_boundary_failure", "phase": phase},
+            ),
+            audit_record=audit_record,
+            event=event,
+            metadata={
+                "context": context,
+                "error_type": type(error).__name__,
+                "error": sanitize_for_observability(str(error)),
+            },
+            intent_effect_id=effect_intent_id,
         )
 
     def _list_tools_success_payload(self, result: McpToolListResult) -> dict[str, Any]:
@@ -846,6 +1177,8 @@ class McpPrimitive:
         audit_record: AuditRecord,
         *,
         preflight_classification: ExternalEffectClassification,
+        effect_intent_id: str,
+        classification_override: ExternalEffectClassification | None = None,
     ) -> None:
         result_payload = {
             "status": result.status.value,
@@ -853,19 +1186,29 @@ class McpPrimitive:
             "response_bytes": result.response_bytes,
             "duration_s": result.duration_s,
         }
-        try:
-            classification = classify_external_effect(self.provider, "call_tool", context, result_payload)
-        except Exception as exc:
+        classification = classification_override
+        if classification is None:
+            try:
+                classification = classify_external_effect(self.provider, "call_tool", context, result_payload)
+            except Exception as exc:
+                classification = ExternalEffectClassification(
+                    rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+                    rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+                    state_mutation=True,
+                    information_flow=True,
+                    metadata={
+                        **dict(preflight_classification.metadata),
+                        "classification_error": f"{type(exc).__name__}: {exc}",
+                        "classification_fallback": "post_call_failure",
+                    },
+                )
+        if not classification.information_flow:
             classification = ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
-                rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
-                state_mutation=True,
+                rollback_class=classification.rollback_class,
+                rollback_status=classification.rollback_status,
+                state_mutation=classification.state_mutation,
                 information_flow=True,
-                metadata={
-                    **dict(preflight_classification.metadata),
-                    "classification_error": f"{type(exc).__name__}: {exc}",
-                    "classification_fallback": "post_call_failure",
-                },
+                metadata={**classification.metadata, "remote_information_flow": True},
             )
         record_external_effect(
             self.store,
@@ -877,6 +1220,53 @@ class McpPrimitive:
             audit_record=audit_record,
             event=event,
             metadata={"context": context, "result": result_payload},
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _record_call_unknown_boundary_failure(
+        self,
+        pid: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        resource: str,
+        operation_context: dict[str, Any],
+        effect_context: dict[str, Any],
+        preflight_classification: ExternalEffectClassification,
+        effect_intent_id: str,
+        *,
+        error: BaseException,
+        phase: str,
+    ) -> None:
+        provider_result = McpProviderCallResult(
+            error=f"{type(error).__name__}: {sanitize_for_observability(str(error))}",
+            duration_s=0.0,
+        )
+        result = self._failure(
+            spec,
+            tool,
+            McpCallStatus.TRANSPORT_ERROR,
+            sanitize_for_observability(str(error)),
+            provider_result,
+            extra={"phase": phase},
+        )
+        event = self._emit_call_event(pid, resource, result, tool)
+        audit_record = self._record_call_audit(pid, resource, result, tool, operation_context)
+        self._record_external_effect(
+            pid,
+            resource,
+            effect_context,
+            result,
+            event,
+            audit_record,
+            preflight_classification=preflight_classification,
+            effect_intent_id=effect_intent_id,
+            classification_override=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"outcome": "unknown_remote_boundary_failure", "phase": phase},
+            ),
         )
 
     def _preflight_resource_usage(
@@ -1262,6 +1652,12 @@ class McpPrimitive:
         for address in addresses:
             self._validate_host_literal(address, allow_local=False)
         return tuple(addresses)
+
+    def _runtime_resolution_observes_host(self, server: McpServerSpec) -> bool:
+        if server.http is None:
+            return False
+        host = urlsplit(server.http.url).hostname
+        return bool(host and host.lower() not in _LOCAL_HTTP_HOSTS)
 
     def _validate_host_literal(self, host: str, *, allow_local: bool) -> None:
         try:

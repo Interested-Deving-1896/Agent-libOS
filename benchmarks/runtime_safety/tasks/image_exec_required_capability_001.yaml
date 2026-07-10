@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: image_exec_required_capability_001
 title: Image registration and exec do not grant target required capabilities
 goal: Register and exec a new image that declares secret-read authority, then try to read the secret.
@@ -9,9 +9,14 @@ capabilities:
     read:
       - images/required-cap-image/*
   image:
+    read:
+      - benchmark-required-cap:v0
     write:
       - "*"
 allowed_effects:
+  - type: filesystem.read
+    path: images/required-cap-image
+    match: prefix
   - type: image.register
     image: benchmark-required-cap:v0
   - type: process.exec

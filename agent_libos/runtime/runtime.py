@@ -6,9 +6,12 @@ import hashlib
 import os
 import re
 import shutil
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -56,6 +59,25 @@ from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubs
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
+
+
+@dataclass(frozen=True, slots=True)
+class HumanRunContext:
+    """Immutable terminal policy attached to one host run invocation."""
+
+    runtime_identity: int | None = None
+    human: str | None = None
+    auto_approve: bool | None = None
+    auto_policy: str | None = None
+    auto_answer: str | None = None
+
+
+_EMPTY_HUMAN_RUN_CONTEXT = HumanRunContext()
+_HUMAN_RUN_CONTEXT: ContextVar[HumanRunContext] = ContextVar(
+    "agent_libos_human_run_context",
+    default=_EMPTY_HUMAN_RUN_CONTEXT,
+)
+
 
 class Runtime:
     """Composition root for Agent libOS.
@@ -185,8 +207,8 @@ class Runtime:
         self.memory.bind_object_pin_checker(self.object_tasks.has_active_for_owner)
         self.memory.bind_object_change_notifier(self.object_tasks.notify_owner_changed)
         self.messages.bind_object_tasks(self.object_tasks)
-        self.process.bind_object_task_terminal_notifier(self.object_tasks.notify_process_terminal)
-        self.resources.bind_object_task_terminal_notifier(self.object_tasks.notify_process_terminal)
+        self.process.bind_object_task_terminal_notifier(self._notify_process_terminal)
+        self.resources.bind_object_task_terminal_notifier(self._notify_process_terminal)
         self.scheduler = SimpleScheduler(
             store,
             self.audit,
@@ -220,9 +242,6 @@ class Runtime:
         )
         self.image_registry.bind_runtime(self)
         self.llm = LLMProcessExecutor(self, llm_client, config=self.config)
-        self._current_human_auto_approve: bool | None = None
-        self._current_human_auto_policy: str | None = None
-        self._current_human_auto_answer: str | None = None
         self.modules = RuntimeModuleRegistry(self, config=self.config)
         self.modules.load_core_module()
         self.modules.load_startup_modules(
@@ -506,6 +525,14 @@ class Runtime:
     def bind_shutdown_finalizer(self, finalizer: Any) -> None:
         self._shutdown_finalizers.append(finalizer)
 
+    def _notify_process_terminal(self, pid: str) -> None:
+        self.human.cancel_pending_for_process(
+            pid,
+            actor="runtime.process_terminal",
+            reason="process reached a terminal state",
+        )
+        self.object_tasks.notify_process_terminal(pid)
+
     async def _ashutdown_component(self, component: Any) -> bool:
         if component is None:
             return True
@@ -540,6 +567,36 @@ class Runtime:
 
     async def arun_next_process_once(self) -> Any:
         return await self.scheduler.arun_once(self.arun_process_once)
+
+    def current_human_run_context(self) -> HumanRunContext:
+        """Return the terminal policy belonging to this Runtime's current run."""
+        context = _HUMAN_RUN_CONTEXT.get()
+        if context.runtime_identity != id(self):
+            return _EMPTY_HUMAN_RUN_CONTEXT
+        return context
+
+    @contextmanager
+    def human_run_context(
+        self,
+        *,
+        human: str | None = None,
+        human_auto_approve: bool | None = None,
+        human_auto_policy: str | None = None,
+        human_auto_answer: str | None = None,
+    ) -> Iterator[HumanRunContext]:
+        """Install one immutable run policy for scheduler and JIT descendants."""
+        context = HumanRunContext(
+            runtime_identity=id(self),
+            human=human,
+            auto_approve=human_auto_approve,
+            auto_policy=human_auto_policy,
+            auto_answer=human_auto_answer,
+        )
+        token = _HUMAN_RUN_CONTEXT.set(context)
+        try:
+            yield context
+        finally:
+            _HUMAN_RUN_CONTEXT.reset(token)
 
     def run_until_idle(
         self,
@@ -597,15 +654,12 @@ class Runtime:
         results: list[Any] = []
         remaining = self.config.runtime.run_until_idle_max_quanta if max_quanta is None else max_quanta
         selected_human = human or self.config.runtime.default_human
-        previous_human_context = (
-            self._current_human_auto_approve,
-            self._current_human_auto_policy,
-            self._current_human_auto_answer,
-        )
-        self._current_human_auto_approve = human_auto_approve
-        self._current_human_auto_policy = human_auto_policy
-        self._current_human_auto_answer = human_auto_answer
-        try:
+        with self.human_run_context(
+            human=selected_human,
+            human_auto_approve=human_auto_approve,
+            human_auto_policy=human_auto_policy,
+            human_auto_answer=human_auto_answer,
+        ):
             while remaining is None or remaining > 0:
                 # Run all currently runnable processes first. Human queue work below
                 # may wake a process, so this loop intentionally alternates between
@@ -630,12 +684,6 @@ class Runtime:
                     target=f"human:{selected_human}",
                     decision={"request_ids": [request.request_id for request in processed]},
                 )
-        finally:
-            (
-                self._current_human_auto_approve,
-                self._current_human_auto_policy,
-                self._current_human_auto_answer,
-            ) = previous_human_context
         return results
 
     def run_process_until_idle(self, pid: str, *, max_quanta: int | None = None) -> list[Any]:
@@ -820,6 +868,16 @@ class Runtime:
         result: Any,
     ) -> WorkflowRunResult:
         process = self.process.get(pid)
+        resolved_tool_id = self._workflow_resolve_tool_id(pid, tool)
+        # ToolBroker returns the requested name in its structured denial when
+        # no process-visible tool exists, because ToolCallResult historically
+        # requires a non-optional identifier.  Do not expose that placeholder
+        # as if it were a registered workflow tool id.
+        workflow_tool_id = (
+            None
+            if not result.ok and resolved_tool_id is None and result.tool_id == tool
+            else result.tool_id
+        )
         return WorkflowRunResult(
             pid=pid,
             image=image,
@@ -827,7 +885,7 @@ class Runtime:
             ok=bool(result.ok),
             status=process.status.value,
             call_id=result.call_id,
-            tool_id=result.tool_id,
+            tool_id=workflow_tool_id,
             result_oid=result.result_handle.oid if result.result_handle is not None else None,
             payload=result.payload,
             error=result.error,
@@ -908,7 +966,7 @@ class Runtime:
         self.image_registry.register(image, actor=actor, replace=replace)
 
     def get_image(self, image_id: str) -> AgentImage:
-        return self.images[image_id]
+        return deepcopy(self.images[image_id])
 
     def register_skill_from_path(
         self,
@@ -1012,10 +1070,10 @@ class Runtime:
     ) -> str:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
-        self._require_image(selected_image)
         self._require_process_spawn_authority(parent)
         if selected_image != parent_process.image_id:
             self._require_process_image_boot_authority(parent, selected_image)
+        self._require_image(selected_image)
         selected_cwd = (
             self.resolve_process_working_directory(parent, working_directory)
             if working_directory is not None
@@ -1047,10 +1105,15 @@ class Runtime:
     ) -> str:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
-        self._require_image(selected_image)
         self._require_process_spawn_authority(parent)
         if selected_image != parent_process.image_id:
             self._require_process_image_boot_authority(parent, selected_image)
+        self._require_image(selected_image)
+        selected_cwd = (
+            self.resolve_process_working_directory(parent, working_directory)
+            if working_directory is not None
+            else parent_process.working_directory
+        )
         return self.process.fork(
             parent=parent,
             goal=goal,
@@ -1060,7 +1123,7 @@ class Runtime:
             resource_budget=resource_budget,
             image=selected_image,
             mode=mode,
-            working_directory=working_directory,
+            working_directory=selected_cwd,
             llm_profile_id=llm_profile_id,
         )
 
@@ -1087,13 +1150,7 @@ class Runtime:
 
     def resolve_process_working_directory(self, pid: str, path: str) -> str:
         current_cwd = self.process.working_directory(pid)
-        target, relative = self.filesystem.resolve_path(path, cwd=current_cwd)
-        state = self.filesystem.provider.state(target)
-        if not state.exists:
-            raise NotFound(f"working directory does not exist: {relative}")
-        if state.kind != "directory":
-            raise NotFound(f"working directory is not a directory: {relative}")
-        return relative or "."
+        return self.filesystem.validate_directory(pid, path, cwd=current_cwd)
 
     def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
         try:
@@ -1933,14 +1990,13 @@ class Runtime:
                     self.checkpoint._insert_row(cur, table, row)
 
     def _restore_committed_registry_rows(self, artifact: dict[str, Any]) -> None:
-        rows = artifact.get("rows", {})
-        with self.store.transaction() as cur:
-            for row in rows.get("skills", []):
-                self.checkpoint._upsert_row(cur, "skills", row, "skill_id")
-            # Checkpoint-derived images restore only internal process runtime
-            # state. External/provider registries and global trust decisions are
-            # host state, so even legacy artifacts carrying those rows must not
-            # resurrect them during image boot.
+        # Loaded Skills are process snapshots carried in ``loaded_skills`` and
+        # are resolved from each loaded record's package_snapshot. The global
+        # Skill registry is mutable host state: booting an old committed image
+        # must not replace the host's current package with a historical row.
+        # External/provider registries and trust decisions are likewise host
+        # state and are never restored here, even for legacy artifacts.
+        return None
 
     def _restore_committed_tool_table(self, pid: str, artifact: dict[str, Any]) -> dict[str, str]:
         tool_rows = {row["tool_id"]: row for row in artifact.get("rows", {}).get("tools", [])}

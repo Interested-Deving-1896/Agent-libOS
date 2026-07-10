@@ -26,6 +26,14 @@ class ShellCommandRule:
     match: Literal["exact", "prefix"] = "exact"
     description: str = ""
 
+    def __post_init__(self) -> None:
+        if not self.argv:
+            raise ValueError("shell command rule argv must include an executable")
+        if not self.argv[0].strip():
+            raise ValueError("shell command rule argv[0] must be a non-empty executable")
+        if any("\x00" in token for token in self.argv):
+            raise ValueError("shell command rule argv must not contain NUL bytes")
+
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class RuntimeDefaults:
@@ -114,7 +122,7 @@ class SchedulerDefaults:
 class ProcessDefaults:
     max_tool_calls: int = 256
     max_child_processes: int = 16
-    max_runtime_seconds: int | None = None
+    max_runtime_seconds: float | None = None
     max_context_materialization_tokens: int = 65_536
     max_context_materialization_total_tokens: int | None = None
     max_llm_calls: int | None = None
@@ -253,11 +261,6 @@ class ShellDefaults:
     policy_capability_key: str = "shell_policy_level"
     policy_resource: str = "shell:*"
     default_policy_level: ShellPolicyLevel = "allowlist_auto_else_ask"
-    always_deny_level: ShellPolicyLevel = "always_deny"
-    allowlist_auto_else_ask_level: ShellPolicyLevel = "allowlist_auto_else_ask"
-    blocklist_ask_else_auto_level: ShellPolicyLevel = "blocklist_ask_else_auto"
-    always_allow_level: ShellPolicyLevel = "always_allow"
-    high_risk_level: ShellPolicyLevel = "always_allow"
     timeout_hard_limit_s: float = 300.0
     max_stdout_chars: int = 32_000
     max_stderr_chars: int = 32_000
@@ -324,6 +327,22 @@ class ShellDefaults:
         ShellCommandRule(("su",), match="prefix"),
         ShellCommandRule(("runas",), match="prefix"),
     )
+
+    @property
+    def always_deny_level(self) -> ShellPolicyLevel:
+        return "always_deny"
+
+    @property
+    def allowlist_auto_else_ask_level(self) -> ShellPolicyLevel:
+        return "allowlist_auto_else_ask"
+
+    @property
+    def blocklist_ask_else_auto_level(self) -> ShellPolicyLevel:
+        return "blocklist_ask_else_auto"
+
+    @property
+    def always_allow_level(self) -> ShellPolicyLevel:
+        return "always_allow"
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -440,7 +459,6 @@ class CheckpointDefaults:
     payload_capture_limit_bytes: int = 1_048_576
     snapshot_hard_limit_bytes: int = 16_777_216
     diff_preview_items: int = 25
-    auto_high_risk_checkpoint: bool = False
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)

@@ -1,4 +1,4 @@
-import type { AgentRating, GuiConnection, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
+import type { AgentRating, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -294,10 +294,10 @@ export class LibOSClient {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/exit`, { message, failed, confirmed });
   }
 
-  async respondHumanRequest(requestId: string, approved: boolean, answer: string, autoRun: boolean, maxQuanta: OptionalQuanta) {
+  async respondHumanRequest(requestId: string, response: HumanResponseInput, autoRun: boolean, maxQuanta: OptionalQuanta) {
+    const { kind: _kind, ...decision } = response;
     return this.request("POST", `/api/human-requests/${encodeURIComponent(requestId)}/respond`, withOptionalQuanta({
-      approved,
-      answer,
+      ...decision,
       auto_run: autoRun
     }, maxQuanta));
   }

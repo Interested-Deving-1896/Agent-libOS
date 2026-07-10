@@ -81,6 +81,12 @@ actor. For `stdio` servers, actor-mode registration, live tool refresh, and tool
 calls also require `process:spawn` `write` because the provider starts a local
 child process. `call_mcp_tool` requires the right declared by the tool spec on
 `mcp:<server_id>:<tool_id>`.
+
+For a live refresh/call, every finite decision needed by that one composite
+boundary is reserved together before provider work: the main tool or server
+decision plus stdio `process:spawn` and exact `mcp_stdio:<hash> execute` when
+applicable. Repeated selection of the same capability id is deduplicated, so a
+single grant satisfying server read and execute is charged once, not twice.
 For tool calls, the primitive gates on `server_id` and `tool_id` before loading
 server metadata or input schemas. A process without tool invocation authority
 gets a generic denial and cannot enumerate registered MCP server metadata
@@ -95,14 +101,15 @@ process cannot call a registered MCP tool without the matching capability.
 ## Security Rules
 
 Only manifest-declared tools may be called. Argument schema failures, missing
-runtime environment variables, HTTP runtime-resolution failures, request-size
-failures, resource-budget preflight failures, and external-effect classifier
-failures happen before the provider boundary and do not consume one-shot tool
-authority. After those checks pass, the one-shot tool grant is consumed just
-before live metadata or provider calls. The primitive asks the provider for live
-tool metadata and fails closed if the server no longer exposes the tool or if a
-pinned `input_schema` changed; those post-boundary failures do not restore the
-use.
+runtime environment variables, request-size failures, resource-budget preflight
+failures, and preflight external-effect classifier failures happen before
+finite authority is reserved. For non-local Streamable HTTP, reservation and
+pending-effect persistence precede DNS because host resolution is itself an
+external observation; an ordinary DNS failure therefore consumes the use and
+finalizes information-flow evidence even without a tool request. The primitive
+asks the provider for live tool metadata and fails closed if the
+server no longer exposes the tool or if a pinned `input_schema` changed; those
+post-boundary failures do not restore the use.
 
 HTTP transport follows the same default network posture as JSON-RPC: HTTPS for
 remote hosts, plain HTTP only for local development hosts, no URL userinfo or
@@ -119,6 +126,34 @@ MCP call arguments and audit context are bounded and sanitized. MCP result
 payloads are JSON-serializable; binary-like content is represented by bounded
 metadata rather than raw bytes.
 
+## External Effects
+
+A refreshed `list_tools` call atomically reserves its finite composite
+authority and persists an `external_effects` row with provider `mcp`, operation
+`list_tools`, and `effect_state: pending` before non-local DNS or the live
+metadata request. Its event/audit/classification path CASes the same
+`effect_id` to `finalized`. If the provider raises or a post-provider sink
+fails, the operation is finalized conservatively when possible; otherwise the
+pending/unknown row remains durable.
+
+`call_tool` similarly reserves deduplicated main/stdio authority and creates one
+pending row after local preflight. That intent spans non-local DNS, the
+mandatory live tool-metadata validation, and the actual tool call: once DNS or
+either live provider boundary is crossed, schema drift, transport failure,
+event/audit failure, or post-call classifier failure cannot be interpreted as
+“no remote effect.” A
+successful final path conditionally finalizes the same id; post-call classifier
+failure falls back to a conservative classification. A
+`ProviderEffectNotStarted` from the first local/stdio live boundary atomically
+restores the reservations and abandons the pending row. Non-local DNS is an
+earlier information flow, so a live-validation PENS after DNS cannot restore or
+abandon. If live validation succeeded and the main `call_tool` then reports
+not-started, the validation already flowed server metadata: the intent is finalized
+`unknown` with `state_mutation=false, information_flow=true`, not abandoned.
+
+Checkpoint reports and benchmark evidence include both finalized and still
+pending MCP effects. v1 does not compensate remote MCP state.
+
 ## CLI
 
 ```bash
@@ -134,6 +169,13 @@ uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 Registry commands accept `--actor-pid <pid>` to enforce that process's
 `mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
 audited admin registry operations.
+
+Per-server register/replace/inspect/tools/unregister authority is checked before
+the store loads existing server metadata. `replace=true` always requires
+server `admin`; non-replace registration requires `write`. Registration,
+replacement, and unregistration commit the server row, stale tool-grant
+invalidation, event, and audit in one store transaction, so a sink failure
+cannot leave a half-published registry mutation.
 
 The optional SDK-backed provider requires:
 

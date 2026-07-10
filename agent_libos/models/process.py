@@ -38,11 +38,24 @@ class ProcessSignal(StrEnum):
     TERMINATE = "terminate"
 
 
+_CONTINUOUS_BUDGET_FIELDS = {
+    "max_runtime_seconds",
+    "max_subprocess_wall_seconds",
+    "max_subprocess_cpu_seconds",
+}
+
+_CONTINUOUS_USAGE_FIELDS = {
+    "runtime_seconds",
+    "subprocess_wall_seconds",
+    "subprocess_cpu_seconds",
+}
+
+
 @dataclass
 class ResourceBudget:
     max_tool_calls: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_tool_calls)
     max_child_processes: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_child_processes)
-    max_runtime_seconds: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_runtime_seconds)
+    max_runtime_seconds: float | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_runtime_seconds)
     max_context_materialization_tokens: int = field(
         default_factory=lambda: DEFAULT_CONFIG.process.max_context_materialization_tokens
     )
@@ -67,10 +80,18 @@ class ResourceBudget:
     max_deno_syscalls: int | None = field(default_factory=lambda: DEFAULT_CONFIG.process.max_deno_syscalls)
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         for item in fields(self):
             value = getattr(self, item.name)
             allow_none = item.name != "max_context_materialization_tokens"
-            _validate_resource_number(item.name, value, allow_none=allow_none)
+            _validate_resource_number(
+                item.name,
+                value,
+                allow_none=allow_none,
+                require_integer=item.name not in _CONTINUOUS_BUDGET_FIELDS,
+            )
 
 
 @dataclass
@@ -95,8 +116,16 @@ class ResourceUsage:
     deno_syscalls: int = 0
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         for item in fields(self):
-            _validate_resource_number(item.name, getattr(self, item.name), allow_none=False)
+            _validate_resource_number(
+                item.name,
+                getattr(self, item.name),
+                allow_none=False,
+                require_integer=item.name not in _CONTINUOUS_USAGE_FIELDS,
+            )
 
 
 @dataclass
@@ -109,10 +138,16 @@ class ResourceReservation:
 
     def __post_init__(self) -> None:
         for key, value in self.reserved.items():
-            _validate_resource_number(key, value, allow_none=False)
+            _validate_resource_number(key, value, allow_none=False, require_integer=False)
 
 
-def _validate_resource_number(name: str, value: Any, *, allow_none: bool) -> None:
+def _validate_resource_number(
+    name: str,
+    value: Any,
+    *,
+    allow_none: bool,
+    require_integer: bool,
+) -> None:
     if value is None and allow_none:
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -121,6 +156,8 @@ def _validate_resource_number(name: str, value: Any, *, allow_none: bool) -> Non
         raise ValueError(f"{name} must be finite")
     if value < 0:
         raise ValueError(f"{name} cannot be negative")
+    if require_integer and not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
 
 
 PROMPT_MODE_IMAGE_ONLY = "image_only"

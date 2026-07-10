@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -23,7 +24,13 @@ from agent_libos.capability.profiles import SandboxProfileBuilder
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import SandboxError
 from agent_libos.models import ValidationResult
-from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
+from agent_libos.substrate import (
+    CommandMetrics,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
+    SubprocessTimeoutExpired,
+    WindowsJobObject,
+)
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.serde import to_jsonable
 
@@ -191,20 +198,41 @@ class DenoTypescriptSandbox(SandboxBackend):
             if cached_only:
                 command.append("--cached-only")
             command.append("runner.ts")
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=tmp,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **self._subprocess_group_kwargs(),
-            )
-            monitor_task = asyncio.create_task(self._monitor_process(proc, limits), name="deno-resource-monitor")
-            serve_task = asyncio.create_task(
-                self._serve_process(proc, args, syscall_handler),
-                name="deno-syscall-server",
-            )
+            (
+                launch_command,
+                launch_kwargs,
+                death_read_fd,
+                death_write_fd,
+                windows_job,
+                windows_gate,
+            ) = self._prepare_supervised_launch(command, tmp_path)
+            proc: asyncio.subprocess.Process | None = None
+            monitor_task: asyncio.Task[CommandMetrics] | None = None
+            serve_task: asyncio.Task[Any] | None = None
             try:
+                proc = await asyncio.create_subprocess_exec(
+                    *launch_command,
+                    cwd=tmp,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    **launch_kwargs,
+                )
+                if death_read_fd is not None:
+                    os.close(death_read_fd)
+                    death_read_fd = None
+                if windows_job is not None:
+                    try:
+                        windows_job.assign_pid(proc.pid)
+                        assert windows_gate is not None
+                        windows_gate.write_text("contained\n", encoding="utf-8")
+                    except Exception as exc:
+                        raise SandboxError("failed to attach Deno supervisor to Windows Job Object") from exc
+                monitor_task = asyncio.create_task(self._monitor_process(proc, limits), name="deno-resource-monitor")
+                serve_task = asyncio.create_task(
+                    self._serve_process(proc, args, syscall_handler),
+                    name="deno-syscall-server",
+                )
                 done, pending = await asyncio.wait(
                     {serve_task, monitor_task},
                     timeout=selected_timeout,
@@ -253,14 +281,26 @@ class DenoTypescriptSandbox(SandboxBackend):
                 await self._kill_process(proc)
                 raise TimeoutError(f"Deno JIT tool timed out after {selected_timeout}s") from exc
             except Exception:
-                await self._kill_process(proc)
+                if proc is not None:
+                    await self._kill_process(proc)
                 raise
             finally:
-                await asyncio.shield(self._kill_process(proc))
-                for task in (serve_task, monitor_task):
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(serve_task, monitor_task, return_exceptions=True)
+                try:
+                    if proc is not None:
+                        await asyncio.shield(self._kill_process(proc))
+                    tasks = [task for task in (serve_task, monitor_task) if task is not None]
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    if death_read_fd is not None:
+                        os.close(death_read_fd)
+                    if death_write_fd is not None:
+                        os.close(death_write_fd)
+                    if windows_job is not None:
+                        windows_job.close()
 
     def run_tests(
         self,
@@ -355,6 +395,17 @@ class DenoTypescriptSandbox(SandboxBackend):
         if proc.stdin is None or proc.stdout is None or proc.stderr is None:
             raise SandboxError("Deno process was not created with stdio pipes")
         stderr_task = asyncio.create_task(proc.stderr.read(self.max_stderr_bytes + 1))
+        ready_line = await proc.stdout.readline()
+        if not ready_line:
+            stderr, _stderr_truncated = await self._finish_stderr(stderr_task)
+            code = await proc.wait()
+            raise SandboxError(stderr.strip() or f"Deno supervisor exited before containment readiness: {code}")
+        try:
+            ready_frame = json.loads(ready_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SandboxError(f"Deno supervisor produced invalid readiness frame: {ready_line[:200]!r}") from exc
+        if ready_frame != {"type": "supervisor_ready", "version": 1}:
+            raise SandboxError(f"unexpected Deno supervisor readiness frame: {ready_frame!r}")
         await self._write_frame(proc, {"type": "run", "args": to_jsonable(args)})
         stdout_bytes = 0
         rpc_calls = 0
@@ -415,11 +466,22 @@ class DenoTypescriptSandbox(SandboxBackend):
         cpu_seconds = 0.0
         try:
             ps_proc = psutil.Process(proc.pid)
-        except psutil.Error:
+        except (psutil.Error, OSError) as exc:
+            if limits is not None:
+                await self._kill_process(proc)
+                raise SandboxError("Deno resource monitor cannot inspect a budgeted subprocess") from exc
             return CommandMetrics(wall_seconds=max(0.0, time.monotonic() - started_at))
         while proc.returncode is None:
             wall_seconds = time.monotonic() - started_at
-            cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+            try:
+                cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+            except OSError as exc:
+                if limits is not None:
+                    await self._kill_process(proc)
+                    raise SandboxError("Deno resource monitor cannot enforce subprocess limits") from exc
+                # The outer wall timeout and process-group containment remain
+                # active even where the host denies process-tree inspection.
+                cpu_seconds, peak_memory = 0.0, 0
             limit_kind = self._limit_kind(
                 wall_seconds=wall_seconds,
                 cpu_seconds=cpu_seconds,
@@ -441,7 +503,12 @@ class DenoTypescriptSandbox(SandboxBackend):
                 )
             await asyncio.sleep(0.02)
         wall_seconds = time.monotonic() - started_at
-        final_cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+        try:
+            final_cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+        except OSError as exc:
+            if limits is not None:
+                raise SandboxError("Deno resource monitor could not verify subprocess limits") from exc
+            final_cpu_seconds, peak_memory = 0.0, 0
         return CommandMetrics(
             wall_seconds=wall_seconds,
             cpu_seconds=max(cpu_seconds, final_cpu_seconds),
@@ -535,6 +602,47 @@ class DenoTypescriptSandbox(SandboxBackend):
             return "", False
         return data[: self.max_stderr_bytes].decode("utf-8", errors="replace"), len(data) > self.max_stderr_bytes
 
+    def _prepare_supervised_launch(
+        self,
+        command: list[str],
+        tmp_path: Path,
+    ) -> tuple[
+        list[str],
+        dict[str, Any],
+        int | None,
+        int | None,
+        WindowsJobObject | None,
+        Path | None,
+    ]:
+        supervisor = Path(__file__).with_name("_process_supervisor.py")
+        if not supervisor.is_file():
+            raise SandboxError(f"Deno subprocess supervisor is unavailable: {supervisor}")
+        launch_command = [
+            sys.executable,
+            "-I",
+            str(supervisor),
+            "--parent-pid",
+            str(os.getpid()),
+        ]
+        launch_kwargs = self._subprocess_group_kwargs()
+        if os.name == "posix":
+            try:
+                death_read_fd, death_write_fd = os.pipe()
+            except OSError as exc:
+                raise SandboxError("failed to create Deno supervisor death pipe") from exc
+            launch_command.extend(["--death-fd", str(death_read_fd), "--", *command])
+            launch_kwargs["pass_fds"] = (death_read_fd,)
+            return launch_command, launch_kwargs, death_read_fd, death_write_fd, None, None
+        if os.name == "nt":
+            try:
+                job = WindowsJobObject.create()
+            except OSError as exc:
+                raise SandboxError("failed to create Deno KILL_ON_JOB_CLOSE Job Object") from exc
+            gate = tmp_path / ".deno-supervisor-contained"
+            launch_command.extend(["--gate-file", str(gate), "--", *command])
+            return launch_command, launch_kwargs, None, None, job, gate
+        raise SandboxError(f"Deno subprocess containment is unavailable on platform: {os.name}")
+
     def _subprocess_group_kwargs(self) -> dict[str, Any]:
         if os.name == "nt":
             return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
@@ -544,7 +652,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         descendants: list[psutil.Process] = []
         try:
             descendants = psutil.Process(proc.pid).children(recursive=True)
-        except psutil.Error:
+        except (psutil.Error, OSError):
             pass
         if os.name != "nt":
             try:

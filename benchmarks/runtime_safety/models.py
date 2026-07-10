@@ -26,6 +26,8 @@ VALID_EFFECT_TYPES = {
     "external.provider_call",
 }
 
+VALID_EFFECT_OUTCOMES = {"performed", "denied", "not_started", "simulated", "unknown"}
+
 
 class BenchmarkValidationError(ValueError):
     pass
@@ -42,7 +44,7 @@ class BenchmarkTask:
     forbidden_effects: list[dict[str, Any]]
     success_oracle: list[dict[str, Any]]
     safety_oracle: list[dict[str, Any]]
-    schema_version: int = 0
+    schema_version: int = 1
     setup: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
     policy: dict[str, Any] = field(default_factory=dict)
@@ -61,6 +63,9 @@ class EffectRecord:
     performed: bool
     denied: bool = False
     simulated: bool = False
+    effect_id: str | None = None
+    outcome: str | None = None
+    evidence: str | None = None
     path: str | None = None
     argv: list[str] | None = None
     namespace: str | None = None
@@ -80,12 +85,15 @@ class EffectRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "effect_id": self.effect_id,
             "task_id": self.task_id,
             "runner": self.runner,
             "type": self.type,
             "performed": self.performed,
             "denied": self.denied,
             "simulated": self.simulated,
+            "outcome": self.outcome,
+            "evidence": self.evidence,
             "path": self.path,
             "argv": self.argv,
             "namespace": self.namespace,
@@ -122,6 +130,8 @@ class BenchmarkResult:
     wall_time_s: float
     audit_records: int
     audit_completeness: float
+    valid: bool = True
+    invalid_reasons: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     workspace: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -143,6 +153,8 @@ class BenchmarkResult:
             "wall_time_s": self.wall_time_s,
             "audit_records": self.audit_records,
             "audit_completeness": self.audit_completeness,
+            "valid": self.valid,
+            "invalid_reasons": self.invalid_reasons,
             "errors": self.errors,
             "workspace": self.workspace,
             "metadata": self.metadata,

@@ -20,6 +20,7 @@ from agent_libos.models import (
     McpToolListResult,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.substrate import ProviderEffectNotStarted
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate.local import _allowed_mcp_connect_addresses
 from agent_libos.utils.serde import dumps
@@ -45,6 +46,98 @@ def _grant_stdio_spawn(
 
 
 class TestMcpPrimitive:
+    @pytest.mark.parametrize('operation', ['inspect', 'list_tools', 'unregister', 'register', 'replace'])
+    @pytest.mark.parametrize('server_id', ['secret-existing', 'secret-missing'])
+    def test_registry_item_authority_precedes_server_metadata_load(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+        server_id: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp registry oracle')
+
+            def fail_if_loaded(_server_id: str) -> Any:
+                raise AssertionError('server metadata must not load before authority')
+
+            monkeypatch.setattr(runtime.store, 'get_mcp_server', fail_if_loaded)
+            with pytest.raises(CapabilityDenied):
+                if operation == 'inspect':
+                    runtime.mcp.inspect_server(server_id, actor=pid)
+                elif operation == 'list_tools':
+                    runtime.mcp.list_tools(server_id, actor=pid, refresh=True)
+                elif operation == 'unregister':
+                    runtime.mcp.unregister_server(server_id, actor=pid)
+                else:
+                    runtime.mcp.register_server_from_yaml_text(
+                        _stdio_manifest(server_id),
+                        actor=pid,
+                        replace=operation == 'replace',
+                    )
+        finally:
+            runtime.close()
+
+    def test_registry_register_audit_failure_rolls_back_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        original_record = runtime.audit.record
+
+        def fail_register_audit(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get('action') == 'mcp.server.register':
+                raise RuntimeError('injected mcp register audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.audit, 'record', fail_register_audit)
+        try:
+            with pytest.raises(RuntimeError, match='register audit failure'):
+                runtime.mcp.register_server_from_yaml_text(
+                    _stdio_manifest('register-rollback'),
+                    actor='cli',
+                    require_capability=False,
+                )
+            assert runtime.store.get_mcp_server('register-rollback') is None
+        finally:
+            runtime.close()
+
+    def test_registry_unregister_audit_failure_rolls_back_server_and_tool_caps(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('unregister-rollback'),
+                actor='cli',
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp unregister rollback')
+            cap = runtime.capability.grant(
+                pid,
+                'mcp:unregister-rollback:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            original_record = runtime.audit.record
+
+            def fail_unregister_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'mcp.server.unregister':
+                    raise RuntimeError('injected mcp unregister audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_unregister_audit)
+            with pytest.raises(RuntimeError, match='unregister audit failure'):
+                runtime.mcp.unregister_server(
+                    'unregister-rollback',
+                    actor='cli',
+                    require_capability=False,
+                )
+
+            assert runtime.store.get_mcp_server('unregister-rollback') is not None
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.active and not persisted.revoked
+        finally:
+            runtime.close()
+
     def test_manifest_validation_rejects_unsafe_server_shapes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open("local")
         try:
@@ -132,6 +225,406 @@ class TestMcpPrimitive:
             assert effect.rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
             assert not effect.state_mutation
             assert effect.information_flow
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('sink', ['event', 'audit'])
+    def test_list_tools_refresh_post_provider_sink_failure_leaves_pending_effect_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sink: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        resource = 'mcp_server:pending-list'
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'mcp list {sink} sink failure')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('pending-list'),
+                actor='cli',
+                require_capability=False,
+            )
+            if sink == 'event':
+                original_emit = runtime.events.emit
+
+                def fail_result_event(event_type: Any, *args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get('target') == resource:
+                        raise RuntimeError('injected mcp list event failure')
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_result_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_result_audit(*args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get('action') == 'primitive.mcp.list_tools':
+                        raise RuntimeError('injected mcp list audit failure')
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_result_audit)
+
+            with pytest.raises(RuntimeError, match=f'injected mcp list {sink} failure'):
+                runtime.mcp.list_tools(
+                    'pending-list',
+                    actor=pid,
+                    require_capability=False,
+                    refresh=True,
+                )
+
+            assert provider.list_calls == ['pending-list']
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].provider == 'mcp'
+            assert effects[0].operation == 'list_tools'
+            assert effects[0].effect_state == 'pending'
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('sink', ['event', 'audit'])
+    def test_call_tool_post_provider_sink_failure_leaves_pending_effect_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sink: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        resource = 'mcp:pending-call:echo'
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'mcp call {sink} sink failure')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('pending-call'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(pid, resource, [CapabilityRight.READ], issued_by='test')
+            _grant_stdio_spawn(runtime, pid)
+            if sink == 'event':
+                original_emit = runtime.events.emit
+
+                def fail_result_event(event_type: Any, *args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get('target') == resource:
+                        raise RuntimeError('injected mcp call event failure')
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_result_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_result_audit(*args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get('action') == 'primitive.mcp.call':
+                        raise RuntimeError('injected mcp call audit failure')
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_result_audit)
+
+            with pytest.raises(RuntimeError, match=f'injected mcp call {sink} failure'):
+                runtime.mcp.call_tool(pid, 'pending-call', 'echo', {'text': 'hello'})
+
+            assert provider.list_calls == ['pending-call']
+            assert provider.call_args == [('pending-call', 'echo', {'text': 'hello'})]
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].provider == 'mcp'
+            assert effects[0].operation == 'call_tool'
+            assert effects[0].effect_state == 'pending'
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('entry_point', ['refresh', 'call_validation'])
+    def test_list_tools_provider_not_started_abandons_effect_intent(self, entry_point: str) -> None:
+        runtime = Runtime.open('local')
+        provider = _NotStartedListMcpProvider()
+        runtime.mcp.provider = provider
+        server_id = f'not-started-{entry_point}'
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'mcp {entry_point} not started')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(server_id),
+                actor='cli',
+                require_capability=False,
+            )
+            main_cap = None
+            if entry_point == 'call_validation':
+                main_cap = runtime.capability.grant_once(
+                    pid,
+                    f'mcp:{server_id}:echo',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+                if entry_point == 'refresh':
+                    runtime.mcp.list_tools(
+                        server_id,
+                        actor=pid,
+                        require_capability=False,
+                        refresh=True,
+                    )
+                else:
+                    runtime.mcp.call_tool(pid, server_id, 'echo', {'text': 'hello'})
+
+            assert provider.list_calls == [server_id]
+            assert provider.call_args == []
+            assert runtime.store.list_external_effects(pid=pid) == []
+            if main_cap is not None:
+                persisted = runtime.store.get_capability(main_cap.cap_id)
+                assert persisted is not None and persisted.uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_call_tool_not_started_after_live_validation_finalizes_unknown_information_flow(self) -> None:
+        runtime = Runtime.open('local')
+        provider = _NotStartedCallMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp call not started after validation')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('call-not-started'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:call-not-started:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            result = runtime.mcp.call_tool(pid, 'call-not-started', 'echo', {'text': 'hello'})
+
+            assert not result.ok
+            assert result.status.value == 'transport_error'
+            assert provider.list_calls == ['call-not-started']
+            assert provider.call_args == [('call-not-started', 'echo', {'text': 'hello'})]
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            effect = effects[0]
+            assert effect.operation == 'call_tool'
+            assert effect.effect_state == 'finalized'
+            assert effect.rollback_class == ExternalEffectRollbackClass.UNKNOWN
+            assert effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert not effect.state_mutation
+            assert effect.information_flow
+            assert effect.provider_metadata['outcome'] == 'call_tool_not_started_after_live_validation'
+        finally:
+            runtime.close()
+
+    def test_stdio_live_validation_not_started_restores_all_finite_authority(self) -> None:
+        runtime = Runtime.open('local')
+        provider = _NotStartedListMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp composite authority restore')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('composite-restore'),
+                actor='cli',
+                require_capability=False,
+            )
+            main = runtime.capability.grant_once(
+                pid,
+                'mcp:composite-restore:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            spawn = runtime.capability.grant_once(
+                pid,
+                'process:spawn',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            stdio = runtime.capability.grant_once(
+                pid,
+                runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server']),
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+                runtime.mcp.call_tool(pid, 'composite-restore', 'echo', {'text': 'hello'})
+
+            for cap in (main, spawn, stdio):
+                persisted = runtime.store.get_capability(cap.cap_id)
+                assert persisted is not None and persisted.uses_remaining == 1
+            assert runtime.store.list_external_effects(pid=pid) == []
+        finally:
+            runtime.close()
+
+    def test_stdio_success_commits_all_finite_authority(self) -> None:
+        runtime = Runtime.open('local')
+        runtime.mcp.provider = _RecordingMcpProvider()
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp composite authority commit')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('composite-commit'),
+                actor='cli',
+                require_capability=False,
+            )
+            caps = [
+                runtime.capability.grant_once(
+                    pid,
+                    'mcp:composite-commit:echo',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                ),
+                runtime.capability.grant_once(
+                    pid,
+                    'process:spawn',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                ),
+                runtime.capability.grant_once(
+                    pid,
+                    runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server']),
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                ),
+            ]
+
+            assert runtime.mcp.call_tool(pid, 'composite-commit', 'echo', {'text': 'hello'}).ok
+
+            for cap in caps:
+                persisted = runtime.store.get_capability(cap.cap_id)
+                assert persisted is not None and persisted.uses_remaining == 0
+        finally:
+            runtime.close()
+
+    def test_list_refresh_deduplicates_one_capability_selected_for_read_and_execute(self) -> None:
+        runtime = Runtime.open('local')
+        runtime.mcp.provider = _NotStartedListMcpProvider()
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp refresh authority dedup')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('refresh-dedup'),
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'mcp_server:refresh-dedup',
+                [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+                runtime.mcp.list_tools('refresh-dedup', actor=pid, refresh=True)
+            restored = runtime.store.get_capability(cap.cap_id)
+            assert restored is not None and restored.uses_remaining == 1
+
+            runtime.mcp.provider = _RecordingMcpProvider()
+            assert runtime.mcp.list_tools('refresh-dedup', actor=pid, refresh=True)['refreshed']
+            committed = runtime.store.get_capability(cap.cap_id)
+            assert committed is not None and committed.uses_remaining == 0
+        finally:
+            runtime.close()
+
+    def test_http_resolution_certified_not_started_restores_all_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        runtime.mcp.provider = _RecordingMcpProvider()
+        monkeypatch.setenv('AGENT_LIBOS_MCP_TEST_TOKEN', 'token')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp resolution not started')
+            runtime.mcp.register_server_from_yaml_text(
+                _http_manifest('resolution-not-started', 'https://mcp.example.test/tools'),
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'mcp:resolution-not-started:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            monkeypatch.setattr(
+                runtime.mcp,
+                '_validate_runtime_resolution',
+                lambda _spec: (_ for _ in ()).throw(ProviderEffectNotStarted('resolution did not start')),
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='resolution did not start'):
+                runtime.mcp.call_tool(pid, 'resolution-not-started', 'echo', {'text': 'hello'})
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
+            assert runtime.store.list_external_effects(pid=pid) == []
+        finally:
+            runtime.close()
+
+    def test_http_live_validation_not_started_after_dns_keeps_information_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _NotStartedListMcpProvider()
+        runtime.mcp.provider = provider
+        monkeypatch.setenv('AGENT_LIBOS_MCP_TEST_TOKEN', 'token')
+        monkeypatch.setattr(
+            'agent_libos.primitives.mcp.socket.getaddrinfo',
+            lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))],
+        )
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp post-dns not started')
+            runtime.mcp.register_server_from_yaml_text(
+                _http_manifest('post-dns-not-started', 'https://mcp.example.test/tools'),
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'mcp:post-dns-not-started:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+                runtime.mcp.call_tool(pid, 'post-dns-not-started', 'echo', {'text': 'hello'})
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 0
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].effect_state == 'finalized'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].information_flow
+            assert effects[0].provider_metadata['phase'] == 'live_validation_not_started_after_dns'
+        finally:
+            runtime.close()
+
+    def test_local_http_provider_not_started_before_transport_restores_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _NotStartedListMcpProvider()
+        runtime.mcp.provider = provider
+        monkeypatch.setenv('AGENT_LIBOS_MCP_TEST_TOKEN', 'token')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='local mcp not started')
+            runtime.mcp.register_server_from_yaml_text(
+                _http_manifest('local-not-started', 'http://localhost:8765/tools'),
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'mcp:local-not-started:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+                runtime.mcp.call_tool(pid, 'local-not-started', 'echo', {'text': 'hello'})
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
+            assert runtime.store.list_external_effects(pid=pid) == []
         finally:
             runtime.close()
 
@@ -368,7 +861,7 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
-    def test_http_dns_private_resolution_denies_before_provider_or_capability_use(
+    def test_http_dns_private_resolution_consumes_authority_and_records_information_flow(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -395,7 +888,14 @@ class TestMcpPrimitive:
 
             assert provider.list_calls == []
             assert provider.call_args == []
-            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 0
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].effect_state == 'finalized'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].information_flow
+            assert effects[0].provider_metadata['phase'] == 'dns_resolution'
         finally:
             runtime.close()
 
@@ -802,6 +1302,18 @@ class _RecordingMcpProvider:
             state_mutation=bool(context["state_mutation"]),
             information_flow=bool(context["information_flow"]),
         )
+
+
+class _NotStartedListMcpProvider(_RecordingMcpProvider):
+    def list_tools(self, server: Any, **_kwargs: Any) -> McpToolListResult:
+        self.list_calls.append(server.server_id)
+        raise ProviderEffectNotStarted('mcp failed before list transport')
+
+
+class _NotStartedCallMcpProvider(_RecordingMcpProvider):
+    def call_tool(self, server: Any, tool: Any, arguments: dict[str, Any], **_kwargs: Any) -> McpProviderCallResult:
+        self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
+        raise ProviderEffectNotStarted('mcp failed before tool transport')
 
 
 class _CallOnlyClassifierMcpProvider(_RecordingMcpProvider):

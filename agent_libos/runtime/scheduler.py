@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import threading
 import time
@@ -369,11 +370,14 @@ class AsyncProcessScheduler:
         return self.store.claim_runnable_process(pid)
 
     def _submit(self, pid: str, operation: Callable[[], Any], *, unblock: bool = False) -> Future[Any]:
+        # ThreadPoolExecutor does not propagate ContextVars. Capture the host
+        # run context at submission so it follows the process quantum.
+        context = contextvars.copy_context()
         with self._executor_lock:
             if self._closed:
                 raise RuntimeError("scheduler is shut down")
             executor = self._unblock_executor if unblock else self._executor
-            future = executor.submit(operation)
+            future = executor.submit(context.run, operation)
         with self._futures_lock:
             self._futures[future] = pid
         future.add_done_callback(self._forget_future)

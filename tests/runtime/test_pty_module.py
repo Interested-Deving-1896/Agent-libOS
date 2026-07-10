@@ -18,8 +18,8 @@ from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.models import AgentImage, CapabilityRight, ExternalEffectClassification
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
 from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
-from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
-from modules.pty.pty_module import LocalPtyProvider
+from agent_libos.substrate import LocalResourceProviderSubstrate, ProviderEffectNotStarted, SubprocessLimits
+from modules.pty.pty_module import LocalPtyProvider, _PtyRuntimeSession
 
 
 class TestPtyModule:
@@ -75,6 +75,32 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_create_tool_explicit_cwd_uses_directory_read_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            explicit_cwd = Path(temp_dir) / "work"
+            explicit_cwd.mkdir()
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty explicit cwd")
+                runtime.capability.issue_trusted(
+                    pid,
+                    runtime.filesystem.directory_resource_for_path("work"),
+                    [CapabilityRight.READ],
+                    issued_by="test.pty.cwd",
+                )
+
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "cwd": "work", "startup_timeout_s": 0},
+                )
+
+                assert created.ok, created.error
+                assert provider.spawned[0]["cwd"] == "work"
+            finally:
+                runtime.close()
+
     def test_process_exit_releases_pty_session_object_and_closes_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider()
@@ -106,6 +132,74 @@ class TestPtyModule:
 
                 assert provider.sessions[0].closed
                 assert runtime.store.get_object(session_oid) is None
+            finally:
+                runtime.close()
+
+    def test_direct_object_release_finalizer_failure_keeps_object_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(close_failures=1)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="direct release retry")
+                created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+
+                with pytest.raises(RuntimeError, match="simulated close failure"):
+                    runtime.memory.delete_object_trusted("test", session_oid, reason="direct_release_failure")
+
+                assert provider.sessions[0].closed is False
+                assert runtime.store.get_object(session_oid) is not None
+                assert session_oid in _pty_adapter(runtime)._sessions
+
+                assert runtime.memory.delete_object_trusted("test", session_oid, reason="direct_release_retry")
+                assert provider.sessions[0].closed
+                assert runtime.store.get_object(session_oid) is None
+            finally:
+                runtime.close()
+
+    def test_direct_object_release_db_failure_preserves_close_effect_and_retries_relational_delete(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="direct release db retry")
+                created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                original_record = runtime.audit.record
+
+                def fail_delete_audit(*args: Any, **kwargs: Any) -> Any:
+                    if kwargs.get("action") == "memory.delete_object":
+                        raise RuntimeError("injected object delete audit failure")
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, "record", fail_delete_audit)
+
+                with pytest.raises(RuntimeError, match="injected object delete audit failure"):
+                    runtime.memory.delete_object_trusted("test", session_oid, reason="direct_release_db_failure")
+
+                assert provider.sessions[0].closed
+                assert runtime.store.get_object(session_oid) is not None
+                close_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close" and effect.target == f"pty:{session_oid}"
+                ]
+                assert len(close_effects) == 1
+                assert close_effects[0].effect_state == "finalized"
+
+                monkeypatch.setattr(runtime.audit, "record", original_record)
+                assert runtime.memory.delete_object_trusted("test", session_oid, reason="direct_release_db_retry")
+                assert runtime.store.get_object(session_oid) is None
+                assert [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close" and effect.target == f"pty:{session_oid}"
+                ] == close_effects
             finally:
                 runtime.close()
 
@@ -155,6 +249,516 @@ class TestPtyModule:
                     for obj in runtime.store.list_objects()
                     if isinstance(obj.payload, dict) and obj.payload.get("kind") == "pty_session"
                 ] == []
+            finally:
+                runtime.close()
+
+    def test_pty_provider_certified_pre_effect_failure_restores_one_time_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = PreEffectFailurePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty pre-effect failure")
+                argv = ["git", "status"]
+                capability = _grant_exact_pty_once(runtime, pid, argv)
+
+                with pytest.raises(ProviderEffectNotStarted, match="before PTY spawn"):
+                    _pty_adapter(runtime).create(pid, argv, cwd=".", startup_timeout_s=0)
+
+                assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+                assert runtime.store.list_external_effects(pid=pid) == []
+                assert _pty_adapter(runtime)._pending_session_creates == 0
+            finally:
+                runtime.close()
+
+    def test_pty_ambiguous_spawn_failure_commits_once_and_records_unknown_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = AmbiguousFailurePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty ambiguous spawn failure")
+                argv = ["git", "status"]
+                capability = _grant_exact_pty_once(runtime, pid, argv)
+
+                with pytest.raises(TimeoutError, match="spawn outcome is unknown"):
+                    _pty_adapter(runtime).create(pid, argv, cwd=".", startup_timeout_s=0)
+
+                assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                assert effects[0].provider == "pty"
+                assert effects[0].operation == "spawn"
+                assert effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
+                assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                assert effects[0].provider_metadata["outcome"] == "unknown_after_provider_exception"
+                assert _pty_adapter(runtime)._pending_session_creates == 0
+            finally:
+                runtime.close()
+
+    def test_pty_session_object_failure_records_unknown_spawn_effect_and_consumes_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty object creation failure")
+                argv = ["git", "status"]
+                capability = _grant_exact_pty_once(runtime, pid, argv)
+                adapter = _pty_adapter(runtime)
+
+                def fail_session_object(*_args: Any, **_kwargs: Any) -> tuple[str, str, str]:
+                    raise RuntimeError("session object creation failed")
+
+                monkeypatch.setattr(adapter, "_create_session_object", fail_session_object)
+
+                with pytest.raises(RuntimeError, match="session object creation failed"):
+                    adapter.create(pid, argv, cwd=".", startup_timeout_s=0)
+
+                assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+                assert provider.sessions[0].closed
+                assert adapter._pending_session_creates == 0
+                assert [
+                    obj
+                    for obj in runtime.store.list_objects()
+                    if isinstance(obj.payload, dict) and obj.payload.get("kind") == "pty_session"
+                ] == []
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                effect = effects[0]
+                assert effect.provider == "pty"
+                assert effect.operation == "spawn"
+                assert effect.rollback_class == ExternalEffectRollbackClass.UNKNOWN
+                assert effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                assert effect.provider_metadata["outcome"] == "unknown_after_provider_success"
+                assert effect.provider_metadata["failure_phase"] == "session_object_creation"
+                assert effect.provider_metadata["cleanup"]["attempted"] is True
+                assert effect.provider_metadata["cleanup"]["succeeded"] is True
+            finally:
+                runtime.close()
+
+    def test_pty_write_resize_and_close_each_record_external_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty mutation effects")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+
+                adapter.write(pid, created.session_oid, "hello\n")
+                adapter.resize(pid, created.session_oid, cols=100, rows=30)
+                adapter.close(pid, created.session_oid)
+
+                effects = runtime.store.list_external_effects(pid=pid)
+                by_operation = {effect.operation: effect for effect in effects}
+                assert set(by_operation) == {"spawn", "write", "resize", "close"}
+                for operation in ("write", "resize", "close"):
+                    effect = by_operation[operation]
+                    assert effect.target == f"pty:{created.session_oid}"
+                    assert effect.record_id is not None
+                    assert effect.event_id is not None
+                    assert effect.rollback_class == ExternalEffectRollbackClass.IRREVERSIBLE
+                    assert effect.rollback_status == ExternalEffectRollbackStatus.NOT_SUPPORTED
+                assert by_operation["write"].provider_metadata["bytes_written"] == len("hello\n".encode("utf-8"))
+                assert by_operation["resize"].provider_metadata["cols"] == 100
+                assert by_operation["resize"].provider_metadata["rows"] == 30
+                assert by_operation["close"].provider_metadata["reason"] == "pty_close"
+            finally:
+                runtime.close()
+
+    def test_pty_write_event_failure_leaves_durable_pending_effect_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty write pending intent")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                finite = _grant_pty_object_once(
+                    runtime,
+                    pid,
+                    created.session_oid,
+                    CapabilityRight.WRITE,
+                )
+                original_emit = adapter.events.emit
+
+                def fail_write_event(event_type: Any, **kwargs: Any) -> Any:
+                    payload = kwargs.get("payload") or {}
+                    if payload.get("operation") == "write":
+                        raise RuntimeError("write event sink failed")
+                    return original_emit(event_type, **kwargs)
+
+                monkeypatch.setattr(adapter.events, "emit", fail_write_event)
+
+                with pytest.raises(RuntimeError, match="write event sink failed"):
+                    adapter.write(pid, created.session_oid, "hello\n")
+
+                assert provider.sessions[0].writes == ["hello\n"]
+                effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "write"
+                ]
+                assert len(effects) == 1
+                pending = effects[0]
+                assert pending.effect_state == "pending"
+                assert pending.record_id is None
+                assert pending.event_id is None
+                assert pending.rollback_class == ExternalEffectRollbackClass.UNKNOWN
+                assert pending.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                assert pending.target == f"pty:{created.session_oid}"
+                assert pending.provider_metadata["effect_state"] == "pending"
+                assert runtime.store.get_capability(finite.cap_id).uses_remaining == 0
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("operation", ["write", "resize", "close"])
+    def test_pty_one_time_mutation_provider_not_started_restores_use_and_abandons_intent(
+        self,
+        operation: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal=f"pty {operation} PENS")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                right = CapabilityRight.DELETE if operation == "close" else CapabilityRight.WRITE
+                finite = _grant_pty_object_once(runtime, pid, created.session_oid, right)
+                handle = provider.sessions[0]
+                original = getattr(handle, operation)
+
+                def fail_not_started(*_args: Any, **_kwargs: Any) -> Any:
+                    raise ProviderEffectNotStarted(f"{operation} did not start")
+
+                monkeypatch.setattr(handle, operation, fail_not_started)
+
+                with pytest.raises(ProviderEffectNotStarted, match="did not start"):
+                    _invoke_pty_mutation(adapter, pid, created.session_oid, operation)
+
+                assert runtime.store.get_capability(finite.cap_id).uses_remaining == 1
+                assert [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == operation
+                ] == []
+
+                monkeypatch.setattr(handle, operation, original)
+                _invoke_pty_mutation(adapter, pid, created.session_oid, operation)
+                assert runtime.store.get_capability(finite.cap_id).uses_remaining == 0
+                effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == operation
+                ]
+                assert len(effects) == 1
+                assert effects[0].effect_state == "finalized"
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("operation", ["write", "resize", "close"])
+    def test_pty_one_time_mutation_ambiguous_failure_consumes_use_and_keeps_pending_intent(
+        self,
+        operation: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal=f"pty {operation} ambiguous")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                right = CapabilityRight.DELETE if operation == "close" else CapabilityRight.WRITE
+                finite = _grant_pty_object_once(runtime, pid, created.session_oid, right)
+                handle = provider.sessions[0]
+                original = getattr(handle, operation)
+
+                def fail_ambiguous(*_args: Any, **_kwargs: Any) -> Any:
+                    raise RuntimeError(f"{operation} outcome unknown")
+
+                monkeypatch.setattr(handle, operation, fail_ambiguous)
+
+                with pytest.raises(RuntimeError, match="outcome unknown"):
+                    _invoke_pty_mutation(adapter, pid, created.session_oid, operation)
+
+                assert runtime.store.get_capability(finite.cap_id).uses_remaining == 0
+                effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == operation
+                ]
+                assert len(effects) == 1
+                assert effects[0].effect_state == "pending"
+                assert effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
+
+                monkeypatch.setattr(handle, operation, original)
+            finally:
+                runtime.close()
+
+    def test_pty_list_consumes_finite_read_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                owner = runtime.process.spawn(image="pty-agent:v0", goal="pty list owner")
+                observer = runtime.process.spawn(image="pty-agent:v0", goal="pty list observer")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(owner, ["git", "status"], cwd=".", startup_timeout_s=0)
+                finite = _grant_pty_object_once(
+                    runtime,
+                    observer,
+                    created.session_oid,
+                    CapabilityRight.READ,
+                )
+
+                assert [entry.session_oid for entry in adapter.list(observer)] == [created.session_oid]
+                assert runtime.store.get_capability(finite.cap_id).uses_remaining == 0
+                assert adapter.list(observer) == []
+            finally:
+                runtime.close()
+
+    def test_pty_auto_exit_finalizes_close_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty auto exit")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                session = adapter._sessions[created.session_oid]
+                session.stop_event.set()
+                adapter._join_session_workers(session, timeout_s=1.0)
+                provider.sessions[0].alive = False
+
+                adapter._mark_session_exited(session, resource="shell:git")
+
+                close_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close"
+                ]
+                assert len(close_effects) == 1
+                assert close_effects[0].effect_state == "finalized"
+                assert close_effects[0].information_flow is True
+                assert close_effects[0].provider_metadata["reason"] == "process_exit"
+            finally:
+                runtime.close()
+
+    def test_pty_auto_exit_event_failure_leaves_pending_close_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty auto exit sink failure")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                session = adapter._sessions[created.session_oid]
+                session.stop_event.set()
+                adapter._join_session_workers(session, timeout_s=1.0)
+                provider.sessions[0].alive = False
+                original_emit = adapter.events.emit
+
+                def fail_exit_event(event_type: Any, **kwargs: Any) -> Any:
+                    if (kwargs.get("payload") or {}).get("operation") == "exit":
+                        raise RuntimeError("exit event sink failed")
+                    return original_emit(event_type, **kwargs)
+
+                monkeypatch.setattr(adapter.events, "emit", fail_exit_event)
+
+                with pytest.raises(RuntimeError, match="exit event sink failed"):
+                    adapter._mark_session_exited(session, resource="shell:git")
+
+                close_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close"
+                ]
+                assert len(close_effects) == 1
+                assert close_effects[0].effect_state == "pending"
+                assert close_effects[0].information_flow is True
+            finally:
+                runtime.close()
+
+    def test_pty_auto_exit_close_pens_after_exit_code_keeps_pending_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty auto exit close PENS")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                session = adapter._sessions[created.session_oid]
+                session.stop_event.set()
+                adapter._join_session_workers(session, timeout_s=1.0)
+                provider.sessions[0].alive = False
+                original_close = provider.sessions[0].close
+
+                def fail_close_not_started(*_args: Any, **_kwargs: Any) -> Any:
+                    raise ProviderEffectNotStarted("auto close did not start")
+
+                monkeypatch.setattr(provider.sessions[0], "close", fail_close_not_started)
+
+                adapter._mark_session_exited(session, resource="shell:git")
+
+                close_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close"
+                ]
+                assert len(close_effects) == 1
+                assert close_effects[0].effect_state == "pending"
+                assert close_effects[0].information_flow is True
+
+                monkeypatch.setattr(provider.sessions[0], "close", original_close)
+            finally:
+                runtime.close()
+
+    def test_pty_auto_exit_exit_code_pens_abandons_close_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty auto exit read PENS")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                session = adapter._sessions[created.session_oid]
+                session.stop_event.set()
+                adapter._join_session_workers(session, timeout_s=1.0)
+                provider.sessions[0].alive = False
+                original_exit_code = provider.sessions[0].exit_code
+
+                def fail_exit_code_not_started() -> int | None:
+                    raise ProviderEffectNotStarted("exit-code read did not start")
+
+                monkeypatch.setattr(provider.sessions[0], "exit_code", fail_exit_code_not_started)
+
+                adapter._mark_session_exited(session, resource="shell:git")
+
+                assert [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close"
+                ] == []
+                assert session.closed is False
+                assert session.closing is False
+
+                monkeypatch.setattr(provider.sessions[0], "exit_code", original_exit_code)
+            finally:
+                runtime.close()
+
+    def test_pty_auto_exit_exit_code_ambiguous_failure_keeps_pending_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty auto exit read unknown")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+                session = adapter._sessions[created.session_oid]
+                session.stop_event.set()
+                adapter._join_session_workers(session, timeout_s=1.0)
+                provider.sessions[0].alive = False
+                original_exit_code = provider.sessions[0].exit_code
+
+                def fail_exit_code_ambiguously() -> int | None:
+                    raise RuntimeError("exit-code outcome unknown")
+
+                monkeypatch.setattr(provider.sessions[0], "exit_code", fail_exit_code_ambiguously)
+
+                adapter._mark_session_exited(session, resource="shell:git")
+
+                close_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "close"
+                ]
+                assert len(close_effects) == 1
+                assert close_effects[0].effect_state == "pending"
+                assert close_effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
+                assert session.closed is False
+                assert session.closing is False
+
+                monkeypatch.setattr(provider.sessions[0], "exit_code", original_exit_code)
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize(
+        "provider_mode",
+        ["unsupported-operation", "classifier-exception"],
+    )
+    def test_pty_mutation_classifier_failure_records_unknown_effects(
+        self,
+        provider_mode: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = (
+                SpawnOnlyClassifierPtyProvider(initial_outputs=[])
+                if provider_mode == "unsupported-operation"
+                else ClassifierFailurePtyProvider(initial_outputs=[])
+            )
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty classifier fallback")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+
+                adapter.write(pid, created.session_oid, "hello\n")
+                adapter.resize(pid, created.session_oid, cols=100, rows=30)
+                adapter.close(pid, created.session_oid)
+
+                effects = {
+                    effect.operation: effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation in {"write", "resize", "close"}
+                }
+                assert set(effects) == {"write", "resize", "close"}
+                for effect in effects.values():
+                    assert effect.rollback_class == ExternalEffectRollbackClass.UNKNOWN
+                    assert effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                    assert effect.provider_metadata["classification_fallback"] == "post_effect_failure"
+                    assert "classification_error" in effect.provider_metadata
+            finally:
+                runtime.close()
+
+    def test_pty_classifier_failure_keeps_started_session_and_records_conservative_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = ClassifierFailurePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty classifier failure")
+
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+
+                assert created.ok, created.error
+                assert provider.sessions[0].closed is False
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                assert effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
+                assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                assert effects[0].provider_metadata["classification_fallback"] == "post_effect_failure"
             finally:
                 runtime.close()
 
@@ -640,7 +1244,10 @@ class TestPtyModule:
                 assert created.ok, created.error
 
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and runtime.process.get(pid).status.value != "killed":
+                while time.monotonic() < deadline and (
+                    runtime.process.get(pid).status.value != "killed"
+                    or not provider.sessions[0].closed
+                ):
                     time.sleep(0.01)
 
                 process = runtime.process.get(pid)
@@ -648,6 +1255,161 @@ class TestPtyModule:
                 assert process.resource_usage.subprocess_wall_seconds > 0
                 assert provider.sessions[0].closed
             finally:
+                runtime.close()
+
+    def test_pty_wall_overage_is_charged_before_sampler_access_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_pid=None)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pty wall budget before sampler failure",
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                adapter = _pty_adapter(runtime)
+                session = adapter._sessions[created.payload["session_oid"]]
+                session.handle.pid = os.getpid()
+                session.started_monotonic = time.monotonic() - 1.0
+
+                def deny_process_access(process_pid: int) -> Any:
+                    raise psutil.AccessDenied(pid=process_pid)
+
+                monkeypatch.setattr("modules.pty.pty_module.psutil.Process", deny_process_access)
+
+                adapter._sample_and_charge(session, "shell:git")
+
+                process = runtime.process.get(pid)
+                assert process.status.value == "killed"
+                assert process.resource_usage.subprocess_wall_seconds > 0
+                assert provider.sessions[0].closed
+                actions = [record.action for record in runtime.audit.trace()]
+                assert "primitive.pty.resource_limit_exceeded" in actions
+                assert "primitive.pty.resource_monitor_denied" not in actions
+            finally:
+                runtime.close()
+
+    def test_pty_resource_monitor_is_independent_from_blocked_output_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = BlockingReadPtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pty blocked reader budget",
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                assert provider.sessions[0].read_started.wait(timeout=1.0)
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and (
+                    runtime.process.get(pid).status.value != "killed"
+                    or not provider.sessions[0].closed
+                ):
+                    time.sleep(0.01)
+
+                assert runtime.process.get(pid).status.value == "killed"
+                assert runtime.process.get(pid).resource_usage.subprocess_wall_seconds > 0
+                assert provider.sessions[0].closed
+                assert provider.sessions[0].read_returned.wait(timeout=1.0)
+            finally:
+                provider.release_read.set()
+                runtime.close()
+
+    def test_pty_cpu_accounting_keeps_exited_child_contribution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = _open_pty_runtime(temp_dir, FakePtyProvider(initial_outputs=[]))
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty cumulative cpu")
+                handle = FakePtySession(cols=80, rows=24, outputs=[], pid=4242)
+                session = _PtyRuntimeSession(
+                    session_oid="pty_cpu_accounting",
+                    session_id="pty_cpu_accounting",
+                    owner_pid=pid,
+                    argv=["git", "status"],
+                    cwd=".",
+                    backend=handle.backend,
+                    handle=handle,
+                    cols=80,
+                    rows=24,
+                    started_at="test",
+                    started_monotonic=time.monotonic(),
+                    buffer_max_chars=100,
+                )
+                child = SequencedPsutilProcess(pid=4243, cpu_values=[0.5], children=[])
+                root = SequencedPsutilProcess(
+                    pid=4242,
+                    cpu_values=[0.1, 0.3],
+                    children=[[child], []],
+                )
+                monkeypatch.setattr("modules.pty.pty_module.psutil.Process", lambda _pid: root)
+
+                _pty_adapter(runtime)._sample_and_charge(session, "shell:git")
+                _pty_adapter(runtime)._sample_and_charge(session, "shell:git")
+
+                usage = runtime.process.get(pid).resource_usage
+                assert usage.subprocess_cpu_seconds == pytest.approx(0.8)
+            finally:
+                runtime.close()
+
+    def test_concurrent_pty_close_waits_and_finalizes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = CoordinatedClosePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            provider.release_close.clear()
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="concurrent pty close")
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                adapter = _pty_adapter(runtime)
+                results: list[Any] = []
+                errors: list[BaseException] = []
+
+                def close_session() -> None:
+                    try:
+                        results.append(adapter.close(pid, session_oid, timeout_s=1.0))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                first = threading.Thread(target=close_session, name="test-pty-close-first")
+                second = threading.Thread(target=close_session, name="test-pty-close-second")
+                first.start()
+                assert provider.sessions[0].close_started.wait(timeout=1.0)
+                second.start()
+                time.sleep(0.05)
+                provider.release_close.set()
+                first.join(timeout=2.0)
+                second.join(timeout=2.0)
+
+                assert not first.is_alive()
+                assert not second.is_alive()
+                assert errors == []
+                assert len(results) == 2
+                assert provider.sessions[0].close_calls == 1
+                assert adapter._sessions == {}
+                assert runtime.store.get_object(session_oid) is None
+            finally:
+                provider.release_close.set()
                 runtime.close()
 
     def test_pty_resource_monitor_access_denied_closes_session_fail_closed(
@@ -672,7 +1434,7 @@ class TestPtyModule:
 
                 monkeypatch.setattr("modules.pty.pty_module.psutil.Process", deny_process_access)
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and not provider.sessions[0].closed:
+                while time.monotonic() < deadline and session_oid in _pty_adapter(runtime)._sessions:
                     time.sleep(0.01)
 
                 assert provider.sessions[0].closed
@@ -814,6 +1576,57 @@ def _pty_adapter(runtime: Runtime) -> Any:
     return getattr(runtime, "_agent_libos_pty_adapter")
 
 
+def _grant_exact_pty_once(runtime: Runtime, pid: str, argv: list[str]) -> Any:
+    return runtime.capability.issue_trusted(
+        pid,
+        runtime.shell.resource_for(argv),
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+        constraints={
+            AUTHORITY_RULES_KEY: [
+                {
+                    "rule_id": "test.pty.once.exact",
+                    "operation": "pty.spawn",
+                    "effect": "allow",
+                    "risk": "medium",
+                    "conditions": {
+                        "argv": list(argv),
+                        "match": "exact",
+                        "cwd": ".",
+                        "continuous_session": True,
+                    },
+                }
+            ]
+        },
+        uses_remaining=1,
+    )
+
+
+def _grant_pty_object_once(
+    runtime: Runtime,
+    pid: str,
+    session_oid: str,
+    right: CapabilityRight,
+) -> Any:
+    return runtime.capability.issue_trusted(
+        pid,
+        f"object:{session_oid}",
+        [right],
+        issued_by="test.pty.object.once",
+        uses_remaining=1,
+    )
+
+
+def _invoke_pty_mutation(adapter: Any, pid: str, session_oid: str, operation: str) -> Any:
+    if operation == "write":
+        return adapter.write(pid, session_oid, "hello\n")
+    if operation == "resize":
+        return adapter.resize(pid, session_oid, cols=100, rows=30)
+    if operation == "close":
+        return adapter.close(pid, session_oid)
+    raise AssertionError(f"unsupported PTY mutation operation: {operation}")
+
+
 class FakePtyProvider:
     supports_subprocess_limits = True
 
@@ -876,6 +1689,106 @@ class NoLimitsPtyProvider(FakePtyProvider):
     supports_subprocess_limits = False
 
 
+class PreEffectFailurePtyProvider(FakePtyProvider):
+    def spawn(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        limits: SubprocessLimits | None = None,
+    ) -> "FakePtySession":
+        raise ProviderEffectNotStarted("provider failed before PTY spawn")
+
+
+class AmbiguousFailurePtyProvider(FakePtyProvider):
+    def spawn(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        limits: SubprocessLimits | None = None,
+    ) -> "FakePtySession":
+        self.spawned.append({"argv": list(argv), "cwd": cwd, "cols": cols, "rows": rows, "limits": limits})
+        raise TimeoutError("spawn outcome is unknown")
+
+
+class SpawnOnlyClassifierPtyProvider(FakePtyProvider):
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation != "spawn":
+            raise ValueError(f"unsupported PTY classifier operation: {operation}")
+        return super().classify_external_effect(operation, context, result)
+
+
+class ClassifierFailurePtyProvider(FakePtyProvider):
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        raise RuntimeError("simulated PTY classifier failure")
+
+
+class BlockingReadPtyProvider(FakePtyProvider):
+    def __init__(self) -> None:
+        super().__init__(initial_outputs=[])
+        self.release_read = threading.Event()
+
+    def spawn(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        limits: SubprocessLimits | None = None,
+    ) -> "BlockingReadPtySession":
+        self.spawned.append({"argv": list(argv), "cwd": cwd, "cols": cols, "rows": rows, "limits": limits})
+        session = BlockingReadPtySession(
+            cols=cols,
+            rows=rows,
+            outputs=[],
+            pid=os.getpid(),
+            release_read=self.release_read,
+        )
+        self.sessions.append(session)
+        return session
+
+
+class CoordinatedClosePtyProvider(FakePtyProvider):
+    def __init__(self, *, initial_outputs: list[str] | None = None) -> None:
+        super().__init__(initial_outputs=initial_outputs)
+        self.release_close = threading.Event()
+
+    def spawn(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        limits: SubprocessLimits | None = None,
+    ) -> "CoordinatedClosePtySession":
+        self.spawned.append({"argv": list(argv), "cwd": cwd, "cols": cols, "rows": rows, "limits": limits})
+        session = CoordinatedClosePtySession(
+            cols=cols,
+            rows=rows,
+            outputs=list(self.initial_outputs),
+            release_close=self.release_close,
+        )
+        self.sessions.append(session)
+        return session
+
+
 class FakePtySession:
     backend = "fake-pty"
 
@@ -927,3 +1840,70 @@ class FakePtySession:
         self.closed = True
         self.alive = False
         return 0
+
+
+class BlockingReadPtySession(FakePtySession):
+    def __init__(self, *, release_read: threading.Event, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.release_read = release_read
+        self.read_started = threading.Event()
+        self.read_returned = threading.Event()
+
+    def read(self, *, timeout_s: float = 0.0) -> str:
+        self.read_started.set()
+        self.release_read.wait(timeout=5.0)
+        self.read_returned.set()
+        return ""
+
+    def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
+        self.release_read.set()
+        return super().close(force=force, timeout_s=timeout_s)
+
+
+class CoordinatedClosePtySession(FakePtySession):
+    def __init__(self, *, release_close: threading.Event, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.release_close = release_close
+        self.close_started = threading.Event()
+        self.close_calls = 0
+
+    def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
+        self.close_calls += 1
+        self.close_started.set()
+        if not self.release_close.wait(timeout=max(1.0, timeout_s)):
+            raise TimeoutError("coordinated close was not released")
+        return super().close(force=force, timeout_s=timeout_s)
+
+
+class SequencedPsutilProcess:
+    def __init__(
+        self,
+        *,
+        pid: int,
+        cpu_values: list[float],
+        children: list[list["SequencedPsutilProcess"]],
+        rss: int = 1,
+    ) -> None:
+        self.pid = pid
+        self._cpu_values = list(cpu_values)
+        self._children = list(children)
+        self._cpu_index = 0
+        self._children_index = 0
+        self._rss = rss
+
+    def create_time(self) -> float:
+        return float(self.pid)
+
+    def children(self, *, recursive: bool) -> list["SequencedPsutilProcess"]:
+        assert recursive
+        index = min(self._children_index, len(self._children) - 1)
+        self._children_index += 1
+        return list(self._children[index])
+
+    def cpu_times(self) -> Any:
+        index = min(self._cpu_index, len(self._cpu_values) - 1)
+        self._cpu_index += 1
+        return type("CpuTimes", (), {"user": self._cpu_values[index], "system": 0.0})()
+
+    def memory_info(self) -> Any:
+        return type("MemoryInfo", (), {"rss": self._rss})()

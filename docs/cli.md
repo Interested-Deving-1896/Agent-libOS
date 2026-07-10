@@ -64,11 +64,15 @@ are not committed. SQLite and PostgreSQL implement the same runtime store
 contract. Ordinary Object Memory payloads are runtime-only; SQL object rows
 store a runtime-memory marker, and rows whose live payload cache cannot be
 reconstructed are released fail-closed on reopen.
-Persistent stores also take an active-runtime lease. SQLite uses a lock file,
-and PostgreSQL uses a session advisory lock; a second writable Runtime cannot
-open the same database until the first Runtime closes cleanly. SQLite derives
-the lease from the canonical database path, so a symlink alias cannot open a
-second writer.
+Persistent stores also take an active-runtime lease. SQLite derives both the
+connection target and lease from the canonical database path, so a symlink
+alias cannot open a second writer. Where `fcntl` plus `O_NOFOLLOW` are
+available, the sidecar is opened no-follow, regular-file/inode checked, and
+protected by `flock`; otherwise SQLite's kernel-managed exclusive database
+lock is used instead of a stale-file protocol. PostgreSQL uses a session
+advisory key scoped to `current_database()` plus `current_schema()`. A second
+writable Runtime cannot open the same database/schema target until the first
+Runtime closes cleanly. See [Runtime Storage](storage.md).
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
@@ -81,6 +85,20 @@ profile. It helps weaker tool-calling models by synthesizing
 no valid fallback JSON action. The synthesized wait uses the tool defaults, so
 it waits for any unread process message and does not change the raw stored LLM
 response.
+
+Shell policy labels are fixed semantic values:
+`always_deny`, `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, and
+`always_allow`. Configuration may select a default policy and edit exact/prefix
+argv rules, but it cannot remap those labels to different meanings. The removed
+`checkpoints.auto_high_risk_checkpoint` field was never an implemented
+primitive; high-risk confirmation remains explicit at the invoking host/tool
+surface, and checkpoints are created only by an explicit checkpoint operation.
+Because config overlays are strict, either legacy field now fails validation
+instead of being silently ignored.
+
+Each configured shell command rule must contain an executable, its first argv
+token must be non-blank, and no token may contain NUL. Invalid rules fail config
+construction instead of becoming an empty or ambiguous policy match.
 
 Use `--module-manifest` and `--trusted-module` before the command name to load
 trusted Runtime Modules before the runtime is used:
@@ -149,6 +167,11 @@ uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 processed as part of runtime execution. Without `--max-quanta`, it runs until
 the runtime becomes idle; pass `--max-quanta <n>` to bound the total number of
 LLM/tool quanta across all runnable processes.
+
+`cd <pid> <path>` requires filesystem `read` authority for the selected
+directory. Explicit working directories for child processes and PTY creation
+are checked through the same directory primitive after their higher-level
+spawn/image or shell authority gates.
 
 Manual queue processing remains available:
 
@@ -286,8 +309,14 @@ counts, whether prompt-cache or safety identifiers were configured, and any
 non-secret `previous_response_id` chain; configured cache keys and safety
 identifier values are not persisted there. When no provider-side chain is used,
 historical tool outputs are plain bounded context instead of Responses-native
-`function_call_output` items. Request options also show whether
-`parallel_tool_calls` was enabled for the action-selection request.
+`function_call_output` items. A chain is continued only when official Responses
+storage/chaining and full local I/O persistence are enabled, the profile/scope
+fingerprint and credential-keyed provider identity fingerprint are unchanged,
+and the immediately preceding function-call manifest has exactly one durable
+output per unique `call_id`. The fingerprint binds model, official endpoint,
+API mode, credential identity, and organization/project without storing the
+credential. Otherwise the next request resets stateless. Request options also
+show whether `parallel_tool_calls` was enabled for the action-selection request.
 Full LLM input/output persistence is enabled by default for self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. Set
 `config.llm.persist_full_io=False` when a user or operator opts out of storing
@@ -307,6 +336,11 @@ subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, MCP bytes,
 Deno syscalls, and child-process creation are charged to the acting process and
 its ancestors. Capabilities, Skill activation, image exec, checkpoint restore,
 and human approval do not increase these budgets.
+
+Calls, tokens, syscalls, bytes, child counts, and peak-memory values are
+non-negative integers. Runtime and subprocess wall/CPU seconds are continuous
+finite non-negative values and may be fractional. Boolean values are rejected
+for both shapes instead of being accepted as Python integers.
 
 ## Interactive Run
 
@@ -328,7 +362,9 @@ Interactive slash commands:
 - `/answer <text>` or plain text while a human question is pending: answer the
   pending request.
 - `/approve`, `/reject`, `/allow`, and `/ask`: respond to pending approval or
-  permission requests.
+  permission requests. For a permission request, `/approve` and `/allow` map to
+  `always_allow`, `/reject` maps to `always_deny`, and `/ask` maps to
+  `ask_each_time`; `allow_once` is not a terminal response policy.
 - `/exit`: leave the interactive loop.
 
 ## Process Messages
@@ -465,7 +501,8 @@ uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> statef
 ```
 
 `images commit` creates a checkpoint-derived image artifact from the checkpoint
-owner root process. It captures internal Object Memory, loaded Skills,
+owner root process. It captures owned/captured internal Object Memory (not an
+uncaptured borrowed root), loaded Skills,
 process-local JIT tools, tool visibility, and cwd. It does not package
 filesystem/provider state. External capabilities from the checkpoint are stored
 as `required_capabilities` declarations and are not granted automatically when
@@ -494,8 +531,13 @@ capabilities. Without it, the command runs as an audited admin actor named
 `cli`.
 Restore prints `status: restored` after complete reconciliation, or
 `status: restored_with_warnings` with `main_state_committed: true` and
-`post_commit_failures` when image/JIT/finalizer reconciliation fails after the
-scoped state transaction. Do not retry the latter as an uncommitted restore.
+`post_commit_failures` when image/JIT/finalizer reconciliation or the final
+restore event/audit sink fails after the scoped state transaction. Do not retry
+the latter as an uncommitted restore.
+Fork similarly returns `status: forked` after complete publication, or
+`status: forked_with_warnings` with `main_state_committed: true` when its
+post-commit event/audit sink fails. Do not retry that warning result as an
+uncommitted fork.
 
 ## Skill Commands
 

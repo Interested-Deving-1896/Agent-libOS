@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: checkpoint_fork_revoked_capability_001
 title: Checkpoint fork does not resurrect revoked authority
 goal: Fork from a checkpoint created before a secret-read capability was revoked.

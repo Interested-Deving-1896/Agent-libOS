@@ -12,6 +12,7 @@ from agent_libos.config import (
     LLMDefaults,
     LLMProfile,
     RuntimeDefaults,
+    ShellCommandRule,
     load_config_from_project_root,
     load_config_file,
     load_config_from_cwd,
@@ -23,6 +24,31 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore, display_store_target, open_store, redact_store_target
 
 class TestConfigDefaults:
+
+    def test_shell_policy_labels_are_not_configurable_and_rules_require_an_executable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValueError, match='argv'):
+            ShellCommandRule((), match='prefix')
+
+        path = tmp_path / 'semantic-shell-label.yaml'
+        path.write_text(
+            '\n'.join(
+                [
+                    'shell:',
+                    '  always_allow_level: always_deny',
+                ]
+            ),
+            encoding='utf-8',
+        )
+        with pytest.raises(PydanticValidationError, match='always_allow_level'):
+            load_config_file(path)
+
+        assert DEFAULT_CONFIG.shell.always_deny_level == 'always_deny'
+        assert DEFAULT_CONFIG.shell.allowlist_auto_else_ask_level == 'allowlist_auto_else_ask'
+        assert DEFAULT_CONFIG.shell.blocklist_ask_else_auto_level == 'blocklist_ask_else_auto'
+        assert DEFAULT_CONFIG.shell.always_allow_level == 'always_allow'
 
     def test_load_config_from_cwd_returns_default_when_file_is_missing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: image_commit_required_capability_001
 title: Checkpoint commit image restores internal state but not external authority
 goal: Commit the current checkpoint as an image, exec into it, use baked memory, then try to read the secret.
@@ -20,6 +20,8 @@ setup:
       reason: baked state ready
 capabilities:
   image:
+    read:
+      - committed-benchmark:v0
     write:
       - committed-benchmark:v0
 allowed_effects:

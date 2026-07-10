@@ -37,21 +37,35 @@ The implementation currently includes:
   `resume`, and `exit`.
 - Hierarchical process resource budgets for tool calls, LLM token usage,
   subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC/MCP bytes, and
-  Deno syscalls.
+  Deno syscalls. Discrete counts/bytes/tokens are integers; runtime and
+  subprocess wall/CPU seconds are continuous values. A charge publishes the
+  full process-to-ancestor accounting chain, reservations, event, and audit as
+  one transaction.
 - Thread-backed process scheduling through `Runtime.run_until_idle()` and the
   async host wrapper `Runtime.arun_until_idle()`, so blocked quanta do not
   monopolize scheduler progress.
 - Process-local working directories for filesystem and shell operations.
+  Selecting a cwd, including an explicit child or PTY cwd, requires filesystem
+  directory `read`; the directory state probe runs only after that authority
+  and is covered by the filesystem external-effect intent.
 - Optional Object-bound PTY sessions through the trusted `modules/pty` runtime
   module; when that module is loaded, `pty_create` returns an Object Memory
   `EXTERNAL_REF` handle, and read, write, resize, and close rights follow
-  object capabilities. On Windows, real PTY support requires installing the
+  object capabilities. Output reading and process-tree resource supervision
+  use independent workers, and concurrent lifecycle closes converge on one
+  close transition. On Windows, real PTY support requires installing the
   optional `pty` extra; see [docs/modules.md](docs/modules.md).
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
   same durable message queues, including optional owner-change watches, without
   exposing their runner child processes to the LLM scheduler.
-- Human queue integration for ordinary questions and per-use approval.
+- Human queue integration for typed questions and permission decisions.
+  Permission responses explicitly choose `always_allow`, `always_deny`, or
+  `ask_each_time`; approved questions require a non-empty string answer.
+  Terminal prompt/read and automatic-response writes use structured pending
+  effect intents. Their effect metadata stores only request/purpose plus
+  length/hash observations, never raw prompts, answers, or provider exception
+  text.
 - Process-private Object Memory namespaces by default, with explicit shared
   namespaces available through capabilities.
 - Structured Capability authority for filesystem, shell, clock, human,
@@ -69,25 +83,35 @@ The implementation currently includes:
   ToolBroker without invoking the LLM scheduler.
 - Runtime store persistence, backed by SQLite by default and optionally
   PostgreSQL, for process/object metadata, capabilities, messages, human
-  requests, LLM calls, events, audit records, tools, Skill/JIT metadata, object
-  tasks, JSON-RPC endpoints, image definitions/artifacts, Runtime Module load
-  records, external effects, and scoped checkpoints.
+  requests, LLM calls, durable LLM wait generations and eligible Responses tool
+  outputs, events, audit records, tools, Skill/JIT metadata, object tasks,
+  JSON-RPC endpoints, image definitions/artifacts, Runtime Module load records,
+  external effects, and scoped checkpoints.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
+  A dedicated supervisor establishes host-lifetime process-tree containment
+  before Deno starts, so hard host termination cannot orphan untrusted code.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
   candidates without granting resource authority.
 - Client-only JSON-RPC 2.0 over HTTP through registered endpoints, method
   capabilities, provider-classified external effects, audit, and checkpoints.
+  Per-item registry authority is checked before metadata lookup; registry row,
+  stale-grant invalidation, event, and audit changes commit atomically.
 - Client-only MCP Tools through registered stdio or Streamable HTTP servers,
   tool capabilities, provider-classified external effects, audit, and resource
-  accounting.
-- A deterministic runtime-safety benchmark harness with 20+ checked-in tasks,
-  including a self-evolution subset, baselines, side-effect oracle, and metrics
-  collection.
+  accounting, with the same authority-before-lookup and transactional registry
+  semantics.
+- A deterministic runtime-safety benchmark harness with 27 checked-in schema-v1
+  tasks, including a self-evolution subset, baselines, evidence-backed
+  side-effect oracle, fail-closed output validity, and explicit metric
+  denominators.
 
 ## Documentation
 
 Start here, then read the deeper references as needed:
 
+- [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
+  2026-07-10 subsystem review, fixes, impact assessment, documentation audit,
+  validation evidence, and remaining release gates.
 - [docs/architecture.md](docs/architecture.md): runtime layers, provider
   substrate, and the tool/primitive boundary.
 - [docs/runtime_model.md](docs/runtime_model.md): process lifecycle, scheduler,
@@ -109,6 +133,8 @@ Start here, then read the deeper references as needed:
   tools, and `swe-agent`.
 - [docs/checkpoints.md](docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, append-only history, and external effects.
+- [docs/storage.md](docs/storage.md): transaction rollback/poison semantics,
+  Object payload durability, schema recovery, and active-runtime leases.
 - [docs/cli.md](docs/cli.md): stable CLI command reference and examples.
 - [docs/gui.md](docs/gui.md): Electron desktop console, local GUI server,
   HTTP/SSE APIs, and development commands.
@@ -124,7 +150,7 @@ Start here, then read the deeper references as needed:
 - [docs/paper_thesis.md](docs/paper_thesis.md): current paper thesis and
   non-goals.
 - [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md):
-  benchmark task schema v0.
+  benchmark task/output schema v1.
 - [plan.md](plan.md): dated paper-submission roadmap; not the implementation
   reference for current behavior.
 - [AGENTS.md](AGENTS.md): repository structure, testing, security, and
@@ -189,6 +215,13 @@ The benchmark defaults to mock/planned actions and does not spend model tokens.
 Real-model benchmark smoke is opt-in and must be scoped with `--llm real
 --limit 1` or a single `--task`.
 
+In the current deterministic `agent_libos_full` 27-task validation, outputs are
+valid with 27/27 task success and safety pass, unauthorized side effects 0/22,
+zero unknown effects, and false denials 0/22 (0%). The denominator is allowed
+attempts with a definite performed/denied outcome; it is not the older 43-record
+normalization. Missing/unknown effect evidence invalidates rates instead of
+being inferred from `result.ok`. See [docs/benchmark.md](docs/benchmark.md).
+
 ## Persistent Runtime
 
 Use `--db` to keep runtime state in a persistent store. A filesystem path uses
@@ -221,10 +254,21 @@ checkpoints, and registered tools/images/skills are durable store records.
 Ordinary Object Memory payloads remain runtime-only; the object table stores a
 runtime-memory marker, and rows whose payload cache cannot be reconstructed are
 released fail-closed on reopen instead of being treated as real payloads.
-Persistent stores take an active-runtime lease: SQLite uses a lock file, and
+Persistent stores take an active-runtime lease: SQLite uses a secure sidecar
+`flock` where available or an exclusive database lock as fallback, and
 PostgreSQL uses a session advisory lock. Two writable `Runtime` instances
 cannot concurrently open the same store. Closing the first runtime releases the
 lease and permits a later reopen.
+
+SQLite resolves both its connection and lease from the canonical database
+path. On platforms with `fcntl` and `O_NOFOLLOW`, the sidecar is opened
+no-follow, verified as the same regular-file inode before use, and protected by
+`flock`; other platforms use SQLite's kernel-managed exclusive database lock
+instead of trusting a stale sidecar. PostgreSQL advisory keys are scoped to the
+current database and schema. Store transactions also fail closed: commit or
+savepoint-release failure triggers rollback, and a rollback failure poisons and
+closes the store rather than allowing further reads or writes. See
+[docs/storage.md](docs/storage.md).
 
 Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
 you want a bounded run.
@@ -269,6 +313,20 @@ not. Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode.
 Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
 `OPENAI_ENABLE_THINKING`.
+
+Provider-side Responses storage/chaining is opt-in: the defaults remain
+`store=false` and `responses_previous_response_id=false`. When both are enabled,
+Agent libOS continues a chain only if the immediately preceding official
+Responses call has the same profile/runtime scope and every unique function
+`call_id` has one complete durable result. The current model, official endpoint,
+API mode, credential identity, and organization/project tenant must also match
+the preceding call's non-secret provider-chain fingerprint. Eligible results
+are sent as native `function_call_output`; partial/redacted/ambiguous output,
+context compaction/restore, or any scope/provider-identity change resets to a
+stateless/plain-context request. Durable waiting actions are claimed once by a
+per-generation resume token. Any exception after that non-replayable claim
+fails the process and retains/audits the interrupted state instead of retrying a
+possibly completed effect. See [docs/development.md](docs/development.md#real-llm-smoke).
 
 ## Common CLI Examples
 
@@ -367,15 +425,21 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   resources before loading provider metadata or input schemas, so missing call
   authority cannot enumerate registered manifests.
 - Human approval is part of a primitive/syscall. Callers see a final success or
-  final failure, not a pending/retry protocol.
+  final failure, not a pending/retry protocol. Run-local automatic decisions
+  are isolated across concurrent scheduler workers, and terminal process states
+  cancel pending requests.
 - When the optional PTY module is loaded, PTY sessions are host runtime
   resources bound to mutable Object Memory `EXTERNAL_REF` handles. Shell policy
   authorizes creation; object read, write, and delete rights authorize read,
   resize, and close; and `pty_write` additionally requires the original session
   owner so delegated object write rights cannot drive an existing shell.
+  Finite-use object rights for write/resize/close are reserved until the PTY
+  provider boundary is known to have started. Automatic child-exit cleanup
+  persists a close intent before reading exit state or closing the handle.
   Runtime shutdown or object release closes the host PTY, and a failed
   post-spawn setup closes the handle and removes the object before returning
-  failure.
+  failure. PTY fork drops `EXTERNAL_REF` handles rather than cloning provider
+  resources.
 - `process.exit` and `process.exec` are ordinary syscalls from TypeScript. The
   runtime applies lifecycle changes after the JIT tool returns its normal tool
   result.
@@ -385,15 +449,29 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Checkpoint restore covers reconstructable process-subtree state and captured
   image registry metadata needed by that state. It does not delete append-only
   audit/events/LLM calls or roll back filesystem, shell, image-package source,
-  network, or provider side effects.
+  network, or provider side effects. Ownership, not borrowed MemoryView
+  reachability, defines the destructive Object scope; restore/fork revalidate
+  current capability state so a committed revoke is not resurrected.
 - Checkpoint-derived images capture internal reconstructable runtime state, not
   external provider state. Their required capabilities are declarations and are
   not granted automatically at spawn or exec.
 - Providers classify successful external effects as `irreversible`,
-  `rollbackable`, or `no_rollback_required`. For filesystem mutations and
-  clock operations, an ordinary exception after the provider call begins is
-  recorded as `unknown` unless the provider explicitly certifies
-  `ProviderEffectNotStarted`. Checkpoint restore reports all classes with
+  `rollbackable`, or `no_rollback_required`. Filesystem mutations, clock,
+  shell, and PTY spawn reserve finite-use authority before the provider
+  boundary. Only `ProviderEffectNotStarted` with no earlier information flow
+  can certify the whole operation did not start and permit intent abandonment;
+  ambiguous failures consume authority and persist an `unknown` effect.
+  Filesystem/clock/shell, human output and terminal I/O, PTY
+  spawn/write/resize/close, and live JSON-RPC/MCP calls persist a pending
+  unknown intent before the
+  provider and conditionally finalize that same `effect_id`, so a post-provider
+  crash cannot erase uncertainty or a duplicate settlement create extra final
+  rows. Failed post-spawn Object publication remains unknown even after cleanup.
+  Remote JSON-RPC/MCP intents are durable before non-local DNS; exact remote and
+  auxiliary stdio authority is reserved together, and a DNS observation means
+  a later certified-not-started transport can no longer erase the information
+  flow or restore the use.
+  Checkpoint restore reports all classes with
   `restore_external_policy="report_only"`.
 - Resource Provider Substrate backends perform host effects, but primitives own
   capability checks, policy decisions, events, and audit.

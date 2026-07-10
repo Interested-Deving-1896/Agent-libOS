@@ -1,13 +1,66 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from agent_libos import AgentImage, Runtime
-from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectOwnerKind, ObjectRight, ObjectType, ProcessStatus, ResourceBudget
-from agent_libos.models.exceptions import CapabilityDenied, ProcessWaitRequired, ResourceLimitExceeded
+from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, ObjectOwnerKind, ObjectRight, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessWaitRequired, ResourceLimitExceeded
 
 
 class TestCheckpointFork:
+
+    @pytest.mark.parametrize(
+        ('sink', 'phase'),
+        [
+            ('event', 'fork_event_emission'),
+            ('audit', 'fork_audit_recording'),
+        ],
+    )
+    def test_fork_reports_event_and_audit_failures_after_main_state_commit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sink: str,
+        phase: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'{sink} failure after fork')
+            checkpoint_id = runtime.checkpoint.create(pid, f'before {sink} failure', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            if sink == 'event':
+                original_emit = runtime.events.emit
+
+                def fail_fork_event(event_type, *args, **kwargs):
+                    if event_type == EventType.PROCESS_FORKED:
+                        raise RuntimeError('injected fork event failure')
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_fork_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_fork_audit(*args, **kwargs):
+                    if kwargs.get('action') == 'checkpoint.fork':
+                        raise RuntimeError('injected fork audit failure')
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_fork_audit)
+
+            result = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert result['status'] == 'forked_with_warnings'
+            assert result['main_state_committed'] is True
+            assert phase in [failure['phase'] for failure in result['post_commit_failures']]
+            assert runtime.store.get_process(result['fork_root_pid']) is not None
+        finally:
+            runtime.close()
 
     def test_fork_from_checkpoint_remaps_process_namespace_objects_and_capabilities(self) -> None:
         runtime = Runtime.open('local')
@@ -25,6 +78,34 @@ class TestCheckpointFork:
             assert fork_obj.namespace == runtime.memory.process_namespace(fork_pid)
             assert fork_obj.payload == {'value': 7}
             assert runtime.capability.check(fork_pid, 'filesystem:workspace:README.md', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_does_not_clone_finite_use_capability(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork finite authority')
+            resource = 'test:one-shot-fork-authority'
+            finite = runtime.capability.grant_once(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'finite authority fork point', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+            fork_pid = forked['fork_root_pid']
+
+            assert runtime.store.get_capability(finite.cap_id).uses_remaining == 1
+            assert not runtime.capability.check(fork_pid, resource, CapabilityRight.READ)
+            assert resource not in [cap.resource for cap in runtime.capability.list_subject(fork_pid)]
         finally:
             runtime.close()
 
@@ -75,6 +156,171 @@ class TestCheckpointFork:
             assert not runtime.capability.check(pid, resource, CapabilityRight.READ)
             assert not runtime.capability.check(fork_root, resource, CapabilityRight.READ)
             assert resource not in [capability.resource for capability in runtime.capability.list_subject(fork_root)]
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_revalidates_capability_after_concurrent_revoke(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        filter_reached = threading.Event()
+        revoke_done = threading.Event()
+        errors: list[BaseException] = []
+        forked_results: list[dict[str, object]] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork concurrent revoke')
+            cap = runtime.capability.grant(pid, 'test:fork-race', [CapabilityRight.READ], issued_by='test')
+            checkpoint_id = runtime.checkpoint.create(pid, 'before fork revoke race', actor=pid)
+            runtime.capability.grant(pid, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+            original_filter = runtime.checkpoint._fork_capability_rows
+
+            def pause_after_filter(rows):
+                filtered = original_filter(rows)
+                filter_reached.set()
+                assert revoke_done.wait(timeout=2)
+                return filtered
+
+            monkeypatch.setattr(runtime.checkpoint, '_fork_capability_rows', pause_after_filter)
+
+            def fork() -> None:
+                try:
+                    forked_results.append(runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id))
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            fork_thread = threading.Thread(target=fork)
+            fork_thread.start()
+            assert filter_reached.wait(timeout=2)
+            runtime.capability.revoke(cap.cap_id, revoked_by=pid, reason='concurrent fork revoke wins')
+            revoke_done.set()
+            fork_thread.join(timeout=3)
+
+            assert not fork_thread.is_alive()
+            assert errors == []
+            fork_pid = str(forked_results[0]['fork_root_pid'])
+            assert not runtime.capability.check(fork_pid, cap.resource, CapabilityRight.READ)
+            assert cap.resource not in [item.resource for item in runtime.capability.list_subject(fork_pid)]
+        finally:
+            runtime.close()
+
+    def test_fork_revalidates_actor_checkpoint_execute_inside_publish_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='fork actor revoke race')
+            checkpoint_id = runtime.checkpoint.create(actor, 'actor authority race', actor=actor)
+            execute = runtime.capability.grant(
+                actor,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            before_pids = {process.pid for process in runtime.process.list()}
+            original_restore_jit = runtime.checkpoint._restore_jit_sources
+
+            def revoke_after_preflight(remapped):
+                original_restore_jit(remapped)
+                runtime.capability.revoke(
+                    execute.cap_id,
+                    revoked_by=actor,
+                    reason='revoke checkpoint execute after fork preflight',
+                )
+
+            monkeypatch.setattr(runtime.checkpoint, '_restore_jit_sources', revoke_after_preflight)
+
+            with pytest.raises(CapabilityDenied):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+        finally:
+            runtime.close()
+
+    def test_fork_consumes_one_shot_checkpoint_execute_only_on_publish(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='fork with one-shot execute')
+            checkpoint_id = runtime.checkpoint.create(actor, 'one-shot execute fork', actor=actor)
+            execute = runtime.capability.grant_once(
+                actor,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            original_insert = runtime.checkpoint._insert_row
+
+            def fail_first_process_publish(cur, table, row):
+                if table == 'processes':
+                    raise RuntimeError('injected fork publish failure')
+                return original_insert(cur, table, row)
+
+            monkeypatch.setattr(runtime.checkpoint, '_insert_row', fail_first_process_publish)
+
+            with pytest.raises(RuntimeError, match='injected fork publish failure'):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert runtime.store.get_capability(execute.cap_id).uses_remaining == 1
+            monkeypatch.setattr(runtime.checkpoint, '_insert_row', original_insert)
+
+            forked = runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert runtime.store.get_process(forked['fork_root_pid']) is not None
+            assert runtime.store.get_capability(execute.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_does_not_clone_external_ref_by_default(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='external ref fork')
+            external_owner = runtime.process.spawn(image='base-agent:v0', goal='borrowed external ref owner')
+            external = runtime.memory.create_object(
+                pid,
+                ObjectType.EXTERNAL_REF,
+                {'provider': 'remote', 'handle': 'opaque'},
+                name='external.ref',
+            )
+            borrowed_external = runtime.memory.create_object(
+                external_owner,
+                ObjectType.EXTERNAL_REF,
+                {'provider': 'remote', 'handle': 'borrowed'},
+                name='borrowed.external.ref',
+            )
+            borrowed_external_handle = runtime.capability.handle_for_object(
+                pid,
+                borrowed_external.oid,
+                [CapabilityRight.READ],
+                issued_by='test.borrowed.external',
+            )
+            runtime._add_handle_to_process_view(pid, external)
+            runtime._add_handle_to_process_view(pid, borrowed_external_handle)
+            checkpoint_id = runtime.checkpoint.create(pid, 'external ref checkpoint', actor=pid)
+            runtime.capability.grant(pid, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+            fork_pid = forked['fork_root_pid']
+
+            assert external.oid not in forked['object_map']
+            assert all(
+                obj.type != ObjectType.EXTERNAL_REF
+                for obj in runtime.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, fork_pid)
+            )
+            assert not runtime.capability.check(fork_pid, f'object:{external.oid}', CapabilityRight.READ)
+            assert not runtime.capability.check(
+                fork_pid,
+                f'object:{borrowed_external.oid}',
+                CapabilityRight.READ,
+            )
+            fork_roots = {handle.oid for handle in runtime.process.get(fork_pid).memory_view.roots}
+            assert external.oid not in fork_roots
+            assert borrowed_external.oid not in fork_roots
         finally:
             runtime.close()
 
@@ -197,6 +443,51 @@ class TestCheckpointFork:
         finally:
             runtime.close()
 
+    def test_fork_revalidates_missing_snapshot_image_write_inside_publish_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-fork-image-write-race:v0'
+        try:
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-fork-image-write-race'),
+                actor='test',
+            )
+            source = runtime.process.spawn(image=image_id, goal='snapshot image source')
+            checkpoint_id = runtime.checkpoint.create(source, 'image write race', actor=source)
+            actor = runtime.process.spawn(image='base-agent:v0', goal='image restore actor')
+            runtime.capability.grant(
+                actor,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            image_write = runtime.image_registry.grant_register(actor, image_id, issued_by='test')
+            runtime.images.pop(image_id)
+            runtime.store.delete_image(image_id)
+            before_pids = {process.pid for process in runtime.process.list()}
+            original_restore_jit = runtime.checkpoint._restore_jit_sources
+
+            def revoke_after_preflight(remapped):
+                original_restore_jit(remapped)
+                runtime.capability.revoke(
+                    image_write.cap_id,
+                    revoked_by=actor,
+                    reason='revoke image write after fork preflight',
+                )
+
+            monkeypatch.setattr(runtime.checkpoint, '_restore_jit_sources', revoke_after_preflight)
+
+            with pytest.raises(CapabilityDenied):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+        finally:
+            runtime.close()
+
     def test_checkpoint_fork_parent_attachment_requires_authority(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -209,6 +500,84 @@ class TestCheckpointFork:
             runtime.capability.grant(owner, runtime.checkpoint.process_resource(other), [CapabilityRight.ADMIN], issued_by='test')
             forked = runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id, parent_pid=other)
             assert runtime.process.get(forked['fork_root_pid']).parent_pid == other
+        finally:
+            runtime.close()
+
+    def test_fork_revalidates_parent_admin_inside_publish_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='fork parent admin race')
+            parent = runtime.process.spawn(image='base-agent:v0', goal='fork target parent')
+            checkpoint_id = runtime.checkpoint.create(actor, 'parent admin race', actor=actor)
+            runtime.capability.grant(
+                actor,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            parent_admin = runtime.capability.grant(
+                actor,
+                runtime.checkpoint.process_resource(parent),
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            before_pids = {process.pid for process in runtime.process.list()}
+            original_restore_jit = runtime.checkpoint._restore_jit_sources
+
+            def revoke_after_preflight(remapped):
+                original_restore_jit(remapped)
+                runtime.capability.revoke(
+                    parent_admin.cap_id,
+                    revoked_by=actor,
+                    reason='revoke parent admin after fork preflight',
+                )
+
+            monkeypatch.setattr(runtime.checkpoint, '_restore_jit_sources', revoke_after_preflight)
+
+            with pytest.raises(CapabilityDenied):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id, parent_pid=parent)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+        finally:
+            runtime.close()
+
+    def test_fork_rejects_parent_that_becomes_terminal_after_preflight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='fork terminal parent race')
+            parent = runtime.process.spawn(image='base-agent:v0', goal='fork target parent')
+            checkpoint_id = runtime.checkpoint.create(actor, 'terminal parent race', actor=actor)
+            runtime.capability.grant(
+                actor,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            runtime.capability.grant(
+                actor,
+                runtime.checkpoint.process_resource(parent),
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            before_pids = {process.pid for process in runtime.process.list()}
+            original_restore_jit = runtime.checkpoint._restore_jit_sources
+
+            def exit_parent_after_preflight(remapped):
+                original_restore_jit(remapped)
+                runtime.process.exit(parent, message='terminal before fork publish')
+
+            monkeypatch.setattr(runtime.checkpoint, '_restore_jit_sources', exit_parent_after_preflight)
+
+            with pytest.raises(ProcessError, match='terminal process'):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id, parent_pid=parent)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
         finally:
             runtime.close()
 

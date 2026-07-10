@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import threading
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -133,6 +134,7 @@ class ImageRegistryPrimitive:
         self.events = events
         self.tool_exists = tool_exists
         self.runtime: Any | None = None
+        self._registration_lock = threading.RLock()
 
     def bind_runtime(self, runtime: Any) -> None:
         self.runtime = runtime
@@ -141,17 +143,18 @@ class ImageRegistryPrimitive:
     def _atomic_image_registration(self, image_id: str) -> Iterator[None]:
         """Keep the durable registry, audit/event rows, and cache in lockstep."""
 
-        previous = self.images.get(image_id)
         transaction_store = self.store or self.audit.store
-        try:
-            with transaction_store.transaction():
-                yield
-        except Exception:
-            if previous is None:
-                self.images.pop(image_id, None)
-            else:
-                self.images[image_id] = previous
-            raise
+        with self._registration_lock:
+            previous = self.images.get(image_id)
+            try:
+                with transaction_store.transaction():
+                    yield
+            except Exception:
+                if previous is None:
+                    self.images.pop(image_id, None)
+                else:
+                    self.images[image_id] = previous
+                raise
 
     def register(
         self,
@@ -165,11 +168,15 @@ class ImageRegistryPrimitive:
         candidate = self._coerce_image(image)
         if require_capability:
             self.capabilities.require(actor, self.resource_for(candidate.image_id), CapabilityRight.WRITE)
-        existing = self.images.get(candidate.image_id)
-        if existing is not None and not replace:
-            raise ValidationError(f"agent image already exists: {candidate.image_id}")
         self._validate_image(candidate)
         with self._atomic_image_registration(candidate.image_id):
+            # This check must share the cache/store registration critical
+            # section.  Otherwise concurrent replace=False callers can both
+            # pass, and a later rollback can remove an earlier committed cache
+            # entry while leaving its durable row behind.
+            existing = self.images.get(candidate.image_id)
+            if existing is not None and not replace:
+                raise ValidationError(f"agent image already exists: {candidate.image_id}")
             self.images[candidate.image_id] = candidate
             now = utc_now()
             if self.store is not None:
@@ -204,7 +211,13 @@ class ImageRegistryPrimitive:
                     "boot_kind": candidate.boot.get("kind", "fresh"),
                 },
             )
-        return ImageRegistrationResult(image=candidate, replaced=existing is not None, source=source)
+        # Do not expose the cache-owned manifest. AgentImage is frozen only at
+        # the top level; its nested lists and mappings remain mutable.
+        return ImageRegistrationResult(
+            image=deepcopy(candidate),
+            replaced=existing is not None,
+            source=source,
+        )
 
     def validate_package_path(self, path: str | Path) -> dict[str, Any]:
         files, source = self._read_host_package(path)
@@ -1200,7 +1213,10 @@ class ImageRegistryPrimitive:
 
     def _coerce_image(self, image: AgentImage | dict[str, Any]) -> AgentImage:
         if isinstance(image, AgentImage):
-            return image
+            # A shallow-frozen dataclass can still be mutated through nested
+            # containers. Cache a private manifest snapshot so caller changes
+            # cannot bypass registration validation, persistence, or audit.
+            return deepcopy(image)
         if not isinstance(image, dict):
             raise ValidationError("image registration requires an AgentImage or mapping")
         unknown = sorted(set(image) - self.IMAGE_FIELDS)

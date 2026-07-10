@@ -199,12 +199,21 @@ paths.
 
 ## Permission Policy And Human Approval
 
-Human-facing policy names are still used at prompts and CLI boundaries:
+Stored capability policy names are:
 
 - `always_allow` maps to `effect=allow`.
 - `always_deny` maps to `effect=deny`.
 - `ask_each_time` maps to `effect=ask`.
 - `allow_once` maps to `effect=allow, uses_remaining=1`.
+
+A terminal response to a `permission_request` must explicitly choose one of
+`always_allow`, `always_deny`, or `ask_each_time`; it cannot choose
+`allow_once`. One-shot authority is requested/issued through the separate
+one-time capability lease shape so its exact use count remains explicit.
+Approved responses cannot install `always_deny`, rejected responses cannot
+install `always_allow`, and the JSON `approved` boolean must agree with the
+terminal status. Approved ordinary questions require a non-empty string
+`answer` rather than implicit coercion.
 
 Model-facing `request_permission` is not a raw grant API. It first requires the
 caller to hold `human:<name>` write authority, then creates a blocking human
@@ -223,9 +232,31 @@ waits inside the operation. The caller eventually receives either the final
 payload or a final denial error; there is no exposed pending/retry syscall
 protocol.
 
-Approval context includes path, resource, overwrite risk, byte count, SHA-256,
-target state, argv, risk, rule id, sandbox profile, and escaped previews when
-available.
+Approval context includes path, resource, caller-declared overwrite policy,
+byte count, SHA-256, argv, risk, rule id, sandbox profile, and escaped previews
+when available. Filesystem target state is deliberately omitted until the
+operation has received and reserved authority, so an approval prompt cannot be
+used as an existence or metadata oracle.
+
+`human_output` requires `human:<name>` write and reserves finite-use authority.
+Before provider delivery, one transaction marks its request `delivered` and
+persists the output event, audit record, and a structured pending external-effect
+intent. Provider failure finalizes unknown evidence when possible; successful
+delivery followed by classifier/finalization failure leaves the pending intent
+and still returns without replay. The terminal queue cannot deliver that request
+again, and the one-shot use is not restored after the provider boundary.
+
+Terminal queue questions, permission-policy prompts, and ordinary approval
+prompts also cross the configured Human provider through structured `read` or
+`write` intents. Interactive answers and automatic decisions settle the same
+pending effect id, but their audit/effect observations persist only request id,
+purpose, lengths, byte counts, and SHA-256 values. Raw prompt text, raw answers,
+and Human-provider exception text are never written to those records. If the
+provider interaction succeeds but later event, audit, classification, or CAS
+settlement fails, the request still commits its answer/policy so draining the
+queue cannot show the prompt again; the unresolved intent remains pending.
+Human output provider failures likewise persist only `provider_error_type`, not
+the exception message.
 
 ## Tool, Skill, And JIT Boundary
 
@@ -370,11 +401,57 @@ model can produce them.
 Read, write, and delete are separate rights. Granting read over a directory does
 not grant write or delete.
 
+Process cwd selection is a filesystem read, not ambient process metadata.
+`set_working_directory`, explicit spawn/fork working directories, and explicit
+PTY cwd values require `read` on the selected directory resource. Higher-level
+spawn/image or shell authorization is checked before the cwd state probe, and
+the probe uses the normal filesystem pending-intent and finite-use semantics.
+
+Write/delete authority, including an `ask` decision, is resolved before the
+primitive calls `state()`. An unauthorized or rejected mutation therefore
+cannot probe whether a target exists, its kind, or its size. After approval, the
+exact finite-use mutation right is reserved and one pending effect intent spans
+both `state()` and the mutation. Read/list similarly use one reservation and
+intent across their state and data/metadata reads.
+
+If the first provider observation certifies `ProviderEffectNotStarted`, the
+reservation and pending row are atomically restored/abandoned. If `state()`
+already returned information but the main mutation then certifies not-started,
+the mutation one-shot is restored while the same effect id is finalized as
+`state_mutation=false, information_flow=true`. Ordinary state/read/mutation
+exceptions cannot prove what was observed or changed and finalize or retain a
+conservative unknown outcome.
+
 The default local filesystem provider performs no-follow traversal inside the
 workspace root for existing files. Existing file read, write, and delete reject
 symlink or junction traversal and reject regular files with multiple hard links
 (`st_nlink > 1`). Directory listings report child symlinks as symlink entries
 without following them.
+
+Bounded reads do not trust the size returned by an earlier `state()` call. If
+that snapshot does not already prove the file is oversized, the primitive asks
+the provider for one internal sentinel byte beyond `max_bytes`; a file that
+grows between state and read is therefore returned at the caller's bound with
+`truncated: true`, not mislabeled as complete. The sentinel is not exposed or
+charged as information flow: `bytes_read` and `external_read_bytes` count only
+the selected bytes up to `max_bytes`. If the original state already exceeds the
+bound, the provider reads only the bound because truncation is already known.
+
+Authorization is also separated from external-effect evidence. Filesystem,
+clock, and shell primitives persist a pending `unknown` effect intent after
+local preflight but before the first provider call. A classified result
+conditionally finalizes that same `effect_id`; after information flow or
+mutation may have begun, a post-provider capability/event/audit/classifier
+failure cannot make the durable effect history look empty.
+
+`clock.sleep` and async `clock.asleep` create that intent before the first
+provider `monotonic()` measurement. The elapsed-time observations make the
+whole composite operation `information_flow=true`. Only
+`ProviderEffectNotStarted` from that first measurement can atomically restore a
+reserved one-shot use and abandon the intent. An ordinary first-measurement
+exception, or any sleep/cancellation/final-measurement exception after the
+first observation (including a later `ProviderEffectNotStarted`), consumes the
+use and finalizes a conservative `unknown` effect.
 
 ## Shell Authority
 
@@ -411,11 +488,21 @@ The built-in shell policy levels then decide how to handle the classified rule:
   intended for broader local operation.
 - `always_allow`: allow non-destructive commands while still reporting risk.
 
+Those four strings are fixed semantic labels, not remappable config fields.
+Configuration can select `default_policy_level` and replace the argv rule lists,
+but an overlay cannot redefine, for example, `always_allow` to mean a different
+level. Legacy `*_level` remapping fields are rejected by strict config loading.
+
 The capability record's own effect is evaluated before its policy level, so an
 `ask` or `deny` shell-policy capability cannot be converted into an automatic
 allow by setting `shell_policy_level=always_allow`. A finite-use command or
-policy allow is consumed after validation and intent recording, immediately
-before provider execution; provider failures do not restore that use.
+policy allow is reserved after validation and intent recording, immediately
+before provider execution. The exact reservation is restored only when the
+provider raises `ProviderEffectNotStarted`, certifying that execution never
+began. Timeout, resource-limit, cancellation, ordinary provider failure, or a
+post-effect classification failure commits the use and records a conservative
+`unknown` external effect; a failed tool result is not proof that the command
+did nothing.
 
 Rules match tokenized argv, not arbitrary substrings. Bare executable names do
 not match path-qualified executables by accident. The local provider executes

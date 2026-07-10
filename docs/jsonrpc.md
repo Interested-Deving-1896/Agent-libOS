@@ -103,9 +103,13 @@ The registry rejects:
 Headers are environment-backed. The registry stores the environment variable
 name and a small approved prefix such as `Bearer `, never the resolved secret
 value. Missing environment variables, parameter schema failures, request-size
-failures, resource-budget preflight failures, external-effect classifier
-failures, and runtime DNS policy failures happen before the HTTP attempt and
-before one-shot remote method authority is consumed.
+failures, resource-budget preflight failures, and preflight external-effect
+classifier failures happen before finite method authority is reserved. DNS is
+different: the reservation and pending effect intent are durable first because
+resolving a non-local host is itself an external information-flow boundary. A
+successful lookup or an ordinary failure after host observation commits the
+use even though no HTTP request was sent.
+
 For remote HTTPS calls, the primitive passes the validated address set to the
 default provider, which opens the socket to one of those exact addresses while
 preserving the original Host header and TLS server name. This prevents a host
@@ -147,6 +151,14 @@ Endpoint registry operations use endpoint metadata authority:
 | replace endpoint | `jsonrpc_endpoint:<endpoint_id> admin` |
 | unregister endpoint | `jsonrpc_endpoint:<endpoint_id> admin` |
 
+These per-item checks occur before the store loads existing endpoint metadata,
+so unauthorized register/replace/inspect/unregister attempts cannot distinguish
+an existing id from a missing one. `replace=true` always requests `admin` and a
+non-replace registration always requests `write`; the right does not depend on
+an existence lookup. Registration, replacement, and unregistration commit the
+endpoint row, stale method-grant invalidation, event, and audit in one store
+transaction.
+
 Tool visibility does not grant remote authority. Default images expose
 `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, and
 `call_jsonrpc_method`, but a call still fails without the method capability.
@@ -160,10 +172,24 @@ The JSON-RPC provider classifies every call from the method spec:
 - `state_mutation`
 - `information_flow`
 
-The runtime stores an append-only `external_effects` row with provider
-`jsonrpc` and operation `call`. Checkpoint restore reports these effects in
-`external_effects_since_checkpoint` and `external_effect_summary`. v1 does not
-perform remote rollback or compensation.
+After schema/environment/request-size/budget/classifier preflight, the runtime
+atomically reserves finite method authority and creates an `external_effects`
+row with provider `jsonrpc`, operation `call`, and `effect_state: pending`.
+Only then does it perform runtime DNS resolution and the live provider call.
+Successful or failed transport results emit event/audit evidence, run the post-call
+classifier, and CAS that same `effect_id` to `finalized`. A post-call classifier
+failure falls back conservatively instead of dropping the effect. If event,
+audit, or finalization fails after the transport may have run, the row remains a
+durable pending/unknown effect for checkpoint and benchmark reporting.
+
+`ProviderEffectNotStarted` conditionally abandons only when the first DNS
+boundary itself certifies that it did not start. Once DNS returned or otherwise
+observed the host, a later not-started transport finalizes
+`state_mutation=false, information_flow=true` and the reservation stays
+committed. Ordinary DNS/transport errors, non-2xx responses, and JSON-RPC error
+results are finalized outcomes. Checkpoint restore reports finalized and
+pending rows in `external_effects_since_checkpoint` and
+`external_effect_summary`. v1 does not perform remote rollback or compensation.
 
 Audit and external-effect metadata store bounded, redacted observations of
 `params` with size and hash. Raw params are sent to the registered provider but
@@ -172,9 +198,11 @@ are not persisted in audit or provider-effect context.
 `params_schema`, when present, is validated at registration time and enforced
 before each call. Parameter validation failures do not contact the provider and
 do not consume one-shot method authority.
-After those pre-provider checks pass, a one-shot method grant is consumed just
-before the provider call. Transport errors, non-2xx responses, or JSON-RPC
-error results after that boundary do not restore the use.
+After local checks pass, a one-shot method grant is reserved in the same
+transaction as pending-effect persistence. It is restored only for a certified
+failure before DNS or any other information flow. DNS observation, transport
+errors, non-2xx responses, JSON-RPC error results, or a later
+certified-not-started transport do not mint another remote-call use.
 
 ## CLI
 
@@ -206,11 +234,11 @@ the target pid and are authorized by that pid's method capability.
 Replacing an existing endpoint requires endpoint `admin` when an actor pid is
 used. A replace invalidates existing exact method grants for that endpoint so
 old authority cannot silently point at a new URL or wire method. The endpoint
-row replacement and stale method-grant invalidation happen in one store
-transaction; if either part fails, the old endpoint spec remains active.
+row replacement, stale method-grant invalidation, event, and audit happen in
+one store transaction; if any part fails, the old endpoint spec remains active.
 Unregistering an endpoint also invalidates exact and wildcard method grants for
-that endpoint, so reusing the same endpoint id cannot revive stale method
-authority.
+that endpoint in the same transaction, so reusing the same endpoint id cannot
+revive stale method authority.
 
 ## Tools And Syscalls
 

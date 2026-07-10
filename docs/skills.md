@@ -110,6 +110,12 @@ are validated and registered through the same ToolBroker path as proposed JIT
 tools, including sandbox resource limits and metrics. They can only access libOS
 through `libos.syscall()`.
 
+The bundled `swe-agent` editor uses a 1 MiB bounded filesystem read. It refuses
+to write when that read reports `truncated: true`; otherwise a partial prefix
+could overwrite and destroy the unseen suffix. Large files require an editor or
+file workflow that preserves the complete source rather than retrying
+`swe_edit` with a partial payload.
+
 `actions.json` and `required-capabilities.json` are advisory prompt metadata.
 They do not create capabilities.
 

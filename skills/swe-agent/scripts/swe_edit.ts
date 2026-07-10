@@ -31,6 +31,11 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
     return { path: write.path ?? path, created: Boolean(write.created), edit: "create" };
   }
   const file = await libos.syscall("filesystem.read_text", { path, max_bytes: 1048576 });
+  if (Boolean(file.truncated)) {
+    throw new Error(
+      "swe_edit refuses to overwrite a truncated source file; use a bounded editor that preserves the complete file",
+    );
+  }
   const content = String(file.content ?? "");
   let updated = content;
   let edit = "replace_text";

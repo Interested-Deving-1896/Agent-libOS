@@ -456,7 +456,7 @@ textarea {
 
 .userRequestCard {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(160px, 300px) auto auto;
+  grid-template-columns: minmax(180px, 1fr) minmax(180px, 300px) auto;
   gap: 8px;
   align-items: center;
 }
@@ -812,13 +812,47 @@ textarea {
 
 .humanCard {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(160px, 260px) auto auto;
+  grid-template-columns: minmax(160px, 1fr) minmax(180px, 260px) auto;
   gap: 8px;
   align-items: center;
   padding: 8px;
   border: 1px solid #e0b98d;
   border-radius: 6px;
   background: #fff8ed;
+}
+
+.typedHumanRequest {
+  min-width: 0;
+}
+
+.humanRequestPrompt {
+  overflow-wrap: anywhere;
+}
+
+.humanDecisionControl {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  color: #52606d;
+  font-size: 11px;
+}
+
+.humanDecisionControl input,
+.humanDecisionControl select {
+  width: 100%;
+  min-width: 0;
+}
+
+.humanDecisionActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.humanDecisionError {
+  grid-column: 1 / -1;
+  color: #b42318;
+  font-size: 12px;
 }
 
 .timeline {

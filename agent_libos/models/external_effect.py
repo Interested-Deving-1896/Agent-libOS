@@ -44,3 +44,8 @@ class ExternalEffectRecord:
     information_flow: bool
     provider_metadata: dict[str, Any]
     created_at: str
+    effect_state: str = "finalized"
+
+    def __post_init__(self) -> None:
+        if self.effect_state not in {"pending", "finalized"}:
+            raise ValueError(f"invalid external effect state: {self.effect_state!r}")

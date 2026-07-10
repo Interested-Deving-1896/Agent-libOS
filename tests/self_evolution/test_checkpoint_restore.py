@@ -16,6 +16,90 @@ from tests.support.checkpoints import ClassifiedShellProvider
 
 
 class TestCheckpointRestore:
+    def test_checkpoint_create_audit_failure_rolls_back_row_head_capability_and_event(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='atomic checkpoint creation')
+            before_events = list(runtime.events.list())
+            before_audit = list(runtime.audit.trace())
+            before_checkpoint_capabilities = {
+                capability.cap_id
+                for capability in runtime.capability.capabilities_for(pid)
+                if capability.resource.startswith('checkpoint:')
+            }
+            original_record = runtime.audit.record
+
+            def fail_create_audit(*args: object, **kwargs: object) -> object:
+                if kwargs.get('action') == 'checkpoint.create':
+                    raise RuntimeError('injected checkpoint create audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_create_audit)
+            with pytest.raises(RuntimeError, match='injected checkpoint create audit failure'):
+                runtime.checkpoint.create(pid, 'must be atomic', actor=pid, require_capability=False)
+
+            assert runtime.process.get(pid).checkpoint_head is None
+            assert runtime.checkpoint.list(pid, actor=pid, require_capability=False) == []
+            assert runtime.events.list() == before_events
+            assert runtime.audit.trace() == before_audit
+            assert {
+                capability.cap_id
+                for capability in runtime.capability.capabilities_for(pid)
+                if capability.resource.startswith('checkpoint:')
+            } == before_checkpoint_capabilities
+        finally:
+            runtime.close()
+
+
+    def test_restore_advances_llm_context_generation_to_break_provider_chain(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore breaks provider chain')
+            runtime.store.set_llm_context_generation(pid, 'generation-before-checkpoint')
+            checkpoint_id = runtime.checkpoint.create(pid, 'provider chain boundary', actor=pid)
+            runtime.store.set_llm_context_generation(pid, 'generation-after-checkpoint')
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            generation = runtime.store.get_llm_context_generation(pid)
+            assert generation not in {'generation-before-checkpoint', 'generation-after-checkpoint'}
+        finally:
+            runtime.close()
+
+    def test_restore_reconciles_plural_human_wait_state_after_all_requests_resolve(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='plural human wait restore')
+            first = runtime.human.query(
+                pid,
+                'owner',
+                {'type': 'question', 'question': 'First?'},
+                blocking=True,
+            )
+            second = runtime.human.query(
+                pid,
+                'owner',
+                {'type': 'question', 'question': 'Second?'},
+                blocking=True,
+            )
+            runtime.human.approve(first, {'approved': True, 'answer': 'one'})
+            waiting = runtime.process.get(pid)
+            assert waiting.status == ProcessStatus.WAITING_HUMAN
+            assert waiting.status_message == f'waiting for human requests {second}'
+            checkpoint_id = runtime.checkpoint.create(pid, 'plural human wait', actor=pid)
+            runtime.human.approve(second, {'approved': True, 'answer': 'two'})
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored = runtime.process.get(pid)
+            assert restored.status == ProcessStatus.RUNNABLE
+            assert restored.status_message is None
+        finally:
+            runtime.close()
 
     def test_legacy_full_table_snapshot_restore_are_disabled(self) -> None:
         runtime = Runtime.open('local')
@@ -109,6 +193,219 @@ class TestCheckpointRestore:
                     runtime.filesystem.read_text(pid, 'secret.txt')
             finally:
                 runtime.close()
+
+    def test_restore_concurrent_revoke_wins_over_snapshot_capability_reinsertion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        filter_reached = threading.Event()
+        revoke_started = threading.Event()
+        revoke_done = threading.Event()
+        restore_errors: list[BaseException] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='concurrent restore revoke')
+            cap = runtime.capability.grant(pid, 'test:restore-race', [CapabilityRight.READ], issued_by='test')
+            checkpoint_id = runtime.checkpoint.create(pid, 'before concurrent revoke', actor=pid)
+            original_filter = runtime.checkpoint._filtered_restored_capability_rows
+
+            def pause_after_filter(rows):
+                filtered = original_filter(rows)
+                filter_reached.set()
+                assert revoke_started.wait(timeout=2)
+                return filtered
+
+            monkeypatch.setattr(runtime.checkpoint, '_filtered_restored_capability_rows', pause_after_filter)
+
+            def restore() -> None:
+                try:
+                    runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    restore_errors.append(exc)
+
+            restore_thread = threading.Thread(target=restore)
+            restore_thread.start()
+            assert filter_reached.wait(timeout=2)
+
+            def revoke() -> None:
+                revoke_started.set()
+                runtime.capability.revoke(cap.cap_id, revoked_by=pid, reason='concurrent revoke wins')
+                revoke_done.set()
+
+            revoke_thread = threading.Thread(target=revoke)
+            revoke_thread.start()
+            restore_thread.join(timeout=2)
+            revoke_thread.join(timeout=2)
+
+            assert not restore_thread.is_alive()
+            assert not revoke_thread.is_alive()
+            assert revoke_done.is_set()
+            assert restore_errors == []
+            restored = runtime.store.get_capability(cap.cap_id)
+            assert restored is not None
+            assert not restored.active
+            assert not runtime.capability.check(pid, cap.resource, CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'mutation_kind',
+        ['spawn', 'capability', 'object', 'message', 'object_task'],
+    )
+    def test_restore_serializes_host_mutations_across_preflight_and_commit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mutation_kind: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        preflight_reached = threading.Event()
+        mutation_started = threading.Event()
+        allow_commit = threading.Event()
+        main_state_committed = threading.Event()
+        mutation_finished = threading.Event()
+        mutation_before_commit: list[bool] = []
+        errors: list[BaseException] = []
+        mutation_results: list[object] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore host mutation boundary')
+            owner = None
+            if mutation_kind in {'spawn', 'object_task'}:
+                runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            if mutation_kind == 'object_task':
+                owner = runtime.memory.create_object(
+                    pid,
+                    ObjectType.ARTIFACT,
+                    {'owner': True},
+                    name='restore.mutation.owner',
+                    immutable=False,
+                )
+            checkpoint_id = runtime.checkpoint.create(pid, 'before host mutation race', actor=pid)
+            original_validate = runtime.checkpoint._validate_snapshot_restore_assets
+            original_restore_rows = runtime.checkpoint._restore_scoped_rows
+
+            def pause_preflight(snapshot):
+                original_validate(snapshot)
+                preflight_reached.set()
+                assert mutation_started.wait(timeout=2)
+                assert allow_commit.wait(timeout=2)
+
+            def mark_main_commit(*args, **kwargs):
+                result = original_restore_rows(*args, **kwargs)
+                main_state_committed.set()
+                return result
+
+            monkeypatch.setattr(runtime.checkpoint, '_validate_snapshot_restore_assets', pause_preflight)
+            monkeypatch.setattr(runtime.checkpoint, '_restore_scoped_rows', mark_main_commit)
+
+            def restore() -> None:
+                try:
+                    runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            restore_thread = threading.Thread(target=restore)
+            restore_thread.start()
+            assert preflight_reached.wait(timeout=2)
+
+            def mutate() -> None:
+                try:
+                    mutation_started.set()
+                    if mutation_kind == 'spawn':
+                        mutation_results.append(runtime.process.spawn_child(pid, 'spawn racing restore'))
+                    elif mutation_kind == 'capability':
+                        mutation_results.append(
+                            runtime.capability.grant(
+                                pid,
+                                'test:capability-racing-restore',
+                                [CapabilityRight.READ],
+                                issued_by='test',
+                            )
+                        )
+                    elif mutation_kind == 'object':
+                        mutation_results.append(
+                            runtime.memory.create_object(
+                                pid,
+                                ObjectType.SUMMARY,
+                                {'racing': True},
+                                name='restore.mutation.object',
+                            )
+                        )
+                    elif mutation_kind == 'message':
+                        mutation_results.append(
+                            runtime.messages.post(
+                                sender='test',
+                                recipient_pid=pid,
+                                subject='message racing restore',
+                            )
+                        )
+                    else:
+                        assert owner is not None
+                        mutation_results.append(
+                            runtime.object_tasks.start(
+                                pid,
+                                owner,
+                                'receive_process_messages',
+                                {'channel': 'restore-mutation-never'},
+                            )
+                        )
+                    mutation_before_commit.append(not main_state_committed.is_set())
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    mutation_finished.set()
+
+            mutation_thread = threading.Thread(target=mutate)
+            mutation_thread.start()
+            assert mutation_started.wait(timeout=2)
+            mutation_finished.wait(timeout=0.2)
+            allow_commit.set()
+            restore_thread.join(timeout=3)
+            mutation_thread.join(timeout=3)
+
+            assert not restore_thread.is_alive()
+            assert not mutation_thread.is_alive()
+            assert errors == []
+            assert mutation_before_commit == [False]
+            assert len(mutation_results) == 1
+        finally:
+            runtime.close()
+
+    def test_restore_does_not_roll_back_borrowed_view_root_or_external_capabilities(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='shared object owner')
+            borrower = runtime.process.spawn(image='base-agent:v0', goal='checkpoint borrower')
+            shared = runtime.memory.create_object(
+                owner,
+                ObjectType.SUMMARY,
+                {'version': 1},
+                ObjectMetadata(title='shared'),
+                immutable=False,
+                name='shared.state',
+            )
+            borrowed = runtime.capability.handle_for_object(
+                borrower,
+                shared.oid,
+                [CapabilityRight.READ],
+                issued_by='test.borrowed',
+            )
+            runtime._add_handle_to_process_view(borrower, borrowed)
+            checkpoint_id = runtime.checkpoint.create(borrower, 'borrowed root checkpoint', actor=borrower)
+
+            runtime.memory.update_object(owner, shared, ObjectPatch(payload={'version': 2}))
+            owner_capability = runtime.store.get_capability(shared.capability_id)
+            assert owner_capability is not None and owner_capability.active
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert runtime.store.get_object(shared.oid).payload == {'version': 2}
+            owner_capability = runtime.store.get_capability(shared.capability_id)
+            assert owner_capability is not None and owner_capability.active
+            assert runtime.capability.check(owner, f'object:{shared.oid}', CapabilityRight.WRITE)
+            restored_borrower = runtime.process.get(borrower)
+            assert shared.oid in {handle.oid for handle in restored_borrower.memory_view.roots}
+        finally:
+            runtime.close()
 
     def test_replay_to_event_is_scoped_to_checkpoint_process_subtree(self) -> None:
         runtime = Runtime.open('local')
@@ -472,7 +769,7 @@ class TestCheckpointRestore:
             pid = runtime.process.spawn(image='base-agent:v0', goal='human wait')
             request_id = runtime.human.ask(pid, 'continue?', blocking=True)
             checkpoint_id = runtime.checkpoint.create(pid, 'waiting for human', actor=pid)
-            runtime.human.approve(request_id, {'approved': True})
+            runtime.human.approve(request_id, {'approved': True, 'answer': 'yes'})
 
             runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
 
@@ -665,5 +962,60 @@ class TestCheckpointRestore:
                 and record.decision['phase'] == 'object_release_finalizers'
                 for record in runtime.audit.trace()
             )
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('sink', 'phase'),
+        [
+            ('event', 'restore_event_emission'),
+            ('audit', 'restore_audit_recording'),
+        ],
+    )
+    def test_restore_reports_event_and_audit_failures_after_main_state_commit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sink: str,
+        phase: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'{sink} failure after restore')
+            state = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'version': 1},
+                ObjectMetadata(title='state'),
+                immutable=False,
+                name=f'{sink}.failure.state',
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, f'before {sink} failure', actor=pid)
+            runtime.memory.update_object(pid, state, ObjectPatch(payload={'version': 2}))
+
+            if sink == 'event':
+                original_emit = runtime.events.emit
+
+                def fail_restore_event(event_type, *args, **kwargs):
+                    if event_type == EventType.ROLLBACK:
+                        raise RuntimeError('injected restore event failure')
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_restore_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_restore_audit(*args, **kwargs):
+                    if kwargs.get('action') == 'checkpoint.restore':
+                        raise RuntimeError('injected restore audit failure')
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_restore_audit)
+
+            result = runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert runtime.memory.get_object_by_name(pid, f'{sink}.failure.state').payload == {'version': 1}
+            assert result['status'] == 'restored_with_warnings'
+            assert result['main_state_committed'] is True
+            assert phase in [failure['phase'] for failure in result['post_commit_failures']]
         finally:
             runtime.close()

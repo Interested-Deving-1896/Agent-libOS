@@ -10,12 +10,15 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 
 - process rows and statuses,
 - process working directories,
-- Object Memory metadata and payloads for the subtree,
+- Object Memory metadata and payloads owned by the subtree,
+- borrowed MemoryView root references and their types, without treating the
+  referenced Object as subtree-owned state,
 - process namespaces and object links,
 - subtree capabilities,
 - process tool tables,
 - JIT candidates and registered process-local JIT tools,
-- Skill registry rows needed by loaded Skills,
+- compatibility Skill registry rows associated with loaded Skills (never
+  applied to the current global Skill registry by restore/fork),
 - loaded Skill records,
 - mailbox delivery state,
 - image definitions needed by the subtree,
@@ -28,12 +31,21 @@ event, tool, or human response back to `runnable`; the forked process must
 re-enter those waits explicitly under its new identity.
 
 Checkpoint creation reads the scoped SQL rows and in-memory Object payloads and
-writes the checkpoint plus the owner's `checkpoint_head` in one store
-transaction. A concurrent store transaction therefore appears wholly before or
-wholly after the captured snapshot; it cannot split an Object row from its
-payload. The denormalized process capability index is rebuilt from the
-capability rows read by that same snapshot, so those two representations cannot
-disagree.
+writes the checkpoint row, owner's `checkpoint_head`, owner's initial
+`checkpoint:<id>` `read` capability, creation event, and creation audit in one
+store transaction. Any event/audit/capability sink failure therefore rolls the
+entire create result back instead of leaving a checkpoint whose id was never
+returned. A concurrent store transaction appears wholly before or wholly after
+the captured snapshot; it cannot split an Object row from its payload. The
+denormalized process capability index is rebuilt from the capability rows read
+by that same snapshot, so those two representations cannot disagree.
+
+Ownership defines the destructive scope. Process- and process-result-owned
+Objects, plus scoped ObjectTask results, are captured as reconstructable state.
+A root in a `MemoryView` is only a reference: checkpointing a borrower does not
+claim ownership of the lender's Object, payload, namespace, or capability.
+Legacy snapshots that mixed roots into `object_oids` are reinterpreted from the
+captured owner fields before restore/fork.
 
 ## Append-Only Boundary
 
@@ -50,7 +62,11 @@ Restore itself appends new audit and event records.
 Restore and fork require the current Python runtime to have already loaded the
 same startup Runtime Module ids and source hashes captured in the checkpoint.
 Checkpoint restore does not import Python modules, change module trust, restore
-global Skill trust rows, or roll back the host module environment.
+global Skill trust rows, replace the global Skill registry, or roll back the
+host module environment. Each restored/forked process continues to use the
+immutable `package_snapshot` in its `loaded_skills` record. Historical
+checkpoint `skills` rows remain readable compatibility data, not a host
+registry mutation.
 
 Host filesystem, shell, JSON-RPC/MCP remote calls, and provider effects are not
 rolled back. Image registry rows are internal runtime metadata: snapshots capture
@@ -60,22 +76,37 @@ image rows so the restored subtree can run against its snapshotted image
 definitions; it does not copy image-package source directories or provider-side
 state.
 
-Providers classify their own effects as:
+Providers classify their successful effects as:
 
 - `irreversible`,
 - `rollbackable`,
 - `no_rollback_required`,
-- `unknown` for an ambiguous filesystem-mutation or clock provider outcome.
+- `unknown` for an outcome whose external state cannot be proven.
 
-For those two adapters, `ProviderEffectNotStarted` certifies a pre-effect
-failure that may restore a reserved finite-use grant. An ordinary provider
-exception cannot make that guarantee, so the grant stays consumed and the
-`unknown` effect remains visible in checkpoint reports.
+Filesystem mutations, clock operations, shell execution, and PTY spawn reserve
+finite-use authority before entering their provider boundary.
+`ProviderEffectNotStarted` restores that exact reservation only when it
+certifies that the operation's first provider observation did not start and no
+earlier information flow occurred. Clock sleep/asleep begins its intent before
+the first `monotonic()` measurement; ordinary first-measurement failure and all
+failures after that observation consume the use, and elapsed-time measurement
+marks the effect as information flow. Timeout, cancellation, resource-limit,
+ordinary provider exception, and post-effect classifier failure otherwise
+cannot prove non-execution, so the use stays consumed and an `unknown` effect
+remains visible in checkpoint reports. A tool/provider error therefore does not
+imply that no outside-world effect occurred. Filesystem/clock/shell, human
+output, PTY spawn/write/resize/close, and live JSON-RPC/MCP calls persist this
+uncertainty before the provider boundary as a pending external-effect intent,
+then conditionally finalize the same id. If any post-provider sink fails,
+checkpoint diff/restore still reports that durable `unknown` row. Cleaning up a
+failed PTY session publication does not remove its uncertain spawn history.
 
 Restore reports provider-recorded effects in
 `external_effects_since_checkpoint`, summarizes them in
 `external_effect_summary`, and returns `restore_external_policy:
-"report_only"`. In v1, `rollbackable` means the provider says a future
+"report_only"`. The summary includes `by_state` counts and an explicit
+`pending` count in addition to rollback class and provider/operation totals. In
+v1, `rollbackable` means the provider says a future
 compensation layer could reason about the effect; restore still does not apply
 external compensation.
 
@@ -94,8 +125,9 @@ Rights map to operations:
 - `execute`: fork from a checkpoint.
 - `admin`: destructive restore.
 
-Creating a checkpoint does not automatically grant destructive restore
-authority to the creator.
+Creating a checkpoint grants the checkpoint owner process `read` on that exact
+new checkpoint. It does not automatically grant `execute` or destructive
+`admin` restore authority.
 
 ## Public Operations
 
@@ -146,22 +178,36 @@ subtree. If the scheduler is actively running a quantum or still has active
 futures, restore is rejected and the caller must retry after the runtime is
 quiescent. Unrelated processes are not restored.
 
+After scheduler quiescence, restore holds the Object ownership boundary and the
+store mutation lock continuously from the first preflight read through the
+main-state commit. Host-side process, capability, Object Memory, mailbox, and
+ObjectTask mutations therefore linearize wholly before or after restore; they
+cannot slip between validation and row replacement. Capability rows are
+filtered inside that boundary against current active/expiry/restrictive policy
+state. A revoke that commits before restore's linearization point wins and is
+not resurrected from the snapshot.
+
 Restore has three explicit phases:
 
 1. **Preflight** validates checkpoint authority, required Runtime Modules,
    image artifacts, JIT metadata, and the absence of active scoped ObjectTasks.
    A preflight failure makes no reconstructable-state changes.
 2. **Commit** replaces scoped SQL rows and in-memory Object payloads in one
-   transaction. A commit failure rolls that transaction back.
+   transaction. Only owned Objects/namespaces are deleted or replaced; borrowed
+   roots remain references to current lender state. A commit failure rolls that
+   transaction back.
 3. **Post-commit reconciliation** re-upserts captured image metadata, restores
-   and prunes JIT registries, and runs release finalizers for scoped Objects
-   removed by the commit. These operations touch global registries or host
-   resources and cannot undo the committed process-state transaction.
+   and prunes process-local JIT registries, and runs release finalizers for
+   scoped Objects removed by the commit. It never applies captured global Skill
+   rows. These operations touch global registries or host resources and cannot
+   undo the committed process-state transaction. The restore event and final
+   restore audit are also post-commit observability sinks; their failure cannot
+   undo that transaction either.
 
 A successful commit returns `main_state_committed: true`. If every
 post-commit phase succeeds, `status` is `restored`; otherwise `status` is
 `restored_with_warnings` and `post_commit_failures` identifies each failed
-phase and error. Each such failure appends a
+reconciliation/event/audit phase and error. Each recordable failure appends a
 `checkpoint.restore.post_commit_failure` audit record. Callers must not retry a
 `restored_with_warnings` result as though the main restore had rolled back.
 
@@ -177,6 +223,15 @@ wait also becomes runnable so the permission path can re-check the current
 capability state. Other resolved human waits become paused with an explanatory
 status message. This keeps checkpoint state from preserving stale waits whose
 blocking condition has already resolved in the restored snapshot.
+
+Restored `llm_pending_actions` remain durable wait generations. Before the next
+quantum, the executor synchronizes its in-memory human/child/message waiter with
+the restored row and `resume_token`, so a pre-restore cached generation cannot
+claim or clear it. Restore also assigns every restored process a fresh durable
+LLM context generation inside the main transaction. Provider-side Responses
+history is append-only and is not rolled back, so this generation change forces
+the next LLM request to reset stateless instead of chaining to a response made
+from post-checkpoint local state.
 
 Scoped Object Memory rows removed by restore run registered release finalizers
 after the main state commit. A finalizer failure is surfaced through the
@@ -198,7 +253,8 @@ A checkpoint can be committed into a new `AgentImage`, similar in spirit to a
 Docker image commit but scoped to Agent libOS reconstructable runtime state.
 The v1 commit captures only the checkpoint owner root process:
 
-- Object Memory metadata and payloads reachable from that process,
+- Object Memory metadata and payloads both referenced by and owned/captured for
+  that process (borrowed roots without captured payloads are excluded),
 - process-local namespace state,
 - loaded Skill records and package rows,
 - visible static tools and process-local JIT tool sources,
@@ -238,7 +294,18 @@ the checkpointed process.
 ## Fork From Checkpoint
 
 Fork creates a new isolated process subtree from checkpoint state. It remaps
-pids, object ids, capability ids, namespace ids, and process-local tool records.
+pids, owned object ids, capability ids, namespace ids, ephemeral JIT tool ids,
+and JIT candidate ids. Candidate Object payloads and loaded-Skill JIT mappings
+are rewritten to those new identities, so unloading or replacing a forked tool
+cannot retire the source process's registration.
+
+Executable JIT handles/sources are prepared before publication. The missing
+Image/artifact rows, all fork rows, Object payload cache entries, and any parent
+child-budget reservation/charge then publish in one store transaction. On
+failure the prepared handles and newly introduced images are discarded; the
+scheduler cannot claim a fork root whose process-local JIT assets are only
+partially installed.
+
 Fork is non-destructive for the global image registry: it restores only missing
 image definitions, and restores checkpoint-derived image artifacts only for the
 missing images it reintroduces. It never replaces an image id that already
@@ -246,19 +313,50 @@ exists. When actor capability checks are enabled, fork therefore requires both
 `execute` on the checkpoint and `write` on each missing `image:<image_id>`
 resource it would reintroduce.
 
+Fork also never replaces the global Skill registry. Forked processes consume
+their captured `loaded_skills.package_snapshot`; checkpoint compatibility rows
+are not upserted into host Skill state.
+
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result
 objects by reference. Checkpointed ObjectTask result objects are remapped to the
 forked process-result owner boundary rather than pointing back at the original
-task id.
+task id. A source capability with `uses_remaining` set is never copied into the
+fork, even when it still has uses left; cloning a finite grant would multiply
+one-shot authority.
 
-Fork capability copying is checked against current capability state before rows
-are remapped. Revoked or expired capabilities are not copied. If a current
+`EXTERNAL_REF` Objects are host-handle descriptions, not clonable runtime
+resources. Fork drops both owned and borrowed `EXTERNAL_REF` roots and filters
+their object capabilities; it never reconnects or aliases the source PTY or
+other host handle. Destructive restore likewise mutates only subtree-owned
+Objects and does not roll back a borrowed Object or its lender's capability.
+
+Fork first performs non-consuming preparation checks: the requested parent must
+exist and be non-terminal, cross-subject parent attachment needs `admin` on the
+parent's checkpoint-process resource, the actor needs `execute` on the source
+checkpoint, and every missing snapshot image needs `write` on its exact image
+resource. All checks run again inside the same store transaction that publishes
+the fork, and finite-use actor authority is consumed only there. A concurrent
+revoke, newly terminal parent, missing image permission, or later transaction
+failure publishes no fork/image/object/process rows and rolls back that
+transaction's one-shot consumption. Only a successful publication spends the
+grant.
+
+Snapshot capability copying is also revalidated at the publication point, so a
+revoke committed before it wins. Revoked, expired, and finite-use capabilities
+are not copied. If a current
 restrictive `deny` or `ask` capability may overlap a checkpointed `allow`
 capability, the overlapping right is dropped from the forked copy. This is
 conservative by design: capability records do not encode exceptions, so a fork
 must not recreate broad authority that current policy has narrowed since the
 checkpoint was taken.
+
+After main-state publication, fork event/audit emission is observability rather
+than rollbackable state. Success returns `status: forked` and
+`main_state_committed: true`. If either post-commit sink fails, the fork remains
+published and the result instead uses `status: forked_with_warnings` with
+`post_commit_failures`; retrying it as an uncommitted fork would duplicate the
+subtree.
 
 ## Replay To Event
 
@@ -274,8 +372,12 @@ Checkpoint defaults live in `CheckpointDefaults`:
 - checkpoint list limit,
 - payload capture limit,
 - snapshot hard byte limit,
-- diff preview size,
-- auto high-risk checkpoint toggle.
+- diff preview size.
+
+There is no automatic high-risk checkpoint setting. The former
+`auto_high_risk_checkpoint` config field described an unimplemented idea and is
+now rejected by strict config loading. Callers that need a safety snapshot must
+create it explicitly before the risky operation.
 
 Payload capture is bounded. A checkpoint can fail when reconstructable state is
 larger than configured limits.

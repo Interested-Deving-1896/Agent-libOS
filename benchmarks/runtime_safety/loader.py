@@ -8,6 +8,7 @@ from agent_libos.utils.yaml_loader import load_yaml_mapping
 from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError, VALID_EFFECT_TYPES
 
 REQUIRED_FIELDS = {
+    "schema_version",
     "id",
     "title",
     "goal",
@@ -42,8 +43,8 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
     source = Path(path)
     data = load_yaml_mapping(source.read_text(encoding="utf-8"))
     _validate_required(data, source)
-    schema_version = data.get("schema_version", 0)
-    if schema_version != 0:
+    schema_version = data.get("schema_version")
+    if schema_version != 1:
         raise BenchmarkValidationError(f"{source}: unsupported schema_version {schema_version!r}")
     task_id = _string_field(data, "id", source)
     if not _TASK_ID_RE.match(task_id):
@@ -67,7 +68,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         forbidden_effects=forbidden,
         success_oracle=success_oracle,
         safety_oracle=safety_oracle,
-        schema_version=0,
+        schema_version=1,
         setup=_optional_mapping(data.get("setup", {}), source, "setup"),
         capabilities=_optional_mapping(data.get("capabilities", {}), source, "capabilities"),
         policy=_optional_mapping(data.get("policy", {}), source, "policy"),
@@ -125,8 +126,25 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
             if "path" not in effect:
                 raise BenchmarkValidationError(f"{source}: {field}[{index}] requires path")
             effect["path"] = _safe_relative_path(str(effect["path"]), source, f"{field}[{index}].path")
+            _validate_match_mode(
+                effect,
+                source,
+                f"{field}[{index}].match",
+                allowed={"exact", "prefix", "glob"},
+            )
+            has_wildcard = any(marker in effect["path"] for marker in ("*", "?", "["))
+            if has_wildcard and effect.get("match") != "glob":
+                raise BenchmarkValidationError(
+                    f"{source}: {field}[{index}] wildcard paths require match: glob"
+                )
         if effect_type == "shell.exec":
             _validate_argv(effect.get("argv"), source, f"{field}[{index}].argv")
+            _validate_match_mode(
+                effect,
+                source,
+                f"{field}[{index}].match",
+                allowed={"exact", "prefix"},
+            )
         if str(effect_type).startswith("object."):
             namespace = effect.get("namespace")
             if namespace is not None and (not isinstance(namespace, str) or ".." in namespace.replace("\\", "/").split("/")):
@@ -146,6 +164,22 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
             _validate_non_empty_string(effect, "endpoint", source, f"{field}[{index}].endpoint")
             _validate_non_empty_string(effect, "method", source, f"{field}[{index}].method")
     return effects
+
+
+def _validate_match_mode(
+    effect: dict[str, Any],
+    source: Path,
+    field: str,
+    *,
+    allowed: set[str],
+) -> None:
+    if "match" not in effect:
+        return
+    value = effect.get("match")
+    if not isinstance(value, str) or value not in allowed:
+        raise BenchmarkValidationError(
+            f"{source}: {field} match must be one of {sorted(allowed)}, got {value!r}"
+        )
 
 
 def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> None:

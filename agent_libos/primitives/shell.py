@@ -14,11 +14,25 @@ from urllib.parse import urlsplit
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY, ShellRuleEngine
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellPolicyLevel
-from agent_libos.models import AuthorityRisk, AuthorityRule, Capability, CapabilityEffect, CapabilityRight, EventType, ResourceUsage, SandboxProfile
+from agent_libos.models import (
+    AuthorityRisk,
+    AuthorityRule,
+    Capability,
+    CapabilityEffect,
+    CapabilityRight,
+    EventType,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+    ResourceUsage,
+    SandboxProfile,
+)
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
+    abandon_external_effect_intent,
+    begin_external_effect_intent,
     classify_external_effect,
     record_external_effect,
     require_external_effect_classifier,
@@ -27,6 +41,7 @@ from agent_libos.substrate import (
     CommandMetrics,
     CommandResult,
     LocalShellProvider,
+    ProviderEffectNotStarted,
     ShellProvider,
     SubprocessLimitExceeded,
     SubprocessLimits,
@@ -112,6 +127,7 @@ class ShellAdapter:
             "sandbox_profile": self._profile_json(decision.sandbox_profile),
         }
         limits = self._subprocess_limits(pid)
+        provider_kwargs = self._provider_run_kwargs(timeout=selected_timeout, cwd=cwd, limits=limits)
         require_external_effect_classifier(self.provider, "run")
         intent_record = self._record_run_intent(
             pid,
@@ -122,15 +138,49 @@ class ShellAdapter:
             cwd=cwd,
         )
         correlation_id = intent_record.record_id
+        reservation_id: str | None = None
         if decision.consume_once and decision.consume_capability_id is not None:
-            self.capabilities.consume_use(
+            reservation_id = self.capabilities.reserve_use(
                 decision.consume_capability_id,
-                used_by="shell",
-                reason="one-time shell permission consumed",
+                reserved_by="shell",
+                reason="one-time shell permission reserved before provider execution",
             )
         try:
-            proc = self._provider_run(checked, timeout=selected_timeout, cwd=cwd, limits=limits)
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="shell",
+                operation="run",
+                target=resource,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_shell_capability(reservation_id)
+            raise
+        try:
+            proc = self.provider.run(checked, **provider_kwargs)
             proc = self._bounded_result(proc)
+        except ProviderEffectNotStarted as exc:
+            with self.audit.store.transaction():
+                self._restore_shell_capability(reservation_id)
+                abandon_external_effect_intent(self.audit.store, effect_intent.effect_id)
+                self.audit.record(
+                    actor=pid,
+                    action="primitive.shell.failed",
+                    target=resource,
+                    decision={
+                        "argv": checked,
+                        "cwd": os.fspath(cwd) if cwd is not None else None,
+                        "effect_outcome": "not_started",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    correlation_id=correlation_id,
+                    parent_record_id=intent_record.record_id,
+                )
+            raise
         except SubprocessTimeoutExpired as exc:
             charge_error: ResourceLimitExceeded | None = None
             try:
@@ -144,30 +194,40 @@ class ShellAdapter:
                 )
             except ResourceLimitExceeded as resource_exc:
                 charge_error = resource_exc
-            self.audit.record(
-                actor=pid,
+            self._record_ambiguous_provider_failure(
+                pid=pid,
+                resource=resource,
+                effect_context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation_id,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
                 action="primitive.shell.timeout",
-                target=resource,
                 decision={
                     "argv": checked,
                     "timeout_s": selected_timeout,
                     "cwd": os.fspath(cwd) if cwd is not None else None,
                     "metrics": self._metrics_json(exc.metrics),
                 },
-                correlation_id=correlation_id,
-                parent_record_id=intent_record.record_id,
             )
             if charge_error is not None:
                 raise charge_error from exc
             raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
         except subprocess.TimeoutExpired as exc:
-            self.audit.record(
-                actor=pid,
+            self._record_ambiguous_provider_failure(
+                pid=pid,
+                resource=resource,
+                effect_context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation_id,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
                 action="primitive.shell.timeout",
-                target=resource,
-                decision={"argv": checked, "timeout_s": selected_timeout, "cwd": os.fspath(cwd) if cwd is not None else None},
-                correlation_id=correlation_id,
-                parent_record_id=intent_record.record_id,
+                decision={
+                    "argv": checked,
+                    "timeout_s": selected_timeout,
+                    "cwd": os.fspath(cwd) if cwd is not None else None,
+                },
             )
             raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
         except SubprocessLimitExceeded as exc:
@@ -191,35 +251,42 @@ class ShellAdapter:
                     reason=reason,
                     limit={"kind": metrics.limit_kind, "metrics": self._metrics_json(metrics)},
                 )
-            self.audit.record(
-                actor=pid,
+            self._record_ambiguous_provider_failure(
+                pid=pid,
+                resource=resource,
+                effect_context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation_id,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
                 action="primitive.shell.resource_limit_exceeded",
-                target=resource,
                 decision={
                     "argv": checked,
                     "cwd": os.fspath(cwd) if cwd is not None else None,
                     "metrics": self._metrics_json(metrics),
                     "reason": reason,
                 },
-                correlation_id=correlation_id,
-                parent_record_id=intent_record.record_id,
             )
             raise (charge_error or ResourceLimitExceeded(reason)) from exc
         except Exception as exc:
-            self.audit.record(
-                actor=pid,
+            self._record_ambiguous_provider_failure(
+                pid=pid,
+                resource=resource,
+                effect_context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation_id,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
                 action="primitive.shell.failed",
-                target=resource,
                 decision={
                     "argv": checked,
                     "cwd": os.fspath(cwd) if cwd is not None else None,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 },
-                correlation_id=correlation_id,
-                parent_record_id=intent_record.record_id,
             )
             raise
+        self._commit_shell_capability(reservation_id)
         event = self._emit_run_event(pid, resource, checked, proc, decision, cwd=cwd, correlation_id=correlation_id)
         audit_record = self.audit.record(
             actor=pid,
@@ -243,8 +310,7 @@ class ShellAdapter:
             correlation_id=correlation_id,
             parent_record_id=intent_record.record_id,
         )
-        classification = classify_external_effect(
-            self.provider,
+        classification = self._classify_external_effect(
             "run",
             effect_context,
             {"returncode": proc.returncode, "stdout_truncated": proc.stdout_truncated, "stderr_truncated": proc.stderr_truncated},
@@ -259,6 +325,7 @@ class ShellAdapter:
             audit_record=audit_record,
             event=event,
             metadata={"context": effect_context, "returncode": proc.returncode},
+            intent_effect_id=effect_intent.effect_id,
         )
         self._charge_subprocess_metrics(
             pid,
@@ -954,14 +1021,13 @@ class ShellAdapter:
             metrics=proc.metrics,
         )
 
-    def _provider_run(
+    def _provider_run_kwargs(
         self,
-        argv: list[str],
         *,
         timeout: float,
         cwd: str | os.PathLike[str] | None,
         limits: SubprocessLimits | None,
-    ) -> CommandResult:
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"timeout": timeout}
         if cwd is not None:
             kwargs["cwd"] = os.fspath(cwd)
@@ -972,7 +1038,106 @@ class ShellAdapter:
         kwargs["stdout_limit_chars"] = self.config.shell.stdout_hard_limit_chars
         kwargs["stderr_limit_chars"] = self.config.shell.stderr_hard_limit_chars
         self._require_provider_run_parameters_support(kwargs)
-        return self.provider.run(argv, **kwargs)
+        return kwargs
+
+    def _commit_shell_capability(self, reservation_id: str | None) -> None:
+        self.capabilities.commit_reserved_use(
+            reservation_id,
+            committed_by="shell",
+            reason="one-time shell permission committed after provider execution began",
+        )
+
+    def _restore_shell_capability(self, reservation_id: str | None) -> None:
+        self.capabilities._restore_reserved_use(
+            reservation_id,
+            restored_by="shell",
+            reason="one-time shell permission restored after certified pre-effect failure",
+        )
+
+    def _record_ambiguous_provider_failure(
+        self,
+        *,
+        pid: str,
+        resource: str,
+        effect_context: dict[str, Any],
+        intent_record: Any,
+        reservation_id: str | None,
+        effect_intent_id: str,
+        error: BaseException,
+        action: str,
+        decision: dict[str, Any],
+    ) -> None:
+        self._commit_shell_capability(reservation_id)
+        event = None
+        if self.events is not None:
+            event = self.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=pid,
+                target=resource,
+                payload={
+                    "adapter": "shell",
+                    "operation": "run",
+                    "outcome": "unknown",
+                    "error_type": type(error).__name__,
+                },
+                correlation_id=intent_record.record_id,
+                causality={"audit_parent_record_id": intent_record.record_id},
+            )
+        audit_record = self.audit.record(
+            actor=pid,
+            action=action,
+            target=resource,
+            decision={
+                **decision,
+                "effect_outcome": "unknown",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+            correlation_id=intent_record.record_id,
+            parent_record_id=intent_record.record_id,
+        )
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="shell",
+            operation="run",
+            target=resource,
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"outcome": "unknown_after_provider_exception"},
+            ),
+            audit_record=audit_record,
+            event=event,
+            metadata={
+                "context": effect_context,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        try:
+            return classify_external_effect(self.provider, operation, context, result)
+        except Exception as exc:
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=True,
+                information_flow=True,
+                metadata={
+                    "classification_error": f"{type(exc).__name__}: {exc}",
+                    "classification_fallback": "post_effect_failure",
+                },
+            )
 
     def _require_provider_run_parameters_support(self, kwargs: dict[str, Any]) -> None:
         try:

@@ -616,7 +616,7 @@ class ProcessManager:
         if process.status in self.TERMINAL_STATUSES:
             self._release_rejected_exit_result(pid, result)
             raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
-        with self.store.locked():
+        with self.memory.ownership_locked(), self.store.locked():
             process = self._get(pid)
             if process.status in self.TERMINAL_STATUSES:
                 self._release_rejected_exit_result(pid, result)
@@ -644,18 +644,27 @@ class ProcessManager:
         self._notify_object_task_process_terminal(process.pid)
 
     def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:
+        errors: list[str] = []
         for pid in pids:
             process = self.store.get_process(pid)
             if process is None or process.status != ProcessStatus.KILLED:
                 continue
-            self._finalize_terminal_process(process, preserve_oids=set())
-            self.events.emit(
-                EventType.PROCESS_EXITED,
-                source=pid,
-                target=process.parent_pid,
-                payload={"pid": pid, "status": process.status.value, "result_oid": None, "reason": reason},
-            )
-            self._notify_object_task_process_terminal(pid)
+            try:
+                self._finalize_terminal_process(process, preserve_oids=set())
+                self.events.emit(
+                    EventType.PROCESS_EXITED,
+                    source=pid,
+                    target=process.parent_pid,
+                    payload={"pid": pid, "status": process.status.value, "result_oid": None, "reason": reason},
+                )
+                self._notify_object_task_process_terminal(pid)
+            except Exception as exc:
+                # A resource kill can cover an entire descendant tree. One
+                # process' cleanup failure must not strand every later killed
+                # process; report the aggregate after attempting them all.
+                errors.append(f"{pid}: {type(exc).__name__}: {exc}")
+        if errors:
+            raise RuntimeError("killed process finalization failed: " + "; ".join(errors))
 
     def _finalize_terminal_process(self, process: AgentProcess, preserve_oids: set[str]) -> None:
         self._release_terminal_child_memory(process.pid, preserve_oids=preserve_oids)

@@ -25,6 +25,8 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
+    abandon_external_effect_intent,
+    begin_external_effect_intent,
     classify_external_effect,
     record_external_effect,
     require_external_effect_classifier,
@@ -39,6 +41,7 @@ from agent_libos.substrate import (
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _RESOURCE_SEGMENT_SAFE = "-._~"
+_DIRECTORY_STATE_OBSERVATION_BYTES = 512
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,146 @@ class FilesystemAdapter:
         self.human = human
         self.resources = resources
 
+    def validate_directory(
+        self,
+        pid: str,
+        path: str | os.PathLike[str],
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> str:
+        """Authorize and validate one directory-state observation.
+
+        Working-directory selection needs host filesystem metadata, so it must
+        cross the same capability, finite-use, resource, audit/event, and
+        external-effect boundary as other filesystem reads.  The returned path
+        is the normalized lexical workspace-relative path; provider state/sink
+        checks resolve real paths only after authorization.
+        """
+
+        target, relative = self._resolve(path, cwd=cwd)
+        resource = self.directory_resource_for(relative)
+        decision = self.capabilities.require(
+            pid,
+            resource,
+            CapabilityRight.READ,
+            self._authorization_context(
+                pid=pid,
+                resource=resource,
+                relative=relative,
+                primitive="runtime.filesystem.validate_directory",
+                operation="state",
+                right=CapabilityRight.READ.value,
+            ),
+            consume=False,
+        )
+        effect_context = {
+            "path": relative,
+            "resource": resource,
+            "expected_kind": "directory",
+        }
+        usage = ResourceUsage(external_read_bytes=_DIRECTORY_STATE_OBSERVATION_BYTES)
+        self._preflight_resource_usage(
+            pid,
+            usage,
+            source="primitive.filesystem.validate_directory",
+            context=effect_context,
+        )
+        reservation = self._reserve_read_decision(decision, operation="state")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="state",
+                target=resource,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_read_decision(reservation, operation="state")
+            raise
+
+        try:
+            state = self.provider.state(target)
+        except ProviderEffectNotStarted as exc:
+            with self.audit.store.transaction():
+                self._restore_read_decision(reservation, operation="state")
+                abandon_external_effect_intent(self.audit.store, effect_intent.effect_id)
+                self.audit.record(
+                    actor=pid,
+                    action="primitive.filesystem.validate_directory.failed",
+                    target=resource,
+                    decision={
+                        "path": relative,
+                        "effect_outcome": "not_started",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+            raise
+        except Exception as exc:
+            self._commit_read_decision(reservation, operation="state")
+            self._finalize_directory_state_observation(
+                pid=pid,
+                resource=resource,
+                relative=relative,
+                effect_context=effect_context,
+                effect_intent_id=effect_intent.effect_id,
+                outcome="unknown",
+                classification=ExternalEffectClassification(
+                    rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                    rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                    state_mutation=False,
+                    information_flow=True,
+                    metadata={"outcome": "unknown_after_state_exception"},
+                ),
+                error=exc,
+            )
+            self._charge_resource_usage(
+                pid,
+                usage,
+                source="primitive.filesystem.validate_directory",
+                context=effect_context,
+            )
+            raise
+
+        self._commit_read_decision(reservation, operation="state")
+        error: Exception | None = None
+        if not state.exists:
+            outcome = "not_found"
+            error = NotFound(f"working directory does not exist: {relative}")
+        elif state.kind != "directory":
+            outcome = "not_directory"
+            error = NotFound(f"working directory is not a directory: {relative}")
+        else:
+            outcome = "validated"
+        self._finalize_directory_state_observation(
+            pid=pid,
+            resource=resource,
+            relative=relative,
+            effect_context=effect_context,
+            effect_intent_id=effect_intent.effect_id,
+            outcome=outcome,
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"outcome": "state_observed"},
+            ),
+            state_kind=state.kind,
+            error=error,
+        )
+        self._charge_resource_usage(
+            pid,
+            usage,
+            source="primitive.filesystem.validate_directory",
+            context=effect_context,
+        )
+        if error is not None:
+            raise error
+        return relative or "."
+
     def read_text(
         self,
         pid: str,
@@ -154,25 +297,106 @@ class FilesystemAdapter:
             ),
             consume=False,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            raise NotFound(f"file does not exist: {relative}")
-        if target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "encoding": encoding, "max_bytes": max_bytes}
-        read_limit = self._read_limit_for_state(target_state.size_bytes, max_bytes)
         self._preflight_resource_usage(
             pid,
-            ResourceUsage(external_read_bytes=read_limit),
+            ResourceUsage(external_read_bytes=max_bytes),
             source="primitive.filesystem.read_text",
             context=effect_context,
         )
         require_external_effect_classifier(self.provider, "read_bytes")
-        self._consume_one_time_decision(decision, used_by="filesystem")
-        raw = self._provider_read_bytes(target, max_bytes=read_limit)
+        reservation = self._reserve_read_decision(decision, operation="read_bytes")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="read_bytes",
+                target=resource,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_read_decision(reservation, operation="read_bytes")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_text.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=False,
+            )
+            raise
+        if not target_state.exists:
+            error = NotFound(f"file does not exist: {relative}")
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_text.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                effect_started=True,
+            )
+            raise error
+        if target_state.kind != "file":
+            error = CapabilityDenied(f"path is not a file: {relative}")
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_text.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                effect_started=True,
+            )
+            raise error
+        read_limit = self._read_limit_for_state(target_state.size_bytes, max_bytes)
+        try:
+            raw = self._provider_read_bytes(target, max_bytes=read_limit)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_text.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=True,
+            )
+            raise
         truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
         selected = raw[:max_bytes]
-        content = self._decode_text_prefix(selected, encoding, truncated=truncated)
+        try:
+            content = self._decode_text_prefix(selected, encoding, truncated=truncated)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_text.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=True,
+            )
+            raise
+        self._commit_read_decision(reservation, operation="read_bytes")
         event = self.events.emit(
             EventType.EXTERNAL_READ,
             source=pid,
@@ -193,10 +417,11 @@ class FilesystemAdapter:
             result={"bytes_read": len(selected), "truncated": truncated},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         self._charge_resource_usage(
             pid,
-            ResourceUsage(external_read_bytes=len(raw)),
+            ResourceUsage(external_read_bytes=len(selected)),
             source="primitive.filesystem.read_text",
             context=effect_context,
         )
@@ -231,22 +456,89 @@ class FilesystemAdapter:
             ),
             consume=False,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            raise NotFound(f"file does not exist: {relative}")
-        if target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "max_bytes": max_bytes}
-        read_limit = self._read_limit_for_state(target_state.size_bytes, max_bytes)
         self._preflight_resource_usage(
             pid,
-            ResourceUsage(external_read_bytes=read_limit),
+            ResourceUsage(external_read_bytes=max_bytes),
             source="primitive.filesystem.read_bytes",
             context=effect_context,
         )
         require_external_effect_classifier(self.provider, "read_bytes")
-        self._consume_one_time_decision(decision, used_by="filesystem")
-        raw = self._provider_read_bytes(target, max_bytes=read_limit)
+        reservation = self._reserve_read_decision(decision, operation="read_bytes")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="read_bytes",
+                target=resource,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_read_decision(reservation, operation="read_bytes")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_bytes.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=False,
+            )
+            raise
+        if not target_state.exists:
+            error = NotFound(f"file does not exist: {relative}")
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_bytes.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                effect_started=True,
+            )
+            raise error
+        if target_state.kind != "file":
+            error = CapabilityDenied(f"path is not a file: {relative}")
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_bytes.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                effect_started=True,
+            )
+            raise error
+        read_limit = self._read_limit_for_state(target_state.size_bytes, max_bytes)
+        try:
+            raw = self._provider_read_bytes(target, max_bytes=read_limit)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="read_bytes",
+                action="primitive.filesystem.read_bytes.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=True,
+            )
+            raise
+        self._commit_read_decision(reservation, operation="read_bytes")
         truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
         selected = raw[:max_bytes]
         event = self.events.emit(
@@ -275,10 +567,11 @@ class FilesystemAdapter:
             result={"bytes_read": len(selected), "truncated": truncated},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         self._charge_resource_usage(
             pid,
-            ResourceUsage(external_read_bytes=len(raw)),
+            ResourceUsage(external_read_bytes=len(selected)),
             source="primitive.filesystem.read_bytes",
             context=effect_context,
         )
@@ -309,11 +602,6 @@ class FilesystemAdapter:
                 extra={"encoding": encoding, "overwrite": overwrite},
             ),
         )
-        target_state = self.provider.state(target)
-        if target_state.exists and target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
-        if target_state.exists and not overwrite:
-            raise FileExistsError(f"file already exists: {relative}")
         consume_capability_id = self._require_write(
             pid=pid,
             resource=resource,
@@ -330,27 +618,92 @@ class FilesystemAdapter:
             source="primitive.filesystem.write_text",
             context={"path": relative, "resource": resource, "encoding": encoding, "overwrite": overwrite},
         )
-        target_state = self.provider.state(target)
-        created = not target_state.exists
-        if target_state.exists and target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
-        if target_state.exists and not overwrite:
-            raise FileExistsError(f"file already exists: {relative}")
         effect_context = {
             "path": relative,
             "resource": resource,
             "encoding": encoding,
             "overwrite": overwrite,
-            "created": created,
+            "created": None,
         }
         require_external_effect_classifier(self.provider, "write_text")
         intent_record = self._record_mutation_intent(
             pid=pid,
             action="primitive.filesystem.write_text.intent",
             target=resource,
-            decision={"path": relative, "bytes_to_write": bytes_to_write, "created": created},
+            decision={"path": relative, "bytes_to_write": bytes_to_write},
         )
         reservation = self._reserve_mutation_capability(consume_capability_id, right="write")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="write_text",
+                target=resource,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_mutation_capability(reservation, right="write")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="write_text",
+                right="write",
+                action="primitive.filesystem.write_text.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                decision={"path": relative, "phase": "state", "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=not isinstance(exc, ProviderEffectNotStarted),
+                mutation_may_have_started=False,
+            )
+            raise
+        created = not target_state.exists
+        effect_context.update({"created": created, "state_observed": True})
+        if target_state.exists and target_state.kind != "file":
+            error = CapabilityDenied(f"path is not a file: {relative}")
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="write_text",
+                right="write",
+                action="primitive.filesystem.write_text.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                prior_information_flow=True,
+                mutation_may_have_started=False,
+            )
+            raise error
+        if target_state.exists and not overwrite:
+            error = FileExistsError(f"file already exists: {relative}")
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="write_text",
+                right="write",
+                action="primitive.filesystem.write_text.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                prior_information_flow=True,
+                mutation_may_have_started=False,
+            )
+            raise error
         try:
             self.provider.write_text(target, text, encoding=encoding, newline="\n", overwrite=overwrite)
         except Exception as exc:
@@ -363,8 +716,11 @@ class FilesystemAdapter:
                 context=effect_context,
                 intent_record=intent_record,
                 reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
                 error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=True,
+                mutation_may_have_started=not isinstance(exc, ProviderEffectNotStarted),
             )
             raise
         self._commit_mutation_capability(reservation, right="write")
@@ -391,6 +747,7 @@ class FilesystemAdapter:
             result={"bytes_written": bytes_written, "created": created},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         self._charge_resource_usage(
             pid,
@@ -429,11 +786,6 @@ class FilesystemAdapter:
             ),
             consume=False,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            raise NotFound(f"directory does not exist: {relative}")
-        if target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
         effect_context = {"path": relative, "resource": resource, "limit": limit}
         estimated_metadata_bytes = self._directory_metadata_preflight_bytes(limit)
         self._preflight_resource_usage(
@@ -443,12 +795,98 @@ class FilesystemAdapter:
             context={**effect_context, "estimated_metadata_bytes": estimated_metadata_bytes},
         )
         require_external_effect_classifier(self.provider, "list_directory")
-        self._consume_one_time_decision(decision, used_by="filesystem")
-        children = list(self.provider.list_directory(target, limit=limit + 1))
+        reservation = self._reserve_read_decision(decision, operation="list_directory")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="list_directory",
+                target=resource,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_read_decision(reservation, operation="list_directory")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="list_directory",
+                action="primitive.filesystem.read_directory.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=False,
+            )
+            raise
+        if not target_state.exists:
+            error = NotFound(f"directory does not exist: {relative}")
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="list_directory",
+                action="primitive.filesystem.read_directory.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                effect_started=True,
+            )
+            raise error
+        if target_state.kind != "directory":
+            error = CapabilityDenied(f"path is not a directory: {relative}")
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="list_directory",
+                action="primitive.filesystem.read_directory.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                effect_started=True,
+            )
+            raise error
+        try:
+            children = list(self.provider.list_directory(target, limit=limit + 1))
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="list_directory",
+                action="primitive.filesystem.read_directory.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=True,
+            )
+            raise
         selected = children[:limit]
-        entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
-        truncated = len(children) > len(selected)
-        metadata_bytes = self._directory_metadata_bytes(children)
+        try:
+            entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
+            truncated = len(children) > len(selected)
+            metadata_bytes = self._directory_metadata_bytes(children)
+        except Exception as exc:
+            self._handle_read_provider_failure(
+                pid=pid,
+                operation="list_directory",
+                action="primitive.filesystem.read_directory.failed",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                effect_started=True,
+            )
+            raise
+        self._commit_read_decision(reservation, operation="list_directory")
         event = self.events.emit(
             EventType.EXTERNAL_READ,
             source=pid,
@@ -475,6 +913,7 @@ class FilesystemAdapter:
             result={"count": len(entries), "truncated": truncated},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         self._charge_resource_usage(
             pid,
@@ -508,11 +947,6 @@ class FilesystemAdapter:
                 extra={"parents": parents, "exist_ok": exist_ok},
             ),
         )
-        target_state = self.provider.state(target)
-        if target_state.exists and target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
-        if target_state.exists and not exist_ok:
-            raise FileExistsError(f"directory already exists: {relative}")
         consume_capability_id = self._require_write_operation(
             pid=pid,
             resource=resource,
@@ -523,27 +957,92 @@ class FilesystemAdapter:
             question=f"Allow this process to create or update directory {relative}?",
             extra_context={"parents": parents, "exist_ok": exist_ok},
         )
-        target_state = self.provider.state(target)
-        created = not target_state.exists
-        if target_state.exists and target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
-        if target_state.exists and not exist_ok:
-            raise FileExistsError(f"directory already exists: {relative}")
         effect_context = {
             "path": relative,
             "resource": resource,
             "parents": parents,
             "exist_ok": exist_ok,
-            "created": created,
+            "created": None,
         }
         require_external_effect_classifier(self.provider, "make_directory")
         intent_record = self._record_mutation_intent(
             pid=pid,
             action="primitive.filesystem.write_directory.intent",
             target=resource,
-            decision={"path": relative, "created": created, "parents": parents, "exist_ok": exist_ok},
+            decision={"path": relative, "parents": parents, "exist_ok": exist_ok},
         )
         reservation = self._reserve_mutation_capability(consume_capability_id, right="write")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="make_directory",
+                target=resource,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_mutation_capability(reservation, right="write")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="make_directory",
+                right="write",
+                action="primitive.filesystem.write_directory.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                decision={"path": relative, "phase": "state", "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=not isinstance(exc, ProviderEffectNotStarted),
+                mutation_may_have_started=False,
+            )
+            raise
+        created = not target_state.exists
+        effect_context.update({"created": created, "state_observed": True})
+        if target_state.exists and target_state.kind != "directory":
+            error = CapabilityDenied(f"path is not a directory: {relative}")
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="make_directory",
+                right="write",
+                action="primitive.filesystem.write_directory.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                prior_information_flow=True,
+                mutation_may_have_started=False,
+            )
+            raise error
+        if target_state.exists and not exist_ok:
+            error = FileExistsError(f"directory already exists: {relative}")
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="make_directory",
+                right="write",
+                action="primitive.filesystem.write_directory.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                prior_information_flow=True,
+                mutation_may_have_started=False,
+            )
+            raise error
         try:
             self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
         except Exception as exc:
@@ -556,8 +1055,11 @@ class FilesystemAdapter:
                 context=effect_context,
                 intent_record=intent_record,
                 reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
                 error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=True,
+                mutation_may_have_started=not isinstance(exc, ProviderEffectNotStarted),
             )
             raise
         self._commit_mutation_capability(reservation, right="write")
@@ -583,6 +1085,7 @@ class FilesystemAdapter:
             result={"created": created},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         return DirectoryWriteResult(path=relative, created=created)
 
@@ -609,11 +1112,6 @@ class FilesystemAdapter:
                 extra={"missing_ok": missing_ok},
             ),
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists and not missing_ok:
-            raise NotFound(f"file does not exist: {relative}")
-        if target_state.exists and target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
         consume_capability_id = self._require_delete(
             pid=pid,
             resource=resource,
@@ -623,17 +1121,6 @@ class FilesystemAdapter:
             recursive=False,
             missing_ok=missing_ok,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            if not missing_ok:
-                raise NotFound(f"file does not exist: {relative}")
-            # A no-op delete still consumes the exact one-shot approval: if the
-            # path appears later, this grant must not turn into a real delete.
-            reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
-            self._commit_mutation_capability(reservation, right="delete")
-            return DeleteResult(path=relative, kind="missing", deleted=False)
-        if target_state.kind != "file":
-            raise CapabilityDenied(f"path is not a file: {relative}")
         effect_context = {"path": relative, "resource": resource, "missing_ok": missing_ok}
         require_external_effect_classifier(self.provider, "delete_file")
         intent_record = self._record_mutation_intent(
@@ -643,6 +1130,89 @@ class FilesystemAdapter:
             decision={"path": relative, "missing_ok": missing_ok},
         )
         reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
+        try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="delete_file",
+                target=resource,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_mutation_capability(reservation, right="delete")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="delete_file",
+                right="delete",
+                action="primitive.filesystem.delete_file.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                decision={"path": relative, "phase": "state", "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=not isinstance(exc, ProviderEffectNotStarted),
+                mutation_may_have_started=False,
+            )
+            raise
+        effect_context["state_observed"] = True
+        if not target_state.exists:
+            if not missing_ok:
+                error = NotFound(f"file does not exist: {relative}")
+                self._handle_mutation_provider_failure(
+                    pid=pid,
+                    operation="delete_file",
+                    right="delete",
+                    action="primitive.filesystem.delete_file.failed",
+                    target=resource,
+                    context=effect_context,
+                    intent_record=intent_record,
+                    reservation_id=reservation,
+                    effect_intent_id=effect_intent.effect_id,
+                    error=error,
+                    decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                    prior_information_flow=True,
+                    mutation_may_have_started=False,
+                )
+                raise error
+            self._finalize_state_only_mutation(
+                pid=pid,
+                operation="delete_file",
+                action="primitive.filesystem.delete_file",
+                right="delete",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                decision={"path": relative, "deleted": False, "missing_ok": True},
+            )
+            return DeleteResult(path=relative, kind="missing", deleted=False)
+        if target_state.kind != "file":
+            error = CapabilityDenied(f"path is not a file: {relative}")
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="delete_file",
+                right="delete",
+                action="primitive.filesystem.delete_file.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                prior_information_flow=True,
+                mutation_may_have_started=False,
+            )
+            raise error
         try:
             self.provider.delete_file(target)
         except Exception as exc:
@@ -655,8 +1225,11 @@ class FilesystemAdapter:
                 context=effect_context,
                 intent_record=intent_record,
                 reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
                 error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=True,
+                mutation_may_have_started=not isinstance(exc, ProviderEffectNotStarted),
             )
             raise
         self._commit_mutation_capability(reservation, right="delete")
@@ -682,6 +1255,7 @@ class FilesystemAdapter:
             result={"deleted": True},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         return DeleteResult(path=relative, kind="file", deleted=True)
 
@@ -711,11 +1285,6 @@ class FilesystemAdapter:
                 extra={"recursive": recursive, "missing_ok": missing_ok},
             ),
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists and not missing_ok:
-            raise NotFound(f"directory does not exist: {relative}")
-        if target_state.exists and target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
         consume_capability_id = self._require_delete(
             pid=pid,
             resource=resource,
@@ -725,17 +1294,6 @@ class FilesystemAdapter:
             recursive=recursive,
             missing_ok=missing_ok,
         )
-        target_state = self.provider.state(target)
-        if not target_state.exists:
-            if not missing_ok:
-                raise NotFound(f"directory does not exist: {relative}")
-            # A no-op delete still consumes the exact one-shot approval: if the
-            # path appears later, this grant must not turn into a real delete.
-            reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
-            self._commit_mutation_capability(reservation, right="delete")
-            return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
-        if target_state.kind != "directory":
-            raise CapabilityDenied(f"path is not a directory: {relative}")
         effect_context = {
             "path": relative,
             "resource": resource,
@@ -751,6 +1309,89 @@ class FilesystemAdapter:
         )
         reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
         try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="filesystem",
+                operation="delete_directory",
+                target=resource,
+                state_mutation=True,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_mutation_capability(reservation, right="delete")
+            raise
+        try:
+            target_state = self.provider.state(target)
+        except Exception as exc:
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="delete_directory",
+                right="delete",
+                action="primitive.filesystem.delete_directory.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=exc,
+                decision={"path": relative, "phase": "state", "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=not isinstance(exc, ProviderEffectNotStarted),
+                mutation_may_have_started=False,
+            )
+            raise
+        effect_context["state_observed"] = True
+        if not target_state.exists:
+            if not missing_ok:
+                error = NotFound(f"directory does not exist: {relative}")
+                self._handle_mutation_provider_failure(
+                    pid=pid,
+                    operation="delete_directory",
+                    right="delete",
+                    action="primitive.filesystem.delete_directory.failed",
+                    target=resource,
+                    context=effect_context,
+                    intent_record=intent_record,
+                    reservation_id=reservation,
+                    effect_intent_id=effect_intent.effect_id,
+                    error=error,
+                    decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                    prior_information_flow=True,
+                    mutation_may_have_started=False,
+                )
+                raise error
+            self._finalize_state_only_mutation(
+                pid=pid,
+                operation="delete_directory",
+                action="primitive.filesystem.delete_directory",
+                right="delete",
+                target=resource,
+                context=effect_context,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                decision={"path": relative, "deleted": False, "missing_ok": True, "recursive": recursive},
+            )
+            return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
+        if target_state.kind != "directory":
+            error = CapabilityDenied(f"path is not a directory: {relative}")
+            self._handle_mutation_provider_failure(
+                pid=pid,
+                operation="delete_directory",
+                right="delete",
+                action="primitive.filesystem.delete_directory.failed",
+                target=resource,
+                context=effect_context,
+                intent_record=intent_record,
+                reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
+                error=error,
+                decision={"path": relative, "phase": "state", "error_type": type(error).__name__, "error": str(error)},
+                prior_information_flow=True,
+                mutation_may_have_started=False,
+            )
+            raise error
+        try:
             self.provider.delete_directory(target, recursive=recursive)
         except Exception as exc:
             self._handle_mutation_provider_failure(
@@ -762,8 +1403,11 @@ class FilesystemAdapter:
                 context=effect_context,
                 intent_record=intent_record,
                 reservation_id=reservation,
+                effect_intent_id=effect_intent.effect_id,
                 error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
+                prior_information_flow=True,
+                mutation_may_have_started=not isinstance(exc, ProviderEffectNotStarted),
             )
             raise
         self._commit_mutation_capability(reservation, right="delete")
@@ -794,6 +1438,7 @@ class FilesystemAdapter:
             result={"deleted": True, "recursive": recursive},
             event=event,
             audit_record=audit_record,
+            effect_intent_id=effect_intent.effect_id,
         )
         return DeleteResult(path=relative, kind="directory", deleted=True, recursive=recursive)
 
@@ -919,6 +1564,7 @@ class FilesystemAdapter:
         result: Any,
         event: Any,
         audit_record: Any,
+        effect_intent_id: str,
     ) -> None:
         try:
             classification = classify_external_effect(self.provider, operation, context, result)
@@ -934,6 +1580,14 @@ class FilesystemAdapter:
                     "classification_fallback": "post_effect_failure",
                 },
             )
+        if context.get("state_observed") and not classification.information_flow:
+            classification = ExternalEffectClassification(
+                rollback_class=classification.rollback_class,
+                rollback_status=classification.rollback_status,
+                state_mutation=classification.state_mutation,
+                information_flow=True,
+                metadata={**classification.metadata, "state_observed": True},
+            )
         record_external_effect(
             self.audit.store,
             pid=pid,
@@ -944,6 +1598,184 @@ class FilesystemAdapter:
             audit_record=audit_record,
             event=event,
             metadata={"context": context, "result": result},
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _handle_read_provider_failure(
+        self,
+        *,
+        pid: str,
+        operation: str,
+        action: str,
+        target: str,
+        context: dict[str, Any],
+        reservation_id: str | None,
+        effect_intent_id: str,
+        error: BaseException,
+        effect_started: bool,
+    ) -> None:
+        if isinstance(error, ProviderEffectNotStarted) and not effect_started:
+            with self.audit.store.transaction():
+                self._restore_read_decision(reservation_id, operation=operation)
+                abandon_external_effect_intent(self.audit.store, effect_intent_id)
+            return
+
+        self._commit_read_decision(reservation_id, operation=operation)
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=target,
+            payload={
+                "adapter": "filesystem",
+                "operation": operation,
+                "outcome": "unknown",
+                "error_type": type(error).__name__,
+            },
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action=action,
+            target=target,
+            decision={
+                "effect_outcome": "unknown",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+        )
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="filesystem",
+            operation=operation,
+            target=target,
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"outcome": "unknown_after_provider_or_state_read"},
+            ),
+            audit_record=audit_record,
+            event=event,
+            metadata={
+                "context": context,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _finalize_directory_state_observation(
+        self,
+        *,
+        pid: str,
+        resource: str,
+        relative: str,
+        effect_context: dict[str, Any],
+        effect_intent_id: str,
+        outcome: str,
+        classification: ExternalEffectClassification,
+        state_kind: str | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        event_payload: dict[str, Any] = {
+            "adapter": "filesystem",
+            "operation": "state",
+            "path": relative,
+            "outcome": outcome,
+        }
+        decision: dict[str, Any] = {
+            "path": relative,
+            "expected_kind": "directory",
+            "state_kind": state_kind,
+            "outcome": outcome,
+        }
+        if error is not None:
+            event_payload["error_type"] = type(error).__name__
+            decision.update(
+                {
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=resource,
+            payload=event_payload,
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action=(
+                "primitive.filesystem.validate_directory"
+                if error is None
+                else "primitive.filesystem.validate_directory.failed"
+            ),
+            target=resource,
+            decision=decision,
+        )
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="filesystem",
+            operation="state",
+            target=resource,
+            classification=classification,
+            audit_record=audit_record,
+            event=event,
+            metadata={
+                "context": effect_context,
+                "result": {
+                    "outcome": outcome,
+                    "state_kind": state_kind,
+                },
+            },
+            intent_effect_id=effect_intent_id,
+        )
+
+    def _finalize_state_only_mutation(
+        self,
+        *,
+        pid: str,
+        operation: str,
+        action: str,
+        right: str,
+        target: str,
+        context: dict[str, Any],
+        reservation_id: str | None,
+        effect_intent_id: str,
+        decision: dict[str, Any],
+    ) -> None:
+        self._commit_mutation_capability(reservation_id, right=right)
+        event = self.events.emit(
+            EventType.EXTERNAL_READ,
+            source=pid,
+            target=target,
+            payload={"adapter": "filesystem", "operation": operation, "outcome": "no_op"},
+        )
+        audit_record = self.audit.record(
+            actor=pid,
+            action=action,
+            target=target,
+            decision={**decision, "effect_outcome": "no_op"},
+        )
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="filesystem",
+            operation=operation,
+            target=target,
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"outcome": "state_observed_no_mutation"},
+            ),
+            audit_record=audit_record,
+            event=event,
+            metadata={"context": context},
+            intent_effect_id=effect_intent_id,
         )
 
     def _preflight_resource_usage(
@@ -978,16 +1810,16 @@ class FilesystemAdapter:
         )
 
     def _read_limit_for_state(self, size_bytes: int | None, max_bytes: int) -> int:
-        if size_bytes is None:
-            # Unknown-size providers must read one extra byte to detect
-            # truncation. Known-size providers can avoid that extra I/O.
-            return max_bytes + 1
-        return min(max(0, size_bytes), max_bytes)
+        # The state snapshot is advisory: a file may grow between state() and
+        # read_bytes(). If it already proves truncation, do not read beyond the
+        # caller's information-flow budget. Otherwise request a sentinel byte
+        # so growth cannot turn a partial read into a false complete result.
+        if size_bytes is not None and size_bytes > max_bytes:
+            return max_bytes
+        return max_bytes + 1
 
     def _is_truncated_read(self, size_bytes: int | None, bytes_read: int, max_bytes: int) -> bool:
-        if size_bytes is not None:
-            return size_bytes > max_bytes
-        return bytes_read > max_bytes
+        return (size_bytes is not None and size_bytes > max_bytes) or bytes_read > max_bytes
 
     def _provider_read_bytes(self, target: ResolvedPath, *, max_bytes: int) -> bytes:
         try:
@@ -1005,20 +1837,35 @@ class FilesystemAdapter:
         # information-flow budgets fail closed before metadata is observed.
         return max(1, (limit + 1) * 512)
 
-    def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
-        self.capabilities.claim_decision_use(
+    def _reserve_read_decision(self, decision: Any, *, operation: str) -> str | None:
+        return self.capabilities.reserve_decision_use(
             decision,
-            used_by=used_by,
-            reason="one-time filesystem permission consumed",
+            used_by="filesystem",
+            reason=f"one-time filesystem {operation} permission reserved",
+        )
+
+    def _commit_read_decision(self, reservation_id: str | None, *, operation: str) -> None:
+        self.capabilities.commit_reserved_use(
+            reservation_id,
+            committed_by="filesystem",
+            reason=f"one-time filesystem {operation} permission committed",
+        )
+
+    def _restore_read_decision(self, reservation_id: str | None, *, operation: str) -> None:
+        self.capabilities._restore_reserved_use(
+            reservation_id,
+            restored_by="filesystem",
+            reason=f"one-time filesystem {operation} permission restored after certified pre-effect failure",
         )
 
     def _reserve_mutation_capability(self, capability_id: str | None, *, right: str) -> str | None:
         if capability_id is None:
             return None
         # Filesystem mutations cross an external provider boundary, so one-shot
-        # grants are reserved before the side effect and refunded only if the
-        # provider raises. This closes the concurrent authorize-then-write race
-        # without consuming approval for ordinary provider failures.
+        # grants are reserved before the side effect. They are refunded when
+        # the mutation provider certifies that the mutation never started,
+        # even if an earlier state probe disclosed metadata; ambiguous ordinary
+        # failures commit the reservation fail-closed.
         return self.capabilities.reserve_use(
             capability_id,
             reserved_by="filesystem",
@@ -1085,18 +1932,68 @@ class FilesystemAdapter:
         context: dict[str, Any],
         intent_record: Any,
         reservation_id: str | None,
+        effect_intent_id: str,
         error: Exception,
         decision: dict[str, Any],
+        prior_information_flow: bool = False,
+        mutation_may_have_started: bool = True,
     ) -> None:
-        if isinstance(error, ProviderEffectNotStarted):
-            self._restore_mutation_capability(reservation_id, right=right)
-            self._record_mutation_failure(
-                pid=pid,
-                action=action,
-                target=target,
-                intent_record=intent_record,
-                decision={**decision, "effect_outcome": "not_started"},
-            )
+        if isinstance(error, ProviderEffectNotStarted) and not mutation_may_have_started:
+            with self.audit.store.transaction():
+                self._restore_mutation_capability(reservation_id, right=right)
+                failure_record = self._record_mutation_failure(
+                    pid=pid,
+                    action=action,
+                    target=target,
+                    intent_record=intent_record,
+                    decision={
+                        **decision,
+                        "effect_outcome": (
+                            "not_started_after_state_read" if prior_information_flow else "not_started"
+                        ),
+                    },
+                )
+                if not prior_information_flow:
+                    abandon_external_effect_intent(self.audit.store, effect_intent_id)
+                    return
+
+                # The mutation provider certified that it never started, so
+                # refund the one-shot mutation authority.  A preceding state()
+                # probe still crossed an information-flow boundary and must
+                # finalize (rather than abandon) the durable effect intent.
+                event = self.events.emit(
+                    EventType.EXTERNAL_READ,
+                    source=pid,
+                    target=target,
+                    payload={
+                        "adapter": "filesystem",
+                        "operation": operation,
+                        "outcome": "mutation_not_started_after_state_read",
+                        "error_type": type(error).__name__,
+                    },
+                )
+                record_external_effect(
+                    self.audit.store,
+                    pid=pid,
+                    provider="filesystem",
+                    operation=operation,
+                    target=target,
+                    classification=ExternalEffectClassification(
+                        rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                        rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                        state_mutation=False,
+                        information_flow=True,
+                        metadata={"outcome": "provider_certified_mutation_not_started_after_state_read"},
+                    ),
+                    audit_record=failure_record,
+                    event=event,
+                    metadata={
+                        "context": context,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                    intent_effect_id=effect_intent_id,
+                )
             return
 
         # Once an effectful provider call has been entered, an ordinary
@@ -1104,7 +2001,7 @@ class FilesystemAdapter:
         # fail-closed one-shot semantics and make the uncertainty durable.
         self._commit_mutation_capability(reservation_id, right=right)
         event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
+            EventType.EXTERNAL_WRITE if mutation_may_have_started else EventType.EXTERNAL_READ,
             source=pid,
             target=target,
             payload={
@@ -1123,8 +2020,8 @@ class FilesystemAdapter:
             classification=ExternalEffectClassification(
                 rollback_class=ExternalEffectRollbackClass.UNKNOWN,
                 rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=True,
-                information_flow=False,
+                state_mutation=mutation_may_have_started,
+                information_flow=prior_information_flow,
                 metadata={"outcome": "unknown_after_provider_exception"},
             ),
             audit_record=intent_record,
@@ -1134,6 +2031,7 @@ class FilesystemAdapter:
                 "error_type": type(error).__name__,
                 "error": str(error),
             },
+            intent_effect_id=effect_intent_id,
         )
         self._record_mutation_failure(
             pid=pid,
@@ -1241,8 +2139,10 @@ class FilesystemAdapter:
         if decision.policy == CapabilityManager.ASK_EACH_TIME:
             if self.human is None:
                 raise CapabilityDenied(f"{pid} requires human approval for write on {resource}")
-            # This primitive has the concrete path, overwrite state, byte count,
-            # and preview needed for a safe per-use human decision.
+            # This primitive has the concrete path, caller-declared overwrite
+            # policy, byte count, and preview needed for a safe per-use human
+            # decision. Target state is deliberately deferred until after the
+            # one-time approval has been issued and reserved.
             request_id = self.human.query(
                 pid=pid,
                     human=self.config.runtime.default_human,
@@ -1328,8 +2228,6 @@ class FilesystemAdapter:
         right: str,
         extra: dict[str, Any],
     ) -> dict[str, Any]:
-        target_state = self._target_state(target)
-        will_overwrite = bool(target_state["exists"] and target_state["kind"] == "file")
         profile = self.capabilities.profiles.filesystem(
             resource=resource,
             right=right,
@@ -1350,9 +2248,7 @@ class FilesystemAdapter:
             "right": right,
             "sandbox_profile": self._profile_json(profile),
             "grant_scope": "one_time",
-            "will_create": not target_state["exists"],
-            "will_overwrite": will_overwrite,
-            "target": target_state,
+            "target_state_observation": "deferred_until_authorized",
             **extra,
         }
 
@@ -1454,18 +2350,6 @@ class FilesystemAdapter:
             if truncated and exc.end == len(data):
                 return data[: exc.start].decode(encoding)
             raise
-
-    def _target_state(self, target: ResolvedPath) -> dict[str, Any]:
-        state = self.provider.state(target)
-        if not state.exists:
-            return {"exists": False, "kind": "missing"}
-        result = {
-            "exists": True,
-            "kind": state.kind,
-            "size_bytes": state.size_bytes,
-            "modified_at": state.modified_at,
-        }
-        return result
 
     def _bounded_positive_int(self, value: int, *, label: str, hard_limit: int) -> int:
         if isinstance(value, bool):

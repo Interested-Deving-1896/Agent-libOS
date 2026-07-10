@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from datetime import timedelta, timezone
@@ -20,6 +21,8 @@ from agent_libos.models import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
+    abandon_external_effect_intent,
+    begin_external_effect_intent,
     classify_external_effect,
     record_external_effect,
     require_external_effect_classifier,
@@ -86,6 +89,20 @@ class ClockPrimitive:
         require_external_effect_classifier(self.provider, "now")
         reservation = self._reserve_one_time_decision(decision, operation="now")
         try:
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="clock",
+                operation="now",
+                target=resource,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
+        except Exception:
+            self._restore_one_time_decision(reservation, operation="now")
+            raise
+        try:
             current = self.provider.now(selected_tz)
         except Exception as exc:
             self._handle_provider_failure(
@@ -96,6 +113,7 @@ class ClockPrimitive:
                 reservation_id=reservation,
                 error=exc,
                 information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
             )
             raise
         self._commit_one_time_decision(reservation, operation="now")
@@ -132,6 +150,7 @@ class ClockPrimitive:
             audit_record=audit_record,
             event=event,
             metadata={"context": effect_context, "result": result.__dict__},
+            intent_effect_id=effect_intent.effect_id,
         )
         return result
 
@@ -140,10 +159,34 @@ class ClockPrimitive:
         decision = self._authorize_sleep(pid, duration)
         require_external_effect_classifier(self.provider, "sleep")
         reservation = self._reserve_one_time_decision(decision, operation="sleep")
+        effect_context = {"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE}
         try:
-            started = self.provider.monotonic()
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="clock",
+                operation="sleep",
+                target=_CLOCK_SLEEP_RESOURCE,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
         except Exception:
             self._restore_one_time_decision(reservation, operation="sleep")
+            raise
+        try:
+            started = self.provider.monotonic()
+        except Exception as exc:
+            self._handle_provider_failure(
+                pid=pid,
+                operation="sleep",
+                target=_CLOCK_SLEEP_RESOURCE,
+                context=effect_context,
+                reservation_id=reservation,
+                error=exc,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+            )
             raise
         try:
             self.provider.sleep(duration)
@@ -155,7 +198,9 @@ class ClockPrimitive:
                 context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
                 reservation_id=reservation,
                 error=exc,
-                information_flow=False,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+                effect_started=True,
             )
             raise
         self._commit_one_time_decision(reservation, operation="sleep")
@@ -169,23 +214,62 @@ class ClockPrimitive:
                 context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
                 reservation_id=None,
                 error=exc,
-                information_flow=False,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+                effect_started=True,
             )
             raise
-        return self._record_sleep(pid, duration, elapsed)
+        return self._record_sleep(pid, duration, elapsed, effect_intent_id=effect_intent.effect_id)
 
     async def asleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
         decision = self._authorize_sleep(pid, duration)
         require_external_effect_classifier(self.provider, "sleep")
         reservation = self._reserve_one_time_decision(decision, operation="sleep")
+        effect_context = {"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE}
         try:
-            started = self.provider.monotonic()
+            effect_intent = begin_external_effect_intent(
+                self.audit.store,
+                pid=pid,
+                provider="clock",
+                operation="sleep",
+                target=_CLOCK_SLEEP_RESOURCE,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"context": effect_context},
+            )
         except Exception:
             self._restore_one_time_decision(reservation, operation="sleep")
             raise
         try:
+            started = self.provider.monotonic()
+        except Exception as exc:
+            self._handle_provider_failure(
+                pid=pid,
+                operation="sleep",
+                target=_CLOCK_SLEEP_RESOURCE,
+                context=effect_context,
+                reservation_id=reservation,
+                error=exc,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+            )
+            raise
+        try:
             await self.provider.asleep(duration)
+        except asyncio.CancelledError as exc:
+            self._handle_provider_failure(
+                pid=pid,
+                operation="sleep",
+                target=_CLOCK_SLEEP_RESOURCE,
+                context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
+                reservation_id=reservation,
+                error=exc,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+                effect_started=True,
+            )
+            raise
         except Exception as exc:
             self._handle_provider_failure(
                 pid=pid,
@@ -194,7 +278,9 @@ class ClockPrimitive:
                 context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
                 reservation_id=reservation,
                 error=exc,
-                information_flow=False,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+                effect_started=True,
             )
             raise
         self._commit_one_time_decision(reservation, operation="sleep")
@@ -208,10 +294,12 @@ class ClockPrimitive:
                 context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
                 reservation_id=None,
                 error=exc,
-                information_flow=False,
+                information_flow=True,
+                effect_intent_id=effect_intent.effect_id,
+                effect_started=True,
             )
             raise
-        return self._record_sleep(pid, duration, elapsed)
+        return self._record_sleep(pid, duration, elapsed, effect_intent_id=effect_intent.effect_id)
 
     def _validate_sleep_duration(self, seconds: float) -> float:
         duration = float(seconds)
@@ -223,7 +311,14 @@ class ClockPrimitive:
             raise ValidationError(f"sleep seconds exceeds max_sleep_seconds={self.max_sleep_seconds}")
         return duration
 
-    def _record_sleep(self, pid: str, duration: float, elapsed: float) -> SleepResult:
+    def _record_sleep(
+        self,
+        pid: str,
+        duration: float,
+        elapsed: float,
+        *,
+        effect_intent_id: str,
+    ) -> SleepResult:
         result = SleepResult(requested_seconds=duration, elapsed_seconds=elapsed)
         effect_context = {"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE}
         event = self.events.emit(
@@ -247,8 +342,16 @@ class ClockPrimitive:
             "sleep",
             effect_context,
             result.__dict__,
-            information_flow=False,
+            information_flow=True,
         )
+        if not classification.information_flow:
+            classification = ExternalEffectClassification(
+                rollback_class=classification.rollback_class,
+                rollback_status=classification.rollback_status,
+                state_mutation=classification.state_mutation,
+                information_flow=True,
+                metadata={**classification.metadata, "elapsed_observed": True},
+            )
         record_external_effect(
             self.audit.store,
             pid=pid,
@@ -259,6 +362,7 @@ class ClockPrimitive:
             audit_record=audit_record,
             event=event,
             metadata={"context": effect_context, "result": result.__dict__},
+            intent_effect_id=effect_intent_id,
         )
         return result
 
@@ -356,11 +460,15 @@ class ClockPrimitive:
         target: str,
         context: dict[str, Any],
         reservation_id: str | None,
-        error: Exception,
+        error: BaseException,
         information_flow: bool,
+        effect_intent_id: str,
+        effect_started: bool = False,
     ) -> None:
-        if isinstance(error, ProviderEffectNotStarted):
-            self._restore_one_time_decision(reservation_id, operation=operation)
+        if isinstance(error, ProviderEffectNotStarted) and not effect_started:
+            with self.audit.store.transaction():
+                self._restore_one_time_decision(reservation_id, operation=operation)
+                abandon_external_effect_intent(self.audit.store, effect_intent_id)
             return
 
         self._commit_one_time_decision(reservation_id, operation=operation)
@@ -405,4 +513,5 @@ class ClockPrimitive:
                 "error_type": type(error).__name__,
                 "error": str(error),
             },
+            intent_effect_id=effect_intent_id,
         )

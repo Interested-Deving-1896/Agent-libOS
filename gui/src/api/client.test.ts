@@ -90,20 +90,43 @@ describe("LibOSClient", () => {
     );
   });
 
-  it("passes auto_run and max_quanta through human responses", async () => {
+  it("passes typed permission decisions and scheduler options through human responses", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
-    await client.respondHumanRequest("request_1", true, "answer", false, 3);
+    await client.respondHumanRequest(
+      "request_1",
+      { kind: "permission", approved: true, decision: { policy: "ask_each_time" } },
+      false,
+      3
+    );
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:1/api/human-requests/request_1/respond",
       expect.objectContaining({
         body: JSON.stringify({
           approved: true,
-          answer: "answer",
+          decision: { policy: "ask_each_time" },
           auto_run: false,
           max_quanta: 3
+        })
+      })
+    );
+  });
+
+  it("passes typed question answers without inventing a permission decision", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.respondHumanRequest("request_2", { kind: "question", approved: true, answer: "eu-west" }, true, null);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/human-requests/request_2/respond",
+      expect.objectContaining({
+        body: JSON.stringify({
+          approved: true,
+          answer: "eu-west",
+          auto_run: true
         })
       })
     );

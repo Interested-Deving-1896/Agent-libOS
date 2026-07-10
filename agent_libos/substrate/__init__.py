@@ -24,6 +24,7 @@ from agent_libos.substrate.local import (
     SdkMcpProvider,
     LocalResourceProviderSubstrate,
     LocalShellProvider,
+    WindowsJobObject,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "LocalHumanProvider",
     "LocalResourceProviderSubstrate",
     "LocalShellProvider",
+    "WindowsJobObject",
     "SdkMcpProvider",
     "PathState",
     "ProviderEffectNotStarted",

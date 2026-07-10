@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     metadata: dict[str, Any] = {
+        "output_schema_version": 1,
         "suite": str(suite),
         "tasks": [task.id for task in tasks],
         "runners": runners,
@@ -67,6 +68,15 @@ def main(argv: list[str] | None = None) -> None:
         for run in runs
         if run.result.metadata.get("runner_failed")
     ]
+    invalid_runs = [
+        {
+            "task_id": run.result.task_id,
+            "runner": run.result.runner,
+            "invalid_reasons": list(run.result.invalid_reasons),
+        }
+        for run in runs
+        if not run.result.valid
+    ]
     print(
         json.dumps(
             to_jsonable(
@@ -76,6 +86,9 @@ def main(argv: list[str] | None = None) -> None:
                     "runner_failure_count": len(runner_failures),
                     "runner_failures": runner_failures[:MAX_FAILURE_PREVIEW],
                     "runner_failures_truncated": len(runner_failures) > MAX_FAILURE_PREVIEW,
+                    "invalid_run_count": len(invalid_runs),
+                    "invalid_runs": invalid_runs[:MAX_FAILURE_PREVIEW],
+                    "invalid_runs_truncated": len(invalid_runs) > MAX_FAILURE_PREVIEW,
                     "metrics": metrics,
                 }
             ),
@@ -86,6 +99,10 @@ def main(argv: list[str] | None = None) -> None:
     if runner_failures:
         raise SystemExit(
             f"{len(runner_failures)} benchmark runner failure(s); outputs were written to {output}"
+        )
+    if not metrics.get("valid", False):
+        raise SystemExit(
+            f"benchmark outputs are invalid; inspect metrics invalid_reasons in {output}"
         )
 
 

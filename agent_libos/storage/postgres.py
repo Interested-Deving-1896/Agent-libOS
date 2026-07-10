@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -9,7 +10,14 @@ from agent_libos.models.exceptions import ValidationError
 from agent_libos.storage.sqlite import SQLRuntimeStore
 
 
-_POSTGRES_RUNTIME_LOCK_KEY = 0x4147454E544C4942
+def _postgres_runtime_lock_key(database: str, schema: str) -> int:
+    """Return a stable signed bigint key scoped to one database/schema pair."""
+
+    digest = hashlib.blake2b(digest_size=8, person=b"AgentLibOS")
+    digest.update(database.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(schema.encode("utf-8"))
+    return int.from_bytes(digest.digest(), byteorder="big", signed=True)
 
 
 class _PostgresDialect:
@@ -132,6 +140,7 @@ class PostgresStore(SQLRuntimeStore):
         self.path = dsn
         self.dsn = dsn
         self._runtime_lease_acquired = False
+        self._runtime_lease_key: int | None = None
         conn = _PostgresConnection(dsn)
         try:
             self._acquire_runtime_lease(conn)
@@ -148,20 +157,32 @@ class PostgresStore(SQLRuntimeStore):
             super().close()
 
     def _acquire_runtime_lease(self, conn: _PostgresConnection) -> None:
+        identity = conn.execute(
+            "SELECT current_database() AS database_name, current_schema() AS schema_name"
+        ).fetchone()
+        database = str(identity.get("database_name") or "") if identity else ""
+        schema = str(identity.get("schema_name") or "") if identity else ""
+        if not database or not schema:
+            raise ValidationError("unable to resolve PostgreSQL database/schema for runtime lease")
+        lease_key = _postgres_runtime_lock_key(database, schema)
         row = conn.execute(
             "SELECT pg_try_advisory_lock(?) AS acquired",
-            (_POSTGRES_RUNTIME_LOCK_KEY,),
+            (lease_key,),
         ).fetchone()
         if not row or not row.get("acquired"):
-            raise ValidationError("runtime store is already open: postgres")
+            raise ValidationError(f"runtime store is already open: postgres:{database}/{schema}")
+        self._runtime_lease_key = lease_key
         self._runtime_lease_acquired = True
 
     def _release_runtime_lease(self, conn: _PostgresConnection | None) -> None:
         if conn is None or not getattr(self, "_runtime_lease_acquired", False):
             return
         self._runtime_lease_acquired = False
+        lease_key = getattr(self, "_runtime_lease_key", None)
+        if lease_key is None:
+            return
         try:
-            conn.execute("SELECT pg_advisory_unlock(?)", (_POSTGRES_RUNTIME_LOCK_KEY,))
+            conn.execute("SELECT pg_advisory_unlock(?)", (lease_key,))
         except Exception:
             pass
 

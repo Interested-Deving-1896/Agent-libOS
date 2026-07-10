@@ -104,6 +104,29 @@ class TestResourceBudgets:
         finally:
             runtime.close()
 
+    def test_llm_malformed_usage_cannot_bypass_token_budget(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.llm.client = MalformedUsageClient()
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="malformed usage",
+                resource_budget=ResourceBudget(max_llm_total_tokens=10),
+            )
+
+            result = runtime.run_next_process_once()
+            process = runtime.process.get(pid)
+
+            assert not result["ok"]
+            assert result["resource_limit_exceeded"]
+            assert "invalid total_tokens" in result["error"]
+            assert process.status == ProcessStatus.KILLED
+            assert process.resource_usage.llm_calls == 1
+            assert process.resource_usage.llm_total_tokens == 0
+            assert not any(record.action == "process.exit" and record.actor == pid for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
     def test_child_llm_usage_counts_against_parent_budget(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -173,6 +196,21 @@ class UsageClient:
             request_id="req_1",
             model="test-model",
             usage=usage,
+        )
+
+
+class MalformedUsageClient:
+    def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        return LLMCompletion(
+            content="",
+            tool_calls=[
+                {
+                    "id": "tool_malformed_usage",
+                    "name": "process_exit",
+                    "arguments": json.dumps({"payload": {"done": True}}),
+                }
+            ],
+            usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": "unknown"},
         )
 
 

@@ -165,16 +165,35 @@ event/audit, or effect-recording step fails, the adapter closes the host handle,
 removes the in-memory session, and releases the object before returning
 failure.
 
+A finite-use shell-policy decision is reserved before `provider.spawn`.
+The adapter then persists a structured pending spawn-effect intent before
+`provider.spawn`. `ProviderEffectNotStarted` is the only provider failure that
+certifies no child was created; reservation restoration and conditional intent
+abandonment share one store transaction. Any other spawn exception commits the
+use and conditionally finalizes the same effect id as `unknown` when the result
+sinks succeed; a post-provider sink failure leaves it pending. Successful spawn
+followed by setup/classification failure is contained by closing the handle and
+removing the Object, but the already-crossed provider outcome remains
+conservatively `unknown`; cleanup is not proof that the process had no external
+effect. If session Object creation is the failed phase, the recorded metadata
+names `session_object_creation` and includes whether cleanup was attempted and
+succeeded, so operators can distinguish containment from non-execution.
+
 The local PTY backend resolves bare executables on a safe host PATH that
 excludes workspace entries, rejects workspace PATH hijacks, and gives child
 processes a workspace-scoped `HOME`/`USERPROFILE`.
 
-PTY resource accounting samples the complete process tree. If process-tree
-discovery or CPU/RSS inspection is denied, the adapter closes the session and
-releases its Object handle instead of continuing without accounting. On POSIX,
-cleanup signals the process group first; if that is denied it explicitly
-signals the discovered descendant tree, and surfaces cleanup failure rather
-than reporting an uncontained session as closed.
+PTY resource accounting runs in a monitor worker independent of the blocking
+output reader, so a provider read cannot suspend wall/CPU/RSS enforcement. Each
+sample covers the complete process tree. CPU is accumulated by `(pid,
+create_time)` and retains each process's maximum observed total, so an exited
+child cannot make aggregate charged CPU decrease; wall time is charged
+cumulatively and RSS records the session peak. If process-tree discovery or
+CPU/RSS inspection is denied, the adapter closes the session and releases its
+Object handle instead of continuing without accounting. On POSIX, cleanup
+signals the process group first; if that is denied it explicitly signals the
+discovered descendant tree, and surfaces cleanup failure rather than reporting
+an uncontained session as closed.
 
 Follow-on tools use that `session_oid` as the public handle:
 
@@ -188,11 +207,46 @@ Follow-on tools use that `session_oid` as the public handle:
 - `pty_list()` returns active sessions whose PTY object is readable by the
   caller.
 
+Finite object write/delete decisions used by `pty_write`, `pty_resize`, and
+`pty_close` are reserved before the provider call. If the first operation
+boundary certifies `ProviderEffectNotStarted`, the reservation and pending
+intent are restored/abandoned together. Ordinary exceptions, partial writes,
+or any failure after provider information has been observed commit the use and
+leave finalized-unknown or pending evidence rather than making a one-use PTY
+handle reusable.
+
+`pty_write`, `pty_resize`, and `pty_close` each persist a pending effect before
+their provider operation and CAS the same id to a final event/audit-linked
+record afterward. `ProviderEffectNotStarted` abandons the pending row and
+restores an exact finite-use reservation only when the first boundary did not
+start; an ordinary provider or post-provider sink failure leaves durable unknown
+evidence. The local provider classifies write and close as
+irreversible/not-supported and resize as rollbackable/not-applied; v1 records
+that classification but does not perform compensation. If a provider does not
+classify one of those operations, or its classifier raises after the operation,
+the module finalizes an `unknown`/`unknown` fallback rather than losing the fact
+that the host boundary was crossed.
+
 PTY sessions are memory-resident host resources. They are closed by explicit
 `pty_close`, object release, process-owned memory release on process exit,
 runtime shutdown, or PTY child process exit. Reopening a runtime does not
 reconnect old PTY objects; stale PTY `EXTERNAL_REF` rows are released during
 startup.
+
+Automatic child-exit cleanup is itself a close provider boundary. The monitor
+persists a close intent before reading the exit code or calling `close()`. A
+failure before either observation can abandon only when certified not-started;
+after the exit-code read, a later close failure or not-started result retains
+the pending information-flow intent. Event/audit failure after successful
+automatic close likewise leaves that intent pending for reconciliation.
+
+The internal close state machine is idempotent under races. The first closer
+sets `closing`, later lifecycle/resource/shutdown closers wait on the same
+completion event, and only the caller that removes the registered session emits
+the close event/audit record. A timeout or provider close failure is surfaced;
+the module does not report `closed` while a handle is still uncontained. Once
+the public Object/session has been removed, a later `pty_close` has no authority
+target and returns the normal not-found failure.
 
 Tests and hosts can override module defaults by setting `substrate.pty_settings`
 to a mapping before loading the module, and can inject a fake provider by

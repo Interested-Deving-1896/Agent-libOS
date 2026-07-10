@@ -1,10 +1,11 @@
 import { AlertTriangle, Bot, Database, MessageSquare, Pause, Play, RefreshCw, Send, Settings, Square } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { GuiConnection, HumanRequest, ImageSummary, LLMProfileInput, LLMProfileSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
+import type { GuiConnection, HumanRequest, HumanResponseInput, ImageSummary, LLMProfileInput, LLMProfileSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import { useI18n } from "../i18n";
 import { parseOptionalQuanta } from "../quanta";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
 import { ImageSelect } from "./ImageSelect";
+import { HumanRequestCard } from "./HumanRequestCard";
 import { LanguageSwitch } from "./LanguageSwitch";
 import { LLMProfileSelect } from "./LLMProfileSelect";
 import { MarkdownMessage } from "./MarkdownMessage";
@@ -34,7 +35,7 @@ type UserPageProps = {
   onImportImage(): void;
   onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
   onSend(kind: "message" | "interrupt"): void;
-  onRespond(request: HumanRequest, approved: boolean, answer?: string): Promise<boolean>;
+  onRespond(request: HumanRequest, response: HumanResponseInput): Promise<boolean>;
   onRate(pid: string, score: number, comment: string): Promise<boolean>;
   onCreateLlmProfile(profile: LLMProfileInput): Promise<boolean>;
   onUpdateLlmProfile(profileId: string, profile: LLMProfileInput): Promise<boolean>;
@@ -84,8 +85,6 @@ export function UserPage({
   onStop
 }: UserPageProps) {
   const { t } = useI18n();
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [submittingAnswers, setSubmittingAnswers] = useState<Record<string, boolean>>({});
   const [commitImageId, setCommitImageId] = useState("");
   const [commitName, setCommitName] = useState("");
   const [commitVersion, setCommitVersion] = useState("v0");
@@ -94,36 +93,6 @@ export function UserPage({
   const isRunning = Boolean(snapshot?.scheduler.running);
   const hasProcess = Boolean(selectedProcess);
   const commitReady = Boolean(hasProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
-
-  function answerFor(requestId: string) {
-    return answers[requestId] ?? "";
-  }
-
-  function updateAnswer(requestId: string, value: string) {
-    setAnswers((current) => ({ ...current, [requestId]: value }));
-  }
-
-  async function submitAnswer(request: HumanRequest, approved: boolean) {
-    if (submittingAnswers[request.request_id]) return;
-    const answer = answerFor(request.request_id);
-    setSubmittingAnswers((current) => ({ ...current, [request.request_id]: true }));
-    try {
-      const ok = await onRespond(request, approved, answer).catch(() => false);
-      if (ok) {
-        setAnswers((current) => {
-          const next = { ...current };
-          delete next[request.request_id];
-          return next;
-        });
-      }
-    } finally {
-      setSubmittingAnswers((current) => {
-        const next = { ...current };
-        delete next[request.request_id];
-        return next;
-      });
-    }
-  }
 
   return (
     <main className="userPage">
@@ -235,20 +204,13 @@ export function UserPage({
 
         {pendingRequests.length > 0 ? (
           <section className="userPendingRequests" aria-label={t("user.pendingRequests")}>
-            {pendingRequests.map(({ request, text }) => (
-              <div className="userRequestCard" key={request.request_id}>
-                <strong>{text}</strong>
-                <input
-                  placeholder={t("user.answerPlaceholder")}
-                  value={answerFor(request.request_id)}
-                  onChange={(event) => updateAnswer(request.request_id, event.currentTarget.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") void submitAnswer(request, true);
-                  }}
-                />
-                <button disabled={Boolean(submittingAnswers[request.request_id])} onClick={() => void submitAnswer(request, true)}>{t("user.submit")}</button>
-                <button disabled={Boolean(submittingAnswers[request.request_id])} className="secondary" onClick={() => void submitAnswer(request, false)}>{t("user.reject")}</button>
-              </div>
+            {pendingRequests.map(({ request }) => (
+              <HumanRequestCard
+                className="userRequestCard"
+                key={request.request_id}
+                request={request}
+                onRespond={onRespond}
+              />
             ))}
           </section>
         ) : null}

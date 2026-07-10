@@ -33,6 +33,31 @@ touch it, and revokes stale `object:<oid>` capabilities. Released objects are
 not returned by oid lookup, name lookup, namespace listing, or materialization;
 their namespace-local names can be reused by new live objects.
 
+Ownership changes are lifecycle changes and increment the Object version.
+Create, update, append, transfer, and trusted delete all acquire the Object
+Memory ownership lock before entering the store transaction. Updates,
+transfers, and deletes condition their row write on `lifecycle_state=live` plus
+the captured owner and version; a lost conditional update cannot report
+success, overwrite a concurrent owner, or revive a released Object. Owner
+cleanup enumerates candidates but deletes each one only if its `owner_kind`,
+`owner_id`, and version still match the captured tuple. Transfer increments the
+version and publishes the whole selected batch plus its audit row in one
+transaction; a conditional failure transfers none of the batch. Therefore a
+release racing an ownership transfer cannot delete the new owner's Object,
+including an A-to-B-to-A (ABA) cycle: returning to the same textual owner does
+not restore the old version.
+
+Trusted delete holds the ownership lock while it snapshots and conditionally
+checks the Object. Host-resource finalizers then run outside the SQL transaction
+so a provider cleanup such as PTY close can durably write its own pending effect
+intent before crossing the host boundary. A finalizer failure leaves relational
+release state untouched. After finalization, delete opens a store transaction,
+rechecks the exact LIVE/owner/version tuple, and commits the Object release,
+object-capability revocation, and delete audit together. A later relational or
+audit failure rolls back the Object row, capabilities, and in-memory payload;
+it cannot undo an already completed host finalizer, whose effect ledger remains
+the reconciliation evidence.
+
 ## Namespaces
 
 Object names are local to a namespace. Runtime code that omits `namespace`
@@ -88,11 +113,27 @@ operation. For example, an `allow_once` `object_namespace:<ns>` `read` grant can
 complete one named lookup or namespace listing, then later lookups must be
 authorized again. Failed validation or missing objects do not burn the grant.
 
+Namespace listing also consumes the finite visibility authority actually used
+to construct its result. In one store transaction it settles the parent
+namespace read plus each returned object's `object:<oid> read` decision and
+each returned child namespace read decision, deduplicating repeated capability
+ids. Thus an object visible through a one-use object-read grant appears in the
+first successful listing and is absent from the next; listing cannot use a
+temporary visibility grant as a reusable directory oracle. Validation, audit,
+or settlement failure rolls back the whole listing consumption.
+
 ## Memory Views
 
 Processes hold `MemoryView` objects that summarize which objects are visible as
 goal, context, evidence, or result state. Fork can attenuate a parent view into
 a child. Spawn creates a fresh goal-only view.
+
+A view root is a borrowed reference unless the Object's explicit owner is that
+process/subtree. Checkpoint restore uses ownership, not reachability, as its
+destructive boundary: restoring a borrower does not roll back the lender's
+payload, namespace, owner, or object capability. Checkpoint fork clones owned
+reconstructable Objects, while `EXTERNAL_REF` roots and their capabilities are
+dropped because a host handle cannot be cloned safely.
 
 `MemoryView.filters` are applied during context materialization after
 capability checks and before budget selection. Filters are ORed together; fields
@@ -105,6 +146,11 @@ When a non-root child exits, its process-owned objects remain available for the
 direct parent to merge. A merge adopts merged child-owned objects into the
 parent and releases unmerged child-owned objects. If the parent exits before
 merging, terminal child-owned objects are released during parent cleanup.
+
+When merge authority is finite-use, creation of the parent's derived handle and
+consumption of the source grant are one store transaction. Failure to consume
+the exact reservation removes the unpublished handle, so a failed merge cannot
+leave durable authority behind.
 
 `ObjectPatch()` leaves object payload unchanged. `ObjectPatch(payload=None)`
 explicitly writes JSON `null` as the payload.

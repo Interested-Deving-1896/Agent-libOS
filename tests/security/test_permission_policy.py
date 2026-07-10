@@ -142,6 +142,24 @@ class TestPermissionPolicy:
         assert self.runtime.human.pending()[0].request_id == request.request_id
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
 
+    def test_approved_permission_request_requires_explicit_policy(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='approve requires policy')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(
+                pid,
+                'request_permission',
+                {'resource': resource, 'rights': ['write'], 'reason': 'write summary'},
+            )
+        request = self.runtime.human.pending()[0]
+
+        with pytest.raises(ValidationError, match='explicit policy'):
+            self.runtime.human.approve(request.request_id, {'approved': True})
+
+        assert self.runtime.human.get(request.request_id).status == HumanRequestStatus.PENDING
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
+
     def test_concurrent_permission_responses_commit_one_terminal_decision(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='permission response race')
         self._grant_human(pid)
@@ -155,8 +173,14 @@ class TestPermissionPolicy:
             barrier.wait(timeout=2)
             try:
                 if approved:
-                    return self.runtime.human.approve(request.request_id, {'approved': True}).status
-                return self.runtime.human.reject(request.request_id, {'approved': False}).status
+                    return self.runtime.human.approve(
+                        request.request_id,
+                        {'approved': True, 'policy': CapabilityManager.ALWAYS_ALLOW},
+                    ).status
+                return self.runtime.human.reject(
+                    request.request_id,
+                    {'approved': False, 'policy': CapabilityManager.ALWAYS_DENY},
+                ).status
             except Exception as exc:
                 return type(exc).__name__
 
@@ -354,7 +378,10 @@ class TestPermissionPolicy:
         assert context['content_bytes'] == 5
         assert context['content_preview'] == repr('first')
         assert context['content_sha256'] == hashlib.sha256(b'first').hexdigest()
-        assert context['target']['exists'] == False
+        assert context['target_state_observation'] == 'deferred_until_authorized'
+        assert 'target' not in context
+        assert 'will_create' not in context
+        assert 'will_overwrite' not in context
         assert first_prompt[0].payload['type'] == 'external_operation_approval'
         assert first_prompt[0].status == HumanRequestStatus.APPROVED
         assert 'content sha256' in self.human_output[0]
@@ -390,7 +417,7 @@ class TestPermissionPolicy:
         assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert not (self.runtime.workspace_root / path).exists()
 
-    def test_per_use_prompt_describes_overwrite_risk(self) -> None:
+    def test_per_use_prompt_does_not_probe_overwrite_state_before_approval(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='review overwrite')
         path = self._path()
         target = self.runtime.workspace_root / path
@@ -402,23 +429,41 @@ class TestPermissionPolicy:
             self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new content'})
         request = self.runtime.human.pending()[0]
         context = request.payload['context']
-        assert context['will_overwrite']
-        assert not context['will_create']
-        assert context['target']['exists']
-        assert context['target']['kind'] == 'file'
-        assert context['target']['size_bytes'] == len('old content'.encode('utf-8'))
+        assert context['overwrite'] is True
+        assert context['target_state_observation'] == 'deferred_until_authorized'
+        assert 'will_overwrite' not in context
+        assert 'will_create' not in context
+        assert 'target' not in context
 
-    def test_write_preconditions_fail_before_per_use_prompt(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='do not prompt impossible write')
+    def test_write_preconditions_are_observed_only_after_per_use_approval(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='authorize before write state probe')
         path = self._path()
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text('existing', encoding='utf-8')
+        state_calls = 0
+        original_state = self.runtime.filesystem.provider.state
+
+        def count_state(*args: object, **kwargs: object) -> object:
+            nonlocal state_calls
+            state_calls += 1
+            return original_state(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.filesystem.provider, 'state', count_state)
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
+        assert len(self.runtime.human.pending()) == 1
+        assert state_calls == 0
+        self.runtime.human.drain_terminal_queue(auto_approve=True)
         result = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
+        assert state_calls == 1
         assert not result.ok
-        assert self.runtime.human.pending() == []
+        assert 'already exists' in (result.error or '')
         assert target.read_text(encoding='utf-8') == 'existing'
 
     def test_missing_delete_consumes_one_time_grant(self) -> None:
@@ -490,7 +535,10 @@ class TestPermissionPolicy:
                 {'resource': resource_1, 'rights': ['write'], 'reason': 'first'},
             )
         request_1 = self.runtime.human.pending()[0]
-        self.runtime.human.approve(request_1.request_id)
+        self.runtime.human.approve(
+            request_1.request_id,
+            {'approved': True, 'policy': CapabilityManager.ASK_EACH_TIME},
+        )
 
         pid_2 = self.runtime.process.spawn(image='review-agent:v0', goal='second permission request')
         self._grant_human(pid_2)

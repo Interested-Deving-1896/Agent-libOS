@@ -43,7 +43,17 @@ manifest, event/audit records, and any newly inserted package or checkpoint
 artifact in one transaction. A failure after artifact insertion therefore
 restores the previous image (for replacement) or removes the new image and
 artifact (for registration/commit); a caller never observes a manifest whose
-registration result was reported as failed.
+registration result was reported as failed. A registry-wide reentrant lock
+covers the cache/store critical section, and `replace=false` is revalidated
+inside it. Two concurrent registrations for one id cannot both win, and one
+caller's rollback cannot delete another caller's committed cache entry.
+
+The registry owns deep snapshots of image definitions. Mutating the caller's
+registration object, a returned registration result, or an object returned by
+`Runtime.get_image()` does not mutate the cached/durable definition. Booting a
+checkpoint-committed image restores the process's captured
+`loaded_skills.package_snapshot`, but does not replace the current global Skill
+or Image registry with historical nested metadata.
 
 `prompt_mode` controls prompt composition. `image_only` uses the image prompt as
 the system prompt and gives the model only materialized task context; this is
@@ -80,6 +90,35 @@ profile inherits legacy `OPENAI_*` provider and model environment variables;
 other named profiles require explicit host profile fields for non-default
 routing.
 
+The default OpenAI posture is stateless and privacy-preserving:
+`llm.store=false` and `responses_previous_response_id=false`. Opt-in Responses
+chaining additionally requires full local I/O persistence, the official
+Responses request path, the same profile/scope fingerprint, the same non-secret
+provider-chain fingerprint, and a complete one-to-one durable output for every
+unique function `call_id` in the immediately preceding response. The provider
+fingerprint is a credential-keyed HMAC over the model, normalized official
+endpoint, API mode, API-key environment name, and organization/project tenant;
+the credential itself is never persisted. This keeps a same-identity chain
+stable across restarts while a model, credential, endpoint, or tenant change
+forces a reset. Eligible outputs, including completed parallel batches and
+waits resumed after reopen, are sent as native `function_call_output` items.
+Any missing, extra, redacted, conflicting, legacy-ambiguous, or partial output,
+or a changed image/tool/Skill/context generation, resets to stateless/plain
+context instead of guessing provider state. Context compaction advances the
+durable generation before payload replacement; checkpoint restore also advances
+it so a local rollback cannot chain to a response produced from post-checkpoint
+state.
+
+LLM-selected blocking actions use durable wait generations. Each row has a
+unique `resume_token`; one executor CASes `pending -> resuming` before crossing
+the resumed primitive boundary and CASes the same generation to `completed`
+afterward. Reblocking writes a new token, closing stale-worker ABA. Once the
+claim succeeds, any dispatch, output-persistence, or completion exception
+immediately fails the process, retains the non-replayable durable state, and
+audits `llm.pending_action_resume_interrupted`; reopening an already-`resuming`
+row follows the same fail-closed rule rather than replaying a possibly completed
+external effect.
+
 `jit_tool_exposure` controls how JIT tools appear to the LLM. `direct` exposes
 each visible JIT as its own OpenAI tool. `multiplexed` exposes one stable
 `run_jit_tool` protocol tool and maps it back to the real process-local JIT
@@ -112,6 +151,14 @@ Each process has its own workspace-relative working directory. Relative
 filesystem paths and shell subprocess cwd resolve from that process cwd. The
 runtime host process does not `chdir` into launched workspaces.
 
+Changing a process cwd requires `read` on the selected filesystem directory.
+An explicit cwd supplied to spawn, fork, or PTY creation is checked through the
+same filesystem directory primitive after the higher-level spawn/image or
+shell authority gates. The directory `state()` observation therefore runs
+under a structured filesystem intent rather than acting as an unauthorized
+existence oracle. Finite directory-read authority is consumed only after an
+observation; an ambiguous provider failure leaves unknown effect evidence.
+
 The CLI command:
 
 ```bash
@@ -137,10 +184,81 @@ process-owned memory cleanup, direct trusted delete, or runtime shutdown, the
 module-bound Object release or shutdown finalizer closes the underlying PTY as
 the object's RAII resource.
 
+Finite object write/delete decisions for `pty_write`, `pty_resize`, and
+`pty_close` are reserved before the host call. A certified not-started result
+restores that exact reservation only when no earlier provider observation in
+the operation flowed information; ordinary or ambiguous failures commit the
+use and retain pending/unknown evidence. When the child exits on its own, the
+monitor writes a close intent before reading the exit code and closing the
+handle. Once the exit-code read succeeds, even a later not-started close cannot
+abandon that information-flow intent.
+
+PTY spawn, write, resize, and close are external-effect operations. Each writes
+a structured pending intent before its provider boundary and conditionally
+finalizes the same effect id afterward; event/audit/finalization failure leaves
+the row pending and unknown. A spawned host session whose Object publication
+later fails is cleaned up but remains an `unknown` spawn effect with
+failure-phase and cleanup metadata. Unsupported or failing post-operation
+classification finalizes an unknown fallback rather than erasing the effect.
+The local provider classifies write/close as irreversible and resize as
+rollbackable-but-not-applied; checkpoint restore does not compensate either.
+
 PTY sessions are not checkpointed or persisted as reconnectable host handles.
-A checkpoint or committed image may contain an `EXTERNAL_REF` row only as stale
-metadata; reopening the runtime releases stale PTY objects rather than trying
-to reconnect a host terminal process.
+A checkpoint or committed image may contain an `EXTERNAL_REF` row only as
+descriptive metadata; it cannot rewind or recreate the provider resource.
+Checkpoint fork drops owned and borrowed `EXTERNAL_REF` roots and object
+capabilities rather than aliasing the source terminal. Reopening the runtime
+releases stale PTY objects rather than trying to reconnect a host process.
+
+## External Effect Ledger
+
+Filesystem, clock, shell, human output/terminal I/O, PTY, JSON-RPC, and live MCP
+primitives close the crash gap around provider calls with a durable
+external-effect intent.
+Immediately before the provider boundary they insert an `unknown` record with
+structured `effect_state: pending`. A classified success or ambiguous provider
+exception CASes that same `effect_id` to `finalized`, matching its pid,
+provider, operation, and target. Repeated, stale, or cross-boundary finalization
+fails closed instead of adding another final record or altering unrelated
+evidence.
+
+`ProviderEffectNotStarted` is the only provider result that can prove its call
+boundary was not crossed. The primitive conditionally deletes a still-pending
+intent only when no earlier provider observation in the composite operation
+flowed information. Filesystem/clock/shell and PTY spawn restore any exact
+finite-use reservation and abandon the intent in one transaction. If an earlier
+filesystem state read or MCP live validation succeeded, a later not-started
+mutation/tool call finalizes an information-flow-only record. After the provider
+may have run, a failure in capability commit, resource/event/audit handling,
+classification, or final effect persistence leaves the pending `unknown` record
+in place. Checkpoint diff/restore and the runtime-safety benchmark consume that
+row conservatively, so a process crash cannot turn an uncertain external effect
+into “no effect recorded.”
+
+Terminal human reads and automatic prompt/decision writes follow the same
+protocol. Their effect context contains request id, purpose, byte/character
+counts, and hashes only; raw prompts, answers, and provider exception text are
+not persisted. A successful human interaction is not replayed when later
+event/audit/classification settlement fails: the request decision commits and
+the pending intent remains the reconciliation evidence.
+
+For JSON-RPC and Streamable HTTP MCP, the pending intent and all finite remote
+authority reservations are durable before non-local DNS resolution. A
+successful DNS lookup, or an ordinary DNS failure after host observation, is
+already information flow and commits the reservations. Consequently a later
+transport-level `ProviderEffectNotStarted` finalizes an information-flow-only
+unknown outcome instead of abandoning the intent. Local HTTP fast paths and
+stdio have no DNS observation, so a certified failure at their first provider
+boundary can still restore and abandon atomically.
+
+Clock sleep is one composite observed operation. Synchronous `sleep` and async
+`asleep` persist the intent before their first provider `monotonic()` call and
+mark it `information_flow=true`, including on success, because the returned
+elapsed time comes from provider observations. Only
+`ProviderEffectNotStarted` at that first measurement can restore a finite-use
+reservation and abandon the intent. Any ordinary first-measurement exception,
+or any later sleep, cancellation, or second-measurement failure, consumes the
+reservation and finalizes the same id as `unknown`.
 
 ## Scheduler
 
@@ -210,9 +328,17 @@ ObjectTask tool thread cannot stop safely, shutdown reports `ok: false` with
 `scheduler_stopped: false` or `object_tasks_stopped: false` and leaves the
 runtime store open rather than closing it underneath a live worker. Once the
 worker finishes, a later shutdown can complete normal resource cleanup.
-Persistent stores also take an active-runtime lease: SQLite uses a lock file,
-and PostgreSQL uses a session advisory lock. Another writable Runtime cannot
-open the same database until the active Runtime closes and releases the lease.
+Persistent stores also take an active-runtime lease: SQLite uses a secure
+sidecar `flock` where available or an exclusive database lock as fallback, and
+PostgreSQL uses a database/schema-scoped session advisory lock. Another
+writable Runtime cannot open the same database until the active Runtime closes
+and releases the lease.
+
+The GUI adds a service-level drain around this contract. It stops background
+scheduling, rejects new runtime users, waits for tracked request handlers, and
+only then calls `Runtime.shutdown()`. A timeout returns failure and reopens the
+service lifecycle gate so shutdown can be retried; it does not mark the service
+closed or close the store underneath live work.
 
 ## Resource Budgets
 
@@ -222,18 +348,32 @@ calls and tokens, context materialization tokens, subprocess wall/CPU/RSS usage,
 external filesystem bytes, JSON-RPC bytes, MCP bytes, and Deno syscalls.
 Observed consumption is stored as `ResourceUsage` on the process row.
 
+Discrete counters and byte/token quantities must be non-negative integers:
+tool/child/LLM call counts, token counts, context counts, Deno syscall counts,
+filesystem/JSON-RPC/MCP byte counts, and subprocess peak bytes reject floats
+and booleans. Runtime duration and subprocess wall/CPU seconds are continuous,
+finite non-negative numbers and may be fractional. This distinction is checked
+when budgets/usages are constructed and again at the resource manager boundary.
+
 Every charge applies to the acting process and its parent chain, so a parent can
-bound an entire child tree. Fork and spawn may request a child budget, but it
-must fit within the parent's remaining budget. `exec_process` keeps the same pid
-and does not reset usage or increase budget. Checkpoint restore replays recorded
-process rows, including their resource state, for the restored processes.
+bound an entire child tree. The complete child-to-ancestor usage update,
+reservation consumption, resource event, and audit row commit in one store
+transaction; a failure at any point leaves none of that charge published. If an
+overage kills a process subtree, terminal Human/Object-task/finalizer callbacks
+run only after the store transaction and lock are released. Fork and spawn may
+request a child budget, but it must fit within the parent's remaining budget.
+`exec_process` keeps the same pid and does not reset usage or increase budget.
+Checkpoint restore replays recorded process rows, including their resource
+state, for the restored processes.
 Checkpoint-committed images do not store or restore resource budgets or usage;
 only the caller that starts the process may set launch-time resource limits.
 
 LLM token usage is charged after provider completion using provider-reported
 usage. If a token budget exists and the provider does not return billable usage,
-the LLM action fails closed. When an LLM completion pushes usage over budget,
-the call record is retained but model-selected tools are not dispatched.
+returns booleans/strings/negative values, or reports a total smaller than its
+prompt-plus-completion components, the LLM action fails closed. When an LLM
+completion pushes usage over budget, the call record is retained but
+model-selected tools are not dispatched.
 Context materialization has both a per-call cap
 (`max_context_materialization_tokens`) and a separate cumulative budget
 (`max_context_materialization_total_tokens`). The cumulative context token
@@ -246,7 +386,9 @@ quantum, and over-budget rendered context fails closed before the model call.
 Shell and Deno subprocesses are run through provider-level monitors. The
 default local provider uses cross-platform process-tree sampling to enforce wall
 time, CPU time, and peak RSS budgets, then records metrics and audits limit
-exceedance. In-process Python primitives are not hard CPU/RSS isolated; they
+exceedance. Deno additionally runs behind a host-lifetime supervisor (a POSIX
+death pipe or Windows `KILL_ON_JOB_CLOSE` Job Object), so a hard host exit does
+not orphan untrusted JIT code. In-process Python primitives are not hard CPU/RSS isolated; they
 remain bounded by call count, wall time, byte limits, and primitive-specific
 caps.
 
@@ -262,10 +404,13 @@ Human interaction is modeled as runtime objects, not raw prompt text.
   privileged rights, `shell:*` execute, or root/global filesystem write such as
   `filesystem:/:*`; workspace write remains a human-approvable scope.
 - `human_output` writes through the HumanObject primitive and provider. It
-  commits the delivery intent, terminal request state, audit record, event, and
-  external-effect record before calling the provider, so a provider exception
-  cannot leave a replayable pending request or restore already committed
-  one-shot authority.
+  commits `delivered` request state, audit, event, and a structured pending
+  external-effect intent in one transaction before calling the provider. A
+  provider exception is finalized as unknown when possible and records only
+  `provider_error_type`, never exception text; if delivery succeeds but
+  classification/final persistence fails, the pending row remains and the call
+  is not retried. Thus output is at-most-once: no post-provider failure can
+  leave a replayable request or restore already committed one-shot authority.
 - Per-use approvals can create one-shot capabilities. Side-effectful primitives
   reserve the use before commit, restore it if a pre-commit failure aborts the
   operation, and leave it consumed once the operation crosses its commit or
@@ -281,6 +426,22 @@ the runtime, except `request_permission` rejection returns a structured
 Terminal queue selection and terminal transition use one serialized critical
 section. Concurrent drains therefore cannot deliver one output twice or install
 two automatic permission policies from the same pending request.
+
+Permission decisions must include a JSON boolean `approved` consistent with the
+terminal status and one explicit policy: `always_allow`, `always_deny`, or
+`ask_each_time`. Approval cannot install `always_deny`; rejection cannot install
+`always_allow`. `allow_once` remains a separate capability lease/API shape and
+is not a terminal permission-response policy. An approved `question` must carry
+a non-empty string `answer`; values are not coerced from numbers, objects, or
+missing fields.
+
+Automatic terminal policy belongs to one host run invocation. It is stored in
+an immutable `ContextVar`, copied into scheduler workers, and captured by a JIT
+syscall session, so concurrent runs cannot overwrite one another's human,
+auto-policy, or answer. Resolving one of several blocking requests leaves the
+process in `waiting_human` until no blocking request remains. Process exit,
+failure, kill, or terminal cancellation cancels all still-pending requests;
+terminal processes cannot create or receive new human decisions.
 
 ## Process Messages And IPC
 

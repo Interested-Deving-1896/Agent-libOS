@@ -8,9 +8,18 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
-from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus
+from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ValidationError
-from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate
+from agent_libos.substrate import (
+    CommandMetrics,
+    CommandResult,
+    LocalClockProvider,
+    LocalFilesystemProvider,
+    LocalHumanProvider,
+    LocalResourceProviderSubstrate,
+    ProviderEffectNotStarted,
+    SubprocessTimeoutExpired,
+)
 
 class TestShellPrimitive:
     def setup_method(self) -> None:
@@ -48,6 +57,33 @@ class TestShellPrimitive:
             assert result.correlation_id == intent.record_id
             assert event.correlation_id == intent.record_id
             assert intent.decision['sandbox_profile']['operation'] == 'shell.run'
+        finally:
+            runtime.close()
+
+    def test_shell_post_provider_event_failure_leaves_durable_unknown_effect_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='durable shell effect intent')
+            runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
+            original_emit = runtime.events.emit
+
+            def fail_shell_result_event(event_type: EventType | str, *args: Any, **kwargs: Any) -> Any:
+                if EventType(event_type) == EventType.EXTERNAL_WRITE and kwargs.get('target') == 'shell:git':
+                    raise RuntimeError('injected shell result event failure')
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_shell_result_event)
+            with pytest.raises(RuntimeError, match='injected shell result event failure'):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].provider_metadata['effect_state'] == 'pending'
         finally:
             runtime.close()
 
@@ -338,6 +374,75 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_shell_timeout_records_unknown_external_effect_and_commits_one_time_use(self) -> None:
+        provider = TimeoutShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='timeout effect accounting')
+            policy = runtime.capability.issue_trusted(
+                pid,
+                runtime.shell.policy_resource(),
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    runtime.config.shell.policy_capability_key: runtime.config.shell.always_allow_level,
+                },
+                uses_remaining=1,
+            )
+
+            with pytest.raises(TimeoutError, match='timed out'):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert runtime.store.get_capability(policy.cap_id).uses_remaining == 0
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].operation == 'run'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].provider_metadata['outcome'] == 'unknown_after_provider_exception'
+        finally:
+            runtime.close()
+
+    def test_shell_classifier_failure_returns_result_and_records_conservative_effect(self) -> None:
+        provider = ClassifierFailureShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='classifier failure accounting')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+            result = runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert result.returncode == 0
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].provider_metadata['classification_fallback'] == 'post_effect_failure'
+        finally:
+            runtime.close()
+
+    def test_shell_provider_certified_pre_effect_failure_restores_one_time_use(self) -> None:
+        provider = PreEffectFailureShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='pre-effect failure restore')
+            policy = runtime.capability.issue_trusted(
+                pid,
+                runtime.shell.policy_resource(),
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    runtime.config.shell.policy_capability_key: runtime.config.shell.always_allow_level,
+                },
+                uses_remaining=1,
+            )
+
+            with pytest.raises(ProviderEffectNotStarted, match='before execution'):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert runtime.store.get_capability(policy.cap_id).uses_remaining == 1
+            assert runtime.store.list_external_effects(pid=pid) == []
+        finally:
+            runtime.close()
+
     def test_permanent_allow_shell_policy_can_authorize_repeated_runs(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
@@ -517,13 +622,16 @@ class TestShellPrimitive:
             runtime.close()
 
     def _runtime_with_fake_shell(self) -> tuple[Runtime, 'FakeShellProvider']:
+        provider = FakeShellProvider()
+        return self._runtime_with_shell_provider(provider), provider
+
+    def _runtime_with_shell_provider(self, provider: 'FakeShellProvider') -> Runtime:
         temp_dir = tempfile.TemporaryDirectory()
         self._temp_dirs.append(temp_dir)
-        provider = FakeShellProvider()
         substrate = RecordingShellSubstrate(temp_dir.name, provider)
         runtime = Runtime.open('local', substrate=substrate)
         runtime.substrate.human.output_sink = lambda _message: None
-        return (runtime, provider)
+        return runtime
 
     def _runtime_with_config(self, config: AgentLibOSConfig) -> tuple[Runtime, 'FakeShellProvider']:
         temp_dir = tempfile.TemporaryDirectory()
@@ -794,3 +902,41 @@ class FakeShellProvider:
 
     def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
         return ExternalEffectClassification(rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE, rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED, state_mutation=True, information_flow=True, metadata={'operation': operation})
+
+
+class TimeoutShellProvider(FakeShellProvider):
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: Any | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
+        self.calls.append((list(argv), timeout))
+        raise SubprocessTimeoutExpired(
+            'provider timed out after execution began',
+            metrics=CommandMetrics(wall_seconds=timeout, killed=True, limit_kind='wall_time'),
+        )
+
+
+class ClassifierFailureShellProvider(FakeShellProvider):
+    def classify_external_effect(self, operation: str, context: dict[str, Any], result: Any) -> ExternalEffectClassification:
+        raise RuntimeError('classifier unavailable after execution')
+
+
+class PreEffectFailureShellProvider(FakeShellProvider):
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: Any | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
+        self.calls.append((list(argv), timeout))
+        raise ProviderEffectNotStarted('provider failed before execution')

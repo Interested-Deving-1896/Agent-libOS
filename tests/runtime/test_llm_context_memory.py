@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import pytest
 import json
@@ -13,6 +14,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
+from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import (
     AgentImage,
@@ -767,6 +769,12 @@ class TestLLMContextMemory:
                 assert second['action']['action'] == 'process_exit'
                 assert 'previous_response_id' not in fake.responses.payloads[0]
                 assert fake.responses.payloads[1]['previous_response_id'] == 'resp_first'
+                chained_output = next(
+                    item for item in fake.responses.payloads[1]['input']
+                    if item.get('type') == 'function_call_output'
+                )
+                assert chained_output['call_id'] == 'call_resp_first'
+                assert json.loads(chained_output['output']) == first['result']
                 assert fake.responses.payloads[0]['safety_identifier'] == 'safe-session'
                 assert fake.responses.payloads[0]['prompt_cache_key'] == 'cache-secret'
                 assert fake.responses.payloads[0]['prompt_cache_retention'] == '24h'
@@ -785,6 +793,514 @@ class TestLLMContextMemory:
                 assert 'safe-session' not in serialized_options
             finally:
                 runtime.close()
+
+    def test_openai_responses_state_chain_persists_parallel_tool_outputs(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                store=True,
+                responses_previous_response_id=True,
+                parallel_tool_calls=True,
+            ),
+        )
+        client = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=True,
+            responses_previous_response_id=True,
+            parallel_tool_calls=True,
+            defaults=config.llm,
+        )
+        fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_parallel_tool_calls(
+                    'resp_parallel',
+                    [
+                        ('read_process_messages', {'ack': False}),
+                        ('read_process_messages', {'ack': False}),
+                    ],
+                ),
+                _responses_tool_call('resp_after_parallel', 'process_exit', {'payload': {'done': True}}),
+            ]
+        )
+        client._async_client = fake
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = client
+            pid = runtime.process.spawn(image='base-agent:v0', goal='persist every parallel output')
+
+            first = runtime.run_next_process_once()
+            second = runtime.run_next_process_once()
+
+            assert first['parallel_tool_calls']
+            assert first['executed_count'] == 2
+            assert second['action']['action'] == 'process_exit'
+            assert fake.responses.payloads[1]['previous_response_id'] == 'resp_parallel'
+            native_outputs = [
+                item for item in fake.responses.payloads[1]['input']
+                if item.get('type') == 'function_call_output'
+            ]
+            assert [item['call_id'] for item in native_outputs] == [
+                'call_resp_parallel_1',
+                'call_resp_parallel_2',
+            ]
+            assert [json.loads(item['output']) for item in native_outputs] == first['results']
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("second_model", "second_api_key"),
+        [("gpt-next", "key"), ("gpt-test", "different-key")],
+    )
+    def test_openai_responses_state_chain_resets_when_provider_identity_changes(
+        self,
+        second_model: str,
+        second_api_key: str,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, store=True, responses_previous_response_id=True),
+        )
+        first_client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            api_mode="responses",
+            store=True,
+            responses_previous_response_id=True,
+            defaults=config.llm,
+        )
+        first_fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_tool_call(
+                    "resp_provider_a",
+                    "create_memory_object",
+                    {"type": "note", "name": "provider-step", "payload": {"ok": True}},
+                )
+            ]
+        )
+        first_client._async_client = first_fake
+        runtime = Runtime.open("local", config=config)
+        try:
+            runtime.llm.client = first_client
+            pid = runtime.process.spawn(image="base-agent:v0", goal="reset provider response chain")
+            first = runtime.run_next_process_once()
+            assert first["action"]["action"] == "create_memory_object"
+
+            second_client = LLMClient(
+                model=second_model,
+                api_key=second_api_key,
+                api_mode="responses",
+                store=True,
+                responses_previous_response_id=True,
+                defaults=config.llm,
+            )
+            second_fake = FakeAsyncOpenAIResponses(
+                [_responses_tool_call("resp_provider_b", "process_exit", {"payload": {"done": True}})]
+            )
+            second_client._async_client = second_fake
+            runtime.llm.client = second_client
+
+            second = runtime.run_next_process_once()
+
+            assert second["action"]["action"] == "process_exit"
+            assert "previous_response_id" not in second_fake.responses.payloads[0]
+            assert not any(
+                item.get("type") == "function_call_output"
+                for item in second_fake.responses.payloads[0]["input"]
+            )
+            calls = runtime.store.list_llm_calls(pid)
+            assert (
+                calls[0].request_options["openai_provider_chain_fingerprint"]
+                != calls[1].request_options["openai_provider_chain_fingerprint"]
+            )
+            serialized_options = json.dumps([call.request_options for call in calls], sort_keys=True)
+            assert '"key"' not in serialized_options
+            assert '"different-key"' not in serialized_options
+        finally:
+            runtime.close()
+
+    def test_openai_provider_fingerprint_preserves_case_sensitive_base_url_path(self) -> None:
+        upper = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            base_url='https://gateway.example/v1/TenantA',
+            store=True,
+            responses_previous_response_id=True,
+            allow_custom_base_url=True,
+            defaults=DEFAULT_CONFIG.llm,
+        )
+        lower = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            base_url='https://gateway.example/v1/tenanta',
+            store=True,
+            responses_previous_response_id=True,
+            allow_custom_base_url=True,
+            defaults=DEFAULT_CONFIG.llm,
+        )
+
+        assert (
+            LLMProcessExecutor._openai_provider_chain_fingerprint(upper)
+            != LLMProcessExecutor._openai_provider_chain_fingerprint(lower)
+        )
+
+    def test_openai_responses_state_chain_resets_when_parallel_output_is_incomplete(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                store=True,
+                responses_previous_response_id=True,
+                parallel_tool_calls=True,
+            ),
+        )
+        client = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=True,
+            responses_previous_response_id=True,
+            parallel_tool_calls=True,
+            defaults=config.llm,
+        )
+        fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_parallel_tool_calls(
+                    'resp_incomplete',
+                    [
+                        ('read_process_messages', {'ack': False}),
+                        ('create_memory_object', {'type': 'not-a-real-object-type', 'payload': {}}),
+                        ('read_process_messages', {'ack': False}),
+                    ],
+                ),
+                _responses_tool_call('resp_after_incomplete', 'process_exit', {'payload': {'done': True}}),
+            ]
+        )
+        client._async_client = fake
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = client
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reset incomplete parallel response chain')
+
+            first = runtime.run_next_process_once()
+            second = runtime.run_next_process_once()
+
+            assert first['parallel_tool_calls']
+            assert first['stop_reason'] == 'tool_failed'
+            assert first['executed_count'] == 2
+            assert second['action']['action'] == 'process_exit'
+            assert 'previous_response_id' not in fake.responses.payloads[1]
+            assert not any(
+                item.get('type') == 'function_call_output'
+                for item in fake.responses.payloads[1]['input']
+            )
+            outputs = runtime.store.list_llm_tool_outputs(pid=pid, response_id='resp_incomplete')
+            assert [output['call_id'] for output in outputs] == [
+                'call_resp_incomplete_1',
+                'call_resp_incomplete_2',
+            ]
+        finally:
+            runtime.close()
+
+    def test_openai_responses_state_chain_resets_when_full_io_persistence_is_disabled(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                store=True,
+                responses_previous_response_id=True,
+                persist_full_io=False,
+            ),
+        )
+        client = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=True,
+            responses_previous_response_id=True,
+            defaults=config.llm,
+        )
+        fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_tool_call('resp_redacted', 'read_process_messages', {'ack': False}),
+                _responses_tool_call('resp_after_redacted', 'process_exit', {'payload': {'done': True}}),
+            ]
+        )
+        client._async_client = fake
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = client
+            pid = runtime.process.spawn(image='base-agent:v0', goal='do not persist output in redacted mode')
+
+            first = runtime.run_next_process_once()
+            second = runtime.run_next_process_once()
+
+            assert first['result']['ok']
+            assert second['action']['action'] == 'process_exit'
+            assert 'previous_response_id' not in fake.responses.payloads[1]
+            assert runtime.store.list_llm_tool_outputs(pid=pid, response_id='resp_redacted') == []
+        finally:
+            runtime.close()
+
+    def test_openai_responses_wait_resume_output_survives_runtime_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            config = replace(
+                DEFAULT_CONFIG,
+                llm=replace(DEFAULT_CONFIG.llm, store=True, responses_previous_response_id=True),
+            )
+            first_client = LLMClient(
+                model='gpt-test',
+                api_key='key',
+                api_mode='responses',
+                store=True,
+                responses_previous_response_id=True,
+                defaults=config.llm,
+            )
+            first_fake = FakeAsyncOpenAIResponses(
+                [_responses_tool_call('resp_wait', 'receive_process_messages', {'channel': 'resume-chain'})]
+            )
+            first_client._async_client = first_fake
+            runtime = Runtime.open(db, config=config)
+            try:
+                runtime.llm.client = first_client
+                pid = runtime.process.spawn(image='base-agent:v0', goal='resume response chain after reopen')
+                waiting = runtime.run_next_process_once()
+                assert waiting['waiting_message']
+            finally:
+                runtime.close()
+
+            second_client = LLMClient(
+                model='gpt-test',
+                api_key='key',
+                api_mode='responses',
+                store=True,
+                responses_previous_response_id=True,
+                defaults=config.llm,
+            )
+            second_fake = FakeAsyncOpenAIResponses(
+                [_responses_tool_call('resp_after_wait', 'process_exit', {'payload': {'done': True}})]
+            )
+            second_client._async_client = second_fake
+            reopened = Runtime.open(db, config=config)
+            try:
+                reopened.llm.client = second_client
+                message = reopened.human.send_process_message(
+                    pid,
+                    'resume response chain',
+                    subject='resume',
+                    channel='resume-chain',
+                )
+                resumed = reopened.run_next_process_once()
+                completed = reopened.run_next_process_once()
+
+                assert resumed['resumed_after_message']
+                assert resumed['result']['payload']['messages'][0]['message_id'] == message.message_id
+                assert completed['action']['action'] == 'process_exit'
+                assert second_fake.responses.payloads[0]['previous_response_id'] == 'resp_wait'
+                output = next(
+                    item for item in second_fake.responses.payloads[0]['input']
+                    if item.get('type') == 'function_call_output'
+                )
+                assert output['call_id'] == 'call_resp_wait'
+                assert json.loads(output['output']) == resumed['result']
+            finally:
+                reopened.close()
+
+    def test_pending_message_resume_is_claimed_once_across_executor_instances(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='claim pending action once')
+            runtime.store.upsert_llm_pending_action(
+                pid,
+                {
+                    'wait_type': 'message',
+                    'filters': {'channel': 'claim-once'},
+                    'action': {'action': 'receive_process_messages', 'channel': 'claim-once'},
+                    'content_preview': '',
+                    'tool_call_count': 1,
+                    'status': 'pending',
+                },
+            )
+            first = LLMProcessExecutor(runtime)
+            second = LLMProcessExecutor(runtime)
+            runtime.human.send_process_message(pid, 'ready', subject='resume', channel='claim-once')
+            dispatch_count = 0
+
+            async def fake_dispatch(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+                nonlocal dispatch_count
+                dispatch_count += 1
+                await asyncio.sleep(0)
+                return {'ok': True, 'tool_id': 'receive', 'result_oid': None, 'payload': {}, 'error': None}
+
+            first.adispatch = fake_dispatch  # type: ignore[method-assign]
+            second.adispatch = fake_dispatch  # type: ignore[method-assign]
+
+            async def resume_both() -> list[dict[str, Any]]:
+                return list(
+                    await asyncio.gather(
+                        first._resume_pending_message_action(pid),
+                        second._resume_pending_message_action(pid),
+                    )
+                )
+
+            results = asyncio.run(resume_both())
+
+            assert dispatch_count == 1
+            assert sum(bool(result.get('resumed_after_message')) for result in results) == 1
+            assert sum(bool(result.get('pending_action_resuming')) for result in results) == 1
+            assert runtime.store.get_llm_pending_action(pid)['status'] == 'completed'
+        finally:
+            runtime.close()
+
+    def test_pending_claim_token_prevents_aba_claim_of_new_wait_generation(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='pending claim generation')
+            first = {
+                'wait_type': 'human',
+                'request_id': 'human_first',
+                'resume_token': 'wait_first',
+                'action': {'action': 'ask_human', 'question': 'first?'},
+                'content_preview': '',
+                'tool_call_count': 1,
+                'status': 'pending',
+            }
+            runtime.store.upsert_llm_pending_action(pid, first)
+            assert runtime.store.claim_llm_pending_action(pid, resume_token='wait_first') is not None
+
+            second = {
+                **first,
+                'request_id': 'human_second',
+                'resume_token': 'wait_second',
+                'action': {'action': 'ask_human', 'question': 'second?'},
+            }
+            runtime.store.upsert_llm_pending_action(pid, second)
+
+            assert runtime.store.claim_llm_pending_action(pid, resume_token='wait_first') is None
+            claimed = runtime.store.claim_llm_pending_action(pid, resume_token='wait_second')
+            assert claimed is not None
+            assert claimed['request_id'] == 'human_second'
+            assert claimed['resume_token'] == 'wait_second'
+        finally:
+            runtime.close()
+
+    def test_checkpoint_restore_rehydrates_restored_pending_action_in_current_executor(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient(
+                [{'action': 'receive_process_messages', 'channel': 'restore-pending'}]
+            )
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore pending LLM action')
+            waiting = runtime.run_next_process_once()
+            assert waiting['waiting_message']
+            checkpoint_id = runtime.checkpoint.create(pid, 'pending message action', actor=pid)
+
+            runtime.human.send_process_message(
+                pid,
+                'first delivery',
+                subject='resume',
+                channel='restore-pending',
+            )
+            first_resume = runtime.run_next_process_once()
+            assert first_resume['resumed_after_message']
+            assert runtime.store.get_llm_pending_action(pid)['status'] == 'completed'
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+            runtime.human.send_process_message(
+                pid,
+                'delivery after restore',
+                subject='resume',
+                channel='restore-pending',
+            )
+            restored_resume = runtime.run_next_process_once()
+
+            assert restored_resume['resumed_after_message']
+            assert restored_resume['result']['payload']['messages'][0]['body'] == 'delivery after restore'
+        finally:
+            runtime.close()
+
+    def test_reopen_fails_process_closed_for_interrupted_pending_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='do not replay interrupted action')
+                runtime.store.upsert_llm_pending_action(
+                    pid,
+                    {
+                        'wait_type': 'human',
+                        'request_id': 'human_interrupted',
+                        'action': {'action': 'write_text_file', 'path': 'agent_outputs/no-replay.txt', 'content': 'x'},
+                        'content_preview': '',
+                        'tool_call_count': 1,
+                        'status': 'resuming',
+                    },
+                )
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db)
+            try:
+                assert reopened.process.get(pid).status == ProcessStatus.FAILED
+                assert reopened.store.get_llm_pending_action(pid)['status'] == 'resuming'
+                assert any(
+                    record.action == 'llm.pending_action_resume_interrupted'
+                    and record.target == f'process:{pid}'
+                    for record in reopened.audit.trace()
+                )
+                assert pid not in reopened.llm._pending_human_actions
+            finally:
+                reopened.close()
+
+    def test_pending_resume_claim_prevents_replay_after_effect_before_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                runtime.llm.client = RecordingActionClient(
+                    [{'action': 'receive_process_messages', 'channel': 'crash-window'}]
+                )
+                pid = runtime.process.spawn(image='base-agent:v0', goal='close replay crash window')
+                waiting = runtime.run_next_process_once()
+                assert waiting['waiting_message']
+                message = runtime.human.send_process_message(
+                    pid,
+                    'effect happens once',
+                    subject='resume',
+                    channel='crash-window',
+                )
+
+                def crash_before_clear(_pid: str, _resume_token: str) -> None:
+                    raise RuntimeError('simulated crash after tool effect')
+
+                runtime.llm._clear_pending_action = crash_before_clear  # type: ignore[method-assign]
+                with pytest.raises(RuntimeError, match='simulated crash'):
+                    runtime.run_process_once(pid)
+
+                pending = runtime.store.get_llm_pending_action(pid)
+                assert pending['status'] == 'resuming'
+                assert runtime.store.get_process_message(message.message_id).status.value == 'acked'
+                assert runtime.process.get(pid).status == ProcessStatus.FAILED
+                assert any(
+                    record.action == 'llm.pending_action_resume_interrupted'
+                    and record.target == f'process:{pid}'
+                    for record in runtime.audit.trace()
+                )
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db)
+            try:
+                assert reopened.process.get(pid).status == ProcessStatus.FAILED
+                assert reopened.store.get_llm_pending_action(pid)['status'] == 'resuming'
+                assert pid not in reopened.llm._pending_message_actions
+            finally:
+                reopened.close()
 
     def test_openai_responses_state_chain_resets_after_context_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1606,6 +2122,29 @@ def _responses_tool_call(response_id: str, name: str, arguments: dict[str, Any])
                 name=name,
                 arguments=json.dumps(arguments),
             )
+        ],
+    )
+
+
+def _responses_parallel_tool_calls(
+    response_id: str,
+    calls: list[tuple[str, dict[str, Any]]],
+) -> Any:
+    return SimpleNamespace(
+        id=response_id,
+        _request_id=f'req_{response_id}',
+        model='gpt-test',
+        usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+        output_text='',
+        output=[
+            SimpleNamespace(
+                type='function_call',
+                id=f'fc_{response_id}_{index}',
+                call_id=f'call_{response_id}_{index}',
+                name=name,
+                arguments=json.dumps(arguments),
+            )
+            for index, (name, arguments) in enumerate(calls, start=1)
         ],
     )
 

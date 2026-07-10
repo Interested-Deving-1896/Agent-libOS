@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import fields
-import math
 from typing import Any
 
 from agent_libos.models import AgentProcess, EventPriority, EventType, ProcessStatus, ResourceBudget, ResourceReservation, ResourceUsage
@@ -91,12 +90,15 @@ class ResourceManager:
         delta = self._coerce_usage(usage)
         if self._is_zero(delta):
             return
-        with self.store.locked():
+        exceeded_after_charge: tuple[AgentProcess, dict[str, Any]] | None = None
+        # A hierarchical charge is one accounting mutation.  In particular,
+        # never leave the child charged when an ancestor update, reservation
+        # consume, event, or audit write fails part-way through the chain.
+        with self.store.transaction():
             chain = self._process_chain(pid)
             relevant_fields = self._nonzero_fields(delta)
             if not allow_overage:
                 self._preflight_locked(pid, delta, source=source, context=context)
-            exceeded_after_charge: tuple[AgentProcess, dict[str, Any]] | None = None
             for index, process in enumerate(chain):
                 latest = self._get(process.pid)
                 latest.resource_usage = self._merge_usage(latest.resource_usage, delta)
@@ -127,13 +129,15 @@ class ResourceManager:
                     "context": context or {},
                 },
             )
-            if exceeded_after_charge is None:
-                return
-            owner, exceeded = exceeded_after_charge
-            message = self._limit_message(owner.pid, exceeded)
-            if kill_on_exceed:
-                self.kill_if_exceeded(owner.pid, reason=message, owner_pid=owner.pid, limit=exceeded)
-            raise ResourceLimitExceeded(message)
+        if exceeded_after_charge is None:
+            return
+        owner, exceeded = exceeded_after_charge
+        message = self._limit_message(owner.pid, exceeded)
+        # Terminal hooks acquire Human/Object Memory locks.  Invoke the kill
+        # path only after releasing the accounting transaction's store lock.
+        if kill_on_exceed:
+            self.kill_if_exceeded(owner.pid, reason=message, owner_pid=owner.pid, limit=exceeded)
+        raise ResourceLimitExceeded(message)
 
     def kill_if_exceeded(
         self,
@@ -143,8 +147,13 @@ class ResourceManager:
         owner_pid: str | None = None,
         limit: dict[str, Any] | None = None,
     ) -> None:
-        with self.store.locked():
-            killed: list[str] = []
+        killed: list[str] = []
+        # Persist the complete descendant state transition, reservation
+        # release, and corresponding evidence atomically.  Cross-subsystem
+        # terminal hooks run only after this transaction releases the store
+        # lock, avoiding a store -> terminal-lock / terminal-lock -> store
+        # inversion with HumanRequestManager.
+        with self.store.transaction():
             for process in self._descendant_tree(pid):
                 if process.status in _TERMINAL_STATUSES:
                     continue
@@ -154,11 +163,6 @@ class ResourceManager:
                 self.store.update_process(process)
                 self.store.delete_resource_reservations_for_process(process.pid)
                 killed.append(process.pid)
-            for killed_pid in killed:
-                self._wake_parent_waiting_on_child(killed_pid)
-                self._notify_object_task_process_terminal(killed_pid)
-            if killed and self._process_kill_finalizer is not None:
-                self._process_kill_finalizer(killed, reason=reason)
             self.events.emit(
                 EventType.RESOURCE_LIMIT_EXCEEDED,
                 source="resource_manager",
@@ -172,28 +176,63 @@ class ResourceManager:
                 target=f"process:{pid}",
                 decision={"reason": reason, "owner_pid": owner_pid or pid, "killed_pids": killed, "limit": limit or {}},
             )
+        finalizer_errors: list[dict[str, str]] = []
+        for killed_pid in killed:
+            try:
+                self._wake_parent_waiting_on_child(killed_pid)
+            except Exception as exc:
+                finalizer_errors.append(
+                    {"phase": "wake_parent", "pid": killed_pid, "error": f"{type(exc).__name__}: {exc}"}
+                )
+            try:
+                self._notify_object_task_process_terminal(killed_pid)
+            except Exception as exc:
+                finalizer_errors.append(
+                    {"phase": "terminal_notify", "pid": killed_pid, "error": f"{type(exc).__name__}: {exc}"}
+                )
+        if killed and self._process_kill_finalizer is not None:
+            try:
+                self._process_kill_finalizer(killed, reason=reason)
+            except Exception as exc:
+                finalizer_errors.append(
+                    {"phase": "process_finalize", "pid": pid, "error": f"{type(exc).__name__}: {exc}"}
+                )
+        if finalizer_errors:
+            try:
+                self.audit.record(
+                    actor="resource_manager",
+                    action="resource.limit_finalize_failed",
+                    target=f"process:{pid}",
+                    decision={"reason": reason, "errors": finalizer_errors},
+                )
+            except Exception:
+                # The terminal state is already committed.  Do not replace the
+                # caller's ResourceLimitExceeded with a secondary warning-sink
+                # failure or skip the remaining cleanup callbacks.
+                pass
 
     def _wake_parent_waiting_on_child(self, child_pid: str) -> None:
-        child = self.store.get_process(child_pid)
-        if child is None or child.parent_pid is None:
-            return
-        parent = self.store.get_process(child.parent_pid)
-        if parent is None:
-            return
-        if parent.status != ProcessStatus.WAITING_EVENT:
-            return
-        if parent.status_message != f"waiting for {child.pid}":
-            return
-        parent.status = ProcessStatus.RUNNABLE
-        parent.status_message = None
-        parent.updated_at = utc_now()
-        self.store.update_process(parent)
-        self.audit.record(
-            actor="resource_manager",
-            action="process.wait_wake",
-            target=f"process:{parent.pid}",
-            decision={"child": child.pid, "child_status": child.status.value},
-        )
+        with self.store.transaction():
+            child = self.store.get_process(child_pid)
+            if child is None or child.parent_pid is None:
+                return
+            parent = self.store.get_process(child.parent_pid)
+            if parent is None:
+                return
+            if parent.status != ProcessStatus.WAITING_EVENT:
+                return
+            if parent.status_message != f"waiting for {child.pid}":
+                return
+            parent.status = ProcessStatus.RUNNABLE
+            parent.status_message = None
+            parent.updated_at = utc_now()
+            self.store.update_process(parent)
+            self.audit.record(
+                actor="resource_manager",
+                action="process.wait_wake",
+                target=f"process:{parent.pid}",
+                decision={"child": child.pid, "child_status": child.status.value},
+            )
 
     def _notify_object_task_process_terminal(self, pid: str) -> None:
         if self._object_task_terminal_notifier is None:
@@ -590,14 +629,10 @@ class ResourceManager:
         return {name for name in _USAGE_FIELD_NAMES if getattr(usage, name) != 0}
 
     def _validate_usage(self, usage: ResourceUsage) -> None:
-        for name in _USAGE_FIELD_NAMES:
-            value = getattr(usage, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValidationError(f"resource usage {name} must be numeric")
-            if not math.isfinite(float(value)):
-                raise ValidationError(f"resource usage {name} must be finite")
-            if value < 0:
-                raise ValidationError(f"resource usage {name} cannot be negative")
+        try:
+            usage.validate()
+        except ValueError as exc:
+            raise ValidationError(f"resource usage {exc}") from exc
 
     def _limit_message(self, pid: str, exceeded: dict[str, Any]) -> str:
         if exceeded["budget"] == "max_child_processes":

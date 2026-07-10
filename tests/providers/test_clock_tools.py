@@ -4,7 +4,7 @@ import pytest
 import time
 from datetime import datetime
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
+from agent_libos.models import CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.substrate import ProviderEffectNotStarted
 
@@ -27,6 +27,31 @@ class TestClockTool:
         assert 'primitive.clock.now' in self._audit_actions()
         assert any((event.target == 'clock:now' and event.payload.get('operation') == 'now' for event in self.runtime.events.list()))
 
+    def test_clock_post_provider_event_failure_leaves_durable_unknown_effect_intent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='durable clock effect intent')
+        self.runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
+        provider = RecordingClockProvider()
+        self.runtime.clock.provider = provider
+        original_emit = self.runtime.events.emit
+
+        def fail_now_event(event_type: EventType | str, *args: object, **kwargs: object) -> object:
+            if EventType(event_type) == EventType.EXTERNAL_READ and kwargs.get('target') == 'clock:now':
+                raise RuntimeError('injected clock result event failure')
+            return original_emit(event_type, *args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.events, 'emit', fail_now_event)
+        with pytest.raises(RuntimeError, match='injected clock result event failure'):
+            self.runtime.clock.now(pid, tz='UTC')
+
+        assert provider.now_calls == 1
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effects[0].provider_metadata['effect_state'] == 'pending'
+
     def test_current_time_tool_supports_iana_timezone(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='check shanghai time')
         self.runtime.capability.grant(pid, 'clock:*', [CapabilityRight.READ], issued_by='test')
@@ -47,6 +72,10 @@ class TestClockTool:
         assert elapsed >= 0.015
         assert 'primitive.clock.sleep' in self._audit_actions()
         assert any((event.target == 'clock:sleep' and event.payload.get('operation') == 'sleep' for event in self.runtime.events.list()))
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].operation == 'sleep'
+        assert effects[0].information_flow
 
     def test_sleep_tool_rejects_unbounded_duration(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='sleep too long')
@@ -152,6 +181,118 @@ class TestClockTool:
         assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
         assert effects[0].provider_metadata['outcome'] == 'unknown_after_provider_exception'
 
+    def test_clock_async_cancellation_commits_reservation_and_records_unknown_effect(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='cancel async sleep')
+        cap = self.runtime.capability.grant_once(pid, 'clock:sleep', [CapabilityRight.READ], issued_by='test')
+        provider = BlockingAsyncClockProvider()
+        self.runtime.clock.provider = provider
+
+        async def cancel_after_provider_starts() -> None:
+            task = asyncio.create_task(self.runtime.clock.asleep(pid, 10.0))
+            await provider.started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancel_after_provider_starts())
+
+        consumed = self.runtime.store.get_capability(cap.cap_id)
+        assert consumed is not None
+        assert consumed.uses_remaining == 0
+        reservations = self.runtime.store.select_table_rows(
+            'capability_use_reservations',
+            'cap_id = ?',
+            [cap.cap_id],
+        )
+        assert reservations[0]['status'] == 'committed'
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].operation == 'sleep'
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+
+    @pytest.mark.parametrize('async_mode', [False, True])
+    def test_post_sleep_measurement_not_started_keeps_unknown_sleep_effect(
+        self,
+        async_mode: bool,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='post sleep measurement failure')
+        cap = self.runtime.capability.grant_once(pid, 'clock:sleep', [CapabilityRight.READ], issued_by='test')
+        provider = PostSleepMeasurementFailureClockProvider()
+        self.runtime.clock.provider = provider
+
+        with pytest.raises(ProviderEffectNotStarted, match='measurement did not start'):
+            if async_mode:
+                asyncio.run(self.runtime.clock.asleep(pid, 0.0))
+            else:
+                self.runtime.clock.sleep(pid, 0.0)
+
+        consumed = self.runtime.store.get_capability(cap.cap_id)
+        assert consumed is not None and consumed.uses_remaining == 0
+        assert provider.sleep_calls + provider.asleep_calls == [0.0]
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].operation == 'sleep'
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effects[0].provider_metadata['effect_state'] == 'finalized'
+
+    @pytest.mark.parametrize('async_mode', [False, True])
+    @pytest.mark.parametrize('certified_not_started', [False, True])
+    def test_initial_sleep_measurement_failure_has_durable_boundary_semantics(
+        self,
+        async_mode: bool,
+        certified_not_started: bool,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='initial sleep measurement failure')
+        cap = self.runtime.capability.grant_once(pid, 'clock:sleep', [CapabilityRight.READ], issued_by='test')
+        provider = InitialMeasurementFailureClockProvider(certified_not_started=certified_not_started)
+        self.runtime.clock.provider = provider
+        expected_error = ProviderEffectNotStarted if certified_not_started else RuntimeError
+
+        with pytest.raises(expected_error, match='initial measurement'):
+            if async_mode:
+                asyncio.run(self.runtime.clock.asleep(pid, 0.0))
+            else:
+                self.runtime.clock.sleep(pid, 0.0)
+
+        capability = self.runtime.store.get_capability(cap.cap_id)
+        assert capability is not None
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        if certified_not_started:
+            assert capability.uses_remaining == 1
+            assert effects == []
+        else:
+            assert capability.uses_remaining == 0
+            assert len(effects) == 1
+            assert effects[0].effect_state == 'finalized'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            assert effects[0].information_flow
+        assert provider.sleep_calls == []
+        assert provider.asleep_calls == []
+
+    @pytest.mark.parametrize('async_mode', [False, True])
+    def test_sleep_provider_not_started_after_initial_measurement_keeps_effect(
+        self,
+        async_mode: bool,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='sleep provider not started')
+        cap = self.runtime.capability.grant_once(pid, 'clock:sleep', [CapabilityRight.READ], issued_by='test')
+        provider = SleepNotStartedClockProvider()
+        self.runtime.clock.provider = provider
+
+        with pytest.raises(ProviderEffectNotStarted, match='sleep body did not start'):
+            if async_mode:
+                asyncio.run(self.runtime.clock.asleep(pid, 0.0))
+            else:
+                self.runtime.clock.sleep(pid, 0.0)
+
+        capability = self.runtime.store.get_capability(cap.cap_id)
+        assert capability is not None and capability.uses_remaining == 0
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effects[0].information_flow
+
     def test_clock_post_effect_classifier_failure_records_conservative_effect(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='clock classifier failure')
         self.runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
@@ -218,3 +359,44 @@ class RecordingClockProvider:
             information_flow=True,
             metadata={'operation': operation},
         )
+
+
+class PostSleepMeasurementFailureClockProvider(RecordingClockProvider):
+    def monotonic(self) -> float:
+        self.monotonic_calls += 1
+        if self.monotonic_calls == 2:
+            raise ProviderEffectNotStarted('post-sleep measurement did not start')
+        return float(self.monotonic_calls)
+
+
+class InitialMeasurementFailureClockProvider(RecordingClockProvider):
+    def __init__(self, *, certified_not_started: bool) -> None:
+        super().__init__()
+        self.certified_not_started = certified_not_started
+
+    def monotonic(self) -> float:
+        self.monotonic_calls += 1
+        if self.certified_not_started:
+            raise ProviderEffectNotStarted('initial measurement did not start')
+        raise RuntimeError('initial measurement failed ambiguously')
+
+
+class SleepNotStartedClockProvider(RecordingClockProvider):
+    def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        raise ProviderEffectNotStarted('sleep body did not start')
+
+    async def asleep(self, seconds: float) -> None:
+        self.asleep_calls.append(seconds)
+        raise ProviderEffectNotStarted('sleep body did not start')
+
+
+class BlockingAsyncClockProvider(RecordingClockProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def asleep(self, seconds: float) -> None:
+        self.asleep_calls.append(seconds)
+        self.started.set()
+        await asyncio.Future()

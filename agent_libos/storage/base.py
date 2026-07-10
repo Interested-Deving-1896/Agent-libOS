@@ -64,7 +64,14 @@ class RuntimeStore(Protocol):
     def insert_object(self, obj: Any) -> None:
         ...
 
-    def update_object(self, obj: Any) -> None:
+    def update_object(
+        self,
+        obj: Any,
+        *,
+        expected_version: int | None = None,
+        expected_owner_kind: Any | None = None,
+        expected_owner_id: str | None = None,
+    ) -> bool:
         ...
 
     def get_object(self, oid: str) -> Any | None:
@@ -88,7 +95,14 @@ class RuntimeStore(Protocol):
     def list_object_oids_owned_by(self, owner_kind: Any, owner_id: str) -> list[str]:
         ...
 
-    def delete_object(self, oid: str) -> None:
+    def delete_object(
+        self,
+        oid: str,
+        *,
+        expected_version: int | None = None,
+        expected_owner_kind: Any | None = None,
+        expected_owner_id: str | None = None,
+    ) -> bool:
         ...
 
     def insert_namespace(self, namespace: Any) -> None:
@@ -206,6 +220,12 @@ class RuntimeStore(Protocol):
     def insert_external_effect(self, record: Any) -> None:
         ...
 
+    def finalize_external_effect(self, intent_effect_id: str, record: Any) -> bool:
+        ...
+
+    def abandon_external_effect_intent(self, effect_id: str) -> bool:
+        ...
+
     def list_external_effects(self, **filters: Any) -> list[Any]:
         ...
 
@@ -227,6 +247,29 @@ class RuntimeStore(Protocol):
     def list_llm_calls(self, pid: str | None = None, limit: int | None = None) -> list[Any]:
         ...
 
+    def get_latest_llm_call(self, *, pid: str, purpose: str | None = None) -> Any | None:
+        ...
+
+    def upsert_llm_tool_output(
+        self,
+        *,
+        pid: str,
+        response_id: str,
+        call_id: str,
+        tool_name: str | None,
+        output: str,
+    ) -> None:
+        ...
+
+    def list_llm_tool_outputs(self, *, pid: str, response_id: str) -> list[dict[str, Any]]:
+        ...
+
+    def get_llm_context_generation(self, pid: str) -> str:
+        ...
+
+    def set_llm_context_generation(self, pid: str, generation: str) -> None:
+        ...
+
     def upsert_llm_pending_action(self, pid: str, pending: dict[str, Any]) -> None:
         ...
 
@@ -236,7 +279,10 @@ class RuntimeStore(Protocol):
     def list_llm_pending_actions(self, *, status: str | None = "pending") -> list[dict[str, Any]]:
         ...
 
-    def complete_llm_pending_action(self, pid: str) -> None:
+    def claim_llm_pending_action(self, pid: str, *, resume_token: str) -> dict[str, Any] | None:
+        ...
+
+    def complete_llm_pending_action(self, pid: str, *, resume_token: str) -> bool:
         ...
 
     def insert_process_message(self, message: Any) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
+import stat
 import threading
 from contextlib import contextmanager
 from copy import deepcopy
@@ -10,7 +12,7 @@ from typing import Any, Iterable
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.utils.ids import utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -120,6 +122,8 @@ class SQLRuntimeStore:
             "checkpoints",
             "human_requests",
             "llm_calls",
+            "llm_context_generations",
+            "llm_tool_outputs",
             "llm_pending_actions",
             "process_messages",
             "object_tasks",
@@ -146,15 +150,75 @@ class SQLRuntimeStore:
         # present in this process.
         self._object_payloads: dict[str, Any] = {}
         self._transaction_depth = 0
+        self._poisoned_reason: str | None = None
         self.initialize()
 
     @contextmanager
     def locked(self):
         with self._lock:
+            self._ensure_healthy()
             yield
 
     def close(self) -> None:
         self.conn.close()
+
+    def _ensure_healthy(self) -> None:
+        if self._poisoned_reason is not None:
+            raise ValidationError(
+                "runtime store is unusable after transaction rollback failure: "
+                f"{self._poisoned_reason}"
+            )
+
+    def _poison(self, reason: str) -> None:
+        if self._poisoned_reason is None:
+            self._poisoned_reason = reason
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def _rollback_scope(
+        self,
+        *,
+        depth: int,
+        savepoint: str,
+        payloads: dict[str, Any] | None,
+        operation: str,
+    ) -> None:
+        rollback_error: BaseException | None = None
+        try:
+            if depth == 0:
+                self.conn.rollback()
+            else:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except BaseException as exc:
+            rollback_error = exc
+        finally:
+            if payloads is not None:
+                self._object_payloads = payloads
+
+        if rollback_error is None:
+            return
+        reason = f"{operation}; rollback failed: {rollback_error}"
+        self._poison(reason)
+        raise ValidationError(
+            f"runtime store is unusable after transaction rollback failure: {reason}"
+        ) from rollback_error
+
+    def _commit_if_outermost(self) -> None:
+        if self._transaction_depth != 0:
+            return
+        try:
+            self.conn.commit()
+        except BaseException:
+            self._rollback_scope(
+                depth=0,
+                savepoint="",
+                payloads=None,
+                operation="autocommit failed",
+            )
+            raise
 
     def initialize(self) -> None:
         with self._lock:
@@ -318,7 +382,8 @@ class SQLRuntimeStore:
                   state_mutation INTEGER NOT NULL,
                   information_flow INTEGER NOT NULL,
                   provider_metadata_json TEXT NOT NULL,
-                  created_at TEXT NOT NULL
+                  created_at TEXT NOT NULL,
+                  effect_state TEXT NOT NULL DEFAULT 'finalized'
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_external_effects_created
@@ -394,15 +459,39 @@ class SQLRuntimeStore:
 
                 CREATE TABLE IF NOT EXISTS llm_pending_actions (
                   pid TEXT PRIMARY KEY,
+                  resume_token TEXT,
                   wait_type TEXT NOT NULL,
                   request_id TEXT,
                   child_pid TEXT,
+                  response_id TEXT,
+                  tool_call_id TEXT,
+                  tool_name TEXT,
                   filters_json TEXT NOT NULL,
                   action_json TEXT NOT NULL,
                   content_preview TEXT NOT NULL,
                   tool_call_count INTEGER NOT NULL,
                   status TEXT NOT NULL,
                   created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS llm_tool_outputs (
+                  pid TEXT NOT NULL,
+                  response_id TEXT NOT NULL,
+                  call_id TEXT NOT NULL,
+                  tool_name TEXT,
+                  output_text TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY(pid, response_id, call_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_llm_tool_outputs_response
+                  ON llm_tool_outputs(pid, response_id);
+
+                CREATE TABLE IF NOT EXISTS llm_context_generations (
+                  pid TEXT PRIMARY KEY,
+                  generation TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
 
@@ -599,13 +688,14 @@ class SQLRuntimeStore:
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> Any:
         with self._lock:
+            self._ensure_healthy()
             cur = self.conn.execute(sql, tuple(params))
-            if self._transaction_depth == 0:
-                self.conn.commit()
+            self._commit_if_outermost()
             return cur
 
     def _query(self, sql: str, params: Iterable[Any] = ()) -> list[Any]:
         with self._lock:
+            self._ensure_healthy()
             return list(self.conn.execute(sql, tuple(params)))
 
     @contextmanager
@@ -620,6 +710,7 @@ class SQLRuntimeStore:
         """
 
         with self._lock:
+            self._ensure_healthy()
             payloads = deepcopy(self._object_payloads) if include_object_payloads else None
             depth = self._transaction_depth
             savepoint = f"agent_libos_sp_{depth}"
@@ -630,20 +721,28 @@ class SQLRuntimeStore:
             self._transaction_depth += 1
             try:
                 yield self.conn.cursor()
-            except Exception:
-                if depth == 0:
-                    self.conn.rollback()
-                else:
-                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                    self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                if payloads is not None:
-                    self._object_payloads = payloads
+            except BaseException:
+                self._rollback_scope(
+                    depth=depth,
+                    savepoint=savepoint,
+                    payloads=payloads,
+                    operation="transaction body failed",
+                )
                 raise
             else:
-                if depth == 0:
-                    self.conn.commit()
-                else:
-                    self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                try:
+                    if depth == 0:
+                        self.conn.commit()
+                    else:
+                        self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except BaseException:
+                    self._rollback_scope(
+                        depth=depth,
+                        savepoint=savepoint,
+                        payloads=payloads,
+                        operation="transaction commit failed" if depth == 0 else "savepoint release failed",
+                    )
+                    raise
             finally:
                 self._transaction_depth -= 1
 
@@ -653,6 +752,7 @@ class SQLRuntimeStore:
         return table
 
     def validate_column_identifier(self, table: str, column: str) -> str:
+        self._ensure_healthy()
         self.validate_table_identifier(table)
         if not column or not column.replace("_", "").isalnum() or not column[0].isalpha():
             raise ValidationError(f"unsupported runtime store column: {table}.{column}")
@@ -693,18 +793,35 @@ class SQLRuntimeStore:
                 ),
             )
 
-    def update_object(self, obj: AgentObject) -> None:
+    def update_object(
+        self,
+        obj: AgentObject,
+        *,
+        expected_version: int | None = None,
+        expected_owner_kind: ObjectOwnerKind | str | None = None,
+        expected_owner_id: str | None = None,
+    ) -> bool:
         with self.transaction(include_object_payloads=True) as cur:
-            self._object_payloads[obj.oid] = deepcopy(obj.payload)
-            cur.execute(
+            where = ["oid = ?", "lifecycle_state = ?"]
+            where_params: list[Any] = [obj.oid, ObjectLifecycleState.LIVE.value]
+            if expected_version is not None:
+                where.append("version = ?")
+                where_params.append(expected_version)
+            if expected_owner_kind is not None:
+                where.append("owner_kind = ?")
+                where_params.append(str(expected_owner_kind))
+            if expected_owner_id is not None:
+                where.append("owner_id = ?")
+                where_params.append(expected_owner_id)
+            updated = cur.execute(
                 """
                 UPDATE objects
                    SET namespace = ?, name = ?, type = ?, schema_version = ?, payload_json = ?, metadata_json = ?,
                        provenance_json = ?, version = ?, immutable = ?, created_by = ?,
                        owner_kind = ?, owner_id = ?, lifecycle_state = ?, deleted_at = ?,
                        created_at = ?, updated_at = ?
-                 WHERE oid = ?
-                """,
+                 WHERE """
+                + " AND ".join(where),
                 (
                     obj.namespace,
                     obj.name,
@@ -722,9 +839,13 @@ class SQLRuntimeStore:
                     obj.deleted_at,
                     obj.created_at,
                     obj.updated_at,
-                    obj.oid,
+                    *where_params,
                 ),
             )
+            if updated.rowcount != 1:
+                return False
+            self._object_payloads[obj.oid] = deepcopy(obj.payload)
+            return True
 
     def get_object(self, oid: str) -> AgentObject | None:
         rows = self._query(
@@ -827,25 +948,46 @@ class SQLRuntimeStore:
             if self.has_object_payload(str(row["oid"]), row=row)
         ]
 
-    def delete_object(self, oid: str) -> None:
+    def delete_object(
+        self,
+        oid: str,
+        *,
+        expected_version: int | None = None,
+        expected_owner_kind: ObjectOwnerKind | str | None = None,
+        expected_owner_id: str | None = None,
+    ) -> bool:
         now = utc_now()
         with self.transaction(include_object_payloads=True) as cur:
-            self._object_payloads.pop(oid, None)
-            cur.execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
-            cur.execute(
+            where = ["oid = ?", "lifecycle_state = ?"]
+            where_params: list[Any] = [oid, ObjectLifecycleState.LIVE.value]
+            if expected_version is not None:
+                where.append("version = ?")
+                where_params.append(expected_version)
+            if expected_owner_kind is not None:
+                where.append("owner_kind = ?")
+                where_params.append(str(expected_owner_kind))
+            if expected_owner_id is not None:
+                where.append("owner_id = ?")
+                where_params.append(expected_owner_id)
+            released = cur.execute(
                 """
                 UPDATE objects
                    SET payload_json = ?, lifecycle_state = ?, deleted_at = ?, updated_at = ?
-                 WHERE oid = ?
-                """,
+                 WHERE """
+                + " AND ".join(where),
                 (
                     dumps(self.payload_marker(present=False)),
                     ObjectLifecycleState.RELEASED.value,
                     now,
                     now,
-                    oid,
+                    *where_params,
                 ),
             )
+            if released.rowcount != 1:
+                return False
+            self._object_payloads.pop(oid, None)
+            cur.execute("DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?", (oid, oid))
+            return True
 
     def insert_namespace(self, namespace: ObjectNamespace) -> None:
         self._execute(
@@ -983,6 +1125,7 @@ class SQLRuntimeStore:
     def claim_runnable_process(self, pid: str) -> AgentProcess | None:
         now = utc_now()
         with self._lock:
+            self._ensure_healthy()
             cur = self.conn.execute(
                 """
                 UPDATE processes
@@ -991,7 +1134,7 @@ class SQLRuntimeStore:
                 """,
                 (ProcessStatus.RUNNING.value, now, pid, ProcessStatus.RUNNABLE.value),
             )
-            self.conn.commit()
+            self._commit_if_outermost()
             if cur.rowcount != 1:
                 return None
             rows = list(self.conn.execute("SELECT * FROM processes WHERE pid = ?", (pid,)))
@@ -1091,6 +1234,7 @@ class SQLRuntimeStore:
         return {"storage": "runtime_memory", "present": present}
 
     def object_payload(self, oid: str) -> Any:
+        self._ensure_healthy()
         if oid in self._object_payloads:
             return deepcopy(self._object_payloads[oid])
         rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
@@ -1103,16 +1247,20 @@ class SQLRuntimeStore:
         return deepcopy(payload)
 
     def set_object_payload(self, oid: str, payload: Any) -> None:
-        self._object_payloads[oid] = deepcopy(payload)
-        self._execute(
-            "UPDATE objects SET payload_json = ? WHERE oid = ?",
-            (dumps(self.payload_marker(present=True)), oid),
-        )
+        self._ensure_healthy()
+        with self.transaction(include_object_payloads=True) as cur:
+            self._object_payloads[oid] = deepcopy(payload)
+            cur.execute(
+                "UPDATE objects SET payload_json = ? WHERE oid = ?",
+                (dumps(self.payload_marker(present=True)), oid),
+            )
 
     def forget_object_payload(self, oid: str) -> None:
+        self._ensure_healthy()
         self._object_payloads.pop(oid, None)
 
     def has_object_payload(self, oid: str, *, row: Any | None = None) -> bool:
+        self._ensure_healthy()
         if oid in self._object_payloads:
             return True
         selected_row = row
@@ -1197,6 +1345,7 @@ class SQLRuntimeStore:
         if count < 1:
             raise ValueError("count must be >= 1")
         with self._lock:
+            self._ensure_healthy()
             cur = self.conn.execute(
                 """
                 UPDATE capabilities
@@ -1219,7 +1368,7 @@ class SQLRuntimeStore:
                     count,
                 ),
             )
-            self.conn.commit()
+            self._commit_if_outermost()
             if cur.rowcount != 1:
                 return None
             rows = list(self.conn.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
@@ -1275,6 +1424,7 @@ class SQLRuntimeStore:
 
     def commit_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> bool:
         with self._lock:
+            self._ensure_healthy()
             cur = self.conn.execute(
                 """
                 UPDATE capability_use_reservations
@@ -1283,8 +1433,7 @@ class SQLRuntimeStore:
                 """,
                 ("committed", updated_at, reservation_id, "reserved"),
             )
-            if self._transaction_depth == 0:
-                self.conn.commit()
+            self._commit_if_outermost()
             return cur.rowcount == 1
 
     def restore_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> Capability | None:
@@ -1464,8 +1613,8 @@ class SQLRuntimeStore:
             INSERT INTO external_effects (
                 effect_id, record_id, event_id, pid, provider, operation, target,
                 rollback_class, rollback_status, state_mutation, information_flow,
-                provider_metadata_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_metadata_json, created_at, effect_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.effect_id,
@@ -1481,8 +1630,72 @@ class SQLRuntimeStore:
                 int(record.information_flow),
                 dumps(record.provider_metadata),
                 record.created_at,
+                record.effect_state,
             ),
         )
+
+    def finalize_external_effect(self, intent_effect_id: str, record: ExternalEffectRecord) -> bool:
+        if record.effect_id != intent_effect_id:
+            raise ValidationError("external effect finalization record id must match intent id")
+        if record.effect_state != "finalized":
+            raise ValidationError("external effect finalization record must be finalized")
+        cursor = self._execute(
+            """
+            UPDATE external_effects
+               SET record_id = ?, event_id = ?, rollback_class = ?, rollback_status = ?,
+                   state_mutation = ?, information_flow = ?, provider_metadata_json = ?, created_at = ?,
+                   effect_state = ?
+             WHERE effect_id = ?
+               AND pid = ?
+               AND provider = ?
+               AND operation = ?
+               AND ((target IS NULL AND ? IS NULL) OR target = ?)
+               AND record_id IS NULL
+               AND event_id IS NULL
+               AND rollback_class = ?
+               AND rollback_status = ?
+               AND effect_state = 'pending'
+            """,
+            (
+                record.record_id,
+                record.event_id,
+                record.rollback_class.value,
+                record.rollback_status.value,
+                int(record.state_mutation),
+                int(record.information_flow),
+                dumps(record.provider_metadata),
+                record.created_at,
+                record.effect_state,
+                intent_effect_id,
+                record.pid,
+                record.provider,
+                record.operation,
+                record.target,
+                record.target,
+                ExternalEffectRollbackClass.UNKNOWN.value,
+                ExternalEffectRollbackStatus.UNKNOWN.value,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def abandon_external_effect_intent(self, effect_id: str) -> bool:
+        cursor = self._execute(
+            """
+            DELETE FROM external_effects
+             WHERE effect_id = ?
+               AND record_id IS NULL
+               AND event_id IS NULL
+               AND rollback_class = ?
+               AND rollback_status = ?
+               AND effect_state = 'pending'
+            """,
+            (
+                effect_id,
+                ExternalEffectRollbackClass.UNKNOWN.value,
+                ExternalEffectRollbackStatus.UNKNOWN.value,
+            ),
+        )
+        return cursor.rowcount == 1
 
     def list_external_effects(
         self,
@@ -1629,19 +1842,103 @@ class SQLRuntimeStore:
         params.append(selected_limit)
         return [self._row_to_llm_call(row) for row in self._query(sql, params)]
 
+    def get_latest_llm_call(self, *, pid: str, purpose: str | None = None) -> LLMCallRecord | None:
+        params: list[Any] = [pid]
+        sql = "SELECT * FROM llm_calls WHERE pid = ?"
+        if purpose is not None:
+            sql += " AND purpose = ?"
+            params.append(purpose)
+        sql += " ORDER BY created_at DESC, call_id DESC LIMIT 1"
+        rows = self._query(sql, params)
+        return self._row_to_llm_call(rows[0]) if rows else None
+
+    def upsert_llm_tool_output(
+        self,
+        *,
+        pid: str,
+        response_id: str,
+        call_id: str,
+        tool_name: str | None,
+        output: str,
+    ) -> None:
+        now = utc_now()
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO llm_tool_outputs (
+                    pid, response_id, call_id, tool_name, output_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pid, response_id, call_id) DO NOTHING
+                """,
+                (pid, response_id, call_id, tool_name, output, now, now),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT tool_name, output_text
+                  FROM llm_tool_outputs
+                 WHERE pid = ? AND response_id = ? AND call_id = ?
+                """,
+                (pid, response_id, call_id),
+            )
+            existing = cursor.fetchone()
+            if existing is None or existing["tool_name"] != tool_name or existing["output_text"] != output:
+                raise ValidationError(
+                    "conflicting durable LLM tool output for "
+                    f"pid={pid} response_id={response_id} call_id={call_id}"
+                )
+
+    def list_llm_tool_outputs(self, *, pid: str, response_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT pid, response_id, call_id, tool_name, output_text, created_at, updated_at
+              FROM llm_tool_outputs
+             WHERE pid = ? AND response_id = ?
+             ORDER BY created_at, call_id
+            """,
+            (pid, response_id),
+        )
+        return [dict(row) for row in rows]
+
+    def get_llm_context_generation(self, pid: str) -> str:
+        rows = self._query(
+            "SELECT generation FROM llm_context_generations WHERE pid = ?",
+            (pid,),
+        )
+        return str(rows[0]["generation"]) if rows else "initial"
+
+    def set_llm_context_generation(self, pid: str, generation: str) -> None:
+        self._execute(
+            """
+            INSERT INTO llm_context_generations (pid, generation, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(pid) DO UPDATE SET
+                generation = excluded.generation,
+                updated_at = excluded.updated_at
+            """,
+            (pid, generation, utc_now()),
+        )
+
     def upsert_llm_pending_action(self, pid: str, pending: dict[str, Any]) -> None:
         now = utc_now()
         created_at = str(pending.get("created_at") or now)
+        resume_token = str(pending.get("resume_token") or new_id("llmwait"))
         self._execute(
             """
             INSERT INTO llm_pending_actions (
-                pid, wait_type, request_id, child_pid, filters_json, action_json,
+                pid, resume_token, wait_type, request_id, child_pid, response_id, tool_call_id, tool_name,
+                filters_json, action_json,
                 content_preview, tool_call_count, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pid) DO UPDATE SET
+                resume_token = excluded.resume_token,
                 wait_type = excluded.wait_type,
                 request_id = excluded.request_id,
                 child_pid = excluded.child_pid,
+                response_id = excluded.response_id,
+                tool_call_id = excluded.tool_call_id,
+                tool_name = excluded.tool_name,
                 filters_json = excluded.filters_json,
                 action_json = excluded.action_json,
                 content_preview = excluded.content_preview,
@@ -1651,9 +1948,13 @@ class SQLRuntimeStore:
             """,
             (
                 pid,
+                resume_token,
                 str(pending["wait_type"]),
                 pending.get("request_id"),
                 pending.get("child_pid"),
+                pending.get("response_id"),
+                pending.get("tool_call_id"),
+                pending.get("tool_name"),
                 dumps(pending.get("filters") or {}),
                 dumps(pending.get("action") or {}),
                 str(pending.get("content_preview") or ""),
@@ -1675,11 +1976,33 @@ class SQLRuntimeStore:
             rows = self._query("SELECT * FROM llm_pending_actions WHERE status = ? ORDER BY updated_at, pid", (status,))
         return [self._row_to_llm_pending_action(row) for row in rows]
 
-    def complete_llm_pending_action(self, pid: str) -> None:
-        self._execute(
-            "UPDATE llm_pending_actions SET status = ?, updated_at = ? WHERE pid = ?",
-            ("completed", utc_now(), pid),
+    def claim_llm_pending_action(self, pid: str, *, resume_token: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._ensure_healthy()
+            cursor = self.conn.execute(
+                """
+                UPDATE llm_pending_actions
+                   SET status = ?, updated_at = ?
+                 WHERE pid = ? AND status = ? AND resume_token = ?
+                """,
+                ("resuming", utc_now(), pid, "pending", resume_token),
+            )
+            self._commit_if_outermost()
+            if cursor.rowcount != 1:
+                return None
+            row = self.conn.execute("SELECT * FROM llm_pending_actions WHERE pid = ?", (pid,)).fetchone()
+            return self._row_to_llm_pending_action(row) if row is not None else None
+
+    def complete_llm_pending_action(self, pid: str, *, resume_token: str) -> bool:
+        cursor = self._execute(
+            """
+            UPDATE llm_pending_actions
+               SET status = ?, updated_at = ?
+             WHERE pid = ? AND status = ? AND resume_token = ?
+            """,
+            ("completed", utc_now(), pid, "resuming", resume_token),
         )
+        return cursor.rowcount == 1
 
     def insert_process_message(self, message: ProcessMessage) -> None:
         self._execute(
@@ -1935,6 +2258,7 @@ class SQLRuntimeStore:
         now = utc_now()
         task_ids = [task.task_id for task in active]
         with self._lock:
+            self._ensure_healthy()
             self.conn.executemany(
                 """
                 UPDATE object_tasks
@@ -1943,7 +2267,7 @@ class SQLRuntimeStore:
                 """,
                 [(ObjectTaskStatus.ABANDONED.value, reason, now, now, task_id) for task_id in task_ids],
             )
-            self.conn.commit()
+            self._commit_if_outermost()
         return task_ids
 
     def insert_tool(self, handle: ToolHandle, spec: ToolSpec, registered_by: str, created_at: str, ephemeral: bool) -> None:
@@ -2601,15 +2925,62 @@ class SQLRuntimeStore:
             """
             CREATE TABLE IF NOT EXISTS llm_pending_actions (
               pid TEXT PRIMARY KEY,
+              resume_token TEXT,
               wait_type TEXT NOT NULL,
               request_id TEXT,
               child_pid TEXT,
+              response_id TEXT,
+              tool_call_id TEXT,
+              tool_name TEXT,
               filters_json TEXT NOT NULL,
               action_json TEXT NOT NULL,
               content_preview TEXT NOT NULL,
               tool_call_count INTEGER NOT NULL,
               status TEXT NOT NULL,
               created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        pending_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(llm_pending_actions)")}
+        if "resume_token" not in pending_columns:
+            self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN resume_token TEXT")
+        if "response_id" not in pending_columns:
+            self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN response_id TEXT")
+        if "tool_call_id" not in pending_columns:
+            self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN tool_call_id TEXT")
+        if "tool_name" not in pending_columns:
+            self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN tool_name TEXT")
+        self.conn.execute(
+            """
+            UPDATE llm_pending_actions
+               SET resume_token = 'legacy:' || pid || ':' || created_at
+             WHERE resume_token IS NULL OR resume_token = ''
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_tool_outputs (
+              pid TEXT NOT NULL,
+              response_id TEXT NOT NULL,
+              call_id TEXT NOT NULL,
+              tool_name TEXT,
+              output_text TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(pid, response_id, call_id)
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_tool_outputs_response "
+            "ON llm_tool_outputs(pid, response_id)"
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_context_generations (
+              pid TEXT PRIMARY KEY,
+              generation TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
             """
@@ -2730,7 +3101,8 @@ class SQLRuntimeStore:
               state_mutation INTEGER NOT NULL,
               information_flow INTEGER NOT NULL,
               provider_metadata_json TEXT NOT NULL,
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              effect_state TEXT NOT NULL DEFAULT 'finalized'
             )
             """
         )
@@ -2740,6 +3112,11 @@ class SQLRuntimeStore:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_effects_pid_created ON external_effects(pid, created_at, effect_id)"
         )
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(external_effects)")}
+        if "effect_state" not in columns:
+            self.conn.execute(
+                "ALTER TABLE external_effects ADD COLUMN effect_state TEXT NOT NULL DEFAULT 'finalized'"
+            )
 
     def _ensure_skill_schema(self) -> None:
         self.conn.executescript(
@@ -2839,14 +3216,54 @@ class SQLRuntimeStore:
             )
             """
         )
-        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(objects)")}
+        interrupted_columns = self._table_columns("objects_old")
+        if interrupted_columns:
+            with self.transaction():
+                current_columns = self._table_columns("objects")
+                required_current = {
+                    "oid",
+                    "namespace",
+                    "name",
+                    "type",
+                    "schema_version",
+                    "payload_json",
+                    "metadata_json",
+                    "provenance_json",
+                    "version",
+                    "immutable",
+                    "created_by",
+                    "owner_kind",
+                    "owner_id",
+                    "lifecycle_state",
+                    "deleted_at",
+                    "created_at",
+                    "updated_at",
+                }
+                if not required_current.issubset(current_columns):
+                    missing = ", ".join(sorted(required_current - current_columns))
+                    raise ValidationError(
+                        "incomplete objects schema migration cannot be recovered automatically; "
+                        f"current objects table is missing: {missing}"
+                    )
+                self._copy_objects_from_table(
+                    "objects_old",
+                    interrupted_columns,
+                    only_missing=True,
+                )
+                self.conn.execute("DROP TABLE objects_old")
+
+        columns = self._table_columns("objects")
         if "namespace" not in columns or self._has_name_only_unique_index():
-            self._rebuild_objects_table_with_namespace(columns)
-            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(objects)")}
+            with self.transaction():
+                self._rebuild_objects_table_with_namespace(columns)
+            columns = self._table_columns("objects")
         elif "name" not in columns:
-            self.conn.execute("ALTER TABLE objects ADD COLUMN name TEXT")
-            self.conn.execute("UPDATE objects SET name = oid WHERE name IS NULL OR name = ''")
-        self._ensure_object_lifecycle_columns(columns)
+            with self.transaction():
+                self.conn.execute("ALTER TABLE objects ADD COLUMN name TEXT")
+                self.conn.execute("UPDATE objects SET name = oid WHERE name IS NULL OR name = ''")
+            columns = self._table_columns("objects")
+        with self.transaction():
+            self._ensure_object_lifecycle_columns(columns)
         self.conn.execute("DROP INDEX IF EXISTS idx_objects_name")
         self.conn.execute("DROP INDEX IF EXISTS idx_objects_namespace_name")
         self.conn.execute(
@@ -2928,8 +3345,70 @@ class SQLRuntimeStore:
             )
             """
         )
-        namespace_expr = "namespace" if "namespace" in columns else f"'{self.SYSTEM_NAMESPACE}'"
-        name_expr = "name" if "name" in columns else "oid"
+        self._copy_objects_from_table("objects_old", columns)
+        self.conn.execute("DROP TABLE objects_old")
+
+    def _table_columns(self, table: str) -> set[str]:
+        if table not in {"objects", "objects_old"}:
+            raise ValidationError(f"unsupported internal migration table: {table}")
+        return {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _copy_objects_from_table(
+        self,
+        source_table: str,
+        columns: set[str],
+        *,
+        only_missing: bool = False,
+    ) -> None:
+        if source_table != "objects_old":
+            raise ValidationError(f"unsupported objects migration source: {source_table}")
+        required_source = {
+            "oid",
+            "type",
+            "schema_version",
+            "payload_json",
+            "metadata_json",
+            "provenance_json",
+            "version",
+            "immutable",
+            "created_by",
+            "created_at",
+            "updated_at",
+        }
+        if not required_source.issubset(columns):
+            missing = ", ".join(sorted(required_source - columns))
+            raise ValidationError(f"objects migration source is missing required columns: {missing}")
+
+        namespace_expr = "src.namespace" if "namespace" in columns else f"'{self.SYSTEM_NAMESPACE}'"
+        name_expr = "src.name" if "name" in columns else "src.oid"
+        derived_owner_kind = """
+            CASE
+                WHEN src.created_by LIKE 'process_result:%' THEN 'process_result'
+                WHEN src.created_by LIKE 'object_task:%' THEN 'object_task'
+                WHEN src.created_by = 'runtime' OR src.created_by LIKE 'runtime.%' THEN 'runtime'
+                ELSE 'process'
+            END
+        """
+        derived_owner_id = """
+            CASE
+                WHEN src.created_by LIKE 'process_result:%'
+                    THEN substr(src.created_by, length('process_result:') + 1)
+                WHEN src.created_by LIKE 'object_task:%'
+                    THEN substr(src.created_by, length('object_task:') + 1)
+                ELSE src.created_by
+            END
+        """
+        owner_kind_expr = (
+            f"COALESCE(src.owner_kind, {derived_owner_kind})" if "owner_kind" in columns else derived_owner_kind
+        )
+        owner_id_expr = f"COALESCE(src.owner_id, {derived_owner_id})" if "owner_id" in columns else derived_owner_id
+        lifecycle_expr = "COALESCE(src.lifecycle_state, 'live')" if "lifecycle_state" in columns else "'live'"
+        deleted_at_expr = "src.deleted_at" if "deleted_at" in columns else "NULL"
+        missing_filter = (
+            "WHERE NOT EXISTS (SELECT 1 FROM objects AS current WHERE current.oid = src.oid)"
+            if only_missing
+            else ""
+        )
         self.conn.execute(
             f"""
             INSERT INTO objects (
@@ -2938,25 +3417,27 @@ class SQLRuntimeStore:
                 lifecycle_state, deleted_at, created_at, updated_at
             )
             SELECT
-                oid, COALESCE({namespace_expr}, '{self.SYSTEM_NAMESPACE}'), COALESCE({name_expr}, oid), type,
-                schema_version, payload_json, metadata_json, provenance_json, version,
-                immutable, created_by,
-                CASE
-                    WHEN created_by LIKE 'process_result:%' THEN 'process_result'
-                    WHEN created_by LIKE 'object_task:%' THEN 'object_task'
-                    WHEN created_by = 'runtime' OR created_by LIKE 'runtime.%' THEN 'runtime'
-                    ELSE 'process'
-                END,
-                CASE
-                    WHEN created_by LIKE 'process_result:%' THEN substr(created_by, length('process_result:') + 1)
-                    WHEN created_by LIKE 'object_task:%' THEN substr(created_by, length('object_task:') + 1)
-                    ELSE created_by
-                END,
-                'live', NULL, created_at, updated_at
-            FROM objects_old
+                src.oid,
+                COALESCE({namespace_expr}, '{self.SYSTEM_NAMESPACE}'),
+                COALESCE({name_expr}, src.oid),
+                src.type,
+                src.schema_version,
+                src.payload_json,
+                src.metadata_json,
+                src.provenance_json,
+                src.version,
+                src.immutable,
+                src.created_by,
+                {owner_kind_expr},
+                {owner_id_expr},
+                {lifecycle_expr},
+                {deleted_at_expr},
+                src.created_at,
+                src.updated_at
+            FROM {source_table} AS src
+            {missing_filter}
             """
         )
-        self.conn.execute("DROP TABLE objects_old")
 
     def _ensure_object_lifecycle_columns(self, columns: set[str]) -> None:
         if "owner_kind" not in columns:
@@ -3301,6 +3782,7 @@ class SQLRuntimeStore:
                 information_flow=bool(row["information_flow"]),
                 provider_metadata=loads(row["provider_metadata_json"], {}),
                 created_at=row["created_at"],
+                effect_state=str(row["effect_state"]),
             )
 
     def _row_to_checkpoint(self, row: sqlite3.Row) -> Checkpoint:
@@ -3357,9 +3839,13 @@ class SQLRuntimeStore:
     def _row_to_llm_pending_action(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "pid": row["pid"],
+            "resume_token": row["resume_token"] if "resume_token" in row.keys() else None,
             "wait_type": row["wait_type"],
             "request_id": row["request_id"],
             "child_pid": row["child_pid"],
+            "response_id": row["response_id"] if "response_id" in row.keys() else None,
+            "tool_call_id": row["tool_call_id"] if "tool_call_id" in row.keys() else None,
+            "tool_name": row["tool_name"] if "tool_name" in row.keys() else None,
             "filters": loads(row["filters_json"], {}),
             "action": loads(row["action_json"], {}),
             "content_preview": row["content_preview"],
@@ -3630,10 +4116,9 @@ class SQLRuntimeStore:
 
 
 class _SQLiteRuntimeLease:
-    def __init__(self, handle: Any, path: Path, *, unlink_on_release: bool) -> None:
+    def __init__(self, handle: Any, path: Path) -> None:
         self.handle = handle
         self.path = path
-        self.unlink_on_release = unlink_on_release
 
 
 class SQLiteStore(SQLRuntimeStore):
@@ -3645,7 +4130,9 @@ class SQLiteStore(SQLRuntimeStore):
 
     def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
         selected_path = str(path)
+        connection_path = selected_path
         self._lease_handle: Any | None = None
+        use_database_lease = False
         if selected_path != ":memory:":
             db_path = Path(selected_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3653,12 +4140,32 @@ class SQLiteStore(SQLRuntimeStore):
             # the lock path. Otherwise the same SQLite file can be opened by
             # two runtimes through distinct path spellings and receive two
             # independent lease files.
-            self._lease_handle = self._acquire_runtime_lease(db_path.resolve())
+            canonical_path = db_path.resolve()
+            connection_path = str(canonical_path)
+            if fcntl is not None and hasattr(os, "O_NOFOLLOW"):
+                self._lease_handle = self._acquire_runtime_lease(canonical_path)
+            else:
+                # SQLite's kernel-managed EXCLUSIVE lock is crash-recoverable,
+                # unlike a create-once fallback lockfile that can survive its
+                # owner indefinitely.  This is also the Windows path.
+                use_database_lease = True
+        conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(selected_path, check_same_thread=False)
+            conn = sqlite3.connect(
+                connection_path,
+                check_same_thread=False,
+                timeout=0.0 if use_database_lease else 5.0,
+            )
             conn.row_factory = sqlite3.Row
+            if use_database_lease:
+                self._acquire_exclusive_sqlite_lease(conn, Path(connection_path))
             self._init_store(selected_path, config=config, conn=conn)
-        except Exception:
+        except BaseException:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self._release_runtime_lease()
             raise
 
@@ -3670,26 +4177,71 @@ class SQLiteStore(SQLRuntimeStore):
 
     def _acquire_runtime_lease(self, db_path: Path) -> _SQLiteRuntimeLease:
         lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
-        if fcntl is None:
+        if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            raise ValidationError("secure file runtime leases require fcntl and O_NOFOLLOW")
+        flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(str(lease_path), flags, 0o600)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+                raise ValidationError(f"unsafe runtime lease path: {lease_path}") from exc
+            raise ValidationError(f"unable to securely open runtime lease: {lease_path}") from exc
+
+        handle: Any | None = None
+        try:
+            opened_stat = os.fstat(fd)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise ValidationError(f"runtime lease must be a regular file: {lease_path}")
+            handle = os.fdopen(fd, "r+", encoding="utf-8")
+            fd = -1
             try:
-                fd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError as exc:
-                raise ValidationError(f"runtime store is already open: {db_path}") from exc
-            handle = os.fdopen(fd, "w")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise ValidationError(f"runtime store is already open: {db_path}") from exc
+                raise ValidationError(f"unable to lock runtime lease: {lease_path}") from exc
+
+            path_stat = os.stat(lease_path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_dev != opened_stat.st_dev
+                or path_stat.st_ino != opened_stat.st_ino
+            ):
+                raise ValidationError(f"unsafe runtime lease path changed while opening: {lease_path}")
+
+            handle.seek(0)
+            handle.truncate()
             handle.write(f"{utc_now()}\n{os.getpid()}\n")
             handle.flush()
-            return _SQLiteRuntimeLease(handle, lease_path, unlink_on_release=True)
-        handle = lease_path.open("a+")
+            os.fsync(handle.fileno())
+            return _SQLiteRuntimeLease(handle, lease_path)
+        except BaseException:
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                handle.close()
+            elif fd >= 0:
+                os.close(fd)
+            raise
+
+    def _acquire_exclusive_sqlite_lease(self, conn: sqlite3.Connection, db_path: Path) -> None:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            handle.close()
-            raise ValidationError(f"runtime store is already open: {db_path}") from exc
-        handle.seek(0)
-        handle.truncate()
-        handle.write(utc_now())
-        handle.flush()
-        return _SQLiteRuntimeLease(handle, lease_path, unlink_on_release=False)
+            row = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+            if row is None or str(row[0]).lower() != "exclusive":
+                raise ValidationError(f"SQLite refused exclusive runtime lease mode: {db_path}")
+            conn.execute("BEGIN EXCLUSIVE")
+            conn.commit()
+        except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            busy_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            if getattr(exc, "sqlite_errorcode", None) in busy_codes:
+                raise ValidationError(f"runtime store is already open: {db_path}") from exc
+            raise ValidationError(f"unable to acquire SQLite runtime lease: {db_path}") from exc
 
     def _release_runtime_lease(self) -> None:
         lease = getattr(self, "_lease_handle", None)
@@ -3697,14 +4249,9 @@ class SQLiteStore(SQLRuntimeStore):
             return
         self._lease_handle = None
         handle = lease.handle
-        if fcntl is not None and not lease.unlink_on_release:
+        if fcntl is not None:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
         handle.close()
-        if lease.unlink_on_release:
-            try:
-                os.unlink(lease.path)
-            except FileNotFoundError:
-                pass

@@ -5,7 +5,7 @@ import time
 import pytest
 from uuid import uuid4
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, EventType, ForkMode, HumanRequestStatus, ProcessStatus
+from agent_libos.models import CapabilityRight, EventType, ExternalEffectRollbackStatus, ForkMode, HumanRequestStatus, ProcessStatus
 
 class TestExternalBoundary:
 
@@ -168,6 +168,48 @@ class TestExternalBoundary:
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
         assert 'human.output' in self._audit_actions()
         assert [item for item in self.runtime.store.list_external_effects() if item.provider == 'human']
+
+    def test_human_output_post_provider_classifier_failure_keeps_pending_effect_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='human effect intent fallback')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+
+        def fail_classifier(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError('injected human classifier failure')
+
+        monkeypatch.setattr(self.runtime.human.provider, 'classify_external_effect', fail_classifier)
+        result = self.runtime.tools.call(pid, 'human_output', {'message': 'visible once'})
+
+        assert result.ok, result.error
+        assert self.human_output == ['visible once']
+        effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'pending'
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+
+    def test_human_output_provider_failure_does_not_persist_exception_text(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='private human failure')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+        error_secret = 'transport-secret-must-not-be-stored'
+
+        def fail_output(_message: str) -> None:
+            raise RuntimeError(error_secret)
+
+        self.runtime.substrate.human.output_sink = fail_output
+        result = self.runtime.tools.call(pid, 'human_output', {'message': 'visible payload'})
+
+        assert not result.ok
+        request = self.runtime.human.list(pid)[0]
+        assert request.decision == {'delivery_committed': True, 'provider_error_type': 'RuntimeError'}
+        effect = next(
+            effect
+            for effect in self.runtime.store.list_external_effects(pid=pid)
+            if effect.provider == 'human'
+        )
+        assert error_secret not in str(effect.provider_metadata)
+        assert error_secret not in str(request.decision)
 
     def test_human_output_preserves_non_terminal_channel_in_observability(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='speak on gui channel')

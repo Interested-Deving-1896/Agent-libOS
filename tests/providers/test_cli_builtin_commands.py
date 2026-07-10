@@ -159,6 +159,16 @@ class TestCLIBuiltinCommand:
             db = root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 spawn = _run_cli_json(['--db', str(db), 'spawn', '--image', 'review-agent:v0', '--goal', 'set cwd'])
+                _run_cli_json([
+                    '--db',
+                    str(db),
+                    'capabilities',
+                    'grant',
+                    spawn['pid'],
+                    'filesystem:workspace:pkg/*',
+                    '--rights',
+                    'read',
+                ])
                 result = _run_cli_json(['--db', str(db), 'cd', spawn['pid'], 'pkg'])
             runtime = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
             try:

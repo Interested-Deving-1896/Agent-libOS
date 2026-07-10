@@ -10,15 +10,17 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
+from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
 from agent_libos.llm.user_profiles import (
     UserLLMProfileStore,
@@ -463,11 +465,14 @@ class SchedulerController:
                 if remaining is not None and remaining <= 0:
                     break
                 batch_quanta = 1 if remaining is None else min(1, remaining)
-                with self.service.runtime_lock:
+                with self.service.runtime_user():
                     result = (
                         self.service.runtime.run_process_until_idle(pid, max_quanta=batch_quanta)
                         if pid is not None
-                        else self.service.runtime.run_until_idle(max_quanta=batch_quanta)
+                        else self.service.runtime.run_until_idle(
+                            max_quanta=batch_quanta,
+                            process_human_queue=False,
+                        )
                     )
                 if not result:
                     break
@@ -516,6 +521,11 @@ class GuiRuntimeService:
         self.token = token or secrets.token_urlsafe(32)
         self.broadcaster = GuiEventBroadcaster(max_events=self.runtime.config.gui.event_buffer_limit)
         self.runtime_lock = threading.RLock()
+        self._lifecycle = threading.Condition(threading.RLock())
+        self._active_runtime_users = 0
+        self._closing = False
+        self._shutdown_in_progress = False
+        self._runtime_teardown_started = False
         selected_max_quanta = self.runtime.config.runtime.run_until_idle_max_quanta if max_quanta is _CONFIG_DEFAULT else max_quanta
         self.scheduler = SchedulerController(self, auto_run=auto_run, default_max_quanta=selected_max_quanta, paused=not auto_run)
         self._closed = False
@@ -541,18 +551,79 @@ class GuiRuntimeService:
         self._user_llm_profile_cache = self._load_user_llm_profiles()
         self.publish_runtime_changes("startup")
 
-    def shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        scheduler_stopped = self.scheduler.shutdown()
-        self.broadcaster.close()
-        # A Python thread blocked inside a model/tool quantum cannot be safely
-        # interrupted. In that case the Electron parent will terminate the
-        # process tree; closing a database handle underneath the live quantum would be a
-        # worse race than letting process teardown reclaim the handle.
-        if self.owns_runtime and scheduler_stopped:
-            self.runtime.shutdown(actor="gui-server", reason="gui-server.shutdown")
+    @contextmanager
+    def runtime_user(self, *, serialize: bool = True) -> Iterator[None]:
+        """Register an in-flight Runtime user so shutdown cannot close under it."""
+        with self._lifecycle:
+            if self._closed or self._closing:
+                raise GuiServerError(HTTPStatus.SERVICE_UNAVAILABLE, "GUI runtime is shutting down")
+            self._active_runtime_users += 1
+        try:
+            if serialize:
+                with self.runtime_lock:
+                    yield
+            else:
+                yield
+        finally:
+            with self._lifecycle:
+                self._active_runtime_users -= 1
+                self._lifecycle.notify_all()
+
+    def shutdown(self, timeout_s: float | None = None) -> bool:
+        selected_timeout = (
+            self.runtime.config.gui.scheduler_shutdown_join_timeout_s
+            if timeout_s is None
+            else max(0.0, float(timeout_s))
+        )
+        deadline = time.monotonic() + selected_timeout
+        with self._lifecycle:
+            if self._closed:
+                return True
+            if self._shutdown_in_progress:
+                return False
+            self._closing = True
+            self._shutdown_in_progress = True
+
+        completed = False
+        try:
+            scheduler_timeout = max(0.0, deadline - time.monotonic())
+            if not self.scheduler.shutdown(timeout_s=scheduler_timeout):
+                return False
+            with self._lifecycle:
+                while self._active_runtime_users:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._lifecycle.wait(timeout=remaining)
+            # Exclude untracked legacy callers that still use runtime_lock
+            # directly while the owned Runtime releases its store handles.
+            remaining = max(0.0, deadline - time.monotonic())
+            acquired = self.runtime_lock.acquire(timeout=remaining)
+            if not acquired:
+                return False
+            try:
+                if self.owns_runtime:
+                    # Runtime.shutdown is a phased, stateful teardown.  Once it
+                    # starts, a false/exception result must not reopen the HTTP
+                    # API onto a partially stopped Runtime.  A later shutdown
+                    # call may retry teardown, but runtime_user stays closed.
+                    self._runtime_teardown_started = True
+                    result = self.runtime.shutdown(actor="gui-server", reason="gui-server.shutdown")
+                    if result.get("ok") is not True:
+                        return False
+            finally:
+                self.runtime_lock.release()
+            self.broadcaster.close()
+            with self._lifecycle:
+                self._closed = True
+            completed = True
+            return True
+        finally:
+            with self._lifecycle:
+                self._shutdown_in_progress = False
+                if not completed and not self._runtime_teardown_started:
+                    self._closing = False
+                self._lifecycle.notify_all()
 
     def close(self) -> None:
         self.shutdown()
@@ -833,11 +904,25 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if method in {"POST", "PUT", "DELETE"}:
                 self._cached_json_body = self._read_body(optional=True)
                 self._body_cached = True
-            if _is_fast_gui_request(method, parsed.path) or _is_object_task_wait_request(method, parsed.path):
+            if method == "GET" and parsed.path == "/api/health":
+                # Health remains non-blocking on ``runtime_lock``, but it still
+                # reads the Runtime store and therefore must be drained before
+                # an owned Runtime is closed.
+                with self.server.service.runtime_user(serialize=False):
+                    result = self._dispatch(method, parsed.path, parse_qs(parsed.query))
+                should_shutdown = False
+            elif _is_fast_gui_request(method, parsed.path):
                 result = self._dispatch(method, parsed.path, parse_qs(parsed.query))
                 should_shutdown = method == "POST" and parsed.path == "/api/shutdown"
+            elif _is_object_task_wait_request(method, parsed.path):
+                # Object-task wait deliberately does not serialize all GUI
+                # operations, but it is still an in-flight Runtime user that
+                # service shutdown must drain.
+                with self.server.service.runtime_user(serialize=False):
+                    result = self._dispatch(method, parsed.path, parse_qs(parsed.query))
+                    should_shutdown = False
             else:
-                with self.server.service.runtime_lock:
+                with self.server.service.runtime_user():
                     result = self._dispatch(method, parsed.path, parse_qs(parsed.query))
                     should_shutdown = method == "POST" and parsed.path == "/api/shutdown"
             if should_shutdown:
@@ -1233,10 +1318,30 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CONFLICT,
                     f"human request is not pending: {route[0]} status={current.status.value}",
                 )
-            decision = body.get("decision") if isinstance(body.get("decision"), dict) else {}
-            if body.get("answer") is not None:
-                decision = {**decision, "answer": str(body["answer"])}
-            if _json_bool(body, "approved", False):
+            raw_decision = body.get("decision")
+            if raw_decision is not None and not isinstance(raw_decision, dict):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "decision must be a JSON object")
+            decision = dict(raw_decision or {})
+            if "answer" in body:
+                if not isinstance(body["answer"], str):
+                    raise GuiServerError(HTTPStatus.BAD_REQUEST, "answer must be a string")
+                decision = {**decision, "answer": body["answer"]}
+            approved = _json_bool(body, "approved", False)
+            request_type = current.payload.get("type")
+            if request_type == "permission_request":
+                policy = decision.get("policy")
+                if not isinstance(policy, str) or policy not in {
+                    CapabilityManager.ALWAYS_ALLOW,
+                    CapabilityManager.ALWAYS_DENY,
+                    CapabilityManager.ASK_EACH_TIME,
+                }:
+                    raise GuiServerError(
+                        HTTPStatus.BAD_REQUEST,
+                        "permission response decision.policy must be always_allow, always_deny, or ask_each_time",
+                    )
+            if request_type == "question" and approved and not isinstance(decision.get("answer"), str):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "approved question response requires a string answer")
+            if approved:
                 request = service.runtime.human.approve(route[0], {"approved": True, "source": "gui", **decision})
             else:
                 request = service.runtime.human.reject(route[0], {"approved": False, "source": "gui", **decision})

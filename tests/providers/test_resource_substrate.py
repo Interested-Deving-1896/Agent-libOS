@@ -128,6 +128,149 @@ class TestResourceProviderSubstrate:
             assert len(result.stdout) == 200000
             assert result.metrics is not None
 
+    @pytest.mark.parametrize("mode", ["success", "wall", "timeout"])
+    def test_local_shell_provider_without_cpu_memory_limits_tolerates_tree_enumeration_denial(
+        self,
+        mode: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        instances: list[Any] = []
+
+        class TreeEnumerationDenied:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.children_calls = 0
+                instances.append(self)
+
+            def children(self, *, recursive: bool) -> list[Any]:
+                assert recursive
+                self.children_calls += 1
+                raise PermissionError("process tree enumeration denied")
+
+            def cpu_times(self) -> Any:
+                return type("CpuTimes", (), {"user": 0.0, "system": 0.0})()
+
+            def memory_info(self) -> Any:
+                return type("MemoryInfo", (), {"rss": 0})()
+
+            def terminate(self) -> None:
+                raise psutil.NoSuchProcess(self.pid)
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                raise psutil.NoSuchProcess(self.pid)
+
+        monkeypatch.setattr("agent_libos.substrate.local.psutil.Process", TreeEnumerationDenied)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            if mode == "success":
+                result = provider.run([sys.executable, "-c", "print('ok')"], timeout=2.0)
+                assert result.returncode == 0
+                assert result.stdout.strip() == "ok"
+            elif mode == "wall":
+                with pytest.raises(SubprocessLimitExceeded) as exc_info:
+                    provider.run(
+                        [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                        timeout=2.0,
+                        limits=SubprocessLimits(wall_seconds=0.02),
+                    )
+                assert exc_info.value.metrics.limit_kind == "subprocess_wall_seconds"
+            else:
+                with pytest.raises(SubprocessTimeoutExpired) as exc_info:
+                    provider.run(
+                        [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                        timeout=0.02,
+                    )
+                assert exc_info.value.metrics.limit_kind == "subprocess_timeout"
+
+        assert len(instances) == 1
+        assert instances[0].children_calls == (0 if mode == "success" else 1)
+
+    @pytest.mark.parametrize(
+        "limits",
+        [
+            SubprocessLimits(cpu_seconds=1.0),
+            SubprocessLimits(memory_bytes=512_000_000),
+        ],
+        ids=["cpu", "memory"],
+    )
+    def test_local_shell_provider_cpu_memory_limits_fail_closed_when_tree_metrics_are_denied(
+        self,
+        limits: SubprocessLimits,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class TreeEnumerationDenied:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def children(self, *, recursive: bool) -> list[Any]:
+                assert recursive
+                raise PermissionError("process tree enumeration denied")
+
+            def terminate(self) -> None:
+                raise psutil.NoSuchProcess(self.pid)
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                raise psutil.NoSuchProcess(self.pid)
+
+        monkeypatch.setattr("agent_libos.substrate.local.psutil.Process", TreeEnumerationDenied)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            with pytest.raises(ValidationError, match="complete process metrics are unavailable"):
+                provider.run(
+                    [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                    timeout=2.0,
+                    limits=limits,
+                )
+
+    def test_local_shell_provider_kill_falls_back_to_direct_child_when_group_and_tree_access_are_denied(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class TreeAccessDenied:
+            def children(self, *, recursive: bool) -> list[Any]:
+                assert recursive
+                raise PermissionError("process tree enumeration denied")
+
+            def terminate(self) -> None:
+                raise PermissionError("process terminate denied")
+
+            def kill(self) -> None:
+                raise PermissionError("process kill denied")
+
+        class DirectChild:
+            pid = 424242
+
+            def __init__(self) -> None:
+                self.kill_calls = 0
+
+            def poll(self) -> int | None:
+                return None
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+
+        def deny_group_signal(_pid: int, _signal: int) -> None:
+            raise PermissionError("process group signal denied")
+
+        def deny_wait(_processes: list[Any], *, timeout: float) -> tuple[list[Any], list[Any]]:
+            raise PermissionError("process wait denied")
+
+        monkeypatch.setattr(os, "killpg", deny_group_signal)
+        monkeypatch.setattr("agent_libos.substrate.local.psutil.wait_procs", deny_wait)
+        child = DirectChild()
+
+        LocalShellProvider(".")._kill_process_tree(TreeAccessDenied(), child)  # type: ignore[arg-type]
+
+        assert child.kill_calls == 1
+
     def test_local_shell_provider_terminates_background_child_process_tree(self) -> None:
         if sys.platform == "win32":
             pytest.skip("POSIX process-group cleanup does not apply to Windows shell provider")
@@ -234,6 +377,33 @@ class TestResourceProviderSubstrate:
                 assert _processes_with_marker(marker) == []
             finally:
                 session.close(force=True, timeout_s=0.5)
+                for proc in _processes_with_marker(marker):
+                    with contextlib.suppress(psutil.Error):
+                        proc.kill()
+
+    def test_local_pty_provider_contains_process_when_post_spawn_initialization_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if sys.platform == "win32":
+            pytest.skip("POSIX PTY initialization containment is platform-specific")
+        marker = f"PTY_PROVIDER_INIT_FAILURE_{time.monotonic_ns()}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalPtyProvider(temp_dir)
+
+            def fail_set_blocking(_fd: int, _blocking: bool) -> None:
+                raise OSError("simulated post-spawn PTY initialization failure")
+
+            monkeypatch.setattr(os, "set_blocking", fail_set_blocking)
+            try:
+                with pytest.raises(OSError, match="post-spawn PTY initialization failure"):
+                    provider.spawn([sys.executable, "-c", "import time; time.sleep(60)", marker])
+
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and _processes_with_marker(marker):
+                    time.sleep(0.05)
+                assert _processes_with_marker(marker) == []
+            finally:
                 for proc in _processes_with_marker(marker):
                     with contextlib.suppress(psutil.Error):
                         proc.kill()

@@ -70,6 +70,19 @@ reconstructed and the final compacted context is recreated under the same
 `llm_context:<pid>` name when the old runtime-only payload is no longer
 materializable.
 
+The same durable row protects LLM-selected human, child, and process-message
+waits. Every wait generation has a unique resume token. A ready waiter must
+atomically claim `pending -> resuming` for that exact token before dispatch; a
+second executor sees the claimed state and cannot repeat the primitive. If the
+resumed action blocks again, it writes a new token/generation, preventing a
+stale completion from clearing the new wait. Reopening a store with an action
+already in `resuming` fails the process and records
+`llm.pending_action_resume_interrupted`; it never replays an action after an
+unknown crash window. The same fail-closed transition happens immediately when
+dispatch, durable output persistence, or completion raises after the claim, so
+a direct `run_process_once` caller cannot spin a still-runnable process around a
+non-replayable action.
+
 ## Workflow Entry Point
 
 A workflow is a tool that a user runs directly. `Runtime.run_workflow()` and
@@ -160,6 +173,14 @@ existing runtime store, it reloads executable TypeScript sources only for JIT
 tool ids still referenced by a process tool table. Stale ephemeral tool
 references with no recoverable registered source are removed from the process
 tool table fail-closed instead of being shown to the model as broken tools.
+
+Checkpoint fork never shares an ephemeral registration identity with the
+source process. It allocates new tool and candidate ids, rewrites the forked
+tool table, candidate descriptors, Object payloads, and loaded-Skill JIT maps,
+and prepares executable handles before the fork process rows are published.
+Fork failure discards those unpublished handles. The captured Skill package
+snapshot remains process-local; fork does not replace the host's current global
+Skill or Image registry.
 
 Skill activation uses the same validation and registration path for bundled JIT
 tools declared in package metadata and stored as `scripts/*.ts` resources.
@@ -306,7 +327,13 @@ metrics fails closed for budgeted validation or execution.
 Cancelling a Deno execution kills its isolated process group (and any discovered
 descendants) and waits for the syscall-serving and resource-monitor workers to
 settle before returning. Failure to terminate the process group is surfaced as
-a sandbox error rather than silently leaving code running.
+a sandbox error rather than silently leaving code running. Deno is started only
+after a dedicated supervisor has established host-lifetime containment: POSIX
+uses an inherited death pipe and an isolated process group, while Windows uses
+a `KILL_ON_JOB_CLOSE` Job Object. If the libOS host is hard-killed, the
+supervisor or operating system terminates the untrusted process tree; if that
+containment cannot be established, JIT execution fails closed before Deno is
+released.
 
 If Deno is missing, validation returns a clear error. Python tests marked
 `real_deno` run by default when `deno` is installed, skip with a clear reason

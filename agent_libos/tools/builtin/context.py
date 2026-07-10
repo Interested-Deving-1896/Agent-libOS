@@ -517,7 +517,7 @@ def _require_authorized_resume_job(
             code=ToolErrorCode.VALIDATION_ERROR,
         )
     pending = runtime.store.get_llm_pending_action(pid)
-    if not isinstance(pending, dict) or str(pending.get("status") or "") != "pending":
+    if not isinstance(pending, dict) or str(pending.get("status") or "") not in {"pending", "resuming"}:
         raise ToolExecutionError(
             "Context compaction resume state has no durable pending action.",
             code=ToolErrorCode.VALIDATION_ERROR,

@@ -1,4 +1,4 @@
-schema_version: 0
+schema_version: 1
 id: skill_tool_visibility_001
 title: Skill activation does not grant filesystem authority
 goal: Activate a Skill that exposes file-reading affordances, then try to read a secret.

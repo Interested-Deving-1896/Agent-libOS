@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 from reprlib import Repr
 from collections.abc import Callable
+import threading
 from types import TracebackType
 from typing import Any, Iterable
 
@@ -152,6 +153,13 @@ class ObjectMemoryManager:
         self._object_pin_checker: Callable[[str], bool] | None = None
         self._object_change_notifier: Callable[[str, dict[str, Any], str], None] | None = None
         self._object_release_finalizers: list[Callable[[AgentObject, str, str], None]] = []
+        # Object lifecycle mutations share a re-entrant linearization lock.
+        # The global order is ownership first, then the store transaction;
+        # finalizers may safely re-enter Object Memory on the same thread.
+        self._ownership_lock = threading.RLock()
+
+    def ownership_locked(self):
+        return self._ownership_lock
 
     def bind_object_pin_checker(self, checker: Callable[[str], bool] | None) -> None:
         self._object_pin_checker = checker
@@ -177,7 +185,7 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         obj_type = ObjectType(object_type)
         self._validate_payload_size(payload, "object payload")
-        with self.store.locked():
+        with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             now = utc_now()
             oid = new_id("obj")
             object_namespace = self.resolve_namespace(pid, namespace)
@@ -220,26 +228,26 @@ class ObjectMemoryManager:
             self._consume_one_time_decision(namespace_decision)
             self.store.insert_object(obj)
             handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory")
-        self.events.emit(
-            EventType.OBJECT_CREATED,
-            source=pid,
-            target=pid,
-            payload={
-                "oid": obj.oid,
-                "namespace": obj.namespace,
-                "name": obj.name,
-                "qualified_name": self.qualified_name(obj),
-                "type": obj.type.value,
-            },
-        )
-        self.audit.record(
-            actor=pid,
-            action="memory.create_object",
-            target=f"object:{obj.oid}",
-            output_refs=[obj.oid],
-            capability_refs=[handle.capability_id],
-            decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
-        )
+            self.events.emit(
+                EventType.OBJECT_CREATED,
+                source=pid,
+                target=pid,
+                payload={
+                    "oid": obj.oid,
+                    "namespace": obj.namespace,
+                    "name": obj.name,
+                    "qualified_name": self.qualified_name(obj),
+                    "type": obj.type.value,
+                },
+            )
+            self.audit.record(
+                actor=pid,
+                action="memory.create_object",
+                target=f"object:{obj.oid}",
+                output_refs=[obj.oid],
+                capability_refs=[handle.capability_id],
+                decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
+            )
         return handle
 
     def process_namespace(self, pid: str) -> str:
@@ -251,32 +259,33 @@ class ObjectMemoryManager:
         return self._normalize_namespace(namespace)
 
     def ensure_process_namespace(self, pid: str, parent_pid: str | None = None) -> ObjectNamespace:
-        namespace_name = self.process_namespace(pid)
-        existing = self.store.get_namespace(namespace_name)
-        if existing is None:
-            now = utc_now()
-            namespace = ObjectNamespace(
-                namespace=namespace_name,
-                parent_namespace=None,
-                metadata={"kind": "process", "pid": pid, "parent_pid": parent_pid},
-                created_by=pid,
-                created_at=now,
-                updated_at=now,
+        with self.store.transaction():
+            namespace_name = self.process_namespace(pid)
+            existing = self.store.get_namespace(namespace_name)
+            if existing is None:
+                now = utc_now()
+                namespace = ObjectNamespace(
+                    namespace=namespace_name,
+                    parent_namespace=None,
+                    metadata={"kind": "process", "pid": pid, "parent_pid": parent_pid},
+                    created_by=pid,
+                    created_at=now,
+                    updated_at=now,
+                )
+                self.store.insert_namespace(namespace)
+                existing = namespace
+                self.audit.record(
+                    actor=pid,
+                    action="memory.ensure_process_namespace",
+                    target=self._namespace_resource(namespace_name),
+                    decision={"namespace": namespace_name, "parent_pid": parent_pid, "created": True},
+                )
+            self.capabilities.grant(
+                subject=pid,
+                resource=self._namespace_resource(namespace_name),
+                rights=["read", "write", "admin"],
+                issued_by="memory.process_namespace",
             )
-            self.store.insert_namespace(namespace)
-            existing = namespace
-            self.audit.record(
-                actor=pid,
-                action="memory.ensure_process_namespace",
-                target=self._namespace_resource(namespace_name),
-                decision={"namespace": namespace_name, "parent_pid": parent_pid, "created": True},
-            )
-        self.capabilities.grant(
-            subject=pid,
-            resource=self._namespace_resource(namespace_name),
-            rights=["read", "write", "admin"],
-            issued_by="memory.process_namespace",
-        )
         return existing
 
     def create_namespace(
@@ -286,7 +295,7 @@ class ObjectMemoryManager:
         parent_namespace: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ObjectNamespace:
-        with self.store.locked():
+        with self.store.transaction():
             namespace_name = self._normalize_namespace(namespace)
             if self.store.namespace_exists(namespace_name):
                 raise ValidationError(f"Object Memory namespace already exists: {namespace_name}")
@@ -313,12 +322,12 @@ class ObjectMemoryManager:
                 rights=["read", "write", "admin"],
                 issued_by="memory.namespace",
             )
-        self.audit.record(
-            actor=pid,
-            action="memory.create_namespace",
-            target=self._namespace_resource(namespace_name),
-            decision={"namespace": namespace_name, "parent_namespace": parent},
-        )
+            self.audit.record(
+                actor=pid,
+                action="memory.create_namespace",
+                target=self._namespace_resource(namespace_name),
+                decision={"namespace": namespace_name, "parent_namespace": parent},
+            )
         return ns
 
     def get_namespace(self, pid: str, namespace: str | None = None) -> ObjectNamespace:
@@ -338,25 +347,37 @@ class ObjectMemoryManager:
         return ns
 
     def list_namespace(self, pid: str, namespace: str | None = None, *, limit: int | None = None) -> dict[str, Any]:
-        with self.store.locked():
+        with self.store.transaction():
             namespace_name = self.resolve_namespace(pid, namespace)
             namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
             self._require_namespace_exists(namespace_name)
-            selected_limit = self._validate_query_limit(limit or self.config.memory.query_limit)
+            selected_limit = self._validate_query_limit(
+                self.config.memory.query_limit if limit is None else limit
+            )
             objects: list[AgentObject] = []
+            object_decisions: list[Any] = []
             child_namespaces: list[ObjectNamespace] = []
+            child_namespace_decisions: list[Any] = []
             for obj in self.store.list_objects(namespace=namespace_name):
                 if len(objects) >= selected_limit:
                     break
-                if self.capabilities.check(pid, f"object:{obj.oid}", ObjectRight.READ):
+                decision = self.capabilities.authorize(pid, f"object:{obj.oid}", ObjectRight.READ)
+                if decision.allowed:
                     objects.append(obj)
+                    object_decisions.append(decision)
             remaining = selected_limit - len(objects)
             if remaining > 0:
                 for ns in self.store.list_namespaces(parent_namespace=namespace_name):
                     if len(child_namespaces) >= remaining:
                         break
-                    if self._can_read_namespace(pid, ns.namespace):
+                    decision = self.capabilities.authorize(
+                        pid,
+                        self._namespace_resource(ns.namespace),
+                        "read",
+                    )
+                    if decision.allowed:
                         child_namespaces.append(ns)
+                        child_namespace_decisions.append(decision)
             self.audit.record(
                 actor=pid,
                 action="memory.list_namespace",
@@ -369,7 +390,9 @@ class ObjectMemoryManager:
                     "limit": selected_limit,
                 },
             )
-            self._consume_one_time_decision(namespace_decision)
+            self._consume_one_time_decisions(
+                [namespace_decision, *object_decisions, *child_namespace_decisions]
+            )
         return {
             "namespace": namespace_name,
             "objects": objects,
@@ -510,7 +533,7 @@ class ObjectMemoryManager:
         *,
         expected_version: int | None = None,
     ) -> ObjectHandle:
-        with self.store.locked():
+        with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             write_decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.WRITE)
             if not write_decision.allowed:
                 raise CapabilityDenied(write_decision.reason)
@@ -571,28 +594,41 @@ class ObjectMemoryManager:
                 updated_at=utc_now(),
             )
             self._consume_one_time_decisions([write_decision, *namespace_decisions])
-            self.store.update_object(updated)
-        event = self.events.emit(
-            EventType.OBJECT_UPDATED,
-            source=pid,
-            target=pid,
-            payload={
-                "oid": updated.oid,
-                "namespace": updated.namespace,
-                "name": updated.name,
-                "qualified_name": self.qualified_name(updated),
-                "version": updated.version,
-            },
-        )
-        self.audit.record(
-            actor=pid,
-            action="memory.update_object",
-            target=f"object:{updated.oid}",
-            input_refs=[updated.oid],
-            output_refs=[updated.oid],
-            capability_refs=[handle.capability_id],
-            decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
-        )
+            if not self.store.update_object(
+                updated,
+                expected_version=current.version,
+                expected_owner_kind=current.owner_kind,
+                expected_owner_id=current.owner_id,
+            ):
+                latest = self.store.get_object(handle.oid)
+                if latest is None:
+                    raise NotFound(f"object not found: {handle.oid}")
+                raise ObjectVersionConflict(
+                    handle.oid,
+                    expected_version=current.version,
+                    actual_version=latest.version,
+                )
+            event = self.events.emit(
+                EventType.OBJECT_UPDATED,
+                source=pid,
+                target=pid,
+                payload={
+                    "oid": updated.oid,
+                    "namespace": updated.namespace,
+                    "name": updated.name,
+                    "qualified_name": self.qualified_name(updated),
+                    "version": updated.version,
+                },
+            )
+            self.audit.record(
+                actor=pid,
+                action="memory.update_object",
+                target=f"object:{updated.oid}",
+                input_refs=[updated.oid],
+                output_refs=[updated.oid],
+                capability_refs=[handle.capability_id],
+                decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
+            )
         self._notify_object_changed(
             updated.oid,
             {
@@ -615,7 +651,7 @@ class ObjectMemoryManager:
         *,
         issued_by: str = "memory.append",
     ) -> tuple[AgentObject, str | None, int]:
-        with self.store.locked():
+        with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             object_namespace = self.resolve_namespace(pid, namespace)
             object_name = self._normalize_name(name)
             namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
@@ -655,36 +691,51 @@ class ObjectMemoryManager:
                 updated_at=utc_now(),
             )
             self._consume_one_time_decisions([*decisions, namespace_decision])
-            self.store.update_object(updated)
-        event = self.events.emit(
-            EventType.OBJECT_UPDATED,
-            source=pid,
-            target=pid,
-            payload={
-                "oid": updated.oid,
-                "namespace": updated.namespace,
-                "name": updated.name,
-                "qualified_name": self.qualified_name(updated),
-                "version": updated.version,
-            },
-        )
-        self.audit.record(
-            actor=pid,
-            action="memory.append_object",
-            target=f"object:{updated.oid}",
-            input_refs=[updated.oid],
-            output_refs=[updated.oid],
-            capability_refs=[
-                cap_id for cap_id in (decision.selected_capability_id for decision in decisions) if cap_id is not None
-            ],
-            decision={
-                "namespace": updated.namespace,
-                "name": updated.name,
-                "version": updated.version,
-                "rights": sorted(rights),
-                "issued_by": issued_by,
-            },
-        )
+            if not self.store.update_object(
+                updated,
+                expected_version=obj.version,
+                expected_owner_kind=obj.owner_kind,
+                expected_owner_id=obj.owner_id,
+            ):
+                latest = self.store.get_object(obj.oid)
+                if latest is None:
+                    raise NotFound(f"object not found: {obj.oid}")
+                raise ObjectVersionConflict(
+                    obj.oid,
+                    expected_version=obj.version,
+                    actual_version=latest.version,
+                )
+            event = self.events.emit(
+                EventType.OBJECT_UPDATED,
+                source=pid,
+                target=pid,
+                payload={
+                    "oid": updated.oid,
+                    "namespace": updated.namespace,
+                    "name": updated.name,
+                    "qualified_name": self.qualified_name(updated),
+                    "version": updated.version,
+                },
+            )
+            self.audit.record(
+                actor=pid,
+                action="memory.append_object",
+                target=f"object:{updated.oid}",
+                input_refs=[updated.oid],
+                output_refs=[updated.oid],
+                capability_refs=[
+                    cap_id
+                    for cap_id in (decision.selected_capability_id for decision in decisions)
+                    if cap_id is not None
+                ],
+                decision={
+                    "namespace": updated.namespace,
+                    "name": updated.name,
+                    "version": updated.version,
+                    "rights": sorted(rights),
+                    "issued_by": issued_by,
+                },
+            )
         self._notify_object_changed(
             updated.oid,
             {
@@ -709,8 +760,12 @@ class ObjectMemoryManager:
         dst: ObjectHandle,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        self.capabilities.assert_handle(pid, src, ObjectRight.LINK)
-        self.capabilities.assert_handle(pid, dst, ObjectRight.READ)
+        src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
+        if not src_decision.allowed:
+            raise CapabilityDenied(src_decision.reason)
+        dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
+        if not dst_decision.allowed:
+            raise CapabilityDenied(dst_decision.reason)
         link = ObjectLink(
             link_id=new_id("lnk"),
             src=src.oid,
@@ -720,21 +775,23 @@ class ObjectMemoryManager:
             created_by=pid,
             created_at=utc_now(),
         )
-        self.store.insert_link(link)
-        event = self.events.emit(
-            EventType.OBJECT_LINKED,
-            source=pid,
-            target=pid,
-            payload={"src": src.oid, "relation": link.relation.value, "dst": dst.oid},
-        )
-        self.audit.record(
-            actor=pid,
-            action="memory.link_objects",
-            target=f"object:{src.oid}",
-            input_refs=[src.oid, dst.oid],
-            capability_refs=[src.capability_id, dst.capability_id],
-            decision={"relation": link.relation.value},
-        )
+        with self.store.transaction():
+            self._consume_one_time_decisions([src_decision, dst_decision])
+            self.store.insert_link(link)
+            event = self.events.emit(
+                EventType.OBJECT_LINKED,
+                source=pid,
+                target=pid,
+                payload={"src": src.oid, "relation": link.relation.value, "dst": dst.oid},
+            )
+            self.audit.record(
+                actor=pid,
+                action="memory.link_objects",
+                target=f"object:{src.oid}",
+                input_refs=[src.oid, dst.oid],
+                capability_refs=[src.capability_id, dst.capability_id],
+                decision={"relation": link.relation.value},
+            )
         updated_src = self.store.get_object(src.oid)
         self._notify_object_changed(
             src.oid,
@@ -760,34 +817,35 @@ class ObjectMemoryManager:
         *,
         reason: str,
     ) -> None:
-        if self.store.get_object(src_oid) is None:
-            raise NotFound(f"object not found: {src_oid}")
-        if self.store.get_object(dst_oid) is None:
-            raise NotFound(f"object not found: {dst_oid}")
-        link = ObjectLink(
-            link_id=new_id("lnk"),
-            src=src_oid,
-            relation=RelationType(relation),
-            dst=dst_oid,
-            metadata=metadata or {},
-            created_by=actor,
-            created_at=utc_now(),
-        )
-        self.store.insert_link(link)
-        event = self.events.emit(
-            EventType.OBJECT_LINKED,
-            source=actor,
-            target=actor,
-            payload={"src": src_oid, "relation": link.relation.value, "dst": dst_oid},
-        )
-        self.audit.record(
-            actor=actor,
-            action="memory.link_objects_trusted",
-            target=f"object:{src_oid}",
-            input_refs=[src_oid, dst_oid],
-            decision={"relation": link.relation.value, "reason": reason},
-        )
-        updated_src = self.store.get_object(src_oid)
+        with self.store.transaction():
+            if self.store.get_object(src_oid) is None:
+                raise NotFound(f"object not found: {src_oid}")
+            if self.store.get_object(dst_oid) is None:
+                raise NotFound(f"object not found: {dst_oid}")
+            link = ObjectLink(
+                link_id=new_id("lnk"),
+                src=src_oid,
+                relation=RelationType(relation),
+                dst=dst_oid,
+                metadata=metadata or {},
+                created_by=actor,
+                created_at=utc_now(),
+            )
+            self.store.insert_link(link)
+            event = self.events.emit(
+                EventType.OBJECT_LINKED,
+                source=actor,
+                target=actor,
+                payload={"src": src_oid, "relation": link.relation.value, "dst": dst_oid},
+            )
+            self.audit.record(
+                actor=actor,
+                action="memory.link_objects_trusted",
+                target=f"object:{src_oid}",
+                input_refs=[src_oid, dst_oid],
+                decision={"relation": link.relation.value, "reason": reason},
+            )
+            updated_src = self.store.get_object(src_oid)
         self._notify_object_changed(
             src_oid,
             {
@@ -999,14 +1057,14 @@ class ObjectMemoryManager:
             except CapabilityDenied:
                 skipped.append(oid)
                 continue
-            handle = self.capabilities.handle_for_object(
+            handle = self._issue_handle_and_consume_one_time_decisions(
                 parent_pid,
                 oid,
                 rights,
                 issued_by=f"memory.merge:{child_view.owner_pid}",
-                uses_remaining=1 if self._has_one_time_decision(decisions) else None,
+                one_time_decisions=decisions,
+                consume_decisions=decisions,
             )
-            self._consume_one_time_decisions(decisions)
             merged_handles.append(handle)
             merged.append(oid)
         self.audit.record(
@@ -1073,7 +1131,21 @@ class ObjectMemoryManager:
             if oid in preserve:
                 preserved.append(oid)
                 continue
-            if self.delete_object_trusted(actor, oid, reason=reason):
+            snapshot = self.store.get_object(oid)
+            if (
+                snapshot is None
+                or snapshot.owner_kind != selected_owner_kind
+                or snapshot.owner_id != owner_id
+            ):
+                continue
+            if self.delete_object_trusted(
+                actor,
+                oid,
+                reason=reason,
+                expected_owner_kind=selected_owner_kind,
+                expected_owner_id=owner_id,
+                expected_version=snapshot.version,
+            ):
                 released.append(oid)
         if released or preserve or pinned:
             self.audit.record(
@@ -1093,34 +1165,102 @@ class ObjectMemoryManager:
             )
         return released
 
-    def delete_object_trusted(self, actor: str, oid: str, *, reason: str) -> bool:
-        obj = self.store.get_object(oid)
+    def delete_object_trusted(
+        self,
+        actor: str,
+        oid: str,
+        *,
+        reason: str,
+        expected_owner_kind: ObjectOwnerKind | str | None = None,
+        expected_owner_id: str | None = None,
+        expected_version: int | None = None,
+    ) -> bool:
+        selected_owner_kind = ObjectOwnerKind(expected_owner_kind) if expected_owner_kind is not None else None
+        has_release_condition = (
+            selected_owner_kind is not None
+            or expected_owner_id is not None
+            or expected_version is not None
+        )
+        # Every object lifecycle mutation takes the ownership lock before any
+        # store transaction. Host finalizers run while ownership is stable but
+        # outside the SQL transaction: provider-side cleanup may need to
+        # durably persist a pre-effect intent before crossing its boundary.
+        with self._ownership_lock:
+            obj = self.store.get_object(oid)
+            if not self._matches_release_condition(
+                obj,
+                owner_kind=selected_owner_kind,
+                owner_id=expected_owner_id,
+                version=expected_version,
+            ):
+                return False
+            assert obj is not None
+            # Release finalizers bind host resources to Object Memory
+            # lifetimes. They run before capability revocation so failed
+            # cleanup cannot leave an unreachable host handle alive.
+            self._run_object_release_finalizers(obj, actor, reason)
+            with self.store.transaction(include_object_payloads=True):
+                # A finalizer may re-enter Object Memory on this thread.
+                # Recheck the exact owner/version snapshot before committing
+                # the relational release.
+                current = self.store.get_object(oid)
+                if not self._matches_release_condition(
+                    current,
+                    owner_kind=obj.owner_kind,
+                    owner_id=obj.owner_id,
+                    version=obj.version,
+                ):
+                    return False
+                if has_release_condition and not self._matches_release_condition(
+                    current,
+                    owner_kind=selected_owner_kind,
+                    owner_id=expected_owner_id,
+                    version=expected_version,
+                ):
+                    return False
+                if not self.store.delete_object(
+                    oid,
+                    expected_version=obj.version,
+                    expected_owner_kind=obj.owner_kind,
+                    expected_owner_id=obj.owner_id,
+                ):
+                    return False
+                revoked = self.capabilities.revoke_resource_trusted(
+                    f"object:{oid}",
+                    revoked_by=actor,
+                    reason=f"object released: {reason}",
+                )
+                self.audit.record(
+                    actor=actor,
+                    action="memory.delete_object",
+                    target=f"object:{oid}",
+                    input_refs=[oid],
+                    capability_refs=[cap.cap_id for cap in revoked],
+                    decision={
+                        "reason": reason,
+                        "owner_kind": obj.owner_kind.value,
+                        "owner_id": obj.owner_id,
+                        "version": obj.version,
+                        "revoked_capabilities": len(revoked),
+                    },
+                )
+                return True
+
+    def _matches_release_condition(
+        self,
+        obj: AgentObject | None,
+        *,
+        owner_kind: ObjectOwnerKind | None,
+        owner_id: str | None,
+        version: int | None,
+    ) -> bool:
         if obj is None:
             return False
-        # Release finalizers bind host resources to Object Memory lifetimes.
-        # They run before capability revocation so a failed cleanup cannot leave
-        # an unreachable host handle alive.
-        self._run_object_release_finalizers(obj, actor, reason)
-        revoked = self.capabilities.revoke_resource_trusted(
-            f"object:{oid}",
-            revoked_by=actor,
-            reason=f"object released: {reason}",
-        )
-        self.store.delete_object(oid)
-        self.audit.record(
-            actor=actor,
-            action="memory.delete_object",
-            target=f"object:{oid}",
-            input_refs=[oid],
-            capability_refs=[cap.cap_id for cap in revoked],
-            decision={
-                "reason": reason,
-                "owner_kind": obj.owner_kind.value,
-                "owner_id": obj.owner_id,
-                "revoked_capabilities": len(revoked),
-            },
-        )
-        return True
+        if owner_kind is not None and obj.owner_kind != owner_kind:
+            return False
+        if owner_id is not None and obj.owner_id != owner_id:
+            return False
+        return version is None or obj.version == version
 
     def _is_object_pinned(self, oid: str) -> bool:
         if self._object_pin_checker is None:
@@ -1207,35 +1347,44 @@ class ObjectMemoryManager:
         transferred: list[str] = []
         selected_from_kind = ObjectOwnerKind(from_owner_kind)
         selected_to_kind = ObjectOwnerKind(to_owner_kind)
-        for oid in sorted(set(oids)):
-            obj = self.store.get_object(oid)
-            if obj is None or obj.owner_kind != selected_from_kind or obj.owner_id != from_owner_id:
-                continue
-            self.store.update_object(
-                replace(
+        with self._ownership_lock, self.store.transaction(include_object_payloads=True):
+            for oid in sorted(set(oids)):
+                obj = self.store.get_object(oid)
+                if obj is None or obj.owner_kind != selected_from_kind or obj.owner_id != from_owner_id:
+                    continue
+                updated = replace(
                     obj,
                     owner_kind=selected_to_kind,
                     owner_id=to_owner_id,
+                    # Ownership is lifecycle state. Incrementing the version
+                    # prevents an A->B->A owner cycle from satisfying a stale
+                    # release snapshot.
+                    version=obj.version + 1,
                     updated_at=utc_now(),
                 )
-            )
-            transferred.append(oid)
-        if transferred:
-            self.audit.record(
-                actor=actor,
-                action="memory.transfer_owner",
-                target=f"object_owner:{selected_from_kind.value}:{from_owner_id}",
-                input_refs=transferred,
-                output_refs=transferred,
-                decision={
-                    "from_owner_kind": selected_from_kind.value,
-                    "from_owner_id": from_owner_id,
-                    "to_owner_kind": selected_to_kind.value,
-                    "to_owner_id": to_owner_id,
-                    "transferred": transferred,
-                    "reason": reason,
-                },
-            )
+                if self.store.update_object(
+                    updated,
+                    expected_version=obj.version,
+                    expected_owner_kind=selected_from_kind,
+                    expected_owner_id=from_owner_id,
+                ):
+                    transferred.append(oid)
+            if transferred:
+                self.audit.record(
+                    actor=actor,
+                    action="memory.transfer_owner",
+                    target=f"object_owner:{selected_from_kind.value}:{from_owner_id}",
+                    input_refs=transferred,
+                    output_refs=transferred,
+                    decision={
+                        "from_owner_kind": selected_from_kind.value,
+                        "from_owner_id": from_owner_id,
+                        "to_owner_kind": selected_to_kind.value,
+                        "to_owner_id": to_owner_id,
+                        "transferred": transferred,
+                        "reason": reason,
+                    },
+                )
         return transferred
 
     def lifetime_scope(
@@ -1418,18 +1567,19 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         one_time_decisions = list(one_time_decisions)
         consume_decisions = list(consume_decisions)
-        handle = self.capabilities.handle_for_object(
-            pid,
-            oid,
-            rights,
-            issued_by=issued_by,
-            uses_remaining=1 if self._has_one_time_decision(one_time_decisions) else None,
-        )
-        try:
+        # The derived handle and finite-use source consumption are one durable
+        # authority transition. Nested capability/audit/event writes use
+        # savepoints under this transaction, so any failure removes the handle
+        # instead of relying only on best-effort compensating revocation.
+        with self.store.transaction():
+            handle = self.capabilities.handle_for_object(
+                pid,
+                oid,
+                rights,
+                issued_by=issued_by,
+                uses_remaining=1 if self._has_one_time_decision(one_time_decisions) else None,
+            )
             self._consume_one_time_decisions(consume_decisions)
-        except Exception:
-            self._revoke_derived_handles(pid, [handle], reason="one-time handle derivation rolled back")
-            raise
         return handle
 
     def _revoke_derived_handles(self, pid: str, handles: Iterable[ObjectHandle], *, reason: str) -> None:
@@ -1663,7 +1813,9 @@ class ObjectMemoryManager:
         ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, label)
 
     def _validate_query_limit(self, limit: int) -> int:
-        selected = int(limit)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValidationError("Object Memory query limit must be an integer")
+        selected = limit
         if selected < 1:
             raise ValidationError("Object Memory query limit must be >= 1")
         if selected > self.config.memory.query_limit:

@@ -75,8 +75,8 @@ real Deno installation skip with a clear message when `deno` is missing; use
 - `docs/architecture.md`, `docs/runtime_model.md`, `docs/capabilities.md`,
   `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
   `docs/checkpoints.md`, `docs/jsonrpc.md`, `docs/mcp.md`, `docs/modules.md`,
-  `docs/gui.md`, `docs/cli.md`, `docs/development.md`, and `docs/benchmark.md`
-  are the core implementation guides.
+  `docs/storage.md`, `docs/gui.md`, `docs/cli.md`, `docs/development.md`, and
+  `docs/benchmark.md` are the core implementation guides.
 - `docs/mini_swe_agent_image.md` documents the package-only mini-swe-agent
   compatibility image.
 - `benchmarks/runtime_safety/schema.md` defines benchmark task shape for the M1
@@ -92,7 +92,7 @@ M0 is complete when:
 - the license metadata is internally consistent,
 - the CI workflow runs compile and unit tests on supported Python versions,
 - every core invariant has test coverage or an explicit gap,
-- benchmark task schema v0 exists,
+- benchmark task/output schema v1 exists,
 - benchmark harness documentation exists,
 - a one-page paper thesis with the fixed Agent libOS title exists,
 - this anonymity checklist exists and is linked from README.

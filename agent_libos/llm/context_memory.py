@@ -215,10 +215,24 @@ class LLMContextMemory:
             target_tokens=target_tokens,
             compressor_pids=compressor_pids,
         )
+        # Advance the durable provider-chain epoch before replacing volatile
+        # context payload state. If the replacement is interrupted, the next
+        # Responses request resets stateless rather than continuing against a
+        # context generation whose exact contents are uncertain.
+        self.runtime.store.set_llm_context_generation(
+            pid,
+            str(compacted_payload["cache_strategy"]["compacted_at"]),
+        )
         metadata = ObjectMetadata(
             title=f"LLM context for {pid}",
             summary="Compacted process prompt context optimized for bounded long-running sessions.",
-            tags=["llm_context", "prompt_cache", "compacted", f"compaction_method:{compaction_method}"],
+            tags=[
+                "llm_context",
+                "prompt_cache",
+                "compacted",
+                f"compaction_method:{compaction_method}",
+                f"compacted_at:{compacted_payload['cache_strategy']['compacted_at']}",
+            ],
             token_estimate=estimate_tokens(compacted_payload),
         )
         if obj is None:

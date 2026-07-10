@@ -62,13 +62,17 @@ that process to hold the capability needed by the underlying primitive, keeping
 audit attribution aligned with the capability decision.
 
 Closing the GUI server pauses auto-run and asks the scheduler to stop before it
-calls `Runtime.shutdown()` on an owned runtime. If no scheduler worker or
-ObjectTask tool thread is still inside synchronous work, shutdown closes owned
-runtime resources, including the runtime store. If a worker cannot be joined
-safely, the GUI server leaves the runtime store open and relies on process
-teardown instead of closing a database handle underneath the live worker. Host shutdown
-does not mark AgentProcess records as exited; process lifecycle changes still
-go through the runtime `process.exit` primitive/tool path.
+calls `Runtime.shutdown()` on an owned runtime. Every request that reads or
+mutates Runtime state registers as an in-flight runtime user, including the
+non-serialized health and ObjectTask-wait paths. Shutdown rejects new users,
+drains the registered handlers and the runtime lock within one bounded deadline,
+then closes the owned Runtime only after its own scheduler/ObjectTask drain
+succeeds. A timeout or failed runtime drain leaves the store and broadcaster
+open, clears the transient `closing` gate, and returns failure so shutdown can
+be retried after work settles. It never closes a database handle underneath a
+live worker. Host shutdown does not mark AgentProcess records as exited;
+process lifecycle changes still go through the runtime `process.exit`
+primitive/tool path.
 
 ## Development
 
@@ -89,7 +93,10 @@ The GUI server accepts the same runtime store targets as the CLI. SQLite paths
 are the default local store; PostgreSQL DSNs require installing the `postgres`
 extra and are redacted in startup and health payloads. Persistent stores use an
 active-runtime lease, so a GUI server and a writable CLI Runtime cannot open
-the same SQLite or PostgreSQL database concurrently.
+the same SQLite target or PostgreSQL database/schema concurrently. SQLite uses
+the canonical target plus a no-follow sidecar `flock` where available and a
+kernel exclusive database lock otherwise; PostgreSQL uses a stable
+database/schema advisory key. See [Runtime Storage](storage.md).
 
 The server prints one JSON line containing the selected local URL and bearer
 token:
@@ -184,6 +191,20 @@ the host runtime is configured with `llm.persist_full_io=False`, the same
 `llm_calls` API returns only bounded previews and hashes for sensitive prompt,
 tool, reasoning, and provider payload fields.
 
+GUI background auto-run deliberately sets `process_human_queue=false`. It may
+advance runnable model work, but it never auto-approves, auto-denies, or invents
+an answer for a pending human request. A human must decide through a request
+card (or another explicit host terminal surface), after which normal runtime
+wakeup/resume semantics apply.
+
+Request cards are typed. A permission card requires one of
+`always_allow`, `ask_each_time`, or `always_deny`; approving with
+`always_deny` and rejecting with `always_allow` are disabled and rejected by
+the server. A question approval requires a non-empty string answer. While a
+response is in flight the card remains visible and disabled; an HTTP error
+keeps its answer/policy draft and shows an error instead of optimistically
+removing the authoritative pending request.
+
 `POST /api/processes` and `POST /api/processes/{pid}/exec` accept optional
 `llm_profile` fields for host-selected per-process LLM routing. The GUI server
 validates those ids before writing a process record. Snapshots expose each
@@ -269,6 +290,10 @@ Important endpoints:
 - `GET /api/human-requests`
 - `POST /api/human-requests/{request_id}/respond` approves or rejects only
   pending requests; terminal or cancelled requests return a conflict.
+  `approved` must be a JSON boolean. Permission requests require
+  `decision.policy` equal to `always_allow`, `always_deny`, or
+  `ask_each_time`, consistent with approval/rejection. Approved questions
+  require a non-empty string `answer`; other JSON types are not coerced.
 - `GET /api/checkpoints`, `POST /api/checkpoints/create`,
   `GET /api/checkpoints/{checkpoint_id}`,
   `GET /api/checkpoints/{checkpoint_id}/diff`, and

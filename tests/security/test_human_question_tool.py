@@ -7,9 +7,15 @@ import tempfile
 import threading
 import time
 from agent_libos import Runtime
-from agent_libos.models.exceptions import HumanResponseRequired
+from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    ExternalEffectRollbackStatus,
+    HumanRequestStatus,
+    ProcessStatus,
+)
+from agent_libos.substrate import ProviderEffectNotStarted
 
 class TestHumanQuestionTool:
 
@@ -40,6 +46,103 @@ class TestHumanQuestionTool:
         assert result.ok, result.error
         assert result.payload['answer'] == 'blue'
         assert result.payload['request_id'] == pending.request_id
+        effects = [
+            effect
+            for effect in self.runtime.store.list_external_effects(pid=pid)
+            if effect.provider == 'human' and effect.operation == 'read'
+        ]
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].information_flow
+        persisted_metadata = json.dumps(effects[0].provider_metadata, sort_keys=True)
+        assert 'Which color should I use?' not in persisted_metadata
+        assert 'blue' not in persisted_metadata
+
+    def test_auto_answer_write_is_recorded_without_persisting_prompt_or_answer(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='auto answer ledger')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Sensitive deployment secret?'},
+            blocking=True,
+        )
+
+        processed = self.runtime.human.drain_terminal_queue(auto_answer='private-answer')
+
+        assert processed[0].request_id == request_id
+        assert processed[0].status == HumanRequestStatus.APPROVED
+        assert processed[0].decision['answer'] == 'private-answer'
+        effects = [
+            effect
+            for effect in self.runtime.store.list_external_effects(pid=pid)
+            if effect.provider == 'human' and effect.operation == 'write'
+        ]
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'finalized'
+        metadata = json.dumps(effects[0].provider_metadata, sort_keys=True)
+        assert 'Sensitive deployment secret?' not in metadata
+        assert 'private-answer' not in metadata
+
+    def test_auto_answer_post_provider_classifier_failure_keeps_pending_without_reprompt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='auto answer sink failure')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Prompt exactly once?'},
+            blocking=True,
+        )
+
+        def fail_classifier(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError('classifier unavailable')
+
+        monkeypatch.setattr(self.runtime.human.provider, 'classify_external_effect', fail_classifier)
+        processed = self.runtime.human.drain_terminal_queue(auto_answer='yes')
+
+        assert processed[0].request_id == request_id
+        assert processed[0].decision['answer'] == 'yes'
+        assert self.runtime.human.drain_terminal_queue(auto_answer='yes') == []
+        assert len(self.human_output) == 1
+        effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'pending'
+
+    @pytest.mark.parametrize('certified_not_started', [False, True])
+    def test_terminal_read_failure_preserves_pending_request_and_effect_semantics(
+        self,
+        certified_not_started: bool,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='terminal read failure')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Do not persist this prompt'},
+            blocking=True,
+        )
+
+        def fail_read(_prompt: str) -> str:
+            if certified_not_started:
+                raise ProviderEffectNotStarted('read did not start')
+            raise RuntimeError('ambiguous terminal read failure')
+
+        self.runtime.substrate.human.input_reader = fail_read
+        expected = ProviderEffectNotStarted if certified_not_started else RuntimeError
+        with pytest.raises(expected):
+            self.runtime.human.process_next_terminal()
+
+        assert self.runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
+        if certified_not_started:
+            assert effects == []
+        else:
+            assert len(effects) == 1
+            assert effects[0].effect_state == 'finalized'
+            assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+            metadata = json.dumps(effects[0].provider_metadata, sort_keys=True)
+            assert 'Do not persist this prompt' not in metadata
+            assert 'ambiguous terminal read failure' not in metadata
 
     def test_one_time_ask_human_capability_is_consumed_after_question_is_queued(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask once')
@@ -74,6 +177,66 @@ class TestHumanQuestionTool:
         ask_result = next((result for result in results if _action_name(result) == 'ask_human'))
         assert ask_result['result']['payload']['answer'] == 'Sunday 02:00 UTC'
         assert self.runtime.human.list(pid)[0].decision['answer'] == 'Sunday 02:00 UTC'
+
+    def test_question_cannot_be_approved_without_a_typed_answer(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='question needs answer')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Which environment?'},
+            blocking=True,
+        )
+
+        with pytest.raises(ValidationError, match='answer'):
+            self.runtime.human.approve(request_id, {'approved': True})
+        with pytest.raises(ValidationError, match='answer'):
+            self.runtime.human.approve(request_id, {'approved': True, 'answer': '   '})
+
+        assert self.runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+
+    def test_multiple_blocking_requests_keep_process_waiting_until_all_are_decided(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='wait for all questions')
+        first = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'First?'},
+            blocking=True,
+        )
+        second = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Second?'},
+            blocking=True,
+        )
+
+        self.runtime.human.approve(first, {'approved': True, 'answer': 'one'})
+        assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+
+        self.runtime.human.approve(second, {'approved': True, 'answer': 'two'})
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+    @pytest.mark.parametrize('terminal_action', ['cancel', 'exit'])
+    def test_terminal_process_cancels_pending_human_requests(self, terminal_action: str) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='terminal request cleanup')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Too late?'},
+            blocking=True,
+        )
+
+        if terminal_action == 'cancel':
+            self.runtime.process.cancel(pid, 'test cancellation')
+        else:
+            self.runtime.process.exit(pid, message='test exit')
+
+        request = self.runtime.human.get(request_id)
+        assert request.status == HumanRequestStatus.CANCELLED
+        assert request.decision is not None
+        assert request.decision['reason']
+        with pytest.raises(ValidationError, match='not pending'):
+            self.runtime.human.approve(request_id, {'approved': True, 'answer': 'late'})
 
     def test_pending_ask_human_llm_action_survives_runtime_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

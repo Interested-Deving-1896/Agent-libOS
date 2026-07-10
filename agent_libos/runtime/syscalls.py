@@ -134,6 +134,7 @@ class LibOSSyscallSession:
         self.runtime = runtime
         self.pid = pid
         self.config = config or DEFAULT_CONFIG
+        self._human_run_context = runtime.current_human_run_context()
         self._deferred_exit: dict[str, Any] | None = None
         self._deferred_exec: dict[str, Any] | None = None
         self._tracked_wait_states: set[tuple[ProcessStatus, str]] = set()
@@ -271,9 +272,9 @@ class LibOSSyscallSession:
                 raise CapabilityDenied(f"human request was not approved: {request_id} status={request.status.value}")
             processed = await self.runtime.human.aprocess_next_terminal(
                 human=request.human,
-                auto_approve=getattr(self.runtime, "_current_human_auto_approve", None),
-                auto_policy=getattr(self.runtime, "_current_human_auto_policy", None),
-                auto_answer=getattr(self.runtime, "_current_human_auto_answer", None),
+                auto_approve=self._human_run_context.auto_approve,
+                auto_policy=self._human_run_context.auto_policy,
+                auto_answer=self._human_run_context.auto_answer,
             )
             if processed is None:
                 await asyncio.sleep(self.runtime.scheduler.poll_interval_s)
