@@ -11,6 +11,7 @@ from agent_libos.models import (
     EventType,
     JIT_MULTIPLEXER_TOOL_NAME,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    ObjectType,
     ProcessStatus,
     ResourceBudget,
     ValidationResult,
@@ -43,6 +44,101 @@ class TestImageRegistration:
             assert runtime.get_image('custom-review:v0') is image
             assert 'image.register' in [record.action for record in runtime.audit.trace()]
             assert EventType.IMAGE_REGISTERED in [event.type for event in runtime.events.list()]
+        finally:
+            runtime.close()
+
+    def test_image_replace_failure_restores_cache_store_event_and_audit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            original = AgentImage(image_id='atomic-image:v0', name='atomic-image', version='v1')
+            runtime.image_registry.register(original, actor='test')
+            before_events = list(runtime.events.list())
+            before_audit = list(runtime.audit.trace())
+            real_record = runtime.audit.record
+
+            def fail_replace_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'image.replace':
+                    raise RuntimeError('image replace audit failed')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_replace_audit)
+            with pytest.raises(RuntimeError, match='image replace audit failed'):
+                runtime.image_registry.register(
+                    AgentImage(image_id='atomic-image:v0', name='atomic-image', version='v2'),
+                    actor='test',
+                    replace=True,
+                )
+
+            persisted = runtime.store.get_image('atomic-image:v0')
+            assert runtime.get_image('atomic-image:v0') is original
+            assert persisted is not None and persisted[0].version == 'v1'
+            assert runtime.events.list() == before_events
+            assert runtime.audit.trace() == before_audit
+        finally:
+            runtime.close()
+
+    def test_image_package_registration_failure_removes_new_artifact_and_manifest(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        package = _write_image_package(tmp_path / 'package-agent')
+        runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(tmp_path))
+        try:
+            before_artifacts = runtime.store.list_image_artifacts()
+            real_record = runtime.audit.record
+
+            def fail_package_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'image.package.register':
+                    raise RuntimeError('package registration audit failed')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_package_audit)
+            with pytest.raises(RuntimeError, match='package registration audit failed'):
+                runtime.image_registry.register_from_package_path(package, actor='test')
+
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.get_image('package-agent:v0') is None
+            assert runtime.store.list_image_artifacts() == before_artifacts
+            assert not [event for event in runtime.events.list() if event.target == 'image:package-agent:v0']
+            assert not [record for record in runtime.audit.trace() if record.target == 'image:package-agent:v0']
+        finally:
+            runtime.close()
+
+    def test_checkpoint_image_commit_failure_removes_new_artifact_and_manifest(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='atomic image commit')
+            checkpoint_id = runtime.checkpoint.create(pid, 'atomic image commit', actor=pid)
+            before_artifacts = runtime.store.list_image_artifacts()
+            real_emit = runtime.events.emit
+
+            def fail_commit_event(event_type: EventType | str, *args: Any, **kwargs: Any) -> Any:
+                if EventType(event_type) == EventType.IMAGE_COMMITTED:
+                    raise RuntimeError('image commit event failed')
+                return real_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_commit_event)
+            with pytest.raises(RuntimeError, match='image commit event failed'):
+                runtime.image_registry.commit_from_checkpoint(
+                    actor='test',
+                    checkpoint_id=checkpoint_id,
+                    image_id='atomic-commit:v0',
+                    name='atomic-commit',
+                    require_capability=False,
+                )
+
+            assert 'atomic-commit:v0' not in runtime.images
+            assert runtime.store.get_image('atomic-commit:v0') is None
+            assert runtime.store.list_image_artifacts() == before_artifacts
+            assert not [event for event in runtime.events.list() if event.target == 'image:atomic-commit:v0']
+            assert not [record for record in runtime.audit.trace() if record.target == 'image:atomic-commit:v0']
         finally:
             runtime.close()
 
@@ -336,6 +432,8 @@ class TestImageRegistration:
                     row for row in runtime.store.list_tools()
                     if row['name'] == 'package_count' and row['ephemeral']
                 ]
+                assert runtime.store.select_table_rows('tool_candidates') == []
+                assert not [obj for obj in runtime.store.list_objects() if obj.type == ObjectType.TOOL_CANDIDATE]
             finally:
                 runtime.close()
 
@@ -356,6 +454,8 @@ class TestImageRegistration:
                     row for row in runtime.store.list_tools()
                     if row['name'] == 'package_count' and row['ephemeral']
                 ]
+                assert runtime.store.select_table_rows('tool_candidates') == []
+                assert not [obj for obj in runtime.store.list_objects() if obj.type == ObjectType.TOOL_CANDIDATE]
             finally:
                 runtime.close()
 
@@ -519,6 +619,46 @@ class TestImageRegistration:
                 assert after.working_directory == before.working_directory
                 assert 'package_count' not in after.tool_table
                 assert seed_files == []
+            finally:
+                runtime.close()
+
+    def test_exec_process_late_package_failure_cleans_registered_jit_candidate_and_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                default_skills=['missing-package-skill'],
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = AcceptingValidationSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(image='base-agent:v0', goal='before late failed exec')
+                runtime.capability.grant(
+                    pid,
+                    runtime.image_registry.resource_for('package-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                before = runtime.process.get(pid)
+
+                with pytest.raises(Exception, match='missing-package-skill'):
+                    runtime.exec_process(pid, 'package-agent:v0', goal='after late failed exec')
+
+                after = runtime.process.get(pid)
+                materialized = Path(temp_dir) / runtime.config.image.materialized_workspace_root
+                seed_files = list(materialized.rglob('seed.txt')) if materialized.exists() else []
+                assert after.image_id == before.image_id
+                assert after.working_directory == before.working_directory
+                assert 'package_count' not in after.tool_table
+                assert seed_files == []
+                assert runtime.store.select_table_rows('tool_candidates', 'pid = ?', [pid]) == []
+                assert not [
+                    obj
+                    for obj in runtime.store.list_objects_owned_by('process', pid)
+                    if obj.type == ObjectType.TOOL_CANDIDATE
+                ]
+                assert not [row for row in runtime.store.list_tools() if row['name'] == 'package_count']
             finally:
                 runtime.close()
 

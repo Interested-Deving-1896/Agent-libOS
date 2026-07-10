@@ -41,6 +41,43 @@ class TestPermissionPolicy:
         assert allowed.ok
         assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'allowed'
 
+    def test_concurrent_terminal_drains_install_one_auto_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='concurrent terminal policy')
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        with pytest.raises(HumanResponseRequired):
+            self.runtime.tools.call(
+                pid,
+                'request_permission',
+                {'resource': resource, 'rights': ['write'], 'reason': 'single terminal winner'},
+            )
+
+        original_select = self.runtime.human._select_permission_policy
+        select_calls = 0
+        calls_lock = threading.Lock()
+
+        def slow_select(*args: object, **kwargs: object) -> str:
+            nonlocal select_calls
+            with calls_lock:
+                select_calls += 1
+            time.sleep(0.05)
+            return original_select(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.human, '_select_permission_policy', slow_select)
+        barrier = threading.Barrier(2)
+
+        def drain() -> object:
+            barrier.wait(timeout=2)
+            return self.runtime.human.process_next_terminal(auto_policy=CapabilityManager.ALWAYS_ALLOW)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: drain(), range(2)))
+
+        assert select_calls == 1
+        assert len([request for request in results if request is not None]) == 1
+        assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
+        assert len([record for record in self.runtime.audit.trace() if record.action == 'capability.permission_policy']) == 1
+
     def test_request_permission_tool_can_set_always_deny_policy_and_resume_process(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='request denied write')
         self._grant_human(pid)

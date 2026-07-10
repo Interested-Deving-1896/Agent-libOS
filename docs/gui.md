@@ -34,6 +34,21 @@ Python GUI server
   -> never grants capability by GUI visibility
 ```
 
+SSE sequence ids are scoped to one GUI-server process and the replay buffer is
+bounded. A reconnecting client sends its last id as `cursor`. If that cursor is
+older than the retained window, or is ahead of the newest id after a server
+restart, the server emits `event.invalidated` with
+`reason: sse_cursor_not_replayable`, resets the stream cursor, and then replays
+the retained events. Clients must fetch `GET /api/snapshot` when they receive
+that invalidation; the bundled renderer does so. This makes a replay gap
+explicit instead of silently leaving the UI on stale state.
+
+Append-event de-duplication is bounded by the GUI event-buffer configuration.
+Immutable events, audit records, messages, and LLM calls use their durable ids.
+Human requests use the request id together with `updated_at` and `status`, so a
+pending request and its later approved/rejected/cancelled version each produce
+a `human_request.updated` event without growing an unbounded in-process set.
+
 The GUI server is not a new security boundary. It is a local admin control
 surface over the same primitives, Capability checks, human approval flow,
 events, and audit records used by the CLI. Its Python entrypoint lives under
@@ -159,7 +174,9 @@ selected process, or run the selected process with an optional quantum budget.
 Leaving the budget blank runs until the process/runtime becomes idle; entering a
 number bounds that run. Automatic runs after spawn/message/exec may advance all
 runnable processes, but `POST /api/processes/{pid}/run` is intentionally scoped
-to that pid. Real LLM calls are still persisted in `llm_calls`, so the GUI can
+to that pid. `POST /api/processes/{pid}/step` is synchronous: its response and
+the snapshot it publishes contain the final scheduler state (`running: false`)
+after the quantum has completed. Real LLM calls are still persisted in `llm_calls`, so the GUI can
 show token usage, errors, full stored LLM inputs and outputs, and bounded
 prompt/output observability metadata. This default supports self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. If
@@ -273,3 +290,7 @@ Important endpoints:
 - `GET /api/modules`, `GET /api/modules/{module_id}`
 
 All endpoints require `Authorization: Bearer <session-token>`.
+Mutation endpoints validate required ids, image names, and paths as non-empty
+JSON strings. Malformed enum values such as an unknown process signal, missing
+required fields, non-object request bodies, and incorrectly typed booleans
+return `400` without invoking the runtime mutation.

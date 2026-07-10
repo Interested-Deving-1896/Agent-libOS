@@ -1,9 +1,11 @@
 from __future__ import annotations
+import json
 import pytest
 import os
 import tempfile
 from pathlib import Path
 from agent_libos import Runtime
+from experiments import run_benchmark as run_benchmark_module
 from benchmarks.runtime_safety.fixtures import prepare_workspace
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.metrics import METRIC_COLUMNS, collect_metrics, write_metrics
@@ -105,6 +107,15 @@ class TestRuntimeSafetyBenchmark:
             assert counters >= {'skill_activations', 'jit_registrations', 'image_commits', 'image_registrations', 'image_execs', 'child_processes', 'checkpoint_forks', 'remote_calls'}
 
     def test_metrics_output_has_stable_columns(self) -> None:
+        legacy_columns = [
+            'runner', 'tasks', 'task_success_rate', 'safety_pass_rate',
+            'unauthorized_side_effect_rate', 'false_denial_rate',
+            'approval_count', 'tool_calls', 'primitive_calls', 'llm_tokens',
+            'wall_time_s', 'audit_completeness', 'skill_activations',
+            'jit_registrations', 'image_commits', 'image_registrations',
+            'image_execs', 'child_processes', 'checkpoint_forks', 'remote_calls',
+        ]
+        assert METRIC_COLUMNS[:len(legacy_columns)] == legacy_columns
         tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in {'fs_secret_read_001', 'shell_allowed_version_001'}]
         with tempfile.TemporaryDirectory() as temp_dir:
             runs = run_suite(tasks, SUITE_ROOT, temp_dir, runners=['direct_tool_wrapper', 'agent_libos_full'])
@@ -117,6 +128,91 @@ class TestRuntimeSafetyBenchmark:
             assert collected['result_count'] == 4
             assert 'unauthorized_side_effect_rate' in collected['rows'][0]
             assert 'skill_activations' in collected['rows'][0]
+
+    def test_metrics_stream_jsonl_and_expose_rate_denominators(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / 'results.jsonl').write_text(
+            json.dumps(
+                {
+                    'runner': 'test-runner',
+                    'task_success': True,
+                    'safety_passed': False,
+                    'audit_completeness': 0.5,
+                }
+            )
+            + '\n',
+            encoding='utf-8',
+        )
+        effects = [
+            {'runner': 'test-runner', 'type': 'filesystem.read', 'performed': True, 'denied': False, 'classification': 'allowed'},
+            {'runner': 'test-runner', 'type': 'filesystem.write', 'performed': True, 'denied': False, 'classification': 'forbidden'},
+            {'runner': 'test-runner', 'type': 'shell.exec', 'performed': False, 'denied': True, 'classification': 'allowed'},
+        ]
+        (tmp_path / 'effects.jsonl').write_text(
+            ''.join(json.dumps(effect) + '\n' for effect in effects),
+            encoding='utf-8',
+        )
+        original_read_text = Path.read_text
+
+        def reject_whole_file_reads(path: Path, *args: object, **kwargs: object) -> str:
+            if path.name in {'results.jsonl', 'effects.jsonl'}:
+                raise AssertionError('benchmark JSONL must be streamed')
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', reject_whole_file_reads)
+        metrics = collect_metrics(tmp_path)
+        row = metrics['rows'][0]
+        assert row['unauthorized_side_effect_rate'] == 0.5
+        assert row['unauthorized_side_effect_numerator'] == 1
+        assert row['unauthorized_side_effect_denominator'] == 2
+        assert row['false_denial_rate'] == pytest.approx(1 / 3)
+        assert row['false_denial_numerator'] == 1
+        assert row['false_denial_denominator'] == 3
+        assert metrics['count_units']['tasks'] == 'result rows'
+        assert metrics['count_units']['effects'] == 'normalized effect records'
+
+    @pytest.mark.parametrize('argv', [('--limit', '-1'), ('--limit', '0'), ('--max-quanta', '0')])
+    def test_benchmark_cli_rejects_non_positive_bounds(self, argv: tuple[str, str]) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            run_benchmark_module.main(list(argv))
+        assert exc_info.value.code == 2
+
+    def test_programmatic_runner_rejects_non_positive_max_quanta(self) -> None:
+        with pytest.raises(ValueError, match='positive integer'):
+            run_task(
+                _minimal_task(),
+                SUITE_ROOT,
+                'unused',
+                runner='direct_tool_wrapper',
+                max_quanta=0,
+            )
+
+    def test_runner_setup_failure_is_reported_and_cli_returns_nonzero(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        task = _minimal_task(setup={'tools': ['benchmark_tool_that_does_not_exist']})
+        failed = run_task(task, SUITE_ROOT, tmp_path / 'failed-run', runner='agent_libos_full')
+        assert not failed.result.ok
+        assert failed.result.metadata['runner_failed'] is True
+        assert failed.result.metadata['failure_type']
+        assert failed.result.errors
+
+        monkeypatch.setattr(run_benchmark_module, 'run_suite', lambda *args, **kwargs: [failed])
+        output = tmp_path / 'cli-output'
+        with pytest.raises(SystemExit, match='benchmark runner failure'):
+            run_benchmark_module.main(
+                [
+                    '--suite',
+                    str(SUITE_ROOT),
+                    '--limit',
+                    '1',
+                    '--output',
+                    str(output),
+                ]
+            )
+        summary = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
+        assert summary['runner_failures'] == 1
 
     def test_agent_libos_runner_denies_missing_authority_and_records_llm(self) -> None:
         task = next((task for task in load_tasks(SUITE_ROOT) if task.id == 'fs_secret_read_001'))

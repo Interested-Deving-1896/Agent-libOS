@@ -2,6 +2,7 @@ from __future__ import annotations
 import pytest
 import asyncio
 import os
+import signal
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from agent_libos.models import (
     CapabilityRight,
     JIT_MULTIPLEXER_TOOL_NAME,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    ObjectOwnerKind,
     ProcessStatus,
     ResourceBudget,
     ValidationResult,
@@ -100,11 +102,90 @@ class TestJitSecurity:
         assert 'filesystem.write' in candidate.spec.side_effects
         assert 'jsonrpc.call' in candidate.spec.side_effects
 
+    def test_jit_proposal_failure_rolls_back_candidate_and_descriptor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        owner = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='atomic proposal')
+        before_oids = {
+            obj.oid
+            for obj in self.runtime.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, owner)
+        }
+        before_candidates = self.runtime.store.select_table_rows('tool_candidates', 'pid = ?', [owner])
+        real_record = self.runtime.audit.record
+
+        def fail_proposal_audit(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get('action') == 'tool.propose':
+                raise RuntimeError('proposal audit failed')
+            return real_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_proposal_audit)
+        with pytest.raises(RuntimeError, match='proposal audit failed'):
+            self.runtime.tools.propose(
+                owner,
+                {'name': 'atomic_proposal', 'description': 'Atomic.', 'input_schema': {'type': 'object'}},
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+        assert self.runtime.store.select_table_rows('tool_candidates', 'pid = ?', [owner]) == before_candidates
+        assert {
+            obj.oid
+            for obj in self.runtime.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, owner)
+        } == before_oids
+
+    def test_jit_validation_and_registration_metadata_commit_atomically(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self.runtime.tools.sandbox = RecordingValidationSandbox()
+        owner = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='atomic jit lifecycle')
+        candidate_id = self.runtime.tools.propose(
+            owner,
+            {'name': 'atomic_jit', 'description': 'Atomic.', 'input_schema': {'type': 'object'}},
+            source_code='export function run(args, libos) { return {}; }',
+        )
+        real_record = self.runtime.audit.record
+
+        def fail_validation_audit(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get('action') == 'tool.validate':
+                raise RuntimeError('validation audit failed')
+            return real_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_validation_audit)
+        with pytest.raises(RuntimeError, match='validation audit failed'):
+            self.runtime.tools.validate(candidate_id, pid=owner)
+        candidate = self.runtime.store.get_tool_candidate(candidate_id)
+        assert candidate is not None
+        assert candidate.status.value == 'proposed'
+        assert candidate.validation is None
+
+        monkeypatch.setattr(self.runtime.audit, 'record', real_record)
+        assert self.runtime.tools.validate(candidate_id, pid=owner).ok
+
+        def fail_registration_audit(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get('action') == 'tool.register':
+                raise RuntimeError('registration audit failed')
+            return real_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_registration_audit)
+        with pytest.raises(RuntimeError, match='registration audit failed'):
+            self.runtime.tools.register(owner, candidate_id)
+
+        candidate = self.runtime.store.get_tool_candidate(candidate_id)
+        assert candidate is not None
+        assert candidate.status.value == 'validated'
+        assert candidate.registered_tool_id is None
+        assert 'atomic_jit' not in self.runtime.process.get(owner).tool_table
+        assert not [row for row in self.runtime.store.list_tools() if row['name'] == 'atomic_jit']
+        assert not [handle for handle in self.runtime.tools._handles.values() if handle.name == 'atomic_jit']
+
     def test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
         commands: list[list[str]] = []
+        launch_kwargs: list[dict[str, Any]] = []
 
-        async def fake_create_subprocess_exec(*command: str, **_kwargs: Any) -> Any:
+        async def fake_create_subprocess_exec(*command: str, **kwargs: Any) -> Any:
             commands.append(list(command))
+            launch_kwargs.append(dict(kwargs))
             return SimpleNamespace()
 
         async def fake_monitor_process(_proc: Any, _limits: Any) -> CommandMetrics:
@@ -132,6 +213,107 @@ class TestJitSecurity:
         assert validation.ok, validation.errors
         assert commands[0] == ['deno', 'run', '--no-prompt', '--cached-only', 'runner.ts']
         assert commands[1] == ['deno', 'run', '--no-prompt', 'runner.ts']
+        group_key = 'creationflags' if os.name == 'nt' else 'start_new_session'
+        assert all(kwargs.get(group_key) for kwargs in launch_kwargs)
+
+    def test_cancelled_deno_execution_kills_process_and_drains_workers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+        started: asyncio.Event
+        killed: asyncio.Event
+
+        async def scenario() -> None:
+            nonlocal started, killed
+            started = asyncio.Event()
+            killed = asyncio.Event()
+            proc = SimpleNamespace(pid=4242, returncode=None)
+
+            async def fake_create_subprocess_exec(*_command: str, **_kwargs: Any) -> Any:
+                return proc
+
+            async def block_worker(*_args: Any, **_kwargs: Any) -> Any:
+                started.set()
+                await asyncio.Event().wait()
+
+            async def kill_process(selected: Any) -> None:
+                assert selected is proc
+                selected.returncode = -9
+                killed.set()
+
+            monkeypatch.setattr(sandbox, '_resolve_deno', lambda: 'deno')
+            monkeypatch.setattr(asyncio, 'create_subprocess_exec', fake_create_subprocess_exec)
+            monkeypatch.setattr(sandbox, '_serve_process', block_worker)
+            monkeypatch.setattr(sandbox, '_monitor_process', block_worker)
+            monkeypatch.setattr(sandbox, '_kill_process', kill_process)
+
+            task = asyncio.create_task(
+                sandbox.arun_source('export function run(args, libos) { return {}; }', {}),
+                name='cancelled-deno-execution',
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert killed.is_set()
+            assert not [
+                worker
+                for worker in asyncio.all_tasks()
+                if worker is not asyncio.current_task()
+                and worker.get_name() in {'deno-resource-monitor', 'deno-syscall-server'}
+                and not worker.done()
+            ]
+
+        asyncio.run(scenario())
+
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX process-group semantics')
+    def test_deno_cleanup_kills_process_group_and_descendants(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sandbox = DenoTypescriptSandbox()
+        killed_groups: list[tuple[int, int]] = []
+
+        class Child:
+            killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+        class Root:
+            def __init__(self, child: Child) -> None:
+                self.child = child
+
+            def children(self, recursive: bool = False) -> list[Child]:
+                assert recursive is True
+                return [self.child]
+
+        class Proc:
+            pid = 7331
+            returncode: int | None = None
+            killed = False
+            waited = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+            async def wait(self) -> int:
+                self.waited = True
+                self.returncode = -9
+                return self.returncode
+
+        child = Child()
+        proc = Proc()
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.Process', lambda _pid: Root(child))
+        monkeypatch.setattr(
+            'agent_libos.tools.sandbox.os.killpg',
+            lambda pid, sig: killed_groups.append((pid, sig)),
+        )
+
+        asyncio.run(sandbox._kill_process(proc))
+
+        assert killed_groups == [(proc.pid, signal.SIGKILL)]
+        assert child.killed
+        assert proc.killed
+        assert proc.waited
 
     @pytest.mark.real_deno
     def test_jit_tool_names_are_process_local(self) -> None:

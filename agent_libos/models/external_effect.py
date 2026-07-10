@@ -10,12 +10,14 @@ class ExternalEffectRollbackClass(StrEnum):
     IRREVERSIBLE = "irreversible"
     ROLLBACKABLE = "rollbackable"
     NO_ROLLBACK_REQUIRED = "no_rollback_required"
+    UNKNOWN = "unknown"
 
 
 class ExternalEffectRollbackStatus(StrEnum):
     NOT_SUPPORTED = "not_supported"
     NOT_APPLIED = "not_applied"
     NOT_REQUIRED = "not_required"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)

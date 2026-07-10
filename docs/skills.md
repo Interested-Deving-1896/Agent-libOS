@@ -160,15 +160,25 @@ filesystem authority for each package file it snapshots.
 
 ## Activation And Unload
 
-`activate_skill` is atomic with respect to the process tool table and loaded
-Skill metadata. The runtime validates the package, existing tool references,
-duplicate tool/JIT names, TypeScript source limits, Deno static checks and
-tests through ToolBroker, and static tool shadowing before it modifies either
-record.
+Process-mediated catalog reads, registration, trust changes, activation, and
+unload reserve any finite-use Skill/process-admin grants before their durable
+operation. A failure before that operation commits restores the exact
+reservation token; an explicit revoke still wins over late cleanup. Registry,
+trust, event, and audit writes that describe one operation share its store
+transaction.
+
+`activate_skill` is atomic across the process tool table, loaded Skill metadata,
+process-local JIT rows, executable handles, and name aliases. The runtime
+validates the package, existing tool references, duplicate tool/JIT names,
+TypeScript source limits, Deno static checks and tests through ToolBroker, and
+static tool shadowing before publishing the new activation. A failed activation
+discards its unpublished candidates and aliases. Reactivation retires only the
+superseded JIT ids after the replacement commits.
 
 `unload_skill` removes tool visibility and prompt instructions contributed by
-that Skill. It does not revoke capabilities, delete audit history, delete JIT
-candidate records, or roll back external side effects.
+that Skill, along with the loaded Skill's process-local JIT tool and candidate
+rows and executable aliases. It does not revoke capabilities, delete audit
+history, or roll back external side effects.
 
 ## Process Semantics
 

@@ -28,11 +28,15 @@ revokes the capability when the count reaches zero. If one-shot Object Memory
 authority is resolved through a namespace/name lookup, any handle minted from
 that lookup remains one-shot; name lookup cannot turn temporary authority into
 a persistent object handle.
-For multi-step effects, primitives may reserve a one-shot use before creating
-human, Skill, ObjectTask, or provider side effects. They restore that reserved
-use only when the operation fails before the effect is committed; after the
-commit/provider boundary, the one-shot use remains consumed even if the remote
-or follow-on result is a failure.
+`require(...)` atomically consumes finite-use authority by default. For
+multi-step effects, primitives opt out with `consume=False`, reserve the exact
+use before creating human, Skill, ObjectTask, or provider side effects, and
+then commit or restore that reservation token. An explicit revoke invalidates
+outstanding tokens, so late cleanup cannot reactivate revoked authority.
+Reservations left in flight by a crashed runtime are abandoned fail-closed on
+the next open. A reserved use is restored only when an operation fails before
+the effect begins; after the commit/provider boundary, the one-shot use remains
+consumed even if the remote or follow-on result is a failure.
 
 `deny` records dominate matching allows. To create an exception, revoke the
 broad deny and issue narrower allow/deny records explicitly. The runtime does
@@ -114,9 +118,13 @@ The manager entry point is:
 authorize(subject, resource, right, context) -> CapabilityDecision
 ```
 
-`require(...)` wraps `authorize(...)` and raises on denial. Primitive code should
-pass operation context such as path, argv, byte counts, hashes, risk labels,
-process lineage, or provider details. The decision records:
+`require(...)` wraps `authorize(...)`, raises on denial, and claims finite-use
+authority before returning. Effect adapters that need pre-commit compensation
+must call `require(..., consume=False)` and use
+`reserve_decision_use`/`commit_reserved_use`; raw authorization decisions are
+not reusable effect tickets. Primitive code should pass operation context such
+as path, argv, byte counts, hashes, risk labels, process lineage, or provider
+details. The decision records:
 
 - matched capability ids,
 - selected capability id,
@@ -402,6 +410,12 @@ The built-in shell policy levels then decide how to handle the classified rule:
 - `blocklist_ask_else_auto`: use the same deterministic risk rules but is
   intended for broader local operation.
 - `always_allow`: allow non-destructive commands while still reporting risk.
+
+The capability record's own effect is evaluated before its policy level, so an
+`ask` or `deny` shell-policy capability cannot be converted into an automatic
+allow by setting `shell_policy_level=always_allow`. A finite-use command or
+policy allow is consumed after validation and intent recording, immediately
+before provider execution; provider failures do not restore that use.
 
 Rules match tokenized argv, not arbitrary substrings. Bare executable names do
 not match path-qualified executables by accident. The local provider executes

@@ -1,8 +1,10 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 import json
 import sqlite3
 import tempfile
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
@@ -1257,6 +1260,89 @@ class TestLLMContextMemory:
             after = runtime.store.get_object(context.oid)
             assert after is not None
             assert after.payload['entries'][-1] == {'kind': 'external_update', 'value': 'must survive'}
+            assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
+        finally:
+            runtime.close()
+
+    def test_replace_with_compacted_summary_matching_version_commits(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='compact matching context version')
+            context = _seed_context_entries(runtime, pid, count=3)
+
+            result = runtime.llm.context_memory.replace_with_compacted_summary(
+                pid,
+                context_oid=context.oid,
+                expected_version=context.version,
+                summary=_compact_summary('matching version summary'),
+                compaction_method='test_compaction',
+                preserve_recent_entries=1,
+                source_tokens=1000,
+                target_tokens=512,
+                compressor_pids=[],
+            )
+
+            after = runtime.store.get_object(context.oid)
+            assert after is not None
+            assert result['old_version'] == context.version
+            assert result['new_version'] == context.version + 1
+            assert after.version == context.version + 1
+            assert after.payload['entries'][0]['kind'] == 'context_compacted'
+            assert after.payload['entries'][0]['summary']['goal'] == 'matching version summary'
+            assert after.payload['entries'][-1] == {'kind': 'seed_entry', 'index': 2}
+        finally:
+            runtime.close()
+
+    def test_replace_with_compacted_summary_final_version_cas_preserves_concurrent_append(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='race final context version check')
+            context = _seed_context_entries(runtime, pid, count=3)
+            original_build = runtime.llm.context_memory._build_compacted_payload
+            entry_version_checked = threading.Barrier(2)
+            allow_replace = threading.Barrier(2)
+
+            def blocked_build(**kwargs: Any) -> tuple[dict[str, Any], int, int]:
+                entry_version_checked.wait(timeout=5)
+                allow_replace.wait(timeout=5)
+                return original_build(**kwargs)
+
+            monkeypatch.setattr(runtime.llm.context_memory, '_build_compacted_payload', blocked_build)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    runtime.llm.context_memory.replace_with_compacted_summary,
+                    pid,
+                    context_oid=context.oid,
+                    expected_version=context.version,
+                    summary=_compact_summary('stale summary after entry check'),
+                    compaction_method='test_compaction',
+                    preserve_recent_entries=0,
+                    source_tokens=1000,
+                    target_tokens=512,
+                    compressor_pids=[],
+                )
+                entry_version_checked.wait(timeout=5)
+                try:
+                    runtime.memory.append_object_by_name(
+                        pid,
+                        context_object_name(pid),
+                        {'kind': 'external_update', 'value': 'must survive final CAS'},
+                    )
+                finally:
+                    allow_replace.wait(timeout=5)
+                with pytest.raises(ValidationError, match='changed during compaction'):
+                    future.result(timeout=5)
+
+            after = runtime.store.get_object(context.oid)
+            assert after is not None
+            assert after.version == context.version + 1
+            assert after.payload['entries'][-1] == {
+                'kind': 'external_update',
+                'value': 'must survive final CAS',
+            }
             assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
         finally:
             runtime.close()

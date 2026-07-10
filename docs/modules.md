@@ -100,11 +100,18 @@ def register_module(ctx):
 
 The module context buffers registrations first. The registry verifies that the
 module registered only declared resources, checks name collisions, then applies
-the registrations before the runtime is returned to the caller. If registration
-or startup hooks fail, external module registrations are rolled back from the
-runtime registries and the module row is recorded as failed. Hook code may still
-perform arbitrary trusted host-side effects, so hooks should be kept small and
-idempotent.
+the registrations before the runtime is returned to the caller. Registration,
+module metadata, audit/event rows, and the in-memory tool/image/syscall/hook
+registries commit as one lifecycle transaction. Startup hooks run under the
+same registry snapshot discipline: if a hook registers a runtime tool, image,
+syscall, or provider hook directly and then fails, those registrations are
+removed before the module row is recorded as failed. The snapshot also restores
+runtime/substrate provider bindings, module-owned runtime attributes, shutdown
+finalizers, and Object release finalizers, which covers adapters such as the PTY
+module's host binding. Hook code may still perform arbitrary external trusted
+host-side effects that the runtime cannot compensate, so hooks should be kept
+small and idempotent and should not treat a registry rollback as an
+external-effect rollback.
 
 `Runtime.open()` runs all configured startup hooks before returning. If host code
 manually calls `runtime.modules.load_module_manifest()` after startup has already
@@ -161,6 +168,13 @@ failure.
 The local PTY backend resolves bare executables on a safe host PATH that
 excludes workspace entries, rejects workspace PATH hijacks, and gives child
 processes a workspace-scoped `HOME`/`USERPROFILE`.
+
+PTY resource accounting samples the complete process tree. If process-tree
+discovery or CPU/RSS inspection is denied, the adapter closes the session and
+releases its Object handle instead of continuing without accounting. On POSIX,
+cleanup signals the process group first; if that is denied it explicitly
+signals the discovered descendant tree, and surfaces cleanup failure rather
+than reporting an uncontained session as closed.
 
 Follow-on tools use that `session_oid` as the public handle:
 

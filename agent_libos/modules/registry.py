@@ -152,18 +152,22 @@ class RuntimeModuleRegistry:
     def run_startup_hooks(self) -> None:
         if self._startup_hooks_ran:
             return
-        for module_id, hook_name, hook in list(self._provider_hooks):
-            try:
-                self._run_module_hook(module_id, hook_name, hook, kind="provider")
-            except Exception as exc:
+        surface_snapshot = self._snapshot_runtime_surfaces()
+        failed_hook: tuple[str, str] | None = None
+        try:
+            with self.runtime.store.transaction(include_object_payloads=True):
+                for module_id, hook_name, hook in list(self._provider_hooks):
+                    failed_hook = (module_id, hook_name)
+                    self._run_module_hook(module_id, hook_name, hook, kind="provider")
+                for module_id, hook_name, hook in list(self._startup_hooks):
+                    failed_hook = (module_id, hook_name)
+                    self._run_module_hook(module_id, hook_name, hook, kind="startup")
+        except Exception as exc:
+            self._restore_runtime_surfaces(surface_snapshot)
+            if failed_hook is not None:
+                module_id, hook_name = failed_hook
                 self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
-                raise
-        for module_id, hook_name, hook in list(self._startup_hooks):
-            try:
-                self._run_module_hook(module_id, hook_name, hook, kind="startup")
-            except Exception as exc:
-                self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
-                raise
+            raise
         self._startup_hooks_ran = True
 
     def shutdown(self) -> bool:
@@ -179,81 +183,81 @@ class RuntimeModuleRegistry:
         import_cleanup: tuple[str, Any] | None = None,
     ) -> dict[str, Any]:
         ctx = ModuleContext(ModuleRuntimeView(config=self.runtime.config), source.manifest, enforce_provides=enforce_provides)
+        surface_snapshot = self._snapshot_runtime_surfaces()
         try:
-            result = entrypoint(ctx)
-            if inspect.isawaitable(result):
-                raise ValidationError(f"module entrypoint must be synchronous: {source.manifest.module_id}")
-            self._preflight_context(ctx)
-            self._apply_context(ctx)
-            now = utc_now()
-            summary = ctx.registered_summary()
-            self.runtime.store.upsert_runtime_module(
-                module_id=source.manifest.module_id,
-                name=source.manifest.name,
-                version=source.manifest.version,
-                entrypoint=source.manifest.entrypoint,
-                manifest_path=source.manifest_path,
-                manifest_sha256=source.manifest_sha256,
-                source_path=source.source_path,
-                source_sha256=source.source_sha256,
-                status="loaded",
-                loaded_at=now,
-                registered=summary,
-                error=None,
-                metadata=source.manifest.metadata,
-            )
-            self._loaded_modules[source.manifest.module_id] = {
-                "module_id": source.manifest.module_id,
-                "name": source.manifest.name,
-                "version": source.manifest.version,
-                "manifest_sha256": source.manifest_sha256,
-                "source_sha256": source.source_sha256,
-                "source_kind": source.source_kind,
-                "source_root": source.source_root,
-                "source_files": [
-                    {
-                        "path": item.path,
-                        "module_path": item.module_path,
-                        "size_bytes": item.size_bytes,
-                        "sha256": item.sha256,
-                    }
-                    for item in source.source_files
-                ],
-                "entrypoint": source.manifest.entrypoint,
-                "registered": summary,
-            }
-            self._applied_contexts[source.manifest.module_id] = ctx
-            self._applied_sources[source.manifest.module_id] = source
-            if import_cleanup is not None:
-                self._module_import_cleanups[source.manifest.module_id] = import_cleanup
-            self.runtime.events.emit(
-                EventType.MODULE_LOADED,
-                source="runtime",
-                target=f"module:{source.manifest.module_id}",
-                payload={"module_id": source.manifest.module_id, "registered": summary},
-            )
-            self.runtime.audit.record(
-                actor="runtime",
-                action="module.load",
-                target=f"module:{source.manifest.module_id}",
-                decision={
+            with self.runtime.store.transaction(include_object_payloads=True):
+                result = entrypoint(ctx)
+                if inspect.isawaitable(result):
+                    raise ValidationError(f"module entrypoint must be synchronous: {source.manifest.module_id}")
+                self._preflight_context(ctx)
+                self._apply_context(ctx)
+                now = utc_now()
+                summary = ctx.registered_summary()
+                self.runtime.store.upsert_runtime_module(
+                    module_id=source.manifest.module_id,
+                    name=source.manifest.name,
+                    version=source.manifest.version,
+                    entrypoint=source.manifest.entrypoint,
+                    manifest_path=source.manifest_path,
+                    manifest_sha256=source.manifest_sha256,
+                    source_path=source.source_path,
+                    source_sha256=source.source_sha256,
+                    status="loaded",
+                    loaded_at=now,
+                    registered=summary,
+                    error=None,
+                    metadata=source.manifest.metadata,
+                )
+                self._loaded_modules[source.manifest.module_id] = {
                     "module_id": source.manifest.module_id,
+                    "name": source.manifest.name,
                     "version": source.manifest.version,
                     "manifest_sha256": source.manifest_sha256,
                     "source_sha256": source.source_sha256,
                     "source_kind": source.source_kind,
+                    "source_root": source.source_root,
+                    "source_files": [
+                        {
+                            "path": item.path,
+                            "module_path": item.module_path,
+                            "size_bytes": item.size_bytes,
+                            "sha256": item.sha256,
+                        }
+                        for item in source.source_files
+                    ],
+                    "entrypoint": source.manifest.entrypoint,
                     "registered": summary,
-                },
-            )
-            if self._startup_hooks_ran and not self._is_internal_module(source.manifest.module_id):
-                self._run_context_hooks(ctx)
-            return self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
+                }
+                self._applied_contexts[source.manifest.module_id] = ctx
+                self._applied_sources[source.manifest.module_id] = source
+                if import_cleanup is not None:
+                    self._module_import_cleanups[source.manifest.module_id] = import_cleanup
+                self.runtime.events.emit(
+                    EventType.MODULE_LOADED,
+                    source="runtime",
+                    target=f"module:{source.manifest.module_id}",
+                    payload={"module_id": source.manifest.module_id, "registered": summary},
+                )
+                self.runtime.audit.record(
+                    actor="runtime",
+                    action="module.load",
+                    target=f"module:{source.manifest.module_id}",
+                    decision={
+                        "module_id": source.manifest.module_id,
+                        "version": source.manifest.version,
+                        "manifest_sha256": source.manifest_sha256,
+                        "source_sha256": source.source_sha256,
+                        "source_kind": source.source_kind,
+                        "registered": summary,
+                    },
+                )
+                if self._startup_hooks_ran and not self._is_internal_module(source.manifest.module_id):
+                    self._run_context_hooks(ctx)
+                loaded = self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
+            return loaded
         except Exception:
-            self._rollback_context(ctx)
+            self._restore_runtime_surfaces(surface_snapshot)
             self._cleanup_module_import(source.manifest.module_id, fallback=import_cleanup)
-            self._loaded_modules.pop(source.manifest.module_id, None)
-            self._applied_contexts.pop(source.manifest.module_id, None)
-            self._applied_sources.pop(source.manifest.module_id, None)
             raise
 
     def _require_module_id_available(self, module_id: str, source_sha256: str) -> None:
@@ -358,6 +362,67 @@ class RuntimeModuleRegistry:
             decision={"hook": hook_name},
         )
 
+    def _snapshot_runtime_surfaces(self) -> dict[str, Any]:
+        """Capture registries that a trusted module can mutate synchronously."""
+
+        substrate = self.runtime.substrate
+        return {
+            "runtime_attrs": dict(self.runtime.__dict__),
+            "shutdown_finalizers": list(self.runtime._shutdown_finalizers),
+            "object_release_finalizers": list(self.runtime.memory._object_release_finalizers),
+            "substrate": substrate,
+            "substrate_attrs": dict(getattr(substrate, "__dict__", {})),
+            "tool_implementations": dict(self.runtime.tools._tools),
+            "tool_ids_by_name": dict(self.runtime.tools._tool_ids_by_name),
+            "tool_handles": dict(self.runtime.tools._handles),
+            "jit_sources": dict(self.runtime.tools._jit_sources),
+            "images": dict(self.runtime.images),
+            "syscalls": dict(self.runtime.syscalls._handlers),
+            "runtime_provider_hooks": {
+                kind: list(hooks)
+                for kind, hooks in self.runtime.provider_hooks.items()
+            },
+            "provider_hooks": list(self._provider_hooks),
+            "startup_hooks": list(self._startup_hooks),
+            "loaded_modules": dict(self._loaded_modules),
+            "applied_contexts": dict(self._applied_contexts),
+            "applied_sources": dict(self._applied_sources),
+            "module_import_cleanups": dict(self._module_import_cleanups),
+        }
+
+    def _restore_runtime_surfaces(self, snapshot: dict[str, Any]) -> None:
+        runtime_attrs = snapshot["runtime_attrs"]
+        for name in set(self.runtime.__dict__) - set(runtime_attrs):
+            del self.runtime.__dict__[name]
+        self.runtime.__dict__.update(runtime_attrs)
+        substrate = snapshot["substrate"]
+        substrate_attrs = getattr(substrate, "__dict__", None)
+        if substrate_attrs is not None:
+            substrate_attrs.clear()
+            substrate_attrs.update(snapshot["substrate_attrs"])
+        self.runtime._shutdown_finalizers[:] = snapshot["shutdown_finalizers"]
+        self.runtime.memory._object_release_finalizers[:] = snapshot["object_release_finalizers"]
+        for target, key in [
+            (self.runtime.tools._tools, "tool_implementations"),
+            (self.runtime.tools._tool_ids_by_name, "tool_ids_by_name"),
+            (self.runtime.tools._handles, "tool_handles"),
+            (self.runtime.tools._jit_sources, "jit_sources"),
+            (self.runtime.images, "images"),
+            (self.runtime.syscalls._handlers, "syscalls"),
+            (self._loaded_modules, "loaded_modules"),
+            (self._applied_contexts, "applied_contexts"),
+            (self._applied_sources, "applied_sources"),
+            (self._module_import_cleanups, "module_import_cleanups"),
+        ]:
+            target.clear()
+            target.update(snapshot[key])
+        self.runtime.provider_hooks.clear()
+        self.runtime.provider_hooks.update(
+            {kind: list(hooks) for kind, hooks in snapshot["runtime_provider_hooks"].items()}
+        )
+        self._provider_hooks[:] = snapshot["provider_hooks"]
+        self._startup_hooks[:] = snapshot["startup_hooks"]
+
     def _rollback_external_modules_after_hook_failure(self, failed_module_id: str, exc: Exception, *, hook_name: str) -> None:
         module_ids = [
             module_id
@@ -381,8 +446,14 @@ class RuntimeModuleRegistry:
 
     def _rollback_module(self, module_id: str) -> None:
         ctx = self._applied_contexts.get(module_id)
-        if ctx is not None:
-            self._rollback_context(ctx)
+        surface_snapshot = self._snapshot_runtime_surfaces()
+        try:
+            with self.runtime.store.transaction(include_object_payloads=True):
+                if ctx is not None:
+                    self._rollback_context(ctx)
+        except Exception:
+            self._restore_runtime_surfaces(surface_snapshot)
+            raise
         self._cleanup_module_import(module_id)
         self._loaded_modules.pop(module_id, None)
         self._applied_contexts.pop(module_id, None)

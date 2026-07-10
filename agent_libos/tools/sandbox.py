@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -196,6 +197,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **self._subprocess_group_kwargs(),
             )
             monitor_task = asyncio.create_task(self._monitor_process(proc, limits), name="deno-resource-monitor")
             serve_task = asyncio.create_task(
@@ -254,9 +256,11 @@ class DenoTypescriptSandbox(SandboxBackend):
                 await self._kill_process(proc)
                 raise
             finally:
+                await asyncio.shield(self._kill_process(proc))
                 for task in (serve_task, monitor_task):
                     if not task.done():
                         task.cancel()
+                await asyncio.gather(serve_task, monitor_task, return_exceptions=True)
 
     def run_tests(
         self,
@@ -395,6 +399,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                     raise SandboxError("Deno JIT stderr exceeded max bytes")
                 return value
             if frame_type == "error":
+                await self._kill_process(proc)
                 stderr, _stderr_truncated = await self._finish_stderr(stderr_task)
                 message = str(frame.get("message") or stderr or "Deno JIT tool failed")
                 raise SandboxError(message)
@@ -530,14 +535,35 @@ class DenoTypescriptSandbox(SandboxBackend):
             return "", False
         return data[: self.max_stderr_bytes].decode("utf-8", errors="replace"), len(data) > self.max_stderr_bytes
 
+    def _subprocess_group_kwargs(self) -> dict[str, Any]:
+        if os.name == "nt":
+            return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        return {"start_new_session": True}
+
     async def _kill_process(self, proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
+        descendants: list[psutil.Process] = []
         try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-        await proc.wait()
+            descendants = psutil.Process(proc.pid).children(recursive=True)
+        except psutil.Error:
+            pass
+        if os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise SandboxError(f"failed to terminate Deno process group {proc.pid}: {exc}") from exc
+        for child in reversed(descendants):
+            try:
+                child.kill()
+            except psutil.Error:
+                continue
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
 
     def _test_syscall_handler(self, test: dict[str, Any], index: int) -> tuple[SyscallHandler, Callable[[], None]]:
         expected = list(test.get("syscalls", []))

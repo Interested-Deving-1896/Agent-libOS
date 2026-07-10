@@ -11,7 +11,17 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.models import AuthorityRisk, Capability, CapabilityEffect, CapabilityRight, EventType, ResourceUsage
+from agent_libos.models import (
+    AuthorityRisk,
+    Capability,
+    CapabilityEffect,
+    CapabilityRight,
+    EventType,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+    ResourceUsage,
+)
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import (
@@ -19,7 +29,12 @@ from agent_libos.runtime.external_effects import (
     record_external_effect,
     require_external_effect_classifier,
 )
-from agent_libos.substrate import FilesystemProvider, LocalFilesystemProvider, ResolvedPath
+from agent_libos.substrate import (
+    FilesystemProvider,
+    LocalFilesystemProvider,
+    ProviderEffectNotStarted,
+    ResolvedPath,
+)
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -137,6 +152,7 @@ class FilesystemAdapter:
                 right=CapabilityRight.READ.value,
                 extra={"max_bytes": max_bytes, "encoding": encoding},
             ),
+            consume=False,
         )
         target_state = self.provider.state(target)
         if not target_state.exists:
@@ -213,6 +229,7 @@ class FilesystemAdapter:
                 right=CapabilityRight.READ.value,
                 extra={"max_bytes": max_bytes},
             ),
+            consume=False,
         )
         target_state = self.provider.state(target)
         if not target_state.exists:
@@ -337,15 +354,20 @@ class FilesystemAdapter:
         try:
             self.provider.write_text(target, text, encoding=encoding, newline="\n", overwrite=overwrite)
         except Exception as exc:
-            self._restore_mutation_capability(reservation, right="write")
-            self._record_mutation_failure(
+            self._handle_mutation_provider_failure(
                 pid=pid,
+                operation="write_text",
+                right="write",
                 action="primitive.filesystem.write_text.failed",
                 target=resource,
+                context=effect_context,
                 intent_record=intent_record,
+                reservation_id=reservation,
+                error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
             )
             raise
+        self._commit_mutation_capability(reservation, right="write")
         bytes_written = bytes_to_write
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
@@ -405,6 +427,7 @@ class FilesystemAdapter:
                 right=CapabilityRight.READ.value,
                 extra={"limit": limit},
             ),
+            consume=False,
         )
         target_state = self.provider.state(target)
         if not target_state.exists:
@@ -524,15 +547,20 @@ class FilesystemAdapter:
         try:
             self.provider.make_directory(target, parents=parents, exist_ok=exist_ok)
         except Exception as exc:
-            self._restore_mutation_capability(reservation, right="write")
-            self._record_mutation_failure(
+            self._handle_mutation_provider_failure(
                 pid=pid,
+                operation="make_directory",
+                right="write",
                 action="primitive.filesystem.write_directory.failed",
                 target=resource,
+                context=effect_context,
                 intent_record=intent_record,
+                reservation_id=reservation,
+                error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
             )
             raise
+        self._commit_mutation_capability(reservation, right="write")
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -601,7 +629,8 @@ class FilesystemAdapter:
                 raise NotFound(f"file does not exist: {relative}")
             # A no-op delete still consumes the exact one-shot approval: if the
             # path appears later, this grant must not turn into a real delete.
-            self._reserve_mutation_capability(consume_capability_id, right="delete")
+            reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
+            self._commit_mutation_capability(reservation, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False)
         if target_state.kind != "file":
             raise CapabilityDenied(f"path is not a file: {relative}")
@@ -617,15 +646,20 @@ class FilesystemAdapter:
         try:
             self.provider.delete_file(target)
         except Exception as exc:
-            self._restore_mutation_capability(reservation, right="delete")
-            self._record_mutation_failure(
+            self._handle_mutation_provider_failure(
                 pid=pid,
+                operation="delete_file",
+                right="delete",
                 action="primitive.filesystem.delete_file.failed",
                 target=resource,
+                context=effect_context,
                 intent_record=intent_record,
+                reservation_id=reservation,
+                error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
             )
             raise
+        self._commit_mutation_capability(reservation, right="delete")
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -697,7 +731,8 @@ class FilesystemAdapter:
                 raise NotFound(f"directory does not exist: {relative}")
             # A no-op delete still consumes the exact one-shot approval: if the
             # path appears later, this grant must not turn into a real delete.
-            self._reserve_mutation_capability(consume_capability_id, right="delete")
+            reservation = self._reserve_mutation_capability(consume_capability_id, right="delete")
+            self._commit_mutation_capability(reservation, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
         if target_state.kind != "directory":
             raise CapabilityDenied(f"path is not a directory: {relative}")
@@ -718,15 +753,20 @@ class FilesystemAdapter:
         try:
             self.provider.delete_directory(target, recursive=recursive)
         except Exception as exc:
-            self._restore_mutation_capability(reservation, right="delete")
-            self._record_mutation_failure(
+            self._handle_mutation_provider_failure(
                 pid=pid,
+                operation="delete_directory",
+                right="delete",
                 action="primitive.filesystem.delete_directory.failed",
                 target=resource,
+                context=effect_context,
                 intent_record=intent_record,
+                reservation_id=reservation,
+                error=exc,
                 decision={"path": relative, "error_type": type(exc).__name__, "error": str(exc)},
             )
             raise
+        self._commit_mutation_capability(reservation, right="delete")
         event = self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -880,7 +920,20 @@ class FilesystemAdapter:
         event: Any,
         audit_record: Any,
     ) -> None:
-        classification = classify_external_effect(self.provider, operation, context, result)
+        try:
+            classification = classify_external_effect(self.provider, operation, context, result)
+        except Exception as exc:
+            mutation = operation in {"write_text", "make_directory", "delete_file", "delete_directory"}
+            classification = ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=mutation,
+                information_flow=not mutation,
+                metadata={
+                    "classification_error": f"{type(exc).__name__}: {exc}",
+                    "classification_fallback": "post_effect_failure",
+                },
+            )
         record_external_effect(
             self.audit.store,
             pid=pid,
@@ -966,18 +1019,24 @@ class FilesystemAdapter:
         # grants are reserved before the side effect and refunded only if the
         # provider raises. This closes the concurrent authorize-then-write race
         # without consuming approval for ordinary provider failures.
-        self.capabilities.consume_use(
+        return self.capabilities.reserve_use(
             capability_id,
-            used_by="filesystem",
+            reserved_by="filesystem",
             reason=f"one-time filesystem {right} permission reserved",
         )
-        return capability_id
 
-    def _restore_mutation_capability(self, capability_id: str | None, *, right: str) -> None:
-        if capability_id is None:
+    def _commit_mutation_capability(self, reservation_id: str | None, *, right: str) -> None:
+        self.capabilities.commit_reserved_use(
+            reservation_id,
+            committed_by="filesystem",
+            reason=f"one-time filesystem {right} permission committed",
+        )
+
+    def _restore_mutation_capability(self, reservation_id: str | None, *, right: str) -> None:
+        if reservation_id is None:
             return
         self.capabilities._restore_reserved_use(
-            capability_id,
+            reservation_id,
             restored_by="filesystem",
             reason=f"one-time filesystem {right} permission restored after provider failure",
         )
@@ -1005,14 +1064,83 @@ class FilesystemAdapter:
         target: str,
         intent_record: Any,
         decision: dict[str, Any],
-    ) -> None:
-        self.audit.record(
+    ) -> Any:
+        return self.audit.record(
             actor=pid,
             action=action,
             target=target,
             decision=decision,
             correlation_id=intent_record.record_id,
             parent_record_id=intent_record.record_id,
+        )
+
+    def _handle_mutation_provider_failure(
+        self,
+        *,
+        pid: str,
+        operation: str,
+        right: str,
+        action: str,
+        target: str,
+        context: dict[str, Any],
+        intent_record: Any,
+        reservation_id: str | None,
+        error: Exception,
+        decision: dict[str, Any],
+    ) -> None:
+        if isinstance(error, ProviderEffectNotStarted):
+            self._restore_mutation_capability(reservation_id, right=right)
+            self._record_mutation_failure(
+                pid=pid,
+                action=action,
+                target=target,
+                intent_record=intent_record,
+                decision={**decision, "effect_outcome": "not_started"},
+            )
+            return
+
+        # Once an effectful provider call has been entered, an ordinary
+        # exception cannot prove that the mutation did not commit.  Preserve
+        # fail-closed one-shot semantics and make the uncertainty durable.
+        self._commit_mutation_capability(reservation_id, right=right)
+        event = self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source=pid,
+            target=target,
+            payload={
+                "adapter": "filesystem",
+                "operation": operation,
+                "outcome": "unknown",
+                "error_type": type(error).__name__,
+            },
+        )
+        record_external_effect(
+            self.audit.store,
+            pid=pid,
+            provider="filesystem",
+            operation=operation,
+            target=target,
+            classification=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=True,
+                information_flow=False,
+                metadata={"outcome": "unknown_after_provider_exception"},
+            ),
+            audit_record=intent_record,
+            event=event,
+            metadata={
+                "context": context,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+        )
+        self._record_mutation_failure(
+            pid=pid,
+            action=action,
+            target=target,
+            intent_record=intent_record,
+            decision={**decision, "effect_outcome": "unknown"},
         )
 
     def _resolve(

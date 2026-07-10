@@ -10,13 +10,159 @@ from agent_libos import AgentImage, Runtime
 from agent_libos.models import CapabilityRight, ResourceBudget, ValidationResult
 from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.substrate import SubprocessLimits
-from agent_libos.tools.sandbox import DenoTypescriptSandbox
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.fakes import RecordingActionClient
 from tests.support.skills import write_skill_package
 
 
 class TestSkillIntegration:
+
+    def test_jit_skill_reactivation_replaces_alias_and_unload_removes_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(
+                root,
+                'replace-jit-skill',
+                jit_tools=[_jit_spec('replace_count', 'scripts/replace_count.ts')],
+                scripts={'scripts/replace_count.ts': _jit_source('v1')},
+            )
+            runtime = Runtime.open('local')
+            runtime.tools.sandbox = PassingSandbox()
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='replace jit skill')
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                runtime.capability.grant(pid, 'skill:replace-jit-skill', [CapabilityRight.EXECUTE], issued_by='test')
+                first = runtime.skills.activate_skill(pid, 'replace-jit-skill', actor=pid)
+                old_tool_id = first['jit_tool_ids']['replace_count']
+
+                write_skill_package(
+                    root,
+                    'replace-jit-skill',
+                    jit_tools=[_jit_spec('replace_count', 'scripts/replace_count.ts')],
+                    scripts={'scripts/replace_count.ts': _jit_source('v2')},
+                )
+                runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='cli',
+                    replace=True,
+                    require_capability=False,
+                )
+                second = runtime.skills.activate_skill(pid, 'replace-jit-skill', actor=pid)
+                new_tool_id = second['jit_tool_ids']['replace_count']
+
+                assert new_tool_id != old_tool_id
+                assert runtime.process.get(pid).tool_table['replace_count'] == new_tool_id
+                assert old_tool_id not in {str(row['tool_id']) for row in runtime.store.list_tools()}
+                assert old_tool_id not in runtime.tools._handles
+                assert old_tool_id not in runtime.tools._jit_sources
+                assert not runtime.store.select_table_rows(
+                    'tool_candidates',
+                    'registered_tool_id = ?',
+                    [old_tool_id],
+                )
+
+                runtime.skills.unload_skill(pid, 'replace-jit-skill', actor=pid)
+                assert 'replace_count' not in runtime.process.get(pid).tool_table
+                assert new_tool_id not in {str(row['tool_id']) for row in runtime.store.list_tools()}
+                assert new_tool_id not in runtime.tools._handles
+                assert new_tool_id not in runtime.tools._jit_sources
+                assert not runtime.store.select_table_rows(
+                    'tool_candidates',
+                    'registered_tool_id = ?',
+                    [new_tool_id],
+                )
+            finally:
+                runtime.close()
+
+    def test_jit_activation_failure_rolls_back_alias_rows_and_one_time_execute(self, monkeypatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'atomic-jit-skill',
+                jit_tools=[_jit_spec('atomic_count', 'scripts/atomic_count.ts')],
+                scripts={'scripts/atomic_count.ts': _jit_source('atomic')},
+            )
+            runtime = Runtime.open('local')
+            runtime.tools.sandbox = PassingSandbox()
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='atomic jit skill')
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                cap = runtime.capability.grant_once(
+                    pid,
+                    'skill:atomic-jit-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                )
+                real_emit = runtime.events.emit
+
+                def fail_loaded_event(event_type, *args, **kwargs):
+                    if str(getattr(event_type, 'value', event_type)) == 'skill_loaded':
+                        raise RuntimeError('skill loaded event failed')
+                    return real_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_loaded_event)
+                with pytest.raises(RuntimeError, match='skill loaded event failed'):
+                    runtime.skills.activate_skill(pid, 'atomic-jit-skill', actor=pid)
+
+                process = runtime.process.get(pid)
+                assert 'atomic-jit-skill' not in process.loaded_skills
+                assert 'atomic_count' not in process.tool_table
+                assert not [row for row in runtime.store.list_tools() if row['name'] == 'atomic_count']
+                candidates = runtime.store.select_table_rows(
+                    'tool_candidates',
+                    'pid = ?',
+                    [pid],
+                )
+                assert candidates == []
+                assert not any(
+                    isinstance(obj.payload, dict) and obj.payload.get('candidate_id')
+                    for obj in runtime.store.list_objects()
+                )
+                assert not [handle for handle in runtime.tools._handles.values() if handle.name == 'atomic_count']
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            finally:
+                runtime.close()
+
+    def test_tool_registration_failure_does_not_leave_partial_jit_state(self, monkeypatch) -> None:
+        runtime = Runtime.open('local')
+        runtime.tools.sandbox = PassingSandbox()
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='partial tool registration')
+            candidate_id = runtime.tools.propose(
+                pid,
+                {
+                    'name': 'partial_tool',
+                    'description': 'Partial tool.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code=_jit_source('partial'),
+            )
+            assert runtime.tools.validate(candidate_id, pid=pid).ok
+            real_update_process = runtime.store.update_process
+            calls = 0
+
+            def fail_once(process):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError('process update failed')
+                return real_update_process(process)
+
+            monkeypatch.setattr(runtime.store, 'update_process', fail_once)
+            with pytest.raises(RuntimeError, match='process update failed'):
+                runtime.tools.register(pid, candidate_id)
+
+            candidate = runtime.store.get_tool_candidate(candidate_id)
+            assert candidate is not None
+            assert candidate.status.value == 'validated'
+            assert candidate.registered_tool_id is None
+            assert 'partial_tool' not in runtime.process.get(pid).tool_table
+            assert not [row for row in runtime.store.list_tools() if row['name'] == 'partial_tool']
+            assert not [handle for handle in runtime.tools._handles.values() if handle.name == 'partial_tool']
+        finally:
+            runtime.close()
 
     @pytest.mark.real_deno
     def test_jit_skill_tool_is_process_local_and_uses_deno_validation_path(self) -> None:
@@ -241,3 +387,37 @@ class RecordingLimitDenoSandbox(DenoTypescriptSandbox):
         self.last_limits = limits
         self.last_return_metrics = return_metrics
         return super().run_tests(source_code, tests, timeout, limits=limits, return_metrics=return_metrics)
+
+
+class PassingSandbox(SandboxBackend):
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(self, source_code: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        return {'marker': source_code, **args}
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        return ValidationResult(ok=True, metadata={})
+
+
+def _jit_spec(name: str, source_path: str) -> dict[str, Any]:
+    return {
+        'name': name,
+        'description': f'{name} test tool.',
+        'source_path': source_path,
+        'input_schema': {'type': 'object'},
+        'output_schema': {'type': 'object'},
+        'tests': [],
+    }
+
+
+def _jit_source(marker: str) -> str:
+    return f'export async function run(args: unknown, libos: unknown) {{ return {{ marker: {marker!r} }}; }}\n'

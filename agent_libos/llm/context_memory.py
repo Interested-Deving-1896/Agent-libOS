@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.memory.object_memory import ObjectVersionConflict
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.utils.ids import estimate_tokens, utc_now
 from agent_libos.models import (
@@ -238,11 +239,18 @@ class LLMContextMemory:
                 optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
                 issued_by="llm.context.compact",
             )
-            updated = self.runtime.memory.update_object(
-                pid,
-                handle,
-                ObjectPatch(payload=compacted_payload, metadata=metadata),
-            )
+            try:
+                updated = self.runtime.memory.update_object(
+                    pid,
+                    handle,
+                    ObjectPatch(payload=compacted_payload, metadata=metadata),
+                    expected_version=expected_version,
+                )
+            except ObjectVersionConflict as exc:
+                raise ValidationError(
+                    "LLM context changed during compaction: "
+                    f"expected version {exc.expected_version}, found {exc.actual_version}"
+                ) from exc
             updated_obj = self.runtime.memory.get_object(pid, updated)
         view_handle = self.runtime.capability.handle_for_object(
             pid,

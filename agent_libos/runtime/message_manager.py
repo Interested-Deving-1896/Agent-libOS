@@ -227,34 +227,39 @@ class ProcessMessageManager:
             reply_to=reply_to,
             message_ids=message_ids,
         )
-        messages = self.list(
-            pid,
-            include_acked=include_acked,
-            kind=filters.get("kind"),
-            sender=filters.get("sender"),
-            channel=filters.get("channel"),
-            correlation_id=filters.get("correlation_id"),
-            reply_to=filters.get("reply_to"),
-            message_ids=filters.get("message_ids"),
-            limit=limit,
-        )
-        if messages or not block:
-            return messages
-        if message_ids == []:
+        if block and message_ids == []:
             raise ValidationError("blocking process message receive requires a non-empty message id filter")
-        if limit == 0:
+        if block and limit == 0:
             raise ValidationError("blocking process message receive requires a positive limit")
-        process = self._require_process(pid)
-        process.status = ProcessStatus.WAITING_EVENT
-        process.status_message = self._wait_status_message(filters)
-        process.updated_at = utc_now()
-        self.store.update_process(process)
-        self.audit.record(
-            actor=pid,
-            action="process.message.wait",
-            target=f"process:{pid}",
-            decision={"filters": filters, "block": True},
-        )
+        # The empty read and WAITING_EVENT registration form one atomic state
+        # transition with respect to post(). A post that wins the lock is seen
+        # by the read; a post that loses it observes the registered waiter and
+        # wakes it. There is no register-after-check lost-wakeup window.
+        with self.store.locked():
+            messages = self.list(
+                pid,
+                include_acked=include_acked,
+                kind=filters.get("kind"),
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+                limit=limit,
+            )
+            if messages or not block:
+                return messages
+            process = self._require_process(pid)
+            process.status = ProcessStatus.WAITING_EVENT
+            process.status_message = self._wait_status_message(filters)
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+            self.audit.record(
+                actor=pid,
+                action="process.message.wait",
+                target=f"process:{pid}",
+                decision={"filters": filters, "block": True},
+            )
         raise ProcessMessageWaitRequired(
             recipient_pid=pid,
             filters=filters,

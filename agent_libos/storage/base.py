@@ -170,7 +170,22 @@ class RuntimeStore(Protocol):
     def consume_capability_uses(self, cap_id: str, count: int = 1) -> Any | None:
         ...
 
-    def restore_reserved_capability_uses(self, cap_id: str, count: int = 1) -> Any | None:
+    def reserve_capability_uses(
+        self,
+        cap_id: str,
+        reservation_id: str,
+        *,
+        count: int = 1,
+        reserved_by: str,
+        reason: str,
+        created_at: str,
+    ) -> Any | None:
+        ...
+
+    def commit_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> bool:
+        ...
+
+    def restore_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> Any | None:
         ...
 
     def update_capability(self, cap: Any) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import hashlib
+import threading
 from typing import TYPE_CHECKING, Any
 
 from agent_libos.capability.manager import CapabilityManager
@@ -90,6 +91,12 @@ class HumanObjectManager:
         self.events = events
         self.provider = provider
         self._messages: ProcessMessageManager | None = None
+        # A terminal is a single human decision stream. Keep request selection,
+        # prompting/auto-policy selection, and the terminal transition in one
+        # critical section so concurrent scheduler drains cannot act on the
+        # same pending request. The lock is re-entrant because the terminal
+        # path completes through approve()/reject().
+        self._terminal_lock = threading.RLock()
 
     def bind_messages(self, messages: "ProcessMessageManager") -> None:
         self._messages = messages
@@ -114,32 +121,36 @@ class HumanObjectManager:
             created_at=now,
             updated_at=now,
         )
-        self.store.insert_human_request(human_request)
-        if blocking:
-            # Blocking human requests suspend scheduling for this process until
-            # a terminal queue decision moves it back to RUNNABLE.
-            process = self.store.get_process(pid)
-            if process is not None:
-                process.status = ProcessStatus.WAITING_HUMAN
-                process.status_message = f"waiting for human request {human_request.request_id}"
-                process.updated_at = utc_now()
-                self.store.update_process(process)
-        self.events.emit(
-            EventType.HUMAN_QUERY,
-            source=pid,
-            target=f"human:{human}",
-            payload={"request_id": human_request.request_id, "request": request, "blocking": blocking},
-        )
-        self.audit.record(
-            actor=pid,
-            action="human.query",
-            target=f"human:{human}",
-            decision={
-                "request_id": human_request.request_id,
-                "blocking": blocking,
-                "request": _sanitize_human_observability(request),
-            },
-        )
+        # Request persistence, scheduler suspension, and observability are one
+        # commit. A caller may therefore safely restore a reserved one-shot
+        # capability if this method raises: no pending request was left behind.
+        with self.store.transaction():
+            self.store.insert_human_request(human_request)
+            if blocking:
+                # Blocking human requests suspend scheduling for this process until
+                # a terminal queue decision moves it back to RUNNABLE.
+                process = self.store.get_process(pid)
+                if process is not None:
+                    process.status = ProcessStatus.WAITING_HUMAN
+                    process.status_message = f"waiting for human request {human_request.request_id}"
+                    process.updated_at = utc_now()
+                    self.store.update_process(process)
+            self.events.emit(
+                EventType.HUMAN_QUERY,
+                source=pid,
+                target=f"human:{human}",
+                payload={"request_id": human_request.request_id, "request": request, "blocking": blocking},
+            )
+            self.audit.record(
+                actor=pid,
+                action="human.query",
+                target=f"human:{human}",
+                decision={
+                    "request_id": human_request.request_id,
+                    "blocking": blocking,
+                    "request": _sanitize_human_observability(request),
+                },
+            )
         return human_request.request_id
 
     def request_permission(
@@ -152,19 +163,26 @@ class HumanObjectManager:
         blocking: bool = True,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
-        decision = self.capabilities.require(pid, f"human:{selected_human}", CapabilityRight.WRITE)
+        decision = self.capabilities.require(
+            pid,
+            f"human:{selected_human}",
+            CapabilityRight.WRITE,
+            consume=False,
+        )
         request = self._permission_request_payload(pid, resource, rights, reason)
-        reserved_capability_id = self._reserve_one_time_decision(decision, used_by="human")
+        reservation_id = self._reserve_one_time_decision(decision, used_by="human")
         try:
-            return self.query(
+            request_id = self.query(
                 pid=pid,
                 human=selected_human,
                 request=request,
                 blocking=blocking,
             )
         except Exception:
-            self._restore_one_time_decision(reserved_capability_id)
+            self._restore_one_time_decision(reservation_id)
             raise
+        self._commit_one_time_decision(reservation_id)
+        return request_id
 
     def _permission_request_payload(self, pid: str, resource: str, rights: list[str], reason: str) -> dict[str, Any]:
         pattern = self.capabilities.parse_resource_pattern(resource)
@@ -331,10 +349,10 @@ class HumanObjectManager:
     ) -> str:
         selected_human = human or self.config.runtime.default_human
         resource = f"human:{selected_human}"
-        decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
-        reserved_capability_id = self._reserve_one_time_decision(decision, used_by="human")
+        decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE, consume=False)
+        reservation_id = self._reserve_one_time_decision(decision, used_by="human")
         try:
-            return self.query(
+            request_id = self.query(
                 pid=pid,
                 human=selected_human,
                 request={
@@ -345,8 +363,10 @@ class HumanObjectManager:
                 blocking=blocking,
             )
         except Exception:
-            self._restore_one_time_decision(reserved_capability_id)
+            self._restore_one_time_decision(reservation_id)
             raise
+        self._commit_one_time_decision(reservation_id)
+        return request_id
 
     def answer_for_request(self, request_id: str) -> str:
         request = self.get(request_id)
@@ -478,8 +498,8 @@ class HumanObjectManager:
                 f"human output message exceeds max characters={self.config.tools.human_output_max_chars}"
             )
         resource = f"human:{selected_human}"
-        decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE)
-        reserved_capability_id = self._reserve_one_time_decision(decision, used_by="human")
+        decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE, consume=False)
+        reservation_id = self._reserve_one_time_decision(decision, used_by="human")
         request = HumanRequest(
             request_id=new_id("hreq"),
             pid=pid,
@@ -491,18 +511,41 @@ class HumanObjectManager:
             created_at=utc_now(),
             updated_at=utc_now(),
         )
-        try:
-            self.store.insert_human_request(request)
-        except Exception:
-            self._restore_one_time_decision(reserved_capability_id)
-            raise
-        try:
-            delivered = self._deliver_output_request(request)
-        except Exception:
-            latest = self.store.get_human_request(request.request_id)
-            if latest is None or latest.status == HumanRequestStatus.PENDING:
-                self._restore_one_time_decision(reserved_capability_id)
-            raise
+        # Insertion and immediate delivery must exclude terminal queue drains;
+        # otherwise a second worker can observe the just-inserted PENDING row
+        # and cross the human provider boundary a second time.
+        with self._terminal_lock:
+            try:
+                self.store.insert_human_request(request)
+            except Exception:
+                self._restore_one_time_decision(reservation_id)
+                raise
+            try:
+                delivered = self._deliver_output_request(request)
+            except Exception:
+                latest = self.store.get_human_request(request.request_id)
+                if latest is None or latest.status == HumanRequestStatus.PENDING:
+                    # A pre-effect failure must not leave a retryable pending
+                    # output after returning its authority to the subject: a
+                    # later terminal drain could otherwise deliver it after the
+                    # restored one-shot grant had been spent elsewhere.
+                    if latest is not None:
+                        latest.status = HumanRequestStatus.CANCELLED
+                        latest.decision = {"delivery_committed": False, "cancelled_before_delivery": True}
+                        latest.updated_at = utc_now()
+                        try:
+                            self.store.update_human_request(latest)
+                        except Exception:
+                            self._commit_one_time_decision(reservation_id)
+                            raise
+                    self._restore_one_time_decision(reservation_id)
+                else:
+                    # The durable effect intent was committed before provider
+                    # invocation; a provider exception is therefore ambiguous
+                    # and must not resurrect one-shot authority.
+                    self._commit_one_time_decision(reservation_id)
+                raise
+            self._commit_one_time_decision(reservation_id)
         return {
             "delivered": True,
             "request_id": delivered.request_id,
@@ -541,44 +584,45 @@ class HumanObjectManager:
         auto_policy: str | None = None,
         auto_answer: str | None = None,
     ) -> HumanRequest | None:
-        selected_human = human or self.config.runtime.default_human
-        pending = self.pending(human=selected_human)
-        if not pending:
-            return None
-        # The terminal is the human's message queue. Process requests strictly
-        # in creation order so approvals and answers remain predictable.
-        request = pending[0]
-        request_type = request.payload.get("type")
-        if request_type == "output":
-            return self._deliver_output_request(request)
-        question = self._terminal_question(request)
-        if request_type == "question":
-            answer = self._select_text_answer(
+        with self._terminal_lock:
+            selected_human = human or self.config.runtime.default_human
+            pending = self.pending(human=selected_human)
+            if not pending:
+                return None
+            # The terminal is the human's message queue. Process requests strictly
+            # in creation order so approvals and answers remain predictable.
+            request = pending[0]
+            request_type = request.payload.get("type")
+            if request_type == "output":
+                return self._deliver_output_request(request)
+            question = self._terminal_question(request)
+            if request_type == "question":
+                answer = self._select_text_answer(
+                    question=question,
+                    auto_answer=auto_answer,
+                )
+                return self.approve(
+                    request.request_id,
+                    {"approved": True, "answer": answer, "source": "terminal_queue"},
+                )
+            if request_type == "permission_request":
+                policy = self._select_permission_policy(
+                    question=question,
+                    auto_policy=auto_policy,
+                    auto_approve=auto_approve,
+                )
+                decision = {"policy": policy, "source": "terminal_queue"}
+                if policy == CapabilityManager.ALWAYS_DENY:
+                    return self.reject(request.request_id, {"approved": False, **decision})
+                return self.approve(request.request_id, {"approved": True, **decision})
+
+            approved = self._select_boolean_approval(
                 question=question,
-                auto_answer=auto_answer,
-            )
-            return self.approve(
-                request.request_id,
-                {"approved": True, "answer": answer, "source": "terminal_queue"},
-            )
-        if request_type == "permission_request":
-            policy = self._select_permission_policy(
-                question=question,
-                auto_policy=auto_policy,
                 auto_approve=auto_approve,
             )
-            decision = {"policy": policy, "source": "terminal_queue"}
-            if policy == CapabilityManager.ALWAYS_DENY:
-                return self.reject(request.request_id, {"approved": False, **decision})
-            return self.approve(request.request_id, {"approved": True, **decision})
-
-        approved = self._select_boolean_approval(
-            question=question,
-            auto_approve=auto_approve,
-        )
-        if approved:
-            return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
-        return self.reject(request.request_id, {"approved": False, "source": "terminal_queue"})
+            if approved:
+                return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
+            return self.reject(request.request_id, {"approved": False, "source": "terminal_queue"})
 
     async def aprocess_next_terminal(
         self,
@@ -640,51 +684,56 @@ class HumanObjectManager:
         decision: dict[str, Any],
         responder: str,
     ) -> HumanRequest:
-        with self.store.transaction():
-            request = self.store.get_human_request(request_id)
-            if request is None:
-                raise NotFound(f"human request not found: {request_id}")
-            if request.status != HumanRequestStatus.PENDING:
-                raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
-            self._validate_decision_side_effects(request, status, decision)
-            self._apply_decision_side_effects(request, status, decision, responder)
-            permission_related = False
-            permission_spec = request.payload.get("requested_permission")
-            if isinstance(permission_spec, dict):
-                permission_related = True
+        with self._terminal_lock:
+            with self.store.transaction():
+                request = self.store.get_human_request(request_id)
+                if request is None:
+                    raise NotFound(f"human request not found: {request_id}")
+                if request.status != HumanRequestStatus.PENDING:
+                    raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
+                self._validate_decision_side_effects(request, status, decision)
+                self._apply_decision_side_effects(request, status, decision, responder)
+                permission_related = False
+                permission_spec = request.payload.get("requested_permission")
+                if isinstance(permission_spec, dict):
+                    permission_related = True
 
-            once_spec = request.payload.get("requested_once_capability")
-            if isinstance(once_spec, dict):
-                permission_related = True
-            request.status = status
-            request.decision = decision
-            request.updated_at = utc_now()
-            self.store.update_human_request(request)
-            process = self.store.get_process(request.pid)
-            if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
-                # Permission denials still wake the process so it can observe the
-                # failed operation and explain what happened. Generic rejected human
-                # approvals remain a pause/interruption signal.
-                process.status = (
-                    ProcessStatus.RUNNABLE
-                    if status == HumanRequestStatus.APPROVED or permission_related
-                    else ProcessStatus.PAUSED
+                once_spec = request.payload.get("requested_once_capability")
+                if isinstance(once_spec, dict):
+                    permission_related = True
+                request.status = status
+                request.decision = decision
+                request.updated_at = utc_now()
+                self.store.update_human_request(request)
+                process = self.store.get_process(request.pid)
+                if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
+                    # Permission denials still wake the process so it can observe the
+                    # failed operation and explain what happened. Generic rejected human
+                    # approvals remain a pause/interruption signal.
+                    process.status = (
+                        ProcessStatus.RUNNABLE
+                        if status == HumanRequestStatus.APPROVED or permission_related
+                        else ProcessStatus.PAUSED
+                    )
+                    process.status_message = None if status == HumanRequestStatus.APPROVED else f"human rejected {request_id}"
+                    process.updated_at = utc_now()
+                    self.store.update_process(process)
+                self.events.emit(
+                    EventType.HUMAN_RESPONSE,
+                    source=responder,
+                    target=request.pid,
+                    payload={
+                        "request_id": request_id,
+                        "status": status.value,
+                        "decision": _sanitize_human_observability(decision),
+                    },
                 )
-                process.status_message = None if status == HumanRequestStatus.APPROVED else f"human rejected {request_id}"
-                process.updated_at = utc_now()
-                self.store.update_process(process)
-        self.events.emit(
-            EventType.HUMAN_RESPONSE,
-            source=responder,
-            target=request.pid,
-            payload={"request_id": request_id, "status": status.value, "decision": _sanitize_human_observability(decision)},
-        )
-        self.audit.record(
-            actor=responder,
-            action="human.response",
-            target=f"human_request:{request_id}",
-            decision={"status": status.value, "decision": _sanitize_human_observability(decision)},
-        )
+                self.audit.record(
+                    actor=responder,
+                    action="human.response",
+                    target=f"human_request:{request_id}",
+                    decision={"status": status.value, "decision": _sanitize_human_observability(decision)},
+                )
         return request
 
     def _validate_decision_side_effects(
@@ -818,31 +867,24 @@ class HumanObjectManager:
         )
 
     def _reserve_one_time_decision(self, decision: Any, *, used_by: str) -> str | None:
-        if decision.consume_capability_id is None:
-            return None
-        self.capabilities.claim_decision_use(
+        return self.capabilities.reserve_decision_use(
             decision,
             used_by=used_by,
             reason="one-time human permission reserved",
         )
-        return str(decision.consume_capability_id)
 
-    def _restore_one_time_decision(self, cap_id: str | None) -> None:
-        if cap_id is None:
-            return
-        self.capabilities._restore_reserved_use(
-            cap_id,
-            restored_by="human",
-            reason="one-time human permission restored before request commit",
+    def _commit_one_time_decision(self, reservation_id: str | None) -> None:
+        self.capabilities.commit_reserved_use(
+            reservation_id,
+            committed_by="human",
+            reason="one-time human permission committed",
         )
 
-    def _consume_one_time_decision(self, decision: Any, *, used_by: str) -> None:
-        if decision.consume_capability_id is None:
-            return
-        self.capabilities.claim_decision_use(
-            decision,
-            used_by=used_by,
-            reason="one-time human permission consumed",
+    def _restore_one_time_decision(self, reservation_id: str | None) -> None:
+        self.capabilities._restore_reserved_use(
+            reservation_id,
+            restored_by="human",
+            reason="one-time human permission restored before request commit",
         )
 
     def _select_permission_policy(

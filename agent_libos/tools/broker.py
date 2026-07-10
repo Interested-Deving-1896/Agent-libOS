@@ -288,33 +288,34 @@ class ToolBroker:
             created_at=now,
             updated_at=now,
         )
-        self.store.insert_tool_candidate(candidate)
-        candidate_obj = self.memory.create_object(
-            pid=pid,
-            object_type=ObjectType.TOOL_CANDIDATE,
-            payload={
-                "candidate_id": candidate.candidate_id,
-                "language": self.sandbox.language,
-                "spec": {
-                    "name": tool_spec.name,
-                    "description": tool_spec.description,
-                    "input_schema": tool_spec.input_schema,
-                    "output_schema": tool_spec.output_schema,
-                    "side_effects": tool_spec.side_effects,
+        with self.store.transaction(include_object_payloads=True):
+            self.store.insert_tool_candidate(candidate)
+            candidate_obj = self.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.TOOL_CANDIDATE,
+                payload={
+                    "candidate_id": candidate.candidate_id,
+                    "language": self.sandbox.language,
+                    "spec": {
+                        "name": tool_spec.name,
+                        "description": tool_spec.description,
+                        "input_schema": tool_spec.input_schema,
+                        "output_schema": tool_spec.output_schema,
+                        "side_effects": tool_spec.side_effects,
+                    },
+                    "tests": candidate.tests,
+                    "requested_capabilities": candidate.requested_capabilities,
                 },
-                "tests": candidate.tests,
-                "requested_capabilities": candidate.requested_capabilities,
-            },
-            metadata=ObjectMetadata(title=f"Tool candidate: {tool_spec.name}", tags=["tool", "candidate"]),
-            immutable=True,
-        )
-        self.audit.record(
-            actor=pid,
-            action="tool.propose",
-            target=f"tool_candidate:{candidate.candidate_id}",
-            output_refs=[candidate_obj.oid],
-            decision={"name": tool_spec.name},
-        )
+                metadata=ObjectMetadata(title=f"Tool candidate: {tool_spec.name}", tags=["tool", "candidate"]),
+                immutable=True,
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.propose",
+                target=f"tool_candidate:{candidate.candidate_id}",
+                output_refs=[candidate_obj.oid],
+                decision={"name": tool_spec.name},
+            )
         return candidate.candidate_id
 
     def validate(self, candidate_id: str, *, pid: str | None = None) -> ValidationResult:
@@ -354,13 +355,24 @@ class ToolBroker:
         candidate.validation = self._validation_observation(validation, metadata)
         candidate.status = ToolCandidateStatus.VALIDATED if validation.ok else ToolCandidateStatus.REJECTED
         candidate.updated_at = utc_now()
-        self.store.update_tool_candidate(candidate)
-        self.audit.record(
-            actor="tool_broker",
-            action="tool.validate",
-            target=f"tool_candidate:{candidate_id}",
-            decision=candidate.validation,
-        )
+        with self.store.transaction():
+            current = self._get_candidate(candidate_id)
+            self._require_candidate_owner(current, owner_pid)
+            state_changed = current.status != ToolCandidateStatus.REGISTERED
+            if state_changed:
+                current.validation = candidate.validation
+                current.status = candidate.status
+                current.updated_at = candidate.updated_at
+                self.store.update_tool_candidate(current)
+            self.audit.record(
+                actor="tool_broker",
+                action="tool.validate",
+                target=f"tool_candidate:{candidate_id}",
+                decision={
+                    **(candidate.validation or {}),
+                    "candidate_state_changed": state_changed,
+                },
+            )
         return validation
 
     def register(
@@ -369,46 +381,115 @@ class ToolBroker:
         candidate_id: str,
         approver: str = "policy:local",
         scope: str = "ephemeral_process",
+        replace_tool_id: str | None = None,
     ) -> ToolHandle:
         candidate = self._get_candidate(candidate_id)
         self._require_candidate_owner(candidate, pid)
         if candidate.status == ToolCandidateStatus.REGISTERED:
             raise ValidationError(f"tool candidate is already registered: {candidate_id}")
-        process = self.store.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        if candidate.spec.name in process.tool_table:
-            raise ValidationError(f"process already has a tool named: {candidate.spec.name}")
         if self._name_collides_with_static_tool(candidate.spec.name):
             raise ValidationError(f"tool name already exists: {candidate.spec.name}")
         if candidate.status != ToolCandidateStatus.VALIDATED:
             validation = self.validate(candidate_id, pid=pid)
             if not validation.ok:
                 raise ValidationError("; ".join(validation.errors))
-            candidate = self._get_candidate(candidate_id)
         tool_id = new_id("tool")
         handle = ToolHandle(tool_id=tool_id, name=candidate.spec.name, capability_id=None, scope=scope)
-        self._jit_sources[tool_id] = candidate.source_code
-        self._handles[tool_id] = handle
         # JIT tool names are process-local through AgentProcess.tool_table. Do
         # not add them to the global name index, otherwise later pid-less
         # resolve(name) calls can turn one process' JIT into a globally
         # referenceable tool.
-        self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
-        candidate.status = ToolCandidateStatus.REGISTERED
-        candidate.registered_tool_id = tool_id
-        candidate.updated_at = utc_now()
-        self.store.update_tool_candidate(candidate)
-        process.tool_table[candidate.spec.name] = tool_id
-        process.updated_at = utc_now()
-        self.store.update_process(process)
-        self.audit.record(
-            actor=approver,
-            action="tool.register",
-            target=f"tool:{tool_id}",
-            decision={"candidate_id": candidate_id, "scope": scope},
-        )
+        with self.store.transaction():
+            candidate = self._get_candidate(candidate_id)
+            self._require_candidate_owner(candidate, pid)
+            if candidate.status == ToolCandidateStatus.REGISTERED:
+                raise ValidationError(f"tool candidate is already registered: {candidate_id}")
+            if candidate.status != ToolCandidateStatus.VALIDATED:
+                raise ValidationError(f"tool candidate is not validated: {candidate_id}")
+            process = self.store.get_process(pid)
+            if process is None:
+                raise NotFound(f"process not found: {pid}")
+            existing_tool_id = process.tool_table.get(candidate.spec.name)
+            if existing_tool_id is not None and existing_tool_id != replace_tool_id:
+                raise ValidationError(f"process already has a tool named: {candidate.spec.name}")
+            if existing_tool_id is None and replace_tool_id is not None:
+                raise ValidationError(
+                    f"tool replacement target is stale for {candidate.spec.name}: {replace_tool_id}"
+                )
+            self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
+            candidate.status = ToolCandidateStatus.REGISTERED
+            candidate.registered_tool_id = tool_id
+            candidate.updated_at = utc_now()
+            self.store.update_tool_candidate(candidate)
+            process.tool_table[candidate.spec.name] = tool_id
+            process.updated_at = utc_now()
+            self.store.update_process(process)
+            self.audit.record(
+                actor=approver,
+                action="tool.register",
+                target=f"tool:{tool_id}",
+                decision={
+                    "candidate_id": candidate_id,
+                    "scope": scope,
+                    "replaced_tool_id": replace_tool_id,
+                },
+            )
+        self._jit_sources[tool_id] = candidate.source_code
+        self._handles[tool_id] = handle
         return handle
+
+    def discard_candidate(
+        self,
+        pid: str,
+        candidate_id: str,
+        *,
+        discarded_by: str = "tool_broker",
+        reason: str = "candidate_abandoned",
+    ) -> bool:
+        """Delete an unpublished candidate and its Object Memory descriptor."""
+
+        with self.store.transaction(include_object_payloads=True):
+            candidate = self.store.get_tool_candidate(candidate_id)
+            if candidate is not None:
+                self._require_candidate_owner(candidate, pid)
+                registered_tool_id = candidate.registered_tool_id
+                tool_exists = bool(
+                    registered_tool_id
+                    and any(row["tool_id"] == registered_tool_id for row in self.store.list_tools())
+                )
+                alias_exists = bool(
+                    registered_tool_id
+                    and any(
+                        registered_tool_id in process.tool_table.values()
+                        for process in self.store.list_processes()
+                    )
+                )
+                if tool_exists or alias_exists:
+                    raise ValidationError(f"cannot discard a registered tool candidate: {candidate_id}")
+            candidate_objects = [
+                obj
+                for obj in self.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, pid)
+                if obj.type == ObjectType.TOOL_CANDIDATE
+                and isinstance(obj.payload, dict)
+                and obj.payload.get("candidate_id") == candidate_id
+            ]
+            if candidate is None and not candidate_objects:
+                return False
+            for obj in candidate_objects:
+                self.memory.delete_object_trusted(
+                    discarded_by,
+                    obj.oid,
+                    reason=f"tool candidate discarded: {reason}",
+                )
+            self.store.delete_table_rows("tool_candidates", "candidate_id = ? AND pid = ?", (candidate_id, pid))
+            self.audit.record(
+                actor=discarded_by,
+                action="tool.candidate.discard",
+                target=f"tool_candidate:{candidate_id}",
+                input_refs=[obj.oid for obj in candidate_objects],
+                decision={"pid": pid, "reason": reason},
+            )
+        return True
 
     def call(
         self,

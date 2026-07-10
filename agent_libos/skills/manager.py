@@ -124,48 +124,49 @@ class SkillManager:
             self._require_trusted_global_source(selected_source, selected_sha)
         if require_capability:
             decisions = self._require_skill_right(actor, spec.skill_id, CapabilityRight.WRITE)
-            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reserved_capability_ids = []
-        existing = self.store.get_skill(spec.skill_id)
-        if existing is not None and not replace:
-            self._restore_skill_rights(reserved_capability_ids)
-            raise ValidationError(f"skill already registered: {spec.skill_id}")
+            reservations = {}
         now = utc_now()
         if spec.package_sha256 != selected_sha:
             spec = self._replace_package_hash(spec, selected_sha)
         try:
-            self.store.upsert_skill(
-                spec,
-                source_type=selected_source_type,
-                source=selected_source,
-                package_sha256=selected_sha,
-                registered_by=actor,
-                created_at=now,
-            )
+            with self.store.transaction():
+                existing = self.store.get_skill(spec.skill_id)
+                if existing is not None and not replace:
+                    raise ValidationError(f"skill already registered: {spec.skill_id}")
+                self.store.upsert_skill(
+                    spec,
+                    source_type=selected_source_type,
+                    source=selected_source,
+                    package_sha256=selected_sha,
+                    registered_by=actor,
+                    created_at=now,
+                )
+                self.events.emit(
+                    EventType.SKILL_REGISTERED,
+                    source=actor,
+                    target=self.resource_for(spec.skill_id),
+                    payload={"skill_id": spec.skill_id, "version": spec.version, "source_type": selected_source_type},
+                )
+                self.audit.record(
+                    actor=actor,
+                    action="skill.register",
+                    target=self.resource_for(spec.skill_id),
+                    decision={
+                        "replace": existing is not None,
+                        "source_type": selected_source_type,
+                        "source": selected_source,
+                        "package_sha256": selected_sha,
+                        "allowed_tools": list(spec.allowed_tools),
+                        "jit_tools": [tool.name for tool in spec.jit_tools],
+                        "resources": [resource.path for resource in spec.resources],
+                    },
+                )
         except Exception:
-            self._restore_skill_rights(reserved_capability_ids)
+            self._restore_skill_rights(reservations)
             raise
-        self.events.emit(
-            EventType.SKILL_REGISTERED,
-            source=actor,
-            target=self.resource_for(spec.skill_id),
-            payload={"skill_id": spec.skill_id, "version": spec.version, "source_type": selected_source_type},
-        )
-        self.audit.record(
-            actor=actor,
-            action="skill.register",
-            target=self.resource_for(spec.skill_id),
-            decision={
-                "replace": existing is not None,
-                "source_type": selected_source_type,
-                "source": selected_source,
-                "package_sha256": selected_sha,
-                "allowed_tools": list(spec.allowed_tools),
-                "jit_tools": [tool.name for tool in spec.jit_tools],
-                "resources": [resource.path for resource in spec.resources],
-            },
-        )
+        self._commit_skill_rights(reservations)
         return self.inspect_skill(spec.skill_id, actor=actor, require_capability=False)
 
     def register_skill_from_path(
@@ -231,11 +232,11 @@ class SkillManager:
         package, source = self._load_package_from_workspace(pid, path)
         if require_capability:
             decisions = self._require_skill_right(pid, package.skill_id, CapabilityRight.WRITE)
-            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reserved_capability_ids = []
+            reservations = {}
         try:
-            return self.register_skill_package(
+            result = self.register_skill_package(
                 package,
                 actor=pid,
                 replace=replace,
@@ -245,8 +246,10 @@ class SkillManager:
                 package_sha256=package.package_sha256,
             )
         except Exception:
-            self._restore_skill_rights(reserved_capability_ids)
+            self._restore_skill_rights(reservations)
             raise
+        self._commit_skill_rights(reservations)
+        return result
 
     def activate_skill_from_workspace_path(
         self,
@@ -259,13 +262,13 @@ class SkillManager:
         package, source = self._load_package_from_workspace(pid, path)
         if require_capability:
             decisions = self._require_skill_rights(pid, package.skill_id, [CapabilityRight.WRITE, CapabilityRight.EXECUTE])
-            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
-            committed_by_registration = self._decision_consume_ids(
+            reservations = self._reserve_skill_rights(decisions, used_by="skill")
+            write_capability_ids = self._decision_consume_ids(
                 decision for decision in decisions if decision.right == CapabilityRight.WRITE.value
             )
         else:
-            reserved_capability_ids = []
-            committed_by_registration = set()
+            reservations = {}
+            write_capability_ids = set()
         try:
             self.register_skill_package(
                 package,
@@ -277,17 +280,15 @@ class SkillManager:
                 package_sha256=package.package_sha256,
             )
         except Exception:
-            self._restore_skill_rights(reserved_capability_ids)
+            self._restore_skill_rights(reservations)
             raise
+        self._commit_skill_rights(reservations, capability_ids=write_capability_ids)
         try:
             result = self.activate_skill(pid, package.skill_id, actor=pid, require_capability=False)
         except Exception:
-            process = self.store.get_process(pid)
-            activation_committed = process is not None and package.skill_id in process.loaded_skills
-            if not activation_committed:
-                uncommitted = [cap_id for cap_id in reserved_capability_ids if cap_id not in committed_by_registration]
-                self._restore_skill_rights(uncommitted)
+            self._restore_skill_rights(reservations, exclude_capability_ids=write_capability_ids)
             raise
+        self._commit_skill_rights(reservations, exclude_capability_ids=write_capability_ids)
         return {**result, "source": source, "registered": True}
 
     def discover_skills(
@@ -298,20 +299,31 @@ class SkillManager:
         require_capability: bool = True,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        reservations: dict[str, str] = {}
         if require_capability and actor is not None:
-            self.capabilities.require(actor, self.config.skills.registry_resource, CapabilityRight.READ)
-        selected_limit = self.config.skills.discover_limit if limit is None else limit
-        registered = [self._skill_summary(skill, metadata) for skill, metadata in self.store.list_skills(text=text, limit=selected_limit)]
-        if actor is not None:
-            return registered
-        discovered = self._discover_host_skill_catalog(text=text, limit=selected_limit)
-        seen = {item["skill_id"] for item in registered}
-        for item in discovered:
-            if item["skill_id"] not in seen:
-                registered.append(item)
-                seen.add(item["skill_id"])
-            if len(registered) >= selected_limit:
-                break
+            decision = self.capabilities.require(
+                actor,
+                self.config.skills.registry_resource,
+                CapabilityRight.READ,
+                consume=False,
+            )
+            reservations = self._reserve_skill_rights([decision], used_by="skill")
+        try:
+            selected_limit = self.config.skills.discover_limit if limit is None else limit
+            registered = [self._skill_summary(skill, metadata) for skill, metadata in self.store.list_skills(text=text, limit=selected_limit)]
+            if actor is None:
+                discovered = self._discover_host_skill_catalog(text=text, limit=selected_limit)
+                seen = {item["skill_id"] for item in registered}
+                for item in discovered:
+                    if item["skill_id"] not in seen:
+                        registered.append(item)
+                        seen.add(item["skill_id"])
+                    if len(registered) >= selected_limit:
+                        break
+        except Exception:
+            self._restore_skill_rights(reservations)
+            raise
+        self._commit_skill_rights(reservations)
         return registered
 
     def inspect_skill(
@@ -322,21 +334,29 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         skill, metadata = self._get_skill(skill_id)
+        reservations: dict[str, str] = {}
         if require_capability and actor is not None:
-            self._require_skill_right(actor, skill_id, CapabilityRight.READ)
-        return {
-            **self._skill_summary(skill, metadata),
-            "instructions": self._prompt_instructions(skill),
-            "allowed_tools": list(skill.allowed_tools),
-            "actions": [asdict(action) for action in skill.actions],
-            "jit_tools": [self._jit_summary(tool) for tool in skill.jit_tools],
-            "required_capabilities": list(skill.required_capabilities),
-            "metadata": dict(skill.metadata),
-            "resources": [self._resource_summary(resource) for resource in skill.resources],
-            "license": skill.license,
-            "compatibility": skill.compatibility,
-            "diagnostics": list(skill.diagnostics),
-        }
+            decisions = self._require_skill_right(actor, skill_id, CapabilityRight.READ)
+            reservations = self._reserve_skill_rights(decisions, used_by="skill")
+        try:
+            result = {
+                **self._skill_summary(skill, metadata),
+                "instructions": self._prompt_instructions(skill),
+                "allowed_tools": list(skill.allowed_tools),
+                "actions": [asdict(action) for action in skill.actions],
+                "jit_tools": [self._jit_summary(tool) for tool in skill.jit_tools],
+                "required_capabilities": list(skill.required_capabilities),
+                "metadata": dict(skill.metadata),
+                "resources": [self._resource_summary(resource) for resource in skill.resources],
+                "license": skill.license,
+                "compatibility": skill.compatibility,
+                "diagnostics": list(skill.diagnostics),
+            }
+        except Exception:
+            self._restore_skill_rights(reservations)
+            raise
+        self._commit_skill_rights(reservations)
+        return result
 
     def prompt_context(self, pid: str) -> list[dict[str, Any]]:
         process = self.store.get_process(pid)
@@ -383,65 +403,108 @@ class SkillManager:
         skill, metadata = self._get_skill(skill_id)
         if require_capability:
             decisions = self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
-            self._require_process_admin_if_cross_actor(selected_actor, pid)
-            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+            admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
+            if admin_decision is not None:
+                decisions.append(admin_decision)
+            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reserved_capability_ids = []
+            reservations = {}
         process = self.store.get_process(pid)
+        jit_handles: dict[str, Any] = {}
+        prepared_jit_tools: list[tuple[JitToolSpec, str]] = []
+        retired_jit_ids: set[str] = set()
         try:
             if process is None:
                 raise NotFound(f"process not found: {pid}")
-            self._validate_loadable(pid, skill, process.tool_table)
-            existing_handles = self._resolve_existing_tools(skill.allowed_tools)
-            jit_handles = self._register_jit_tools(pid, skill)
-        except Exception:
-            self._restore_skill_rights(reserved_capability_ids)
+            preflight_loaded = process.loaded_skills.get(skill.skill_id)
+            preflight_jit_ids = self._loaded_tool_id_map(preflight_loaded, "jit_tool_ids")
+            self._validate_loadable(
+                pid,
+                skill,
+                process.tool_table,
+                replacing_jit_tool_ids=preflight_jit_ids,
+            )
+            prepared_jit_tools = self._prepare_jit_tools(pid, skill)
+            with self.store.transaction() as cur:
+                process = self.store.get_process(pid)
+                if process is None:
+                    raise NotFound(f"process not found: {pid}")
+                previous_loaded = process.loaded_skills.get(skill.skill_id)
+                previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
+                previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
+                self._validate_loadable(
+                    pid,
+                    skill,
+                    process.tool_table,
+                    replacing_jit_tool_ids=previous_jit_ids,
+                )
+                existing_handles = self._resolve_existing_tools(skill.allowed_tools)
+                jit_handles = self._register_prepared_jit_tools(
+                    pid,
+                    skill,
+                    prepared_jit_tools,
+                    replacing_jit_tool_ids=previous_jit_ids,
+                )
+                tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
+                jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
+                updated_table = dict(process.tool_table)
+                for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
+                    if updated_table.get(name) == tool_id:
+                        updated_table.pop(name, None)
+                for name, handle in {**existing_handles, **jit_handles}.items():
+                    updated_table[name] = handle.tool_id
+                loaded = LoadedSkill(
+                    skill_id=skill.skill_id,
+                    version=skill.version,
+                    source=metadata.get("source"),
+                    package_sha256=skill.package_sha256,
+                    loaded_at=utc_now(),
+                    tool_names=sorted([*tool_ids, *jit_tool_ids]),
+                    tool_ids=tool_ids,
+                    jit_tool_ids=jit_tool_ids,
+                    instructions_hash=self._hash_text(skill.instructions),
+                    package_snapshot=self._skill_snapshot(skill),
+                )
+                process.tool_table = updated_table
+                process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
+                process.updated_at = utc_now()
+                self.store.update_process(process)
+                retired_jit_ids = set(previous_jit_ids.values()) - set(jit_tool_ids.values())
+                self._delete_jit_rows(cur, pid, retired_jit_ids)
+                self.events.emit(
+                    EventType.SKILL_LOADED,
+                    source=selected_actor,
+                    target=pid,
+                    payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
+                )
+                self.audit.record(
+                    actor=selected_actor,
+                    action="skill.activate",
+                    target=f"process:{pid}",
+                    decision={
+                        "skill_id": skill.skill_id,
+                        "version": skill.version,
+                        "replaced_loaded_version": self._loaded_version(previous_loaded),
+                        "tool_ids": tool_ids,
+                        "jit_tool_ids": jit_tool_ids,
+                        "retired_jit_tool_ids": sorted(retired_jit_ids),
+                        "source": metadata.get("source"),
+                        "package_sha256": skill.package_sha256,
+                    },
+                )
+        except Exception as exc:
+            self._discard_uncommitted_jit_tools(jit_handles)
+            try:
+                self._discard_prepared_jit_candidates(pid, prepared_jit_tools)
+            except Exception as cleanup_exc:
+                exc.add_note(
+                    "failed to discard uncommitted Skill JIT candidates: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            self._restore_skill_rights(reservations)
             raise
-        tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
-        jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
-        updated_table = dict(process.tool_table)
-        for name, handle in {**existing_handles, **jit_handles}.items():
-            updated_table[name] = handle.tool_id
-        loaded = LoadedSkill(
-            skill_id=skill.skill_id,
-            version=skill.version,
-            source=metadata.get("source"),
-            package_sha256=skill.package_sha256,
-            loaded_at=utc_now(),
-            tool_names=sorted([*tool_ids, *jit_tool_ids]),
-            tool_ids=tool_ids,
-            jit_tool_ids=jit_tool_ids,
-            instructions_hash=self._hash_text(skill.instructions),
-            package_snapshot=self._skill_snapshot(skill),
-        )
-        process.tool_table = updated_table
-        process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
-        process.updated_at = utc_now()
-        try:
-            self.store.update_process(process)
-        except Exception:
-            self._remove_registered_jit_tools(pid, jit_handles)
-            self._restore_skill_rights(reserved_capability_ids)
-            raise
-        self.events.emit(
-            EventType.SKILL_LOADED,
-            source=selected_actor,
-            target=pid,
-            payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
-        )
-        self.audit.record(
-            actor=selected_actor,
-            action="skill.activate",
-            target=f"process:{pid}",
-            decision={
-                "skill_id": skill.skill_id,
-                "version": skill.version,
-                "tool_ids": tool_ids,
-                "jit_tool_ids": jit_tool_ids,
-                "source": metadata.get("source"),
-                "package_sha256": skill.package_sha256,
-            },
-        )
+        self._forget_jit_tool_ids(retired_jit_ids)
+        self._commit_skill_rights(reservations)
         return {
             "pid": pid,
             "skill_id": skill.skill_id,
@@ -465,44 +528,53 @@ class SkillManager:
         selected_actor = actor or pid
         if require_capability:
             decisions = self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
-            self._require_process_admin_if_cross_actor(selected_actor, pid)
-            reserved_capability_ids = self._reserve_skill_rights(decisions, used_by="skill")
+            admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
+            if admin_decision is not None:
+                decisions.append(admin_decision)
+            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reserved_capability_ids = []
-        process = self.store.get_process(pid)
-        if process is None:
-            self._restore_skill_rights(reserved_capability_ids)
-            raise NotFound(f"process not found: {pid}")
-        loaded = process.loaded_skills.get(skill_id)
-        if loaded is None:
-            self._restore_skill_rights(reserved_capability_ids)
-            raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
-        tool_ids = dict(loaded.get("tool_ids", {})) if isinstance(loaded, dict) else {}
-        jit_tool_ids = dict(loaded.get("jit_tool_ids", {})) if isinstance(loaded, dict) else {}
+            reservations = {}
         removed: list[str] = []
-        for name, tool_id in {**tool_ids, **jit_tool_ids}.items():
-            if process.tool_table.get(name) == tool_id:
-                process.tool_table.pop(name, None)
-                removed.append(name)
-        process.loaded_skills.pop(skill_id, None)
-        process.updated_at = utc_now()
+        jit_tool_ids: dict[str, str] = {}
         try:
-            self.store.update_process(process)
+            with self.store.transaction() as cur:
+                process = self.store.get_process(pid)
+                if process is None:
+                    raise NotFound(f"process not found: {pid}")
+                loaded = process.loaded_skills.get(skill_id)
+                if loaded is None:
+                    raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
+                tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+                jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
+                for name, tool_id in {**tool_ids, **jit_tool_ids}.items():
+                    if process.tool_table.get(name) == tool_id:
+                        process.tool_table.pop(name, None)
+                        removed.append(name)
+                process.loaded_skills.pop(skill_id, None)
+                process.updated_at = utc_now()
+                self.store.update_process(process)
+                self._delete_jit_rows(cur, pid, set(jit_tool_ids.values()))
+                self.events.emit(
+                    EventType.SKILL_UNLOADED,
+                    source=selected_actor,
+                    target=pid,
+                    payload={"skill_id": skill_id, "removed_tools": sorted(removed)},
+                )
+                self.audit.record(
+                    actor=selected_actor,
+                    action="skill.unload",
+                    target=f"process:{pid}",
+                    decision={
+                        "skill_id": skill_id,
+                        "removed_tools": sorted(removed),
+                        "retired_jit_tool_ids": sorted(jit_tool_ids.values()),
+                    },
+                )
         except Exception:
-            self._restore_skill_rights(reserved_capability_ids)
+            self._restore_skill_rights(reservations)
             raise
-        self.events.emit(
-            EventType.SKILL_UNLOADED,
-            source=selected_actor,
-            target=pid,
-            payload={"skill_id": skill_id, "removed_tools": sorted(removed)},
-        )
-        self.audit.record(
-            actor=selected_actor,
-            action="skill.unload",
-            target=f"process:{pid}",
-            decision={"skill_id": skill_id, "removed_tools": sorted(removed)},
-        )
+        self._forget_jit_tool_ids(set(jit_tool_ids.values()))
+        self._commit_skill_rights(reservations)
         return {"pid": pid, "skill_id": skill_id, "removed_tools": sorted(removed)}
 
     def read_skill_resource(
@@ -561,29 +633,42 @@ class SkillManager:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         selected_source_type = self._validate_source_type(source_type)
+        reservations: dict[str, str] = {}
         if require_capability:
-            self.capabilities.require(actor, self.config.skills.trust_resource, CapabilityRight.ADMIN)
-        self.store.insert_skill_trust(
-            trust_id=new_id("strust"),
-            source_type=selected_source_type,
-            source=source,
-            package_sha256=package_sha256,
-            trusted_by=actor,
-            created_at=utc_now(),
-            metadata=metadata or {},
-        )
-        self.events.emit(
-            EventType.SKILL_TRUSTED,
-            source=actor,
-            target=self.trust_resource(package_sha256),
-            payload={"source_type": selected_source_type, "source": source},
-        )
-        self.audit.record(
-            actor=actor,
-            action="skill.trust",
-            target=self.trust_resource(package_sha256),
-            decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
-        )
+            decision = self.capabilities.require(
+                actor,
+                self.config.skills.trust_resource,
+                CapabilityRight.ADMIN,
+                consume=False,
+            )
+            reservations = self._reserve_skill_rights([decision], used_by="skill")
+        try:
+            with self.store.transaction():
+                self.store.insert_skill_trust(
+                    trust_id=new_id("strust"),
+                    source_type=selected_source_type,
+                    source=source,
+                    package_sha256=package_sha256,
+                    trusted_by=actor,
+                    created_at=utc_now(),
+                    metadata=metadata or {},
+                )
+                self.events.emit(
+                    EventType.SKILL_TRUSTED,
+                    source=actor,
+                    target=self.trust_resource(package_sha256),
+                    payload={"source_type": selected_source_type, "source": source},
+                )
+                self.audit.record(
+                    actor=actor,
+                    action="skill.trust",
+                    target=self.trust_resource(package_sha256),
+                    decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
+                )
+        except Exception:
+            self._restore_skill_rights(reservations)
+            raise
+        self._commit_skill_rights(reservations)
         return {"source_type": selected_source_type, "source": source, "package_sha256": package_sha256, "trusted": True}
 
     def untrust_skill_source(
@@ -596,15 +681,28 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         selected_source_type = self._validate_source_type(source_type)
+        reservations: dict[str, str] = {}
         if require_capability:
-            self.capabilities.require(actor, self.config.skills.trust_resource, CapabilityRight.ADMIN)
-        self.store.delete_skill_trust(source_type=selected_source_type, source=source, package_sha256=package_sha256)
-        self.audit.record(
-            actor=actor,
-            action="skill.untrust",
-            target=self.trust_resource(package_sha256),
-            decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
-        )
+            decision = self.capabilities.require(
+                actor,
+                self.config.skills.trust_resource,
+                CapabilityRight.ADMIN,
+                consume=False,
+            )
+            reservations = self._reserve_skill_rights([decision], used_by="skill")
+        try:
+            with self.store.transaction():
+                self.store.delete_skill_trust(source_type=selected_source_type, source=source, package_sha256=package_sha256)
+                self.audit.record(
+                    actor=actor,
+                    action="skill.untrust",
+                    target=self.trust_resource(package_sha256),
+                    decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
+                )
+        except Exception:
+            self._restore_skill_rights(reservations)
+            raise
+        self._commit_skill_rights(reservations)
         return {"source_type": selected_source_type, "source": source, "package_sha256": package_sha256, "trusted": False}
 
     def _load_package_from_host_path(self, path: str | Path) -> tuple[SkillPackage, str]:
@@ -970,18 +1068,27 @@ class SkillManager:
         for spec in skill.required_capabilities:
             self._validate_capability_spec(spec)
 
-    def _validate_loadable(self, pid: str, skill: SkillPackage, process_tool_table: dict[str, str]) -> None:
+    def _validate_loadable(
+        self,
+        pid: str,
+        skill: SkillPackage,
+        process_tool_table: dict[str, str],
+        *,
+        replacing_jit_tool_ids: dict[str, str] | None = None,
+    ) -> None:
         runtime = self._runtime()
         static_names = {row["name"] for row in runtime.tools.list() if not bool(row.get("ephemeral"))}
         process = runtime.process.get(pid)
         image = runtime.images.get(process.image_id) if process is not None else None
         multiplexed_jit = getattr(image, "jit_tool_exposure", None) == JIT_TOOL_EXPOSURE_MULTIPLEXED
+        replaceable = replacing_jit_tool_ids or {}
         for name in skill.allowed_tools:
             runtime.tools.resolve(name)
         for tool in skill.jit_tools:
             if multiplexed_jit and tool.name == JIT_MULTIPLEXER_TOOL_NAME:
                 raise ValidationError(f"{JIT_MULTIPLEXER_TOOL_NAME} is reserved by multiplexed JIT tool exposure")
-            if tool.name in process_tool_table:
+            existing_tool_id = process_tool_table.get(tool.name)
+            if existing_tool_id is not None and replaceable.get(tool.name) != existing_tool_id:
                 raise ValidationError(f"process already has a tool named: {tool.name}")
             if tool.name in static_names:
                 raise ValidationError(f"JIT skill tool cannot shadow static tool: {tool.name}")
@@ -990,57 +1097,114 @@ class SkillManager:
         runtime = self._runtime()
         return {name: runtime.tools.resolve(name) for name in names}
 
-    def _register_jit_tools(self, pid: str, skill: SkillPackage) -> dict[str, Any]:
+    def _prepare_jit_tools(self, pid: str, skill: SkillPackage) -> list[tuple[JitToolSpec, str]]:
         runtime = self._runtime()
         prepared: list[tuple[JitToolSpec, str]] = []
-        for jit in skill.jit_tools:
-            candidate_id = runtime.tools.propose(
+        try:
+            for jit in skill.jit_tools:
+                candidate_id = runtime.tools.propose(
+                    pid,
+                    {
+                        "name": jit.name,
+                        "description": jit.description,
+                        "input_schema": jit.input_schema,
+                        "output_schema": jit.output_schema,
+                        "metadata": {"skill_id": skill.skill_id, "source_path": jit.source_path, **jit.metadata},
+                    },
+                    source_code=jit.source,
+                    tests=jit.tests,
+                )
+                prepared.append((jit, candidate_id))
+                validation = runtime.tools.validate(candidate_id, pid=pid)
+                if not validation.ok:
+                    raise ValidationError(f"JIT skill tool {jit.name} failed validation: {'; '.join(validation.errors)}")
+                candidate = runtime.store.get_tool_candidate(candidate_id)
+                if candidate is None:
+                    raise NotFound(f"tool candidate not found after validation: {candidate_id}")
+                candidate.status = ToolCandidateStatus.VALIDATED
+                runtime.store.update_tool_candidate(candidate)
+        except Exception:
+            self._discard_prepared_jit_candidates(pid, prepared)
+            raise
+        return prepared
+
+    def _discard_prepared_jit_candidates(
+        self,
+        pid: str,
+        prepared: Iterable[tuple[JitToolSpec, str]],
+    ) -> None:
+        runtime = self._runtime()
+        for _jit, candidate_id in reversed(list(prepared)):
+            runtime.tools.discard_candidate(
                 pid,
-                {
-                    "name": jit.name,
-                    "description": jit.description,
-                    "input_schema": jit.input_schema,
-                    "output_schema": jit.output_schema,
-                    "metadata": {"skill_id": skill.skill_id, "source_path": jit.source_path, **jit.metadata},
-                },
-                source_code=jit.source,
-                tests=jit.tests,
+                candidate_id,
+                discarded_by="skill",
+                reason="skill activation did not commit",
             )
-            validation = runtime.tools.validate(candidate_id, pid=pid)
-            if not validation.ok:
-                raise ValidationError(f"JIT skill tool {jit.name} failed validation: {'; '.join(validation.errors)}")
-            candidate = runtime.store.get_tool_candidate(candidate_id)
-            if candidate is None:
-                raise NotFound(f"tool candidate not found after validation: {candidate_id}")
-            candidate.status = ToolCandidateStatus.VALIDATED
-            runtime.store.update_tool_candidate(candidate)
-            prepared.append((jit, candidate_id))
+
+    def _register_prepared_jit_tools(
+        self,
+        pid: str,
+        skill: SkillPackage,
+        prepared: list[tuple[JitToolSpec, str]],
+        *,
+        replacing_jit_tool_ids: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._runtime()
+        replaceable = replacing_jit_tool_ids or {}
         handles: dict[str, Any] = {}
         try:
             for jit, candidate_id in prepared:
-                handles[jit.name] = runtime.tools.register(pid, candidate_id, approver=f"skill:{skill.skill_id}")
+                handles[jit.name] = runtime.tools.register(
+                    pid,
+                    candidate_id,
+                    approver=f"skill:{skill.skill_id}",
+                    replace_tool_id=replaceable.get(jit.name),
+                )
         except Exception:
-            self._remove_registered_jit_tools(pid, handles)
+            self._discard_uncommitted_jit_tools(handles)
             raise
         return handles
 
-    def _remove_registered_jit_tools(self, pid: str, handles: dict[str, Any]) -> None:
-        if not handles:
-            return
+    def _discard_uncommitted_jit_tools(self, handles: dict[str, Any]) -> None:
+        """Remove process-local runtime aliases after the enclosing DB transaction rolled back."""
+
         runtime = self._runtime()
-        process = runtime.store.get_process(pid)
-        if process is not None:
-            for name, handle in handles.items():
-                if process.tool_table.get(name) == handle.tool_id:
-                    process.tool_table.pop(name, None)
-            process.updated_at = utc_now()
-            runtime.store.update_process(process)
         for handle in handles.values():
             getattr(runtime.tools, "_jit_sources", {}).pop(handle.tool_id, None)
             getattr(runtime.tools, "_handles", {}).pop(handle.tool_id, None)
             names = getattr(runtime.tools, "_tool_ids_by_name", None)
             if names is not None and names.get(handle.name) == handle.tool_id:
                 names.pop(handle.name, None)
+
+    def _delete_jit_rows(self, cur: Any, pid: str, tool_ids: Iterable[str]) -> None:
+        for tool_id in set(tool_ids):
+            cur.execute("DELETE FROM tools WHERE tool_id = ? AND ephemeral = 1", (tool_id,))
+            cur.execute(
+                "DELETE FROM tool_candidates WHERE pid = ? AND registered_tool_id = ?",
+                (pid, tool_id),
+            )
+
+    def _forget_jit_tool_ids(self, tool_ids: Iterable[str]) -> None:
+        runtime = self._runtime()
+        for tool_id in set(tool_ids):
+            handle = getattr(runtime.tools, "_handles", {}).pop(tool_id, None)
+            getattr(runtime.tools, "_jit_sources", {}).pop(tool_id, None)
+            if handle is not None:
+                names = getattr(runtime.tools, "_tool_ids_by_name", None)
+                if names is not None and names.get(handle.name) == tool_id:
+                    names.pop(handle.name, None)
+
+    def _loaded_tool_id_map(self, loaded: Any, field: str) -> dict[str, str]:
+        if not isinstance(loaded, dict) or not isinstance(loaded.get(field), dict):
+            return {}
+        return {str(name): str(tool_id) for name, tool_id in loaded[field].items()}
+
+    def _loaded_version(self, loaded: Any) -> str | None:
+        if not isinstance(loaded, dict):
+            return None
+        value = loaded.get("version")
+        return str(value) if value is not None else None
 
     def _require_skill_right(self, actor: str, skill_id: str, right: CapabilityRight) -> list[CapabilityDecision]:
         return self._require_skill_rights(actor, skill_id, [right])
@@ -1076,38 +1240,86 @@ class SkillManager:
         )
         raise HumanApprovalRequired(request_id, f"human approval required for skill {skill_id}")
 
-    def _reserve_skill_rights(self, decisions: Iterable[CapabilityDecision], *, used_by: str) -> list[str]:
-        reserved: list[str] = []
+    def _reserve_skill_rights(self, decisions: Iterable[CapabilityDecision], *, used_by: str) -> dict[str, str]:
+        reserved: dict[str, str] = {}
         try:
             for decision in decisions:
-                if decision.consume_capability_id is None or str(decision.consume_capability_id) in reserved:
+                cap_id = str(decision.consume_capability_id) if decision.consume_capability_id is not None else None
+                if cap_id is None or cap_id in reserved:
                     continue
-                self.capabilities.claim_decision_use(
+                reservation_id = self.capabilities.reserve_decision_use(
                     decision,
                     used_by=used_by,
                     reason="one-time skill permission reserved",
                 )
-                reserved.append(str(decision.consume_capability_id))
+                if reservation_id is not None:
+                    reserved[cap_id] = reservation_id
         except Exception:
             self._restore_skill_rights(reserved)
             raise
         return reserved
 
-    def _restore_skill_rights(self, cap_ids: Iterable[str]) -> None:
-        for cap_id in cap_ids:
+    def _commit_skill_rights(
+        self,
+        reservations: dict[str, str],
+        *,
+        capability_ids: set[str] | None = None,
+        exclude_capability_ids: set[str] | None = None,
+    ) -> None:
+        selected = self._select_skill_reservations(
+            reservations,
+            capability_ids=capability_ids,
+            exclude_capability_ids=exclude_capability_ids,
+        )
+        for cap_id, reservation_id in selected.items():
+            self.capabilities.commit_reserved_use(
+                reservation_id,
+                committed_by="skill",
+                reason=f"one-time skill permission committed: {cap_id}",
+            )
+            reservations.pop(cap_id, None)
+
+    def _restore_skill_rights(
+        self,
+        reservations: dict[str, str],
+        *,
+        capability_ids: set[str] | None = None,
+        exclude_capability_ids: set[str] | None = None,
+    ) -> None:
+        selected = self._select_skill_reservations(
+            reservations,
+            capability_ids=capability_ids,
+            exclude_capability_ids=exclude_capability_ids,
+        )
+        for cap_id, reservation_id in selected.items():
             self.capabilities._restore_reserved_use(
-                cap_id,
+                reservation_id,
                 restored_by="skill",
                 reason="one-time skill permission restored before commit",
             )
+            reservations.pop(cap_id, None)
+
+    def _select_skill_reservations(
+        self,
+        reservations: dict[str, str],
+        *,
+        capability_ids: set[str] | None,
+        exclude_capability_ids: set[str] | None,
+    ) -> dict[str, str]:
+        return {
+            cap_id: reservation_id
+            for cap_id, reservation_id in reservations.items()
+            if (capability_ids is None or cap_id in capability_ids)
+            and (exclude_capability_ids is None or cap_id not in exclude_capability_ids)
+        }
 
     def _decision_consume_ids(self, decisions: Iterable[CapabilityDecision]) -> set[str]:
         return {str(decision.consume_capability_id) for decision in decisions if decision.consume_capability_id is not None}
 
-    def _require_process_admin_if_cross_actor(self, actor: str, pid: str) -> None:
+    def _require_process_admin_if_cross_actor(self, actor: str, pid: str) -> CapabilityDecision | None:
         if actor == pid:
-            return
-        self.capabilities.require(actor, f"process:{pid}", CapabilityRight.ADMIN)
+            return None
+        return self.capabilities.require(actor, f"process:{pid}", CapabilityRight.ADMIN, consume=False)
 
     def _require_trusted_global_source(self, source: str, package_sha256: str) -> None:
         if not self.config.skills.global_requires_trust:

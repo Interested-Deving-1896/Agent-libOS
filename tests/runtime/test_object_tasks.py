@@ -14,6 +14,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
+    EventType,
     ObjectHandle,
     ObjectMetadata,
     ObjectOwnerKind,
@@ -104,6 +105,21 @@ class TestObjectTasks:
             assert unread[-1].sender == f"object_task:{task.task_id}"
             assert unread[-1].channel == runtime.config.object_tasks.notification_channel
             assert unread[-1].payload["status"] == ObjectTaskStatus.SUCCEEDED.value
+            lifecycle = [
+                event.type
+                for event in runtime.events.list(target=owner.oid)
+                if event.type
+                in {
+                    EventType.OBJECT_TASK_STARTED,
+                    EventType.OBJECT_TASK_RUNNING,
+                    EventType.OBJECT_TASK_COMPLETED,
+                }
+            ]
+            assert lifecycle == [
+                EventType.OBJECT_TASK_STARTED,
+                EventType.OBJECT_TASK_RUNNING,
+                EventType.OBJECT_TASK_COMPLETED,
+            ]
         finally:
             runtime.close()
 
@@ -279,6 +295,62 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_concurrent_object_task_start_reserves_one_time_owner_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="one time owner race parent")
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "one time owner race creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+                capability_id=cap.cap_id,
+            )
+            original_assert = runtime.object_tasks._assert_owner_rights
+            authorized = threading.Barrier(2)
+
+            def synchronized_assert(pid: str, handle: ObjectHandle, rights: set[str]) -> list[object]:
+                decisions = original_assert(pid, handle, rights)
+                authorized.wait(timeout=2)
+                return decisions
+
+            monkeypatch.setattr(runtime.object_tasks, "_assert_owner_rights", synchronized_assert)
+
+            def start() -> object:
+                return runtime.object_tasks.start(child, one_time_owner, "get_working_directory", {})
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(start) for _ in range(2)]
+                outcomes: list[object] = []
+                errors: list[BaseException] = []
+                for future in futures:
+                    try:
+                        outcomes.append(future.result(timeout=2))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+            assert len(outcomes) == 1
+            assert len(errors) == 1
+            assert isinstance(errors[0], CapabilityDenied)
+            completed = runtime.object_tasks.wait(outcomes[0].task_id, actor_pid=child, timeout=2)  # type: ignore[union-attr]
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            assert len(runtime.store.list_object_tasks(include_terminal=True)) == 1
+        finally:
+            runtime.close()
+
     def test_object_task_start_cleans_runner_before_restoring_one_time_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open("local")
         try:
@@ -316,6 +388,167 @@ class TestObjectTasks:
             assert runtime.store.list_object_tasks(include_terminal=True) == []
             assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
         finally:
+            runtime.close()
+
+    def test_object_task_schedule_failure_terminalizes_task_and_removes_runner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="schedule failure parent")
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "schedule failure creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value},
+                capability_id=cap.cap_id,
+            )
+
+            def fail_schedule(_task_id: str) -> object:
+                raise RuntimeError("executor rejected object task")
+
+            monkeypatch.setattr(runtime.object_tasks, "_schedule_task_locked", fail_schedule)
+
+            with pytest.raises(RuntimeError, match="executor rejected object task"):
+                runtime.object_tasks.start(child, one_time_owner, "get_working_directory", {})
+
+            tasks = runtime.store.list_object_tasks(include_terminal=True)
+            assert len(tasks) == 1
+            assert tasks[0].status == ObjectTaskStatus.FAILED
+            assert runtime.store.get_process(str(tasks[0].runner_pid)) is None
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            assert runtime.store.list_object_tasks(include_terminal=False) == []
+        finally:
+            runtime.close()
+
+    def test_object_task_result_wiring_failure_removes_result_and_terminalizes_runner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="result wiring failure")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            result_oids: list[str] = []
+
+            def fail_link(
+                _actor: str,
+                _src_oid: str,
+                _relation: object,
+                dst_oid: str,
+                **_kwargs: object,
+            ) -> object:
+                result_oids.append(dst_oid)
+                raise RuntimeError("result link failed")
+
+            monkeypatch.setattr(runtime.memory, "link_objects_trusted", fail_link)
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+            failed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert failed.status == ObjectTaskStatus.FAILED
+            assert "result link failed" in (failed.error or "")
+            assert len(result_oids) == 1
+            assert runtime.store.get_object(result_oids[0]) is None
+            runner = runtime.store.get_process(str(task.runner_pid))
+            assert runner is not None
+            assert runner.status in runtime.process.TERMINAL_STATUSES
+            creator = runtime.process.get(pid)
+            assert creator.memory_view is None or all(root.oid != result_oids[0] for root in creator.memory_view.roots)
+            assert runtime.store.list_objects_owned_by(ObjectOwnerKind.OBJECT_TASK, task.task_id) == []
+        finally:
+            runtime.close()
+
+    def test_object_task_success_commit_failure_discards_result_and_fails_task(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="success commit failure")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            original_update = runtime.store.update_object_task
+            failed_success_commit = False
+
+            def fail_success_once(task: object) -> None:
+                nonlocal failed_success_commit
+                if getattr(task, "status", None) == ObjectTaskStatus.SUCCEEDED and not failed_success_commit:
+                    failed_success_commit = True
+                    raise RuntimeError("object task success commit failed")
+                original_update(task)
+
+            monkeypatch.setattr(runtime.store, "update_object_task", fail_success_once)
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+            failed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert failed_success_commit
+            assert failed.status == ObjectTaskStatus.FAILED
+            assert "object task success commit failed" in (failed.error or "")
+            assert runtime.store.list_objects_owned_by(ObjectOwnerKind.OBJECT_TASK, task.task_id) == []
+            runner = runtime.store.get_process(str(task.runner_pid))
+            assert runner is not None
+            assert runner.status in runtime.process.TERMINAL_STATUSES
+            creator = runtime.process.get(pid)
+            assert creator.memory_view is None or all(
+                runtime.store.get_object(root.oid) is not None for root in creator.memory_view.roots
+            )
+        finally:
+            runtime.close()
+
+    def test_object_task_cancel_winning_during_result_wiring_discards_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        release_link = threading.Event()
+        link_started = threading.Event()
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="cancel during result wiring")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            original_link = runtime.memory.link_objects_trusted
+            result_oids: list[str] = []
+
+            def delayed_link(
+                actor: str,
+                src_oid: str,
+                relation: object,
+                dst_oid: str,
+                **kwargs: object,
+            ) -> None:
+                result_oids.append(dst_oid)
+                link_started.set()
+                assert release_link.wait(timeout=2)
+                original_link(actor, src_oid, relation, dst_oid, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(runtime.memory, "link_objects_trusted", delayed_link)
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+            assert link_started.wait(timeout=2)
+
+            cancelled = runtime.object_tasks.cancel(task.task_id, actor_pid=pid, reason="cancel won")
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            release_link.set()
+            settled = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert settled.status == ObjectTaskStatus.CANCELLED
+            assert len(result_oids) == 1
+            assert runtime.store.get_object(result_oids[0]) is None
+            assert runtime.store.list_objects_owned_by(ObjectOwnerKind.OBJECT_TASK, task.task_id) == []
+            creator = runtime.process.get(pid)
+            assert creator.memory_view is None or all(root.oid != result_oids[0] for root in creator.memory_view.roots)
+        finally:
+            release_link.set()
             runtime.close()
 
     def test_object_task_notification_can_interrupt_and_wake_message_waiter(self) -> None:
@@ -449,10 +682,17 @@ class TestObjectTasks:
                 if cap.issued_by == f"object_task:{first.task_id}"
             ] == [f"object:{first_completed.result_oid}"]
             assert not any(cap.issued_by == f"object_task:{second.task_id}" for cap in notify_object_grants)
+            reserve_record = next(
+                record
+                for record in runtime.audit.trace()
+                if record.action == "capability.reserve_use" and grant_cap.cap_id in record.capability_refs
+            )
             assert any(
-                record.action == "capability.consume" and grant_cap.cap_id in record.capability_refs
+                record.action == "capability.commit_reserved_use"
+                and record.target == f"capability_reservation:{reserve_record.decision['reservation_id']}"
                 for record in runtime.audit.trace()
             )
+            assert runtime.store.list_objects_owned_by(ObjectOwnerKind.OBJECT_TASK, second.task_id) == []
         finally:
             runtime.close()
 

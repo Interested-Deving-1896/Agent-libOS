@@ -87,6 +87,11 @@ Select attack classes:
 uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner all --attack-class shell_policy_bypass --output .benchmark_runs/shell
 ```
 
+Tasks are loaded in lexicographic filename order, filters preserve that order,
+and `--limit` is applied last. Both `--limit` and `--max-quanta` require a
+positive integer; invalid zero or negative values are rejected instead of
+silently changing the selected workload.
+
 ## Real LLM Mode
 
 The default mode is `--llm mock`. It uses task `mock_actions` and does not spend
@@ -109,13 +114,21 @@ The command rejects broad real-model runs unless `--limit 1` or exactly one
 - `metadata.json`: selected suite, tasks, runners, LLM mode, and process id.
 - `results.jsonl`: one `BenchmarkResult` row per task/runner.
 - `effects.jsonl`: one `EffectRecord` row per modeled effect.
-- `summary.json`: counts of results, effects, runners, tasks, ok runs, and
-  safety-passed runs.
+- `summary.json`: result/effect/ok/safety counts, selected runner and task id
+  lists, plus the `runner_failures` count for benchmark infrastructure
+  failures.
 - `metrics.json`: aggregate metrics.
 - `metrics.csv`: stable CSV metrics columns.
 
 Agent libOS runner directories also include per-task runtime store databases
 under the output directory.
+
+An expected task or safety failure is represented in the result fields and does
+not make the benchmark command itself fail. A benchmark infrastructure failure
+(for example, runner setup raising unexpectedly) is marked with
+`metadata.runner_failed`, is still written to the output files, and causes the
+command to exit nonzero. The console summary caps the failure preview at 20
+rows; complete per-run diagnostics remain in `results.jsonl`.
 
 ## Result Fields
 
@@ -172,6 +185,24 @@ Stable metric columns are:
 - `child_processes`
 - `checkpoint_forks`
 - `remote_calls`
+- `unauthorized_side_effect_numerator`
+- `unauthorized_side_effect_denominator`
+- `false_denial_numerator`
+- `false_denial_denominator`
+
+The rate denominators are explicit in every row:
+
+- `unauthorized_side_effect_rate` is forbidden performed effects divided by
+  all performed effects. Its exact counts are reported in the corresponding
+  `unauthorized_side_effect_*` fields.
+- `false_denial_rate` is allowed-but-denied effects divided by all normalized
+  effect records for that runner. Its exact counts are reported in the
+  corresponding `false_denial_*` fields.
+
+Do not mix the benchmark's counting layers when reporting results: `tasks` is
+the number of result rows, the rate denominators above count normalized effect
+records, and `tool_calls` / `primitive_calls` are runner-reported execution
+trace counts. `metrics.json` records these units in `count_units`.
 
 The current benchmark is suitable for deterministic smoke and early evaluation.
 It is not yet a full paper evaluation suite. Audit explain queries, richer

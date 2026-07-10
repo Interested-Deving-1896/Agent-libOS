@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
@@ -141,6 +141,8 @@ def run_task(
     llm_mode: str = "mock",
     max_quanta: int | None = None,
 ) -> TaskRun:
+    if max_quanta is not None and max_quanta <= 0:
+        raise ValueError("max_quanta must be a positive integer")
     if runner in AGENT_LIBOS_RUNNERS:
         return _run_agent_libos_task(task, suite_root, output_dir, runner=runner, llm_mode=llm_mode, max_quanta=max_quanta)
     if llm_mode == "real":
@@ -236,19 +238,27 @@ def _run_agent_libos_task(
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     db_path = run_root / "runtime.sqlite"
-    client = PlannedActionClient([]) if llm_mode == "mock" else LLMClient.from_env()
-    runtime = Runtime(SQLiteStore(db_path), llm_client=client, substrate=LocalResourceProviderSubstrate(workspace))
-    if llm_mode == "mock":
-        runtime.tools.sandbox = BenchmarkDenoSandbox()
+    runtime: Runtime | None = None
+    runtime_store: SQLiteStore | None = None
+    task_run: TaskRun | None = None
     errors: list[str] = []
     try:
+        client = PlannedActionClient([]) if llm_mode == "mock" else LLMClient.from_env()
+        runtime_store = SQLiteStore(db_path)
+        runtime = Runtime(
+            runtime_store,
+            llm_client=client,
+            substrate=LocalResourceProviderSubstrate(workspace),
+        )
+        if llm_mode == "mock":
+            runtime.tools.sandbox = BenchmarkDenoSandbox()
         pid = runtime.process.spawn(image="review-agent:v0", goal=task.goal)
         setup_objects = _setup_runtime_memory(task, runtime, runner, pid)
         _grant_task_capabilities(task, runtime, pid, runner, setup_objects)
         setup_state = _setup_runtime_benchmark_resources(task, runtime, workspace, pid)
         if isinstance(client, PlannedActionClient):
             client.actions = [_dispatch_action(action, setup_state) for action in task.mock_actions]
-        selected_quanta = max_quanta or max(len(task.mock_actions) + 4, 4)
+        selected_quanta = max_quanta if max_quanta is not None else max(len(task.mock_actions) + 4, 4)
         results = runtime.run_until_idle(
             max_quanta=selected_quanta,
             human_auto_approve=bool(task.policy.get("human_auto_approve", False)),
@@ -297,7 +307,7 @@ def _run_agent_libos_task(
                 "self_evolution_counts": _self_evolution_counts(effects),
             },
         )
-        return TaskRun(result=result, effects=effects)
+        task_run = TaskRun(result=result, effects=effects)
     except Exception as exc:
         errors.append(str(exc))
         wall_time = time.perf_counter() - started
@@ -315,14 +325,56 @@ def _run_agent_libos_task(
             primitive_calls=0,
             llm_tokens=0,
             wall_time_s=wall_time,
-            audit_records=len(runtime.audit.trace()),
+            audit_records=_safe_audit_record_count(runtime),
             audit_completeness=0.0,
             errors=errors,
             workspace=str(workspace),
+            metadata={
+                "runner_failed": True,
+                "failure_type": type(exc).__name__,
+            },
         )
-        return TaskRun(result=result, effects=[])
+        task_run = TaskRun(result=result, effects=[])
     finally:
-        runtime.shutdown(actor="benchmark", reason="benchmark.run_complete")
+        if runtime is not None:
+            try:
+                runtime.shutdown(actor="benchmark", reason="benchmark.run_complete")
+            except Exception as exc:
+                if task_run is None:
+                    raise
+                task_run.result.ok = False
+                task_run.result.task_success = False
+                task_run.result.safety_passed = False
+                task_run.result.errors.append(f"runtime shutdown failed: {exc}")
+                if task_run.result.metadata.get("runner_failed"):
+                    task_run.result.metadata["shutdown_failure_type"] = type(exc).__name__
+                else:
+                    task_run.result.metadata["runner_failed"] = True
+                    task_run.result.metadata["failure_type"] = type(exc).__name__
+        elif runtime_store is not None:
+            try:
+                runtime_store.close()
+            except Exception as exc:
+                if task_run is None:
+                    raise
+                task_run.result.errors.append(f"runtime store close failed: {exc}")
+                if task_run.result.metadata.get("runner_failed"):
+                    task_run.result.metadata["store_close_failure_type"] = type(exc).__name__
+                else:
+                    task_run.result.metadata["runner_failed"] = True
+                    task_run.result.metadata["failure_type"] = type(exc).__name__
+    if task_run is None:  # pragma: no cover - guarded by the try/except above
+        raise RuntimeError("benchmark runner did not produce a result")
+    return task_run
+
+
+def _safe_audit_record_count(runtime: Runtime | None) -> int:
+    if runtime is None:
+        return 0
+    try:
+        return len(runtime.audit.trace())
+    except Exception:
+        return 0
 
 
 def _setup_wrapper_memory(task: BenchmarkTask) -> dict[tuple[str, str], Any]:
@@ -847,8 +899,11 @@ def _looks_like_denial(error: str) -> bool:
 def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(output / "results.jsonl", [run.result.to_dict() for run in runs])
-    _write_jsonl(output / "effects.jsonl", [effect.to_dict() for run in runs for effect in run.effects])
+    _write_jsonl(output / "results.jsonl", (run.result.to_dict() for run in runs))
+    _write_jsonl(
+        output / "effects.jsonl",
+        (effect.to_dict() for run in runs for effect in run.effects),
+    )
     summary = {
         "results": len(runs),
         "effects": sum(len(run.effects) for run in runs),
@@ -856,15 +911,18 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
         "tasks": sorted({run.result.task_id for run in runs}),
         "ok": sum(1 for run in runs if run.result.ok),
         "safety_passed": sum(1 for run in runs if run.result.safety_passed),
+        "runner_failures": sum(
+            1 for run in runs if run.result.metadata.get("runner_failed")
+        ),
     }
     (output / "summary.json").write_text(json.dumps(to_jsonable(summary), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.write_text(
-        "".join(json.dumps(to_jsonable(row), ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(to_jsonable(row), ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
 
 
 def env_has_real_llm_config() -> bool:

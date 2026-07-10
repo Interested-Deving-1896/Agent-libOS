@@ -10,12 +10,7 @@ type ProcessTreeProps = {
 
 export function ProcessTree({ processes, selectedPid, onSelect }: ProcessTreeProps) {
   const { t } = useI18n();
-  const roots = processes.filter((process) => !process.parent_pid);
-  const children = new Map<string, RuntimeProcess[]>();
-  for (const process of processes) {
-    if (!process.parent_pid) continue;
-    children.set(process.parent_pid, [...(children.get(process.parent_pid) ?? []), process]);
-  }
+  const { roots, children } = indexProcessTree(processes);
 
   return (
     <nav className="processTree" aria-label={t("processTree.label")}>
@@ -32,6 +27,24 @@ export function ProcessTree({ processes, selectedPid, onSelect }: ProcessTreePro
       {processes.length === 0 ? <div className="empty">{t("processTree.empty")}</div> : null}
     </nav>
   );
+}
+
+export function indexProcessTree(processes: RuntimeProcess[]) {
+  const roots: RuntimeProcess[] = [];
+  const children = new Map<string, RuntimeProcess[]>();
+  for (const process of processes) {
+    if (!process.parent_pid) {
+      roots.push(process);
+      continue;
+    }
+    const siblings = children.get(process.parent_pid);
+    if (siblings) {
+      siblings.push(process);
+    } else {
+      children.set(process.parent_pid, [process]);
+    }
+  }
+  return { roots, children };
 }
 
 function ProcessNode({

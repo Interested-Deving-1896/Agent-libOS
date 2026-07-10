@@ -13,8 +13,13 @@ from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
-from agent_libos.models import CapabilityRight, HumanRequestStatus
-from agent_libos.substrate import LocalFilesystemProvider, LocalResourceProviderSubstrate, ResolvedPath
+from agent_libos.models import CapabilityRight, ExternalEffectRollbackStatus, HumanRequestStatus
+from agent_libos.substrate import (
+    LocalFilesystemProvider,
+    LocalResourceProviderSubstrate,
+    ProviderEffectNotStarted,
+    ResolvedPath,
+)
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 DEFAULT_FILESYSTEM_READ_HARD_LIMIT = _TOOL_DEFAULTS.filesystem_read_hard_limit_bytes
 DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT = _TOOL_DEFAULTS.directory_entry_hard_limit
@@ -389,7 +394,7 @@ class TestFilesystemDirectoryTool:
                     [CapabilityRight.WRITE],
                     issued_by='test',
                 )
-                with pytest.raises(OSError, match='simulated write failure'):
+                with pytest.raises(ProviderEffectNotStarted, match='simulated write failure'):
                     runtime.filesystem.write_text(pid, 'out.txt', 'content')
                 assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 1
 
@@ -400,10 +405,65 @@ class TestFilesystemDirectoryTool:
                     [CapabilityRight.DELETE],
                     issued_by='test',
                 )
-                with pytest.raises(OSError, match='simulated delete failure'):
+                with pytest.raises(ProviderEffectNotStarted, match='simulated delete failure'):
                     runtime.filesystem.delete_file(pid, 'delete.txt')
                 assert runtime.store.get_capability(delete_cap.cap_id).uses_remaining == 1
                 assert (root / 'delete.txt').exists()
+            finally:
+                runtime.close()
+
+    def test_commit_then_throw_keeps_one_time_authority_consumed_and_records_unknown_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            provider = CommitThenThrowMutationProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='ambiguous mutation failure')
+                cap = runtime.capability.grant_once(
+                    pid,
+                    runtime.filesystem.resource_for_path('committed.txt'),
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(OSError, match='failure after write committed'):
+                    runtime.filesystem.write_text(pid, 'committed.txt', 'durable content')
+
+                assert (root / 'committed.txt').read_text(encoding='utf-8') == 'durable content'
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                assert effects[0].operation == 'write_text'
+                assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                assert effects[0].provider_metadata['outcome'] == 'unknown_after_provider_exception'
+            finally:
+                runtime.close()
+
+    def test_post_commit_classifier_failure_records_conservative_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            provider = FailingClassifierMutationProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='classifier failure')
+                cap = runtime.capability.grant_once(
+                    pid,
+                    runtime.filesystem.resource_for_path('classified.txt'),
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+
+                result = runtime.filesystem.write_text(pid, 'classified.txt', 'written')
+
+                assert result.bytes_written == len('written')
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+                effect = runtime.store.list_external_effects(pid=pid)[0]
+                assert effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+                assert effect.provider_metadata['classification_fallback'] == 'post_effect_failure'
             finally:
                 runtime.close()
 
@@ -518,10 +578,29 @@ class FailingMutationProvider(LocalFilesystemProvider):
         *,
         overwrite: bool = True,
     ) -> None:
-        raise OSError('simulated write failure')
+        raise ProviderEffectNotStarted('simulated write failure')
 
     def delete_file(self, path: ResolvedPath) -> None:
-        raise OSError('simulated delete failure')
+        raise ProviderEffectNotStarted('simulated delete failure')
+
+
+class CommitThenThrowMutationProvider(LocalFilesystemProvider):
+    def write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = '\n',
+        *,
+        overwrite: bool = True,
+    ) -> None:
+        super().write_text(path, text, encoding=encoding, newline=newline, overwrite=overwrite)
+        raise OSError('failure after write committed')
+
+
+class FailingClassifierMutationProvider(LocalFilesystemProvider):
+    def classify_external_effect(self, operation: str, context: dict, result: object):
+        raise RuntimeError('classifier unavailable after commit')
 
 
 class SlowCountingMutationProvider(LocalFilesystemProvider):

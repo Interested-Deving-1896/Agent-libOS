@@ -293,6 +293,46 @@ class TestConfigDefaults:
         with pytest.raises(ValueError, match='runtime.store_dsn is required'):
             AgentLibOSConfig(runtime=RuntimeDefaults(store_backend='postgres'))
 
+    def test_runtime_store_config_rejects_backend_target_conflicts(self) -> None:
+        with pytest.raises(ValueError, match='must be unset'):
+            AgentLibOSConfig(
+                runtime=RuntimeDefaults(
+                    store_backend='sqlite',
+                    store_dsn='postgresql://agent:secret@localhost/agent_libos',
+                )
+            )
+        with pytest.raises(ValueError, match='must use a postgres:// or postgresql:// URI'):
+            AgentLibOSConfig(
+                runtime=RuntimeDefaults(
+                    store_backend='postgres',
+                    store_dsn='runtime.sqlite',
+                )
+            )
+        with pytest.raises(ValueError, match='must use a postgres:// or postgresql:// URI'):
+            AgentLibOSConfig(
+                runtime=RuntimeDefaults(
+                    store_backend='postgres',
+                    store_dsn='postgresql:runtime',
+                )
+            )
+        with pytest.raises(ValueError, match='local_store_target selects PostgreSQL'):
+            AgentLibOSConfig(
+                runtime=RuntimeDefaults(
+                    store_backend='sqlite',
+                    local_store_target='postgresql://agent:secret@localhost/agent_libos',
+                )
+            )
+
+    def test_explicit_runtime_store_target_rejects_unknown_uri_scheme(self) -> None:
+        with pytest.raises(ValidationError, match='unsupported runtime store target scheme'):
+            open_store('mysql://agent:secret@localhost/agent_libos')
+        with pytest.raises(ValidationError, match='unsupported runtime store target scheme'):
+            display_store_target('https://example.com/runtime.sqlite')
+        with pytest.raises(ValidationError, match='libpq keyword DSNs are not supported'):
+            open_store('host=localhost dbname=agent_libos user=agent password=secret')
+        with pytest.raises(ValidationError, match='PostgreSQL runtime store targets must use'):
+            open_store('postgresql:agent_libos')
+
     def test_configured_postgres_backend_uses_store_dsn_when_target_is_omitted(self) -> None:
         dsn = 'postgresql://agent:secret@localhost/agent_libos'
         config = AgentLibOSConfig(

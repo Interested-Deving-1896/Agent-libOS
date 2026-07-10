@@ -27,6 +27,14 @@ from a checkpoint also normalizes transient wait states such as waiting for an
 event, tool, or human response back to `runnable`; the forked process must
 re-enter those waits explicitly under its new identity.
 
+Checkpoint creation reads the scoped SQL rows and in-memory Object payloads and
+writes the checkpoint plus the owner's `checkpoint_head` in one store
+transaction. A concurrent store transaction therefore appears wholly before or
+wholly after the captured snapshot; it cannot split an Object row from its
+payload. The denormalized process capability index is rebuilt from the
+capability rows read by that same snapshot, so those two representations cannot
+disagree.
+
 ## Append-Only Boundary
 
 Restore never deletes:
@@ -56,7 +64,13 @@ Providers classify their own effects as:
 
 - `irreversible`,
 - `rollbackable`,
-- `no_rollback_required`.
+- `no_rollback_required`,
+- `unknown` for an ambiguous filesystem-mutation or clock provider outcome.
+
+For those two adapters, `ProviderEffectNotStarted` certifies a pre-effect
+failure that may restore a reserved finite-use grant. An ordinary provider
+exception cannot make that guarantee, so the grant stays consumed and the
+`unknown` effect remains visible in checkpoint reports.
 
 Restore reports provider-recorded effects in
 `external_effects_since_checkpoint`, summarizes them in
@@ -132,6 +146,25 @@ subtree. If the scheduler is actively running a quantum or still has active
 futures, restore is rejected and the caller must retry after the runtime is
 quiescent. Unrelated processes are not restored.
 
+Restore has three explicit phases:
+
+1. **Preflight** validates checkpoint authority, required Runtime Modules,
+   image artifacts, JIT metadata, and the absence of active scoped ObjectTasks.
+   A preflight failure makes no reconstructable-state changes.
+2. **Commit** replaces scoped SQL rows and in-memory Object payloads in one
+   transaction. A commit failure rolls that transaction back.
+3. **Post-commit reconciliation** re-upserts captured image metadata, restores
+   and prunes JIT registries, and runs release finalizers for scoped Objects
+   removed by the commit. These operations touch global registries or host
+   resources and cannot undo the committed process-state transaction.
+
+A successful commit returns `main_state_committed: true`. If every
+post-commit phase succeeds, `status` is `restored`; otherwise `status` is
+`restored_with_warnings` and `post_commit_failures` identifies each failed
+phase and error. Each such failure appends a
+`checkpoint.restore.post_commit_failure` audit record. Callers must not retry a
+`restored_with_warnings` result as though the main restore had rolled back.
+
 All post-checkpoint pending human requests for restored processes are cancelled.
 Post-checkpoint mailbox entries are kept in history but marked as superseded by
 restore so they are not delivered as unread by default.
@@ -146,8 +179,9 @@ status message. This keeps checkpoint state from preserving stale waits whose
 blocking condition has already resolved in the restored snapshot.
 
 Scoped Object Memory rows removed by restore run registered release finalizers
-before their rows and payloads are deleted, so host resources such as PTY
-sessions are not orphaned by a destructive restore.
+after the main state commit. A finalizer failure is surfaced through the
+post-commit warning contract above so operators can reconcile host resources
+such as PTY sessions without confusing that failure with a rolled-back restore.
 
 If irreversible provider effects exist after the checkpoint, restore still
 continues by default. The irreversible effects stay in append-only history and

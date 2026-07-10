@@ -6,6 +6,7 @@ from datetime import datetime
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.substrate import ProviderEffectNotStarted
 
 class TestClockTool:
 
@@ -133,6 +134,36 @@ class TestClockTool:
         assert self.runtime.capability.check(pid, 'clock:now', CapabilityRight.READ)
         assert 'primitive.clock.now' not in self._audit_actions()
 
+    def test_clock_ambiguous_provider_failure_consumes_one_time_authority_and_records_effect(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='clock ambiguous failure')
+        cap = self.runtime.capability.grant_once(pid, 'clock:sleep', [CapabilityRight.READ], issued_by='test')
+        provider = RecordingClockProvider(fail_sleep_unknown=True)
+        self.runtime.clock.provider = provider
+
+        with pytest.raises(RuntimeError, match='sleep may have completed'):
+            self.runtime.clock.sleep(pid, 0.0)
+
+        consumed = self.runtime.store.get_capability(cap.cap_id)
+        assert consumed is not None
+        assert consumed.uses_remaining == 0
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].operation == 'sleep'
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effects[0].provider_metadata['outcome'] == 'unknown_after_provider_exception'
+
+    def test_clock_post_effect_classifier_failure_records_conservative_effect(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='clock classifier failure')
+        self.runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
+        self.runtime.clock.provider = RecordingClockProvider(fail_classifier=True)
+
+        result = self.runtime.clock.now(pid, tz='UTC')
+
+        assert result.timezone == 'UTC'
+        effect = self.runtime.store.list_external_effects(pid=pid)[0]
+        assert effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effect.provider_metadata['classification_fallback'] == 'post_effect_failure'
+
     def test_clock_tools_are_in_process_tool_table(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='time tools')
         names = {schema['function']['name'] for schema in self.runtime.tools.openai_tool_schemas(pid)}
@@ -144,8 +175,16 @@ class TestClockTool:
 
 
 class RecordingClockProvider:
-    def __init__(self, *, fail_now: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_now: bool = False,
+        fail_sleep_unknown: bool = False,
+        fail_classifier: bool = False,
+    ) -> None:
         self.fail_now = fail_now
+        self.fail_sleep_unknown = fail_sleep_unknown
+        self.fail_classifier = fail_classifier
         self.now_calls = 0
         self.monotonic_calls = 0
         self.sleep_calls: list[float] = []
@@ -154,7 +193,7 @@ class RecordingClockProvider:
     def now(self, timezone_):
         self.now_calls += 1
         if self.fail_now:
-            raise RuntimeError('clock provider failed')
+            raise ProviderEffectNotStarted('clock provider failed')
         return datetime(2040, 1, 2, 3, 4, 5, tzinfo=timezone_)
 
     def monotonic(self) -> float:
@@ -163,11 +202,15 @@ class RecordingClockProvider:
 
     def sleep(self, seconds: float) -> None:
         self.sleep_calls.append(seconds)
+        if self.fail_sleep_unknown:
+            raise RuntimeError('sleep may have completed')
 
     async def asleep(self, seconds: float) -> None:
         self.asleep_calls.append(seconds)
 
     def classify_external_effect(self, operation: str, context: dict, result) -> ExternalEffectClassification:
+        if self.fail_classifier:
+            raise RuntimeError('clock classifier unavailable')
         return ExternalEffectClassification(
             rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
             rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,

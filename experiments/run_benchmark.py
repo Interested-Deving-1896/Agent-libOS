@@ -11,6 +11,8 @@ from benchmarks.runtime_safety.runners import RUNNER_NAMES, run_suite, write_run
 from benchmarks.runtime_safety.metrics import write_metrics
 from agent_libos.utils.serde import to_jsonable
 
+MAX_FAILURE_PREVIEW = 20
+
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the runtime-safety benchmark suite.")
@@ -18,10 +20,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--runner", action="append", default=[], help="Runner name, repeated; use 'all' for every runner.")
     parser.add_argument("--task", action="append", default=[], help="Task id to include, repeated.")
     parser.add_argument("--attack-class", action="append", default=[], help="Attack class to include, repeated.")
-    parser.add_argument("--limit", type=int, help="Maximum number of tasks after filtering.")
+    parser.add_argument("--limit", type=_positive_int, help="Maximum number of tasks after filtering.")
     parser.add_argument("--output", default=".benchmark_runs/m1", help="Output run directory.")
     parser.add_argument("--llm", choices=["mock", "real"], default="mock", help="LLM mode for Agent libOS runners.")
-    parser.add_argument("--max-quanta", type=int, help="Maximum scheduler quanta per Agent libOS task.")
+    parser.add_argument(
+        "--max-quanta",
+        type=_positive_int,
+        help="Maximum scheduler quanta per Agent libOS task.",
+    )
     args = parser.parse_args(argv)
 
     suite = Path(args.suite)
@@ -52,7 +58,35 @@ def main(argv: list[str] | None = None) -> None:
     runs = run_suite(tasks, suite, output, runners=runners, llm_mode=args.llm, max_quanta=args.max_quanta)
     write_run_outputs(runs, output)
     metrics = write_metrics(output)
-    print(json.dumps(to_jsonable({"output": str(output), "results": len(runs), "metrics": metrics}), indent=2, ensure_ascii=False))
+    runner_failures = [
+        {
+            "task_id": run.result.task_id,
+            "runner": run.result.runner,
+            "failure_type": run.result.metadata.get("failure_type"),
+        }
+        for run in runs
+        if run.result.metadata.get("runner_failed")
+    ]
+    print(
+        json.dumps(
+            to_jsonable(
+                {
+                    "output": str(output),
+                    "results": len(runs),
+                    "runner_failure_count": len(runner_failures),
+                    "runner_failures": runner_failures[:MAX_FAILURE_PREVIEW],
+                    "runner_failures_truncated": len(runner_failures) > MAX_FAILURE_PREVIEW,
+                    "metrics": metrics,
+                }
+            ),
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    if runner_failures:
+        raise SystemExit(
+            f"{len(runner_failures)} benchmark runner failure(s); outputs were written to {output}"
+        )
 
 
 def _selected_runners(values: list[str]) -> list[str]:
@@ -67,6 +101,16 @@ def _selected_runners(values: list[str]) -> list[str]:
             raise SystemExit(f"unknown runner {value!r}; choose one of {list(RUNNER_NAMES)} or 'all'")
         selected.append(value)
     return list(dict.fromkeys(selected))
+
+
+def _positive_int(value: str) -> int:
+    try:
+        selected = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if selected <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return selected
 
 
 if __name__ == "__main__":

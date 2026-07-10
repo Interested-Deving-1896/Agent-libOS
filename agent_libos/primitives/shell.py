@@ -452,7 +452,41 @@ class ShellAdapter:
         if not policy_caps:
             raise CapabilityDenied(f"{pid} lacks shell execute policy for {resource}")
 
-        level = self._selected_policy_level(policy_caps)
+        policy_decision = self.capabilities.authorize_matching_capabilities(
+            pid,
+            resource,
+            CapabilityRight.EXECUTE,
+            policy_caps,
+            operation_context,
+        )
+        level = self._selected_policy_level(policy_caps, policy_decision.selected_capability_id)
+        if policy_decision.effect == CapabilityEffect.ASK:
+            return ShellPolicyDecision(
+                allowed=False,
+                ask_human=True,
+                reason="shell policy capability requires approval",
+                policy_level=level,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        if not policy_decision.allowed:
+            return ShellPolicyDecision(
+                allowed=False,
+                ask_human=False,
+                reason=policy_decision.reason,
+                policy_level=level,
+                matched_rule=rule_match.matched_argv,
+                high_risk=self._is_high_risk(rule.risk),
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        consume_capability_id = policy_decision.consume_capability_id
         if level in {self.config.shell.allowlist_auto_else_ask_level, self.config.shell.blocklist_ask_else_auto_level}:
             if rule.effect == CapabilityEffect.ALLOW:
                 return ShellPolicyDecision(
@@ -460,6 +494,8 @@ class ShellAdapter:
                     ask_human=False,
                     reason=rule.description or "shell rule allowed command",
                     policy_level=level,
+                    consume_once=consume_capability_id is not None,
+                    consume_capability_id=consume_capability_id,
                     matched_rule=rule_match.matched_argv,
                     high_risk=self._is_high_risk(rule.risk),
                     risk=rule.risk,
@@ -485,6 +521,8 @@ class ShellAdapter:
                 ask_human=False,
                 reason="shell policy is always_allow",
                 policy_level=level,
+                consume_once=consume_capability_id is not None,
+                consume_capability_id=consume_capability_id,
                 matched_rule=rule_match.matched_argv,
                 high_risk=self._is_high_risk(rule.risk),
                 risk=rule.risk,
@@ -816,8 +854,12 @@ class ShellAdapter:
         # a shell policy approved by the human.
         return context.get("rule_effect") == CapabilityEffect.ALLOW.value
 
-    def _selected_policy_level(self, caps: list[Capability]) -> str:
-        return self._normalize_policy_level(caps[0].constraints[self.config.shell.policy_capability_key])
+    def _selected_policy_level(self, caps: list[Capability], selected_capability_id: str | None = None) -> str:
+        selected = next(
+            (cap for cap in caps if cap.cap_id == selected_capability_id),
+            caps[0],
+        )
+        return self._normalize_policy_level(selected.constraints[self.config.shell.policy_capability_key])
 
     def _normalize_policy_level(self, value: Any) -> str:
         normalized = str(value).strip().lower()

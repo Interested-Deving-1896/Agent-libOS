@@ -1,4 +1,7 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 import pytest
 from uuid import uuid4
 from agent_libos import Runtime
@@ -92,6 +95,35 @@ class TestExternalBoundary:
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
         assert 'human.output' in self._audit_actions()
 
+    def test_terminal_drain_cannot_double_deliver_new_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='single output delivery')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+        original_insert = self.runtime.store.insert_human_request
+        inserted = threading.Event()
+        release_insert = threading.Event()
+
+        def delayed_insert(request: object) -> None:
+            original_insert(request)
+            inserted.set()
+            assert release_insert.wait(timeout=2)
+
+        monkeypatch.setattr(self.runtime.store, 'insert_human_request', delayed_insert)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                output_future = executor.submit(self.runtime.human.output, pid, 'visible once')
+                assert inserted.wait(timeout=2)
+                drain_future = executor.submit(self.runtime.human.process_next_terminal)
+                time.sleep(0.05)
+                assert not drain_future.done()
+                release_insert.set()
+                assert output_future.result(timeout=2)['delivered'] is True
+                assert drain_future.result(timeout=2) is None
+        finally:
+            release_insert.set()
+
+        assert self.human_output == ['visible once']
+        assert len([effect for effect in self.runtime.store.list_external_effects() if effect.provider == 'human']) == 1
+
     def test_human_output_does_not_write_provider_when_effect_commit_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='human effect failure')
         cap = self.runtime.capability.grant_once(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
@@ -106,8 +138,9 @@ class TestExternalBoundary:
         assert not result.ok
         assert 'failed during execution' in (result.error or '')
         assert self.human_output == []
-        assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.PENDING
+        assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.CANCELLED
         assert self.runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+        assert self.runtime.human.process_next_terminal() is None
         assert 'human.output' not in self._audit_actions()
 
     def test_human_output_visible_write_is_not_left_pending_if_final_status_update_fails(

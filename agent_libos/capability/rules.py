@@ -10,6 +10,17 @@ from agent_libos.models.exceptions import ValidationError
 
 AUTHORITY_RULES_KEY = "authority_rules"
 
+_AUTHORITY_RULE_FIELDS = frozenset(
+    {
+        "rule_id",
+        "operation",
+        "effect",
+        "risk",
+        "conditions",
+        "description",
+    }
+)
+
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
 _NETWORK_EXECUTABLES = {"curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "netcat"}
 _SCRIPT_EXECUTABLES = {
@@ -88,6 +99,9 @@ class AuthorityRuleCodec:
             return value
         if not isinstance(value, dict):
             raise ValidationError("authority rule must be a mapping")
+        unknown_fields = sorted(str(field) for field in value if field not in _AUTHORITY_RULE_FIELDS)
+        if unknown_fields:
+            raise ValidationError(f"authority rule has unknown fields: {', '.join(unknown_fields)}")
         try:
             conditions = value.get("conditions") or {}
             if not isinstance(conditions, dict):

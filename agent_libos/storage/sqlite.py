@@ -114,6 +114,7 @@ class SQLRuntimeStore:
             "process_resource_reservations",
             "events",
             "capabilities",
+            "capability_use_reservations",
             "audit_records",
             "external_effects",
             "checkpoints",
@@ -265,6 +266,17 @@ class SQLRuntimeStore:
                   uses_remaining INTEGER,
                   status TEXT NOT NULL,
                   metadata_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS capability_use_reservations (
+                  reservation_id TEXT PRIMARY KEY,
+                  cap_id TEXT NOT NULL,
+                  count INTEGER NOT NULL,
+                  status TEXT NOT NULL,
+                  reserved_by TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS audit_records (
@@ -569,6 +581,7 @@ class SQLRuntimeStore:
             self._ensure_process_schema()
             self._ensure_resource_reservation_schema()
             self._ensure_capability_schema()
+            self._abandon_stale_capability_use_reservations()
             self._ensure_audit_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
@@ -601,21 +614,36 @@ class SQLRuntimeStore:
 
         Object payloads live outside SQLite, so callers that change object rows
         and payloads together must ask for an in-memory payload rollback too.
+        Nested manager operations use savepoints so a higher-level lifecycle
+        transaction can safely call repository helpers that are independently
+        atomic.
         """
 
         with self._lock:
             payloads = deepcopy(self._object_payloads) if include_object_payloads else None
-            try:
-                self._transaction_depth += 1
+            depth = self._transaction_depth
+            savepoint = f"agent_libos_sp_{depth}"
+            if depth == 0:
                 self.conn.execute("BEGIN")
+            else:
+                self.conn.execute(f"SAVEPOINT {savepoint}")
+            self._transaction_depth += 1
+            try:
                 yield self.conn.cursor()
             except Exception:
-                self.conn.rollback()
+                if depth == 0:
+                    self.conn.rollback()
+                else:
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 if payloads is not None:
                     self._object_payloads = payloads
                 raise
             else:
-                self.conn.commit()
+                if depth == 0:
+                    self.conn.commit()
+                else:
+                    self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             finally:
                 self._transaction_depth -= 1
 
@@ -1197,11 +1225,85 @@ class SQLRuntimeStore:
             rows = list(self.conn.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
             return self._row_to_capability(rows[0]) if rows else None
 
-    def restore_reserved_capability_uses(self, cap_id: str, count: int = 1) -> Capability | None:
+    def reserve_capability_uses(
+        self,
+        cap_id: str,
+        reservation_id: str,
+        *,
+        count: int = 1,
+        reserved_by: str,
+        reason: str,
+        created_at: str,
+    ) -> Capability | None:
         if count < 1:
             raise ValueError("count must be >= 1")
+        with self.transaction() as cur:
+            updated = cur.execute(
+                """
+                UPDATE capabilities
+                   SET uses_remaining = uses_remaining - ?,
+                       status = CASE
+                           WHEN uses_remaining - ? <= 0 THEN ?
+                           ELSE status
+                       END
+                 WHERE cap_id = ?
+                   AND status = ?
+                   AND uses_remaining IS NOT NULL
+                   AND uses_remaining >= ?
+                """,
+                (
+                    count,
+                    count,
+                    CapabilityStatus.REVOKED.value,
+                    cap_id,
+                    CapabilityStatus.ACTIVE.value,
+                    count,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            cur.execute(
+                """
+                INSERT INTO capability_use_reservations (
+                    reservation_id, cap_id, count, status, reserved_by, reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (reservation_id, cap_id, count, "reserved", reserved_by, reason, created_at, created_at),
+            )
+            rows = list(cur.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
+            return self._row_to_capability(rows[0]) if rows else None
+
+    def commit_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> bool:
         with self._lock:
             cur = self.conn.execute(
+                """
+                UPDATE capability_use_reservations
+                   SET status = ?, updated_at = ?
+                 WHERE reservation_id = ? AND status = ?
+                """,
+                ("committed", updated_at, reservation_id, "reserved"),
+            )
+            if self._transaction_depth == 0:
+                self.conn.commit()
+            return cur.rowcount == 1
+
+    def restore_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> Capability | None:
+        with self.transaction() as cur:
+            reservations = list(
+                cur.execute(
+                    """
+                    SELECT * FROM capability_use_reservations
+                     WHERE reservation_id = ? AND status = ?
+                    """,
+                    (reservation_id, "reserved"),
+                )
+            )
+            if not reservations:
+                return None
+            reservation = reservations[0]
+            cap_id = str(reservation["cap_id"])
+            count = int(reservation["count"])
+            restored = cur.execute(
                 """
                 UPDATE capabilities
                    SET uses_remaining = uses_remaining + ?,
@@ -1222,15 +1324,29 @@ class SQLRuntimeStore:
                     CapabilityStatus.REVOKED.value,
                 ),
             )
-            self.conn.commit()
-            if cur.rowcount != 1:
+            if restored.rowcount != 1:
+                cur.execute(
+                    """
+                    UPDATE capability_use_reservations
+                       SET status = ?, updated_at = ?
+                     WHERE reservation_id = ? AND status = ?
+                    """,
+                    ("invalidated", updated_at, reservation_id, "reserved"),
+                )
                 return None
-            rows = list(self.conn.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
+            cur.execute(
+                """
+                UPDATE capability_use_reservations
+                   SET status = ?, updated_at = ?
+                 WHERE reservation_id = ? AND status = ?
+                """,
+                ("restored", updated_at, reservation_id, "reserved"),
+            )
+            rows = list(cur.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
             return self._row_to_capability(rows[0]) if rows else None
 
     def update_capability(self, cap: Capability) -> None:
-        self._execute(
-            """
+        sql = """
             UPDATE capabilities
                SET subject = ?, resource = ?, rights_json = ?, constraints_json = ?,
                    issued_by = ?, issued_at = ?, expires_at = ?, delegable = ?,
@@ -1238,28 +1354,40 @@ class SQLRuntimeStore:
                    delegation_depth = ?, max_delegation_depth = ?, uses_remaining = ?,
                    status = ?, metadata_json = ?
              WHERE cap_id = ?
-            """,
-            (
-                cap.subject,
-                cap.resource,
-                dumps(cap.rights),
-                dumps(cap.constraints),
-                cap.issued_by,
-                cap.issued_at,
-                cap.expires_at,
-                int(cap.delegable),
-                int(cap.revocable),
-                cap.effect.value,
-                cap.issuer_cap_id,
-                cap.parent_cap_id,
-                cap.delegation_depth,
-                cap.max_delegation_depth,
-                cap.uses_remaining,
-                cap.status.value,
-                dumps(cap.metadata),
-                cap.cap_id,
-            ),
+            """
+        params = (
+            cap.subject,
+            cap.resource,
+            dumps(cap.rights),
+            dumps(cap.constraints),
+            cap.issued_by,
+            cap.issued_at,
+            cap.expires_at,
+            int(cap.delegable),
+            int(cap.revocable),
+            cap.effect.value,
+            cap.issuer_cap_id,
+            cap.parent_cap_id,
+            cap.delegation_depth,
+            cap.max_delegation_depth,
+            cap.uses_remaining,
+            cap.status.value,
+            dumps(cap.metadata),
+            cap.cap_id,
         )
+        if cap.status == CapabilityStatus.ACTIVE:
+            self._execute(sql, params)
+            return
+        with self.transaction() as cur:
+            cur.execute(sql, params)
+            cur.execute(
+                """
+                UPDATE capability_use_reservations
+                   SET status = ?, updated_at = ?
+                 WHERE cap_id = ? AND status = ?
+                """,
+                ("invalidated", utc_now(), cap.cap_id, "reserved"),
+            )
 
     def get_capability(self, cap_id: str) -> Capability | None:
         rows = self._query("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,))
@@ -2397,6 +2525,29 @@ class SQLRuntimeStore:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_capabilities_parent ON capabilities(parent_cap_id)"
         )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capability_reservations_cap_status "
+            "ON capability_use_reservations(cap_id, status)"
+        )
+
+    def _abandon_stale_capability_use_reservations(self) -> None:
+        """Fail closed after a runtime crash during an external effect.
+
+        Runtime-store leases ensure initialization cannot overlap a live
+        provider call.  A reservation still marked ``reserved`` at this point
+        therefore belongs to a previous, interrupted runtime.  Its authority
+        remains consumed; only the bookkeeping state is made terminal so a
+        later cleanup cannot refund it.
+        """
+        self.conn.execute(
+            """
+            UPDATE capability_use_reservations
+               SET status = ?, updated_at = ?
+             WHERE status = ?
+            """,
+            ("abandoned", utc_now(), "reserved"),
+        )
+        self.conn.commit()
 
     def _ensure_audit_schema(self) -> None:
         self.conn.execute(
@@ -3498,7 +3649,11 @@ class SQLiteStore(SQLRuntimeStore):
         if selected_path != ":memory:":
             db_path = Path(selected_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._lease_handle = self._acquire_runtime_lease(db_path)
+            # Resolve existing symlinks and relative aliases before deriving
+            # the lock path. Otherwise the same SQLite file can be opened by
+            # two runtimes through distinct path spellings and receive two
+            # independent lease files.
+            self._lease_handle = self._acquire_runtime_lease(db_path.resolve())
         try:
             conn = sqlite3.connect(selected_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row

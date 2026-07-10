@@ -92,6 +92,51 @@ class TestStorageBackendBoundaries:
         second = SQLiteStore(db_path)
         second.close()
 
+    def test_sqlite_runtime_lease_rejects_symlink_alias(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "runtime.sqlite"
+        alias = tmp_path / "runtime-alias.sqlite"
+        first = SQLiteStore(db_path)
+        try:
+            try:
+                alias.symlink_to(db_path)
+            except OSError:
+                pytest.skip("symlink creation is not available in this environment")
+            with pytest.raises(ValidationError, match="already open"):
+                SQLiteStore(alias)
+        finally:
+            first.close()
+
+        reopened = SQLiteStore(alias)
+        reopened.close()
+
+    def test_nested_store_transactions_use_savepoints(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            with store.transaction() as outer:
+                outer.execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("outer", None, "{}", "test", "1", "1"),
+                )
+                with pytest.raises(RuntimeError, match="rollback inner"):
+                    with store.transaction() as inner:
+                        inner.execute(
+                            "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                            ("inner", None, "{}", "test", "1", "1"),
+                        )
+                        raise RuntimeError("rollback inner")
+                outer.execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("after", None, "{}", "test", "1", "1"),
+                )
+
+            namespaces = {
+                row["namespace"] for row in store.select_table_rows("object_namespaces", order_by="namespace")
+            }
+            assert {"after", "outer"}.issubset(namespaces)
+            assert "inner" not in namespaces
+        finally:
+            store.close()
+
     def test_sqlite_uri_normalizes_posix_absolute_paths(self) -> None:
         assert _sqlite_target("sqlite:////tmp/agent-libos.sqlite") == "/tmp/agent-libos.sqlite"
         assert _sqlite_target("sqlite:///C:/agent-libos/runtime.sqlite") == "C:/agent-libos/runtime.sqlite"

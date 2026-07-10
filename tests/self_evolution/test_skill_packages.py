@@ -55,6 +55,80 @@ class TestSkillPackageLoading:
             finally:
                 runtime.close()
 
+    def test_failed_skill_replace_rolls_back_registry_and_restores_one_time_write(self, monkeypatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(root, 'atomic-skill', allowed_tools=['echo'], body='original instructions\n')
+            runtime = Runtime.open('local')
+            try:
+                original, _source = runtime.skills._load_package_from_host_path(skill_dir)
+                runtime.skills.register_skill_package(original, actor='cli', require_capability=False)
+                write_skill_package(root, 'atomic-skill', allowed_tools=['human_output'], body='replacement instructions\n')
+                replacement, _source = runtime.skills._load_package_from_host_path(skill_dir)
+                actor = runtime.process.spawn(image='base-agent:v0', goal='replace skill')
+                cap = runtime.capability.grant_once(
+                    actor,
+                    'skill:atomic-skill',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                real_record = runtime.audit.record
+
+                def fail_registration_audit(*args, **kwargs):
+                    if kwargs.get('action') == 'skill.register':
+                        raise RuntimeError('registration audit failed')
+                    return real_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_registration_audit)
+                with pytest.raises(RuntimeError, match='registration audit failed'):
+                    runtime.skills.register_skill_package(replacement, actor=actor, replace=True)
+
+                persisted, _metadata = runtime.store.get_skill('atomic-skill')
+                assert persisted.package_sha256 == original.package_sha256
+                assert persisted.allowed_tools == ['echo']
+                assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+                assert not any(
+                    event.type.value == 'skill_registered' and event.source == actor
+                    for event in runtime.events.list()
+                )
+            finally:
+                runtime.close()
+
+    def test_failed_skill_trust_rolls_back_record_and_restores_one_time_admin(self, monkeypatch) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='trust skill')
+            cap = runtime.capability.grant_once(
+                actor,
+                runtime.config.skills.trust_resource,
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            real_emit = runtime.events.emit
+
+            def fail_trust_event(event_type, *args, **kwargs):
+                if str(getattr(event_type, 'value', event_type)) == 'skill_trusted':
+                    raise RuntimeError('trust event failed')
+                return real_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_trust_event)
+            with pytest.raises(RuntimeError, match='trust event failed'):
+                runtime.skills.trust_skill_source(
+                    actor=actor,
+                    source_type='global',
+                    source='global/example',
+                    package_sha256='a' * 64,
+                )
+
+            assert not runtime.store.is_skill_trusted(
+                source_type='global',
+                source='global/example',
+                package_sha256='a' * 64,
+            )
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+        finally:
+            runtime.close()
+
     def test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             write_skill_package(Path(temp_dir), 'workspace-skill', allowed_tools=['echo'], extra_resources={'references/guide.md': 'Workspace resource guide.'})
@@ -339,6 +413,36 @@ class TestSkillPackageLoading:
                 loaded = runtime.skills.activate_skill(target, 'cross-load-skill', actor=actor)
                 assert loaded['pid'] == target
                 assert 'echo' in runtime.process.get(target).tool_table
+            finally:
+                runtime.close()
+
+    def test_cross_process_failed_activation_restores_execute_and_admin_one_shots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(Path(temp_dir), 'cross-fail-skill', allowed_tools=['missing_cross_tool'])
+            runtime = Runtime.open('local')
+            try:
+                actor = runtime.process.spawn(image='base-agent:v0', goal='actor')
+                target = runtime.process.spawn(image='base-agent:v0', goal='target')
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                execute_cap = runtime.capability.grant_once(
+                    actor,
+                    'skill:cross-fail-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                )
+                admin_cap = runtime.capability.grant_once(
+                    actor,
+                    f'process:{target}',
+                    [CapabilityRight.ADMIN],
+                    issued_by='test',
+                )
+
+                with pytest.raises(NotFound, match='tool not found'):
+                    runtime.skills.activate_skill(target, 'cross-fail-skill', actor=actor)
+
+                assert runtime.store.get_capability(execute_cap.cap_id).uses_remaining == 1
+                assert runtime.store.get_capability(admin_cap.cap_id).uses_remaining == 1
+                assert 'cross-fail-skill' not in runtime.process.get(target).loaded_skills
             finally:
                 runtime.close()
 

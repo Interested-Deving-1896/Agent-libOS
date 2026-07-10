@@ -282,6 +282,81 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_ask_shell_policy_requires_human_approval_even_at_always_allow_level(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='ask shell policy')
+            runtime.capability.issue_trusted(
+                pid,
+                runtime.shell.policy_resource(),
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                effect=CapabilityEffect.ASK,
+                constraints={
+                    runtime.config.shell.policy_capability_key: runtime.config.shell.always_allow_level,
+                },
+            )
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert provider.calls == []
+            pending = runtime.human.pending()
+            assert len(pending) == 1
+            assert pending[0].payload['context']['argv'] == ['git', 'status', '--short']
+            assert runtime.human.drain_terminal_queue(auto_approve=True)[0].status == HumanRequestStatus.APPROVED
+            allowed = runtime.shell.run(pid, ['git', 'status', '--short'])
+            assert allowed.stdout == 'ok\n'
+            with pytest.raises(HumanApprovalRequired):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+        finally:
+            runtime.close()
+
+    def test_one_time_shell_policy_is_consumed_after_success(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='one-time shell policy')
+            policy = runtime.capability.issue_trusted(
+                pid,
+                runtime.shell.policy_resource(),
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    runtime.config.shell.policy_capability_key: runtime.config.shell.always_allow_level,
+                },
+                uses_remaining=1,
+            )
+
+            result = runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert result.stdout == 'ok\n'
+            assert runtime.store.get_capability(policy.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+        finally:
+            runtime.close()
+
+    def test_permanent_allow_shell_policy_can_authorize_repeated_runs(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='permanent shell policy')
+            policy = runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+            first = runtime.shell.run(pid, ['git', 'status', '--short'])
+            second = runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert first.stdout == 'ok\n'
+            assert second.stdout == 'ok\n'
+            assert runtime.store.get_capability(policy.cap_id).uses_remaining is None
+            assert provider.calls == [
+                (['git', 'status', '--short'], runtime.config.tools.shell_timeout_s),
+                (['git', 'status', '--short'], runtime.config.tools.shell_timeout_s),
+            ]
+        finally:
+            runtime.close()
+
     def test_always_deny_shell_policy_overrides_exact_command_grant(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:

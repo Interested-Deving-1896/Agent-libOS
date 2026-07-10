@@ -8,6 +8,7 @@ import math
 import secrets
 import threading
 import time
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -190,6 +191,13 @@ def _validate_json_bool_fields(body: dict[str, Any]) -> None:
             raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{key} must be a JSON boolean")
 
 
+def _required_body_string(body: dict[str, Any], key: str) -> str:
+    value = body.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{key} must be a non-empty JSON string")
+    return value
+
+
 class GuiServerError(Exception):
     def __init__(self, status: int, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -208,10 +216,11 @@ class GuiEventBroadcaster:
     """In-process event buffer used by the GUI SSE endpoint."""
 
     def __init__(self, max_events: int = _GUI_DEFAULTS.event_buffer_limit) -> None:
+        if max_events <= 0:
+            raise ValueError("GUI event buffer limit must be positive")
         self._condition = threading.Condition()
-        self._events: list[GuiEvent] = []
+        self._events: deque[GuiEvent] = deque(maxlen=max_events)
         self._next_seq = 1
-        self._max_events = max_events
         self._closed = False
 
     def publish(self, event: str, data: dict[str, Any] | None = None) -> GuiEvent:
@@ -219,20 +228,18 @@ class GuiEventBroadcaster:
             item = GuiEvent(seq=self._next_seq, event=event, data=data or {})
             self._next_seq += 1
             self._events.append(item)
-            if len(self._events) > self._max_events:
-                self._events = self._events[-self._max_events :]
             self._condition.notify_all()
             return item
 
     def replay_after(self, cursor: int) -> list[GuiEvent]:
         with self._condition:
-            return [event for event in self._events if event.seq > cursor]
+            return self._events_after_locked(cursor)
 
     def wait_after(self, cursor: int, timeout_s: float = 15.0) -> list[GuiEvent]:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while not self._closed:
-                ready = [event for event in self._events if event.seq > cursor]
+                ready = self._events_after_locked(cursor)
                 if ready:
                     return ready
                 remaining = deadline - time.monotonic()
@@ -241,10 +248,83 @@ class GuiEventBroadcaster:
                 self._condition.wait(remaining)
             return []
 
+    def _events_after_locked(self, cursor: int) -> list[GuiEvent]:
+        """Return replayable events and make an evicted/restarted cursor explicit.
+
+        Sequence numbers are intentionally in-memory and restart at one with a
+        new GUI server.  A client can therefore present either a cursor older
+        than the retained buffer or one ahead of this server's newest event.
+        Silently returning the retained suffix in the first case (or nothing in
+        the second) can leave the renderer permanently stale.  The synthetic
+        invalidation tells it to fetch a fresh snapshot before applying the
+        retained stream.
+        """
+
+        if not self._events:
+            if cursor <= 0:
+                return []
+            return [self._cursor_invalidation(cursor, reset_cursor=0, oldest=None, latest=None)]
+
+        oldest = self._events[0].seq
+        latest = self._events[-1].seq
+        if cursor < oldest - 1:
+            reset_cursor = oldest - 1
+            return [
+                self._cursor_invalidation(cursor, reset_cursor=reset_cursor, oldest=oldest, latest=latest),
+                *self._events,
+            ]
+        if cursor > latest:
+            return [
+                self._cursor_invalidation(cursor, reset_cursor=0, oldest=oldest, latest=latest),
+                *self._events,
+            ]
+        return [event for event in self._events if event.seq > cursor]
+
+    @staticmethod
+    def _cursor_invalidation(
+        requested_cursor: int,
+        *,
+        reset_cursor: int,
+        oldest: int | None,
+        latest: int | None,
+    ) -> GuiEvent:
+        return GuiEvent(
+            seq=reset_cursor,
+            event="event.invalidated",
+            data={
+                "invalidated": True,
+                "reason": "sse_cursor_not_replayable",
+                "requested_cursor": requested_cursor,
+                "reset_cursor": reset_cursor,
+                "oldest_available": oldest,
+                "latest_available": latest,
+            },
+        )
+
     def close(self) -> None:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
+
+
+class _BoundedSeenKeys:
+    """A bounded insertion-ordered set for GUI delta de-duplication."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, limit)
+        self._keys: OrderedDict[str, None] = OrderedDict()
+
+    def add_if_new(self, key: str) -> bool:
+        if key in self._keys:
+            self._keys.move_to_end(key)
+            return False
+        self._keys[key] = None
+        while len(self._keys) > self._limit:
+            self._keys.popitem(last=False)
+        return True
+
+    def __len__(self) -> int:
+        return len(self._keys)
 
 
 @dataclass
@@ -354,17 +434,23 @@ class SchedulerController:
         try:
             with self.service.runtime_lock:
                 result = asyncio.run(self.service.runtime.arun_process_once(pid))
-                self.last_result = [result]
-                self.service.publish_runtime_changes("step")
-            return {"started": True, "result": to_jsonable(result), "scheduler": self.status()}
+                with self._lock:
+                    self.last_result = [result]
         except Exception as exc:
-            self.last_error = str(exc)
+            with self._lock:
+                self.last_error = str(exc)
             raise
         finally:
             with self._lock:
                 self.running = False
                 self.finished_at = time.time()
             self.service.publish_scheduler_status()
+        # Publish the snapshot only after the synchronous step has transitioned
+        # back to its final scheduler state.  Otherwise both the API response
+        # and the renderer's latest snapshot can claim that a completed step is
+        # still running.
+        self.service.publish_runtime_changes("step")
+        return {"started": True, "result": to_jsonable(result), "scheduler": self.status()}
 
     def _run_background(self, max_quanta: int | None, pid: str | None) -> None:
         collected: list[Any] = []
@@ -435,11 +521,22 @@ class GuiRuntimeService:
         self._closed = False
         self._static_snapshot_cache: dict[str, Any] | None = None
         self._static_snapshot_dirty = True
-        self._seen_event_ids: set[str] = set()
-        self._seen_audit_ids: set[str] = set()
-        self._seen_human_request_ids: set[str] = set()
-        self._seen_message_ids: set[str] = set()
-        self._seen_llm_call_ids: set[str] = set()
+        dedupe_limit = max(1, self.runtime.config.gui.event_buffer_limit * 2)
+        self._seen_event_ids = _BoundedSeenKeys(max(dedupe_limit, self.runtime.config.gui.snapshot_event_limit * 2))
+        self._seen_audit_ids = _BoundedSeenKeys(max(dedupe_limit, self.runtime.config.gui.snapshot_audit_limit * 2))
+        self._seen_human_request_versions = _BoundedSeenKeys(
+            max(dedupe_limit, self.runtime.config.gui.snapshot_collection_max_items * 2)
+        )
+        self._seen_message_ids = _BoundedSeenKeys(
+            max(
+                dedupe_limit,
+                self.runtime.config.gui.snapshot_collection_max_items
+                * self.runtime.config.gui.snapshot_process_message_limit,
+            )
+        )
+        self._seen_llm_call_ids = _BoundedSeenKeys(
+            max(dedupe_limit, self.runtime.config.gui.snapshot_llm_call_limit * 2)
+        )
         self.user_llm_profiles = UserLLMProfileStore(llm_profiles_file, config=self.runtime.config)
         self._user_llm_profile_cache = self._load_user_llm_profiles()
         self.publish_runtime_changes("startup")
@@ -470,30 +567,32 @@ class GuiRuntimeService:
             snapshot = self.snapshot()
             self.broadcaster.publish("snapshot", {"reason": reason, "snapshot": snapshot})
             for event in snapshot["events"]:
-                if event["event_id"] in self._seen_event_ids:
+                if not self._seen_event_ids.add_if_new(event["event_id"]):
                     continue
-                self._seen_event_ids.add(event["event_id"])
                 self.broadcaster.publish("event.appended", event)
             for record in snapshot["audit"]:
-                if record["record_id"] in self._seen_audit_ids:
+                if not self._seen_audit_ids.add_if_new(record["record_id"]):
                     continue
-                self._seen_audit_ids.add(record["record_id"])
                 self.broadcaster.publish("audit.appended", record)
             for request in snapshot["human_requests"]:
-                if request["request_id"] in self._seen_human_request_ids:
+                version_key = ":".join(
+                    (
+                        str(request["request_id"]),
+                        str(request.get("updated_at") or ""),
+                        str(request.get("status") or ""),
+                    )
+                )
+                if not self._seen_human_request_versions.add_if_new(version_key):
                     continue
-                self._seen_human_request_ids.add(request["request_id"])
                 self.broadcaster.publish("human_request.updated", request)
             for process in snapshot["processes"]:
                 for message in process.get("messages", []):
-                    if message["message_id"] in self._seen_message_ids:
+                    if not self._seen_message_ids.add_if_new(message["message_id"]):
                         continue
-                    self._seen_message_ids.add(message["message_id"])
                     self.broadcaster.publish("message.posted", message)
             for call in snapshot["llm_calls"]:
-                if call["call_id"] in self._seen_llm_call_ids:
+                if not self._seen_llm_call_ids.add_if_new(call["call_id"]):
                     continue
-                self._seen_llm_call_ids.add(call["call_id"])
                 self.broadcaster.publish("llm_call.appended", call)
 
     def health(self) -> dict[str, Any]:
@@ -514,7 +613,10 @@ class GuiRuntimeService:
 
     def snapshot(self) -> dict[str, Any]:
         with self.runtime_lock:
-            processes = [self._process_summary(process.pid, include_messages=True) for process in self.runtime.process.list()]
+            processes = [
+                self._process_summary(process.pid, include_messages=True, process=process)
+                for process in self.runtime.process.list()
+            ]
             static = self._static_snapshot()
             snapshot = {
                 "db": self.db,
@@ -546,8 +648,14 @@ class GuiRuntimeService:
     def _reason_changes_static_snapshot(self, reason: str) -> bool:
         return reason.startswith(("image.", "skill.", "jsonrpc.", "mcp.", "module.", "process.exec", "llm_profile."))
 
-    def _process_summary(self, pid: str, *, include_messages: bool = False) -> dict[str, Any]:
-        process = self.runtime.process.get(pid)
+    def _process_summary(
+        self,
+        pid: str,
+        *,
+        include_messages: bool = False,
+        process: Any | None = None,
+    ) -> dict[str, Any]:
+        process = process if process is not None else self.runtime.process.get(pid)
         unread = self.runtime.messages.list(pid, include_acked=False)
         messages = (
             self.runtime.messages.list(pid, include_acked=True, limit=self.runtime.config.gui.snapshot_process_message_limit)
@@ -811,7 +919,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and route == ["snapshot"]:
             return service.snapshot()
         if method == "GET" and route == ["processes"]:
-            return [service._process_summary(process.pid, include_messages=True) for process in service.runtime.process.list()]
+            return [
+                service._process_summary(process.pid, include_messages=True, process=process)
+                for process in service.runtime.process.list()
+            ]
         if method == "GET" and route == ["tools"]:
             return service._tool_summaries()
         if method == "POST" and route == ["processes"]:
@@ -1040,7 +1151,10 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service._process_summary(pid, include_messages=True)
         if method == "POST" and route == ["signal"]:
             body = self._read_body()
-            signal = ProcessSignal(str(body.get("signal") or ProcessSignal.INTERRUPT.value))
+            try:
+                signal = ProcessSignal(str(body.get("signal") or ProcessSignal.INTERRUPT.value))
+            except ValueError as exc:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, f"unknown process signal: {body.get('signal')}") from exc
             if signal in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
                 self._require_confirmed("process.signal", body, {"pid": pid, "signal": signal.value})
             service.runtime.process.signal(pid, signal, payload=body.get("payload"))
@@ -1070,7 +1184,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return {"message": to_jsonable(message), "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
         if method == "POST" and route == ["cd"]:
             body = self._read_body()
-            process = service.runtime.set_process_working_directory(pid, str(body["path"]))
+            process = service.runtime.set_process_working_directory(pid, _required_body_string(body, "path"))
             service.publish_runtime_changes("process.cd")
             return to_jsonable(process)
         if method == "POST" and route == ["exec"]:
@@ -1084,7 +1198,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             )
             process = service.runtime.exec_process(
                 pid,
-                str(body["image"]),
+                _required_body_string(body, "image"),
                 args=body.get("args") if isinstance(body.get("args"), dict) else {},
                 goal=body.get("goal"),
                 preserve_memory=_json_bool(body, "preserve_memory", True),
@@ -1139,7 +1253,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and route == ["create"]:
             body = self._read_body()
             checkpoint_id = service.runtime.checkpoint.create(
-                str(body["pid"]),
+                _required_body_string(body, "pid"),
                 str(body.get("reason") or "GUI checkpoint"),
                 actor=str(body.get("actor") or "gui"),
                 require_capability=body.get("actor") is not None,
@@ -1187,7 +1301,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if actor_value is not None:
                 result = service.runtime.skills.register_skill_from_workspace_path(
                     str(actor_value),
-                    str(body["path"]),
+                    _required_body_string(body, "path"),
                     replace=replace,
                     require_capability=True,
                 )
@@ -1209,14 +1323,14 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             actor = str(body.get("actor") or "gui")
             if route[1] == "activate":
                 result = service.runtime.skills.activate_skill(
-                    str(body["pid"]),
+                    _required_body_string(body, "pid"),
                     route[0],
                     actor=actor,
                     require_capability=require_capability,
                 )
             else:
                 result = service.runtime.skills.unload_skill(
-                    str(body["pid"]),
+                    _required_body_string(body, "pid"),
                     route[0],
                     actor=actor,
                     require_capability=require_capability,
@@ -1239,16 +1353,16 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             actor = body.get("actor")
             if actor is None:
                 cap = service.runtime.capability.grant(
-                    str(body["subject"]),
-                    str(body["resource"]),
+                    _required_body_string(body, "subject"),
+                    _required_body_string(body, "resource"),
                     rights,
                     issued_by="gui",
                 )
             else:
                 cap = service.runtime.capability.issue(
                     actor=str(actor),
-                    subject=str(body["subject"]),
-                    spec=CapabilitySpec(resource=str(body["resource"]), rights=set(rights)),
+                    subject=_required_body_string(body, "subject"),
+                    spec=CapabilitySpec(resource=_required_body_string(body, "resource"), rights=set(rights)),
                     require_authority=True,
                 )
             service.publish_runtime_changes("capability.grant")
@@ -1257,13 +1371,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             self._require_confirmed("capability.delegate", body, {"parent": body.get("parent"), "child": body.get("child"), "resource": body.get("resource"), "rights": body.get("rights")})
             actor = body.get("actor")
-            parent = str(body["parent"])
+            parent = _required_body_string(body, "parent")
             if actor is not None and parent != str(actor):
                 raise CapabilityDenied("GUI actor-mode delegation may only delegate from the actor process")
             cap = service.runtime.capability.delegate(
                 parent,
-                str(body["child"]),
-                {"resource": body["resource"], "rights": _gui_capability_rights(body.get("rights"))},
+                _required_body_string(body, "child"),
+                {"resource": _required_body_string(body, "resource"), "rights": _gui_capability_rights(body.get("rights"))},
                 actor=str(actor or "gui"),
             )
             service.publish_runtime_changes("capability.delegate")
@@ -1281,7 +1395,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return to_jsonable(cap)
         if method == "POST" and route == ["explain"]:
             body = self._read_body()
-            return service.runtime.capability.explain_decision(str(body["subject"]), str(body["resource"]), str(body["right"]))
+            return service.runtime.capability.explain_decision(
+                _required_body_string(body, "subject"),
+                _required_body_string(body, "resource"),
+                _required_body_string(body, "right"),
+            )
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown capability endpoint")
 
     def _dispatch_images(self, method: str, route: list[str]) -> Any:
@@ -1343,9 +1461,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             )
             result = service.runtime.image_registry.commit_from_checkpoint(
                 actor=str(body.get("actor") or "gui"),
-                checkpoint_id=str(body["checkpoint_id"]),
-                image_id=str(body["image_id"]),
-                name=str(body["name"]),
+                checkpoint_id=_required_body_string(body, "checkpoint_id"),
+                image_id=_required_body_string(body, "image_id"),
+                name=_required_body_string(body, "name"),
                 version=str(body.get("version") or "v0"),
                 replace=_json_bool(body, "replace", False),
                 metadata=dict(body.get("metadata") or {}),
@@ -1434,7 +1552,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and len(route) == 2 and route[1] == "call":
             body = self._read_body()
             self._require_confirmed("jsonrpc.call", body, {"pid": body.get("pid"), "endpoint_id": route[0], "method_id": body.get("method_id")})
-            result = service.runtime.jsonrpc.call(str(body["pid"]), route[0], str(body["method_id"]), params=body.get("params"))
+            result = service.runtime.jsonrpc.call(
+                _required_body_string(body, "pid"),
+                route[0],
+                _required_body_string(body, "method_id"),
+                params=body.get("params"),
+            )
             service.publish_runtime_changes("jsonrpc.call")
             return to_jsonable(result)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown JSON-RPC endpoint")
@@ -1481,9 +1604,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 {"pid": body.get("pid"), "server_id": route[0], "tool_id": body.get("tool_id")},
             )
             result = service.runtime.mcp.call_tool(
-                str(body["pid"]),
+                _required_body_string(body, "pid"),
                 route[0],
-                str(body["tool_id"]),
+                _required_body_string(body, "tool_id"),
                 arguments=body["arguments"] if "arguments" in body and body["arguments"] is not None else {},
             )
             service.publish_runtime_changes("mcp.call")

@@ -3,11 +3,13 @@ import pytest
 import json
 import asyncio
 import tempfile
+import threading
+import time
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessStatus
-from agent_libos.models.exceptions import ProcessError, ValidationError
+from agent_libos.models.exceptions import ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
 
@@ -229,6 +231,59 @@ class TestProcessMessage:
 
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         finally:
+            runtime.close()
+
+    def test_post_racing_empty_receive_cannot_be_lost_before_wait_registration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        checked_empty = threading.Event()
+        poster_attempted = threading.Event()
+        posted = threading.Event()
+        poster_errors: list[BaseException] = []
+        poster: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='race message wait')
+            original_list = runtime.messages.list
+
+            def coordinated_list(*args, **kwargs):
+                result = original_list(*args, **kwargs)
+                if not result and not checked_empty.is_set():
+                    checked_empty.set()
+                    assert poster_attempted.wait(timeout=5)
+                    # On the old register-after-check path, post completes in
+                    # this window and observes a RUNNABLE process. On the fixed
+                    # path it blocks on the store lock until WAITING_EVENT is
+                    # registered, then wakes the process.
+                    time.sleep(0.05)
+                return result
+
+            monkeypatch.setattr(runtime.messages, 'list', coordinated_list)
+
+            def post_message() -> None:
+                try:
+                    assert checked_empty.wait(timeout=5)
+                    poster_attempted.set()
+                    runtime.messages.post(sender='test', recipient_pid=pid, channel='control', subject='racing post')
+                    posted.set()
+                except BaseException as exc:
+                    poster_errors.append(exc)
+
+            poster = threading.Thread(target=post_message)
+            poster.start()
+            with pytest.raises(ProcessMessageWaitRequired):
+                runtime.messages.receive(pid, block=True, channel='control')
+
+            assert posted.wait(timeout=5)
+            poster.join(timeout=5)
+            assert not poster.is_alive()
+            assert poster_errors == []
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+            assert [message.subject for message in runtime.messages.unread(pid)] == ['racing post']
+        finally:
+            if poster is not None:
+                poster.join(timeout=5)
             runtime.close()
 
     def test_receive_process_messages_blocks_until_matching_message_then_resumes(self) -> None:

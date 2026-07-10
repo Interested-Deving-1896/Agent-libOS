@@ -38,6 +38,13 @@ derived from one checkpoint root process. Image-package images boot from an
 immutable directory-package artifact created from `IMAGE.yaml`, `prompt.md`,
 optional `tools/`, optional `resources/`, and optional `workspace/`.
 
+Image registration and replacement keep the in-memory image cache, durable
+manifest, event/audit records, and any newly inserted package or checkpoint
+artifact in one transaction. A failure after artifact insertion therefore
+restores the previous image (for replacement) or removes the new image and
+artifact (for registration/commit); a caller never observes a manifest whose
+registration result was reported as failed.
+
 `prompt_mode` controls prompt composition. `image_only` uses the image prompt as
 the system prompt and gives the model only materialized task context; this is
 the default for custom images and image packages. `minimal_runtime` adds a
@@ -95,6 +102,9 @@ process-local ephemeral tools and are not copied into the workspace. Package
 artifacts persist only declared package content: `IMAGE.yaml`, the referenced
 prompt, declared `workspace/` content, referenced `tools/` JIT files, and
 `resources/`. Cache, VCS, likely secret, and platform-unsafe paths are rejected.
+Failed package boot or exec removes the private workspace, unpublished JIT
+tool rows and process aliases, candidate source rows, and candidate Object
+Memory descriptors before returning failure.
 
 ## Working Directory
 
@@ -252,9 +262,10 @@ Human interaction is modeled as runtime objects, not raw prompt text.
   privileged rights, `shell:*` execute, or root/global filesystem write such as
   `filesystem:/:*`; workspace write remains a human-approvable scope.
 - `human_output` writes through the HumanObject primitive and provider. It
-  commits the delivered request state, audit record, event, and external-effect
-  record before calling the provider, so a visible output is not left as a
-  replayable pending request.
+  commits the delivery intent, terminal request state, audit record, event, and
+  external-effect record before calling the provider, so a provider exception
+  cannot leave a replayable pending request or restore already committed
+  one-shot authority.
 - Per-use approvals can create one-shot capabilities. Side-effectful primitives
   reserve the use before commit, restore it if a pre-commit failure aborts the
   operation, and leave it consumed once the operation crosses its commit or
@@ -267,6 +278,9 @@ messages, update the request, wake the process, and resume the original
 operation. Rejection returns a normal failure to the process instead of crashing
 the runtime, except `request_permission` rejection returns a structured
 `rejected` decision after installing the selected deny policy.
+Terminal queue selection and terminal transition use one serialized critical
+section. Concurrent drains therefore cannot deliver one output twice or install
+two automatic permission policies from the same pending request.
 
 ## Process Messages And IPC
 
@@ -290,6 +304,9 @@ means "all messages." Read limits bound both returned messages and
 acknowledgement; a blocking receive must use a positive limit and a non-empty
 explicit id filter because zero-size receive windows cannot ever produce a
 message.
+An empty blocking read registers its wait atomically with message posting, so a
+matching concurrent post either satisfies the read or wakes the registered
+process; it cannot disappear between the mailbox query and wait-state update.
 
 Interrupt messages preempt before non-message tool calls until read. Normal
 messages notify after a tool call and do not block the current action.

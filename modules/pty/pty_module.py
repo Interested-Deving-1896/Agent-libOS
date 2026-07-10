@@ -433,12 +433,27 @@ class _PosixPtySession:
         except ProcessLookupError:
             return
         except PermissionError:
-            if sig == signal.SIGKILL:
-                with contextlib.suppress(ProcessLookupError):
-                    self.proc.kill()
-            else:
-                with contextlib.suppress(ProcessLookupError):
-                    self.proc.terminate()
+            # Falling back to only the direct child would leave descendants
+            # running outside the PTY lifecycle.  psutil gives us a second,
+            # explicit tree-containment path; if that is also denied, surface
+            # the cleanup failure instead of reporting the session closed.
+            self._signal_process_tree(sig)
+
+    def _signal_process_tree(self, sig: int) -> None:
+        try:
+            root = psutil.Process(self.proc.pid)
+        except psutil.NoSuchProcess:
+            return
+        descendants = root.children(recursive=True)
+        for process in reversed(descendants):
+            try:
+                process.send_signal(sig)
+            except psutil.NoSuchProcess:
+                continue
+        try:
+            root.send_signal(sig)
+        except psutil.NoSuchProcess:
+            return
 
 
 class _WinPtySession:
@@ -1211,6 +1226,9 @@ class PtyAdapter:
             processes = [proc]
             try:
                 processes.extend(proc.children(recursive=True))
+            except psutil.AccessDenied as exc:
+                self._fail_closed_resource_monitor(session, resource=resource, error=exc)
+                return
             except psutil.Error:
                 pass
             for item in processes:
@@ -1218,8 +1236,14 @@ class PtyAdapter:
                     times = item.cpu_times()
                     cpu_seconds += float(times.user) + float(times.system)
                     peak_memory += int(item.memory_info().rss)
+                except psutil.AccessDenied as exc:
+                    self._fail_closed_resource_monitor(session, resource=resource, error=exc)
+                    return
                 except psutil.Error:
                     continue
+        except psutil.AccessDenied as exc:
+            self._fail_closed_resource_monitor(session, resource=resource, error=exc)
+            return
         except psutil.Error:
             return
         with session.lock:
@@ -1266,6 +1290,40 @@ class PtyAdapter:
                     target=f"pty:{session.session_oid}",
                     decision={"reason": str(exc)},
                 )
+
+    def _fail_closed_resource_monitor(
+        self,
+        session: _PtyRuntimeSession,
+        *,
+        resource: str,
+        error: Exception,
+    ) -> None:
+        try:
+            self._close_session(
+                session.session_oid,
+                actor="runtime.pty",
+                reason="resource_monitor_access_denied",
+                force=True,
+                timeout_s=self.config.pty.close_timeout_s,
+                wait_if_closing=True,
+            )
+            self.runtime.memory.delete_object_trusted(
+                "runtime.pty",
+                session.session_oid,
+                reason="resource_monitor_access_denied",
+            )
+        finally:
+            self.audit.record(
+                actor="runtime.pty",
+                action="primitive.pty.resource_monitor_denied",
+                target=f"pty:{session.session_oid}",
+                decision={
+                    "resource": resource,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "fail_closed": True,
+                },
+            )
 
     def _close_session(
         self,

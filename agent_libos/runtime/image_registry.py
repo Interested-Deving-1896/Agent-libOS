@@ -8,9 +8,10 @@ import os
 import re
 import stat
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
 from jsonschema.validators import validator_for as jsonschema_validator_for
@@ -136,6 +137,22 @@ class ImageRegistryPrimitive:
     def bind_runtime(self, runtime: Any) -> None:
         self.runtime = runtime
 
+    @contextmanager
+    def _atomic_image_registration(self, image_id: str) -> Iterator[None]:
+        """Keep the durable registry, audit/event rows, and cache in lockstep."""
+
+        previous = self.images.get(image_id)
+        transaction_store = self.store or self.audit.store
+        try:
+            with transaction_store.transaction():
+                yield
+        except Exception:
+            if previous is None:
+                self.images.pop(image_id, None)
+            else:
+                self.images[image_id] = previous
+            raise
+
     def register(
         self,
         image: AgentImage | dict[str, Any],
@@ -152,40 +169,41 @@ class ImageRegistryPrimitive:
         if existing is not None and not replace:
             raise ValidationError(f"agent image already exists: {candidate.image_id}")
         self._validate_image(candidate)
-        self.images[candidate.image_id] = candidate
-        now = utc_now()
-        if self.store is not None:
-            self.store.upsert_image(candidate, registered_by=actor, source=source, created_at=now)
-        action = "image.replace" if existing is not None else "image.register"
-        self.events.emit(
-            EventType.IMAGE_REGISTERED,
-            source=actor,
-            target=self.resource_for(candidate.image_id),
-            payload={
-                "image_id": candidate.image_id,
-                "name": candidate.name,
-                "version": candidate.version,
-                "replaced": existing is not None,
-                "source": source,
-                "boot_kind": candidate.boot.get("kind", "fresh"),
-            },
-        )
-        self.audit.record(
-            actor=actor,
-            action=action,
-            target=self.resource_for(candidate.image_id),
-            decision={
-                "image_id": candidate.image_id,
-                "name": candidate.name,
-                "version": candidate.version,
-                "default_tools": list(candidate.default_tools),
-                "required_capabilities": len(candidate.required_capabilities),
-                "required_modules": len(candidate.required_modules),
-                "replaced": existing is not None,
-                "source": source,
-                "boot_kind": candidate.boot.get("kind", "fresh"),
-            },
-        )
+        with self._atomic_image_registration(candidate.image_id):
+            self.images[candidate.image_id] = candidate
+            now = utc_now()
+            if self.store is not None:
+                self.store.upsert_image(candidate, registered_by=actor, source=source, created_at=now)
+            action = "image.replace" if existing is not None else "image.register"
+            self.events.emit(
+                EventType.IMAGE_REGISTERED,
+                source=actor,
+                target=self.resource_for(candidate.image_id),
+                payload={
+                    "image_id": candidate.image_id,
+                    "name": candidate.name,
+                    "version": candidate.version,
+                    "replaced": existing is not None,
+                    "source": source,
+                    "boot_kind": candidate.boot.get("kind", "fresh"),
+                },
+            )
+            self.audit.record(
+                actor=actor,
+                action=action,
+                target=self.resource_for(candidate.image_id),
+                decision={
+                    "image_id": candidate.image_id,
+                    "name": candidate.name,
+                    "version": candidate.version,
+                    "default_tools": list(candidate.default_tools),
+                    "required_capabilities": len(candidate.required_capabilities),
+                    "required_modules": len(candidate.required_modules),
+                    "replaced": existing is not None,
+                    "source": source,
+                    "boot_kind": candidate.boot.get("kind", "fresh"),
+                },
+            )
         return ImageRegistrationResult(image=candidate, replaced=existing is not None, source=source)
 
     def validate_package_path(self, path: str | Path) -> dict[str, Any]:
@@ -293,48 +311,49 @@ class ImageRegistryPrimitive:
             },
         )
         self._validate_image(image)
-        created_at = utc_now()
-        if self.store.get_image_artifact(artifact_id) is None:
-            self.store.insert_image_artifact(
-                artifact_id=artifact_id,
-                kind=_PACKAGE_BOOT_KIND,
-                artifact=artifact,
-                sha256=artifact_sha256,
-                created_by=actor,
-                created_at=created_at,
-                metadata={
+        with self._atomic_image_registration(image.image_id):
+            created_at = utc_now()
+            if self.store.get_image_artifact(artifact_id) is None:
+                self.store.insert_image_artifact(
+                    artifact_id=artifact_id,
+                    kind=_PACKAGE_BOOT_KIND,
+                    artifact=artifact,
+                    sha256=artifact_sha256,
+                    created_by=actor,
+                    created_at=created_at,
+                    metadata={
+                        "source": source,
+                        "package_sha256": artifact["package_sha256"],
+                        "artifact_bytes": artifact_bytes,
+                        "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
+                        "jit_tools": len(artifact.get("jit_tools", [])),
+                        "required_modules": len(image.required_modules),
+                    },
+                )
+            result = self.register(
+                image,
+                actor=actor,
+                replace=replace,
+                require_capability=False,
+                source=source,
+            )
+            self.audit.record(
+                actor=actor,
+                action="image.package.register",
+                target=self.resource_for(image.image_id),
+                decision={
                     "source": source,
+                    "artifact_id": artifact_id,
+                    "artifact_sha256": artifact_sha256,
                     "package_sha256": artifact["package_sha256"],
-                    "artifact_bytes": artifact_bytes,
+                    "files": artifact.get("counts", {}).get("files", 0),
                     "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
                     "jit_tools": len(artifact.get("jit_tools", [])),
                     "required_modules": len(image.required_modules),
+                    "jit_tool_exposure": image.jit_tool_exposure,
+                    "replaced": result.replaced,
                 },
             )
-        result = self.register(
-            image,
-            actor=actor,
-            replace=replace,
-            require_capability=False,
-            source=source,
-        )
-        self.audit.record(
-            actor=actor,
-            action="image.package.register",
-            target=self.resource_for(image.image_id),
-            decision={
-                "source": source,
-                "artifact_id": artifact_id,
-                "artifact_sha256": artifact_sha256,
-                "package_sha256": artifact["package_sha256"],
-                "files": artifact.get("counts", {}).get("files", 0),
-                "workspace_files": artifact.get("counts", {}).get("workspace_files", 0),
-                "jit_tools": len(artifact.get("jit_tools", [])),
-                "required_modules": len(image.required_modules),
-                "jit_tool_exposure": image.jit_tool_exposure,
-                "replaced": result.replaced,
-            },
-        )
         return result
 
     def _package_validation_summary(self, image: AgentImage, artifact: dict[str, Any]) -> dict[str, Any]:
@@ -1074,21 +1093,6 @@ class ImageRegistryPrimitive:
             )
         artifact_sha256 = hashlib.sha256(artifact_json.encode("utf-8")).hexdigest()
         artifact_id = f"imgart_{artifact_sha256[:24]}"
-        created_at = utc_now()
-        if self.store.get_image_artifact(artifact_id) is None:
-            self.store.insert_image_artifact(
-                artifact_id=artifact_id,
-                kind="checkpoint_commit",
-                artifact=artifact,
-                sha256=artifact_sha256,
-                created_by=actor,
-                created_at=created_at,
-                metadata={
-                    "source_checkpoint_id": checkpoint_id,
-                    "source_pid": checkpoint.pid,
-                    "artifact_bytes": artifact_bytes,
-                },
-            )
         source_image = self.images.get(str(artifact["source_image_id"]))
         image = AgentImage(
             image_id=image_id,
@@ -1123,39 +1127,55 @@ class ImageRegistryPrimitive:
                 "root_only": True,
             },
         )
-        result = self.register(
-            image,
-            actor=actor,
-            replace=replace,
-            require_capability=False,
-            source=f"checkpoint:{checkpoint_id}",
-        )
-        self.events.emit(
-            EventType.IMAGE_COMMITTED,
-            source=actor,
-            target=self.resource_for(image_id),
-            payload={
-                "image_id": image_id,
-                "checkpoint_id": checkpoint_id,
-                "artifact_id": artifact_id,
-                "artifact_sha256": artifact_sha256,
-                "artifact_bytes": artifact_bytes,
-            },
-        )
-        self.audit.record(
-            actor=actor,
-            action="image.commit",
-            target=self.resource_for(image_id),
-            decision={
-                "checkpoint_id": checkpoint_id,
-                "source_pid": checkpoint.pid,
-                "artifact_id": artifact_id,
-                "artifact_sha256": artifact_sha256,
-                "artifact_bytes": artifact_bytes,
-                "required_capabilities": len(image.required_capabilities),
-                "required_modules": len(image.required_modules),
-            },
-        )
+        with self._atomic_image_registration(image_id):
+            created_at = utc_now()
+            if self.store.get_image_artifact(artifact_id) is None:
+                self.store.insert_image_artifact(
+                    artifact_id=artifact_id,
+                    kind="checkpoint_commit",
+                    artifact=artifact,
+                    sha256=artifact_sha256,
+                    created_by=actor,
+                    created_at=created_at,
+                    metadata={
+                        "source_checkpoint_id": checkpoint_id,
+                        "source_pid": checkpoint.pid,
+                        "artifact_bytes": artifact_bytes,
+                    },
+                )
+            result = self.register(
+                image,
+                actor=actor,
+                replace=replace,
+                require_capability=False,
+                source=f"checkpoint:{checkpoint_id}",
+            )
+            self.events.emit(
+                EventType.IMAGE_COMMITTED,
+                source=actor,
+                target=self.resource_for(image_id),
+                payload={
+                    "image_id": image_id,
+                    "checkpoint_id": checkpoint_id,
+                    "artifact_id": artifact_id,
+                    "artifact_sha256": artifact_sha256,
+                    "artifact_bytes": artifact_bytes,
+                },
+            )
+            self.audit.record(
+                actor=actor,
+                action="image.commit",
+                target=self.resource_for(image_id),
+                decision={
+                    "checkpoint_id": checkpoint_id,
+                    "source_pid": checkpoint.pid,
+                    "artifact_id": artifact_id,
+                    "artifact_sha256": artifact_sha256,
+                    "artifact_bytes": artifact_bytes,
+                    "required_capabilities": len(image.required_capabilities),
+                    "required_modules": len(image.required_modules),
+                },
+            )
         return result
 
     def grant_register(

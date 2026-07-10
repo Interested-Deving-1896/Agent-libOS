@@ -137,6 +137,15 @@ before the task reaches a terminal state; once the task is terminal, normal
 process-owned memory cleanup can release an owner whose creating process has
 already exited.
 
+Task start reserves finite-use owner authority before creating its runner and
+commits it with the durable task row. A pre-commit failure removes the runner
+before restoring those exact reservations; an executor handoff failure marks
+the task failed and removes the unstarted runner. Result creation and linking
+use a lifetime scope: failed wiring or a cancellation that wins the terminal
+transition releases the unpublished result and derived handles, terminalizes
+the runner, and releases the owner pin. Once the succeeded row is durable,
+later observability failures do not retract the published result.
+
 Runtime-internal multi-step writes can use an Object Memory lifetime scope.
 Objects created in the scope are released automatically unless the scope is
 committed or the object is transferred to another owner. This is used for

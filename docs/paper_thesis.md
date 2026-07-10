@@ -44,8 +44,8 @@ substrate for capability-controlled self-evolution.
    Resource Provider Substrate, runtime store persistence, audit/events, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
    image registry/exec/commit primitives, standard `SKILL.md` packages, JSON-RPC over
-   HTTP client endpoints, and Deno/TypeScript JIT tools that can reach libOS
-   only through syscall RPC.
+   HTTP client endpoints, MCP client tools over registered servers, and
+   Deno/TypeScript JIT tools that can reach libOS only through syscall RPC.
 
 3. Benchmark suite.
    The current implementation includes an M1 deterministic runtime-safety harness

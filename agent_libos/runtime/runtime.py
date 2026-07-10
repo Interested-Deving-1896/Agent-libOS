@@ -1633,57 +1633,68 @@ class Runtime:
         process = self.process.get(pid)
         registered: list[str] = []
         prepared: list[tuple[str, str]] = []
-        for item in artifact.get("jit_tools", []):
-            name = str(item.get("name") or "")
-            if not name:
-                continue
-            if name in process.tool_table:
-                raise RuntimeError(f"image package JIT tool conflicts with visible tool: {name}")
-            if self.tools._name_collides_with_static_tool(name):
-                raise RuntimeError(f"image package JIT tool conflicts with static tool: {name}")
-            spec = ToolSpec(
-                name=name,
-                description=str(item.get("description") or ""),
-                input_schema=dict(item.get("input_schema") or {}),
-                output_schema=dict(item.get("output_schema") or {}),
-                tags=["image", "jit", "package"],
-                metadata={
-                    "image_id": image.image_id,
-                    "artifact_id": image.boot.get("artifact_id"),
-                    "source_path": item.get("source_path"),
-                    **dict(item.get("metadata") or {}),
-                },
-            )
-            candidate_id = self.tools.propose(
-                pid,
-                spec,
-                source_code=str(item.get("source") or ""),
-                tests=[dict(test) for test in item.get("tests", [])],
-            )
-            validation = self.tools.validate(candidate_id, pid=pid)
-            if not validation.ok:
-                raise ValidationError(f"image package JIT tool {name} failed validation: {'; '.join(validation.errors)}")
-            prepared.append((name, candidate_id))
+        candidate_ids: list[str] = []
         handles: dict[str, ToolHandle] = {}
         try:
+            for item in artifact.get("jit_tools", []):
+                name = str(item.get("name") or "")
+                if not name:
+                    continue
+                if name in process.tool_table:
+                    raise RuntimeError(f"image package JIT tool conflicts with visible tool: {name}")
+                if self.tools._name_collides_with_static_tool(name):
+                    raise RuntimeError(f"image package JIT tool conflicts with static tool: {name}")
+                spec = ToolSpec(
+                    name=name,
+                    description=str(item.get("description") or ""),
+                    input_schema=dict(item.get("input_schema") or {}),
+                    output_schema=dict(item.get("output_schema") or {}),
+                    tags=["image", "jit", "package"],
+                    metadata={
+                        "image_id": image.image_id,
+                        "artifact_id": image.boot.get("artifact_id"),
+                        "source_path": item.get("source_path"),
+                        **dict(item.get("metadata") or {}),
+                    },
+                )
+                candidate_id = self.tools.propose(
+                    pid,
+                    spec,
+                    source_code=str(item.get("source") or ""),
+                    tests=[dict(test) for test in item.get("tests", [])],
+                )
+                candidate_ids.append(candidate_id)
+                validation = self.tools.validate(candidate_id, pid=pid)
+                if not validation.ok:
+                    raise ValidationError(
+                        f"image package JIT tool {name} failed validation: {'; '.join(validation.errors)}"
+                    )
+                prepared.append((name, candidate_id))
             for name, candidate_id in prepared:
                 handle = self.tools.register(pid, candidate_id, approver=f"image.package:{image.image_id}")
                 handles[name] = handle
                 registered.append(name)
+            if registered:
+                current_process = self.store.get_process(pid)
+                if current_process is not None:
+                    current_process.updated_at = utc_now()
+                    self.store.update_process(current_process)
+                self.audit.record(
+                    actor=f"image:{image.image_id}",
+                    action="image.package_jit.register",
+                    target=f"process:{pid}",
+                    decision={"tools": sorted(registered)},
+                )
         except Exception:
             self._remove_registered_image_package_jit_tools(pid, handles)
+            for candidate_id in reversed(candidate_ids):
+                self.tools.discard_candidate(
+                    pid,
+                    candidate_id,
+                    discarded_by=f"image.package:{image.image_id}",
+                    reason="image_package_jit_boot_failed",
+                )
             raise
-        if registered:
-            current_process = self.store.get_process(pid)
-            if current_process is not None:
-                current_process.updated_at = utc_now()
-                self.store.update_process(current_process)
-            self.audit.record(
-                actor=f"image:{image.image_id}",
-                action="image.package_jit.register",
-                target=f"process:{pid}",
-                decision={"tools": sorted(registered)},
-            )
         return sorted(registered)
 
     def _remove_registered_image_package_jit_tools(self, pid: str, handles: dict[str, ToolHandle]) -> None:
@@ -1697,13 +1708,20 @@ class Runtime:
             process.updated_at = utc_now()
             self.store.update_process(process)
         for handle in handles.values():
+            candidate_rows = self.store.select_table_rows(
+                "tool_candidates",
+                "pid = ? AND registered_tool_id = ?",
+                (pid, handle.tool_id),
+            )
             getattr(self.tools, "_jit_sources", {}).pop(handle.tool_id, None)
             getattr(self.tools, "_handles", {}).pop(handle.tool_id, None)
             self.store.delete_tool(handle.tool_id)
-            with self.store.transaction() as cur:
-                cur.execute(
-                    "DELETE FROM tool_candidates WHERE pid = ? AND registered_tool_id = ?",
-                    (pid, handle.tool_id),
+            for row in candidate_rows:
+                self.tools.discard_candidate(
+                    pid,
+                    str(row["candidate_id"]),
+                    discarded_by="runtime",
+                    reason="image_package_jit_unpublished",
                 )
 
     def _remove_registered_image_package_jit_tool_names(self, pid: str, names: list[str]) -> None:

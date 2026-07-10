@@ -8,7 +8,12 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from agent_libos.api.gui.server import _sse_payload_data, create_gui_http_server
+from agent_libos.api.gui.server import (
+    GuiEventBroadcaster,
+    _BoundedSeenKeys,
+    _sse_payload_data,
+    create_gui_http_server,
+)
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
 from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessSignal, ProcessStatus
 from agent_libos.runtime.runtime import Runtime
@@ -338,6 +343,44 @@ class TestGuiServer:
             assert frame_lines[1] == 'event: snapshot'
             assert frame_lines[2].startswith('data: ')
 
+    def test_sse_broadcaster_invalidates_evicted_and_restarted_cursors(self) -> None:
+        broadcaster = GuiEventBroadcaster(max_events=2)
+        broadcaster.publish('snapshot', {'version': 1})
+        broadcaster.publish('snapshot', {'version': 2})
+        broadcaster.publish('snapshot', {'version': 3})
+
+        evicted = broadcaster.replay_after(0)
+
+        assert [event.event for event in evicted] == ['event.invalidated', 'snapshot', 'snapshot']
+        assert evicted[0].seq == 1
+        assert evicted[0].data == {
+            'invalidated': True,
+            'reason': 'sse_cursor_not_replayable',
+            'requested_cursor': 0,
+            'reset_cursor': 1,
+            'oldest_available': 2,
+            'latest_available': 3,
+        }
+        assert [event.seq for event in evicted[1:]] == [2, 3]
+
+        restarted = broadcaster.replay_after(99)
+
+        assert [event.event for event in restarted] == ['event.invalidated', 'snapshot', 'snapshot']
+        assert restarted[0].seq == 0
+        assert restarted[0].data['requested_cursor'] == 99
+        assert restarted[0].data['reset_cursor'] == 0
+
+    def test_gui_delta_deduplication_is_bounded(self) -> None:
+        seen = _BoundedSeenKeys(2)
+
+        assert seen.add_if_new('first') is True
+        assert seen.add_if_new('second') is True
+        assert seen.add_if_new('second') is False
+        assert seen.add_if_new('third') is True
+        assert len(seen) == 2
+        assert seen.add_if_new('first') is True
+        assert len(seen) == 2
+
     def test_snapshot_audit_window_contains_latest_records(self) -> None:
         for index in range(205):
             self.server.service.runtime.audit.record(
@@ -502,6 +545,36 @@ class TestGuiServer:
         )
         assert status == 200
         assert allowed['status'] == ProcessStatus.KILLED.value
+
+    def test_invalid_process_signal_is_a_bad_request_without_mutation(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'invalid signal target', 'auto_run': False})
+        pid = spawned['pid']
+
+        status, body = self.request('POST', f'/api/processes/{pid}/signal', {'signal': 'not-a-signal'})
+
+        assert status == 400
+        assert 'unknown process signal' in body['error']['message']
+        assert self.server.service.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+    def test_missing_required_mutation_fields_are_bad_requests(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'required fields', 'auto_run': False})
+        pid = spawned['pid']
+
+        exec_status, exec_body = self.request(
+            'POST',
+            f'/api/processes/{pid}/exec',
+            {'goal': 'missing image', 'confirmed': True, 'auto_run': False},
+        )
+        cd_status, cd_body = self.request('POST', f'/api/processes/{pid}/cd', {})
+        checkpoint_status, checkpoint_body = self.request('POST', '/api/checkpoints/create', {})
+
+        assert exec_status == 400
+        assert 'image must be a non-empty JSON string' in exec_body['error']['message']
+        assert cd_status == 400
+        assert 'path must be a non-empty JSON string' in cd_body['error']['message']
+        assert checkpoint_status == 400
+        assert 'pid must be a non-empty JSON string' in checkpoint_body['error']['message']
+        assert self.server.service.runtime.process.get(pid).image_id == 'base-agent:v0'
 
     def test_high_risk_image_commit_requires_confirmation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'commit source', 'auto_run': False})
@@ -724,6 +797,30 @@ class TestGuiServer:
         records = self.server.service.runtime.audit.trace()
         assert not any((record.target == f"process:{first['pid']}" and record.action == 'scheduler.run_quantum' for record in records))
         assert any((record.target == f"process:{second['pid']}" and record.action == 'scheduler.run_quantum' for record in records))
+
+    def test_process_step_returns_and_publishes_final_scheduler_status(self) -> None:
+        _status, spawned = self.request('POST', '/api/processes', {'goal': 'step once', 'auto_run': False})
+        pid = spawned['pid']
+
+        async def fake_quantum(selected_pid: str) -> dict[str, str]:
+            assert selected_pid == pid
+            return {'pid': selected_pid, 'status': 'completed'}
+
+        self.server.service.runtime.arun_process_once = fake_quantum
+        before = self.server.service.broadcaster.replay_after(0)[-1].seq
+
+        status, body = self.request('POST', f'/api/processes/{pid}/step', {})
+
+        assert status == 200
+        assert body['started'] is True
+        assert body['scheduler']['running'] is False
+        snapshots = [
+            event.data['snapshot']
+            for event in self.server.service.broadcaster.replay_after(before)
+            if event.event == 'snapshot'
+        ]
+        assert snapshots
+        assert snapshots[-1]['scheduler']['running'] is False
 
     def test_workflow_run_endpoint_returns_result_and_snapshot_process(self) -> None:
         status, result = self.request('POST', '/api/workflows/run', {'tool': 'get_working_directory', 'args': {}})
@@ -1232,6 +1329,42 @@ class TestGuiServer:
         assert approved['request']['status'] == 'approved'
         assert status_again == 409
         assert 'not pending' in conflict['error']['message']
+
+    def test_human_request_delta_is_emitted_for_each_changed_version(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='gui human delta')
+        cursor = self.server.service.broadcaster.replay_after(0)[-1].seq
+        request_id = runtime.human.ask(pid, 'Emit both versions?', blocking=True)
+
+        self.server.service.publish_runtime_changes('human.pending')
+        pending_events = self.server.service.broadcaster.replay_after(cursor)
+        pending_updates = [
+            event
+            for event in pending_events
+            if event.event == 'human_request.updated' and event.data['request_id'] == request_id
+        ]
+        assert len(pending_updates) == 1
+        assert pending_updates[0].data['status'] == 'pending'
+        cursor = pending_events[-1].seq
+
+        runtime.human.approve(request_id, {'approved': True, 'source': 'test'})
+        self.server.service.publish_runtime_changes('human.approved')
+        approved_events = self.server.service.broadcaster.replay_after(cursor)
+        approved_updates = [
+            event
+            for event in approved_events
+            if event.event == 'human_request.updated' and event.data['request_id'] == request_id
+        ]
+        assert len(approved_updates) == 1
+        assert approved_updates[0].data['status'] == 'approved'
+        cursor = approved_events[-1].seq
+
+        self.server.service.publish_runtime_changes('human.unchanged')
+        unchanged = self.server.service.broadcaster.replay_after(cursor)
+        assert not any(
+            event.event == 'human_request.updated' and event.data['request_id'] == request_id
+            for event in unchanged
+        )
 
     def test_human_request_respond_without_approved_defaults_to_reject(self) -> None:
         runtime = self.server.service.runtime

@@ -1,4 +1,6 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 import pytest
 import contextlib
 import io
@@ -221,6 +223,72 @@ class TestCapabilityManager:
             assert allowed.allowed
             assert not denied.allowed
             assert 'constraints rejected' in denied.reason
+        finally:
+            runtime.close()
+
+    def test_authority_rule_unknown_top_level_field_is_rejected(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reject malformed authority rule')
+
+            with pytest.raises(ValidationError, match='unknown fields: condition'):
+                runtime.capability.issue_trusted(
+                    pid,
+                    'shell:git',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                    constraints={
+                        'authority_rules': [
+                            {
+                                'rule_id': 'test.git.status.typo',
+                                'operation': 'shell.run',
+                                'effect': 'allow',
+                                'risk': 'harmless',
+                                'condition': {'argv': ['git', 'status'], 'match': 'exact'},
+                            }
+                        ]
+                    },
+                )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push']},
+            )
+            assert not decision.allowed
+        finally:
+            runtime.close()
+
+    def test_authority_rule_without_conditions_is_valid_unconditional_rule(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='unconditional authority rule')
+            capability = runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.git.unconditional',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'low',
+                        }
+                    ]
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push']},
+            )
+            assert decision.allowed
+            assert runtime.capability.inspect(capability.cap_id)['rules'][0]['conditions'] == {}
         finally:
             runtime.close()
 
@@ -679,6 +747,191 @@ class TestCapabilityManager:
             assert not runtime.capability.check(owner, 'object:revocable', CapabilityRight.READ)
         finally:
             runtime.close()
+
+    def test_one_time_revoke_authority_is_reserved_before_target_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+            actor = runtime.process.spawn(image='base-agent:v0', goal='actor')
+            first = runtime.capability.issue_trusted(
+                owner,
+                'object:protected-a',
+                [CapabilityRight.READ],
+                issued_by='issuer',
+                effect=CapabilityEffect.DENY,
+            )
+            second = runtime.capability.issue_trusted(
+                owner,
+                'object:protected-b',
+                [CapabilityRight.READ],
+                issued_by='issuer',
+                effect=CapabilityEffect.DENY,
+            )
+            runtime.capability.issue_trusted(
+                actor,
+                'object:*',
+                [CapabilityRight.REVOKE],
+                issued_by='issuer',
+                uses_remaining=1,
+            )
+            barrier = Barrier(2)
+            original = runtime.capability._require_revoke_authority
+
+            def gated_require(who: str, cap: object):
+                decision = original(who, cap)
+                barrier.wait(timeout=5)
+                return decision
+
+            monkeypatch.setattr(runtime.capability, '_require_revoke_authority', gated_require)
+
+            def revoke(cap_id: str) -> str:
+                try:
+                    runtime.capability.revoke(cap_id, revoked_by=actor)
+                    return 'ok'
+                except CapabilityDenied:
+                    return 'denied'
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(revoke, [first.cap_id, second.cap_id]))
+
+            statuses = {
+                runtime.store.get_capability(first.cap_id).status.value,
+                runtime.store.get_capability(second.cap_id).status.value,
+            }
+            assert sorted(results) == ['denied', 'ok']
+            assert statuses == {'active', 'revoked'}
+        finally:
+            runtime.close()
+
+    def test_reserved_use_restore_does_not_reactivate_explicit_revoke(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reservation revoke race')
+            cap = runtime.capability.issue_trusted(
+                pid,
+                'object:reservation-race',
+                [CapabilityRight.READ],
+                issued_by='issuer',
+                uses_remaining=1,
+            )
+            decision = runtime.capability.authorize(pid, cap.resource, CapabilityRight.READ)
+            reservation_id = runtime.capability.reserve_decision_use(
+                decision,
+                used_by='test',
+                reason='provider preflight reservation',
+            )
+            assert reservation_id is not None
+
+            runtime.capability.revoke(cap.cap_id, revoked_by='issuer', reason='explicit revoke wins')
+            restored = runtime.capability._restore_reserved_use(
+                reservation_id,
+                restored_by='test',
+                reason='provider failed before commit',
+            )
+
+            assert restored is None
+            after = runtime.store.get_capability(cap.cap_id)
+            assert after.status.value == 'revoked'
+            assert after.uses_remaining == 0
+            assert not runtime.capability.check(pid, cap.resource, CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_require_consumes_finite_use_by_default(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:required-once',
+                [CapabilityRight.READ],
+                issued_by='issuer',
+                uses_remaining=1,
+            )
+
+            decision = runtime.capability.require('worker', cap.resource, CapabilityRight.READ)
+
+            assert decision.allowed
+            assert decision.consume_capability_id is None
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.require('worker', cap.resource, CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_require_consume_false_supports_explicit_effect_reservation(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:reserved-once',
+                [CapabilityRight.READ],
+                issued_by='issuer',
+                uses_remaining=1,
+            )
+
+            decision = runtime.capability.require(
+                'worker',
+                cap.resource,
+                CapabilityRight.READ,
+                consume=False,
+            )
+
+            assert decision.consume_capability_id == cap.cap_id
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            reservation_id = runtime.capability.reserve_decision_use(
+                decision,
+                used_by='test',
+                reason='explicit boundary reservation',
+            )
+            assert reservation_id is not None
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+        finally:
+            runtime.close()
+
+    def test_inflight_reservation_is_abandoned_fail_closed_after_runtime_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / 'runtime.sqlite')
+            runtime = Runtime.open(db_path)
+            try:
+                cap = runtime.capability.issue_trusted(
+                    'crashed-worker',
+                    'object:crash-boundary',
+                    [CapabilityRight.READ],
+                    issued_by='issuer',
+                    uses_remaining=1,
+                )
+                decision = runtime.capability.authorize('crashed-worker', cap.resource, CapabilityRight.READ)
+                reservation_id = runtime.capability.reserve_decision_use(
+                    decision,
+                    used_by='test',
+                    reason='simulate provider call interrupted by runtime exit',
+                )
+                assert reservation_id is not None
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db_path)
+            try:
+                assert reopened.capability._restore_reserved_use(
+                    reservation_id,
+                    restored_by='test',
+                    reason='late cleanup from previous runtime',
+                ) is None
+                persisted = reopened.store.get_capability(cap.cap_id)
+                assert persisted is not None
+                assert persisted.uses_remaining == 0
+                assert persisted.status.value == 'revoked'
+                rows = reopened.store.select_table_rows(
+                    'capability_use_reservations',
+                    'reservation_id = ?',
+                    [reservation_id],
+                )
+                assert rows[0]['status'] == 'abandoned'
+            finally:
+                reopened.close()
 
     def test_holder_cannot_self_revoke_restrictive_capability(self) -> None:
         runtime = Runtime.open('local')

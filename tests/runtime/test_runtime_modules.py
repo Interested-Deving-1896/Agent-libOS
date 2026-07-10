@@ -750,6 +750,59 @@ sha256: {package_sha}
             finally:
                 runtime.close()
 
+    def test_failing_startup_hook_cannot_leave_direct_runtime_registrations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            manifest, source_sha = _write_mutating_hook_module(root)
+            trust = _module_trust_key('mutating-hook-module:v0', manifest, source_sha)
+
+            with pytest.raises(RuntimeError, match='mutating startup hook failed'):
+                Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(trust,))
+
+            runtime = Runtime.open(db)
+            try:
+                failed = runtime.modules.inspect_module('mutating-hook-module:v0')
+                assert failed['status'] == 'failed'
+                assert 'mutating startup hook failed' in failed['error']
+                assert 'hook-direct-image:v0' not in runtime.images
+                assert all(row['name'] != 'hook_direct_tool' for row in runtime.store.list_tools())
+                assert runtime.store.get_image('hook-direct-image:v0') is None
+                assert runtime.syscalls.get('hook.direct') is None
+            finally:
+                runtime.close()
+
+    def test_runtime_loaded_failing_hook_restores_in_memory_registries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_mutating_hook_module(root)
+            trust = _module_trust_key('mutating-hook-module:v0', manifest, source_sha)
+            runtime = Runtime.open()
+            try:
+                before_provider_hooks = {
+                    kind: list(hooks)
+                    for kind, hooks in runtime.provider_hooks.items()
+                }
+                before_shutdown_finalizers = list(runtime._shutdown_finalizers)
+                before_release_finalizers = list(runtime.memory._object_release_finalizers)
+                assert not hasattr(runtime, '_agent_libos_pty_adapter')
+                assert not hasattr(runtime.substrate, 'hook_direct_provider')
+                with pytest.raises(RuntimeError, match='mutating startup hook failed'):
+                    runtime.modules.load_module_manifest(manifest, trusted_modules=(trust,))
+
+                assert 'hook-direct-image:v0' not in runtime.images
+                assert all(row['name'] != 'hook_direct_tool' for row in runtime.store.list_tools())
+                assert runtime.store.get_image('hook-direct-image:v0') is None
+                assert runtime.syscalls.get('hook.direct') is None
+                assert runtime.provider_hooks == before_provider_hooks
+                assert runtime._shutdown_finalizers == before_shutdown_finalizers
+                assert runtime.memory._object_release_finalizers == before_release_finalizers
+                assert not hasattr(runtime, '_agent_libos_pty_adapter')
+                assert not hasattr(runtime.substrate, 'hook_direct_provider')
+                assert runtime.modules.inspect_module('mutating-hook-module:v0')['status'] == 'failed'
+            finally:
+                runtime.close()
+
     def test_duplicate_module_id_does_not_overwrite_loaded_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -883,6 +936,80 @@ def _write_module(root: Path, *, expose_read_tool: bool=False, invalid_registrat
     manifest = root / 'module.yaml'
     manifest.write_text(f"\nschema_version: 1\nmodule_id: test-module:v0\nname: Test startup module\nversion: v0\nentrypoint: {entrypoint}\nprovides:\n  tools: ['module_echo']\n  images: ['module-agent:v0']\n  syscalls: {syscalls.rstrip()}\n  provider_hooks: {(['test_hook'] if provider_hook else [])!r}\n  startup_hooks: ['mark_startup']\nsha256: {source_sha}\nmetadata:\n  test: true\n".lstrip(), encoding='utf-8')
     return (manifest, source_sha)
+
+
+def _write_mutating_hook_module(root: Path) -> tuple[Path, str]:
+    source = root / 'mutating_hook_module.py'
+    source.write_text(
+        """
+from pydantic import BaseModel
+
+from agent_libos.models import AgentImage
+from agent_libos.tools.base import SyncAgentTool, ToolContext
+
+
+class HookArgs(BaseModel):
+    pass
+
+
+class HookDirectTool(SyncAgentTool[HookArgs]):
+    name = "hook_direct_tool"
+    description = "Registered directly by a failing startup hook."
+    args_schema = HookArgs
+
+    def run(self, args: HookArgs, ctx: ToolContext):
+        return {"ok": True}
+
+
+def hook_syscall(session, args):
+    return {"ok": True}
+
+
+def mutating_hook(runtime):
+    runtime.tools.register_tool(
+        HookDirectTool(),
+        registered_by="module:mutating-hook-module:v0",
+        scope="module:mutating-hook-module:v0",
+    )
+    runtime.image_registry.register(
+        AgentImage(image_id="hook-direct-image:v0", name="hook-direct-image"),
+        actor="module:mutating-hook-module:v0",
+        require_capability=False,
+    )
+    runtime.syscalls.register(
+        "hook.direct",
+        hook_syscall,
+        registered_by="module:mutating-hook-module:v0",
+    )
+    runtime.provider_hooks.setdefault("hook-direct", []).append(lambda _runtime: None)
+    runtime.bind_shutdown_finalizer(lambda: True)
+    runtime.memory.bind_object_release_finalizer(lambda _obj, _actor, _reason: None)
+    runtime._agent_libos_pty_adapter = object()
+    runtime.substrate.hook_direct_provider = object()
+    raise RuntimeError("mutating startup hook failed")
+
+
+def register_module(ctx):
+    ctx.add_startup_hook(mutating_hook)
+""".lstrip(),
+        encoding='utf-8',
+    )
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest = root / 'mutating-hook-module.yaml'
+    manifest.write_text(
+        f"""
+schema_version: 1
+module_id: mutating-hook-module:v0
+name: Mutating hook module
+version: v0
+entrypoint: ./mutating_hook_module.py:register_module
+provides:
+  startup_hooks: ['mutating_hook']
+sha256: {source_sha}
+""".lstrip(),
+        encoding='utf-8',
+    )
+    return manifest, source_sha
 
 
 def _write_multifile_module(root: Path) -> tuple[Path, str]:

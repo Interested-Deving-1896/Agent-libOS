@@ -389,8 +389,11 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Checkpoint-derived images capture internal reconstructable runtime state, not
   external provider state. Their required capabilities are declarations and are
   not granted automatically at spawn or exec.
-- Providers classify external effects as `irreversible`, `rollbackable`, or
-  `no_rollback_required`; checkpoint restore reports those classes with
+- Providers classify successful external effects as `irreversible`,
+  `rollbackable`, or `no_rollback_required`. For filesystem mutations and
+  clock operations, an ordinary exception after the provider call begins is
+  recorded as `unknown` unless the provider explicitly certifies
+  `ProviderEffectNotStarted`. Checkpoint restore reports all classes with
   `restore_external_policy="report_only"`.
 - Resource Provider Substrate backends perform host effects, but primitives own
   capability checks, policy decisions, events, and audit.

@@ -85,6 +85,17 @@ class SubprocessTimeoutExpired(TimeoutError):
         self.result = result
 
 
+class ProviderEffectNotStarted(RuntimeError):
+    """Provider-certified failure before an externally visible effect began.
+
+    Primitives treat every other exception from an effectful provider call as
+    an ambiguous outcome: one-shot authority remains consumed and an unknown
+    external-effect record is persisted.  A provider may raise this exception
+    only when it can guarantee that no mutation, delivery, remote request, or
+    other externally visible operation was attempted.
+    """
+
+
 class FilesystemProvider(Protocol):
     namespace: str
     root_display: str

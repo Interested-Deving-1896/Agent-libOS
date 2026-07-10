@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
@@ -11,6 +12,10 @@ from agent_libos.storage.sqlite import SQLiteStore
 
 POSTGRES_SCHEMES = {"postgres", "postgresql"}
 SQLITE_SCHEME = "sqlite"
+_LIBPQ_DSN_FIELD = re.compile(
+    r"(?:^|\s)(?:dbname|host|hostaddr|options|password|port|service|sslmode|target_session_attrs|user)\s*=",
+    re.IGNORECASE,
+)
 
 
 def open_store(target: str | Path | None = None, *, config: AgentLibOSConfig | None = None) -> RuntimeStore:
@@ -64,10 +69,27 @@ def _backend_for(target: str | Path, config: AgentLibOSConfig, *, explicit: bool
     text = str(target)
     parsed = urlsplit(text)
     scheme = parsed.scheme.lower()
+    inferred_backend: str | None = None
     if scheme in POSTGRES_SCHEMES:
-        return "postgres"
-    if scheme == SQLITE_SCHEME:
-        return "sqlite"
+        if "://" not in text:
+            raise ValidationError("PostgreSQL runtime store targets must use a postgres:// or postgresql:// URI")
+        inferred_backend = "postgres"
+    elif scheme == SQLITE_SCHEME:
+        inferred_backend = "sqlite"
+    elif "://" in text:
+        raise ValidationError(f"unsupported runtime store target scheme: {scheme or '<missing>'}")
+    elif _LIBPQ_DSN_FIELD.search(text):
+        raise ValidationError(
+            "libpq keyword DSNs are not supported as runtime store targets; "
+            "use a postgres:// or postgresql:// URI"
+        )
+    if inferred_backend is not None:
+        if not explicit and inferred_backend != config.runtime.store_backend:
+            raise ValidationError(
+                "runtime store target conflicts with runtime.store_backend: "
+                f"target selects {inferred_backend}, config selects {config.runtime.store_backend}"
+            )
+        return inferred_backend
     if explicit:
         return "sqlite"
     return config.runtime.store_backend

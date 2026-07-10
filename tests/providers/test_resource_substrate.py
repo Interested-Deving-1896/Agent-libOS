@@ -3,6 +3,7 @@ import contextlib
 import os
 import pytest
 import psutil
+import signal
 import sys
 import tempfile
 import time
@@ -14,7 +15,7 @@ from agent_libos.primitives.shell import ShellAdapter
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
-from modules.pty.pty_module import LocalPtyProvider
+from modules.pty.pty_module import LocalPtyProvider, _PosixPtySession
 
 class TestResourceProviderSubstrate:
 
@@ -236,6 +237,42 @@ class TestResourceProviderSubstrate:
                 for proc in _processes_with_marker(marker):
                     with contextlib.suppress(psutil.Error):
                         proc.kill()
+
+    def test_local_pty_provider_permission_denied_group_signal_uses_tree_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if sys.platform == "win32":
+            pytest.skip("POSIX process-group cleanup does not apply to pywinpty")
+
+        class SignalNode:
+            def __init__(self, pid: int, children: list["SignalNode"] | None = None) -> None:
+                self.pid = pid
+                self._children = list(children or [])
+                self.signals: list[int] = []
+
+            def children(self, *, recursive: bool) -> list["SignalNode"]:
+                assert recursive
+                return list(self._children)
+
+            def send_signal(self, selected_signal: int) -> None:
+                self.signals.append(selected_signal)
+
+        child = SignalNode(102)
+        root = SignalNode(101, [child])
+        process = type("FakePopen", (), {"pid": root.pid})()
+        session = _PosixPtySession(master_fd=-1, proc=process)
+
+        def deny_group_signal(_pid: int, _signal: int) -> None:
+            raise PermissionError("simulated process-group denial")
+
+        monkeypatch.setattr(os, "killpg", deny_group_signal)
+        monkeypatch.setattr("modules.pty.pty_module.psutil.Process", lambda pid: root)
+
+        session._signal_process_group(signal.SIGTERM)
+
+        assert child.signals == [signal.SIGTERM]
+        assert root.signals == [signal.SIGTERM]
 
     def test_effectful_provider_without_classification_fails_closed(self) -> None:
         runtime = Runtime.open('local')

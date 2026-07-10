@@ -53,15 +53,22 @@ Explicit CLI options still win over config defaults. Passing `--db local`,
 default backend is PostgreSQL. When `--db` is omitted, the CLI uses
 `runtime.local_store_target` for SQLite or `runtime.store_dsn` for PostgreSQL.
 If `runtime.store_backend: postgres` is selected without `runtime.store_dsn`,
-config loading fails. Prefer environment variables or environment-specific
-config so DSN credentials are not committed. SQLite and PostgreSQL implement
-the same runtime store contract. Ordinary
-Object Memory payloads are runtime-only; SQL object rows store a
-runtime-memory marker, and rows whose live payload cache cannot be reconstructed
-are released fail-closed on reopen.
+config loading fails. A configured PostgreSQL DSN must use `postgres://` or
+`postgresql://`; `runtime.store_dsn` is rejected for the SQLite backend, and a
+PostgreSQL URI in `runtime.local_store_target` is rejected instead of silently
+overriding `runtime.store_backend`. Explicit `--db` targets accept filesystem
+paths, the SQLite sentinels/URI, or URI-form PostgreSQL DSNs; other URI schemes
+and libpq `key=value` DSNs fail closed rather than becoming SQLite filenames.
+Prefer environment variables or environment-specific config so DSN credentials
+are not committed. SQLite and PostgreSQL implement the same runtime store
+contract. Ordinary Object Memory payloads are runtime-only; SQL object rows
+store a runtime-memory marker, and rows whose live payload cache cannot be
+reconstructed are released fail-closed on reopen.
 Persistent stores also take an active-runtime lease. SQLite uses a lock file,
 and PostgreSQL uses a session advisory lock; a second writable Runtime cannot
-open the same database until the first Runtime closes cleanly.
+open the same database until the first Runtime closes cleanly. SQLite derives
+the lease from the canonical database path, so a symlink alias cannot open a
+second writer.
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
@@ -485,6 +492,10 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <e
 `--actor-pid <pid>` makes the CLI enforce that process's checkpoint
 capabilities. Without it, the command runs as an audited admin actor named
 `cli`.
+Restore prints `status: restored` after complete reconciliation, or
+`status: restored_with_warnings` with `main_state_committed: true` and
+`post_commit_failures` when image/JIT/finalizer reconciliation fails after the
+scoped state transaction. Do not retry the latter as an uncommitted restore.
 
 ## Skill Commands
 

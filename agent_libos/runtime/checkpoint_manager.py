@@ -100,40 +100,46 @@ class CheckpointManager:
             self._require_process_right(selected_actor, pid, CapabilityRight.WRITE)
         checkpoint_id = new_id("ckpt")
         created_at = utc_now()
-        snapshot = self._build_snapshot(
-            checkpoint_id=checkpoint_id,
-            pid=pid,
-            reason=reason,
-            created_at=created_at,
-            created_by=selected_actor,
-        )
-        checkpoint = Checkpoint(
-            checkpoint_id=checkpoint_id,
-            pid=pid,
-            reason=reason,
-            created_at=created_at,
-            created_by=selected_actor,
-            snapshot_version=self.config.checkpoint.snapshot_version,
-            metadata={
-                **(metadata or {}),
-                "subtree_pids": snapshot["subtree_pids"],
-                "object_count": len(snapshot["object_payloads"]),
-                "module_count": len(snapshot.get("modules", [])),
-                "snapshot_bytes": len(dumps(snapshot).encode("utf-8")),
-            },
-        )
-        snapshot_bytes = len(dumps(snapshot).encode("utf-8"))
-        if snapshot_bytes > self.config.checkpoint.snapshot_hard_limit_bytes:
-            raise ValidationError(
-                "checkpoint snapshot exceeded "
-                f"snapshot_hard_limit_bytes={self.config.checkpoint.snapshot_hard_limit_bytes}"
+        # Snapshot discovery spans process, object, capability, message, image,
+        # and in-memory object-payload state. Keep every read plus the durable
+        # checkpoint/head write behind one store transaction so a concurrent
+        # mutation cannot produce a row from one instant and a payload from
+        # another.
+        with self.store.transaction(include_object_payloads=True):
+            snapshot = self._build_snapshot(
+                checkpoint_id=checkpoint_id,
+                pid=pid,
+                reason=reason,
+                created_at=created_at,
+                created_by=selected_actor,
             )
-        self.store.insert_checkpoint(checkpoint, snapshot)
-        process = self.store.get_process(pid)
-        if process is not None:
-            process.checkpoint_head = checkpoint_id
-            process.updated_at = utc_now()
-            self.store.update_process(process)
+            snapshot_bytes = len(dumps(snapshot).encode("utf-8"))
+            checkpoint = Checkpoint(
+                checkpoint_id=checkpoint_id,
+                pid=pid,
+                reason=reason,
+                created_at=created_at,
+                created_by=selected_actor,
+                snapshot_version=self.config.checkpoint.snapshot_version,
+                metadata={
+                    **(metadata or {}),
+                    "subtree_pids": snapshot["subtree_pids"],
+                    "object_count": len(snapshot["object_payloads"]),
+                    "module_count": len(snapshot.get("modules", [])),
+                    "snapshot_bytes": snapshot_bytes,
+                },
+            )
+            if snapshot_bytes > self.config.checkpoint.snapshot_hard_limit_bytes:
+                raise ValidationError(
+                    "checkpoint snapshot exceeded "
+                    f"snapshot_hard_limit_bytes={self.config.checkpoint.snapshot_hard_limit_bytes}"
+                )
+            self.store.insert_checkpoint(checkpoint, snapshot)
+            process = self.store.get_process(pid)
+            if process is not None:
+                process.checkpoint_head = checkpoint_id
+                process.updated_at = utc_now()
+                self.store.update_process(process)
         if self.capabilities is not None:
             self.capabilities.grant(
                 subject=pid,
@@ -260,6 +266,8 @@ class CheckpointManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         with self._runtime_quiescent_for_restore():
+            # Preflight: every check in this section is required to finish
+            # before the reconstructable process state is mutated.
             checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
             if require_capability:
                 self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
@@ -274,10 +282,26 @@ class CheckpointManager:
             external_effect_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=current_pids)
             external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
             external_effect_summary = self._external_effect_summary_since(checkpoint, pids=external_effect_pids)
-            cancelled_human_requests, superseded_messages = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
-            self._restore_images(snapshot)
-            self._restore_jit_sources(snapshot)
-            self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=set(snapshot_pids) | set(current_pids))
+            # Commit: this transaction either replaces all scoped durable rows
+            # and object payloads, or leaves the pre-restore state intact.
+            cancelled_human_requests, superseded_messages, release_finalizer_objects = self._restore_scoped_rows(
+                snapshot,
+                current_pids,
+                checkpoint,
+            )
+            # Post-commit reconciliation touches global image/JIT registries and
+            # external object finalizers. It cannot roll back the committed
+            # process state, so failures are reported explicitly and audited
+            # instead of being re-raised as if the restore had not happened.
+            post_commit_failures = self._run_restore_post_commit_phases(
+                actor=actor,
+                checkpoint=checkpoint,
+                snapshot=snapshot,
+                stale_tool_ids=stale_tool_ids,
+                scoped_pids=set(snapshot_pids) | set(current_pids),
+                release_finalizer_objects=release_finalizer_objects,
+            )
+            status = "restored_with_warnings" if post_commit_failures else "restored"
             self.events.emit(
                 EventType.ROLLBACK,
                 source=actor,
@@ -288,6 +312,9 @@ class CheckpointManager:
                     "external_effects_since_checkpoint": len(external_effects),
                     "external_effect_summary": external_effect_summary,
                     "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
+                    "main_state_committed": True,
+                    "status": status,
+                    "post_commit_failures": post_commit_failures,
                 },
             )
             self.audit.record(
@@ -303,12 +330,17 @@ class CheckpointManager:
                     "external_effects_since_checkpoint": external_effects,
                     "external_effect_summary": external_effect_summary,
                     "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
+                    "main_state_committed": True,
+                    "status": status,
+                    "post_commit_failures": post_commit_failures,
                 },
             )
             return {
                 "checkpoint_id": checkpoint_id,
                 "pid": checkpoint.pid,
-                "status": "restored",
+                "status": status,
+                "main_state_committed": True,
+                "post_commit_failures": post_commit_failures,
                 "restored_pids": snapshot_pids,
                 "previous_pids": current_pids,
                 "cancelled_human_requests": cancelled_human_requests,
@@ -433,6 +465,19 @@ class CheckpointManager:
         object_oids = self._scoped_object_oids(process_rows, subtree_pids)
         namespace_names = self._scoped_namespaces(object_oids, subtree_pids)
         capability_rows = self._capability_rows_for_subjects(subtree_pids)
+        capability_ids_by_subject: dict[str, list[str]] = {selected_pid: [] for selected_pid in subtree_pids}
+        for capability_row in capability_rows:
+            capability_ids_by_subject.setdefault(str(capability_row["subject"]), []).append(
+                str(capability_row["cap_id"])
+            )
+        # capabilities_json is a denormalized process index. Derive it from the
+        # capability rows captured by this same transaction so a capability
+        # insertion racing its process-index attachment cannot leave a torn
+        # checkpoint.
+        for process_row in process_rows:
+            process_row["capabilities_json"] = dumps(
+                sorted(capability_ids_by_subject.get(str(process_row["pid"]), []))
+            )
         rows = {
             "processes": process_rows,
             "object_namespaces": self._rows_by_ids("object_namespaces", "namespace", namespace_names),
@@ -515,13 +560,23 @@ class CheckpointManager:
         snapshot: dict[str, Any],
         current_pids: list[str],
         checkpoint: Checkpoint,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[Any]]:
         rows = snapshot["rows"]
         snapshot_object_oids = {str(oid) for oid in snapshot.get("object_oids", [])}
         current_object_oids = set(self._current_scoped_object_oids(current_pids))
         object_oids = snapshot_object_oids | current_object_oids
         namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
         restored_capability_rows = self._filtered_restored_capability_rows(rows.get("capabilities", []))
+        restored_process_rows = [dict(row) for row in rows.get("processes", [])]
+        restored_capability_ids: dict[str, list[str]] = {}
+        for capability_row in restored_capability_rows:
+            restored_capability_ids.setdefault(str(capability_row["subject"]), []).append(
+                str(capability_row["cap_id"])
+            )
+        for process_row in restored_process_rows:
+            process_row["capabilities_json"] = dumps(
+                sorted(restored_capability_ids.get(str(process_row["pid"]), []))
+            )
         release_finalizer_objects = self._object_release_finalizer_objects(current_object_oids - snapshot_object_oids)
         with self.store.transaction(include_object_payloads=True) as cur:
             # Pending human/message state belongs to the same reconstructable
@@ -530,6 +585,7 @@ class CheckpointManager:
             # object payloads.
             cancelled_human_requests = self._cancel_pending_human_requests(cur, current_pids, checkpoint)
             superseded_messages = self._supersede_post_checkpoint_messages(cur, current_pids, checkpoint)
+            self._invalidate_scoped_capability_use_reservations(cur, current_pids, object_oids)
             self._delete_object_links(cur, object_oids)
             self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
             self._delete_object_capabilities(cur, object_oids)
@@ -571,15 +627,66 @@ class CheckpointManager:
                 self._upsert_row(cur, "process_messages", row, "message_id")
             for row in rows.get("llm_pending_actions", []):
                 self._upsert_row(cur, "llm_pending_actions", row, "pid")
-            for row in rows.get("processes", []):
+            for row in restored_process_rows:
                 self._insert_row(cur, "processes", row)
-            self._reconcile_restored_wait_states(cur, [str(row["pid"]) for row in rows.get("processes", [])])
-        self._run_object_release_finalizers_for_objects(
-            release_finalizer_objects,
-            actor="checkpoint.restore",
-            reason="checkpoint_restore",
-        )
-        return cancelled_human_requests, superseded_messages
+            self._reconcile_restored_wait_states(cur, [str(row["pid"]) for row in restored_process_rows])
+        return cancelled_human_requests, superseded_messages, release_finalizer_objects
+
+    def _run_restore_post_commit_phases(
+        self,
+        *,
+        actor: str,
+        checkpoint: Checkpoint,
+        snapshot: dict[str, Any],
+        stale_tool_ids: set[str],
+        scoped_pids: set[str],
+        release_finalizer_objects: list[Any],
+    ) -> list[dict[str, str]]:
+        phases = [
+            ("image_reconciliation", lambda: self._restore_images(snapshot)),
+            ("jit_source_reconciliation", lambda: self._restore_jit_sources(snapshot)),
+            (
+                "jit_pruning",
+                lambda: self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=scoped_pids),
+            ),
+            (
+                "object_release_finalizers",
+                lambda: self._run_object_release_finalizers_for_objects(
+                    release_finalizer_objects,
+                    actor="checkpoint.restore",
+                    reason="checkpoint_restore",
+                ),
+            ),
+        ]
+        failures: list[dict[str, str]] = []
+        for phase, operation in phases:
+            try:
+                operation()
+            except Exception as exc:
+                failure = {
+                    "phase": phase,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                failures.append(failure)
+                try:
+                    self.audit.record(
+                        actor=actor,
+                        action="checkpoint.restore.post_commit_failure",
+                        target=self.checkpoint_resource(checkpoint.checkpoint_id),
+                        decision={
+                            **failure,
+                            "pid": checkpoint.pid,
+                            "main_state_committed": True,
+                        },
+                    )
+                except Exception as audit_exc:
+                    # The committed restore must remain observable to the
+                    # caller even when its append-only audit sink is itself
+                    # unavailable. Preserve that secondary failure in-band.
+                    failure["audit_error_type"] = type(audit_exc).__name__
+                    failure["audit_error"] = str(audit_exc)
+        return failures
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None, root_pid: str) -> dict[str, Any]:
         original_pids = list(snapshot["subtree_pids"])
@@ -1501,6 +1608,38 @@ class CheckpointManager:
         resources = [f"object:{oid}" for oid in sorted(object_oids)]
         placeholders = ", ".join("?" for _ in resources)
         cur.execute(f"DELETE FROM capabilities WHERE resource IN ({placeholders})", resources)
+
+    def _invalidate_scoped_capability_use_reservations(
+        self,
+        cur: Any,
+        pids: list[str],
+        object_oids: set[str],
+    ) -> None:
+        conditions: list[str] = []
+        params: list[str] = []
+        if pids:
+            placeholders = ", ".join("?" for _ in pids)
+            conditions.append(f"subject IN ({placeholders})")
+            params.extend(pids)
+        resources = [f"object:{oid}" for oid in sorted(object_oids)]
+        if resources:
+            placeholders = ", ".join("?" for _ in resources)
+            conditions.append(f"resource IN ({placeholders})")
+            params.extend(resources)
+        if not conditions:
+            return
+        cur.execute(
+            f"""
+            UPDATE capability_use_reservations
+               SET status = ?, updated_at = ?
+             WHERE status = ?
+               AND cap_id IN (
+                   SELECT cap_id FROM capabilities
+                    WHERE {' OR '.join(conditions)}
+               )
+            """,
+            ["invalidated", utc_now(), "reserved", *params],
+        )
 
     def _delete_rows_by_ids(self, cur: Any, table: str, column: str, values: Iterable[str]) -> None:
         selected = list(dict.fromkeys(values))

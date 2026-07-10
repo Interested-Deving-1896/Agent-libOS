@@ -42,6 +42,19 @@ from agent_libos.storage import RuntimeStore
 from agent_libos.tools.observability import ensure_json_size
 
 
+class ObjectVersionConflict(ValidationError):
+    """Raised when a conditional object update observes a different version."""
+
+    def __init__(self, oid: str, *, expected_version: int, actual_version: int) -> None:
+        self.oid = oid
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"object version changed for {oid}: "
+            f"expected version {expected_version}, found {actual_version}"
+        )
+
+
 class ObjectLifetimeScope:
     """Runtime-internal RAII guard for multi-step Object Memory writes."""
 
@@ -309,52 +322,54 @@ class ObjectMemoryManager:
         return ns
 
     def get_namespace(self, pid: str, namespace: str | None = None) -> ObjectNamespace:
-        namespace_name = self.resolve_namespace(pid, namespace)
-        namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
-        ns = self.store.get_namespace(namespace_name)
-        if ns is None:
-            raise NotFound(f"Object Memory namespace not found: {namespace_name}")
-        self.audit.record(
-            actor=pid,
-            action="memory.get_namespace",
-            target=self._namespace_resource(namespace_name),
-            decision={"namespace": namespace_name},
-        )
-        self._consume_one_time_decision(namespace_decision)
+        with self.store.locked():
+            namespace_name = self.resolve_namespace(pid, namespace)
+            namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
+            ns = self.store.get_namespace(namespace_name)
+            if ns is None:
+                raise NotFound(f"Object Memory namespace not found: {namespace_name}")
+            self.audit.record(
+                actor=pid,
+                action="memory.get_namespace",
+                target=self._namespace_resource(namespace_name),
+                decision={"namespace": namespace_name},
+            )
+            self._consume_one_time_decision(namespace_decision)
         return ns
 
     def list_namespace(self, pid: str, namespace: str | None = None, *, limit: int | None = None) -> dict[str, Any]:
-        namespace_name = self.resolve_namespace(pid, namespace)
-        namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
-        self._require_namespace_exists(namespace_name)
-        selected_limit = self._validate_query_limit(limit or self.config.memory.query_limit)
-        objects: list[AgentObject] = []
-        child_namespaces: list[ObjectNamespace] = []
-        for obj in self.store.list_objects(namespace=namespace_name):
-            if len(objects) >= selected_limit:
-                break
-            if self.capabilities.check(pid, f"object:{obj.oid}", ObjectRight.READ):
-                objects.append(obj)
-        remaining = selected_limit - len(objects)
-        if remaining > 0:
-            for ns in self.store.list_namespaces(parent_namespace=namespace_name):
-                if len(child_namespaces) >= remaining:
+        with self.store.locked():
+            namespace_name = self.resolve_namespace(pid, namespace)
+            namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
+            self._require_namespace_exists(namespace_name)
+            selected_limit = self._validate_query_limit(limit or self.config.memory.query_limit)
+            objects: list[AgentObject] = []
+            child_namespaces: list[ObjectNamespace] = []
+            for obj in self.store.list_objects(namespace=namespace_name):
+                if len(objects) >= selected_limit:
                     break
-                if self._can_read_namespace(pid, ns.namespace):
-                    child_namespaces.append(ns)
-        self.audit.record(
-            actor=pid,
-            action="memory.list_namespace",
-            target=self._namespace_resource(namespace_name),
-            output_refs=[obj.oid for obj in objects],
-            decision={
-                "namespace": namespace_name,
-                "objects": len(objects),
-                "namespaces": len(child_namespaces),
-                "limit": selected_limit,
-            },
-        )
-        self._consume_one_time_decision(namespace_decision)
+                if self.capabilities.check(pid, f"object:{obj.oid}", ObjectRight.READ):
+                    objects.append(obj)
+            remaining = selected_limit - len(objects)
+            if remaining > 0:
+                for ns in self.store.list_namespaces(parent_namespace=namespace_name):
+                    if len(child_namespaces) >= remaining:
+                        break
+                    if self._can_read_namespace(pid, ns.namespace):
+                        child_namespaces.append(ns)
+            self.audit.record(
+                actor=pid,
+                action="memory.list_namespace",
+                target=self._namespace_resource(namespace_name),
+                output_refs=[obj.oid for obj in objects],
+                decision={
+                    "namespace": namespace_name,
+                    "objects": len(objects),
+                    "namespaces": len(child_namespaces),
+                    "limit": selected_limit,
+                },
+            )
+            self._consume_one_time_decision(namespace_decision)
         return {
             "namespace": namespace_name,
             "objects": objects,
@@ -377,28 +392,29 @@ class ObjectMemoryManager:
         return obj
 
     def get_object_by_name(self, pid: str, name: str, namespace: str | None = None) -> AgentObject:
-        object_namespace = self.resolve_namespace(pid, namespace)
-        object_name = self._normalize_name(name)
-        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
-        self._require_namespace_exists(object_namespace)
-        obj_ref = self.store.get_object_ref_by_name(object_name, namespace=object_namespace)
-        if obj_ref is None:
-            raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-        # Name lookup never bypasses the object capability model.
-        oid = str(obj_ref["oid"])
-        decision = self.capabilities.require(pid, f"object:{oid}", ObjectRight.READ)
-        obj = self.store.get_object(oid)
-        if obj is None:
-            raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-        self.audit.record(
-            actor=pid,
-            action="memory.get_object_by_name",
-            target=f"object:{self.qualified_name(obj)}",
-            input_refs=[obj.oid],
-            decision={"namespace": obj.namespace, "name": obj.name, "oid": obj.oid},
-        )
-        self._consume_one_time_decision(namespace_decision)
-        self._consume_one_time_decision(decision)
+        with self.store.locked():
+            object_namespace = self.resolve_namespace(pid, namespace)
+            object_name = self._normalize_name(name)
+            namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+            self._require_namespace_exists(object_namespace)
+            obj_ref = self.store.get_object_ref_by_name(object_name, namespace=object_namespace)
+            if obj_ref is None:
+                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+            # Name lookup never bypasses the object capability model.
+            oid = str(obj_ref["oid"])
+            decision = self.capabilities.require(pid, f"object:{oid}", ObjectRight.READ, consume=False)
+            obj = self.store.get_object(oid)
+            if obj is None:
+                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+            self.audit.record(
+                actor=pid,
+                action="memory.get_object_by_name",
+                target=f"object:{self.qualified_name(obj)}",
+                input_refs=[obj.oid],
+                decision={"namespace": obj.namespace, "name": obj.name, "oid": obj.oid},
+            )
+            self._consume_one_time_decision(namespace_decision)
+            self._consume_one_time_decision(decision)
         return obj
 
     def handle_for_name(
@@ -486,7 +502,14 @@ class ObjectMemoryManager:
         )
         return handle
 
-    def update_object(self, pid: str, handle: ObjectHandle, patch: ObjectPatch) -> ObjectHandle:
+    def update_object(
+        self,
+        pid: str,
+        handle: ObjectHandle,
+        patch: ObjectPatch,
+        *,
+        expected_version: int | None = None,
+    ) -> ObjectHandle:
         with self.store.locked():
             write_decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.WRITE)
             if not write_decision.allowed:
@@ -494,6 +517,12 @@ class ObjectMemoryManager:
             current = self.store.get_object(handle.oid)
             if current is None:
                 raise NotFound(f"object not found: {handle.oid}")
+            if expected_version is not None and current.version != expected_version:
+                raise ObjectVersionConflict(
+                    handle.oid,
+                    expected_version=expected_version,
+                    actual_version=current.version,
+                )
             if current.immutable:
                 raise CapabilityDenied(f"immutable object cannot be updated: {handle.oid}")
             next_namespace = current.namespace
@@ -1608,10 +1637,16 @@ class ObjectMemoryManager:
         namespace: str,
         right: str,
     ) -> Any:
-        # Namespace checks protect directory-style lookup and mutation. The
-        # caller consumes returned one-shot decisions only after the operation
-        # succeeds, so failed validation does not burn an approval.
-        return self.capabilities.require(pid, self._namespace_resource(namespace), right)
+        # Namespace callers hold the store lock until validation, finite-use
+        # claim, and result/mutation commit complete. This preserves the
+        # documented "successful lookup" semantics without reopening an
+        # authorize-then-use race.
+        return self.capabilities.require(
+            pid,
+            self._namespace_resource(namespace),
+            right,
+            consume=False,
+        )
 
     def _can_read_namespace(self, pid: str, namespace: str) -> bool:
         return self.capabilities.check(

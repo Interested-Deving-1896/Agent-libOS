@@ -93,27 +93,40 @@ class CapabilityManager:
         expires_at = selected.expires_at
         if transfer_parent is not None and expires_at is None:
             expires_at = transfer_parent.expires_at
-        self._consume_mutation_authority(
+        authority_reservation = self.reserve_decision_use(
             issue_authority.mutation_decision,
             used_by=actor,
-            reason="one-time issue authority consumed",
+            reason="one-time issue authority reserved",
         )
-        cap = self._insert_capability(
-            subject=subject,
-            resource=selected.resource,
-            rights=selected.rights,
-            effect=selected.effect,
-            constraints=selected.constraints,
-            metadata=selected.metadata,
-            issued_by=actor,
-            issuer_cap_id=issuer_cap_id,
-            parent_cap_id=transfer_parent.cap_id if transfer_parent is not None else None,
-            delegation_depth=delegation_depth,
-            max_delegation_depth=max_delegation_depth,
-            expires_at=expires_at,
-            uses_remaining=selected.uses_remaining,
-            delegable=selected.delegable,
-            revocable=selected.revocable,
+        try:
+            cap = self._insert_capability(
+                subject=subject,
+                resource=selected.resource,
+                rights=selected.rights,
+                effect=selected.effect,
+                constraints=selected.constraints,
+                metadata=selected.metadata,
+                issued_by=actor,
+                issuer_cap_id=issuer_cap_id,
+                parent_cap_id=transfer_parent.cap_id if transfer_parent is not None else None,
+                delegation_depth=delegation_depth,
+                max_delegation_depth=max_delegation_depth,
+                expires_at=expires_at,
+                uses_remaining=selected.uses_remaining,
+                delegable=selected.delegable,
+                revocable=selected.revocable,
+            )
+        except Exception:
+            self._restore_reserved_use(
+                authority_reservation,
+                restored_by=actor,
+                reason="one-time issue authority restored before capability insertion",
+            )
+            raise
+        self.commit_reserved_use(
+            authority_reservation,
+            committed_by=actor,
+            reason="one-time issue authority committed",
         )
         self.audit.record(
             actor=actor,
@@ -453,11 +466,29 @@ class CapabilityManager:
         resource: str,
         right: str | CapabilityRight,
         context: OperationContext | dict[str, Any] | None = None,
+        *,
+        consume: bool = True,
+        used_by: str | None = None,
+        reason: str = "one-time required capability consumed",
     ) -> CapabilityDecision:
+        """Require authority and atomically claim finite-use grants by default.
+
+        Callers that cross a fallible effect boundary and need compensating
+        rollback must opt out with ``consume=False`` and use the reservation
+        API.  Making consumption the default prevents a forgotten follow-up
+        claim from silently turning a one-shot grant into reusable authority.
+        """
         decision = self.authorize(subject, resource, right, context, audit=True)
-        if decision.allowed:
-            return decision
-        raise CapabilityDenied(decision.reason)
+        if not decision.allowed:
+            raise CapabilityDenied(decision.reason)
+        if consume and decision.consume_capability_id is not None:
+            self.consume_use(
+                decision.consume_capability_id,
+                used_by=used_by or subject,
+                reason=reason,
+            )
+            return replace(decision, consume_capability_id=None)
+        return decision
 
     def check(
         self,
@@ -552,36 +583,117 @@ class CapabilityManager:
             )
         return updated
 
-    def _restore_reserved_use(
+    def reserve_use(
         self,
         cap_id: str,
         *,
-        restored_by: str,
-        reason: str = "reserved capability use restored",
+        reserved_by: str,
+        reason: str = "capability use reserved",
         count: int = 1,
-    ) -> Capability:
-        """Restore a use consumed as an effect reservation before provider I/O.
+    ) -> str:
+        """Atomically reserve a finite capability use before a fallible effect.
 
-        This is intentionally not part of the public capability workflow:
-        regular callers should grant or consume capabilities, while primitives
-        use this only when a provider raises before reporting a committed effect.
+        The returned reservation id is the only value accepted by the restore
+        path. Explicit revoke/disable invalidates outstanding reservations, so a
+        late failure cleanup cannot reactivate authority that was revoked while
+        the provider call was in flight.
         """
         if count < 1:
-            raise ValidationError("capability restore count must be >= 1")
+            raise ValidationError("capability reservation count must be >= 1")
         cap = self.store.get_capability(cap_id)
         if cap is None:
             raise NotFound(f"capability not found: {cap_id}")
         if cap.uses_remaining is None:
-            return cap
-        updated = self.store.restore_reserved_capability_uses(cap_id, count)
+            raise ValidationError(f"capability is not finite-use: {cap_id}")
+        reservation_id = new_id("capres")
+        updated = self.store.reserve_capability_uses(
+            cap_id,
+            reservation_id,
+            count=count,
+            reserved_by=reserved_by,
+            reason=reason,
+            created_at=utc_now(),
+        )
         if updated is None:
-            raise CapabilityDenied(f"reserved capability use cannot be restored: {cap_id}")
+            raise CapabilityDenied(f"capability use exhausted: {cap_id}")
+        self.audit.record(
+            actor=reserved_by,
+            action="capability.reserve_use",
+            target=cap.resource,
+            capability_refs=[cap_id],
+            decision={
+                "reservation_id": reservation_id,
+                "uses_remaining": updated.uses_remaining,
+                "count": count,
+                "reason": reason,
+            },
+        )
+        if updated.revoked:
+            self.events.emit(
+                EventType.CAPABILITY_REVOKED,
+                source=reserved_by,
+                target=cap.subject,
+                payload={"capability_id": cap_id, "reason": reason, "reservation_id": reservation_id},
+            )
+        return reservation_id
+
+    def reserve_decision_use(self, decision: CapabilityDecision | None, *, used_by: str, reason: str) -> str | None:
+        if decision is None or decision.consume_capability_id is None:
+            return None
+        return self.reserve_use(str(decision.consume_capability_id), reserved_by=used_by, reason=reason)
+
+    def commit_reserved_use(self, reservation_id: str | None, *, committed_by: str, reason: str) -> bool:
+        if reservation_id is None:
+            return False
+        committed = self.store.commit_capability_use_reservation(reservation_id, updated_at=utc_now())
+        self.audit.record(
+            actor=committed_by,
+            action="capability.commit_reserved_use",
+            target=f"capability_reservation:{reservation_id}",
+            decision={"committed": committed, "reason": reason},
+        )
+        return committed
+
+    def _restore_reserved_use(
+        self,
+        reservation_id: str | None,
+        *,
+        restored_by: str,
+        reason: str = "reserved capability use restored",
+    ) -> Capability | None:
+        """Restore only the exact still-live reservation created for this effect."""
+        if reservation_id is None:
+            return None
+        updated = self.store.restore_capability_use_reservation(reservation_id, updated_at=utc_now())
+        if updated is None:
+            self.audit.record(
+                actor=restored_by,
+                action="capability.restore_reserved_use_skipped",
+                target=f"capability_reservation:{reservation_id}",
+                decision={"restored": False, "reason": reason},
+            )
+            return None
         self.audit.record(
             actor=restored_by,
             action="capability.restore_reserved_use",
-            target=cap.resource,
-            capability_refs=[cap_id],
-            decision={"uses_remaining": updated.uses_remaining, "count": count, "reason": reason},
+            target=updated.resource,
+            capability_refs=[updated.cap_id],
+            decision={
+                "reservation_id": reservation_id,
+                "uses_remaining": updated.uses_remaining,
+                "reason": reason,
+            },
+        )
+        self.events.emit(
+            EventType.CAPABILITY_GRANTED,
+            source=restored_by,
+            target=updated.subject,
+            payload={
+                "capability_id": updated.cap_id,
+                "reason": reason,
+                "reservation_id": reservation_id,
+                "uses_remaining": updated.uses_remaining,
+            },
         )
         return updated
 
@@ -607,9 +719,26 @@ class CapabilityManager:
             authority_decision = self._require_revoke_authority(revoked_by, cap)
         else:
             authority_decision = None
+        authority_reservation = self.reserve_decision_use(
+            authority_decision,
+            used_by=revoked_by,
+            reason="one-time revoke authority reserved",
+        )
         revoked = replace(cap, status=CapabilityStatus.REVOKED)
-        self.store.update_capability(revoked)
-        self._consume_mutation_authority(authority_decision, used_by=revoked_by, reason="one-time revoke authority consumed")
+        try:
+            self.store.update_capability(revoked)
+        except Exception:
+            self._restore_reserved_use(
+                authority_reservation,
+                restored_by=revoked_by,
+                reason="one-time revoke authority restored before target mutation",
+            )
+            raise
+        self.commit_reserved_use(
+            authority_reservation,
+            committed_by=revoked_by,
+            reason="one-time revoke authority committed",
+        )
         self.events.emit(
             EventType.CAPABILITY_REVOKED,
             source=revoked_by,
@@ -890,11 +1019,6 @@ class CapabilityManager:
             },
         )
         return cap
-
-    def _consume_mutation_authority(self, decision: CapabilityDecision | None, *, used_by: str, reason: str) -> None:
-        if decision is None or decision.consume_capability_id is None:
-            return
-        self.consume_use(decision.consume_capability_id, used_by=used_by, reason=reason)
 
     def claim_decision_use(self, decision: CapabilityDecision, *, used_by: str, reason: str) -> None:
         if decision.consume_capability_id is None:

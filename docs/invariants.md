@@ -24,9 +24,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   approval, and validation before side effects, including hidden provider
   metadata gates, PTY spawn cleanup, and write limits.
 - `capability-matching-and-delegation`: typed matching, deny dominance,
-  one-shot grants, revocation, grant-as-transfer, parent-linked delegation
-  attenuation, restrictive parent boundaries, malformed authority-rule
-  fail-closed behavior, and ISO-normalized leases.
+  one-shot grants, atomic default consumption, exact effect reservations,
+  revoke-wins restoration, crash abandonment, grant-as-transfer,
+  parent-linked delegation attenuation, restrictive parent boundaries,
+  malformed authority-rule fail-closed behavior, and ISO-normalized leases.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
@@ -44,14 +45,20 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   RAII cleanup are explicit and revoke stale authority, including Object-bound
   PTY handles.
 - `runtime-store-single-active-writer`: a writable persistent runtime store has
-  at most one active Runtime opener, while normal reopen after close is still
-  allowed.
+  at most one active Runtime opener across canonical/symlink path aliases,
+  while normal reopen after close is still allowed.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, reserve and consume one-shot grants exactly once, are decided exactly
-  once from pending state, and route through primitives.
+  once from pending state, and route through primitives. Concurrent terminal
+  drains serialize request selection through the terminal transition, so only
+  the winning worker may install an automatic permission policy or cross the
+  human output provider boundary.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
-  sandboxed, process-local, cached-only at runtime, and syscall-mediated; PTY
-  creation reuses shell authorization and follow-on PTY access uses Object
+  including shell policy capability effects and finite-use leases, sandboxed,
+  process-local, cached-only at runtime, and syscall-mediated. JIT lifecycle
+  rows/aliases/handles commit atomically, composite failures discard unpublished
+  candidates, and cancellation terminates the isolated Deno process group;
+  PTY creation reuses shell authorization and follow-on PTY access uses Object
   capabilities.
 - `command-risk-rules-are-deterministic`: command risk rules separate
   harmless, risky, and destructive shell operations without model judgment.
@@ -75,12 +82,19 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `workflow-entry-uses-toolbroker-authority`: user-facing workflow entrypoints
   run tools through process tool tables, ToolBroker, result objects, and normal
   wait/exit/exec lifecycle semantics.
+- `process-message-waits-are-race-free`: an empty blocking mailbox read and its
+  wait registration are atomic with message posting, so a concurrent matching
+  post either satisfies the read or wakes the registered process.
 - `object-task-entry-uses-toolbroker-and-object-authority`: Object-bound
   background tasks run tools through ToolBroker, process tool tables, Object
   capabilities, owner-watch Object Memory primitive notifications, and
   process-message boundaries. Runner processes are host-managed and excluded
-  from the LLM scheduler; terminal/cancel reconciliation must not leave active
-  pins behind, and owner-watch resumes only replay tools with explicitly safe
+  from the LLM scheduler; one-shot owner authority is reserved before runner
+  creation and committed with the durable task record. Failed executor handoff
+  terminalizes the task and removes the unstarted runner, while failed result
+  wiring terminalizes the runner and releases the unpublished result and its
+  derived handles. Terminal/cancel reconciliation must not leave active pins
+  behind, and owner-watch resumes only replay tools with explicitly safe
   message-receive semantics.
 - `llm-call-records-opt-out-are-bounded-and-redacted`: when
   `llm.persist_full_io` is false, LLM call persistence stores bounded preview,
@@ -100,21 +114,32 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   usage is settled before any model-selected tool call is dispatched.
 - `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
   CPU, and RSS limits are enforced by providers and audited on exceedance; PTY
-  providers also have deterministic fake-provider coverage and real backend
-  smoke coverage where available.
+  providers also fail closed when process-tree accounting is denied, fall back
+  to explicit descendant signaling when process-group signaling is denied, and
+  have deterministic fake-provider plus real backend smoke coverage where
+  available.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
   prompt context without granting resources; API actor mode must still honor
-  skill capability or human-approval gates.
+  skill capability or human-approval gates. Finite-use Skill permissions are
+  reserved before a registry, trust, activation, or unload mutation and are
+  committed only with that mutation. Registry/trust/audit state changes are
+  transactional; failed activation cannot leave a visible JIT alias, and
+  reactivation or unload retires the exact superseded process-local JIT rows.
 - `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
   trust to the current source hash, reject ambiguous manifests and duplicate
   module ids, resolve import strings without executing untrusted package code,
-  bound source hashing, and roll back failed registrations so persisted module
-  status stays aligned with loaded runtime state.
-- `checkpoint-restore-and-fork-are-scoped`: checkpoint restore/fork are scoped,
-  capability-controlled, and append-only outside reconstructable state.
+  bound source hashing, and roll back failed declared or hook-created
+  tool/image/syscall/hook registrations so persisted module status stays
+  aligned with loaded runtime state.
+- `checkpoint-restore-and-fork-are-scoped`: checkpoint creation captures one
+  consistent store snapshot; restore/fork are scoped, capability-controlled,
+  and append-only outside reconstructable state; post-commit image, JIT, or
+  finalizer failures are reported and audited without claiming rollback.
 - `image-self-evolution-requires-image-authority`: image registration, package
   boot, exec, and checkpoint commit require image authority and do not bake
-  external authority.
+  external authority. Failed registration/commit removes new artifacts and
+  restores replaced manifests; failed package boot/exec removes private
+  workspace and unpublished JIT source/candidate state.
 - `agent-output-is-not-control-channel`: untrusted command output cannot trigger
   lifecycle control actions; submission/exit must use explicit tool or syscall
   arguments.

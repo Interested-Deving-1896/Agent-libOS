@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import psutil
 
 from agent_libos import Runtime
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
@@ -646,6 +647,40 @@ class TestPtyModule:
                 assert process.status.value == "killed"
                 assert process.resource_usage.subprocess_wall_seconds > 0
                 assert provider.sessions[0].closed
+            finally:
+                runtime.close()
+
+    def test_pty_resource_monitor_access_denied_closes_session_fail_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_pid=os.getpid())
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty monitor denied")
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+
+                def deny_process_access(process_pid: int) -> Any:
+                    raise psutil.AccessDenied(pid=process_pid)
+
+                monkeypatch.setattr("modules.pty.pty_module.psutil.Process", deny_process_access)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not provider.sessions[0].closed:
+                    time.sleep(0.01)
+
+                assert provider.sessions[0].closed
+                assert session_oid not in _pty_adapter(runtime)._sessions
+                assert runtime.store.get_object(session_oid) is None
+                assert "primitive.pty.resource_monitor_denied" in [
+                    record.action for record in runtime.audit.trace()
+                ]
             finally:
                 runtime.close()
 

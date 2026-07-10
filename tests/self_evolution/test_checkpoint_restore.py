@@ -11,6 +11,7 @@ from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
 from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectType, ProcessMessageStatus, ProcessStatus
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.substrate import LocalHumanProvider, LocalResourceProviderSubstrate
+from agent_libos.utils.serde import loads
 from tests.support.checkpoints import ClassifiedShellProvider
 
 
@@ -23,6 +24,41 @@ class TestCheckpointRestore:
                 runtime.store.snapshot_tables()
             with pytest.raises(RuntimeError, match='full-table SQLite restore is disabled'):
                 runtime.store.restore_tables({})
+        finally:
+            runtime.close()
+
+    def test_restore_invalidates_inflight_capability_reservations_before_replacing_scope(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore reservation boundary')
+            cap = runtime.capability.issue_trusted(
+                pid,
+                'object:restore-reservation',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=2,
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'before reservation', actor=pid)
+            decision = runtime.capability.authorize(pid, cap.resource, CapabilityRight.READ)
+            reservation_id = runtime.capability.reserve_decision_use(
+                decision,
+                used_by='test',
+                reason='effect in flight while checkpoint restore begins',
+            )
+            assert reservation_id is not None
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored = runtime.store.get_capability(cap.cap_id)
+            assert restored is not None
+            assert restored.uses_remaining == 1
+            assert runtime.capability._restore_reserved_use(
+                reservation_id,
+                restored_by='test',
+                reason='late provider cleanup after scope replacement',
+            ) is None
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
         finally:
             runtime.close()
 
@@ -211,6 +247,134 @@ class TestCheckpointRestore:
             assert inspected['processes'][0]['status'] == ProcessStatus.RUNNABLE.value
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         finally:
+            runtime.close()
+
+    def test_checkpoint_create_captures_object_row_and_payload_from_one_store_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        snapshot_reached_payloads = threading.Event()
+        writer_attempted = threading.Event()
+        writer_acquired_store = threading.Event()
+        allow_writer_commit = threading.Event()
+        writer_errors: list[BaseException] = []
+        writer: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='consistent checkpoint')
+            handle = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'generation': 1},
+                ObjectMetadata(title='consistent state'),
+                immutable=False,
+                name='consistent.state',
+            )
+            before = runtime.store.get_object(handle.oid)
+            assert before is not None
+            original_payload_snapshot = runtime.checkpoint._object_payload_snapshot
+
+            def coordinated_payload_snapshot(object_oids: list[str]) -> dict[str, object]:
+                snapshot_reached_payloads.set()
+                assert writer_attempted.wait(timeout=5)
+                # Without a transaction spanning the checkpoint reads, the
+                # writer acquires the store here and can split the object row
+                # from its payload. With the transaction it remains blocked
+                # until the checkpoint has been durably inserted.
+                writer_acquired_store.wait(timeout=0.2)
+                allow_writer_commit.set()
+                return original_payload_snapshot(object_oids)
+
+            monkeypatch.setattr(runtime.checkpoint, '_object_payload_snapshot', coordinated_payload_snapshot)
+
+            def mutate_row_and_payload_atomically() -> None:
+                try:
+                    assert snapshot_reached_payloads.wait(timeout=5)
+                    writer_attempted.set()
+                    with runtime.store.transaction(include_object_payloads=True) as cur:
+                        writer_acquired_store.set()
+                        cur.execute(
+                            'UPDATE objects SET version = ? WHERE oid = ?',
+                            (before.version + 1, handle.oid),
+                        )
+                        runtime.store.set_object_payload(handle.oid, {'generation': 2})
+                        assert allow_writer_commit.wait(timeout=5)
+                except BaseException as exc:
+                    writer_errors.append(exc)
+
+            writer = threading.Thread(target=mutate_row_and_payload_atomically)
+            writer.start()
+            checkpoint_id = runtime.checkpoint.create(pid, 'consistent snapshot', actor=pid)
+            writer.join(timeout=5)
+            assert not writer.is_alive()
+            assert writer_errors == []
+
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _checkpoint, snapshot = found
+            object_row = next(row for row in snapshot['rows']['objects'] if row['oid'] == handle.oid)
+            captured_pair = (object_row['version'], snapshot['object_payloads'][handle.oid]['generation'])
+            assert captured_pair in {(before.version, 1), (before.version + 1, 2)}
+        finally:
+            allow_writer_commit.set()
+            if writer is not None:
+                writer.join(timeout=5)
+            runtime.close()
+
+    def test_checkpoint_snapshot_canonicalizes_process_capability_index_during_concurrent_grant(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        capability_inserted = threading.Event()
+        allow_process_attach = threading.Event()
+        grant_errors: list[BaseException] = []
+        grant_result: list[object] = []
+        grant_thread: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='capability snapshot')
+            original_attach = runtime.capability._attach_to_process
+
+            def pause_grant_attach(subject: str, cap_id: str) -> None:
+                if threading.current_thread() is grant_thread:
+                    capability_inserted.set()
+                    assert allow_process_attach.wait(timeout=5)
+                original_attach(subject, cap_id)
+
+            monkeypatch.setattr(runtime.capability, '_attach_to_process', pause_grant_attach)
+
+            def grant_capability() -> None:
+                try:
+                    grant_result.append(
+                        runtime.capability.grant(pid, 'test:concurrent-checkpoint', [CapabilityRight.READ], issued_by='test')
+                    )
+                except BaseException as exc:
+                    grant_errors.append(exc)
+
+            grant_thread = threading.Thread(target=grant_capability)
+            grant_thread.start()
+            assert capability_inserted.wait(timeout=5)
+            checkpoint_id = runtime.checkpoint.create(pid, 'capability index snapshot', actor=pid)
+            allow_process_attach.set()
+            grant_thread.join(timeout=5)
+            assert not grant_thread.is_alive()
+            assert grant_errors == []
+            assert len(grant_result) == 1
+
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _checkpoint, snapshot = found
+            captured_capability = next(
+                row
+                for row in snapshot['rows']['capabilities']
+                if row['resource'] == 'test:concurrent-checkpoint'
+            )
+            process_row = next(row for row in snapshot['rows']['processes'] if row['pid'] == pid)
+            assert captured_capability['cap_id'] in loads(process_row['capabilities_json'], [])
+        finally:
+            allow_process_attach.set()
+            if grant_thread is not None:
+                grant_thread.join(timeout=5)
             runtime.close()
 
     def test_restore_refuses_while_scheduler_quantum_is_active(self) -> None:
@@ -421,5 +585,85 @@ class TestCheckpointRestore:
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
             assert runtime.store.get_process_message(message.message_id).status == ProcessMessageStatus.UNREAD
             assert runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('method_name', 'phase'),
+        [
+            ('_restore_images', 'image_reconciliation'),
+            ('_restore_jit_sources', 'jit_source_reconciliation'),
+            ('_prune_stale_ephemeral_jit_tools', 'jit_pruning'),
+        ],
+    )
+    def test_restore_reports_post_commit_reconciliation_failure_without_claiming_rollback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        method_name: str,
+        phase: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='post-commit restore failure')
+            handle = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'version': 1},
+                ObjectMetadata(title='state'),
+                immutable=False,
+                name='post.commit.state',
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'before post-commit failure', actor=pid)
+            runtime.memory.update_object(pid, handle, ObjectPatch(payload={'version': 2}))
+
+            def fail_reconciliation(*_args, **_kwargs):
+                raise RuntimeError(f'injected {phase} failure')
+
+            monkeypatch.setattr(runtime.checkpoint, method_name, fail_reconciliation)
+            result = runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert runtime.memory.get_object_by_name(pid, 'post.commit.state').payload == {'version': 1}
+            assert result['status'] == 'restored_with_warnings'
+            assert result['main_state_committed'] is True
+            assert [failure['phase'] for failure in result['post_commit_failures']] == [phase]
+            failure_audits = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'checkpoint.restore.post_commit_failure'
+            ]
+            assert failure_audits[-1].decision['phase'] == phase
+            assert failure_audits[-1].decision['main_state_committed'] is True
+        finally:
+            runtime.close()
+
+    def test_restore_reports_release_finalizer_failure_after_main_state_commit(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='finalizer failure')
+            checkpoint_id = runtime.checkpoint.create(pid, 'before temporary object', actor=pid)
+            temporary = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'temporary': True},
+                ObjectMetadata(title='temporary'),
+                immutable=False,
+                name='post.commit.temporary',
+            )
+
+            def fail_finalizer(_obj, _actor, _reason):
+                raise RuntimeError('injected release finalizer failure')
+
+            runtime.memory.bind_object_release_finalizer(fail_finalizer)
+            result = runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert runtime.store.get_object(temporary.oid) is None
+            assert result['status'] == 'restored_with_warnings'
+            assert result['main_state_committed'] is True
+            assert result['post_commit_failures'][0]['phase'] == 'object_release_finalizers'
+            assert any(
+                record.action == 'checkpoint.restore.post_commit_failure'
+                and record.decision['phase'] == 'object_release_finalizers'
+                for record in runtime.audit.trace()
+            )
         finally:
             runtime.close()

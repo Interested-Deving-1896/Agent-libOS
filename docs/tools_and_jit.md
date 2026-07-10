@@ -148,6 +148,13 @@ The manual lifecycle is:
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
 
+Each lifecycle transition commits its durable row, process-local alias, audit
+record, and in-memory executable handle atomically. Manual validation failures
+remain inspectable as rejected candidates. Composite Skill activation or image
+package boot discards candidates that it created when the enclosing operation
+fails, including their Object Memory descriptors, so unpublished source and
+aliases do not accumulate as failed-boot residue.
+
 Registered JIT tools are process-local but persistent: when a runtime reopens an
 existing runtime store, it reloads executable TypeScript sources only for JIT
 tool ids still referenced by a process tool table. Stale ephemeral tool
@@ -296,6 +303,10 @@ primitive Capability checks, human approval, and resource budgets.
 Validation and execution both use subprocess resource budgets when the process
 has them. A sandbox backend that cannot accept limits or return subprocess
 metrics fails closed for budgeted validation or execution.
+Cancelling a Deno execution kills its isolated process group (and any discovered
+descendants) and waits for the syscall-serving and resource-monitor workers to
+settle before returning. Failure to terminate the process group is surfaced as
+a sandbox error rather than silently leaving code running.
 
 If Deno is missing, validation returns a clear error. Python tests marked
 `real_deno` run by default when `deno` is installed, skip with a clear reason

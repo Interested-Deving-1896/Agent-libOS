@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import field
 import math
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
@@ -576,6 +577,27 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         if runtime.store_dsn is None:
             raise ValueError("runtime.store_dsn is required when runtime.store_backend is postgres")
         _require_non_empty("store_dsn", runtime.store_dsn)
+        if (
+            urlsplit(runtime.store_dsn).scheme.lower() not in {"postgres", "postgresql"}
+            or "://" not in runtime.store_dsn
+        ):
+            raise ValueError(
+                "runtime.store_dsn must use a postgres:// or postgresql:// URI "
+                "when runtime.store_backend is postgres"
+            )
+    elif runtime.store_dsn is not None:
+        raise ValueError("runtime.store_dsn must be unset when runtime.store_backend is sqlite")
+    if runtime.store_backend == "sqlite":
+        local_store_scheme = urlsplit(runtime.local_store_target).scheme.lower()
+        if local_store_scheme in {"postgres", "postgresql"}:
+            raise ValueError(
+                "runtime.local_store_target selects PostgreSQL while runtime.store_backend is sqlite; "
+                "use runtime.store_dsn with runtime.store_backend=postgres"
+            )
+        if "://" in runtime.local_store_target and local_store_scheme not in {"sqlite"}:
+            raise ValueError(
+                "runtime.local_store_target must be a filesystem path, local, :memory:, or sqlite:// URI"
+            )
     _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
 

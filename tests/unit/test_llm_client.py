@@ -13,6 +13,8 @@ class TestLLMClient:
         fake = FakeAsyncOpenAI(responses=FakeResponses(response))
         client = LLMClient(model='gpt-test', api_key='key', api_mode='responses')
         client._async_client = fake
+        assert client.store is False
+        assert client.responses_previous_response_id is False
         completion = asyncio.run(client.acomplete_action(messages=[{'role': 'system', 'content': 'system rules'}, {'role': 'user', 'content': 'write a file'}], tools=[{'type': 'function', 'function': {'name': 'write_text_file', 'description': 'Write text.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}}}}]))
         payload = fake.responses.payloads[0]
         assert payload['instructions'] == 'system rules'

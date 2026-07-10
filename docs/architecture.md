@@ -79,7 +79,12 @@ Providers are also the source of truth for external-effect rollback
 classification. Effectful provider calls must return an external-effect
 classification to the primitive; missing classification fails closed instead of
 silently executing. The runtime persists those records for checkpoint reports,
-but v1 does not apply external compensation.
+but v1 does not apply external compensation. Filesystem-mutation and clock
+adapters additionally use compensating one-shot reservations. Their providers
+may raise `ProviderEffectNotStarted` only when they can certify that no
+externally visible effect began. Any other exception after entering those
+provider calls is treated as an ambiguous outcome: one-shot authority stays
+consumed and the runtime records an `unknown` external-effect class/status.
 
 ## Composition Root
 
