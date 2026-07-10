@@ -63,7 +63,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `runtime-store-single-active-writer`: a writable persistent runtime store has
   at most one active Runtime opener across canonical/symlink path aliases.
   SQLite validates a no-follow regular-file lease or uses its kernel exclusive
-  fallback; PostgreSQL keys advisory leases by database/schema.
+  fallback; the secure POSIX path keeps database/lease/journal/WAL/SHM files
+  owner-only; PostgreSQL keys advisory leases by database/schema.
 - `storage-transactions-recover-or-fail-closed`: commit/savepoint finalization
   failure restores SQL and opted-in Object payload state; rollback failure
   poisons/closes the store, and interrupted Object schema rebuilds recover
@@ -76,6 +77,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   human output provider boundary. Permission policy and question-answer types
   are explicit, run-local `ContextVar` policy cannot cross concurrent runs,
   multiple blockers remain waiting, and terminal processes cancel requests.
+  Blocking terminal provider I/O runs outside the selection lock so exit/cancel
+  never waits for human input, and GUI history bounds never omit pending rows.
   Human output commits delivered state/event/audit/pending intent before the
   provider and remains at-most-once after provider or classifier failure.
   Terminal prompt reads and automatic-response writes also use structured
@@ -100,6 +103,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   call, and automatic child-exit cleanup records a close intent before exit-code
   observation/close. Object release finalizers run outside the SQL transaction so PTY
   close can durably record its intent; `swe_edit` refuses truncated source.
+  Auto-allowed Git inspection disables optional locks, repository fsmonitor,
+  and external diff helpers before the provider boundary.
 - `command-risk-rules-are-deterministic`: command risk rules separate
   harmless, risky, and destructive shell operations without model judgment.
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
@@ -124,7 +129,16 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   wait/exit/exec lifecycle semantics.
 - `process-message-waits-are-race-free`: an empty blocking mailbox read and its
   wait registration are atomic with message posting, so a concurrent matching
-  post either satisfies the read or wakes the registered process.
+  post either satisfies the read or wakes the registered process. Message row,
+  evidence, terminal recheck, and wake state also roll back together.
+- `runtime-lifecycle-transitions-are-atomic`: capability issuance, the core
+  process exec row/capability/evidence transition, process exit, and
+  parent/message waiter transitions do not publish partial authoritative state
+  when an in-transaction sink fails. Higher-level image boot uses compensating
+  restore rather than claiming one transaction across host/package work.
+- `scheduler-quantum-ownership-is-serialized`: scheduler and direct pid
+  single-step APIs share the same runtime lock, store claim, and resource-charge
+  boundary, so one process cannot be re-entered concurrently.
 - `runtime-shutdown-is-drained-and-retry-safe`: scheduler work, ObjectTask
   executors, PTY reader/monitor workers, and GUI runtime users drain before
   shared state closes; a timed-out shutdown leaves storage open and can be
@@ -134,7 +148,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   capabilities, owner-watch Object Memory primitive notifications, and
   process-message boundaries. Runner processes are host-managed and excluded
   from the LLM scheduler; one-shot owner authority is reserved before runner
-  creation and committed with the durable task record. Failed executor handoff
+  creation and committed with the durable task record. The mapped cross-actor
+  regression directly proves finite read consumption for get and finite write
+  consumption for cancel. Failed executor handoff
   terminalizes the task and removes the unstarted runner, while failed result
   wiring terminalizes the runner and releases the unpublished result and its
   derived handles. Terminal/cancel reconciliation must not leave active pins
@@ -149,6 +165,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   parallel batches and reopened waits. Missing/extra/redacted outputs, changed
   profile/scope/context generation, or local rollback break the chain rather
   than continuing against guessed provider state.
+- `llm-async-clients-are-event-loop-scoped`: real async SDK clients and their
+  keep-alive pools are request-scoped and cannot cross scheduler event loops.
 - `llm-provider-state-is-scope-bound-and-nonreplayable`: provider-chain state
   is bound to process/context plus a credential-keyed model, endpoint, API-mode,
   and tenant fingerprint. Durable waits use token-scoped
@@ -196,6 +214,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   snapshot authority is never copied. Fork revalidates/consumes actor authority
   only in its publication transaction, global Skill/Image rows are not replaced
   by fork, and post-commit failures are reported without claiming rollback.
+  The implementation uses one reservation scope for diagnostic
+  inspect/diff/replay; the mapped one-shot regression directly proves inspect
+  consumes the selected finite checkpoint/process read exactly once.
 - `image-self-evolution-requires-image-authority`: image registration, package
   boot, exec, and checkpoint commit require image authority and do not bake
   external authority. Failed registration/commit removes new artifacts and

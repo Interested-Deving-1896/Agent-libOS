@@ -80,7 +80,10 @@ class TestResourceProviderSubstrate:
             runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
             result = shell.run(pid, ['git', 'status', '--short'], timeout=2.0)
             assert result.stdout == 'ok\n'
-            assert provider.calls == [(['git', 'status', '--short'], 2.0)]
+            assert provider.calls == [
+                (['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--short'], 2.0)
+            ]
+            assert result.argv == ['git', 'status', '--short']
         finally:
             runtime.close()
 

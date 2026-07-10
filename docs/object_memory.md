@@ -192,6 +192,15 @@ transition releases the unpublished result and derived handles, terminalizes
 the runner, and releases the owner pin. Once the succeeded row is durable,
 later observability failures do not retract the published result.
 
+The creator can inspect and control its own task without a second owner-object
+grant. For another process, `get` and `wait` require owner-object `read`, list
+filters to rows visible with `read`, and `cancel` requires `write` after terminal
+and unsafe-cancellation preflight. A finite read selected by `get`/`wait` is
+claimed once; list claims each distinct finite read used by the returned rows
+at most once, and its internal filtering does not spend authority for omitted
+rows. Wait polling does not claim the same read repeatedly. Updating an owner
+watch also requires owner-object `write` for a non-creator.
+
 Runtime-internal multi-step writes can use an Object Memory lifetime scope.
 Objects created in the scope are released automatically unless the scope is
 committed or the object is transferred to another owner. This is used for

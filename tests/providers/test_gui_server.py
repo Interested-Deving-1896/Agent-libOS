@@ -18,7 +18,17 @@ from agent_libos.api.gui.server import (
 )
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
-from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType, ProcessSignal, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    EventType,
+    HumanRequest,
+    HumanRequestStatus,
+    ObjectMetadata,
+    ObjectType,
+    ProcessSignal,
+    ProcessStatus,
+)
+from agent_libos.utils.ids import utc_now
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
 
@@ -136,6 +146,44 @@ class TestGuiServer:
         assert 'images' in snapshot
         assert any((profile['profile_id'] == 'gui-spawn' for profile in snapshot['llm_profiles']))
         assert any((image['image_id'] == 'base-agent:v0' for image in snapshot['images']))
+
+    def test_snapshot_keeps_new_pending_human_request_ahead_of_bounded_history(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='pending must stay visible')
+        now = utc_now()
+        for index in range(runtime.config.gui.snapshot_collection_max_items + 1):
+            runtime.store.insert_human_request(
+                HumanRequest(
+                    request_id=f'hreq_history_{index:04d}',
+                    pid=pid,
+                    human='owner',
+                    payload={'type': 'question', 'question': f'history {index}'},
+                    status=HumanRequestStatus.REJECTED,
+                    decision={'approved': False},
+                    blocking=False,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        pending_id = 'hreq_pending_latest'
+        runtime.store.insert_human_request(
+            HumanRequest(
+                request_id=pending_id,
+                pid=pid,
+                human='owner',
+                payload={'type': 'question', 'question': 'must remain visible'},
+                status=HumanRequestStatus.PENDING,
+                decision=None,
+                blocking=True,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        assert pending_id in {request['request_id'] for request in snapshot['human_requests']}
 
     def test_llm_profile_endpoints_persist_user_profiles_and_reject_secrets(self, monkeypatch) -> None:
         monkeypatch.setenv('KIMI_API_KEY', 'secret')

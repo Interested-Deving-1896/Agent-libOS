@@ -6,7 +6,7 @@ import hashlib
 import inspect
 import math
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -51,6 +51,14 @@ from agent_libos.substrate import (
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
+_READ_ONLY_GIT_COMMANDS = {
+    ("git", "status"),
+    ("git", "status", "--short"),
+    ("git", "branch", "--show-current"),
+    ("git", "rev-parse", "--show-toplevel"),
+    ("git", "diff"),
+    ("git", "diff", "--stat"),
+}
 
 
 @dataclass(frozen=True)
@@ -114,8 +122,10 @@ class ShellAdapter:
             self._request_human_approval(pid, checked, resource, decision, timeout=selected_timeout, cwd=cwd)
         if not decision.allowed:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
+        provider_argv = self._harden_read_only_git_argv(checked)
         effect_context = {
             "argv": list(checked),
+            "provider_argv": list(provider_argv),
             "resource": resource,
             "timeout_s": selected_timeout,
             "cwd": os.fspath(cwd) if cwd is not None else None,
@@ -160,8 +170,8 @@ class ShellAdapter:
             self._restore_shell_capability(reservation_id)
             raise
         try:
-            proc = self.provider.run(checked, **provider_kwargs)
-            proc = self._bounded_result(proc)
+            proc = self.provider.run(provider_argv, **provider_kwargs)
+            proc = replace(self._bounded_result(proc), argv=list(checked))
         except ProviderEffectNotStarted as exc:
             with self.audit.store.transaction():
                 self._restore_shell_capability(reservation_id)
@@ -336,6 +346,21 @@ class ShellAdapter:
             allow_overage=True,
         )
         return proc
+
+    def _harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
+        """Harden the exact built-in Git read allowlist before provider use."""
+        if tuple(argv) not in _READ_ONLY_GIT_COMMANDS:
+            return list(argv)
+        # --no-optional-locks prevents index refresh writes; overriding
+        # core.fsmonitor prevents a repository-configured executable hook.
+        hardened = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", argv[1]]
+        remaining = list(argv[2:])
+        if argv[1] == "diff":
+            # diff.external and attribute diff drivers otherwise execute
+            # arbitrary repository-controlled helpers even for exact git diff.
+            hardened.append("--no-ext-diff")
+        hardened.extend(remaining)
+        return hardened
 
     async def arun(
         self,

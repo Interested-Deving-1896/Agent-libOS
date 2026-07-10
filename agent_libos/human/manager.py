@@ -104,12 +104,13 @@ class HumanObjectManager:
         self.events = events
         self.provider = provider
         self._messages: ProcessMessageManager | None = None
-        # A terminal is a single human decision stream. Keep request selection,
-        # prompting/auto-policy selection, and the terminal transition in one
-        # critical section so concurrent scheduler drains cannot act on the
-        # same pending request. The lock is re-entrant because the terminal
-        # path completes through approve()/reject().
+        # A terminal is a single human decision stream. Serialize queue-head
+        # claims and durable transitions so concurrent drains cannot act on the
+        # same request, but never hold this lock across blocking provider I/O.
+        # It is re-entrant because approve()/reject() commit under the same
+        # transition lock.
         self._terminal_lock = threading.RLock()
+        self._terminal_claims: set[str] = set()
 
     def bind_messages(self, messages: "ProcessMessageManager") -> None:
         self._messages = messages
@@ -540,15 +541,18 @@ class HumanObjectManager:
             created_at=utc_now(),
             updated_at=utc_now(),
         )
-        # Insertion and immediate delivery must exclude terminal queue drains;
-        # otherwise a second worker can observe the just-inserted PENDING row
-        # and cross the human provider boundary a second time.
+        # Claim the just-inserted row against terminal queue drains, then cross
+        # the potentially blocking provider boundary without holding the
+        # terminal lock. Exit/cancel can proceed and a late delivery rechecks
+        # the durable pending state.
         with self._terminal_lock:
             try:
                 self.store.insert_human_request(request)
             except Exception:
                 self._restore_one_time_decision(reservation_id)
                 raise
+            self._terminal_claims.add(request.request_id)
+        try:
             try:
                 delivered = self._deliver_output_request(request)
             except Exception:
@@ -575,6 +579,9 @@ class HumanObjectManager:
                     self._commit_one_time_decision(reservation_id)
                 raise
             self._commit_one_time_decision(reservation_id)
+        finally:
+            with self._terminal_lock:
+                self._terminal_claims.discard(request.request_id)
         return {
             "delivered": True,
             "request_id": delivered.request_id,
@@ -597,7 +604,17 @@ class HumanObjectManager:
         return request
 
     def list(self, pid: str | None = None) -> builtins.list[HumanRequest]:
-        return self.store.list_human_requests(pid=pid, limit=self.config.tools.human_request_list_limit)
+        # Pending decisions are liveness-critical and must never fall behind a
+        # bounded history window.  Put every pending request first, followed by
+        # the newest historical window for observability.
+        pending = self.store.list_human_requests(pid=pid, status=HumanRequestStatus.PENDING)
+        recent = self.store.list_human_requests(
+            pid=pid,
+            limit=self.config.tools.human_request_list_limit,
+            newest=True,
+        )
+        pending_ids = {request.request_id for request in pending}
+        return [*pending, *(request for request in recent if request.request_id not in pending_ids)]
 
     def pending(self, human: str | None = None) -> builtins.list[HumanRequest]:
         return self.store.list_human_requests(
@@ -645,48 +662,71 @@ class HumanObjectManager:
         auto_policy: str | None = None,
         auto_answer: str | None = None,
     ) -> HumanRequest | None:
+        selected_human = human or self.config.runtime.default_human
         with self._terminal_lock:
-            selected_human = human or self.config.runtime.default_human
             pending = self.pending(human=selected_human)
             if not pending:
                 return None
             # The terminal is the human's message queue. Process requests strictly
-            # in creation order so approvals and answers remain predictable.
+            # in creation order so approvals and answers remain predictable. A
+            # second drain may not skip a claimed head request.
             request = pending[0]
-            request_type = request.payload.get("type")
-            if request_type == "output":
-                return self._deliver_output_request(request)
-            question = self._terminal_question(request)
-            if request_type == "question":
-                answer = self._select_text_answer(
-                    request=request,
-                    question=question,
-                    auto_answer=auto_answer,
-                )
-                return self.approve(
-                    request.request_id,
-                    {"approved": True, "answer": answer, "source": "terminal_queue"},
-                )
-            if request_type == "permission_request":
-                policy = self._select_permission_policy(
-                    request=request,
-                    question=question,
-                    auto_policy=auto_policy,
-                    auto_approve=auto_approve,
-                )
-                decision = {"policy": policy, "source": "terminal_queue"}
-                if policy == CapabilityManager.ALWAYS_DENY:
-                    return self.reject(request.request_id, {"approved": False, **decision})
-                return self.approve(request.request_id, {"approved": True, **decision})
+            if request.request_id in self._terminal_claims:
+                return None
+            self._terminal_claims.add(request.request_id)
+        try:
+            return self._process_claimed_terminal_request(
+                request=request,
+                auto_approve=auto_approve,
+                auto_policy=auto_policy,
+                auto_answer=auto_answer,
+            )
+        finally:
+            with self._terminal_lock:
+                self._terminal_claims.discard(request.request_id)
 
-            approved = self._select_boolean_approval(
+    def _process_claimed_terminal_request(
+        self,
+        *,
+        request: HumanRequest,
+        auto_approve: bool | None,
+        auto_policy: str | None,
+        auto_answer: str | None,
+    ) -> HumanRequest:
+        request_type = request.payload.get("type")
+        if request_type == "output":
+            return self._deliver_output_request(request)
+        question = self._terminal_question(request)
+        if request_type == "question":
+            answer = self._select_text_answer(
                 request=request,
                 question=question,
+                auto_answer=auto_answer,
+            )
+            return self.approve(
+                request.request_id,
+                {"approved": True, "answer": answer, "source": "terminal_queue"},
+            )
+        if request_type == "permission_request":
+            policy = self._select_permission_policy(
+                request=request,
+                question=question,
+                auto_policy=auto_policy,
                 auto_approve=auto_approve,
             )
-            if approved:
-                return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
-            return self.reject(request.request_id, {"approved": False, "source": "terminal_queue"})
+            decision = {"policy": policy, "source": "terminal_queue"}
+            if policy == CapabilityManager.ALWAYS_DENY:
+                return self.reject(request.request_id, {"approved": False, **decision})
+            return self.approve(request.request_id, {"approved": True, **decision})
+
+        approved = self._select_boolean_approval(
+            request=request,
+            question=question,
+            auto_approve=auto_approve,
+        )
+        if approved:
+            return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
+        return self.reject(request.request_id, {"approved": False, "source": "terminal_queue"})
 
     async def aprocess_next_terminal(
         self,
@@ -1431,11 +1471,24 @@ class HumanObjectManager:
             "request_kind": "output",
         }
         require_external_effect_classifier(self.provider, "write")
-        request.status = HumanRequestStatus.DELIVERED
-        request.decision = {"delivery_committed": True}
-        request.updated_at = utc_now()
         resource = f"human:{request.human}"
         with self.store.transaction():
+            latest = self.store.get_human_request(request.request_id)
+            if latest is None:
+                raise NotFound(f"human request not found: {request.request_id}")
+            if latest.status != HumanRequestStatus.PENDING:
+                raise ValidationError(
+                    f"human output request is not pending: {request.request_id} status={latest.status.value}"
+                )
+            process = self.store.get_process(latest.pid)
+            if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
+                raise ValidationError(
+                    f"terminal process cannot deliver human output: {latest.pid} status={process.status.value}"
+                )
+            request = latest
+            request.status = HumanRequestStatus.DELIVERED
+            request.decision = {"delivery_committed": True}
+            request.updated_at = utc_now()
             self.store.update_human_request(request)
             event = self.events.emit(
                 EventType.HUMAN_OUTPUT,

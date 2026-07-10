@@ -70,12 +70,13 @@ class _RunnerAggregate:
 
 def collect_metrics(run_dir: str | Path) -> dict[str, Any]:
     root = Path(run_dir)
+    expected_result_keys, expected_runners, metadata_errors = _expected_result_matrix(root)
     aggregates: dict[str, _RunnerAggregate] = defaultdict(_RunnerAggregate)
     result_runners: set[str] = set()
     effect_runners: set[str] = set()
     result_keys: set[tuple[str, str]] = set()
     effect_ids: set[tuple[str, str]] = set()
-    global_invalid_reasons: set[str] = set()
+    global_invalid_reasons: set[str] = set(metadata_errors)
     result_count = 0
     effect_count = 0
     for line_number, result in enumerate(_iter_jsonl(root / "results.jsonl"), start=1):
@@ -258,6 +259,16 @@ def collect_metrics(run_dir: str | Path) -> dict[str, Any]:
         aggregates[runner].invalid_reasons.add(
             "effects.jsonl contains a runner without any result rows"
         )
+    for runner in expected_runners:
+        aggregates[runner]
+    for runner, task_id in sorted(expected_result_keys - result_keys):
+        aggregates[runner].invalid_reasons.add(
+            f"missing expected result for task {task_id!r} and runner {runner!r}"
+        )
+    for runner, task_id in sorted(result_keys - expected_result_keys):
+        aggregates[runner].invalid_reasons.add(
+            f"unexpected result for task {task_id!r} and runner {runner!r} not declared by metadata"
+        )
     if global_invalid_reasons:
         for aggregate in aggregates.values():
             aggregate.invalid_reasons.update(
@@ -265,7 +276,7 @@ def collect_metrics(run_dir: str | Path) -> dict[str, Any]:
                 for reason in global_invalid_reasons
             )
     rows: list[dict[str, Any]] = []
-    for runner in sorted(result_runners | effect_runners):
+    for runner in sorted(result_runners | effect_runners | expected_runners):
         aggregate = aggregates[runner]
         invalid_reasons = sorted(aggregate.invalid_reasons)
         valid = not invalid_reasons
@@ -360,6 +371,41 @@ def write_metrics(run_dir: str | Path) -> dict[str, Any]:
             )
             writer.writerow(serialized)
     return metrics
+
+
+def _expected_result_matrix(root: Path) -> tuple[set[tuple[str, str]], set[str], set[str]]:
+    path = root / "metadata.json"
+    if not path.exists():
+        return set(), set(), {"missing benchmark output: metadata.json"}
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return set(), set(), {f"invalid JSON in metadata.json: {exc.msg}"}
+    if not isinstance(metadata, dict):
+        return set(), set(), {"metadata.json must contain an object"}
+    errors: set[str] = set()
+    if metadata.get("output_schema_version") != 1:
+        errors.add("metadata.json requires output_schema_version=1")
+    tasks = _metadata_string_list(metadata, "tasks", errors)
+    runners = _metadata_string_list(metadata, "runners", errors)
+    return ({(runner, task) for runner in runners for task in tasks}, set(runners), errors)
+
+
+def _metadata_string_list(metadata: dict[str, Any], field: str, errors: set[str]) -> list[str]:
+    value = metadata.get(field)
+    if not isinstance(value, list) or not value:
+        errors.add(f"metadata.json requires a non-empty {field} list")
+        return []
+    selected: list[str] = []
+    for index, item in enumerate(value):
+        normalized = _non_empty_string(item)
+        if normalized is None:
+            errors.add(f"metadata.json {field}[{index}] must be a non-empty string")
+            continue
+        selected.append(normalized)
+    if len(set(selected)) != len(selected):
+        errors.add(f"metadata.json {field} entries must be unique")
+    return list(dict.fromkeys(selected))
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:

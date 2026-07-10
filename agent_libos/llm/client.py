@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import os
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -426,8 +427,27 @@ class LLMClient:
             from openai import AsyncOpenAI
         except ImportError as exc:
             raise LLMError("The OpenAI Python SDK is not installed. Install it with `pip install openai`.") from exc
-        self._async_client = AsyncOpenAI(**self._client_kwargs())
-        return self._async_client
+        # Scheduler quanta may run on different short-lived event loops.  An
+        # AsyncOpenAI/httpx connection pool is bound to the loop that first
+        # opened its keep-alive connections, so caching it on this long-lived
+        # profile client makes the next quantum reuse a transport owned by a
+        # closed (or different worker) loop.  Keep explicitly injected clients
+        # for tests/hosts, but scope real SDK clients to one request.
+        return AsyncOpenAI(**self._client_kwargs())
+
+    @asynccontextmanager
+    async def _async_client_scope(self) -> Any:
+        client = self._async_client_or_raise()
+        owned = self._async_client is None
+        try:
+            yield client
+        finally:
+            if owned:
+                close = getattr(client, "aclose", None) or getattr(client, "close", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
 
     def _client_kwargs(self) -> dict[str, Any]:
         self._validate_base_url_policy()
@@ -514,12 +534,12 @@ class LLMClient:
         return payload
 
     async def _create_response(self, payload: dict[str, Any]) -> Any:
-        client = self._async_client_or_raise()
-        return await self._call_with_compatibility(client.responses.create, payload, api="responses")
+        async with self._async_client_scope() as client:
+            return await self._call_with_compatibility(client.responses.create, payload, api="responses")
 
     async def _create_chat_completion(self, payload: dict[str, Any]) -> Any:
-        client = self._async_client_or_raise()
-        return await self._call_with_compatibility(client.chat.completions.create, payload, api="chat")
+        async with self._async_client_scope() as client:
+            return await self._call_with_compatibility(client.chat.completions.create, payload, api="chat")
 
     async def _call_with_compatibility(self, create: Any, payload: dict[str, Any], api: str) -> Any:
         request = dict(payload)

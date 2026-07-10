@@ -77,6 +77,52 @@ class SlowSyncSideEffectTool(SyncAgentTool[EmptyArgs]):
 
 
 class TestObjectTasks:
+    def test_cross_actor_task_view_and_cancel_consume_one_shot_authority(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            creator = runtime.process.spawn(image="base-agent:v0", goal="task creator")
+            actor = runtime.process.spawn(image="base-agent:v0", goal="task controller")
+            _grant_process_spawn(runtime, creator)
+            owner = _owner(runtime, creator)
+            tasks = [
+                runtime.object_tasks.start(
+                    creator,
+                    owner,
+                    "receive_process_messages",
+                    {"channel": f"never-{index}"},
+                )
+                for index in range(2)
+            ]
+            for task in tasks:
+                waiting = runtime.object_tasks.wait(task.task_id, actor_pid=creator, timeout=2)
+                assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            write_cap = runtime.capability.issue_trusted(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.WRITE],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            cancelled = runtime.object_tasks.cancel(tasks[0].task_id, actor_pid=actor)
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.object_tasks.cancel(tasks[1].task_id, actor_pid=actor)
+
+            read_cap = runtime.capability.issue_trusted(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.READ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            assert runtime.object_tasks.get(tasks[1].task_id, actor_pid=actor).task_id == tasks[1].task_id
+            assert runtime.store.get_capability(read_cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.object_tasks.get(tasks[1].task_id, actor_pid=actor)
+        finally:
+            runtime.close()
     def test_object_task_runs_visible_tool_links_result_and_notifies_creator(self) -> None:
         runtime = Runtime.open("local")
         try:

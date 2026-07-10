@@ -263,9 +263,11 @@ lease and permits a later reopen.
 SQLite resolves both its connection and lease from the canonical database
 path. On platforms with `fcntl` and `O_NOFOLLOW`, the sidecar is opened
 no-follow, verified as the same regular-file inode before use, and protected by
-`flock`; other platforms use SQLite's kernel-managed exclusive database lock
-instead of trusting a stale sidecar. PostgreSQL advisory keys are scoped to the
-current database and schema. Store transactions also fail closed: commit or
+`flock`. On that secure POSIX path, the database, lease, journal, WAL, and SHM
+files are created or tightened owner-only (`0600`). Where that path is
+unavailable, SQLite uses its kernel-managed exclusive database lock instead of
+trusting a stale sidecar. PostgreSQL advisory keys are scoped to the current
+database and schema. Store transactions also fail closed: commit or
 savepoint-release failure triggers rollback, and a rollback failure poisons and
 closes the store rather than allowing further reads or writes. See
 [docs/storage.md](docs/storage.md).

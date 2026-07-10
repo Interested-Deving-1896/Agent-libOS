@@ -359,6 +359,27 @@ class ProcessManager:
         preserve_capabilities: bool = False,
         llm_profile_id: str | None = None,
     ) -> None:
+        with self.store.transaction(include_object_payloads=True):
+            self._exec_uncommitted(
+                pid,
+                image,
+                args=args,
+                goal=goal,
+                preserve_memory=preserve_memory,
+                preserve_capabilities=preserve_capabilities,
+                llm_profile_id=llm_profile_id,
+            )
+
+    def _exec_uncommitted(
+        self,
+        pid: str,
+        image: str,
+        args: dict[str, Any] | None = None,
+        goal: dict[str, Any] | str | ObjectHandle | None = None,
+        preserve_memory: bool = True,
+        preserve_capabilities: bool = False,
+        llm_profile_id: str | None = None,
+    ) -> None:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot exec terminated process: {pid}")
@@ -616,7 +637,10 @@ class ProcessManager:
         if process.status in self.TERMINAL_STATUSES:
             self._release_rejected_exit_result(pid, result)
             raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
-        with self.memory.ownership_locked(), self.store.locked():
+        # Terminal state, child-budget release, evidence, and parent wakeup are
+        # one durable lifecycle transition.  Host/object finalizers remain
+        # post-commit because provider cleanup cannot be rolled back safely.
+        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
             process = self._get(pid)
             if process.status in self.TERMINAL_STATUSES:
                 self._release_rejected_exit_result(pid, result)
@@ -625,22 +649,22 @@ class ProcessManager:
             process.status_message = f"result_oid:{result.oid}" if result is not None else message
             process.updated_at = utc_now()
             self.store.update_process(process)
-        self._release_child_budget(pid)
-        self.events.emit(
-            EventType.PROCESS_EXITED,
-            source=pid,
-            target=process.parent_pid,
-            payload={"pid": pid, "status": process.status.value, "result_oid": result.oid if result else None},
-        )
-        self.audit.record(
-            actor=pid,
-            action="process.exit",
-            target=f"process:{pid}",
-            output_refs=[result.oid] if result else [],
-            decision={"status": process.status.value, "message": message},
-        )
+            self._release_child_budget(pid)
+            self.events.emit(
+                EventType.PROCESS_EXITED,
+                source=pid,
+                target=process.parent_pid,
+                payload={"pid": pid, "status": process.status.value, "result_oid": result.oid if result else None},
+            )
+            self.audit.record(
+                actor=pid,
+                action="process.exit",
+                target=f"process:{pid}",
+                output_refs=[result.oid] if result else [],
+                decision={"status": process.status.value, "message": message},
+            )
+            self._wake_parent_waiting_on_child(process)
         self._finalize_terminal_process(process, preserve_oids={result.oid} if result is not None else set())
-        self._wake_parent_waiting_on_child(process)
         self._notify_object_task_process_terminal(process.pid)
 
     def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:

@@ -226,13 +226,27 @@ The rate denominators are explicit in every row:
   simulated, and not-started records are not part of this denominator. Exact
   counts are reported in the corresponding `false_denial_*` fields.
 
-Metric rows are fail-closed. Duplicate/missing result or effect ids, orphan
-effects, invalid numeric/count fields, unknown classifications/outcomes,
+Metric rows are fail-closed. Duplicate/missing result task keys or effect ids,
+orphan effects, invalid numeric/count fields, unknown classifications/outcomes,
 missing evidence, inconsistent outcome flags, or runner infrastructure failure
 set `valid: false`. Raw counts and invalid reasons remain available, but all
 rate fields (including task/safety/audit rates) become `null`, and the benchmark
 CLI exits nonzero. Invalid evidence is never silently folded into a favorable
 rate.
+
+`metadata.json` is also a completion manifest. `run_benchmark.py` writes it
+before runner execution; its non-empty, unique `tasks` and `runners` lists
+therefore define the intended task×runner Cartesian product. Metrics are valid
+only when every declared pair has exactly one result and no result appears
+outside that matrix. Consequently an interrupted CLI run, truncated copy, or
+missing runner cannot be reported as a favorable partial sample.
+
+`write_run_outputs(...)` also supports direct programmatic/test callers. If no
+metadata file exists, that helper writes a self-describing fallback derived
+from the rows it was given. Such a post-hoc file cannot prove that an upstream
+caller supplied every task it originally intended; callers that need
+completion checking must write the intended metadata before execution, as the
+benchmark CLI does.
 
 Do not mix the benchmark's counting layers when reporting results: `tasks` is
 the number of result rows, the rate denominators above count different qualified

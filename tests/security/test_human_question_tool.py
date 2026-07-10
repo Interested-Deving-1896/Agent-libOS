@@ -238,6 +238,97 @@ class TestHumanQuestionTool:
         with pytest.raises(ValidationError, match='not pending'):
             self.runtime.human.approve(request_id, {'approved': True, 'answer': 'late'})
 
+    def test_terminal_exit_does_not_wait_for_blocked_human_provider_read(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='cancel blocked human read')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'May block forever?'},
+            blocking=True,
+        )
+        read_started = threading.Event()
+        release_read = threading.Event()
+        terminal_errors: list[BaseException] = []
+        exit_errors: list[BaseException] = []
+
+        def blocked_read(_prompt: str) -> str:
+            read_started.set()
+            assert release_read.wait(timeout=2)
+            return 'late answer'
+
+        def drain() -> None:
+            try:
+                self.runtime.human.process_next_terminal()
+            except BaseException as exc:
+                terminal_errors.append(exc)
+
+        def exit_process() -> None:
+            try:
+                self.runtime.process.exit(pid, message='cancel pending question')
+            except BaseException as exc:
+                exit_errors.append(exc)
+
+        self.runtime.substrate.human.input_reader = blocked_read
+        terminal = threading.Thread(target=drain)
+        terminal.start()
+        assert read_started.wait(timeout=1)
+        exiting = threading.Thread(target=exit_process)
+        exiting.start()
+        exiting.join(timeout=0.5)
+        try:
+            assert not exiting.is_alive()
+            assert exit_errors == []
+            assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
+            assert self.runtime.human.get(request_id).status == HumanRequestStatus.CANCELLED
+        finally:
+            release_read.set()
+            terminal.join(timeout=2)
+            exiting.join(timeout=2)
+        assert len(terminal_errors) == 1
+        assert isinstance(terminal_errors[0], ValidationError)
+
+    def test_terminal_exit_does_not_wait_for_blocked_human_provider_write(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='exit during human output')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+        write_started = threading.Event()
+        release_write = threading.Event()
+        output_errors: list[BaseException] = []
+        exit_errors: list[BaseException] = []
+
+        def blocked_write(_message: str) -> None:
+            write_started.set()
+            assert release_write.wait(timeout=2)
+
+        def deliver() -> None:
+            try:
+                self.runtime.human.output(pid, 'committed before exit')
+            except BaseException as exc:
+                output_errors.append(exc)
+
+        def exit_process() -> None:
+            try:
+                self.runtime.process.exit(pid, message='exit while output provider blocks')
+            except BaseException as exc:
+                exit_errors.append(exc)
+
+        self.runtime.substrate.human.output_sink = blocked_write
+        output = threading.Thread(target=deliver)
+        output.start()
+        assert write_started.wait(timeout=1)
+        exiting = threading.Thread(target=exit_process)
+        exiting.start()
+        exiting.join(timeout=0.5)
+        try:
+            assert not exiting.is_alive()
+            assert exit_errors == []
+            assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
+        finally:
+            release_write.set()
+            output.join(timeout=2)
+            exiting.join(timeout=2)
+        assert output_errors == []
+        assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
+
     def test_pending_ask_human_llm_action_survives_runtime_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = f'{temp_dir}/runtime.sqlite'

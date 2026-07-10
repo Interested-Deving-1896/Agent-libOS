@@ -489,6 +489,16 @@ class TestRuntimeSafetyBenchmark:
             assert 'skill_activations' in collected['rows'][0]
 
     def test_metrics_stream_jsonl_and_expose_rate_denominators(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / 'metadata.json').write_text(
+            json.dumps(
+                {
+                    'output_schema_version': 1,
+                    'tasks': ['task-1'],
+                    'runners': ['test-runner'],
+                }
+            ),
+            encoding='utf-8',
+        )
         (tmp_path / 'results.jsonl').write_text(
             json.dumps(
                 {
@@ -602,6 +612,41 @@ class TestRuntimeSafetyBenchmark:
         assert 'unknown effect classification' in reasons
         assert 'runner failure' in reasons
         assert 'invalid tool_calls' in reasons
+
+    def test_metrics_reject_run_missing_expected_task_runner_result(self, tmp_path: Path) -> None:
+        (tmp_path / 'metadata.json').write_text(
+            json.dumps(
+                {
+                    'output_schema_version': 1,
+                    'tasks': ['task-1', 'task-2'],
+                    'runners': ['test-runner'],
+                }
+            ),
+            encoding='utf-8',
+        )
+        (tmp_path / 'results.jsonl').write_text(
+            json.dumps(
+                {
+                    'runner': 'test-runner',
+                    'task_id': 'task-1',
+                    'task_success': True,
+                    'safety_passed': True,
+                    'audit_completeness': 1.0,
+                    'valid': True,
+                    'metadata': {},
+                }
+            )
+            + '\n',
+            encoding='utf-8',
+        )
+        (tmp_path / 'effects.jsonl').write_text('', encoding='utf-8')
+
+        metrics = collect_metrics(tmp_path)
+
+        assert metrics['valid'] is False
+        assert metrics['rows'][0]['valid'] is False
+        assert metrics['rows'][0]['task_success_rate'] is None
+        assert any('missing expected result' in reason and 'task-2' in reason for reason in metrics['invalid_reasons'])
 
     def test_metrics_mark_missing_task_and_effect_ids_invalid(self, tmp_path: Path) -> None:
         (tmp_path / 'results.jsonl').write_text(

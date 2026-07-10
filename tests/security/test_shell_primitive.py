@@ -2,6 +2,7 @@ from __future__ import annotations
 import agent_libos.substrate.local as local_substrate
 import os
 import pytest
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ from agent_libos.substrate import (
     SubprocessTimeoutExpired,
 )
 
+_HARDENED_GIT_STATUS = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status']
+_HARDENED_GIT_STATUS_SHORT = [*_HARDENED_GIT_STATUS, '--short']
+
 class TestShellPrimitive:
     def setup_method(self) -> None:
         self._temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
@@ -36,7 +40,7 @@ class TestShellPrimitive:
             runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
             result = runtime.shell.run(pid, ['git', 'status', '--short'], timeout=2.0)
             assert result.stdout == 'ok\n'
-            assert provider.calls == [(['git', 'status', '--short'], 2.0)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, 2.0)]
             assert 'primitive.shell.run' in self._audit_actions(runtime)
         finally:
             runtime.close()
@@ -79,7 +83,7 @@ class TestShellPrimitive:
             with pytest.raises(RuntimeError, match='injected shell result event failure'):
                 runtime.shell.run(pid, ['git', 'status', '--short'])
 
-            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)]
             effects = runtime.store.list_external_effects(pid=pid)
             assert len(effects) == 1
             assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
@@ -175,6 +179,37 @@ class TestShellPrimitive:
                 runtime.shell.run(pid, ['git', 'diff', '--output=patch.diff'])
             context = runtime.human.pending()[0].payload['context']
             assert context['rule_id'] != 'shell.low.git'
+        finally:
+            runtime.close()
+
+    def test_auto_allowed_git_diff_disables_repo_configured_external_helper(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self._temp_dirs.append(temp_dir)
+        root = Path(temp_dir.name)
+        marker = root / 'external-diff-ran'
+        helper = root / 'external-diff-helper.sh'
+        helper.write_text(f'#!/bin/sh\nprintf ran > "{marker}"\nexit 0\n', encoding='utf-8')
+        helper.chmod(0o700)
+        subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+        subprocess.run(['git', 'config', 'diff.external', str(helper)], cwd=root, check=True)
+        tracked = root / 'tracked.txt'
+        tracked.write_text('before\n', encoding='utf-8')
+        subprocess.run(['git', 'add', 'tracked.txt'], cwd=root, check=True)
+        tracked.write_text('after\n', encoding='utf-8')
+        runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='safe git diff')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.allowlist_auto_else_ask_level,
+                issued_by='test',
+            )
+
+            result = runtime.shell.run(pid, ['git', 'diff'])
+
+            assert result.returncode == 0
+            assert result.argv == ['git', 'diff']
+            assert not marker.exists()
         finally:
             runtime.close()
 
@@ -345,7 +380,7 @@ class TestShellPrimitive:
             assert allowed.stdout == 'ok\n'
             with pytest.raises(HumanApprovalRequired):
                 runtime.shell.run(pid, ['git', 'status', '--short'])
-            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)]
         finally:
             runtime.close()
 
@@ -370,7 +405,7 @@ class TestShellPrimitive:
             assert runtime.store.get_capability(policy.cap_id).uses_remaining == 0
             with pytest.raises(CapabilityDenied):
                 runtime.shell.run(pid, ['git', 'status', '--short'])
-            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)]
         finally:
             runtime.close()
 
@@ -456,8 +491,8 @@ class TestShellPrimitive:
             assert second.stdout == 'ok\n'
             assert runtime.store.get_capability(policy.cap_id).uses_remaining is None
             assert provider.calls == [
-                (['git', 'status', '--short'], runtime.config.tools.shell_timeout_s),
-                (['git', 'status', '--short'], runtime.config.tools.shell_timeout_s),
+                (_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s),
+                (_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s),
             ]
         finally:
             runtime.close()
@@ -495,7 +530,7 @@ class TestShellPrimitive:
             with pytest.raises(CapabilityDenied):
                 runtime.shell.run(pid, ['git', 'push'])
             assert result.stdout == 'ok\n'
-            assert provider.calls == [(['git', 'status'], runtime.config.tools.shell_timeout_s)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS, runtime.config.tools.shell_timeout_s)]
         finally:
             runtime.close()
 
@@ -538,7 +573,7 @@ class TestShellPrimitive:
             assert request.payload['status'] == 'approved'
             assert any(rule['rule_id'] == 'shell.git.deny.push' for rule in rules)
             assert allowed.stdout == 'ok\n'
-            assert provider.calls == [(['git', 'status'], runtime.config.tools.shell_timeout_s)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS, runtime.config.tools.shell_timeout_s)]
         finally:
             runtime.close()
 
@@ -582,7 +617,7 @@ class TestShellPrimitive:
             result = runtime.tools.call(pid, 'run_shell_command', {'argv': ['git', 'status', '--short']})
             assert result.ok, result.error
             assert result.payload['stdout'] == 'ok\n'
-            assert provider.calls == [(['git', 'status', '--short'], runtime.config.tools.shell_timeout_s)]
+            assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)]
         finally:
             runtime.close()
 

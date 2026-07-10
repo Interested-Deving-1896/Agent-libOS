@@ -325,16 +325,24 @@ class ObjectTaskManager:
             tasks = [task for task in tasks if self._can_view_task(actor_pid, task)]
         if selected_limit is not None:
             tasks = tasks[:selected_limit]
+        if actor_pid is not None:
+            self._consume_task_visibility(actor_pid, tasks)
         return tasks
 
     def cancel(self, task_id: str, *, actor_pid: str, reason: str | None = None) -> ObjectTask:
         task = self._refresh_task_from_runner(self._get(task_id))
-        self._require_task_mutable(actor_pid, task)
+        decision = self._require_task_mutable(actor_pid, task)
         if task.status in _TERMINAL_STATUSES:
             return task
         if task.status == ObjectTaskStatus.RUNNING and self.runtime.tools.is_sync_side_effect_tool(task.tool):
             raise ValidationError(
                 f"running synchronous side-effect object task cannot be safely cancelled: {task_id}"
+            )
+        if decision is not None:
+            self.runtime.capability.claim_decision_use(
+                decision,
+                used_by=actor_pid,
+                reason="one-time object task cancellation authority consumed",
             )
         with self._lock:
             future = self._futures.get(task_id)
@@ -345,8 +353,10 @@ class ObjectTaskManager:
     def wait(self, task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> ObjectTask:
         selected_timeout = self._coerce_wait_timeout(timeout)
         deadline = None if selected_timeout is None else time.monotonic() + selected_timeout
+        if actor_pid is not None:
+            self._require_task_visible(actor_pid, self._refresh_task_from_runner(self._get(task_id)))
         while True:
-            task = self.get(task_id, actor_pid=actor_pid)
+            task = self.get(task_id)
             if (
                 task.status == ObjectTaskStatus.WAITING_HUMAN
                 and not self._has_active_future(task.task_id)
@@ -366,7 +376,7 @@ class ObjectTaskManager:
                 # the lifetime check. Re-read so callers observe its final
                 # notification/result cleanup writes, not the stale terminal
                 # snapshot that preceded coroutine settlement.
-                settled = self.get(task_id, actor_pid=actor_pid)
+                settled = self.get(task_id)
                 self._cleanup_owner_pin_after_terminal(settled)
                 return settled
             if (
@@ -1332,15 +1342,46 @@ class ObjectTaskManager:
             raise ValidationError("object task per-object concurrency limit exceeded")
 
     def _require_task_visible(self, actor_pid: str, task: ObjectTask) -> None:
-        if not self._can_view_task(actor_pid, task):
-            raise CapabilityDenied(f"{actor_pid} cannot inspect object task: {task.task_id}")
-
-    def _require_task_mutable(self, actor_pid: str, task: ObjectTask) -> None:
         if task.creator_pid == actor_pid:
             return
+        decision = self.runtime.capability.authorize(actor_pid, f"object:{task.owner_oid}", ObjectRight.READ)
+        if not decision.allowed:
+            raise CapabilityDenied(f"{actor_pid} cannot inspect object task: {task.task_id}")
+        self.runtime.capability.claim_decision_use(
+            decision,
+            used_by=actor_pid,
+            reason="one-time object task visibility authority consumed",
+        )
+
+    def _require_task_mutable(self, actor_pid: str, task: ObjectTask) -> Any | None:
+        if task.creator_pid == actor_pid:
+            return None
         decision = self.runtime.capability.authorize(actor_pid, f"object:{task.owner_oid}", ObjectRight.WRITE)
         if not decision.allowed:
             raise CapabilityDenied(f"{actor_pid} cannot cancel object task: {task.task_id}")
+        return decision
+
+    def _consume_task_visibility(self, actor_pid: str, tasks: list[ObjectTask]) -> None:
+        decisions: list[Any] = []
+        capability_ids: set[str] = set()
+        for task in tasks:
+            if task.creator_pid == actor_pid:
+                continue
+            decision = self.runtime.capability.authorize(actor_pid, f"object:{task.owner_oid}", ObjectRight.READ)
+            if not decision.allowed:
+                raise CapabilityDenied(f"{actor_pid} cannot inspect object task: {task.task_id}")
+            cap_id = decision.consume_capability_id
+            if cap_id is None or str(cap_id) in capability_ids:
+                continue
+            capability_ids.add(str(cap_id))
+            decisions.append(decision)
+        with self.runtime.store.transaction():
+            for decision in decisions:
+                self.runtime.capability.claim_decision_use(
+                    decision,
+                    used_by=actor_pid,
+                    reason="one-time object task list visibility authority consumed",
+                )
 
     def _can_view_task(self, actor_pid: str, task: ObjectTask) -> bool:
         if task.creator_pid == actor_pid:

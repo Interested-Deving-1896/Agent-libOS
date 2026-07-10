@@ -423,9 +423,12 @@ messages, update the request, wake the process, and resume the original
 operation. Rejection returns a normal failure to the process instead of crashing
 the runtime, except `request_permission` rejection returns a structured
 `rejected` decision after installing the selected deny policy.
-Terminal queue selection and terminal transition use one serialized critical
-section. Concurrent drains therefore cannot deliver one output twice or install
-two automatic permission policies from the same pending request.
+Terminal queue selection claims the oldest pending request in one serialized
+critical section, but blocking provider input/output runs outside that lock.
+Concurrent drains therefore cannot deliver one output twice or install two
+automatic permission policies from the same pending request, while process
+exit/cancel can still cancel the claim without waiting for user input. A late
+answer rechecks the durable pending state and is discarded after cancellation.
 
 Permission decisions must include a JSON boolean `approved` consistent with the
 terminal status and one explicit policy: `always_allow`, `always_deny`, or
@@ -468,6 +471,9 @@ message.
 An empty blocking read registers its wait atomically with message posting, so a
 matching concurrent post either satisfies the read or wakes the registered
 process; it cannot disappear between the mailbox query and wait-state update.
+Recipient terminal-state recheck, message insertion, event/audit evidence, and
+matching waiter wakeup commit in the same store transaction. An evidence sink
+failure therefore leaves neither an orphan unread message nor a false wakeup.
 
 Interrupt messages preempt before non-message tool calls until read. Normal
 messages notify after a tool call and do not block the current action.
@@ -511,10 +517,20 @@ external authority by default.
 It never grants the target image's declared required capabilities
 automatically. Existing external capabilities are preserved only when explicitly
 requested; otherwise exec shrinks external authority.
+The core `ProcessManager.exec` transition commits the process image row,
+capability shrink, exec event, and exec audit atomically. Higher-level
+`Runtime.exec_process` then configures the target tool table, package/checkpoint
+state, and default Skills. A later boot-phase failure cleans package state and
+restores the captured process/Object/capability/tool state in a compensating
+transaction, then records `image.boot.failed`; those phases are not one SQL
+transaction. Hosts that call the embedded API concurrently must therefore
+provide Runtime-level serialization if intermediate reads are unacceptable.
 
 `wait_child_process` blocks the parent in `waiting_event`. Child exit wakes the
 parent and resumes the original wait action without asking the model for a new
-action.
+action. Terminal child state, budget release, exit evidence, and parent wakeup
+commit atomically, so an evidence failure leaves the child retryable rather than
+terminal with a stranded parent.
 
 Signals can pause, resume, cancel, interrupt, or terminate direct children.
 
@@ -524,6 +540,10 @@ Signals can pause, resume, cancel, interrupt, or terminate direct children.
 Object Memory result. Process-owned memory is released on exit unless retained
 as the process result. Cleanup follows explicit Object Memory owner fields, not
 the object's creator provenance, and release revokes stale object capabilities.
+The terminal row, child-budget release, exit evidence, and parent wake commit
+together. Object/host finalizers and ObjectTask terminal notification run after
+that commit because their provider cleanup cannot be rolled back; a later
+cleanup error does not make the terminal transition uncommitted.
 
 When a Deno JIT tool calls `process.exit` or `process.exec`, the syscall records
 a deferred lifecycle change. The runtime applies that change only after the JIT

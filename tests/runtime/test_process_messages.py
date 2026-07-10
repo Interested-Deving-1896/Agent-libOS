@@ -19,6 +19,48 @@ def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
 
 class TestProcessMessage:
 
+    def test_post_event_failure_rolls_back_message_and_waiter_wakeup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='wait for message')
+            with pytest.raises(ProcessMessageWaitRequired):
+                runtime.messages.receive(pid, block=True, channel='control')
+            original_emit = runtime.events.emit
+
+            def fail_post_event(event_type, *args, **kwargs):
+                from agent_libos.models import EventType
+
+                if event_type == EventType.PROCESS_MESSAGE_POSTED:
+                    raise RuntimeError('injected process message event failure')
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_post_event)
+            with pytest.raises(RuntimeError, match='injected process message event failure'):
+                runtime.messages.post(
+                    sender='test',
+                    recipient_pid=pid,
+                    channel='control',
+                    subject='must roll back',
+                )
+
+            assert runtime.messages.unread(pid) == []
+            assert runtime.process.get(pid).status == ProcessStatus.WAITING_EVENT
+
+            monkeypatch.setattr(runtime.events, 'emit', original_emit)
+            runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                channel='control',
+                subject='committed',
+            )
+            assert [message.subject for message in runtime.messages.unread(pid)] == ['committed']
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
     def test_process_message_tools_send_read_and_ack_related_processes(self) -> None:
         runtime = Runtime.open('local')
         try:

@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
-from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec
+from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec, EventType
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
@@ -438,6 +438,53 @@ class TestCapabilityManager:
             assert runtime.capability.inspect(grant_cap.cap_id)['status'] == 'revoked'
             with pytest.raises(CapabilityDenied):
                 runtime.capability.issue(issuer, subject, CapabilitySpec(resource='object:alpha', rights={CapabilityRight.WRITE.value}))
+        finally:
+            runtime.close()
+
+    def test_issue_rolls_back_capability_and_one_shot_authority_when_event_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            issuer = runtime.process.spawn(image='base-agent:v0', goal='issuer')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            runtime.capability.issue_trusted(issuer, 'object:alpha', [CapabilityRight.READ], issued_by='test')
+            grant_cap = runtime.capability.grant_once(
+                issuer,
+                'object:alpha',
+                [CapabilityRight.GRANT],
+                issued_by='test',
+            )
+            before_ids = {cap.cap_id for cap in runtime.capability.capabilities_for(subject)}
+            original_emit = runtime.events.emit
+
+            def fail_grant_event(event_type, *args, **kwargs):
+                if event_type == EventType.CAPABILITY_GRANTED:
+                    raise RuntimeError('injected capability grant event failure')
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_grant_event)
+            with pytest.raises(RuntimeError, match='injected capability grant event failure'):
+                runtime.capability.issue(
+                    issuer,
+                    subject,
+                    CapabilitySpec(resource='object:alpha', rights={CapabilityRight.READ.value}),
+                )
+
+            assert {cap.cap_id for cap in runtime.capability.capabilities_for(subject)} == before_ids
+            grant_after_failure = runtime.capability.inspect(grant_cap.cap_id)
+            assert grant_after_failure['status'] == 'active'
+            assert grant_after_failure['uses_remaining'] == 1
+
+            monkeypatch.setattr(runtime.events, 'emit', original_emit)
+            issued = runtime.capability.issue(
+                issuer,
+                subject,
+                CapabilitySpec(resource='object:alpha', rights={CapabilityRight.READ.value}),
+            )
+            assert {cap.cap_id for cap in runtime.capability.capabilities_for(subject)} == before_ids | {issued.cap_id}
+            assert runtime.capability.inspect(grant_cap.cap_id)['status'] == 'revoked'
         finally:
             runtime.close()
 

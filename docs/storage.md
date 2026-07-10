@@ -81,6 +81,13 @@ symlink, directory, replaced inode, or second lock holder is rejected without
 modifying the unsafe target. The sidecar may remain after close; ownership is
 the kernel lock, not file existence.
 
+The database is atomically pre-created owner-only (`0600`) before SQLite opens
+it. Existing owner-controlled database, lease, rollback-journal, WAL, and SHM
+files are verified as regular files and tightened to `0600`; a file owned by a
+different uid is rejected. This is required because the store may contain full
+LLM prompts/outputs, capabilities, audit data, messages, and Human requests.
+The Windows fallback relies on deployment ACLs rather than POSIX mode bits.
+
 Where that secure file-lock path is unavailable, including the normal Windows
 fallback, the connection uses SQLite `locking_mode=EXCLUSIVE` plus
 `BEGIN EXCLUSIVE`. This kernel-managed database lease is crash-recoverable and

@@ -171,6 +171,14 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <e
 Passing `--actor-pid` makes the CLI enforce that process's checkpoint
 capabilities. Omitting it runs as an audited admin CLI actor.
 
+Finite read authority follows the operation shape. Actor-mode `list` consumes
+the selected `checkpoint:*` read immediately, or the selected
+`checkpoint:process:<pid>` read when `--pid` is supplied. `inspect`, `diff`, and
+`replay` instead reserve an exact `checkpoint:<id>` read, falling back to the
+checkpoint owner's process-read authority, for the duration of the diagnostic;
+they restore that reservation if the diagnostic fails and commit it once on
+success. Admin CLI mode skips these process capability checks.
+
 ## Restore
 
 Restore applies at a runtime safe point and is scoped to the checkpoint owner

@@ -242,6 +242,8 @@
         "tests/runtime/test_store_contract.py::test_sqlite_file_store_rejects_concurrent_active_runtime_and_reopens_after_close",
         "tests/unit/test_storage_backend_boundaries.py::TestStorageBackendBoundaries::test_sqlite_runtime_lease_uses_atomic_lockfile_without_fcntl",
         "tests/unit/test_storage_backend_boundaries.py::TestStorageBackendBoundaries::test_sqlite_runtime_lease_rejects_symlink_alias",
+        "tests/unit/test_storage_backend_boundaries.py::TestStorageBackendBoundaries::test_sqlite_database_lease_and_wal_sidecars_are_owner_only",
+        "tests/unit/test_storage_backend_boundaries.py::TestStorageBackendBoundaries::test_sqlite_reopen_tightens_owner_database_and_lease_modes",
         "tests/unit/test_storage_recovery.py::TestSQLiteRuntimeLeaseRecovery::test_runtime_lease_refuses_symlink_without_modifying_target",
         "tests/unit/test_storage_recovery.py::TestSQLiteRuntimeLeaseRecovery::test_runtime_lease_requires_regular_file_from_fstat",
         "tests/unit/test_storage_recovery.py::TestSQLiteRuntimeLeaseRecovery::test_fcntl_fallback_ignores_stale_legacy_lockfile",
@@ -296,6 +298,8 @@
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_multiple_blocking_requests_keep_process_waiting_until_all_are_decided",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_process_cancels_pending_human_requests[cancel]",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_process_cancels_pending_human_requests[exit]",
+        "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_exit_does_not_wait_for_blocked_human_provider_read",
+        "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_exit_does_not_wait_for_blocked_human_provider_write",
         "tests/runtime/test_async_scheduler.py::TestAsyncScheduler::test_concurrent_runs_keep_human_policy_in_the_originating_run_context",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_one_time_human_output_capability_is_consumed_after_delivery",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_human_output_does_not_write_provider_when_effect_commit_fails",
@@ -307,6 +311,7 @@
         "tests/runtime/test_pty_module.py::TestPtyModule::test_high_risk_pty_spawn_requests_human_with_continuous_session_context",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_human_jsonrpc_approval_is_bound_to_params_hash",
         "tests/providers/test_gui_server.py::TestGuiServer::test_human_request_respond_rejects_non_pending_request",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_snapshot_keeps_new_pending_human_request_ahead_of_bounded_history",
         "tests/providers/test_gui_server.py::TestGuiServer::test_permission_response_requires_explicit_valid_policy",
         "tests/providers/test_gui_server.py::TestGuiServer::test_question_response_requires_string_answer_before_commit",
         "tests/providers/test_gui_server.py::TestGuiServer::test_permission_response_without_approved_uses_explicit_deny_policy",
@@ -339,6 +344,7 @@
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_denies_attached_short_option_home_operand_before_execution",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_single_dash_url_and_define_arguments_are_not_path_operands",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_subprocess_home_points_to_workspace",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_auto_allowed_git_diff_disables_repo_configured_external_helper",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_shell_once_approval_does_not_authorize_pty_spawn",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_other_process_without_object_capability_cannot_operate_pty",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_delegated_object_write_cannot_drive_existing_pty_session",
@@ -503,7 +509,30 @@
       "title": "Blocking process-message reads register waits atomically with concurrent message posting.",
       "lane": "runtime",
       "node_ids": [
-        "tests/runtime/test_process_messages.py::TestProcessMessage::test_post_racing_empty_receive_cannot_be_lost_before_wait_registration"
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_post_racing_empty_receive_cannot_be_lost_before_wait_registration",
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_post_event_failure_rolls_back_message_and_waiter_wakeup"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "runtime-lifecycle-transitions-are-atomic",
+      "title": "Capability issue, core process exec, process exit, and message transitions atomically persist their in-store authority, evidence, and waiter state.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/security/test_capability.py::TestCapabilityManager::test_issue_rolls_back_capability_and_one_shot_authority_when_event_fails",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exec_event_failure_rolls_back_image_tools_skills_and_capabilities",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exit_event_failure_rolls_back_terminal_state_and_parent_wakeup",
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_post_event_failure_rolls_back_message_and_waiter_wakeup"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "scheduler-quantum-ownership-is-serialized",
+      "title": "Every scheduler and direct single-step process quantum uses one pid claim, one serialization lock, and one resource-accounting boundary.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_parallel_scheduler.py::TestParallelScheduler::test_concurrent_top_level_runs_do_not_reenter_same_process",
+        "tests/runtime/test_parallel_scheduler.py::TestParallelScheduler::test_concurrent_direct_single_step_calls_do_not_reenter_same_process"
       ],
       "benchmark_attack_classes": []
     },
@@ -532,6 +561,7 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runner_does_not_inherit_external_capability_unless_explicit",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runner_is_not_scheduled_by_llm_scheduler",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_completion_survives_one_time_owner_handle",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_cross_actor_task_view_and_cancel_consume_one_shot_authority",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_concurrent_object_task_start_reserves_one_time_owner_once",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_start_cleans_runner_before_restoring_one_time_owner",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_schedule_failure_terminalizes_task_and_removes_runner",
@@ -575,6 +605,15 @@
       "node_ids": [
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_call_records_can_opt_out_of_full_io_persistence",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-async-clients-are-event-loop-scoped",
+      "title": "Real asynchronous LLM transports never reuse keep-alive connections across closed or different event loops.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_llm_client.py::TestLLMClient::test_real_async_client_is_not_reused_across_closed_event_loops"
       ],
       "benchmark_attack_classes": []
     },
@@ -701,6 +740,7 @@
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_does_not_replace_current_image_without_image_write",
         "tests/self_evolution/test_checkpoint_jit.py::TestCheckpointJit::test_checkpoint_restore_prunes_post_checkpoint_ephemeral_jit_tool",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
+        "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_one_shot_checkpoint_read_is_consumed_by_inspect",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_clone_finite_use_capability",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_revalidates_actor_checkpoint_execute_inside_publish_transaction",
@@ -941,6 +981,7 @@
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_m1_task_suite",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_workspace_fixture_copy_rejects_symlinks",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_runtime_setup_paths_must_stay_under_prepared_workspace",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_metrics_reject_run_missing_expected_task_runner_result",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_deterministic_smoke_run_across_baselines_and_libos",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_self_evolution_smoke_run_across_wrapper_and_libos"
       ],

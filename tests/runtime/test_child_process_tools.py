@@ -473,6 +473,74 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_exec_event_failure_rolls_back_image_tools_skills_and_capabilities(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stay on base')
+            _grant_image_read(runtime, pid, 'coding-agent:v0')
+            before = runtime.process.get(pid)
+            before_capabilities = {cap.cap_id for cap in runtime.capability.capabilities_for(pid)}
+            original_emit = runtime.events.emit
+
+            def fail_exec_event(event_type, *args, **kwargs):
+                if event_type == EventType.PROCESS_EXEC:
+                    raise RuntimeError('injected process exec event failure')
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_exec_event)
+            with pytest.raises(RuntimeError, match='injected process exec event failure'):
+                runtime.exec_process(
+                    pid,
+                    'coding-agent:v0',
+                    goal='must roll back',
+                    preserve_capabilities=False,
+                    preserve_memory=False,
+                )
+
+            after = runtime.process.get(pid)
+            assert after.image_id == before.image_id
+            assert after.goal_oid == before.goal_oid
+            assert after.tool_table == before.tool_table
+            assert after.loaded_skills == before.loaded_skills
+            assert {cap.cap_id for cap in runtime.capability.capabilities_for(pid)} == before_capabilities
+        finally:
+            runtime.close()
+
+    def test_exit_event_failure_rolls_back_terminal_state_and_parent_wakeup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'child')
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
+            original_emit = runtime.events.emit
+
+            def fail_exit_event(event_type, *args, **kwargs):
+                if event_type == EventType.PROCESS_EXITED:
+                    raise RuntimeError('injected process exit event failure')
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_exit_event)
+            with pytest.raises(RuntimeError, match='injected process exit event failure'):
+                runtime.process.exit(child)
+
+            assert runtime.process.get(child).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+
+            monkeypatch.setattr(runtime.events, 'emit', original_emit)
+            runtime.process.exit(child)
+            assert runtime.process.get(child).status == ProcessStatus.EXITED
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
     def test_merge_child_memory_tool_adds_child_view_objects_to_parent(self) -> None:
         runtime = Runtime.open('local')
         try:

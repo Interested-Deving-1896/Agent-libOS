@@ -68,7 +68,8 @@ Persistent stores also take an active-runtime lease. SQLite derives both the
 connection target and lease from the canonical database path, so a symlink
 alias cannot open a second writer. Where `fcntl` plus `O_NOFOLLOW` are
 available, the sidecar is opened no-follow, regular-file/inode checked, and
-protected by `flock`; otherwise SQLite's kernel-managed exclusive database
+protected by `flock`, while the database and SQLite sidecars are tightened to
+owner-only (`0600`); otherwise SQLite's kernel-managed exclusive database
 lock is used instead of a stale-file protocol. PostgreSQL uses a session
 advisory key scoped to `current_database()` plus `current_schema()`. A second
 writable Runtime cannot open the same database/schema target until the first

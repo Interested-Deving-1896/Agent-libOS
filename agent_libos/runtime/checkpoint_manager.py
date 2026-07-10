@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Iterable
 
@@ -199,7 +200,8 @@ class CheckpointManager:
     ) -> dict[str, Any]:
         checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
         if require_capability and actor is not None:
-            self._require_checkpoint_or_process_read(actor, checkpoint)
+            with self._checkpoint_or_process_read_scope(actor, checkpoint):
+                return self.inspect(checkpoint_id, actor=actor, require_capability=False)
         return {
             "checkpoint": self._checkpoint_summary(checkpoint),
             "snapshot_version": snapshot.get("version"),
@@ -228,7 +230,8 @@ class CheckpointManager:
     ) -> dict[str, Any]:
         checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
         if require_capability and actor is not None:
-            self._require_checkpoint_or_process_read(actor, checkpoint)
+            with self._checkpoint_or_process_read_scope(actor, checkpoint):
+                return self.diff(checkpoint_id, actor=actor, require_capability=False)
         current = self._build_current_state_for_diff(snapshot)
         tables: dict[str, Any] = {}
         for table in [
@@ -513,7 +516,13 @@ class CheckpointManager:
     ) -> dict[str, Any]:
         checkpoint, _snapshot = self._load_checkpoint(checkpoint_id)
         if require_capability and actor is not None:
-            self._require_checkpoint_or_process_read(actor, checkpoint)
+            with self._checkpoint_or_process_read_scope(actor, checkpoint):
+                return self.replay_to_event(
+                    checkpoint_id,
+                    event_id,
+                    actor=actor,
+                    require_capability=False,
+                )
         events = self.store.list_events()
         scoped_pids = set(self._subtree_pids(checkpoint.pid))
         selected = []
@@ -1382,14 +1391,58 @@ class CheckpointManager:
         resource = "checkpoint:*" if checkpoint_id == "*" else self.checkpoint_resource(checkpoint_id)
         self.capabilities.require(actor, resource, right, consume=consume)
 
-    def _require_checkpoint_or_process_read(self, actor: str, checkpoint: Checkpoint) -> None:
+    @contextmanager
+    def _checkpoint_or_process_read_scope(
+        self,
+        actor: str,
+        checkpoint: Checkpoint,
+        *,
+        purpose: str = "checkpoint diagnostic read",
+    ):
         if self.capabilities is None:
+            yield
             return
-        if self.capabilities.check(actor, self.checkpoint_resource(checkpoint.checkpoint_id), CapabilityRight.READ):
+        decision = self.capabilities.authorize(
+            actor,
+            self.checkpoint_resource(checkpoint.checkpoint_id),
+            CapabilityRight.READ,
+        )
+        if not decision.allowed:
+            decision = self.capabilities.authorize(
+                actor,
+                self.process_resource(checkpoint.pid),
+                CapabilityRight.READ,
+            )
+        if not decision.allowed:
+            raise CapabilityDenied(f"{actor} lacks read on checkpoint {checkpoint.checkpoint_id}")
+        reservation = self.capabilities.reserve_decision_use(
+            decision,
+            used_by=actor,
+            reason=f"one-time {purpose} reserved",
+        )
+        try:
+            yield
+        except BaseException:
+            self.capabilities._restore_reserved_use(
+                reservation,
+                restored_by=actor,
+                reason=f"{purpose} failed before completion",
+            )
+            raise
+        self.capabilities.commit_reserved_use(
+            reservation,
+            committed_by=actor,
+            reason=f"one-time {purpose} committed",
+        )
+
+    def _require_checkpoint_or_process_read(self, actor: str, checkpoint: Checkpoint) -> None:
+        """Consume checkpoint/process read for non-diagnostic commit workflows."""
+        with self._checkpoint_or_process_read_scope(
+            actor,
+            checkpoint,
+            purpose="checkpoint image commit read",
+        ):
             return
-        if self.capabilities.check(actor, self.process_resource(checkpoint.pid), CapabilityRight.READ):
-            return
-        raise CapabilityDenied(f"{actor} lacks read on checkpoint {checkpoint.checkpoint_id}")
 
     def _validate_fork_parent(
         self,

@@ -16,6 +16,29 @@ from tests.support.checkpoints import checkpoint_cli_json
 
 class TestCheckpointAuthority:
 
+    def test_one_shot_checkpoint_read_is_consumed_by_inspect(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+            reader = runtime.process.spawn(image='base-agent:v0', goal='reader')
+            checkpoint_id = runtime.checkpoint.create(owner, 'one-shot read', actor=owner)
+            cap = runtime.capability.issue_trusted(
+                reader,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=1,
+            )
+
+            inspected = runtime.checkpoint.inspect(checkpoint_id, actor=reader)
+
+            assert inspected['checkpoint']['checkpoint_id'] == checkpoint_id
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.checkpoint.inspect(checkpoint_id, actor=reader)
+        finally:
+            runtime.close()
+
     def test_checkpoint_capabilities_gate_inspect_restore_and_fork(self) -> None:
         runtime = Runtime.open('local')
         try:

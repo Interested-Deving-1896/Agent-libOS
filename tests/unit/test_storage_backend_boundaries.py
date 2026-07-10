@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import stat
 
 import pytest
 
@@ -20,6 +22,47 @@ STORAGE_BACKENDS = {
 
 
 class TestStorageBackendBoundaries:
+    def test_sqlite_database_lease_and_wal_sidecars_are_owner_only(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "private-runtime.sqlite"
+        previous_umask = os.umask(0o022)
+        try:
+            store = SQLiteStore(db_path)
+        finally:
+            os.umask(previous_umask)
+        try:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+            lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+            if sqlite_backend.fcntl is not None and hasattr(os, "O_NOFOLLOW"):
+                assert stat.S_IMODE(lease_path.stat().st_mode) == 0o600
+
+            store.conn.execute("PRAGMA journal_mode=WAL")
+            store.conn.execute("CREATE TABLE private_mode_probe(value TEXT)")
+            store.conn.execute("INSERT INTO private_mode_probe VALUES ('secret')")
+            store.conn.commit()
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{db_path}{suffix}")
+                assert sidecar.exists()
+                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+        finally:
+            store.close()
+
+    def test_sqlite_reopen_tightens_owner_database_and_lease_modes(self, tmp_path: Path) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        db_path = tmp_path / "existing-runtime.sqlite"
+        store = SQLiteStore(db_path)
+        store.close()
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        db_path.chmod(0o644)
+        lease_path.chmod(0o644)
+
+        reopened = SQLiteStore(db_path)
+        try:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(lease_path.stat().st_mode) == 0o600
+        finally:
+            reopened.close()
+
     def test_runtime_code_does_not_reach_into_store_connection(self) -> None:
         offenders: list[str] = []
         for path in AGENT_LIBOS.rglob("*.py"):

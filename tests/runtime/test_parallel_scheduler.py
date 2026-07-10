@@ -21,6 +21,53 @@ def _parallel_config(max_workers: int = 4) -> AgentLibOSConfig:
 
 
 class TestParallelScheduler:
+    def test_concurrent_direct_single_step_calls_do_not_reenter_same_process(self) -> None:
+        runtime = Runtime.open("local", config=_parallel_config(max_workers=2))
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="direct single step")
+            active = 0
+            max_active = 0
+            calls = 0
+            lock = threading.Lock()
+            start = threading.Barrier(2)
+            errors: list[BaseException] = []
+
+            async def quantum(selected_pid: str) -> dict[str, str]:
+                nonlocal active, max_active, calls
+                assert selected_pid == pid
+                with lock:
+                    active += 1
+                    calls += 1
+                    max_active = max(max_active, active)
+                try:
+                    await asyncio.sleep(0.05)
+                    return {"pid": selected_pid}
+                finally:
+                    with lock:
+                        active -= 1
+
+            runtime.llm.arun_once = quantum  # type: ignore[method-assign]
+
+            def runner() -> None:
+                try:
+                    start.wait(timeout=1.0)
+                    runtime.run_process_once(pid)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=runner) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2.0)
+
+            assert errors == []
+            assert calls == 2
+            assert max_active == 1
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
     def test_blocking_quantum_does_not_block_other_process(self) -> None:
         runtime = Runtime.open("local", config=_parallel_config(max_workers=2))
         try:

@@ -21,6 +21,10 @@ from agent_libos.storage import RuntimeStore
 
 Quantum = Callable[[str], Any | Awaitable[Any]]
 _SCHEDULER_DEFAULTS = DEFAULT_CONFIG.scheduler
+_ACTIVE_QUANTUM: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar(
+    "agent_libos_active_scheduler_quantum",
+    default=None,
+)
 
 
 class AsyncProcessScheduler:
@@ -112,6 +116,23 @@ class AsyncProcessScheduler:
                 return None
             future = self._submit(pid, lambda: self._run_quantum(pid, quantum))
             return future.result()
+
+    async def arun_pid_once(self, pid: str, quantum: Quantum) -> Any:
+        return await asyncio.to_thread(self.run_pid_once, pid, quantum)
+
+    def run_pid_once(self, pid: str, quantum: Quantum) -> Any:
+        """Advance one explicitly selected runnable process by one quantum."""
+        with self._run_lock:
+            process = self.store.get_process(pid)
+            if process is None:
+                raise ValidationError(f"process not found: {pid}")
+            if process.status != ProcessStatus.RUNNABLE or not self._is_schedulable(pid):
+                return {"ok": False, "skipped": True, "status": process.status.value}
+            future = self._submit(pid, lambda: self._run_quantum(pid, quantum))
+            return future.result()
+
+    def is_active_quantum(self, pid: str) -> bool:
+        return _ACTIVE_QUANTUM.get() == (id(self), pid)
 
     async def arun_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         return await asyncio.to_thread(self.run_until_idle, quantum, max_quanta=max_quanta)
@@ -312,9 +333,13 @@ class AsyncProcessScheduler:
         error: BaseException | None = None
         resource_error: ResourceLimitExceeded | None = None
         try:
-            result = quantum(pid)
-            if inspect.isawaitable(result):
-                result = self._run_awaitable(pid, result)
+            token = _ACTIVE_QUANTUM.set((id(self), pid))
+            try:
+                result = quantum(pid)
+                if inspect.isawaitable(result):
+                    result = self._run_awaitable(pid, result)
+            finally:
+                _ACTIVE_QUANTUM.reset(token)
         except BaseException as exc:
             error = exc
         finally:

@@ -1774,6 +1774,7 @@ class SQLRuntimeStore:
         human: str | None = None,
         status: HumanRequestStatus | str | None = None,
         limit: int | None = None,
+        newest: bool = False,
     ) -> list[HumanRequest]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1788,7 +1789,8 @@ class SQLRuntimeStore:
             clauses.append("status = ?")
             params.append(selected_status)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"SELECT * FROM human_requests{where} ORDER BY created_at, request_id"
+        direction = "DESC" if newest else "ASC"
+        sql = f"SELECT * FROM human_requests{where} ORDER BY created_at {direction}, request_id {direction}"
         if limit is not None:
             selected_limit = max(0, int(limit))
             sql += " LIMIT ?"
@@ -4142,6 +4144,7 @@ class SQLiteStore(SQLRuntimeStore):
             # independent lease files.
             canonical_path = db_path.resolve()
             connection_path = str(canonical_path)
+            self._secure_database_files(canonical_path)
             if fcntl is not None and hasattr(os, "O_NOFOLLOW"):
                 self._lease_handle = self._acquire_runtime_lease(canonical_path)
             else:
@@ -4192,6 +4195,9 @@ class SQLiteStore(SQLRuntimeStore):
             opened_stat = os.fstat(fd)
             if not stat.S_ISREG(opened_stat.st_mode):
                 raise ValidationError(f"runtime lease must be a regular file: {lease_path}")
+            self._require_owned_file(opened_stat, lease_path, label="runtime lease")
+            os.fchmod(fd, 0o600)
+            opened_stat = os.fstat(fd)
             handle = os.fdopen(fd, "r+", encoding="utf-8")
             fd = -1
             try:
@@ -4225,6 +4231,59 @@ class SQLiteStore(SQLRuntimeStore):
             elif fd >= 0:
                 os.close(fd)
             raise
+
+    def _secure_database_files(self, db_path: Path) -> None:
+        """Create/tighten the SQLite database and existing sidecars to 0600."""
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "fchmod"):
+            return
+        flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(str(db_path), flags)
+        except FileNotFoundError:
+            try:
+                fd = os.open(str(db_path), flags | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                fd = os.open(str(db_path), flags)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+                raise ValidationError(f"unsafe SQLite database path: {db_path}") from exc
+            raise
+        try:
+            self._tighten_open_file(fd, db_path, label="SQLite database")
+        finally:
+            os.close(fd)
+        for suffix in ("-journal", "-wal", "-shm"):
+            sidecar = Path(f"{db_path}{suffix}")
+            try:
+                sidecar_fd = os.open(str(sidecar), flags)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+                    raise ValidationError(f"unsafe SQLite sidecar path: {sidecar}") from exc
+                raise
+            try:
+                self._tighten_open_file(sidecar_fd, sidecar, label="SQLite sidecar")
+            finally:
+                os.close(sidecar_fd)
+
+    def _tighten_open_file(self, fd: int, path: Path, *, label: str) -> None:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValidationError(f"{label} must be a regular file: {path}")
+        self._require_owned_file(opened_stat, path, label=label)
+        os.fchmod(fd, 0o600)
+        path_stat = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_dev != opened_stat.st_dev
+            or path_stat.st_ino != opened_stat.st_ino
+        ):
+            raise ValidationError(f"unsafe {label} path changed while opening: {path}")
+
+    def _require_owned_file(self, opened_stat: os.stat_result, path: Path, *, label: str) -> None:
+        if hasattr(os, "getuid") and opened_stat.st_uid != os.getuid():
+            raise ValidationError(f"{label} is not owned by the current user: {path}")
 
     def _acquire_exclusive_sqlite_lease(self, conn: sqlite3.Connection, db_path: Path) -> None:
         try:

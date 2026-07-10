@@ -140,6 +140,14 @@ not sent to custom OpenAI-compatible endpoints. In the default stateless mode,
 prior tool messages are sent back as ordinary bounded context text and no
 durable provider-chain tool-output row is written.
 
+Real asynchronous SDK transports are request-scoped. Scheduler quanta and
+parallel process workers may use different short-lived event loops, so a cached
+`AsyncOpenAI`/httpx keep-alive pool must never be reused across quanta. Explicit
+host/test transports injected into an `LLMClient` are the exception: they are
+retained across requests and are closed only when that wrapper, or the profile
+registry that owns it, shuts down. The injector is responsible for using them
+only with a compatible event-loop lifetime.
+
 A provider-side chain is eligible only for the official Responses API with
 `store=true`, `responses_previous_response_id=true`, and
 `persist_full_io=true`. The preceding call must use the same LLM profile and

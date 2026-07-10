@@ -93,12 +93,17 @@ class CapabilityManager:
         expires_at = selected.expires_at
         if transfer_parent is not None and expires_at is None:
             expires_at = transfer_parent.expires_at
-        authority_reservation = self.reserve_decision_use(
-            issue_authority.mutation_decision,
-            used_by=actor,
-            reason="one-time issue authority reserved",
-        )
-        try:
+        # The issued row, process attachment, evidence, and finite-use issuer
+        # mutation are one authority transition.  If any sink fails, callers
+        # must not observe a granted capability while also receiving an error,
+        # and a consumed one-shot grant must not be restored independently of
+        # the inserted row.
+        with self.store.transaction():
+            authority_reservation = self.reserve_decision_use(
+                issue_authority.mutation_decision,
+                used_by=actor,
+                reason="one-time issue authority reserved",
+            )
             cap = self._insert_capability(
                 subject=subject,
                 resource=selected.resource,
@@ -116,30 +121,23 @@ class CapabilityManager:
                 delegable=selected.delegable,
                 revocable=selected.revocable,
             )
-        except Exception:
-            self._restore_reserved_use(
+            self.commit_reserved_use(
                 authority_reservation,
-                restored_by=actor,
-                reason="one-time issue authority restored before capability insertion",
+                committed_by=actor,
+                reason="one-time issue authority committed",
             )
-            raise
-        self.commit_reserved_use(
-            authority_reservation,
-            committed_by=actor,
-            reason="one-time issue authority committed",
-        )
-        self.audit.record(
-            actor=actor,
-            action="capability.issue",
-            target=f"{subject}:{cap.resource}",
-            capability_refs=[cap.cap_id] + ([issuer_cap_id] if issuer_cap_id else []),
-            decision={
-                "effect": cap.effect.value,
-                "rights": sorted(cap.rights),
-                "uses_remaining": cap.uses_remaining,
-                "delegable": cap.delegable,
-            },
-        )
+            self.audit.record(
+                actor=actor,
+                action="capability.issue",
+                target=f"{subject}:{cap.resource}",
+                capability_refs=[cap.cap_id] + ([issuer_cap_id] if issuer_cap_id else []),
+                decision={
+                    "effect": cap.effect.value,
+                    "rights": sorted(cap.rights),
+                    "uses_remaining": cap.uses_remaining,
+                    "delegable": cap.delegable,
+                },
+            )
         return cap
 
     def issue_trusted(

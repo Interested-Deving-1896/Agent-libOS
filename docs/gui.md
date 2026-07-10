@@ -197,6 +197,15 @@ an answer for a pending human request. A human must decide through a request
 card (or another explicit host terminal surface), after which normal runtime
 wakeup/resume semantics apply.
 
+Pending Human requests are liveness-critical. The Human list returns every
+pending request first, followed by a bounded newest-history window. A snapshot
+then applies the GUI's general collection-size bound to that pending-first
+sequence and reports any omission in `_truncated`: terminal history cannot
+displace a pending request, although more pending requests than the collection
+bound cannot all fit in one snapshot. `GET /api/human-requests` does not apply
+the snapshot collection cap: it returns every pending row plus the Human
+list's bounded newest-history window.
+
 Request cards are typed. A permission card requires one of
 `always_allow`, `ask_each_time`, or `always_deny`; approving with
 `always_deny` and rejecting with `always_allow` are disabled and rejected by

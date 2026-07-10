@@ -78,36 +78,45 @@ class ProcessMessageManager:
             created_at=now,
             updated_at=now,
         )
-        self.store.insert_process_message(message)
-        self.events.emit(
-            EventType.PROCESS_MESSAGE_POSTED,
-            source=sender,
-            target=recipient_pid,
-            payload={
-                "message_id": message.message_id,
-                "kind": message.kind.value,
-                "channel": message.channel,
-                "correlation_id": message.correlation_id,
-                "reply_to": message.reply_to,
-                "subject": message.subject,
-                "sender": sender,
-            },
-            priority=EventPriority.HIGH if message.kind == ProcessMessageKind.INTERRUPT else EventPriority.NORMAL,
-        )
-        self.audit.record(
-            actor=sender,
-            action="process.message.post",
-            target=f"process:{recipient_pid}",
-            decision={
-                "message_id": message.message_id,
-                "kind": message.kind.value,
-                "channel": message.channel,
-                "correlation_id": message.correlation_id,
-                "reply_to": message.reply_to,
-                "subject": message.subject,
-            },
-        )
-        self._wake_if_waiting_for_message(message)
+        # Recheck terminal state while holding the same transaction that
+        # inserts the message and wakes a matching waiter.  This linearizes
+        # post against process exit and makes evidence failures retry-safe.
+        with self.store.transaction():
+            recipient = self.store.get_process(recipient_pid)
+            if recipient is None:
+                raise NotFound(f"process not found: {recipient_pid}")
+            if recipient.status in self.TERMINAL_STATUSES:
+                raise ProcessError(f"cannot post message to terminal process: {recipient_pid}")
+            self.store.insert_process_message(message)
+            self.events.emit(
+                EventType.PROCESS_MESSAGE_POSTED,
+                source=sender,
+                target=recipient_pid,
+                payload={
+                    "message_id": message.message_id,
+                    "kind": message.kind.value,
+                    "channel": message.channel,
+                    "correlation_id": message.correlation_id,
+                    "reply_to": message.reply_to,
+                    "subject": message.subject,
+                    "sender": sender,
+                },
+                priority=EventPriority.HIGH if message.kind == ProcessMessageKind.INTERRUPT else EventPriority.NORMAL,
+            )
+            self.audit.record(
+                actor=sender,
+                action="process.message.post",
+                target=f"process:{recipient_pid}",
+                decision={
+                    "message_id": message.message_id,
+                    "kind": message.kind.value,
+                    "channel": message.channel,
+                    "correlation_id": message.correlation_id,
+                    "reply_to": message.reply_to,
+                    "subject": message.subject,
+                },
+            )
+            self._wake_if_waiting_for_message(message)
         if self._object_tasks is not None:
             self._object_tasks.notify_process_message(message)
         return message

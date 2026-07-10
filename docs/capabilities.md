@@ -37,6 +37,16 @@ Reservations left in flight by a crashed runtime are abandoned fail-closed on
 the next open. A reserved use is restored only when an operation fails before
 the effect begins; after the commit/provider boundary, the one-shot use remains
 consumed even if the remote or follow-on result is a failure.
+Checkpoint inspect/diff/replay reserve the selected exact-checkpoint or
+checkpoint-process read lease across the diagnostic, restore it if the
+diagnostic raises, and commit it once on success. Actor-mode checkpoint list
+uses the ordinary immediate `require(...)` path. Cross-actor ObjectTask
+get/wait consumes one selected finite read lease; list consumes each distinct
+finite read lease used by its returned rows at most once; cancel consumes the
+selected finite write lease after terminal/unsafe-cancellation preflight.
+Internal wait polling does not repeatedly consume authority.
+Capability issuance itself commits the new row, process attachment, event,
+audit, and issuer reservation as one transaction.
 
 `deny` records dominate matching allows. To create an exception, revoke the
 broad deny and issue narrower allow/deny records explicitly. The runtime does
@@ -521,6 +531,14 @@ whole-shell authority must be represented as a policy capability carrying
 `shell_policy_level`, so the primitive can still apply the four-level shell
 policy semantics. Broad `deny` and `ask` records remain conservative
 constraints.
+
+For the exact built-in inspection argv `git status`, `git status --short`,
+`git branch --show-current`, `git rev-parse --show-toplevel`, `git diff`, and
+`git diff --stat`, the shell primitive injects `--no-optional-locks`, disables
+`core.fsmonitor`, and adds `--no-ext-diff` for the two diff forms.
+Authorization and returned results retain the original argv. Configured or
+human-approved Git argv outside this exact set do not receive this rewrite and
+must be assessed under their own rule/approval context.
 
 Scoped denies are supported with `AuthorityRule` constraints. An unconstrained
 deny still dominates all matching grants; a constrained deny dominates only when

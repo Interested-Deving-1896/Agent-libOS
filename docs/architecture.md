@@ -265,7 +265,8 @@ Persistent stores take an active-runtime lease so two writable Runtime
 instances cannot concurrently open the same database. File-backed SQLite
 canonicalizes the database path for both the connection and lease. On systems
 with `fcntl` and `O_NOFOLLOW`, its sidecar is opened no-follow, regular-file and
-inode checked, and protected by `flock`; the fallback uses SQLite's
+inode checked, and protected by `flock`; database/lease/journal/WAL/SHM files
+are owner-only (`0600`). The fallback uses SQLite's
 kernel-managed exclusive database lock. PostgreSQL derives its advisory-lock
 key from the current database and schema. A clean close releases the lease and
 permits a later reopen.

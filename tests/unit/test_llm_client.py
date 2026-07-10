@@ -1,12 +1,41 @@
 from __future__ import annotations
 import pytest
 import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
 from agent_libos.config import AgentLibOSConfig, LLMDefaults
 from agent_libos.llm.client import LLMClient, LLMError
 
 class TestLLMClient:
+
+    def test_real_async_client_is_not_reused_across_closed_event_loops(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveChatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = LLMClient(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            model="gpt-test",
+            api_key="key",
+            api_mode="chat",
+            allow_custom_base_url=True,
+        )
+        try:
+            messages = [{"role": "user", "content": "reply"}]
+
+            first = asyncio.run(client.acomplete(messages, json_mode=False))
+            second = asyncio.run(client.acomplete(messages, json_mode=False))
+
+            assert first == "ok"
+            assert second == "ok"
+            assert _KeepAliveChatHandler.request_count == 2
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1.0)
 
     def test_responses_action_request_converts_chat_tools_and_parses_function_calls(self) -> None:
         response = SimpleNamespace(id='resp_123', model='gpt-test', usage=SimpleNamespace(input_tokens=11, output_tokens=3, total_tokens=14), output_text='', output=[SimpleNamespace(type='reasoning', summary=[{'text': 'choose write_text_file'}]), SimpleNamespace(type='function_call', id='fc_1', call_id='call_1', name='write_text_file', arguments='{"path":"out.txt","content":"ok"}')])
@@ -555,3 +584,40 @@ class AsyncClosableClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _KeepAliveChatHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    request_count = 0
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        type(self).request_count += 1
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length:
+            self.rfile.read(content_length)
+        payload = json.dumps(
+            {
+                "id": f"chatcmpl-{type(self).request_count}",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return

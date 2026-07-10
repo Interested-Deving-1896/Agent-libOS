@@ -627,7 +627,12 @@ class TestCheckpointRestore:
         allow_process_attach = threading.Event()
         grant_errors: list[BaseException] = []
         grant_result: list[object] = []
+        checkpoint_started = threading.Event()
+        checkpoint_done = threading.Event()
+        checkpoint_errors: list[BaseException] = []
+        checkpoint_result: list[str] = []
         grant_thread: threading.Thread | None = None
+        checkpoint_thread: threading.Thread | None = None
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='capability snapshot')
             original_attach = runtime.capability._attach_to_process
@@ -651,13 +656,36 @@ class TestCheckpointRestore:
             grant_thread = threading.Thread(target=grant_capability)
             grant_thread.start()
             assert capability_inserted.wait(timeout=5)
-            checkpoint_id = runtime.checkpoint.create(pid, 'capability index snapshot', actor=pid)
+
+            def create_checkpoint() -> None:
+                checkpoint_started.set()
+                try:
+                    checkpoint_result.append(
+                        runtime.checkpoint.create(pid, 'capability index snapshot', actor=pid)
+                    )
+                except BaseException as exc:
+                    checkpoint_errors.append(exc)
+                finally:
+                    checkpoint_done.set()
+
+            checkpoint_thread = threading.Thread(target=create_checkpoint)
+            checkpoint_thread.start()
+            assert checkpoint_started.wait(timeout=5)
+            # Capability issue is now a single transaction.  A checkpoint must
+            # wait instead of observing the inserted capability before its
+            # process index attachment and evidence are committed.
+            assert not checkpoint_done.wait(timeout=0.1)
             allow_process_attach.set()
             grant_thread.join(timeout=5)
             assert not grant_thread.is_alive()
             assert grant_errors == []
             assert len(grant_result) == 1
+            checkpoint_thread.join(timeout=5)
+            assert not checkpoint_thread.is_alive()
+            assert checkpoint_errors == []
+            assert len(checkpoint_result) == 1
 
+            checkpoint_id = checkpoint_result[0]
             found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
             assert found is not None
             _checkpoint, snapshot = found
@@ -672,6 +700,8 @@ class TestCheckpointRestore:
             allow_process_attach.set()
             if grant_thread is not None:
                 grant_thread.join(timeout=5)
+            if checkpoint_thread is not None:
+                checkpoint_thread.join(timeout=5)
             runtime.close()
 
     def test_restore_refuses_while_scheduler_quantum_is_active(self) -> None:

@@ -557,10 +557,14 @@ class Runtime:
         return True
 
     def run_process_once(self, pid: str) -> dict[str, Any]:
-        return self.llm.run_once(pid)
+        if self.scheduler.is_active_quantum(pid):
+            return self.llm.run_once(pid)
+        return self.scheduler.run_pid_once(pid, self.llm.arun_once)
 
     async def arun_process_once(self, pid: str) -> dict[str, Any]:
-        return await self.llm.arun_once(pid)
+        if self.scheduler.is_active_quantum(pid):
+            return await self.llm.arun_once(pid)
+        return await self.scheduler.arun_pid_once(pid, self.llm.arun_once)
 
     def run_next_process_once(self) -> Any:
         return self.scheduler.run_once(self.arun_process_once)
@@ -1022,17 +1026,17 @@ class Runtime:
             self._require_process_image_boot_authority(pid, image)
         self._preflight_process_image_boot(selected_image)
         previous_state = self._snapshot_process_exec_state(pid)
-        self.process.exec(
-            pid,
-            image,
-            args=args,
-            goal=goal,
-            preserve_memory=preserve_memory,
-            preserve_capabilities=preserve_capabilities,
-            llm_profile_id=llm_profile_id,
-        )
         boot_kind = selected_image.boot.get("kind", "fresh")
         try:
+            self.process.exec(
+                pid,
+                image,
+                args=args,
+                goal=goal,
+                preserve_memory=preserve_memory,
+                preserve_capabilities=preserve_capabilities,
+                llm_profile_id=llm_profile_id,
+            )
             # Exec swaps the process image and tool table, but deliberately does
             # not apply image required_capabilities. Exec may preserve existing
             # capabilities or shrink them; it never grants new external

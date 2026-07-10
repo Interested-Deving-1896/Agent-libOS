@@ -1318,6 +1318,22 @@ def _runtime_result_is_denial(result: dict[str, Any], error: str) -> bool:
 def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    metadata_path = output / "metadata.json"
+    if not metadata_path.exists():
+        metadata_path.write_text(
+            json.dumps(
+                to_jsonable(
+                    {
+                        "output_schema_version": 1,
+                        "tasks": sorted({run.result.task_id for run in runs}),
+                        "runners": sorted({run.result.runner for run in runs}),
+                    }
+                ),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
     _write_jsonl(output / "results.jsonl", (run.result.to_dict() for run in runs))
     _write_jsonl(
         output / "effects.jsonl",
