@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 from reprlib import Repr
 from collections.abc import Callable
 import threading
@@ -10,9 +11,15 @@ from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.memory.data_labels import (
+    is_label_downgrade,
+    labels_for_explain,
+    propagate_object_labels,
+)
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
+    CapabilityRight,
     EventType,
     MaterializedContext,
     MemoryView,
@@ -195,7 +202,30 @@ class ObjectMemoryManager:
             # Names are stable namespace directory entries, not authority. Reads by
             # name still resolve to an oid and pass through object capability checks.
             self._require_unique_name(object_name, object_namespace)
-            meta = self._metadata_for_payload(payload, metadata)
+            selected_provenance = deepcopy(provenance) if provenance is not None else Provenance(
+                created_from_action="memory.create_object"
+            )
+            operations = getattr(self.store, "operation_manager", None)
+            operation_id = operations.current_id() if operations is not None else None
+            if operation_id is not None and operation_id not in selected_provenance.source_operation_ids:
+                selected_provenance.source_operation_ids.append(operation_id)
+            if (
+                operation_id is not None
+                and not selected_provenance.parent_oids
+                and str(selected_provenance.created_from_action or "").startswith("llm.")
+            ):
+                selected_provenance.parent_oids.extend(
+                    self._included_context_oids_for_operation(operation_id)
+                )
+            parent_objects = [
+                parent
+                for parent_oid in selected_provenance.parent_oids
+                if (parent := self.store.get_object(parent_oid)) is not None
+            ]
+            meta = propagate_object_labels(
+                self._metadata_for_payload(payload, metadata),
+                [parent.metadata for parent in parent_objects],
+            )
             obj = AgentObject(
                 oid=oid,
                 namespace=object_namespace,
@@ -204,7 +234,7 @@ class ObjectMemoryManager:
                 schema_version=self.config.memory.object_schema_version,
                 payload=payload,
                 metadata=meta,
-                provenance=provenance or Provenance(created_from_action="memory.create_object"),
+                provenance=selected_provenance,
                 version=1,
                 immutable=immutable,
                 created_by=pid,
@@ -572,6 +602,29 @@ class ObjectMemoryManager:
                 )
             else:
                 next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
+            next_provenance = current.provenance if patch.provenance is None else deepcopy(patch.provenance)
+            operations = getattr(self.store, "operation_manager", None)
+            operation_id = operations.current_id() if operations is not None else None
+            if operation_id is not None and operation_id not in next_provenance.source_operation_ids:
+                next_provenance = deepcopy(next_provenance)
+                next_provenance.source_operation_ids.append(operation_id)
+            parent_objects = [
+                parent
+                for parent_oid in next_provenance.parent_oids
+                if (parent := self.store.get_object(parent_oid)) is not None
+            ]
+            next_metadata = propagate_object_labels(
+                next_metadata,
+                [parent.metadata for parent in parent_objects],
+            )
+            if is_label_downgrade(current.metadata, next_metadata):
+                self.capabilities.require(
+                    pid,
+                    f"declassification:object:{current.oid}",
+                    CapabilityRight.ADMIN,
+                    used_by="object_memory.declassify",
+                    reason="finite declassification authority consumed",
+                )
             changed_fields: list[str] = []
             if payload_is_set:
                 changed_fields.append("payload")
@@ -589,7 +642,7 @@ class ObjectMemoryManager:
                 name=next_name,
                 payload=next_payload,
                 metadata=next_metadata,
-                provenance=current.provenance if patch.provenance is None else patch.provenance,
+                provenance=next_provenance,
                 version=current.version + 1,
                 updated_at=utc_now(),
             )
@@ -1426,19 +1479,54 @@ class ObjectMemoryManager:
         objects: list[AgentObject] = []
         omitted: list[str] = []
         filtered: list[str] = []
+        manifest_by_oid: dict[str, dict[str, Any]] = {}
         for handle in view.roots:
             try:
                 self.capabilities.assert_handle(pid, handle, ObjectRight.MATERIALIZE)
                 obj = self.store.get_object(handle.oid)
                 if obj is None:
+                    omitted.append(handle.oid)
+                    manifest_by_oid[handle.oid] = {
+                        "oid": handle.oid,
+                        "version": None,
+                        "type": None,
+                        "disposition": "omitted",
+                        "reason": "missing",
+                        "transform": "verbatim",
+                        "tokens": 0,
+                        "rendered_sha256": None,
+                        "labels": None,
+                    }
                     continue
                 if not self._matches_view_filters(obj, view.filters):
                     omitted.append(obj.oid)
                     filtered.append(obj.oid)
+                    manifest_by_oid[obj.oid] = {
+                        "oid": obj.oid,
+                        "version": obj.version,
+                        "type": obj.type.value,
+                        "disposition": "omitted",
+                        "reason": "filter_mismatch",
+                        "transform": "verbatim",
+                        "tokens": 0,
+                        "rendered_sha256": None,
+                        "labels": labels_for_explain(obj.metadata),
+                    }
                 else:
                     objects.append(obj)
             except CapabilityDenied:
                 omitted.append(handle.oid)
+                manifest_by_oid[handle.oid] = {
+                    "oid": handle.oid,
+                    "version": None,
+                    "type": None,
+                    "disposition": "omitted",
+                    "reason": "capability_denied",
+                    "transform": "verbatim",
+                    "tokens": 0,
+                    "rendered_sha256": None,
+                    "labels": None,
+                }
 
         objects = self._sort_for_policy(objects, selected_policy)
         chunks: list[str] = []
@@ -1449,16 +1537,46 @@ class ObjectMemoryManager:
             tokens = estimate_tokens(rendered)
             if total + tokens > selected_budget:
                 omitted.append(obj.oid)
+                manifest_by_oid[obj.oid] = {
+                    "oid": obj.oid,
+                    "version": obj.version,
+                    "type": obj.type.value,
+                    "disposition": "omitted",
+                    "reason": "token_budget",
+                    "transform": "verbatim",
+                    "tokens": tokens,
+                    "rendered_sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+                    "labels": labels_for_explain(obj.metadata),
+                }
                 continue
             chunks.append(rendered)
             refs.append(obj.oid)
             total += tokens
+            manifest_by_oid[obj.oid] = {
+                "oid": obj.oid,
+                "version": obj.version,
+                "type": obj.type.value,
+                "disposition": "included",
+                "reason": "selected",
+                "transform": "verbatim",
+                "tokens": tokens,
+                "rendered_sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+                "labels": labels_for_explain(obj.metadata),
+            }
         context = MaterializedContext(
             text="\n\n".join(chunks),
             object_refs=refs,
             token_count=total,
             omitted_objects=omitted,
             policy_used=selected_policy,
+            materialization_id=new_id("ctxmat"),
+            view_id=view.view_id,
+            budget_tokens=selected_budget,
+            object_manifest=[
+                manifest_by_oid[handle.oid]
+                for handle in view.roots
+                if handle.oid in manifest_by_oid
+            ],
         )
         self.audit.record(
             actor=pid,
@@ -1833,3 +1951,32 @@ class ObjectMemoryManager:
         if force_token_estimate or meta.token_estimate is None:
             meta.token_estimate = estimate_tokens(payload)
         return meta
+
+    def _included_context_oids_for_operation(self, operation_id: str) -> list[str]:
+        """Return explicitly materialized context sources for an LLM-derived object."""
+
+        selected_id: str | None = operation_id
+        seen: set[str] = set()
+        while selected_id is not None and selected_id not in seen:
+            seen.add(selected_id)
+            links = self.store.list_operation_evidence(
+                operation_ids=[selected_id],
+                evidence_types=["context_manifest"],
+            )
+            if links:
+                oids: set[str] = set()
+                for link in links:
+                    manifest = self.store.get_context_materialization_manifest(link.evidence_id)
+                    if manifest is None:
+                        continue
+                    oids.update(
+                        str(item["oid"])
+                        for item in manifest.objects
+                        if isinstance(item, dict)
+                        and item.get("disposition") == "included"
+                        and item.get("oid")
+                    )
+                return sorted(oids)
+            operation = self.store.get_operation(selected_id)
+            selected_id = operation.parent_operation_id if operation is not None else None
+        return []

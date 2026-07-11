@@ -72,6 +72,10 @@ The implementation currently includes:
   process, image, checkpoint, skill, and Object Memory primitives, including
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.
+- Durable Host-authored Task Authority Manifests that compile launch authority,
+  budgets, approval policy, and effect ceilings while treating image
+  `required_capabilities` as declarations only. See
+  [docs/task_authority_manifest.md](docs/task_authority_manifest.md).
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
   human I/O backends, plus JSON-RPC over HTTP and MCP client providers for
   pre-registered remote endpoints.
@@ -87,6 +91,10 @@ The implementation currently includes:
   outputs, events, audit records, tools, Skill/JIT metadata, object tasks,
   JSON-RPC endpoints, image definitions/artifacts, Runtime Module load records,
   external effects, and scoped checkpoints.
+- Host-only Explainable Operations with persistent causal trees across LLM,
+  Tool, syscall, primitive, capability, Human, provider-effect, resource, event,
+  and audit boundaries. Per-LLM Context Materialization Manifests retain Object
+  selection reasons, versions, token counts, and hashes without copying payloads.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
   A dedicated supervisor establishes host-lifetime process-tree containment
   before Deno starts, so hard host termination cannot orphan untrusted code.
@@ -116,6 +124,9 @@ Start here, then read the deeper references as needed:
   substrate, and the tool/primitive boundary.
 - [docs/runtime_model.md](docs/runtime_model.md): process lifecycle, scheduler,
   cwd, human queue, IPC, fork/spawn/exec, and waits.
+- [docs/explainable_operations.md](docs/explainable_operations.md): operation
+  trees, evidence completeness, Context Manifests, redaction, CLI, and GUI/API
+  queries.
 - [docs/capabilities.md](docs/capabilities.md): resource naming, rights,
   one-shot grants, human approval, shell policy, and filesystem containment.
 - [docs/object_memory.md](docs/object_memory.md): namespaces, object rights,

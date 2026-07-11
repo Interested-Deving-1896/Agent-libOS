@@ -144,6 +144,28 @@ class TestHumanQuestionTool:
             assert 'Do not persist this prompt' not in metadata
             assert 'ambiguous terminal read failure' not in metadata
 
+    def test_human_output_not_started_abandons_effect_and_restores_one_time_authority(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='output did not start')
+        capability = self.runtime.capability.grant_once(
+            pid,
+            'human:owner',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+
+        def fail_write(_message: str) -> None:
+            raise ProviderEffectNotStarted('write did not start')
+
+        self.runtime.substrate.human.output_sink = fail_write
+        with pytest.raises(ProviderEffectNotStarted):
+            self.runtime.human.output(pid, 'retryable output')
+
+        request = self.runtime.human.list(pid=pid)[0]
+        assert request.status == HumanRequestStatus.CANCELLED
+        assert self.runtime.store.list_external_effects(pid=pid) == []
+        restored = self.runtime.store.get_capability(capability.cap_id)
+        assert restored is not None and restored.uses_remaining == 1
+
     def test_one_time_ask_human_capability_is_consumed_after_question_is_queued(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask once')
         self.runtime.capability.grant_once(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
@@ -168,7 +190,11 @@ class TestHumanQuestionTool:
 
     def test_async_runtime_resumes_human_question_with_answer(self) -> None:
         self.runtime.llm.client = PlannedActionClient([{'action': 'ask_human', 'question': 'What deployment window should I use?'}, {'action': 'process_exit', 'payload': {'done': True}}])
-        pid = self.runtime.process.spawn(image='base-agent:v0', goal='ask then exit')
+        pid = self.runtime.process.spawn(
+            image='base-agent:v0',
+            goal='ask then exit',
+            authority_manifest=_human_manifest(),
+        )
         results = asyncio.run(self.runtime.arun_until_idle(max_quanta=4, human_auto_answer='Sunday 02:00 UTC'))
         assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
         assert self.runtime.llm.client.calls == 2
@@ -335,7 +361,11 @@ class TestHumanQuestionTool:
             runtime = Runtime.open(db_path)
             try:
                 runtime.llm.client = PlannedActionClient([{'action': 'ask_human', 'question': 'Continue after reopen?'}])
-                pid = runtime.process.spawn(image='base-agent:v0', goal='ask then reopen')
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='ask then reopen',
+                    authority_manifest=_human_manifest(),
+                )
                 waiting = runtime.run_next_process_once()
                 request_id = waiting['request_id']
                 assert waiting['waiting_human']
@@ -385,6 +415,19 @@ class TestHumanQuestionTool:
 
     def _audit_actions(self) -> list[str]:
         return [record.action for record in self.runtime.audit.trace()]
+
+
+def _human_manifest() -> dict[str, object]:
+    return {
+        'authorized_capabilities': [
+            {
+                'resource': 'human:owner',
+                'rights': [CapabilityRight.WRITE.value],
+            }
+        ],
+        'permitted_effects': ['human.*'],
+    }
+
 
 class PlannedActionClient:
 

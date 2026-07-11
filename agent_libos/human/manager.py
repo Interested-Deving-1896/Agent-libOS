@@ -37,6 +37,7 @@ from agent_libos.runtime.external_effects import (
     record_external_effect,
     require_external_effect_classifier,
 )
+from agent_libos.runtime.effect_binding import canonical_effect_hash
 from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import HumanProvider, ProviderEffectNotStarted
 from agent_libos.utils.serde import dumps, to_jsonable
@@ -122,6 +123,7 @@ class HumanObjectManager:
         request: dict[str, Any],
         blocking: bool = True,
     ) -> str:
+        request = self._bind_external_operation_approval(request)
         _ensure_json_size(request, self.config.tools.human_request_payload_max_bytes, "human request payload")
         now = utc_now()
         human_request = HumanRequest(
@@ -145,6 +147,15 @@ class HumanObjectManager:
                     f"terminal process cannot create human requests: {pid} status={process.status.value}"
                 )
             self.store.insert_human_request(human_request)
+            operations = getattr(self.store, "operation_manager", None)
+            if operations is not None:
+                operations.expect("approval")
+                operations.link_evidence(
+                    "human_request",
+                    human_request.request_id,
+                    "approval",
+                    metadata={"status": human_request.status.value, "blocking": blocking},
+                )
             if blocking:
                 # Blocking human requests suspend scheduling for this process until
                 # a terminal queue decision moves it back to RUNNABLE.
@@ -181,6 +192,9 @@ class HumanObjectManager:
         blocking: bool = True,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
+        manifests = getattr(self.store, "authority_manifest_manager", None)
+        if manifests is not None:
+            manifests.assert_capability_request(pid, resource, rights)
         decision = self.capabilities.require(
             pid,
             f"human:{selected_human}",
@@ -201,6 +215,28 @@ class HumanObjectManager:
             raise
         self._commit_one_time_decision(reservation_id)
         return request_id
+
+    def _bind_external_operation_approval(self, request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("type") != "external_operation_approval":
+            return request
+        context = request.get("context")
+        if not isinstance(context, dict):
+            raise ValidationError("external operation approval requires an object context")
+        selected = dict(request)
+        binding = {
+            "effect_id": new_id("eff"),
+            "canonical_args_hash": canonical_effect_hash(context),
+            "target_state_version": context.get("target_state_version"),
+        }
+        selected["effect_binding"] = binding
+        once = selected.get("requested_once_capability")
+        if isinstance(once, dict):
+            constrained = dict(once)
+            constraints = dict(constrained.get("constraints") or {})
+            constraints[CapabilityManager.APPROVAL_BINDING_KEY] = binding
+            constrained["constraints"] = constraints
+            selected["requested_once_capability"] = constrained
+        return selected
 
     def _permission_request_payload(self, pid: str, resource: str, rights: list[str], reason: str) -> dict[str, Any]:
         pattern = self.capabilities.parse_resource_pattern(resource)
@@ -548,6 +584,15 @@ class HumanObjectManager:
         with self._terminal_lock:
             try:
                 self.store.insert_human_request(request)
+                operations = getattr(self.store, "operation_manager", None)
+                if operations is not None:
+                    operations.expect("approval")
+                    operations.link_evidence(
+                        "human_request",
+                        request.request_id,
+                        "approval",
+                        metadata={"status": request.status.value, "blocking": request.blocking},
+                    )
             except Exception:
                 self._restore_one_time_decision(reservation_id)
                 raise
@@ -782,6 +827,21 @@ class HumanObjectManager:
             processed.append(request)
 
     def _decide(
+        self,
+        request_id: str,
+        status: HumanRequestStatus,
+        decision: dict[str, Any],
+        responder: str,
+    ) -> HumanRequest:
+        operations = getattr(self.store, "operation_manager", None)
+        if operations is not None:
+            candidates = operations.operation_for_evidence(("human_request",), request_id)
+            if len(candidates) == 1:
+                with operations.attach(candidates[0].operation_id):
+                    return self._decide_impl(request_id, status, decision, responder)
+        return self._decide_impl(request_id, status, decision, responder)
+
+    def _decide_impl(
         self,
         request_id: str,
         status: HumanRequestStatus,
@@ -1230,6 +1290,32 @@ class HumanObjectManager:
         text: str,
         purpose: str,
     ) -> str | None:
+        operations = getattr(self.store, "operation_manager", None)
+        if operations is not None:
+            candidates = operations.operation_for_evidence(("human_request",), request.request_id)
+            if len(candidates) == 1:
+                with operations.attach(candidates[0].operation_id):
+                    return self._terminal_provider_io_impl(
+                        request,
+                        operation=operation,
+                        text=text,
+                        purpose=purpose,
+                    )
+        return self._terminal_provider_io_impl(
+            request,
+            operation=operation,
+            text=text,
+            purpose=purpose,
+        )
+
+    def _terminal_provider_io_impl(
+        self,
+        request: HumanRequest,
+        *,
+        operation: str,
+        text: str,
+        purpose: str,
+    ) -> str | None:
         if operation not in {"read", "write"}:
             raise ValidationError(f"unsupported terminal human provider operation: {operation}")
         require_external_effect_classifier(self.provider, operation)
@@ -1519,6 +1605,30 @@ class HumanObjectManager:
             )
         try:
             self.provider.write(message)
+        except ProviderEffectNotStarted:
+            with self.store.transaction():
+                abandon_external_effect_intent(self.store, effect_intent.effect_id)
+                latest = self.store.get_human_request(request.request_id)
+                if latest is not None and latest.status == HumanRequestStatus.DELIVERED:
+                    latest.status = HumanRequestStatus.PENDING
+                    latest.decision = {
+                        "delivery_committed": False,
+                        "provider_not_started": True,
+                    }
+                    latest.updated_at = utc_now()
+                    self.store.update_human_request(latest)
+                self.audit.record(
+                    actor=request.pid,
+                    action="human.output.not_started",
+                    target=resource,
+                    decision={
+                        "request_id": request.request_id,
+                        "channel": channel,
+                        "chars": len(message),
+                        "provider_started": False,
+                    },
+                )
+            raise
         except Exception as exc:
             try:
                 record_external_effect(

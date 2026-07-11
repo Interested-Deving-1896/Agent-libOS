@@ -185,6 +185,12 @@ class ObjectTaskManager:
                 updated_at=now,
             )
             self.runtime.store.insert_object_task(task)
+            self.runtime.operations.link_evidence(
+                "object_task",
+                task.task_id,
+                "result",
+                metadata={"owner_oid": task.owner_oid, "status": task.status.value},
+            )
             task_inserted = True
         except Exception:
             if not task_inserted:
@@ -511,7 +517,6 @@ class ObjectTaskManager:
             task = self._mark_running(task)
             if task.status != ObjectTaskStatus.RUNNING:
                 return
-            self._set_runner_status(str(task.runner_pid), ProcessStatus.RUNNING, "object task running")
             result = await self.runtime.tools.acall(
                 str(task.runner_pid),
                 task.tool,
@@ -877,12 +882,21 @@ class ObjectTaskManager:
         return True
 
     def _context_metadata_for_resume(self, task: ObjectTask) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        task_operations = self.runtime.operations.operation_for_evidence(("object_task",), task.task_id)
+        if len(task_operations) == 1:
+            metadata["parent_operation_id"] = task_operations[0].operation_id
         if task.status != ObjectTaskStatus.WAITING_HUMAN:
-            return {}
+            return metadata
         request_id = task.wait.get("request_id")
         if not isinstance(request_id, str) or not request_id:
-            return {}
-        return {"human_resume_request_id": request_id}
+            return metadata
+        metadata["human_resume_request_id"] = request_id
+        waiting_operations = self.runtime.operations.operation_for_evidence(("human_request",), request_id)
+        if len(waiting_operations) == 1:
+            metadata["operation_id"] = waiting_operations[0].operation_id
+            metadata.pop("parent_operation_id", None)
+        return metadata
 
     def _can_resume_waiting_message(self, task: ObjectTask) -> bool:
         return task.tool in _MESSAGE_REPLAY_SAFE_TOOLS
@@ -911,6 +925,12 @@ class ObjectTaskManager:
                 return latest
             updated = replace(latest, status=ObjectTaskStatus.RUNNING, started_at=latest.started_at or now, updated_at=now)
             self.runtime.store.update_object_task(updated)
+            if updated.runner_pid is not None:
+                # Keep the logical task transition and runner transition under
+                # the same manager lock. Otherwise cancel() can kill the runner
+                # between these writes and a stale RUNNING write can resurrect
+                # the terminal process after cancellation has returned.
+                self._set_runner_status(str(updated.runner_pid), ProcessStatus.RUNNING, "object task running")
         self.runtime.events.emit(
             EventType.OBJECT_TASK_RUNNING,
             source=updated.creator_pid,
@@ -1031,13 +1051,8 @@ class ObjectTaskManager:
                 completed_at=now,
             )
             self.runtime.store.update_object_task(updated)
-        if updated.runner_pid is not None:
-            process = self.runtime.store.get_process(updated.runner_pid)
-            if process is not None and process.status not in self.runtime.process.TERMINAL_STATUSES:
-                try:
-                    self.runtime.process.signal(updated.runner_pid, "cancel", {"reason": reason})
-                except Exception:
-                    pass
+            if updated.runner_pid is not None:
+                self._terminalize_runner(str(updated.runner_pid), reason=reason)
         self.runtime.events.emit(
             EventType.OBJECT_TASK_CANCELLED,
             source=actor,
@@ -1144,13 +1159,17 @@ class ObjectTaskManager:
         )
 
     def _set_runner_status(self, runner_pid: str, status: ProcessStatus, message: str | None = None) -> None:
-        process = self.runtime.store.get_process(runner_pid)
-        if process is None or process.status in self.runtime.process.TERMINAL_STATUSES:
-            return
-        process.status = status
-        process.status_message = message
-        process.updated_at = utc_now()
-        self.runtime.store.update_process(process)
+        # Serialize the read/check/write sequence with store-backed process
+        # transitions. A terminal signal that wins this race must never be
+        # overwritten by an earlier non-terminal snapshot.
+        with self.runtime.store.locked():
+            process = self.runtime.store.get_process(runner_pid)
+            if process is None or process.status in self.runtime.process.TERMINAL_STATUSES:
+                return
+            process.status = status
+            process.status_message = message
+            process.updated_at = utc_now()
+            self.runtime.store.update_process(process)
 
     def _terminalize_runner(self, runner_pid: str, *, reason: str) -> None:
         process = self.runtime.store.get_process(runner_pid)

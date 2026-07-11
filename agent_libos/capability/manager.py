@@ -28,6 +28,11 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.effect_binding import (
+    APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY,
+    canonical_effect_hash,
+    normalize_approval_binding,
+)
 from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import new_id, utc_now
 
@@ -47,12 +52,14 @@ class CapabilityManager:
     ASK_EACH_TIME = "ask_each_time"
     ALLOW_ONCE = "allow_once"
     MISSING = "missing"
+    APPROVAL_BINDING_KEY = APPROVAL_BINDING_CONSTRAINT_KEY
     POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
 
     _KNOWN_CONSTRAINT_KEYS = {
         "shell_policy_level",
         "inherited_from",
         AUTHORITY_RULES_KEY,
+        APPROVAL_BINDING_KEY,
     }
 
     def __init__(self, store: RuntimeStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
@@ -154,6 +161,7 @@ class CapabilityManager:
         uses_remaining: int | None = None,
         delegable: bool = False,
         revocable: bool = True,
+        max_delegation_depth: int | None = None,
     ) -> Capability:
         return self.issue(
             actor=issued_by,
@@ -168,6 +176,7 @@ class CapabilityManager:
                 uses_remaining=uses_remaining,
                 delegable=delegable,
                 revocable=revocable,
+                max_delegation_depth=max_delegation_depth,
             ),
             require_authority=False,
         )
@@ -270,6 +279,183 @@ class CapabilityManager:
             ),
             actor=issued_by,
         )
+
+    def spec_covers(
+        self,
+        parent: Capability | CapabilitySpec | dict[str, Any],
+        requested: CapabilitySpec | dict[str, Any],
+    ) -> bool:
+        """Return whether a declared authority spec safely covers another spec.
+
+        This is the public, side-effect-free coverage primitive used by launch
+        manifests and transition planners.  It deliberately applies the same
+        resource, rights, constraint, expiry, and finite-use attenuation rules
+        as real capability delegation.
+        """
+
+        if isinstance(parent, Capability):
+            parent_resource = parent.resource
+            parent_rights = set(parent.rights)
+            parent_constraints = dict(parent.constraints)
+            parent_expires_at = parent.expires_at
+            parent_uses = parent.uses_remaining
+            parent_delegable = parent.delegable
+            parent_max_depth = (
+                self._capability_max_delegation_depth(parent)
+                if parent.delegable or parent.max_delegation_depth is not None
+                else None
+            )
+        else:
+            selected_parent = self._coerce_spec(parent)
+            parent_resource = selected_parent.resource
+            parent_rights = set(selected_parent.rights)
+            parent_constraints = dict(selected_parent.constraints)
+            parent_expires_at = selected_parent.expires_at
+            parent_uses = selected_parent.uses_remaining
+            parent_delegable = selected_parent.delegable
+            parent_max_depth = (
+                int(selected_parent.max_delegation_depth)
+                if selected_parent.max_delegation_depth is not None
+                else (self.config.capability.default_delegation_depth if selected_parent.delegable else None)
+            )
+        selected = self._coerce_spec(requested)
+        if not self._resource_covers(parent_resource, selected.resource):
+            return False
+        if not selected.rights.issubset(parent_rights):
+            return False
+        if any(selected.constraints.get(key) != value for key, value in parent_constraints.items()):
+            return False
+        if parent_expires_at is not None and (
+            selected.expires_at is None or selected.expires_at > parent_expires_at
+        ):
+            return False
+        if parent_uses is not None and selected.uses_remaining != parent_uses:
+            return False
+        if selected.delegable and not parent_delegable:
+            return False
+        if (
+            parent_max_depth is not None
+            and selected.max_delegation_depth is not None
+            and int(selected.max_delegation_depth) > parent_max_depth
+        ):
+            return False
+        return True
+
+    def derive_authority(
+        self,
+        *,
+        source_subject: str,
+        target_subject: str,
+        requested_specs: Iterable[CapabilitySpec | dict[str, Any]],
+        transition_kind: str,
+        ceiling_specs: Iterable[CapabilitySpec | dict[str, Any]] | None = None,
+        actor: str | None = None,
+    ) -> list[Capability]:
+        """Derive child authority through one audited transition entry point."""
+
+        ceiling = list(ceiling_specs or [])
+        derived: list[Capability] = []
+        for requested in requested_specs:
+            selected = self._coerce_spec(requested)
+            if ceiling and not any(self.spec_covers(limit, selected) for limit in ceiling):
+                raise CapabilityDenied(
+                    f"{transition_kind} authority exceeds transition ceiling: "
+                    f"{selected.resource} rights={sorted(selected.rights)}"
+                )
+            derived.append(
+                self.delegate(
+                    source_subject,
+                    target_subject,
+                    selected,
+                    actor=actor or f"authority_transition:{transition_kind}",
+                )
+            )
+        self.audit.record(
+            actor=actor or source_subject,
+            action="capability.derive_authority",
+            target=f"{source_subject}->{target_subject}",
+            capability_refs=[cap.cap_id for cap in derived],
+            decision={
+                "transition_kind": transition_kind,
+                "derived": len(derived),
+                "ceiling_applied": bool(ceiling),
+            },
+        )
+        return derived
+
+    def is_expired(self, capability: Capability) -> bool:
+        """Public expiry predicate for authority transition planners."""
+
+        return self._is_expired(capability)
+
+    def resources_overlap(self, left: str, right: str) -> bool:
+        """Return whether two canonical resource patterns may select one target."""
+
+        try:
+            left_pattern = self.parse_resource_pattern(left)
+            right_pattern = self.parse_resource_pattern(right)
+        except CapabilityDenied:
+            return left == right
+        if left_pattern.kind != right_pattern.kind:
+            return False
+        if self._resource_matches(left, right) or self._resource_matches(right, left):
+            return True
+        left_has_wildcard = left.endswith(":*") or left.endswith("/*")
+        right_has_wildcard = right.endswith(":*") or right.endswith("/*")
+        if left_has_wildcard or right_has_wildcard:
+            return left_pattern.body.startswith(right_pattern.body) or right_pattern.body.startswith(left_pattern.body)
+        return False
+
+    def transition_allowed_rights(
+        self,
+        capability: Capability,
+        *,
+        transition_kind: str,
+        duplicates_authority: bool,
+    ) -> list[str]:
+        """Apply the common policy ceiling for checkpoint/image/process transitions."""
+
+        if not capability.active or self.is_expired(capability):
+            return []
+        if duplicates_authority and capability.uses_remaining is not None:
+            return []
+        if capability.effect != CapabilityEffect.ALLOW:
+            return sorted(capability.rights)
+        restrictive = [
+            candidate
+            for candidate in self.capabilities_for(capability.subject)
+            if candidate.active
+            and not self.is_expired(candidate)
+            and candidate.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}
+        ]
+        allowed: list[str] = []
+        for right in sorted(capability.rights):
+            if any(
+                right in candidate.rights
+                and self.resources_overlap(capability.resource, candidate.resource)
+                for candidate in restrictive
+            ):
+                continue
+            decision = self.authorize(
+                capability.subject,
+                capability.resource,
+                right,
+                {"primitive": "authority_transition", "operation": transition_kind},
+            )
+            if decision.allowed and decision.selected_capability_id == capability.cap_id:
+                allowed.append(right)
+        self.audit.record(
+            actor=capability.subject,
+            action="capability.transition_filter",
+            target=f"capability:{capability.cap_id}",
+            capability_refs=[capability.cap_id],
+            decision={
+                "transition_kind": transition_kind,
+                "duplicates_authority": duplicates_authority,
+                "allowed_rights": allowed,
+            },
+        )
+        return allowed
 
     def authorize(
         self,
@@ -626,6 +812,15 @@ class CapabilityManager:
                 "reason": reason,
             },
         )
+        operations = getattr(self.store, "operation_manager", None)
+        if operations is not None:
+            operations.expect("reservation")
+            operations.link_evidence(
+                "capability_reservation",
+                reservation_id,
+                "reservation",
+                metadata={"capability_id": cap_id, "status": "reserved", "count": count},
+            )
         if updated.revoked:
             self.events.emit(
                 EventType.CAPABILITY_REVOKED,
@@ -650,6 +845,14 @@ class CapabilityManager:
             target=f"capability_reservation:{reservation_id}",
             decision={"committed": committed, "reason": reason},
         )
+        operations = getattr(self.store, "operation_manager", None)
+        if operations is not None:
+            operations.link_evidence(
+                "capability_reservation",
+                reservation_id,
+                "result",
+                metadata={"status": "committed" if committed else "commit_skipped"},
+            )
         return committed
 
     def _restore_reserved_use(
@@ -670,6 +873,14 @@ class CapabilityManager:
                 target=f"capability_reservation:{reservation_id}",
                 decision={"restored": False, "reason": reason},
             )
+            operations = getattr(self.store, "operation_manager", None)
+            if operations is not None:
+                operations.link_evidence(
+                    "capability_reservation",
+                    reservation_id,
+                    "result",
+                    metadata={"status": "restore_skipped"},
+                )
             return None
         self.audit.record(
             actor=restored_by,
@@ -693,6 +904,14 @@ class CapabilityManager:
                 "uses_remaining": updated.uses_remaining,
             },
         )
+        operations = getattr(self.store, "operation_manager", None)
+        if operations is not None:
+            operations.link_evidence(
+                "capability_reservation",
+                reservation_id,
+                "result",
+                metadata={"status": "restored", "capability_id": updated.cap_id},
+            )
         return updated
 
     def consume_allow_once(self, subject: str, resource: str, right: str | CapabilityRight, used_by: str) -> None:
@@ -1377,6 +1596,30 @@ class CapabilityManager:
                     continue
                 results[key] = self._evaluate_authority_rules(rules, context)
                 continue
+            if key == self.APPROVAL_BINDING_KEY:
+                try:
+                    binding = normalize_approval_binding(value)
+                except ValidationError as exc:
+                    results[key] = {"ok": False, "reason": str(exc)}
+                    continue
+                expected_hash = binding["canonical_args_hash"]
+                actual_hash = canonical_effect_hash(context)
+                expected_version = binding.get("target_state_version")
+                actual_version = context.get("target_state_version")
+                hash_ok = bool(expected_hash) and expected_hash == actual_hash
+                version_ok = expected_version is None or expected_version == actual_version
+                results[key] = {
+                    "ok": hash_ok and version_ok,
+                    "reason": (
+                        "approved effect arguments or target state changed"
+                        if not hash_ok or not version_ok
+                        else "approval binding matched"
+                    ),
+                    "effect_id": binding["effect_id"],
+                    "canonical_args_hash": actual_hash,
+                    "target_state_version": actual_version,
+                }
+                continue
             results[key] = {"ok": True, "value": value}
         return results
 
@@ -1720,6 +1963,9 @@ class CapabilityManager:
 
     def _record_decision(self, decision: CapabilityDecision, *, audit: bool) -> CapabilityDecision:
         if audit:
+            operations = getattr(self.store, "operation_manager", None)
+            if operations is not None:
+                operations.expect("decision")
             self.audit.record(
                 actor=decision.subject,
                 action="capability.authorize",

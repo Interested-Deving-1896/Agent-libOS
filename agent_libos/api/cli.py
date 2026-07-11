@@ -14,6 +14,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
+from agent_libos.models.exceptions import NotFound
 from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.models import (
     CapabilityEffect,
@@ -94,6 +95,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("init", help="Initialize a runtime database")
     sub.add_parser("demo", help="Run the deterministic coding-agent demo")
     sub.add_parser("audit", help="Print audit trace")
+    explain_parser = sub.add_parser("explain", help="Explain protected operations from explicit runtime evidence")
+    _add_explain_parser_args(explain_parser)
     llm_calls_parser = sub.add_parser("llm-calls", help="Print persisted LLM call records")
     llm_calls_parser.add_argument("--pid", help="Filter by process id.")
     llm_calls_parser.add_argument("--limit", type=int, help="Maximum number of records to print.")
@@ -109,6 +112,11 @@ def main(argv: list[str] | None = None) -> None:
     spawn_parser.add_argument("--image")
     spawn_parser.add_argument("--goal", required=True)
     spawn_parser.add_argument("--llm-profile", help="Optional host-selected LLM profile id for the new process.")
+    spawn_parser.add_argument(
+        "--authority-manifest-json",
+        default="{}",
+        help="Host-authored TaskAuthorityManifest template as a JSON object.",
+    )
     cd_parser = sub.add_parser("cd", help="Set an AgentProcess working directory")
     cd_parser.add_argument("pid")
     cd_parser.add_argument("path")
@@ -189,6 +197,20 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
         elif args.command == "audit":
             _print_json([record.__dict__ for record in runtime.audit.trace()])
+        elif args.command == "explain":
+            try:
+                result = _run_explain_command(runtime, args)
+            except NotFound as exc:
+                _print_json(
+                    {
+                        "schema_version": 1,
+                        "error": {"type": "NotFound", "message": str(exc)},
+                    }
+                )
+                raise SystemExit(1) from None
+            _print_json(result)
+            if result.get("ambiguous"):
+                raise SystemExit(2)
         elif args.command == "llm-calls":
             _print_json([record.__dict__ for record in runtime.store.list_llm_calls(pid=args.pid, limit=args.limit)])
         elif args.command == "processes":
@@ -205,7 +227,13 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "object-task":
             _print_json(_run_object_task_command(runtime, args))
         elif args.command == "spawn":
-            pid = runtime.process.spawn(image=args.image, goal=args.goal, llm_profile_id=args.llm_profile)
+            manifest = _parse_json_mapping(args.authority_manifest_json, "--authority-manifest-json")
+            pid = runtime.process.spawn(
+                image=args.image,
+                goal=args.goal,
+                llm_profile_id=args.llm_profile,
+                authority_manifest=manifest or None,
+            )
             process = runtime.process.get(pid)
             _print_json(
                 {
@@ -264,6 +292,43 @@ def _resource_summary(runtime: Runtime, pid: str) -> dict[str, Any]:
     }
 
 
+def _add_explain_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="explain_command", required=True)
+    process = sub.add_parser("process", help="List explainable operations for one process")
+    process.add_argument("pid")
+    process.add_argument("--limit", type=int)
+    process.add_argument("--cursor")
+    operation = sub.add_parser("operation", help="Explain one operation and its causal tree")
+    operation.add_argument("operation_id")
+    operation.add_argument("--evidence-limit", type=int)
+    operation.add_argument("--cursor")
+    for kind in ("call", "effect", "request", "audit", "event", "reservation", "context"):
+        evidence = sub.add_parser(kind, help=f"Resolve {kind} evidence to its operation")
+        evidence.add_argument("evidence_id")
+        evidence.add_argument("--evidence-limit", type=int)
+        evidence.add_argument("--cursor")
+
+
+def _run_explain_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    command = args.explain_command
+    if command == "process":
+        return runtime.explain.list_operations(args.pid, limit=args.limit, cursor=args.cursor)
+    if command == "operation":
+        return runtime.explain.explain_operation(
+            args.operation_id,
+            evidence_limit=args.evidence_limit,
+            cursor=args.cursor,
+        )
+    if command in {"call", "effect", "request", "audit", "event", "reservation", "context"}:
+        return runtime.explain.resolve(
+            command,
+            args.evidence_id,
+            evidence_limit=args.evidence_limit,
+            cursor=args.cursor,
+        )
+    raise SystemExit(f"unknown explain command: {command}")
+
+
 def _add_workflow_parser_args(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="workflow_command", required=True)
     run_parser = sub.add_parser("run", help="Spawn a workflow process and call one visible tool")
@@ -272,6 +337,11 @@ def _add_workflow_parser_args(parser: argparse.ArgumentParser) -> None:
     run_parser.add_argument("--image", help="AgentImage id to use; defaults to the runtime default image.")
     run_parser.add_argument("--goal", help="Optional process goal; defaults to workflow:<tool>.")
     run_parser.add_argument("--working-directory", help="Optional AgentProcess working directory.")
+    run_parser.add_argument(
+        "--authority-manifest-json",
+        default="{}",
+        help="Host/workflow-controller TaskAuthorityManifest template as a JSON object.",
+    )
 
 
 def _run_workflow_command(runtime: Runtime, args: argparse.Namespace) -> Any:
@@ -283,6 +353,9 @@ def _run_workflow_command(runtime: Runtime, args: argparse.Namespace) -> Any:
         image=args.image,
         goal=args.goal,
         working_directory=args.working_directory,
+        authority_manifest=(
+            _parse_json_mapping(args.authority_manifest_json, "--authority-manifest-json") or None
+        ),
     )
 
 

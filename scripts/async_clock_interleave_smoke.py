@@ -58,10 +58,24 @@ async def run_interleaved_clock_demo(
         pid_a = runtime.process.spawn(
             image=_RUNTIME_DEFAULTS.default_image_id,
             goal=f"Process A: output the current time {iterations} times, sleeping between outputs.",
+            authority_manifest={
+                "authorized_capabilities": [
+                    {"resource": _RUNTIME_DEFAULTS.default_human_resource, "rights": ["write"]},
+                ],
+                "permitted_effects": ["clock.*", "human.*"],
+                "metadata": {"provided_by": "async_clock_interleave_smoke"},
+            },
         )
         pid_b = runtime.process.spawn(
             image=_RUNTIME_DEFAULTS.default_image_id,
             goal=f"Process B: sleep {offset:.3f}s first, then output the current time {iterations} times.",
+            authority_manifest={
+                "authorized_capabilities": [
+                    {"resource": _RUNTIME_DEFAULTS.default_human_resource, "rights": ["write"]},
+                ],
+                "permitted_effects": ["clock.*", "human.*"],
+                "metadata": {"provided_by": "async_clock_interleave_smoke"},
+            },
         )
         for pid in (pid_a, pid_b):
             runtime.capability.grant(pid, "clock:*", [CapabilityRight.READ], issued_by="script")

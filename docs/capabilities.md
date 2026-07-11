@@ -48,11 +48,28 @@ Internal wait polling does not repeatedly consume authority.
 Capability issuance itself commits the new row, process attachment, event,
 audit, and issuer reservation as one transaction.
 
+Launch authority is additionally bounded by a metadata-only
+[`TaskAuthorityManifest`](task_authority_manifest.md). Image requirements do
+not compile into capabilities. Model permission requests are rejected before a
+Human prompt when the requested resource/right exceeds the manifest.
+
+Human approval for a concrete external operation adds an
+`approval_binding` constraint containing an effect id, canonical argument hash,
+and optional target state version. A resumed operation with changed arguments
+or a changed supplied target version cannot consume that one-time capability.
+
 `deny` records dominate matching allows. To create an exception, revoke the
 broad deny and issue narrower allow/deny records explicitly. The runtime does
 not implement hidden override precedence that could accidentally reopen a
 blocked resource, and primitive-specific candidate filtering must reapply the
 same deny-first ordering before making a decision.
+
+Authority derivation uses public CapabilityManager transition APIs.
+`derive_authority()` applies source authority and an optional manifest ceiling;
+`transition_allowed_rights()` reapplies expiry, finite-use duplication rules,
+and current restrictive policy for checkpoint/fork/restore transitions. These
+surfaces replace subsystem-local resource matching as the transition policy
+boundary.
 
 ## Rights
 

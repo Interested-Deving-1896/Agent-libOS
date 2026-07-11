@@ -403,13 +403,21 @@ class TestChildProcessTool:
     def test_spawn_child_process_inherits_only_explicit_capabilities(self) -> None:
         runtime = Runtime.open('local')
         try:
-            parent = runtime.process.spawn(image='review-agent:v0', goal='parent')
-            _grant_process_spawn(runtime, parent)
-            runtime.filesystem.grant_path(parent, 'README.md', [CapabilityRight.READ], issued_by='test')
+            readme_resource = runtime.filesystem.resource_for_path('README.md')
+            parent = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='parent',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {'resource': 'process:spawn', 'rights': ['write']},
+                        {'resource': readme_resource, 'rights': ['read'], 'delegable': True},
+                    ],
+                },
+            )
             spawned = runtime.tools.call(parent, 'spawn_child_process', {'goal': 'read one file', 'inherit_read_files': ['README.md']})
             assert spawned.ok, spawned.error
             child = runtime.process.get(spawned.payload['child_pid'])
-            allowed = runtime.filesystem.resource_for_path('README.md')
+            allowed = readme_resource
             other = runtime.filesystem.resource_for_path('pyproject.toml')
             assert runtime.capability.check(child.pid, allowed, CapabilityRight.READ)
             assert not runtime.capability.check(child.pid, other, CapabilityRight.READ)

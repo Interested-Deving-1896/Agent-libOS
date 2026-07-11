@@ -28,6 +28,7 @@ Agent personality / application
      - capability manager
      - event bus
      - checkpoint manager
+     - operation/explain manager
      - audit manager
   -> Resource Provider Substrate
      - filesystem provider
@@ -54,11 +55,18 @@ Image registration and `exec` are also self-evolution mechanisms. They can
 change a process prompt, prompt composition mode, default tool table, default
 Skills, and lifecycle shape, but image visibility and target-image metadata do
 not grant resource capabilities or impose resource budgets. Launch-time callers
-own resource limits for newly started processes. Image packages may seed a
+provide a durable [`TaskAuthorityManifest`](task_authority_manifest.md) that
+owns capability, effect-class, approval-policy, and resource-budget ceilings.
+Image `required_capabilities` are unmet-requirement declarations, not grants.
+Image packages may seed a
 private per-process workspace and process-local JIT tools, but those are scoped
 to the booted process and do not expose the package source directory.
 Default tool tables are exact image declarations: the runtime does not add
 generic lifecycle or Object Memory tools unless the image lists them.
+Images may opt into lazy model projection. The complete image tool table stays
+callable and capability-enforced, while a separate durable model projection
+initially exposes only discovery/core tools. Activating a group changes schemas
+and visibility but never capabilities.
 
 Startup Runtime Modules are different from Skills. A module is trusted Python
 host code loaded before `Runtime.open()` returns. Modules extend the runtime
@@ -70,6 +78,15 @@ than by process capabilities.
 The runtime owns agent-level semantics: process identity, capability checks,
 approval, event emission, audit, process wakeups, checkpointing, and durable
 metadata.
+
+Explainable Operations overlays these managers without replacing their source
+records. A `ContextVar` carries the active causal operation through async calls
+and `asyncio.to_thread`; protected public boundaries create typed parent/child
+rows, while audit, event, capability reservation, Human request, provider
+effect, resource charge, LLM call, and context materialization code attaches
+explicit evidence ids. Query code follows only those links. It does not infer
+causality from pid and time proximity. See
+[explainable_operations.md](explainable_operations.md).
 
 The Resource Provider Substrate owns concrete host calls. A provider is a
 backend, not a security bypass. Replacing the filesystem or shell provider must
@@ -88,8 +105,15 @@ ambiguous failure, the store conditionally updates that same `effect_id` from
 already finalized, abandoned, or mismatched intent cannot be settled again. If
 capability commit, event/audit, classification, or final persistence fails after
 the provider may have run, the pending `unknown` row remains durable and is
-visible to checkpoint and benchmark consumers instead of creating a false
+visible to checkpoint, Explain, and benchmark consumers instead of creating a false
 absence of evidence.
+
+Each intent also records a canonical argument hash, idempotency key, and an
+irreversible transaction state (`prepared`, `dispatched`, `committed`,
+`failed`, `unknown`, or `compensated`). A unique process/idempotency-key index
+blocks duplicate dispatch. Startup may call a provider reconciliation hook to
+query an existing receipt; it never replays the effect. Providers without that
+hook leave the transaction `unknown`.
 
 A provider may raise `ProviderEffectNotStarted` only when it can certify that
 its selected call did not begin. The primitive abandons the pending intent only

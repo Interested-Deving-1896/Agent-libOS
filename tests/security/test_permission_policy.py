@@ -24,7 +24,7 @@ class TestPermissionPolicy:
         self.runtime.close()
 
     def test_request_permission_tool_can_set_always_allow_policy(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request write')
+        pid = self._spawn_review(goal='request write')
         self._grant_human(pid)
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
@@ -42,7 +42,7 @@ class TestPermissionPolicy:
         assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'allowed'
 
     def test_concurrent_terminal_drains_install_one_auto_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='concurrent terminal policy')
+        pid = self._spawn_review(goal='concurrent terminal policy')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -79,7 +79,7 @@ class TestPermissionPolicy:
         assert len([record for record in self.runtime.audit.trace() if record.action == 'capability.permission_policy']) == 1
 
     def test_request_permission_tool_can_set_always_deny_policy_and_resume_process(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request denied write')
+        pid = self._spawn_review(goal='request denied write')
         self._grant_human(pid)
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
@@ -98,7 +98,7 @@ class TestPermissionPolicy:
         assert not (self.runtime.workspace_root / path).exists()
 
     def test_rejected_permission_request_cannot_install_allow_policy(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject cannot allow')
+        pid = self._spawn_review(goal='reject cannot allow')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -112,7 +112,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
 
     def test_rejected_permission_request_can_keep_ask_each_time_policy(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject can ask again')
+        pid = self._spawn_review(goal='reject can ask again')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -129,7 +129,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ASK_EACH_TIME
 
     def test_approved_permission_request_cannot_install_deny_policy(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='approve cannot deny')
+        pid = self._spawn_review(goal='approve cannot deny')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -143,7 +143,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
 
     def test_approved_permission_request_requires_explicit_policy(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='approve requires policy')
+        pid = self._spawn_review(goal='approve requires policy')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -161,7 +161,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.MISSING
 
     def test_concurrent_permission_responses_commit_one_terminal_decision(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='permission response race')
+        pid = self._spawn_review(goal='permission response race')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -198,7 +198,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == expected_policy
 
     def test_request_permission_tool_rejects_unknown_right_before_human_prompt(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request invalid right')
+        pid = self._spawn_review(goal='request invalid right')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         request = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['*'], 'reason': 'invalid broad right'})
@@ -206,7 +206,7 @@ class TestPermissionPolicy:
         assert self.runtime.human.pending() == []
 
     def test_request_permission_prompt_includes_risk_scope_lease_and_constraints(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request explained permission')
+        pid = self._spawn_review(goal='request explained permission')
         self._grant_human(pid)
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
@@ -226,14 +226,14 @@ class TestPermissionPolicy:
         assert pending.payload['requested_permission']['constraints'] == {}
 
     def test_request_permission_rejects_broad_shell_execute_before_human_prompt(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request broad shell')
+        pid = self._spawn_review(goal='request broad shell')
         self._grant_human(pid)
         request = self.runtime.tools.call(pid, 'request_permission', {'resource': 'shell:*', 'rights': ['execute'], 'reason': 'run commands'})
         assert not request.ok
         assert self.runtime.human.pending() == []
 
     def test_request_permission_can_approve_workspace_write(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request workspace write')
+        pid = self._spawn_review(goal='request workspace write')
         self._grant_human(pid)
         with pytest.raises(HumanResponseRequired):
             self.runtime.tools.call(
@@ -256,7 +256,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, self.runtime.filesystem.resource_for(self._path()), CapabilityRight.WRITE) == CapabilityManager.ALWAYS_ALLOW
 
     def test_request_permission_rejects_workspace_wide_delete_before_human_prompt(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request workspace delete')
+        pid = self._spawn_review(goal='request workspace delete')
         self._grant_human(pid)
 
         request = self.runtime.tools.call(
@@ -280,7 +280,20 @@ class TestPermissionPolicy:
             ),
             actor="test",
         )
-        pid = self.runtime.process.spawn(image='no-human-permission-agent:v0', goal='request without human authority')
+        pid = self.runtime.process.spawn(
+            image='no-human-permission-agent:v0',
+            goal='request without human authority',
+            authority_manifest={
+                'approval_policy': {
+                    'requestable_capabilities': [
+                        {
+                            'resource': 'filesystem:workspace:*',
+                            'rights': [CapabilityRight.WRITE.value],
+                        }
+                    ]
+                }
+            },
+        )
         resource = self.runtime.filesystem.resource_for(self._path())
 
         denied = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write'})
@@ -290,7 +303,7 @@ class TestPermissionPolicy:
         assert self.runtime.human.pending() == []
 
     def test_cancelled_human_request_cannot_be_approved_later(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='cancelled approval')
+        pid = self._spawn_review(goal='cancelled approval')
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(
@@ -314,7 +327,7 @@ class TestPermissionPolicy:
         assert not (self.runtime.workspace_root / path).exists()
 
     def test_waiting_process_cannot_be_advanced_by_direct_tool_call(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='waiting direct call')
+        pid = self._spawn_review(goal='waiting direct call')
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(
@@ -334,7 +347,7 @@ class TestPermissionPolicy:
         assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
 
     def test_request_permission_rejects_root_filesystem_write_before_human_prompt(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request root write')
+        pid = self._spawn_review(goal='request root write')
         self._grant_human(pid)
         request = self.runtime.tools.call(
             pid,
@@ -345,7 +358,7 @@ class TestPermissionPolicy:
         assert self.runtime.human.pending() == []
 
     def test_request_permission_rejects_broad_capability_admin_before_human_prompt(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request capability admin')
+        pid = self._spawn_review(goal='request capability admin')
         self._grant_human(pid)
 
         request = self.runtime.tools.call(
@@ -359,7 +372,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, 'capability:anything', CapabilityRight.ADMIN) == CapabilityManager.MISSING
 
     def test_ask_each_time_prompts_from_filesystem_primitive_and_consumes_one_time_grant(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask every write')
+        pid = self._spawn_review(goal='ask every write')
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
@@ -393,7 +406,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ASK_EACH_TIME
 
     def test_per_use_prompt_uses_repr_preview_for_human_safety(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='safe preview')
+        pid = self._spawn_review(goal='safe preview')
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
@@ -406,7 +419,7 @@ class TestPermissionPolicy:
         assert '\n' not in context['content_preview']
 
     def test_rejected_per_use_prompt_resumes_process_without_writing(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject one write')
+        pid = self._spawn_review(goal='reject one write')
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
@@ -418,7 +431,7 @@ class TestPermissionPolicy:
         assert not (self.runtime.workspace_root / path).exists()
 
     def test_per_use_prompt_does_not_probe_overwrite_state_before_approval(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='review overwrite')
+        pid = self._spawn_review(goal='review overwrite')
         path = self._path()
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -439,7 +452,7 @@ class TestPermissionPolicy:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='authorize before write state probe')
+        pid = self._spawn_review(goal='authorize before write state probe')
         path = self._path()
         target = self.runtime.workspace_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -467,7 +480,7 @@ class TestPermissionPolicy:
         assert target.read_text(encoding='utf-8') == 'existing'
 
     def test_missing_delete_consumes_one_time_grant(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='delete missing once')
+        pid = self._spawn_review(goal='delete missing once')
         path = self._path()
         resource = self.runtime.filesystem.resource_for(path)
         self.runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.DELETE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
@@ -487,7 +500,8 @@ class TestPermissionPolicy:
         path = self._path()
         client = FakeActionClient([{'action': 'write_text_file', 'path': path, 'content': 'approved after waiting'}])
         self.runtime.llm.client = client
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='write with per-use approval')
+        pid = self._spawn_review(goal='write with per-use approval')
+        self.runtime.tools.activate_tool_group(pid, 'filesystem')
         self.runtime.capability.set_permission_policy(subject=pid, resource=self.runtime.filesystem.resource_for(path), rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
         waiting = self.runtime.run_next_process_once()
         assert waiting['waiting_human']
@@ -510,7 +524,7 @@ class TestPermissionPolicy:
             {'action': 'request_permission', 'resource': resource, 'rights': ['write'], 'reason': 'edit file'}
         ])
         self.runtime.llm.client = client
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request deny policy')
+        pid = self._spawn_review(goal='request deny policy')
         self._grant_human(pid)
 
         results = self.runtime.run_until_idle(
@@ -525,7 +539,7 @@ class TestPermissionPolicy:
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_DENY
 
     def test_human_resume_request_id_does_not_leak_into_unrelated_tool_call(self) -> None:
-        pid_1 = self.runtime.process.spawn(image='review-agent:v0', goal='first permission request')
+        pid_1 = self._spawn_review(goal='first permission request')
         self._grant_human(pid_1)
         resource_1 = self.runtime.filesystem.resource_for(self._path())
         with pytest.raises(HumanResponseRequired):
@@ -540,7 +554,7 @@ class TestPermissionPolicy:
             {'approved': True, 'policy': CapabilityManager.ASK_EACH_TIME},
         )
 
-        pid_2 = self.runtime.process.spawn(image='review-agent:v0', goal='second permission request')
+        pid_2 = self._spawn_review(goal='second permission request')
         self._grant_human(pid_2)
         resource_2 = self.runtime.filesystem.resource_for(self._path())
         setattr(self.runtime, '_current_human_resume_request_id', request_1.request_id)
@@ -559,7 +573,7 @@ class TestPermissionPolicy:
         assert pending[0].request_id != request_1.request_id
 
     def test_concurrent_identical_request_permission_calls_share_pending_request(self) -> None:
-        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request permission concurrently')
+        pid = self._spawn_review(goal='request permission concurrently')
         self._grant_human(pid)
         resource = self.runtime.filesystem.resource_for(self._path())
         original_request_permission = self.runtime.human.request_permission
@@ -589,6 +603,36 @@ class TestPermissionPolicy:
 
     def _path(self) -> str:
         return f'agent_outputs/permission_policy_{uuid4().hex}.txt'
+
+    def _spawn_review(self, *, goal: str) -> str:
+        return self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal=goal,
+            authority_manifest={
+                'authorized_capabilities': [
+                    {
+                        'resource': 'human:owner',
+                        'rights': [CapabilityRight.WRITE.value],
+                    }
+                ],
+                'approval_policy': {
+                    'requestable_capabilities': [
+                        {
+                            'resource': 'filesystem:workspace:*',
+                            'rights': [
+                                CapabilityRight.READ.value,
+                                CapabilityRight.WRITE.value,
+                                CapabilityRight.DELETE.value,
+                            ],
+                        },
+                        {
+                            'resource': 'shell:git',
+                            'rights': [CapabilityRight.EXECUTE.value],
+                        },
+                    ]
+                },
+            },
+        )
 
     def _grant_human(self, pid: str) -> None:
         self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')

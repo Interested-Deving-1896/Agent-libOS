@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import ObjectMetadata, ObjectType, ViewMode
+from agent_libos.models import ObjectMetadata, ObjectType, Provenance, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 _MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
@@ -18,6 +18,10 @@ class CreateMemoryObjectArgs(BaseModel):
     type: str = Field(description="Agent libOS object type, for example summary, plan, observation, or artifact.")
     payload: Any = Field(description="Structured payload to store.")
     metadata: dict[str, Any] = Field(default_factory=dict)
+    parent_oids: list[str] = Field(
+        default_factory=list,
+        description="Optional Object Memory source ids used for conservative data-label propagation.",
+    )
     immutable: bool = True
 
 
@@ -139,12 +143,22 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             mime_type=args.metadata.get("mime_type"),
             sensitivity=args.metadata.get("sensitivity", _MEMORY_DEFAULTS.metadata_sensitivity),
             retention_policy=args.metadata.get("retention_policy", _MEMORY_DEFAULTS.metadata_retention_policy),
+            trust_level=args.metadata.get("trust_level", "unknown"),
+            integrity=args.metadata.get("integrity", "unknown"),
+            origin=args.metadata.get("origin", "llm"),
+            tenant=args.metadata.get("tenant"),
+            principal=args.metadata.get("principal"),
+            declassification_authority=args.metadata.get("declassification_authority"),
         )
         handle = runtime.memory.create_object(
             pid=ctx.pid,
             object_type=ObjectType(args.type),
             payload=args.payload,
             metadata=metadata,
+            provenance=Provenance(
+                created_from_action="llm.create_memory_object",
+                parent_oids=list(args.parent_oids),
+            ),
             immutable=args.immutable,
             name=args.name,
             namespace=args.namespace,

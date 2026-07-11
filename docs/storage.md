@@ -18,10 +18,19 @@ response state is not in this database; the runtime continues an opt-in chain
 only after validating these local rows against the current profile, scope, and
 credential-keyed non-secret provider identity fingerprint.
 
+Explainable Operations adds three additive metadata tables shared by SQLite and
+PostgreSQL: `operations`, deduplicated `operation_evidence`, and
+`context_materialization_manifests`. They contain lifecycle state, causal ids,
+typed evidence references, Object ids/versions, counts, and hashes, not an
+additional copy of Object or prompt payloads. Older stores create these tables
+on open; pre-existing audit/effect rows are not heuristically backfilled.
+
 External-effect intents are also ordinary durable `external_effects` rows. A
-primitive writes a pending `unknown` intent before its provider boundary. Final
-classification uses one conditional update to keep the same `effect_id` while
-changing structured `effect_state` from `pending` to `finalized`. The CAS also
+primitive writes a pending intent, canonical argument hash, and idempotency key
+before its provider boundary, then durably advances the transaction from
+`prepared` to `dispatched`. Final classification uses one conditional update
+to keep the same `effect_id`, move the transaction to `committed` or `unknown`,
+and change structured `effect_state` from `pending` to `finalized`. The CAS also
 matches pid, provider, operation, and target, so a duplicate or wrong-intent
 settlement fails without adding a final row or changing unrelated evidence. A
 finalization rollback therefore exposes the conservative pending row. Before
@@ -30,6 +39,12 @@ after the call is attempted, only a provider-certified
 `ProviderEffectNotStarted` path with no earlier information flow may delete it
 without a final record. Core filesystem/clock/shell authority restoration and
 intent abandonment share one transaction.
+
+`authority_manifests` stores metadata-only launch contracts and their hashes.
+`processes.model_tool_table_json` stores the model schema projection separately
+from the complete callable image tool table. External effects have a unique
+partial index on `(pid, idempotency_key)`. All fields are additive in the shared
+SQLite/PostgreSQL schema contract.
 
 ## Transaction Failure Semantics
 

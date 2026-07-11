@@ -20,6 +20,7 @@ from agent_libos.models import (
     ObjectOwnerKind,
     ObjectPatch,
     ObjectRight,
+    ObjectTask,
     ObjectTaskNotificationStatus,
     ObjectTaskStatus,
     ObjectType,
@@ -874,10 +875,29 @@ class TestObjectTasks:
     def test_object_task_request_permission_resumes_after_human_decision(self) -> None:
         runtime = Runtime.open("local")
         try:
-            pid = runtime.process.spawn(image="base-agent:v0", goal="permission task")
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="permission task",
+                authority_manifest={
+                    "authorized_capabilities": [
+                        {
+                            "resource": "human:owner",
+                            "rights": [CapabilityRight.WRITE.value],
+                            "delegable": True,
+                        }
+                    ],
+                    "approval_policy": {
+                        "requestable_capabilities": [
+                            {
+                                "resource": "filesystem:workspace:agent_outputs/*",
+                                "rights": [CapabilityRight.WRITE.value],
+                            }
+                        ]
+                    },
+                },
+            )
             _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
-            runtime.capability.grant(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test", delegable=True)
             resource = "filesystem:workspace:agent_outputs/object_task_permission.txt"
 
             task = runtime.object_tasks.start(
@@ -1115,6 +1135,62 @@ class TestObjectTasks:
             assert cancelled.status == ObjectTaskStatus.CANCELLED
             assert runtime.process.get(str(cancelled.runner_pid)).status == ProcessStatus.KILLED
         finally:
+            runtime.close()
+
+    def test_object_task_cancel_cannot_resurrect_runner_during_running_transition(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        transition_started = threading.Event()
+        release_transition = threading.Event()
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="cancel during running transition")
+            _grant_process_spawn(runtime, pid)
+            _grant_delegable_clock_sleep(runtime, pid)
+            owner = _owner(runtime, pid)
+            original_set_runner_status = runtime.object_tasks._set_runner_status
+
+            def delayed_set_runner_status(
+                runner_pid: str,
+                status: ProcessStatus,
+                message: str | None = None,
+            ) -> None:
+                transition_started.set()
+                assert release_transition.wait(timeout=2)
+                original_set_runner_status(runner_pid, status, message)
+
+            monkeypatch.setattr(runtime.object_tasks, "_set_runner_status", delayed_set_runner_status)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "sleep",
+                {"seconds": 1.0},
+                inherit_capabilities=_inherit_clock_sleep(),
+            )
+            assert transition_started.wait(timeout=2)
+
+            cancel_started = threading.Event()
+
+            def cancel() -> ObjectTask:
+                cancel_started.set()
+                return runtime.object_tasks.cancel(task.task_id, actor_pid=pid, reason="cancel won")
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                cancel_future = executor.submit(cancel)
+                assert cancel_started.wait(timeout=2)
+                assert not cancel_future.done()
+                release_transition.set()
+                cancelled = cancel_future.result(timeout=2)
+
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            runner_pid = str(cancelled.runner_pid)
+            assert runtime.process.get(runner_pid).status == ProcessStatus.KILLED
+            settled = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert settled.status == ObjectTaskStatus.CANCELLED
+            assert runtime.process.get(runner_pid).status == ProcessStatus.KILLED
+        finally:
+            release_transition.set()
             runtime.close()
 
     def test_object_task_refuses_to_cancel_running_sync_side_effect_tool(self) -> None:

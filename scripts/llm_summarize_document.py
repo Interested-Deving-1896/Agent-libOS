@@ -91,6 +91,28 @@ async def amain(args: argparse.Namespace) -> None:
                 max_bytes=args.max_bytes,
             ),
             resource_budget=ResourceBudget(max_context_materialization_tokens=_context_budget(args.max_bytes)),
+            authority_manifest={
+                "authorized_capabilities": [
+                    {
+                        "resource": runtime.filesystem.resource_for(document_path),
+                        "rights": ["read"],
+                    },
+                    {
+                        "resource": _RUNTIME_DEFAULTS.default_human_resource,
+                        "rights": ["write"],
+                    },
+                ],
+                "approval_policy": {
+                    "requestable_capabilities": [
+                        {
+                            "resource": runtime.filesystem.resource_for(output_path),
+                            "rights": ["write"],
+                        }
+                    ]
+                },
+                "permitted_effects": ["filesystem.*", "human.*"],
+                "metadata": {"provided_by": "llm_summarize_document"},
+            },
         )
         permission_policy = args.permission_policy
         if permission_policy is None and args.auto_approve:

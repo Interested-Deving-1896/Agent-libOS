@@ -448,11 +448,17 @@ class SkillManager:
                 tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
                 jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
                 updated_table = dict(process.tool_table)
+                updated_model_table = dict(process.model_tool_table)
                 for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
                     if updated_table.get(name) == tool_id:
                         updated_table.pop(name, None)
+                    if updated_model_table.get(name) == tool_id:
+                        updated_model_table.pop(name, None)
                 for name, handle in {**existing_handles, **jit_handles}.items():
                     updated_table[name] = handle.tool_id
+                    # Loading a Skill is an explicit tool-visibility action,
+                    # independent of the base image's lazy built-in groups.
+                    updated_model_table[name] = handle.tool_id
                 loaded = LoadedSkill(
                     skill_id=skill.skill_id,
                     version=skill.version,
@@ -466,6 +472,7 @@ class SkillManager:
                     package_snapshot=self._skill_snapshot(skill),
                 )
                 process.tool_table = updated_table
+                process.model_tool_table = updated_model_table
                 process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
                 process.updated_at = utc_now()
                 self.store.update_process(process)
@@ -550,6 +557,8 @@ class SkillManager:
                     if process.tool_table.get(name) == tool_id:
                         process.tool_table.pop(name, None)
                         removed.append(name)
+                    if process.model_tool_table.get(name) == tool_id:
+                        process.model_tool_table.pop(name, None)
                 process.loaded_skills.pop(skill_id, None)
                 process.updated_at = utc_now()
                 self.store.update_process(process)

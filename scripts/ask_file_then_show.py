@@ -82,6 +82,20 @@ async def run_file_viewer(
                 "Ask the human which workspace file they want to view. Read that file and show its content "
                 "to the human. If reading fails, show the failure reason to the human. Then exit."
             ),
+            authority_manifest={
+                "authorized_capabilities": [
+                    {
+                        "resource": _RUNTIME_DEFAULTS.default_human_resource,
+                        "rights": ["read", "write"],
+                    },
+                    {
+                        "resource": runtime.filesystem.workspace_resource(),
+                        "rights": ["read"],
+                    },
+                ],
+                "permitted_effects": ["human.*", "filesystem.*"],
+                "metadata": {"provided_by": "ask_file_then_show"},
+            },
         )
         results = await runtime.arun_until_idle(
             max_quanta=max_quanta,

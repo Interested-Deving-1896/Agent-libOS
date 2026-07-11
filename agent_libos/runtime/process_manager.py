@@ -49,6 +49,7 @@ class ProcessManager:
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
         llm_profile_resolver: Callable[[str, str | None], str] | None = None,
+        authority_manifests: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -58,6 +59,7 @@ class ProcessManager:
         self.events = events
         self.resources = resources
         self._llm_profile_resolver = llm_profile_resolver
+        self.authority_manifests = authority_manifests
         self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
         self._object_task_terminal_notifier: Callable[[str], None] | None = None
 
@@ -75,6 +77,7 @@ class ProcessManager:
         resource_budget: ResourceBudget | None = None,
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
+        authority_manifest: Any | None = None,
     ) -> str:
         now = utc_now()
         pid = new_id("pid")
@@ -111,7 +114,24 @@ class ProcessManager:
             process.memory_view = view
             process.updated_at = utc_now()
             self.store.update_process(process)
-            self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
+            if self.authority_manifests is not None:
+                manifest = self.authority_manifests.prepare_launch(
+                    pid=pid,
+                    image_id=selected_image,
+                    goal_ref=goal_handle.oid,
+                    supplied=authority_manifest,
+                    authorized_capabilities=capabilities or [],
+                    resource_budget=resource_budget,
+                    issued_by="process.spawn",
+                )
+                if manifest.resource_budget:
+                    process = self._get(pid)
+                    process.resource_budget = ResourceBudget(**manifest.resource_budget)
+                    process.updated_at = utc_now()
+                    self.store.update_process(process)
+                self.authority_manifests.compile_root_capabilities(manifest)
+            else:
+                self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
             self._run_after_spawn_hooks(pid, selected_image)
             process = self._get(pid)
             process.status = ProcessStatus.RUNNABLE
@@ -153,6 +173,7 @@ class ProcessManager:
         mode: ForkMode | str = ForkMode.RESTRICTED,
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
+        authority_manifest: Any | None = None,
     ) -> str:
         parent_proc = self._get(parent)
         fork_mode = ForkMode(mode)
@@ -204,12 +225,26 @@ class ProcessManager:
             child.memory_view = child_view
             child.updated_at = utc_now()
             self.store.update_process(child)
-            self._grant_specs(child_pid, capabilities or [], issued_by=f"process.fork:{parent}")
-            self._inherit_capability_specs(
+            requested_specs = [*(capabilities or []), *inherit_specs]
+            manifest = None
+            if self.authority_manifests is not None:
+                manifest = self.authority_manifests.prepare_launch(
+                    pid=child_pid,
+                    image_id=child.image_id,
+                    goal_ref=goal_handle.oid,
+                    supplied=authority_manifest,
+                    authorized_capabilities=requested_specs,
+                    resource_budget=selected_budget,
+                    parent_pid=parent,
+                    issued_by=f"process.fork:{parent}",
+                )
+            self._compile_child_authority(
                 parent_pid=parent,
                 child_pid=child_pid,
-                specs=inherit_specs,
-                issued_by=f"process.fork:{parent}",
+                manifest=manifest,
+                requested_capabilities=capabilities or [],
+                inherit_specs=inherit_specs,
+                transition_kind="process.fork",
             )
             self._run_after_spawn_hooks(child_pid, child.image_id)
             self._charge_child_creation(parent)
@@ -259,6 +294,7 @@ class ProcessManager:
         working_directory: str | None = None,
         initial_status: ProcessStatus | str = ProcessStatus.RUNNABLE,
         llm_profile_id: str | None = None,
+        authority_manifest: Any | None = None,
     ) -> str:
         parent_proc = self._get(parent)
         if parent_proc.status in self.TERMINAL_STATUSES:
@@ -304,12 +340,26 @@ class ProcessManager:
             child.goal_oid = goal_handle.oid
             child.updated_at = utc_now()
             self.store.update_process(child)
-            self._grant_specs(child_pid, capabilities or [], issued_by=f"process.spawn_child:{parent}")
-            self._inherit_capability_specs(
+            requested_specs = [*(capabilities or []), *inherit_specs]
+            manifest = None
+            if self.authority_manifests is not None:
+                manifest = self.authority_manifests.prepare_launch(
+                    pid=child_pid,
+                    image_id=child.image_id,
+                    goal_ref=goal_handle.oid,
+                    supplied=authority_manifest,
+                    authorized_capabilities=requested_specs,
+                    resource_budget=selected_budget,
+                    parent_pid=parent,
+                    issued_by=f"process.spawn_child:{parent}",
+                )
+            self._compile_child_authority(
                 parent_pid=parent,
                 child_pid=child_pid,
-                specs=inherit_specs,
-                issued_by=f"process.spawn_child:{parent}",
+                manifest=manifest,
+                requested_capabilities=capabilities or [],
+                inherit_specs=inherit_specs,
+                transition_kind="process.spawn_child",
             )
             self._run_after_spawn_hooks(child_pid, child.image_id)
             self._charge_child_creation(parent)
@@ -896,6 +946,57 @@ class ProcessManager:
                 revocable=spec.get("revocable", True),
             )
 
+    def _compile_child_authority(
+        self,
+        *,
+        parent_pid: str,
+        child_pid: str,
+        manifest: Any | None,
+        requested_capabilities: list[dict[str, Any]],
+        inherit_specs: list[dict[str, Any]],
+        transition_kind: str,
+    ) -> None:
+        # The compatibility mode keeps trusted, non-ceiling launch grants on
+        # its legacy path. Every manifest-enforced transition derives the final
+        # declared authority, not merely the duplicate ``capabilities`` input.
+        transition_ceiling = bool(
+            manifest is not None and manifest.metadata.get("transition_ceiling")
+        )
+        if (
+            self.config.runtime.launch_authority_mode == "legacy_image_grants"
+            and not transition_ceiling
+        ):
+            if requested_capabilities:
+                self._grant_specs(
+                    child_pid,
+                    requested_capabilities,
+                    issued_by=f"{transition_kind}:{parent_pid}",
+                )
+            if inherit_specs:
+                self.capabilities.derive_authority(
+                    source_subject=parent_pid,
+                    target_subject=child_pid,
+                    requested_specs=inherit_specs,
+                    transition_kind=f"{transition_kind}.inherit",
+                    ceiling_specs=manifest.authorized_capabilities if manifest is not None else None,
+                )
+            return
+
+        selected_specs = (
+            list(manifest.authorized_capabilities)
+            if manifest is not None
+            else [*requested_capabilities, *inherit_specs]
+        )
+        if not selected_specs:
+            return
+        self.capabilities.derive_authority(
+            source_subject=parent_pid,
+            target_subject=child_pid,
+            requested_specs=selected_specs,
+            transition_kind=transition_kind,
+            ceiling_specs=manifest.authorized_capabilities if manifest is not None else None,
+        )
+
     def _inherit_capability_specs(
         self,
         parent_pid: str,
@@ -947,6 +1048,7 @@ class ProcessManager:
                 cur.execute("DELETE FROM capabilities WHERE subject = ? OR resource = ?", (pid, namespace_resource))
                 cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
                 cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
+                cur.execute("DELETE FROM authority_manifests WHERE pid = ?", (pid,))
                 cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
                 cur.execute("DELETE FROM process_messages WHERE sender = ? OR recipient_pid = ?", (pid, pid))
                 cur.execute("DELETE FROM object_namespaces WHERE namespace = ? AND created_by = ?", (namespace, pid))

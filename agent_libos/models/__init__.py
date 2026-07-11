@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent_libos.models.audit import AuditRecord
+from agent_libos.models.authority_manifest import TaskAuthorityManifest
 from agent_libos.models.base import (
     AuditID,
     CapabilityID,
@@ -93,6 +94,15 @@ from agent_libos.models.object_tasks import (
     ObjectTaskOwnerWatch,
     ObjectTaskStatus,
 )
+from agent_libos.models.operations import (
+    ContextMaterializationManifest,
+    OperationEvidenceLink,
+    OperationEvidenceRole,
+    OperationKind,
+    OperationOutcome,
+    OperationRecord,
+    OperationState,
+)
 from agent_libos.models.policy import PolicyDecision
 from agent_libos.models.process import (
     AgentImage,
@@ -146,6 +156,7 @@ __all__ = [
     "CapabilityStatus",
     "Checkpoint",
     "CheckpointID",
+    "ContextMaterializationManifest",
     "DelegationPolicy",
     "Event",
     "EventID",
@@ -207,6 +218,12 @@ __all__ = [
     "ObjectTaskOwnerWatch",
     "ObjectTaskStatus",
     "ObjectType",
+    "OperationEvidenceLink",
+    "OperationEvidenceRole",
+    "OperationKind",
+    "OperationOutcome",
+    "OperationRecord",
+    "OperationState",
     "OperationContext",
     "PID",
     "PolicyDecision",
@@ -238,6 +255,7 @@ __all__ = [
     "ToolHandle",
     "ToolID",
     "ToolSpec",
+    "TaskAuthorityManifest",
     "ValidationResult",
     "ViewMode",
     "WorkflowRunResult",

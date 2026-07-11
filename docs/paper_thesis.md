@@ -67,6 +67,11 @@ substrate for capability-controlled self-evolution.
    allowed attempts with definite performed/denied outcomes. Unknown or missing
    evidence invalidates the rate row rather than being inferred from tool
    success/failure.
+   Practical workflow results must additionally label their evidence level.
+   Only `native-live` rows with real ToolBroker calls, provider state oracles,
+   external-effect records, and explicit operation links are runtime evidence.
+   `modeled` rows are design-coverage experiments and use a separate
+   denominator; trace completeness never upgrades them to native execution.
 
 The current repository-backed, token-free `agent_libos_full` validation is a
 27-task smoke/evaluation snapshot: 27/27 task success, 27/27 safety pass, zero
@@ -106,7 +111,9 @@ explainable when action-surface evolution is decoupled from resource authority
 by a capability-controlled runtime substrate.
 
 M0 freezes repository hygiene and the thesis. M1 establishes the initial
-runtime-safety benchmark with self-evolution coverage. The next milestones
-should prioritize larger self-evolution workloads, audit explain, context
-materialization metadata, and quantitative results rather than broad ecosystem
-compatibility.
+runtime-safety benchmark with self-evolution coverage. The runtime now also has
+deterministic Explainable Operations and metadata-only Context Materialization
+Manifests, Task Authority Manifests, and a first no-fallback native practical
+connector lane. The next milestones should prioritize larger self-evolution
+workloads, evaluating explanation usefulness, and quantitative results rather
+than broad ecosystem compatibility.

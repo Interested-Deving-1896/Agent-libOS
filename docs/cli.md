@@ -324,6 +324,49 @@ training and fine-tuning pipelines under the deployment's user agreement. Set
 sensitive prompt, tool, reasoning, and provider payload fields; the runtime
 then persists only bounded previews and hashes for those fields.
 
+## Explainable Operations
+
+List causal-root operations for one process or explain one causal tree:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite explain process <pid>
+uv run agent-libos --db .agent_libos.sqlite explain operation <operation_id>
+```
+
+Resolve an explicit evidence id:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite explain call <call_id>
+uv run agent-libos --db .agent_libos.sqlite explain effect <effect_id>
+uv run agent-libos --db .agent_libos.sqlite explain request <request_id>
+uv run agent-libos --db .agent_libos.sqlite explain audit <record_id>
+uv run agent-libos --db .agent_libos.sqlite explain event <event_id>
+uv run agent-libos --db .agent_libos.sqlite explain reservation <reservation_id>
+uv run agent-libos --db .agent_libos.sqlite explain context <materialization_id>
+```
+
+Process lists accept `--limit` and `--cursor`; detail/evidence lookups accept
+`--evidence-limit` and `--cursor`. An ambiguous evidence id prints the explicit
+causal-root candidates and exits with status 2. A not-found id prints a
+structured `NotFound` error and exits with status 1. Explain output is metadata/redaction oriented even when
+full LLM I/O persistence is enabled. See
+[explainable_operations.md](explainable_operations.md).
+
+## Task Authority Manifest at launch
+
+`spawn` and `workflow run` accept a Host-authored manifest JSON object:
+
+```bash
+uv run agent-libos spawn --goal "review" \
+  --authority-manifest-json '{"authorized_capabilities":[{"resource":"filesystem:workspace:reports/*","rights":["read"]}]}'
+```
+
+The default mode is `manifest_required`. Image requirements are reported but
+not granted. The workflow controller may construct the exact target-image read
+authority needed by `exec_process`; it does so in the launch manifest rather
+than granting authority after spawn. See
+[task_authority_manifest.md](task_authority_manifest.md).
+
 ## Process Resources
 
 Inspect one process's configured budget, observed usage, and remaining budget:

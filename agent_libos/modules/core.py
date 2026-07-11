@@ -4,6 +4,7 @@ from agent_libos.images import build_default_images
 from agent_libos.modules.context import ModuleContext
 from agent_libos.tools.builtin import (
     ActivateSkillTool,
+    ActivateToolGroupTool,
     AskHumanTool,
     AppendMemoryObjectTool,
     CallJsonRpcMethodTool,
@@ -20,6 +21,7 @@ from agent_libos.tools.builtin import (
     DelegateCapabilityTool,
     DiffCheckpointTool,
     DiscoverSkillsTool,
+    DiscoverToolGroupsTool,
     EchoTool,
     ExecProcessTool,
     ForkCheckpointTool,
@@ -93,6 +95,8 @@ def register_module(ctx: ModuleContext) -> None:
         DelegateCapabilityTool(),
         DiffCheckpointTool(),
         DiscoverSkillsTool(),
+        DiscoverToolGroupsTool(),
+        ActivateToolGroupTool(),
         ActivateSkillTool(),
         ForkChildProcessTool(),
         ForkCheckpointTool(),

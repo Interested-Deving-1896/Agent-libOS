@@ -342,6 +342,21 @@ class TestLLMContextMemory:
             assert llm_call.request_options['openai_parallel_tool_calls_enabled'] is True
             assert llm_call.tool_calls[0]['name'] == 'create_memory_object'
             assert llm_call.observability['tool_calls']['sha256']
+            llm_operation = next(
+                operation
+                for operation in runtime.store.list_operations(pid=pid)
+                if operation.name == 'llm.action_selection'
+            )
+            tool_operations = [
+                operation
+                for operation in runtime.store.list_operations(root_operation_id=llm_operation.operation_id)
+                if operation.kind.value == 'tool_call'
+            ]
+            assert {operation.name for operation in tool_operations} == {
+                'tool.create_memory_object',
+                'tool.process_exit',
+            }
+            assert {operation.parent_operation_id for operation in tool_operations} == {llm_operation.operation_id}
             batches = [record for record in runtime.audit.trace() if record.action == 'llm.action_batch']
             assert len(batches) == 1
             assert batches[0].decision['executed_count'] == 2
@@ -496,6 +511,12 @@ class TestLLMContextMemory:
             assert waiting['executed_count'] == 1
             assert waiting['completed_actions'][0]['action'] == 'create_memory_object'
             assert runtime.process.get(child).status == ProcessStatus.WAITING_EVENT
+            pending = runtime.store.get_llm_pending_action(child)
+            assert pending is not None
+            waiting_llm_operation = pending['llm_operation_id']
+            waiting_tool_operation = pending['tool_operation_id']
+            assert waiting_llm_operation
+            assert waiting_tool_operation
             assert not any(
                 record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
                 for record in runtime.audit.trace()
@@ -516,6 +537,13 @@ class TestLLMContextMemory:
             assert resumed['action']['action'] == 'receive_process_messages'
             assert resumed['result']['payload']['messages'][0]['message_id'] == matching.message_id
             assert len(runtime.llm.client.user_prompts) == 1
+            assert runtime.store.get_operation(waiting_llm_operation).outcome.value == 'succeeded'
+            assert runtime.store.get_operation(waiting_tool_operation).outcome.value == 'succeeded'
+            assert len([
+                operation
+                for operation in runtime.store.list_operations(pid=child)
+                if operation.name == 'tool.receive_process_messages'
+            ]) == 1
             assert not any(
                 record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
                 for record in runtime.audit.trace()
@@ -545,6 +573,12 @@ class TestLLMContextMemory:
             assert waiting['executed_count'] == 1
             assert waiting['completed_actions'][0]['action'] == 'create_memory_object'
             assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+            pending = runtime.store.get_llm_pending_action(parent)
+            assert pending is not None
+            waiting_llm_operation = pending['llm_operation_id']
+            waiting_tool_operation = pending['tool_operation_id']
+            assert waiting_llm_operation
+            assert waiting_tool_operation
             assert not any(
                 record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
                 for record in runtime.audit.trace()
@@ -556,6 +590,13 @@ class TestLLMContextMemory:
             assert resumed['ok']
             assert resumed['action']['action'] == 'wait_child_process'
             assert len(runtime.llm.client.user_prompts) == 1
+            assert runtime.store.get_operation(waiting_llm_operation).outcome.value == 'succeeded'
+            assert runtime.store.get_operation(waiting_tool_operation).outcome.value == 'succeeded'
+            assert len([
+                operation
+                for operation in runtime.store.list_operations(pid=parent)
+                if operation.name == 'tool.wait_child_process'
+            ]) == 1
             assert not any(
                 record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
                 for record in runtime.audit.trace()
@@ -574,7 +615,15 @@ class TestLLMContextMemory:
                     {'action': 'process_exit', 'payload': {'should_not_run': True}},
                 ]
             ])
-            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel human wait')
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='parallel human wait',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {'resource': 'human:owner', 'rights': ['write']},
+                    ],
+                },
+            )
 
             waiting = runtime.run_process_once(pid)
 
@@ -1531,6 +1580,7 @@ class TestLLMContextMemory:
                     {'action': 'write_text_file', 'path': path, 'content': 'persisted approval action'},
                 ])
                 pid = runtime.process.spawn(image='review-agent:v0', goal='write after approval')
+                runtime.tools.activate_tool_group(pid, 'filesystem')
                 runtime.capability.set_permission_policy(
                     subject=pid,
                     resource=runtime.filesystem.resource_for(path),
@@ -1806,6 +1856,14 @@ class TestLLMContextMemory:
             assert after.payload['entries'][0]['kind'] == 'context_compacted'
             assert after.payload['entries'][0]['summary']['goal'] == 'matching version summary'
             assert after.payload['entries'][-1] == {'kind': 'seed_entry', 'index': 2}
+            runtime.llm.client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+            assert runtime.run_process_once(pid)['ok']
+            manifest = runtime.store.list_context_materialization_manifests(pid=pid)[0]
+            context_entry = next(item for item in manifest.objects if item['oid'] == after.oid)
+            assert context_entry['version'] == manifest.context_version
+            assert context_entry['version'] > after.version
+            assert context_entry['transform'] == 'compacted'
+            assert manifest.compaction['transform'] == 'compacted'
         finally:
             runtime.close()
 

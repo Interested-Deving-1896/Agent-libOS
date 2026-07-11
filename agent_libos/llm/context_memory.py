@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import replace
@@ -8,12 +9,13 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.memory.object_memory import ObjectVersionConflict
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
-from agent_libos.utils.ids import estimate_tokens, utc_now
+from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
     AgentImage,
     AgentObject,
     AgentProcess,
     Capability,
+    ContextMaterializationManifest,
     Event,
     MaterializedContext,
     MemoryView,
@@ -25,6 +27,7 @@ from agent_libos.models import (
     ResourceUsage,
     ViewMode,
 )
+from agent_libos.memory.data_labels import labels_for_explain
 
 _LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
 LLM_CONTEXT_POLICY = _LLM_CONTEXT_DEFAULTS.policy
@@ -75,12 +78,60 @@ class LLMContextMemory:
         rendered = self.render(obj.payload)
         token_count = estimate_tokens(rendered)
         self._charge_rendered_context(pid, process, obj.oid, token_count)
+        materialization_id = source_context.materialization_id or new_id("ctxmat")
+        cache_strategy = obj.payload.get("cache_strategy", {}) if isinstance(obj.payload, dict) else {}
+        transform = "compacted" if str(cache_strategy.get("mode") or "").startswith("compacted") else "verbatim"
+        object_manifest = [
+            *source_context.object_manifest,
+            {
+                "oid": obj.oid,
+                "version": obj.version,
+                "type": obj.type.value,
+                "disposition": "included",
+                "reason": "llm_context",
+                "transform": transform,
+                "tokens": token_count,
+                "rendered_sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+                "labels": labels_for_explain(obj.metadata),
+            },
+        ]
+        manifest = ContextMaterializationManifest(
+            materialization_id=materialization_id,
+            pid=pid,
+            view_id=source_context.view_id or (process.memory_view.view_id if process.memory_view is not None else ""),
+            policy=source_context.policy_used,
+            budget_tokens=int(source_context.budget_tokens or process.resource_budget.max_context_materialization_tokens),
+            rendered_tokens=token_count,
+            rendered_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+            context_generation=self.runtime.store.get_llm_context_generation(pid),
+            context_oid=obj.oid,
+            context_version=obj.version,
+            objects=object_manifest,
+            compaction={
+                "mode": cache_strategy.get("mode"),
+                "compacted_at": cache_strategy.get("compacted_at"),
+                "transform": transform,
+            },
+            created_at=utc_now(),
+        )
+        self.runtime.store.insert_context_materialization_manifest(manifest)
+        self.runtime.operations.link_evidence(
+            "context_manifest",
+            manifest.materialization_id,
+            "context",
+            metadata={"rendered_tokens": token_count, "object_count": len(object_manifest)},
+        )
+        self.runtime.operations.expect("context")
         return MaterializedContext(
             text=rendered,
             object_refs=[obj.oid, *source_context.object_refs],
             token_count=token_count,
             omitted_objects=source_context.omitted_objects,
             policy_used=LLM_CONTEXT_POLICY,
+            materialization_id=materialization_id,
+            view_id=source_context.view_id,
+            budget_tokens=source_context.budget_tokens,
+            object_manifest=object_manifest,
         )
 
     def _charge_rendered_context(self, pid: str, process: AgentProcess, context_oid: str, token_count: int) -> None:

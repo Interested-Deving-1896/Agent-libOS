@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import psutil
 
 from agent_libos import Runtime
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import AgentImage, CapabilityRight, ExternalEffectClassification
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
 from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
@@ -1561,6 +1563,12 @@ def _open_pty_runtime(
     return Runtime.open(
         "local",
         substrate=substrate,
+        config=AgentLibOSConfig(
+            runtime=replace(
+                DEFAULT_CONFIG.runtime,
+                launch_authority_mode="legacy_image_grants",
+            )
+        ),
         module_manifests=(str(manifest),),
         trusted_modules=(f"agent-libos-pty:v0:{manifest_sha}:{source_sha}",),
     )

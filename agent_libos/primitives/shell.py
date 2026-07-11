@@ -647,6 +647,26 @@ class ShellAdapter:
     ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for shell execute on {resource}")
+        selected_cwd = os.fspath(cwd) if cwd is not None else "."
+        approval_context = self._operation_context(
+            pid,
+            argv,
+            resource,
+            timeout=timeout,
+            cwd=selected_cwd,
+            profile=decision.sandbox_profile,
+        )
+        approval_context.update(
+            {
+                "workspace_root": str(getattr(self.provider, "cwd", "")),
+                "working_directory": selected_cwd,
+                "grant_scope": "one_time",
+                "policy_level": decision.policy_level,
+                "policy_reason": decision.reason,
+                "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
+                "high_risk": decision.high_risk,
+            }
+        )
         request_id = self.human.query(
             pid=pid,
             human=self.config.runtime.default_human,
@@ -659,28 +679,7 @@ class ShellAdapter:
                     "rights": [CapabilityRight.EXECUTE.value],
                     "constraints": self._approval_constraints(argv, decision, timeout=timeout, cwd=os.fspath(cwd) if cwd is not None else "."),
                 },
-                "context": {
-                    "adapter": "shell",
-                    "primitive": "runtime.shell.run",
-                    "operation": "run",
-                    "pid": pid,
-                    "workspace_root": str(getattr(self.provider, "cwd", "")),
-                    "working_directory": os.fspath(cwd) if cwd is not None else ".",
-                    "argv": list(argv),
-                    "command": argv[0],
-                    "resource": resource,
-                    "right": CapabilityRight.EXECUTE.value,
-                    "grant_scope": "one_time",
-                    "timeout_s": timeout,
-                    "policy_level": decision.policy_level,
-                    "policy_reason": decision.reason,
-                    "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
-                    "high_risk": decision.high_risk,
-                    "risk": decision.risk.value,
-                    "rule_id": decision.rule_id,
-                    "rule_effect": decision.rule_effect.value,
-                    "sandbox_profile": self._profile_json(decision.sandbox_profile),
-                },
+                "context": approval_context,
             },
             blocking=True,
         )

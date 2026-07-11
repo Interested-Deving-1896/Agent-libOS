@@ -468,7 +468,18 @@ class TestResourceProviderSubstrate:
             substrate.human = human
             runtime = Runtime.open('local', substrate=substrate)
             try:
-                pid = runtime.process.spawn(image='base-agent:v0', goal='use fake human')
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='use fake human',
+                    authority_manifest={
+                        'authorized_capabilities': [
+                            {
+                                'resource': 'human:owner',
+                                'rights': [CapabilityRight.WRITE.value],
+                            }
+                        ]
+                    },
+                )
                 output = runtime.tools.call(pid, 'human_output', {'message': 'hello'})
                 question_id = runtime.human.ask(pid, 'Favorite color?', blocking=True)
                 processed = runtime.human.drain_terminal_queue()

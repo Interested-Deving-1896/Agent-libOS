@@ -278,8 +278,47 @@ class TestConfigDefaults:
         runtime = Runtime(SQLiteStore(':memory:'), llm_client=ScriptedActionClient(), config=config)
         try:
             pid = runtime.process.spawn(image=config.runtime.coding_image_id, goal='inspect')
-            assert runtime.capability.permission_policy(pid, 'filesystem:repo:*', CapabilityRight.READ) == runtime.capability.ALWAYS_ALLOW
-            assert runtime.capability.permission_policy(pid, DEFAULT_CONFIG.runtime.default_human_resource, CapabilityRight.WRITE) == runtime.capability.ALWAYS_ALLOW
+            manifest = runtime.authority_manifests.summary_for_process(pid)
+            assert manifest is not None
+            assert {
+                (spec['resource'], tuple(spec['rights']))
+                for spec in manifest['required_capabilities']
+            } >= {
+                ('filesystem:repo:*', (CapabilityRight.READ.value,)),
+                (config.runtime.default_human_resource, (CapabilityRight.WRITE.value,)),
+            }
+            assert runtime.capability.permission_policy(
+                pid,
+                'filesystem:repo:*',
+                CapabilityRight.READ,
+            ) == runtime.capability.MISSING
+
+            authorized_pid = runtime.process.spawn(
+                image=config.runtime.coding_image_id,
+                goal='authorized inspect',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {
+                            'resource': 'filesystem:repo:*',
+                            'rights': [CapabilityRight.READ.value],
+                        },
+                        {
+                            'resource': config.runtime.default_human_resource,
+                            'rights': [CapabilityRight.WRITE.value],
+                        },
+                    ]
+                },
+            )
+            assert runtime.capability.permission_policy(
+                authorized_pid,
+                'filesystem:repo:*',
+                CapabilityRight.READ,
+            ) == runtime.capability.ALWAYS_ALLOW
+            assert runtime.capability.permission_policy(
+                authorized_pid,
+                config.runtime.default_human_resource,
+                CapabilityRight.WRITE,
+            ) == runtime.capability.ALWAYS_ALLOW
         finally:
             runtime.close()
 
@@ -444,8 +483,22 @@ class TestConfigDefaults:
         config = AgentLibOSConfig(runtime=RuntimeDefaults(default_human='admin'))
         runtime = Runtime.open(config=config)
         try:
-            pid = runtime.process.spawn(goal='configured human default')
-            runtime.capability.grant(pid, 'human:admin', [CapabilityRight.WRITE], issued_by='test')
+            pid = runtime.process.spawn(
+                goal='configured human default',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {'resource': 'human:admin', 'rights': [CapabilityRight.WRITE.value]}
+                    ],
+                    'approval_policy': {
+                        'requestable_capabilities': [
+                            {
+                                'resource': 'filesystem:workspace:configured.txt',
+                                'rights': [CapabilityRight.WRITE.value],
+                            }
+                        ]
+                    },
+                },
+            )
 
             with pytest.raises(HumanResponseRequired):
                 runtime.tools.call(
@@ -458,8 +511,14 @@ class TestConfigDefaults:
             assert len(pending) == 1
             assert pending[0].human == 'admin'
 
-            output_pid = runtime.process.spawn(goal='configured human output')
-            runtime.capability.grant(output_pid, 'human:admin', [CapabilityRight.WRITE], issued_by='test')
+            output_pid = runtime.process.spawn(
+                goal='configured human output',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {'resource': 'human:admin', 'rights': [CapabilityRight.WRITE.value]}
+                    ]
+                },
+            )
             output = runtime.tools.call(output_pid, 'human_output', {'message': 'hello admin'})
             assert output.ok
             output_request = runtime.human.list(pid=output_pid)[0]

@@ -1,8 +1,9 @@
 # Runtime Model
 
 Agent libOS models work as `AgentProcess` instances. A process has identity,
-status, a goal object, a memory view, a process-local working directory, a tool
-table, loaded Skills, capabilities, children, message queue state, an
+status, a goal object, a memory view, a process-local working directory, a
+complete callable tool table, a separate model tool projection, loaded Skills,
+capabilities, children, a Task Authority Manifest, message queue state, an
 `llm_profile_id`, and resource budgets.
 
 The paper frames this process model as the substrate for self-evolving agents:
@@ -62,9 +63,13 @@ short factual runtime note and state sections. `libos_default` preserves the
 native Agent libOS planner envelope and fallback JSON instructions used by the
 built-in images.
 
-Root process spawn may use image `required_capabilities` as a bootstrap
-declaration for ordinary fresh images. `exec_process`, checkpoint-commit image
-boot, and image-package boot never grant those declarations automatically.
+Root process spawn never grants image `required_capabilities` in the default
+`manifest_required` mode. Requirements are copied into the Host-authored
+Task Authority Manifest and reported as satisfied or unmet. Only the
+manifest's `authorized_capabilities` compile into authority. The explicit
+`legacy_image_grants` compatibility mode retains the older bootstrap behavior.
+`exec_process`, checkpoint-commit image boot, and image-package boot never
+grant requirement declarations automatically.
 Image `required_modules` are always startup prerequisites only: spawn and exec
 fail unless each declared module id is already loaded with the declared
 `source_sha256`.
@@ -78,6 +83,12 @@ shell, or other builtin access, it must list that tool explicitly. Internal
 runtime paths such as JIT syscalls may still call primitives directly through
 their syscall session without exposing the corresponding builtin tool to the
 model.
+
+An image with `metadata.lazy_tool_groups=true` initially projects only the
+stable discovery/core subset into LLM schemas. `discover_tool_groups` and
+`activate_tool_group` expand the durable model projection from the already
+authorized image tool table. Host calls and primitive capability enforcement
+continue to use the complete table; activation cannot grant authority.
 
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
@@ -110,7 +121,8 @@ it so a local rollback cannot chain to a response produced from post-checkpoint
 state.
 
 LLM-selected blocking actions use durable wait generations. Each row has a
-unique `resume_token`; one executor CASes `pending -> resuming` before crossing
+unique `resume_token` plus the causal LLM and Tool operation ids; one executor
+CASes `pending -> resuming` before crossing
 the resumed primitive boundary and CASes the same generation to `completed`
 afterward. Reblocking writes a new token, closing stale-worker ABA. Once the
 claim succeeds, any dispatch, output-persistence, or completion exception
@@ -118,6 +130,14 @@ immediately fails the process, retains the non-replayable durable state, and
 audits `llm.pending_action_resume_interrupted`; reopening an already-`resuming`
 row follows the same fail-closed rule rather than replaying a possibly completed
 external effect.
+
+The Explainable Operations lifecycle mirrors this state machine. The LLM and
+Tool rows become `waiting` before control returns to the scheduler. Resume
+reactivates those exact rows even though the concrete retry may get a new
+`call_id`. A runtime reopen preserves waiting rows but marks any orphaned
+`running` row `interrupted`. Human terminal evidence is attached to the waiting
+Tool operation without prematurely changing it to running. See
+[explainable_operations.md](explainable_operations.md).
 
 `jit_tool_exposure` controls how JIT tools appear to the LLM. `direct` exposes
 each visible JIT as its own OpenAI tool. `multiplexed` exposes one stable
@@ -222,6 +242,11 @@ provider, operation, and target. Repeated, stale, or cross-boundary finalization
 fails closed instead of adding another final record or altering unrelated
 evidence.
 
+Transaction outcome and rollback support are separate axes. A confirmed
+provider completion is `transaction_state: committed` even when rollback
+support remains `unknown`; only an explicit unknown provider outcome is
+`transaction_state: unknown` and propagates `unknown` to its operation tree.
+
 `ProviderEffectNotStarted` is the only provider result that can prove its call
 boundary was not crossed. The primitive conditionally deletes a still-pending
 intent only when no earlier provider observation in the composite operation
@@ -240,7 +265,14 @@ protocol. Their effect context contains request id, purpose, byte/character
 counts, and hashes only; raw prompts, answers, and provider exception text are
 not persisted. A successful human interaction is not replayed when later
 event/audit/classification settlement fails: the request decision commits and
-the pending intent remains the reconciliation evidence.
+the pending intent remains the reconciliation evidence. A Human provider that
+certifies `ProviderEffectNotStarted` instead abandons the intent and restores
+retryable request/finite-authority state.
+
+Startup reconciliation is isolated per pending intent. If one provider's
+reconciliation hook raises, that intent remains explicitly `unknown` and the
+runtime continues opening and reconciling other providers; the exception text
+is not persisted.
 
 For JSON-RPC and Streamable HTTP MCP, the pending intent and all finite remote
 authority reservations are durable before non-local DNS resolution. A

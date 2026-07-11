@@ -558,8 +558,26 @@ class TestShellPrimitive:
     def test_request_permission_shell_command_class_is_rule_constrained(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
-            pid = runtime.process.spawn(image='review-agent:v0', goal='request git shell')
-            runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='request git shell',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {
+                            'resource': 'human:owner',
+                            'rights': [CapabilityRight.WRITE.value],
+                        }
+                    ],
+                    'approval_policy': {
+                        'requestable_capabilities': [
+                            {
+                                'resource': 'shell:git',
+                                'rights': [CapabilityRight.EXECUTE.value],
+                            }
+                        ]
+                    },
+                },
+            )
             with pytest.raises(HumanResponseRequired):
                 runtime.tools.call(pid, 'request_permission', {'resource': 'shell:git', 'rights': ['execute'], 'reason': 'inspect git state'})
             pending = runtime.human.pending()[0]

@@ -49,6 +49,7 @@ def build_review_agent_image() -> AgentImage:
         system_prompt=REVIEW_AGENT_PROMPT,
         prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
         default_tools=[
+            "activate_tool_group",
             "append_memory_object",
             "ask_human",
             "compact_process_context",
@@ -61,6 +62,7 @@ def build_review_agent_image() -> AgentImage:
             "delete_file",
             "diff_checkpoint",
             "discover_skills",
+            "discover_tool_groups",
             "exec_process",
             "fork_child_process",
             "get_current_time",
@@ -109,4 +111,5 @@ def build_review_agent_image() -> AgentImage:
         ],
         context_policy="evidence_first",
         safety_profile="review",
+        metadata={"lazy_tool_groups": True},
     )

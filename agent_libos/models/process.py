@@ -223,6 +223,7 @@ class AgentProcess:
     working_directory: str = "."
     status_message: str | None = None
     llm_profile_id: str = field(default_factory=lambda: DEFAULT_CONFIG.llm.default_profile_id)
+    model_tool_table: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

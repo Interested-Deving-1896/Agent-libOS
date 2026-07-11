@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -13,6 +14,7 @@ import pytest
 from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import (
     CapabilityRight,
+    ContextMaterializationManifest,
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     LLMCallRecord,
@@ -20,6 +22,8 @@ from agent_libos.models import (
     McpStdioTransportSpec,
     McpToolSpec,
     ObjectType,
+    OperationOutcome,
+    OperationState,
 )
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.utils.ids import utc_now
@@ -168,6 +172,74 @@ def test_runtime_store_contract_core_records(kind: str, tmp_path: Path) -> None:
             )
         )
         checkpoint_id = runtime.checkpoint.create(pid, "store contract", require_capability=False)
+        operation = runtime.operations.start(
+            kind="runtime",
+            name="contract.operation",
+            actor=pid,
+            pid=pid,
+            expected_roles=["result"],
+        )
+        assert runtime.operations.link_evidence(
+            "result",
+            "contract-operation-result",
+            "result",
+            operation_id=operation.operation_id,
+        ) is not None
+        assert runtime.operations.link_evidence(
+            "result",
+            "contract-operation-result",
+            "result",
+            operation_id=operation.operation_id,
+        ) is None
+        runtime.operations.finish("succeeded", operation_id=operation.operation_id)
+        cas_operation = runtime.operations.start(
+            kind="runtime",
+            name="contract.cas",
+            actor=pid,
+            pid=pid,
+        )
+        runtime.operations.wait(operation_id=cas_operation.operation_id)
+        waiting_snapshot = runtime.store.get_operation(cas_operation.operation_id)
+        assert waiting_snapshot is not None
+        assert runtime.operations.resume(cas_operation.operation_id).state == OperationState.RUNNING
+        stale_terminal = replace(
+            waiting_snapshot,
+            state=OperationState.TERMINAL,
+            outcome=OperationOutcome.SUCCEEDED,
+            completed_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        assert runtime.store.update_operation(
+            stale_terminal,
+            expected_states=[OperationState.WAITING.value],
+        ) is False
+        runtime.operations.finish("succeeded", operation_id=cas_operation.operation_id)
+        manifest = ContextMaterializationManifest(
+            materialization_id="contract-context-manifest",
+            pid=pid,
+            view_id="contract-view",
+            policy="contract",
+            budget_tokens=64,
+            rendered_tokens=12,
+            rendered_sha256="a" * 64,
+            context_generation="generation-1",
+            context_oid=None,
+            context_version=None,
+            objects=[
+                {
+                    "oid": handle.oid,
+                    "version": 1,
+                    "type": ObjectType.ARTIFACT.value,
+                    "disposition": "included",
+                    "reason": "selected",
+                    "transform": "verbatim",
+                    "tokens": 12,
+                    "rendered_sha256": "b" * 64,
+                }
+            ],
+            created_at=utc_now(),
+        )
+        runtime.store.insert_context_materialization_manifest(manifest)
 
         assert runtime.process.get(pid) is not None
         assert runtime.memory.get_object(pid, handle).payload["backend"] == kind
@@ -181,6 +253,11 @@ def test_runtime_store_contract_core_records(kind: str, tmp_path: Path) -> None:
         assert runtime.store.get_mcp_server("contract-mcp")[0].tool_by_id("echo") is not None
         assert runtime.store.list_llm_calls(pid=pid)[0].call_id == "contract-llm-call"
         assert runtime.store.get_checkpoint_snapshot(checkpoint_id) is not None
+        stored_operation = runtime.store.get_operation(operation.operation_id)
+        assert stored_operation is not None
+        assert stored_operation.outcome.value == "succeeded"
+        assert runtime.store.list_operation_evidence(operation_ids=[operation.operation_id])
+        assert runtime.store.get_context_materialization_manifest(manifest.materialization_id) == manifest
 
 
 def test_sqlite_file_store_rejects_concurrent_active_runtime_and_reopens_after_close(tmp_path: Path) -> None:

@@ -84,6 +84,7 @@ async def amain(args: argparse.Namespace) -> None:
                 "then writing that Object to the target. Do not call read_text_file."
             ),
         )
+        runtime.tools.activate_tool_group(pid, "filesystem")
         runtime.filesystem.grant_path(pid, source, [CapabilityRight.READ], issued_by="object_copy_smoke")
         runtime.filesystem.grant_path(pid, target, [CapabilityRight.WRITE], issued_by="object_copy_smoke")
 

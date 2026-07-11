@@ -151,6 +151,13 @@ rows; complete per-run diagnostics remain in `results.jsonl`.
 - `audit_completeness`
 - `valid`
 - `invalid_reasons`
+
+Agent-libOS runner result metadata also includes an `explainability` object with
+`operation_count`, `causal_root_count`, `evidence_complete_root_count`, and
+`unknown_outcome_count` for operations created after task setup. These are
+diagnostic provenance counts, not additional rate columns or a safety score.
+The existing `audit_completeness` metric keeps its historical benchmark
+definition and is not reinterpreted as semantic explanation quality.
 - `errors`
 - `workspace`
 - `metadata`, including `metadata.self_evolution_counts` for per-run
@@ -270,7 +277,38 @@ result rows with no infrastructure failure or invalid output. These are
 repository validation snapshots, not a claim that the current 27-task harness
 is a complete paper evaluation.
 
-The current benchmark is suitable for deterministic smoke and early evaluation.
-It is not yet a full paper evaluation suite. Audit explain queries, richer
-context materialization metadata, adversarial remote provider tasks, and
-Git/worktree provider tasks remain future work.
+## Practical workflow evidence levels
+
+`benchmarks/practical_agent_workflows/` is the first mainline replacement for
+the branch-only practical evaluation. Run it with:
+
+```bash
+uv run python experiments/run_practical_evaluation.py \
+  --output .benchmark_runs/practical/report.json
+```
+
+The report keeps four counting layers separate: scenarios, semantic effects,
+runtime tool calls, and explicit operations. `native-live` scenarios must map
+every semantic effect to a real ToolBroker call, a stateful provider before/
+after oracle, a persisted external effect, and an Explain-resolvable operation.
+The native connector provider writes the actual semantic class and target into
+its provider receipt, and the runner requires an exact per-effect match rather
+than accepting equal counts as evidence of correspondence.
+There is no fallback branch: absent native evidence fails the scenario and
+`modeled_fallback` remains zero. Unsupported or research-only scenarios belong
+to the separately counted `modeled` suite and never enter a native denominator.
+
+The initial connector provider covers stateful mail, CRM, and calendar writes
+through registered JSON-RPC methods. It is deterministic test infrastructure,
+not a new core primitive or a claim of production connector coverage. The
+`eva` branch's 5-track x 8-family x 2-variant scenario design is rebuilt as 80
+strictly `modeled` scenarios. Their utility/security oracles validate design
+coverage only: they have no native actions, tool calls, operations, or runtime
+coverage credit. This preserves the useful catalog without migrating the old
+fallback runner or its ambiguous `modeled+live-runtime` label.
+
+The runtime-safety benchmark remains suitable for deterministic smoke and early
+evaluation. The practical suite establishes evidence-level accounting but is
+not yet a complete paper evaluation; adversarial remote-provider tasks,
+Git/worktree provider tasks, and a broader evaluation of explanation usefulness
+remain future work.

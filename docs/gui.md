@@ -281,6 +281,10 @@ Important endpoints:
   `PUT /api/llm-profiles/{profile_id}`, and
   `DELETE /api/llm-profiles/{profile_id}` for user-level GUI model profiles.
 - `GET /api/processes`, `POST /api/processes`
+- `GET /api/operations?pid=...`, `GET /api/operations/{operation_id}`, and
+  `GET /api/operations/resolve?kind=...&id=...` for host-only deterministic
+  operation explanations. List/detail responses support cursor pagination;
+  ambiguous evidence resolution returns `409` with candidate causal roots.
 - `POST /api/workflows/run`
 - `POST /api/scheduler/auto`, `POST /api/scheduler/pause`
 - `GET /api/processes/{pid}`
@@ -328,3 +332,17 @@ Mutation endpoints validate required ids, image names, and paths as non-empty
 JSON strings. Malformed enum values such as an unknown process signal, missing
 required fields, non-object request bodies, and incorrectly typed booleans
 return `400` without invoking the runtime mutation.
+
+The process detail pane includes an Explain tab. It renders an outcome and
+evidence-completeness summary, an explicit causal tree, and a filterable
+evidence timeline. Audit, event, LLM-call, and Human-request entries in the main
+timeline can open the corresponding explanation. Snapshot/SSE updates refresh
+the panel against the current store. Explain serialization retains ids,
+statuses, hashes, counts, rights, targets, and rollback classification while
+redacting Object/LLM/Human/provider content. It is not exposed to model tools or
+process syscalls. See [explainable_operations.md](explainable_operations.md).
+
+`POST /api/processes` and `POST /api/workflows/run` accept an optional
+`authority_manifest` JSON object. It is a Host/admin-plane launch contract;
+the GUI does not synthesize authority from image requirements. Explain shows
+the resulting id/hash, grants, unmet requirements, budget, and effect policy.

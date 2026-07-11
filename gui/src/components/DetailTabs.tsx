@@ -1,8 +1,9 @@
-import { useState } from "react";
-import type { ImageInspectResult, RuntimeProcess, RuntimeSnapshot } from "../api/types";
+import { useEffect, useState } from "react";
+import type { ExplainOperationResponse, ImageInspectResult, OperationListResponse, RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
 import { ImagePanel } from "./ImagePanel";
+import { ExplainPanel } from "./ExplainPanel";
 import { RatingPanel } from "./RatingPanel";
 
 const tabs = [
@@ -12,6 +13,7 @@ const tabs = [
   { key: "toolsSkills", label: "details.toolsSkills" },
   { key: "checkpoints", label: "details.checkpoints" },
   { key: "audit", label: "details.audit" },
+  { key: "explain", label: "details.explain" },
   { key: "llmCalls", label: "details.llmCalls" },
   { key: "jsonRpc", label: "details.jsonRpc" },
   { key: "mcp", label: "details.mcp" },
@@ -29,7 +31,11 @@ export function DetailTabs({
   onUseImageForSpawn,
   onUseImageForExec,
   onRate,
-  onInspectImage
+  onInspectImage,
+  onListOperations,
+  onExplainOperation,
+  onResolveOperation,
+  explainLookup
 }: {
   process: RuntimeProcess | null;
   snapshot: RuntimeSnapshot | null;
@@ -39,9 +45,16 @@ export function DetailTabs({
   onUseImageForExec(imageId: string): void;
   onRate(pid: string, score: number, comment: string): Promise<boolean>;
   onInspectImage(imageId: string): Promise<ImageInspectResult>;
+  onListOperations(pid: string, cursor?: string): Promise<OperationListResponse>;
+  onExplainOperation(operationId: string, cursor?: string): Promise<ExplainOperationResponse>;
+  onResolveOperation(kind: string, id: string): Promise<ExplainOperationResponse>;
+  explainLookup: { kind: string; id: string; nonce: number } | null;
 }) {
   const { t } = useI18n();
   const [tab, setTab] = useState<TabKey>("overview");
+  useEffect(() => {
+    if (explainLookup) setTab("explain");
+  }, [explainLookup?.nonce]);
   if (!snapshot) return <div className="empty">{t("details.snapshotMissing")}</div>;
   return (
     <aside className="details">
@@ -58,7 +71,11 @@ export function DetailTabs({
         onUseImageForSpawn,
         onUseImageForExec,
         onRate,
-        onInspectImage
+        onInspectImage,
+        onListOperations,
+        onExplainOperation,
+        onResolveOperation,
+        explainLookup
       })}</div>
     </aside>
   );
@@ -76,6 +93,10 @@ function renderTab(
     onUseImageForExec(imageId: string): void;
     onRate(pid: string, score: number, comment: string): Promise<boolean>;
     onInspectImage(imageId: string): Promise<ImageInspectResult>;
+    onListOperations(pid: string, cursor?: string): Promise<OperationListResponse>;
+    onExplainOperation(operationId: string, cursor?: string): Promise<ExplainOperationResponse>;
+    onResolveOperation(kind: string, id: string): Promise<ExplainOperationResponse>;
+    explainLookup: { kind: string; id: string; nonce: number } | null;
   }
 ) {
   if (!process && !["jsonRpc", "mcp", "toolsSkills", "images"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
@@ -85,6 +106,18 @@ function renderTab(
   if (tab === "toolsSkills") return <JsonBlock value={{ process_tools: process?.tool_table, loaded_skills: process?.loaded_skills, registry: snapshot.skills, tools: snapshot.tools }} />;
   if (tab === "checkpoints") return <JsonBlock value={{ checkpoint_head: process?.checkpoint_head }} />;
   if (tab === "audit") return <JsonBlock value={snapshot.audit.filter((item) => item.actor === process?.pid || item.target === `process:${process?.pid}`)} />;
+  if (tab === "explain" && process) {
+    return (
+      <ExplainPanel
+        key={explainRefreshKey(process, snapshot)}
+        pid={process.pid}
+        listOperations={imageActions.onListOperations}
+        explainOperation={imageActions.onExplainOperation}
+        resolveOperation={imageActions.onResolveOperation}
+        lookup={imageActions.explainLookup}
+      />
+    );
+  }
   if (tab === "llmCalls") return <JsonBlock value={snapshot.llm_calls.filter((item) => item.pid === process?.pid)} />;
   if (tab === "jsonRpc") return <JsonBlock value={snapshot.jsonrpc_endpoints} />;
   if (tab === "mcp") return <JsonBlock value={snapshot.mcp_servers} />;
@@ -103,6 +136,16 @@ function renderTab(
     );
   }
   return <JsonBlock value={{ goal_oid: process?.goal_oid, note: t("details.objectMemoryNote") }} />;
+}
+
+export function explainRefreshKey(process: RuntimeProcess, snapshot: RuntimeSnapshot): string {
+  return [
+    process.pid,
+    snapshot.audit.at(-1)?.record_id,
+    snapshot.events.at(-1)?.event_id,
+    snapshot.llm_calls.at(-1)?.call_id,
+    snapshot.human_requests.at(-1)?.updated_at
+  ].join(":");
 }
 
 function JsonBlock({ value }: { value: unknown }) {

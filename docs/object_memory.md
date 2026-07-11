@@ -238,6 +238,24 @@ exposure. It does not bypass filesystem or object capabilities.
 `write_object_to_file` accepts only a string payload or a mapping with a string
 `content` field; other payload shapes fail instead of being guessed.
 
+## Data labels and provenance
+
+Object metadata carries `sensitivity`, `trust_level`, `integrity`, `origin`,
+`tenant`, `principal`, and optional `declassification_authority` labels.
+Provenance records parent Object ids and explicit source operation ids. Derived
+objects conservatively take the highest source sensitivity and the lowest
+source trust/integrity; mixed origins are marked `derived` and mixed tenant or
+principal identities are not silently collapsed.
+
+An update that lowers sensitivity or raises trust/integrity requires explicit
+`admin` authority on `declassification:object:<oid>`. Context Materialization
+Manifests and Explain expose labels alongside ids/hashes without copying Object
+payloads. Finite declassification authority is consumed atomically with the
+Object update, so a one-shot downgrade grant cannot be reused. External
+information-flow intents may record an observe-only label
+summary and manifest policy. Version 1 does not yet enforce source-to-sink
+policy at Human, JSON-RPC, MCP, network, or file-write sinks.
+
 ## Context Materialization
 
 The LLM executor materializes prompt context from process state, event facts,
@@ -263,9 +281,17 @@ double-charging the same quantum. The rendered context must fit both the
 per-call materialization window and the cumulative materialization budget before
 the model is called.
 
-Current context materialization does not yet expose complete per-call metadata
-for every included, omitted, summarized, or truncated object. That remains a
-known gap for future audit explain work.
+LLM context preparation now persists a metadata-only Context Materialization
+Manifest. For each source Object it records oid/version/type, included or
+omitted disposition, the exact selection reason, transformation
+(`verbatim`, `compacted`, or `truncated`), token count, rendered hash, and data
+labels. The
+final context Object/version, context generation, effective budget, rendered
+tokens, and hash are recorded as well. No extra Object payload or rendered
+prompt text is copied into the manifest. Direct materialization returns the
+same per-Object selection metadata in memory; durable rows are created when the
+final LLM context is prepared. See
+[explainable_operations.md](explainable_operations.md).
 
 ## Persistence Invariant
 

@@ -62,7 +62,16 @@ class TestWorkflowEntry:
     def test_workflow_waiting_for_human_returns_request_without_auto_exit(self) -> None:
         runtime = Runtime.open("local")
         try:
-            result = runtime.run_workflow("ask_human", {"question": "Continue?"})
+            result = runtime.run_workflow(
+                "ask_human",
+                {"question": "Continue?"},
+                authority_manifest={
+                    "authorized_capabilities": [
+                        {"resource": "human:owner", "rights": ["write"]}
+                    ],
+                    "permitted_effects": ["human.*"],
+                },
+            )
 
             assert not result.ok
             assert result.waiting_human
@@ -84,6 +93,19 @@ class TestWorkflowEntry:
                     "resource": "filesystem:workspace:*",
                     "rights": ["write"],
                     "reason": "edit workspace",
+                },
+                authority_manifest={
+                    "authorized_capabilities": [
+                        {"resource": "human:owner", "rights": ["write"]}
+                    ],
+                    "approval_policy": {
+                        "requestable_capabilities": [
+                            {
+                                "resource": "filesystem:workspace:*",
+                                "rights": ["write"],
+                            }
+                        ]
+                    },
                 },
             )
 

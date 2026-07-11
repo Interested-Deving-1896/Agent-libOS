@@ -141,6 +141,31 @@ class LibOSSyscallSession:
 
     async def handle(self, name: str, args: dict[str, Any]) -> Any:
         normalized = name.strip()
+        with self.runtime.operations.scope(
+            kind="syscall",
+            name=f"syscall.{normalized or 'invalid'}",
+            actor=self.pid,
+            pid=self.pid,
+            expected_roles=["invocation", "audit"],
+        ) as operation:
+            self.runtime.operations.link_evidence(
+                "syscall_call",
+                operation.operation_id,
+                "invocation",
+                operation_id=operation.operation_id,
+                metadata={"name": normalized},
+            )
+            result = await self._handle_impl(name, args)
+            self.runtime.operations.link_evidence(
+                "syscall_call",
+                operation.operation_id,
+                "result",
+                operation_id=operation.operation_id,
+            )
+            return result
+
+    async def _handle_impl(self, name: str, args: dict[str, Any]) -> Any:
+        normalized = name.strip()
         if not normalized:
             raise ValidationError("syscall name must be non-empty")
         self._require_non_terminal_process()

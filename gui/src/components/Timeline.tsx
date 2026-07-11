@@ -32,7 +32,8 @@ export function Timeline({
   humanRequests,
   llmCalls,
   events,
-  audit
+  audit,
+  onExplainEvidence
 }: {
   pid: string | null;
   messages: ProcessMessage[];
@@ -40,6 +41,7 @@ export function Timeline({
   llmCalls: LlmCall[];
   events: RuntimeEvent[];
   audit: AuditRecord[];
+  onExplainEvidence?(kind: string, id: string): void;
 }) {
   const { formatTime, t } = useI18n();
   const [filter, setFilter] = useState<TimelineFilter>("all");
@@ -85,6 +87,18 @@ export function Timeline({
                 <time>{formatTime(entry.time)}</time>
               </div>
               <p className="timelineSummary" title={summary(entry, t)}>{summary(entry, t)}</p>
+              {evidenceRef(entry) && onExplainEvidence ? (
+                <button
+                  type="button"
+                  className="timelineExplain"
+                  onClick={() => {
+                    const ref = evidenceRef(entry);
+                    if (ref) onExplainEvidence(ref.kind, ref.id);
+                  }}
+                >
+                  {t("timeline.explain")}
+                </button>
+              ) : null}
               <CollapsibleJson value={entry.item} />
             </div>
           </article>
@@ -92,6 +106,14 @@ export function Timeline({
       </div>
     </section>
   );
+}
+
+export function evidenceRef(entry: TimelineItem): { kind: string; id: string } | null {
+  if (entry.kind === "human") return { kind: "request", id: entry.item.request_id };
+  if (entry.kind === "llm") return { kind: "call", id: entry.item.call_id };
+  if (entry.kind === "event") return { kind: "event", id: entry.item.event_id };
+  if (entry.kind === "audit") return { kind: "audit", id: entry.item.record_id };
+  return null;
 }
 
 export function buildTimelineItems({

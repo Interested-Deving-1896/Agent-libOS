@@ -279,9 +279,16 @@ def _run_agent_libos_task(
         setup_state = _setup_runtime_benchmark_resources(task, runtime, workspace, pid)
         if isinstance(client, PlannedActionClient):
             client.actions = [_dispatch_action(action, setup_state) for action in task.mock_actions]
+            for action in client.actions:
+                group = runtime.tools.tool_group_for(str(action.get("action") or ""))
+                if group is not None:
+                    runtime.tools.activate_tool_group(pid, group)
         baseline_audit_ids = {record.record_id for record in runtime.audit.trace()}
         baseline_external_effect_ids = {
             effect.effect_id for effect in runtime.store.list_external_effects()
+        }
+        baseline_operation_ids = {
+            operation.operation_id for operation in runtime.store.list_operations()
         }
         selected_quanta = max_quanta if max_quanta is not None else max(len(task.mock_actions) + 4, 4)
         results = runtime.run_until_idle(
@@ -352,6 +359,10 @@ def _run_agent_libos_task(
                 "process_status": process.status.value,
                 "setup_object_oids": [item["oid"] for item in setup_objects],
                 "self_evolution_counts": _self_evolution_counts(effects),
+                "explainability": _operation_explainability_metadata(
+                    runtime,
+                    baseline_operation_ids,
+                ),
             },
         )
         task_run = TaskRun(result=result, effects=effects)
@@ -1221,6 +1232,34 @@ def _evaluate_success(task: BenchmarkTask, workspace: Path, state: dict[str, Any
             continue
         return False
     return True
+
+
+def _operation_explainability_metadata(
+    runtime: Runtime,
+    baseline_operation_ids: set[str],
+) -> dict[str, int]:
+    operations = [
+        operation
+        for operation in runtime.store.list_operations()
+        if operation.operation_id not in baseline_operation_ids
+    ]
+    root_ids = sorted(
+        {
+            operation.root_operation_id
+            for operation in operations
+            if operation.root_operation_id not in baseline_operation_ids
+        }
+    )
+    complete_roots = sum(
+        int(runtime.explain.explain_operation(root_id, evidence_limit=1)["evidence_complete"])
+        for root_id in root_ids
+    )
+    return {
+        "operation_count": len(operations),
+        "causal_root_count": len(root_ids),
+        "evidence_complete_root_count": complete_roots,
+        "unknown_outcome_count": sum(operation.outcome.value == "unknown" for operation in operations),
+    }
 
 
 def _audit_completeness(runner: str, effects: list[EffectRecord], audit_records: int) -> float:

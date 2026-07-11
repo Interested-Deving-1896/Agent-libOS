@@ -40,6 +40,18 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   imply broader authority. Cwd selection requires filesystem directory read,
   and explicit child/PTY cwd probes occur only after their higher-level
   authority gates and under a filesystem effect intent.
+- `task-authority-manifest-bounds-launch`: image requirements are declarations;
+  Host manifests compile launch grants and bound model requests, child
+  transitions, budgets, approval policy, and provider effect classes.
+- `effect-transactions-are-idempotent-and-reconcilable`: provider intents bind
+  canonical arguments and idempotency keys, approval leases bind exact effects,
+  and startup reconciliation queries but never replays providers.
+- `data-labels-propagate-conservatively`: derived Object sensitivity, trust,
+  and integrity labels merge conservatively; manifests expose metadata only;
+  label downgrade requires declassification authority.
+- `model-tool-projection-does-not-change-authority`: lazy model schemas are a
+  durable projection of the complete image tool table and cannot add
+  capabilities.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
   namespaces do not bypass object capabilities. Successful namespace listing
   consumes every finite namespace/object visibility decision used in the
@@ -242,20 +254,32 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   deduplicated main, server, process-spawn, and exact stdio authority and persist
   pending evidence before DNS/live-provider boundaries. Local/stdio first-call
   PENS may restore; non-local DNS observation cannot be erased.
+- `explainable-operations-use-explicit-causality`: protected LLM, Tool,
+  syscall, primitive, and runtime boundaries persist typed parent/child rows and
+  explicit evidence links. Human/child/message waits reuse their durable
+  operation ids; reopen interrupts only orphaned running rows. Explanation
+  completeness checks declared roles and never fills gaps from pid/time
+  proximity. Host output applies observability redaction.
+- `context-manifests-are-metadata-only`: each LLM context preparation records
+  source Object selection/omission reason, version, transform, tokens, hashes,
+  final context generation/Object, and compaction metadata without copying
+  Object payloads or rendered prompt text.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
   remain schema-v1, deterministic, and token-free by default. Effect outcome
   and evidence are explicit; exact/prefix/glob matching cannot broaden
   implicitly; unknown/invalid/orphan/runner-failure output nulls rate fields;
   false-denial and unauthorized-effect denominators use only their documented
   qualified effect subsets.
+- `practical-native-evidence-has-no-modeled-fallback`: native practical rows
+  require real tool, provider-state, external-effect, and operation evidence;
+  modeled rows stay in a separate denominator.
 
 ## Known Test Gaps
 
-- Audit explain is not implemented yet; current tests check audit record
-  emission and selected audit counts, not query/explanation completeness.
 - The runtime-safety benchmark is an early deterministic workload, not a
   complete paper evaluation suite.
-- Context materialization metadata is not complete enough to compute
-  included/omitted/summarized/truncated object statistics for every LLM call.
+- Explainability tests verify provenance completeness and deterministic
+  summaries, but do not yet measure whether operators understand explanations
+  better in a user study.
 - MCP Resources/Prompts, Git worktree, and mock PR providers are planned but not
   implemented.

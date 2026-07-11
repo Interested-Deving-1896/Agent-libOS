@@ -1018,6 +1018,100 @@ textarea {
   padding: 12px;
 }
 
+.explainPanel {
+  display: grid;
+  gap: 14px;
+}
+
+.explainPanel h3 {
+  margin: 0 0 8px;
+}
+
+.explainOperationList {
+  display: grid;
+  gap: 6px;
+}
+
+.explainOperationList > button,
+.operationTree button {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  text-align: left;
+}
+
+.explainOperationList > button span {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.explainOperationList button.active,
+.operationTree button.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+}
+
+.explainSummary,
+.explainTree,
+.explainEvidence {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--panel);
+}
+
+.explainBadges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.explainBadges span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 0.76rem;
+}
+
+.operationTree,
+.operationTree ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 16px;
+  list-style: none;
+}
+
+.operationTree {
+  padding-left: 0;
+}
+
+.explainEvidenceHeader,
+.explainEvidenceRow header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.explainEvidenceRow {
+  display: grid;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.explainEvidenceRow code {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.explainError {
+  color: var(--danger);
+}
+
 .jsonBlock {
   max-height: calc(100vh - 190px);
 }

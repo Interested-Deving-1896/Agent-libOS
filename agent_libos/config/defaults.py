@@ -48,6 +48,7 @@ class RuntimeDefaults:
     terminal_channel: str = "terminal"
     run_until_idle_max_quanta: int | None = None
     launcher_max_quanta: int = 40
+    launch_authority_mode: Literal["manifest_required", "legacy_image_grants"] = "manifest_required"
 
     @property
     def default_human_resource(self) -> str:
@@ -587,6 +588,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "workspace_namespace",
         "default_image_id",
         "coding_image_id",
+        "launch_authority_mode",
         "default_human",
         "terminal_channel",
     ):

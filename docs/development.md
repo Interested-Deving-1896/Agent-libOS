@@ -86,6 +86,7 @@ uv run agent-libos checkpoint --help
 uv run agent-libos skills --help
 uv run agent-libos jsonrpc --help
 uv run python experiments/run_benchmark.py --help
+uv run python experiments/run_practical_evaluation.py --help
 uv run python experiments/collect_metrics.py --help
 ```
 
@@ -97,6 +98,11 @@ uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 ```
 
 `.benchmark_runs/` is ignored and should not be committed.
+
+The practical runner separates `native-live` from `modeled` scenarios. Native
+scenarios fail when a semantic effect lacks a real ToolBroker call, state
+oracle, external-effect row, or Explain-resolvable operation; there is no
+modeled fallback in that lane.
 
 ## Real LLM Smoke
 
@@ -179,6 +185,16 @@ completion raises after a claim, it immediately marks the process failed,
 retains the non-replayable state, and audits
 `llm.pending_action_resume_interrupted` instead of automatically replaying a
 tool whose external effect may already have happened.
+
+Protected public boundaries are registered by the runtime composition root for
+Explainable Operations. New process, Object Memory, checkpoint, capability,
+Human, ObjectTask, Skill/Image/remote-registry, or external primitive mutation
+entrypoints must be added to that registry. Authorization and provider helpers
+add decision/effect expectations only when those phases are actually reached;
+do not declare provider evidence unconditionally for preflight denial paths.
+Tests should cover the operation outcome, expected-role completeness, explicit
+evidence resolution, and redacted output in addition to the original audit and
+effect assertions. See [explainable_operations.md](explainable_operations.md).
 
 Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
 provider return multiple tool calls in one action-selection response. Agent

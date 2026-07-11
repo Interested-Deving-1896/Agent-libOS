@@ -77,6 +77,46 @@ class LLMProcessExecutor:
     async def arun_once(self, pid: str) -> dict[str, Any]:
         process = self.runtime.process.get(pid)
         if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
+            return await self._arun_once_impl(pid)
+        pending = self.runtime.store.get_llm_pending_action(pid)
+        operation_id = str(pending.get("llm_operation_id") or "") if pending is not None else ""
+        with self.runtime.operations.scope(
+            kind="llm_request",
+            name="llm.action_selection",
+            actor=pid,
+            pid=pid,
+            expected_roles=["context", "invocation", "audit"],
+            operation_id=operation_id or None,
+            auto_finish=False,
+        ) as operation:
+            result = await self._arun_once_impl(pid)
+            if any(result.get(key) for key in ("waiting_human", "waiting_event", "waiting_message", "pending_action_resuming")):
+                self.runtime.operations.wait(operation_id=operation.operation_id)
+            elif result.get("resource_limit_exceeded"):
+                self.runtime.operations.finish("denied", operation_id=operation.operation_id)
+            elif result.get("ok"):
+                descendants = self.runtime.store.list_operations(
+                    root_operation_id=operation.root_operation_id
+                )
+                outcome = (
+                    "unknown"
+                    if any(
+                        candidate.operation_id != operation.operation_id
+                        and candidate.outcome.value == "unknown"
+                        for candidate in descendants
+                    )
+                    else "succeeded"
+                )
+                self.runtime.operations.finish(outcome, operation_id=operation.operation_id)
+            elif result.get("skipped"):
+                self.runtime.operations.finish("interrupted", operation_id=operation.operation_id)
+            else:
+                self.runtime.operations.finish("failed", operation_id=operation.operation_id)
+            return result
+
+    async def _arun_once_impl(self, pid: str) -> dict[str, Any]:
+        process = self.runtime.process.get(pid)
+        if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
             return {"ok": False, "skipped": True, "status": process.status.value}
         durable_pending = self._synchronize_pending_action(pid)
         if pid in self._pending_human_actions:
@@ -539,9 +579,12 @@ class LLMProcessExecutor:
             tool_call_id=tool_call_id,
             tool_name=tool_name,
         )
+        operation_context = self.runtime.store.get_llm_pending_action(pid) or {}
         self._pending_human_actions[pid] = {
             "request_id": request_id,
             "resume_token": resume_token,
+            "llm_operation_id": operation_context.get("llm_operation_id"),
+            "tool_operation_id": operation_context.get("tool_operation_id"),
             "action": dict(action),
             "content_preview": content_preview,
             "tool_call_count": tool_call_count,
@@ -585,9 +628,12 @@ class LLMProcessExecutor:
             tool_call_id=tool_call_id,
             tool_name=tool_name,
         )
+        operation_context = self.runtime.store.get_llm_pending_action(pid) or {}
         self._pending_wait_actions[pid] = {
             "child_pid": child_pid,
             "resume_token": resume_token,
+            "llm_operation_id": operation_context.get("llm_operation_id"),
+            "tool_operation_id": operation_context.get("tool_operation_id"),
             "action": dict(action),
             "content_preview": content_preview,
             "tool_call_count": tool_call_count,
@@ -631,9 +677,12 @@ class LLMProcessExecutor:
             tool_call_id=tool_call_id,
             tool_name=tool_name,
         )
+        operation_context = self.runtime.store.get_llm_pending_action(pid) or {}
         self._pending_message_actions[pid] = {
             "filters": dict(filters),
             "resume_token": resume_token,
+            "llm_operation_id": operation_context.get("llm_operation_id"),
+            "tool_operation_id": operation_context.get("tool_operation_id"),
             "action": dict(action),
             "content_preview": content_preview,
             "tool_call_count": tool_call_count,
@@ -679,7 +728,10 @@ class LLMProcessExecutor:
                 result = await self.adispatch(
                     pid,
                     action,
-                    context_metadata={"human_resume_request_id": request_id},
+                    context_metadata={
+                        "human_resume_request_id": request_id,
+                        "operation_id": pending.get("tool_operation_id"),
+                    },
                 )
             except HumanApprovalRequired as exc:
                 return self._wait_for_human_action(
@@ -956,6 +1008,7 @@ class LLMProcessExecutor:
                 context_metadata={
                     "pending_child_resume": True,
                     "pending_child_pid": child_pid,
+                    "operation_id": pending.get("tool_operation_id"),
                 },
             )
         except ProcessWaitRequired as exc:
@@ -1026,7 +1079,11 @@ class LLMProcessExecutor:
         action = dict(pending["action"])
         self._forget_pending_generation(self._pending_message_actions, pid, resume_token)
         try:
-            result = await self.adispatch(pid, action)
+            result = await self.adispatch(
+                pid,
+                action,
+                context_metadata={"operation_id": pending.get("tool_operation_id")},
+            )
         except ProcessMessageWaitRequired as exc:
             return self._wait_for_message_action(
                 pid=pid,
@@ -1256,8 +1313,8 @@ class LLMProcessExecutor:
         if not name:
             raise ValueError("selected action has an empty tool name")
         process = self.runtime.process.get(pid)
-        if name not in process.tool_table:
-            raise ValueError(f"selected action is not in this process tool table: {name}")
+        if name not in process.model_tool_table:
+            raise ValueError(f"selected action is not in this process model tool projection: {name}")
 
     def _tool_call_previews(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         previews: list[dict[str, Any]] = []
@@ -1395,6 +1452,12 @@ class LLMProcessExecutor:
                     completed_at=utc_now(),
                 )
             )
+            self.runtime.operations.link_evidence(
+                "llm_call",
+                call_id,
+                "invocation",
+                metadata={"attempt": attempt, "status": "error"},
+            )
             raise
         self._charge_llm_attempt(pid, source="llm.completion", context={"usage": dict(getattr(completion, "usage", {}) or {})})
         if getattr(completion, "api", None) == "responses":
@@ -1432,6 +1495,19 @@ class LLMProcessExecutor:
                 completed_at=utc_now(),
             )
         )
+        self.runtime.operations.link_evidence(
+            "llm_call",
+            call_id,
+            "invocation",
+            metadata={"attempt": attempt, "status": "ok"},
+        )
+        if getattr(completion, "request_id", None):
+            self.runtime.operations.link_evidence(
+                "llm_request",
+                str(completion.request_id),
+                "invocation",
+                metadata={"call_id": call_id},
+            )
         self._charge_llm_completion(pid, completion)
         return completion, parallel_tool_calls, auto_wait_on_empty_tool_calls, str(request_options["llm_profile_id"])
 
@@ -1901,10 +1977,36 @@ class LLMProcessExecutor:
         # the blocked primitive can be resumed, preserving the original model
         # decision across runtime restarts and human approval latency.
         selected_resume_token = resume_token or new_id("llmwait")
+        llm_operation = self.runtime.operations.current()
+        tool_operation_id: str | None = None
+        if llm_operation is not None:
+            evidence_id = request_id or child_pid
+            evidence_types = ("human_request",) if request_id else (("process",) if child_pid else ())
+            if evidence_id is not None and evidence_types:
+                candidates = self.runtime.operations.operation_for_evidence(evidence_types, evidence_id)
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.root_operation_id == llm_operation.root_operation_id
+                    and candidate.operation_id != llm_operation.operation_id
+                ]
+                tool_operation_id = self._select_waiting_tool_operation(candidates)
+            if tool_operation_id is None:
+                waiting = [
+                    candidate
+                    for candidate in self.runtime.store.list_operations(
+                        root_operation_id=llm_operation.root_operation_id,
+                        state="waiting",
+                    )
+                    if candidate.operation_id != llm_operation.operation_id
+                ]
+                tool_operation_id = self._select_waiting_tool_operation(waiting)
         self.runtime.store.upsert_llm_pending_action(
             pid,
             {
                 "resume_token": selected_resume_token,
+                "llm_operation_id": llm_operation.operation_id if llm_operation is not None else None,
+                "tool_operation_id": tool_operation_id,
                 "wait_type": wait_type,
                 "request_id": request_id,
                 "child_pid": child_pid,
@@ -1919,6 +2021,19 @@ class LLMProcessExecutor:
             },
         )
         return selected_resume_token
+
+    @staticmethod
+    def _select_waiting_tool_operation(candidates: list[Any]) -> str | None:
+        tool_operations = [
+            candidate
+            for candidate in candidates
+            if candidate.kind.value == "tool_call" and candidate.state.value == "waiting"
+        ]
+        if len(tool_operations) == 1:
+            return tool_operations[0].operation_id
+        if len(candidates) == 1:
+            return candidates[0].operation_id
+        return None
 
     def _clear_pending_action(self, pid: str, resume_token: str) -> None:
         if not self.runtime.store.complete_llm_pending_action(pid, resume_token=resume_token):
@@ -1967,6 +2082,8 @@ class LLMProcessExecutor:
         wait_type = str(pending["wait_type"])
         common = {
             "resume_token": self._pending_resume_token(pending),
+            "llm_operation_id": pending.get("llm_operation_id"),
+            "tool_operation_id": pending.get("tool_operation_id"),
             "action": dict(pending.get("action") or {}),
             "content_preview": str(pending.get("content_preview") or ""),
             "tool_call_count": int(pending.get("tool_call_count") or 0),

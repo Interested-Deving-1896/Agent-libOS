@@ -11,6 +11,10 @@ from agent_libos.storage import RuntimeStore
 class EventBus:
     def __init__(self, store: RuntimeStore):
         self.store = store
+        self.operations: Any | None = None
+
+    def bind_operations(self, operations: Any) -> None:
+        self.operations = operations
 
     def emit(
         self,
@@ -34,6 +38,10 @@ class EventBus:
             causality=causality or {},
         )
         self.store.insert_event(event)
+        if self.operations is not None:
+            self.operations.link_evidence("event", event.event_id, "event")
+            if event.type == EventType.RESOURCE_CHARGED:
+                self.operations.link_evidence("event", event.event_id, "resource_charge")
         return event
 
     def list(self, target: str | None = None) -> builtins.list[Event]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import os
 import re
 import shutil
@@ -42,11 +43,15 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ValidationError
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
+from agent_libos.runtime.authority_manifest_manager import AuthorityManifestManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.external_effects import reconcile_pending_external_effects
+from agent_libos.runtime.explain_manager import ExplainManager
 from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.object_tasks import ObjectTaskManager
+from agent_libos.runtime.operation_manager import OperationManager
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.ratings import AgentRatingManager
 from agent_libos.runtime.resource_manager import ResourceManager
@@ -106,9 +111,15 @@ class Runtime:
         self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
         self.store = store
         self.store.config = self.config
+        self.operations = OperationManager(store)
+        self.store.operation_manager = self.operations
+        self.operations.interrupt_stale_running()
         self.llms = LLMProfileRegistry(self, config=self.config)
         self.audit = AuditManager(store)
         self.events = EventBus(store)
+        self.audit.bind_operations(self.operations)
+        self.events.bind_operations(self.operations)
+        self.explain = ExplainManager(self)
         self.ratings = AgentRatingManager(store, self.audit, config=self.config)
         self.resources = ResourceManager(store, self.audit, self.events)
         self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
@@ -179,6 +190,15 @@ class Runtime:
             resources=self.resources,
         )
         self.images: dict[str, AgentImage] = {}
+        self.authority_manifests = AuthorityManifestManager(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            config=self.config,
+        )
+        self.authority_manifests.bind_runtime(self)
+        self.store.authority_manifest_manager = self.authority_manifests
         self.tools = ToolBroker(
             store,
             self.memory,
@@ -200,6 +220,7 @@ class Runtime:
             config=self.config,
             resources=self.resources,
             llm_profile_resolver=self._resolve_launch_llm_profile_id,
+            authority_manifests=self.authority_manifests,
         )
         self.resources.bind_process_kill_finalizer(self.process.finalize_killed_processes)
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
@@ -252,8 +273,112 @@ class Runtime:
         self.image_registry.load_persisted_images()
         self._rehydrate_registered_jit_tools()
         self.modules.run_startup_hooks()
+        self.reconciled_external_effects = reconcile_pending_external_effects(self.store, self.substrate)
+        self._install_operation_boundaries()
         self._closed = False
         self._shutdown_reason: str | None = None
+
+    def _install_operation_boundaries(self) -> None:
+        """Attach explainable scopes to documented protected public boundaries."""
+
+        boundaries: list[tuple[Any, str, str, str, str, str, tuple[str, ...], bool]] = [
+            # Authorization and provider helpers dynamically add decision/effect expectations.
+            (self.filesystem, "read_text", "primitive", "primitive.filesystem.read_text", "pid", "pid", ("audit",), False),
+            (self.filesystem, "read_bytes", "primitive", "primitive.filesystem.read_bytes", "pid", "pid", ("audit",), False),
+            (self.filesystem, "write_text", "primitive", "primitive.filesystem.write_text", "pid", "pid", ("audit",), False),
+            (self.filesystem, "read_directory", "primitive", "primitive.filesystem.read_directory", "pid", "pid", ("audit",), False),
+            (self.filesystem, "write_directory", "primitive", "primitive.filesystem.write_directory", "pid", "pid", ("audit",), False),
+            (self.filesystem, "delete_file", "primitive", "primitive.filesystem.delete_file", "pid", "pid", ("audit",), False),
+            (self.filesystem, "delete_directory", "primitive", "primitive.filesystem.delete_directory", "pid", "pid", ("audit",), False),
+            (self.shell, "run", "primitive", "primitive.shell.run", "pid", "pid", ("audit",), False),
+            (self.jsonrpc, "call", "primitive", "primitive.jsonrpc.call", "pid", "pid", ("audit",), False),
+            (self.mcp, "list_tools", "primitive", "primitive.mcp.list_tools", "actor", "actor", ("audit",), False),
+            (self.mcp, "call_tool", "primitive", "primitive.mcp.call", "pid", "pid", ("audit",), False),
+            (self.clock, "now", "primitive", "primitive.clock.now", "pid", "pid", ("audit",), False),
+            (self.clock, "sleep", "primitive", "primitive.clock.sleep", "pid", "pid", ("audit",), False),
+            # Process and Object Memory state transitions.
+            (self.process, "spawn", "runtime", "process.spawn", "", "", ("audit",), True),
+            (self.process, "fork", "runtime", "process.fork", "parent", "parent", ("audit",), False),
+            (self.process, "spawn_child", "runtime", "process.spawn_child", "parent", "parent", ("audit",), False),
+            (self.process, "exec", "runtime", "process.exec", "pid", "pid", ("audit",), False),
+            (self.process, "set_working_directory", "runtime", "process.chdir", "pid", "pid", ("audit",), False),
+            (self.process, "signal_child", "runtime", "process.signal_child", "pid", "pid", ("audit",), False),
+            (self.process, "signal", "runtime", "process.signal", "target", "target", ("audit",), False),
+            (self.process, "wait", "runtime", "process.wait", "pid", "pid", ("audit",), False),
+            (self.process, "pause", "runtime", "process.pause", "pid", "pid", ("audit",), False),
+            (self.process, "resume", "runtime", "process.resume", "pid", "pid", ("audit",), False),
+            (self.process, "cancel", "runtime", "process.cancel", "pid", "pid", ("audit",), False),
+            (self.process, "exit", "runtime", "process.exit", "pid", "pid", ("audit",), False),
+            (self.memory, "create_object", "runtime", "memory.create_object", "pid", "pid", ("audit",), False),
+            (self.memory, "update_object", "runtime", "memory.update_object", "pid", "pid", ("audit",), False),
+            (self.memory, "append_object_by_name", "runtime", "memory.append_object", "pid", "pid", ("audit",), False),
+            (self.memory, "link_objects", "runtime", "memory.link_objects", "pid", "pid", ("audit",), False),
+            (self.memory, "create_view", "runtime", "memory.create_view", "pid", "pid", ("audit",), False),
+            (self.memory, "fork_view", "runtime", "memory.fork_view", "parent_pid", "parent_pid", ("audit",), False),
+            (self.memory, "merge_view", "runtime", "memory.merge_view", "parent_pid", "parent_pid", ("audit",), False),
+            (self.memory, "snapshot_view", "runtime", "memory.snapshot_view", "pid", "pid", ("audit",), False),
+            (self.memory, "materialize_context", "runtime", "memory.materialize_context", "pid", "pid", ("audit",), False),
+            # Checkpoints and durable workflow coordination.
+            (self.checkpoint, "create", "runtime", "checkpoint.create", "actor", "pid", ("audit",), False),
+            (self.checkpoint, "inspect", "runtime", "checkpoint.inspect", "actor", "actor", ("audit",), False),
+            (self.checkpoint, "diff", "runtime", "checkpoint.diff", "actor", "actor", ("audit",), False),
+            (self.checkpoint, "restore", "runtime", "checkpoint.restore", "actor", "actor", ("audit",), False),
+            (self.checkpoint, "fork_from_checkpoint", "runtime", "checkpoint.fork", "actor", "actor", ("audit",), False),
+            (self.checkpoint, "replay_to_event", "runtime", "checkpoint.replay", "actor", "actor", ("audit",), False),
+            (self.human, "query", "runtime", "human.query", "pid", "pid", ("audit",), False),
+            (self.human, "request_permission", "runtime", "human.request_permission", "pid", "pid", ("audit",), False),
+            (self.human, "ask", "runtime", "human.ask", "pid", "pid", ("audit",), False),
+            (self.human, "output", "runtime", "human.output", "pid", "pid", ("audit",), False),
+            (self.human, "interrupt", "runtime", "human.interrupt", "pid", "pid", ("audit",), False),
+            (self.human, "send_process_message", "runtime", "human.process_message", "human", "recipient_pid", ("audit",), False),
+            (self.messages, "post", "runtime", "process.message.post", "sender", "recipient_pid", ("audit",), False),
+            (self.messages, "send_from_process", "runtime", "process.message.send", "sender_pid", "sender_pid", ("audit",), False),
+            (self.messages, "receive", "runtime", "process.message.receive", "pid", "pid", ("audit",), False),
+            (self.messages, "ack", "runtime", "process.message.ack", "pid", "pid", ("audit",), False),
+            (self.object_tasks, "start", "runtime", "object_task.start", "pid", "pid", ("audit",), False),
+            (self.object_tasks, "watch_owner", "runtime", "object_task.watch", "actor_pid", "actor_pid", ("audit",), False),
+            (self.object_tasks, "cancel", "runtime", "object_task.cancel", "actor_pid", "actor_pid", ("audit",), False),
+            (self.object_tasks, "wait", "runtime", "object_task.wait", "actor_pid", "actor_pid", ("audit",), False),
+            # Capability, Skill, Image, and remote registry mutations.
+            (self.authority_manifests, "prepare_launch", "runtime", "authority_manifest.bind", "issued_by", "pid", ("audit",), False),
+            (self.capability, "issue", "runtime", "capability.issue", "actor", "subject", ("audit",), False),
+            (self.capability, "delegate", "runtime", "capability.delegate", "parent", "parent", ("audit",), False),
+            (self.capability, "derive_authority", "runtime", "capability.derive_authority", "source_subject", "source_subject", ("audit",), False),
+            (self.capability, "revoke", "runtime", "capability.revoke", "revoked_by", "revoked_by", ("audit",), False),
+            (self.tools, "activate_tool_group", "runtime", "tool_group.activate", "pid", "pid", ("audit",), False),
+            (self.skills, "register_skill_package", "runtime", "skill.register", "actor", "actor", ("audit",), False),
+            (self.skills, "activate_skill", "runtime", "skill.activate", "pid", "pid", ("audit",), False),
+            (self.skills, "unload_skill", "runtime", "skill.unload", "pid", "pid", ("audit",), False),
+            (self.skills, "trust_skill_source", "runtime", "skill.trust", "actor", "actor", ("audit",), False),
+            (self.skills, "untrust_skill_source", "runtime", "skill.untrust", "actor", "actor", ("audit",), False),
+            (self.image_registry, "register", "runtime", "image.register", "actor", "actor", ("audit",), False),
+            (self.image_registry, "register_from_package_files", "runtime", "image.register_package", "actor", "actor", ("audit",), False),
+            (self.image_registry, "commit_from_checkpoint", "runtime", "image.commit", "actor", "actor", ("audit",), False),
+            (self.jsonrpc, "register_endpoint", "runtime", "jsonrpc.register", "actor", "actor", ("audit",), False),
+            (self.jsonrpc, "unregister_endpoint", "runtime", "jsonrpc.unregister", "actor", "actor", ("audit",), False),
+            (self.mcp, "register_server", "runtime", "mcp.register", "actor", "actor", ("audit",), False),
+            (self.mcp, "unregister_server", "runtime", "mcp.unregister", "actor", "actor", ("audit",), False),
+        ]
+        for owner, method_name, kind, name, actor_arg, pid_arg, expected_roles, result_pid in boundaries:
+            method = getattr(owner, method_name, None)
+            if method is None:
+                continue
+            parameters = inspect.signature(method).parameters
+            for role, argument in (("actor", actor_arg), ("pid", pid_arg)):
+                if argument and argument not in parameters:
+                    raise RuntimeError(
+                        f"operation boundary {name} declares unknown {role} argument {argument!r}"
+                    )
+            wrapped = self.operations.protected(
+                kind=kind,
+                name=name,
+                actor_arg=actor_arg,
+                pid_arg=pid_arg,
+                expected_roles=expected_roles,
+                result_pid=result_pid,
+            )(method)
+            setattr(owner, method_name, wrapped)
+        self.explainable_boundary_names = frozenset(name for _, _, _, name, *_ in boundaries)
 
     @classmethod
     def open(
@@ -716,6 +841,7 @@ class Runtime:
         image: str | None = None,
         goal: dict[str, Any] | str | None = None,
         working_directory: str | None = None,
+        authority_manifest: dict[str, Any] | None = None,
     ) -> WorkflowRunResult:
         try:
             asyncio.get_running_loop()
@@ -727,6 +853,7 @@ class Runtime:
                     image=image,
                     goal=goal,
                     working_directory=working_directory,
+                    authority_manifest=authority_manifest,
                 )
             )
         raise RuntimeError("Cannot call run_workflow() inside a running event loop. Use await arun_workflow(...).")
@@ -739,6 +866,7 @@ class Runtime:
         image: str | None = None,
         goal: dict[str, Any] | str | None = None,
         working_directory: str | None = None,
+        authority_manifest: dict[str, Any] | None = None,
     ) -> WorkflowRunResult:
         tool_name = str(tool).strip()
         if not tool_name:
@@ -751,12 +879,18 @@ class Runtime:
             raise ValidationError("workflow args must be a JSON object")
 
         selected_image = image or self.config.runtime.default_image_id
+        workflow_manifest = self._workflow_authority_manifest(
+            selected_image,
+            tool_name,
+            tool_args,
+            authority_manifest,
+        )
         pid = self.process.spawn(
             image=selected_image,
             goal=goal if goal is not None else f"workflow:{tool_name}",
             working_directory=working_directory,
+            authority_manifest=workflow_manifest,
         )
-        self._grant_workflow_tool_authority(pid, selected_image, tool_name, tool_args)
         initial = self.process.get(pid)
         initial_image = initial.image_id
         initial_goal_oid = initial.goal_oid
@@ -849,20 +983,35 @@ class Runtime:
             filters=dict(filters or {}) if filters is not None else None,
         )
 
-    def _grant_workflow_tool_authority(self, pid: str, selected_image: str, tool_name: str, tool_args: dict[str, Any]) -> None:
-        if tool_name != "exec_process":
-            return
+    def _workflow_authority_manifest(
+        self,
+        selected_image: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        supplied: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if supplied is not None:
+            return dict(supplied)
+        authorized: list[dict[str, Any]] = []
         target_image = tool_args.get("image")
-        if not isinstance(target_image, str) or target_image == selected_image:
-            return
-        if target_image not in self.images:
-            return
-        self.capability.grant(
-            pid,
-            self.image_registry.resource_for(target_image),
-            [CapabilityRight.READ],
-            issued_by="workflow",
-        )
+        if (
+            tool_name == "exec_process"
+            and isinstance(target_image, str)
+            and target_image != selected_image
+            and target_image in self.images
+        ):
+            authorized.append(
+                {
+                    "resource": self.image_registry.resource_for(target_image),
+                    "rights": [CapabilityRight.READ.value],
+                }
+            )
+        if not authorized:
+            return None
+        return {
+            "authorized_capabilities": authorized,
+            "metadata": {"provided_by": "workflow_controller", "tool": tool_name},
+        }
 
     def _workflow_result_from_tool_call(
         self,
@@ -1199,37 +1348,26 @@ class Runtime:
                 decision={"image": image_id, "parent_pid": process.parent_pid},
             )
             return
-        if is_checkpoint_commit or is_image_package:
-            self.audit.record(
-                actor="runtime",
-                action="image.required_capabilities_declared_only",
-                target=f"process:{pid}",
-                decision={
-                    "image": image_id,
-                    "required_capabilities": len(image.required_capabilities),
-                    "reason": f"{boot_kind} images never grant external authority automatically",
-                },
-            )
-            return
-        for spec in image.required_capabilities:
-            try:
-                self.capability.grant(
-                    subject=pid,
-                    resource=spec["resource"],
-                    rights=spec.get("rights", []),
-                    issued_by=f"image:{image_id}",
-                    constraints=spec.get("constraints"),
-                    expires_at=spec.get("expires_at"),
-                    delegable=spec.get("delegable", False),
-                    revocable=spec.get("revocable", True),
-                )
-            except Exception as exc:
-                self.audit.record(
-                    actor="runtime",
-                    action="image.default_capability_grant_failed",
-                    target=f"process:{pid}",
-                    decision={"capability": spec, "error": str(exc)},
-                )
+        manifest_summary = self.authority_manifests.summary_for_process(pid)
+        self.audit.record(
+            actor="runtime",
+            action="image.required_capabilities_declared_only",
+            target=f"process:{pid}",
+            decision={
+                "image": image_id,
+                "boot_kind": boot_kind,
+                "required_capabilities": len(image.required_capabilities),
+                "authority_manifest_id": (
+                    manifest_summary.get("manifest_id") if manifest_summary is not None else None
+                ),
+                "missing_required_capabilities": (
+                    manifest_summary.get("missing_required_capabilities", [])
+                    if manifest_summary is not None
+                    else list(image.required_capabilities)
+                ),
+                "reason": "image requirements are declarations; launch manifests own grants",
+            },
+        )
 
     def _require_image(self, image_id: str) -> AgentImage:
         image = self.images.get(image_id)
@@ -1428,7 +1566,14 @@ class Runtime:
 
     def _configure_process_tools_for_image(self, pid: str, image_id: str, assigned_by: str) -> dict[str, str]:
         image = self._require_image(image_id)
-        return self.tools.configure_process_tools(pid, sorted(image.default_tools), assigned_by=assigned_by)
+        full_table = self.tools.configure_process_tools(pid, sorted(image.default_tools), assigned_by=assigned_by)
+        projected = self.tools.initial_tool_projection(image)
+        self.tools.configure_model_tool_projection(
+            pid,
+            sorted(projected),
+            assigned_by=f"{assigned_by}:model_projection",
+        )
+        return full_table
 
     def _configure_process_skills_for_image(self, pid: str, image_id: str, assigned_by: str) -> None:
         process = self.store.get_process(pid)
@@ -2092,6 +2237,7 @@ class Runtime:
         if process is None or not process.loaded_skills:
             return
         updated = dict(process.tool_table)
+        updated_model = dict(process.model_tool_table)
         for loaded in process.loaded_skills.values():
             if not isinstance(loaded, dict):
                 continue
@@ -2102,6 +2248,11 @@ class Runtime:
                 for name, tool_id in mapping.items():
                     if isinstance(name, str) and isinstance(tool_id, str):
                         updated[name] = tool_id
+                        # Skill activation is an explicit visibility action.
+                        # Its tools must enter the model projection even when
+                        # the base image uses lazy built-in tool groups.
+                        updated_model[name] = tool_id
         process.tool_table = updated
+        process.model_tool_table = updated_model
         process.updated_at = utc_now()
         self.store.update_process(process)

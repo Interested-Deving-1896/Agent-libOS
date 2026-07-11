@@ -23,6 +23,7 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityStatus,
     Checkpoint,
+    ContextMaterializationManifest,
     Event,
     EventPriority,
     EventType,
@@ -55,6 +56,11 @@ from agent_libos.models import (
     ObjectTaskOwnerWatch,
     ObjectTaskStatus,
     ObjectType,
+    OperationEvidenceLink,
+    OperationKind,
+    OperationOutcome,
+    OperationRecord,
+    OperationState,
     ProcessStatus,
     PROMPT_MODES,
     ProcessMessage,
@@ -65,6 +71,7 @@ from agent_libos.models import (
     ResourceBudget,
     ResourceReservation,
     ResourceUsage,
+    TaskAuthorityManifest,
     ToolCandidate,
     ToolCandidateStatus,
     ToolHandle,
@@ -113,11 +120,15 @@ class SQLRuntimeStore:
             "object_namespaces",
             "object_links",
             "processes",
+            "authority_manifests",
             "process_resource_reservations",
             "events",
             "capabilities",
             "capability_use_reservations",
             "audit_records",
+            "operations",
+            "operation_evidence",
+            "context_materialization_manifests",
             "external_effects",
             "checkpoints",
             "human_requests",
@@ -273,6 +284,7 @@ class SQLRuntimeStore:
                   capabilities_json TEXT NOT NULL,
                   loaded_skills_json TEXT NOT NULL,
                   tool_table_json TEXT NOT NULL,
+                  model_tool_table_json TEXT NOT NULL DEFAULT '{}',
                   event_cursor TEXT,
                   checkpoint_head TEXT,
                   status_message TEXT,
@@ -283,6 +295,28 @@ class SQLRuntimeStore:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS authority_manifests (
+                  manifest_id TEXT PRIMARY KEY,
+                  pid TEXT NOT NULL UNIQUE,
+                  image_id TEXT NOT NULL,
+                  goal_ref TEXT,
+                  authorized_capabilities_json TEXT NOT NULL,
+                  required_capabilities_json TEXT NOT NULL,
+                  permitted_effects_json TEXT NOT NULL,
+                  resource_budget_json TEXT NOT NULL,
+                  approval_policy_json TEXT NOT NULL,
+                  data_flow_policy_json TEXT NOT NULL,
+                  expires_at TEXT,
+                  issued_by TEXT NOT NULL,
+                  parent_manifest_id TEXT,
+                  manifest_hash TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_authority_manifests_parent
+                  ON authority_manifests(parent_manifest_id, created_at, manifest_id);
 
                 CREATE TABLE IF NOT EXISTS process_resource_reservations (
                   parent_pid TEXT NOT NULL,
@@ -383,7 +417,12 @@ class SQLRuntimeStore:
                   information_flow INTEGER NOT NULL,
                   provider_metadata_json TEXT NOT NULL,
                   created_at TEXT NOT NULL,
-                  effect_state TEXT NOT NULL DEFAULT 'finalized'
+                  effect_state TEXT NOT NULL DEFAULT 'finalized',
+                  transaction_state TEXT NOT NULL DEFAULT 'committed',
+                  canonical_args_hash TEXT,
+                  idempotency_key TEXT,
+                  provider_receipt_json TEXT NOT NULL DEFAULT '{}',
+                  updated_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_external_effects_created
@@ -460,6 +499,8 @@ class SQLRuntimeStore:
                 CREATE TABLE IF NOT EXISTS llm_pending_actions (
                   pid TEXT PRIMARY KEY,
                   resume_token TEXT,
+                  llm_operation_id TEXT,
+                  tool_operation_id TEXT,
                   wait_type TEXT NOT NULL,
                   request_id TEXT,
                   child_pid TEXT,
@@ -668,10 +709,12 @@ class SQLRuntimeStore:
             )
             self._ensure_object_namespace_schema()
             self._ensure_process_schema()
+            self._ensure_authority_manifest_schema()
             self._ensure_resource_reservation_schema()
             self._ensure_capability_schema()
             self._abandon_stale_capability_use_reservations()
             self._ensure_audit_schema()
+            self._ensure_operation_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_object_task_schema()
@@ -1059,10 +1102,10 @@ class SQLRuntimeStore:
             """
             INSERT INTO processes (
                 pid, parent_pid, image_id, status, goal_oid, memory_view_json,
-                capabilities_json, loaded_skills_json, tool_table_json, event_cursor,
+                capabilities_json, loaded_skills_json, tool_table_json, model_tool_table_json, event_cursor,
                 checkpoint_head, status_message, resource_budget_json, resource_usage_json,
                 working_directory, llm_profile_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._process_params(process),
         )
@@ -1073,7 +1116,7 @@ class SQLRuntimeStore:
             UPDATE processes
                SET parent_pid = ?, image_id = ?, status = ?, goal_oid = ?,
                    memory_view_json = ?, capabilities_json = ?, loaded_skills_json = ?,
-                   tool_table_json = ?, event_cursor = ?, checkpoint_head = ?,
+                   tool_table_json = ?, model_tool_table_json = ?, event_cursor = ?, checkpoint_head = ?,
                    status_message = ?, resource_budget_json = ?, resource_usage_json = ?,
                    working_directory = ?, llm_profile_id = ?, created_at = ?, updated_at = ?
              WHERE pid = ?
@@ -1087,6 +1130,7 @@ class SQLRuntimeStore:
                 dumps(process.capabilities),
                 dumps(process.loaded_skills),
                 dumps(process.tool_table),
+                dumps(process.model_tool_table),
                 process.event_cursor,
                 process.checkpoint_head,
                 process.status_message,
@@ -1121,6 +1165,62 @@ class SQLRuntimeStore:
             (parent_pid,),
         )
         return [self._row_to_process(row) for row in rows]
+
+    def insert_authority_manifest(self, manifest: TaskAuthorityManifest) -> None:
+        self._execute(
+            """
+            INSERT INTO authority_manifests (
+                manifest_id, pid, image_id, goal_ref,
+                authorized_capabilities_json, required_capabilities_json,
+                permitted_effects_json, resource_budget_json,
+                approval_policy_json, data_flow_policy_json, expires_at,
+                issued_by, parent_manifest_id, manifest_hash, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                manifest.manifest_id,
+                manifest.pid,
+                manifest.image_id,
+                manifest.goal_ref,
+                dumps(manifest.authorized_capabilities),
+                dumps(manifest.required_capabilities),
+                dumps(manifest.permitted_effects),
+                dumps(manifest.resource_budget),
+                dumps(manifest.approval_policy),
+                dumps(manifest.data_flow_policy),
+                manifest.expires_at,
+                manifest.issued_by,
+                manifest.parent_manifest_id,
+                manifest.manifest_hash,
+                dumps(manifest.metadata),
+                manifest.created_at,
+            ),
+        )
+
+    def get_authority_manifest(self, manifest_id: str) -> TaskAuthorityManifest | None:
+        rows = self._query("SELECT * FROM authority_manifests WHERE manifest_id = ?", (manifest_id,))
+        return self._row_to_authority_manifest(rows[0]) if rows else None
+
+    def get_authority_manifest_for_process(self, pid: str) -> TaskAuthorityManifest | None:
+        rows = self._query("SELECT * FROM authority_manifests WHERE pid = ?", (pid,))
+        return self._row_to_authority_manifest(rows[0]) if rows else None
+
+    def list_authority_manifests(
+        self,
+        *,
+        parent_manifest_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[TaskAuthorityManifest]:
+        params: list[Any] = []
+        where = ""
+        if parent_manifest_id is not None:
+            where = " WHERE parent_manifest_id = ?"
+            params.append(parent_manifest_id)
+        sql = f"SELECT * FROM authority_manifests{where} ORDER BY created_at, manifest_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._row_to_authority_manifest(row) for row in self._query(sql, params)]
 
     def claim_runnable_process(self, pid: str) -> AgentProcess | None:
         now = utc_now()
@@ -1308,6 +1408,10 @@ class SQLRuntimeStore:
             )
         return [self._row_to_event(row) for row in rows]
 
+    def get_event(self, event_id: str) -> Event | None:
+        rows = self._query("SELECT * FROM events WHERE event_id = ?", (event_id,))
+        return self._row_to_event(rows[0]) if rows else None
+
     def insert_capability(self, cap: Capability) -> None:
         self._execute(
             """
@@ -1494,6 +1598,13 @@ class SQLRuntimeStore:
             rows = list(cur.execute("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,)))
             return self._row_to_capability(rows[0]) if rows else None
 
+    def get_capability_use_reservation(self, reservation_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM capability_use_reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+        return dict(rows[0]) if rows else None
+
     def update_capability(self, cap: Capability) -> None:
         sql = """
             UPDATE capabilities
@@ -1607,14 +1718,244 @@ class SQLRuntimeStore:
         )
         return [self._row_to_audit(row) for row in rows]
 
+    def get_audit(self, record_id: str) -> AuditRecord | None:
+        rows = self._query("SELECT * FROM audit_records WHERE record_id = ?", (record_id,))
+        return self._row_to_audit(rows[0]) if rows else None
+
+    def insert_operation(self, record: OperationRecord) -> None:
+        self._execute(
+            """
+            INSERT INTO operations (
+                operation_id, root_operation_id, parent_operation_id, kind, name,
+                actor, pid, state, outcome, expected_roles_json, metadata_json,
+                started_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.operation_id,
+                record.root_operation_id,
+                record.parent_operation_id,
+                record.kind.value,
+                record.name,
+                record.actor,
+                record.pid,
+                record.state.value,
+                record.outcome.value,
+                dumps(record.expected_roles),
+                dumps(record.metadata),
+                record.started_at,
+                record.updated_at,
+                record.completed_at,
+            ),
+        )
+
+    def get_operation(self, operation_id: str) -> OperationRecord | None:
+        rows = self._query("SELECT * FROM operations WHERE operation_id = ?", (operation_id,))
+        return self._row_to_operation(rows[0]) if rows else None
+
+    def list_operations(
+        self,
+        *,
+        pid: str | None = None,
+        root_operation_id: str | None = None,
+        roots_only: bool = False,
+        state: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> list[OperationRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if pid is not None:
+            clauses.append("pid = ?")
+            params.append(pid)
+        if root_operation_id is not None:
+            clauses.append("root_operation_id = ?")
+            params.append(root_operation_id)
+        if roots_only:
+            clauses.append("parent_operation_id IS NULL")
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(str(state))
+        if cursor is not None:
+            cursor_row = self.get_operation(cursor)
+            if cursor_row is None:
+                return []
+            clauses.append("(started_at < ? OR (started_at = ? AND operation_id < ?))")
+            params.extend((cursor_row.started_at, cursor_row.started_at, cursor_row.operation_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM operations{where} ORDER BY started_at DESC, operation_id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        return [self._row_to_operation(row) for row in self._query(sql, params)]
+
+    def update_operation(
+        self,
+        record: OperationRecord,
+        *,
+        expected_states: Iterable[str] | None = None,
+    ) -> bool:
+        params: list[Any] = [
+            record.root_operation_id,
+            record.parent_operation_id,
+            record.kind.value,
+            record.name,
+            record.actor,
+            record.pid,
+            record.state.value,
+            record.outcome.value,
+            dumps(record.expected_roles),
+            dumps(record.metadata),
+            record.started_at,
+            record.updated_at,
+            record.completed_at,
+            record.operation_id,
+        ]
+        where = "operation_id = ?"
+        selected_states = sorted({str(value) for value in expected_states or []})
+        if selected_states:
+            placeholders = ", ".join("?" for _ in selected_states)
+            where += f" AND state IN ({placeholders})"
+            params.extend(selected_states)
+        cursor = self._execute(
+            f"""
+            UPDATE operations
+               SET root_operation_id = ?, parent_operation_id = ?, kind = ?, name = ?,
+                   actor = ?, pid = ?, state = ?, outcome = ?, expected_roles_json = ?,
+                   metadata_json = ?, started_at = ?, updated_at = ?, completed_at = ?
+             WHERE {where}
+            """,
+            params,
+        )
+        return cursor.rowcount == 1
+
+    def insert_operation_evidence(self, link: OperationEvidenceLink) -> bool:
+        cursor = self._execute(
+            """
+            INSERT INTO operation_evidence (
+                link_id, operation_id, evidence_type, evidence_id, role, created_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(operation_id, evidence_type, evidence_id, role) DO NOTHING
+            """,
+            (
+                link.link_id,
+                link.operation_id,
+                link.evidence_type,
+                link.evidence_id,
+                link.role,
+                link.created_at,
+                dumps(link.metadata),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def list_operation_evidence(
+        self,
+        *,
+        operation_ids: Iterable[str] | None = None,
+        evidence_types: Iterable[str] | None = None,
+        evidence_id: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> list[OperationEvidenceLink]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        selected_operations = sorted({str(value) for value in operation_ids or []})
+        if operation_ids is not None:
+            if not selected_operations:
+                return []
+            placeholders = ", ".join("?" for _ in selected_operations)
+            clauses.append(f"operation_id IN ({placeholders})")
+            params.extend(selected_operations)
+        selected_types = sorted({str(value) for value in evidence_types or []})
+        if evidence_types is not None:
+            if not selected_types:
+                return []
+            placeholders = ", ".join("?" for _ in selected_types)
+            clauses.append(f"evidence_type IN ({placeholders})")
+            params.extend(selected_types)
+        if evidence_id is not None:
+            clauses.append("evidence_id = ?")
+            params.append(evidence_id)
+        if cursor is not None:
+            cursor_rows = self._query("SELECT * FROM operation_evidence WHERE link_id = ?", (cursor,))
+            if not cursor_rows:
+                return []
+            cursor_row = cursor_rows[0]
+            clauses.append("(created_at > ? OR (created_at = ? AND link_id > ?))")
+            params.extend((cursor_row["created_at"], cursor_row["created_at"], cursor_row["link_id"]))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM operation_evidence{where} ORDER BY created_at, link_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        return [self._row_to_operation_evidence(row) for row in self._query(sql, params)]
+
+    def insert_context_materialization_manifest(self, manifest: ContextMaterializationManifest) -> None:
+        self._execute(
+            """
+            INSERT INTO context_materialization_manifests (
+                materialization_id, pid, view_id, policy, budget_tokens, rendered_tokens,
+                rendered_sha256, context_generation, context_oid, context_version,
+                objects_json, compaction_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                manifest.materialization_id,
+                manifest.pid,
+                manifest.view_id,
+                manifest.policy,
+                manifest.budget_tokens,
+                manifest.rendered_tokens,
+                manifest.rendered_sha256,
+                manifest.context_generation,
+                manifest.context_oid,
+                manifest.context_version,
+                dumps(manifest.objects),
+                dumps(manifest.compaction),
+                manifest.created_at,
+            ),
+        )
+
+    def get_context_materialization_manifest(
+        self,
+        materialization_id: str,
+    ) -> ContextMaterializationManifest | None:
+        rows = self._query(
+            "SELECT * FROM context_materialization_manifests WHERE materialization_id = ?",
+            (materialization_id,),
+        )
+        return self._row_to_context_materialization_manifest(rows[0]) if rows else None
+
+    def list_context_materialization_manifests(
+        self,
+        *,
+        pid: str | None = None,
+        limit: int | None = None,
+    ) -> list[ContextMaterializationManifest]:
+        params: list[Any] = []
+        where = ""
+        if pid is not None:
+            where = " WHERE pid = ?"
+            params.append(pid)
+        sql = (
+            "SELECT * FROM context_materialization_manifests"
+            f"{where} ORDER BY created_at DESC, materialization_id DESC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        return [self._row_to_context_materialization_manifest(row) for row in self._query(sql, params)]
+
     def insert_external_effect(self, record: ExternalEffectRecord) -> None:
         self._execute(
             """
             INSERT INTO external_effects (
                 effect_id, record_id, event_id, pid, provider, operation, target,
                 rollback_class, rollback_status, state_mutation, information_flow,
-                provider_metadata_json, created_at, effect_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_metadata_json, created_at, effect_state, transaction_state,
+                canonical_args_hash, idempotency_key, provider_receipt_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.effect_id,
@@ -1631,6 +1972,11 @@ class SQLRuntimeStore:
                 dumps(record.provider_metadata),
                 record.created_at,
                 record.effect_state,
+                record.transaction_state,
+                record.canonical_args_hash,
+                record.idempotency_key,
+                dumps(record.provider_receipt),
+                record.updated_at or record.created_at,
             ),
         )
 
@@ -1644,7 +1990,8 @@ class SQLRuntimeStore:
             UPDATE external_effects
                SET record_id = ?, event_id = ?, rollback_class = ?, rollback_status = ?,
                    state_mutation = ?, information_flow = ?, provider_metadata_json = ?, created_at = ?,
-                   effect_state = ?
+                   effect_state = ?, transaction_state = ?, canonical_args_hash = ?,
+                   idempotency_key = ?, provider_receipt_json = ?, updated_at = ?
              WHERE effect_id = ?
                AND pid = ?
                AND provider = ?
@@ -1666,6 +2013,11 @@ class SQLRuntimeStore:
                 dumps(record.provider_metadata),
                 record.created_at,
                 record.effect_state,
+                record.transaction_state,
+                record.canonical_args_hash,
+                record.idempotency_key,
+                dumps(record.provider_receipt),
+                record.updated_at or record.created_at,
                 intent_effect_id,
                 record.pid,
                 record.provider,
@@ -1674,6 +2026,41 @@ class SQLRuntimeStore:
                 record.target,
                 ExternalEffectRollbackClass.UNKNOWN.value,
                 ExternalEffectRollbackStatus.UNKNOWN.value,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def transition_external_effect(
+        self,
+        effect_id: str,
+        *,
+        expected_states: Iterable[str],
+        transaction_state: str,
+        provider_metadata: dict[str, Any] | None = None,
+        provider_receipt: dict[str, Any] | None = None,
+        updated_at: str,
+    ) -> bool:
+        states = list(dict.fromkeys(str(state) for state in expected_states))
+        if not states:
+            raise ValidationError("external effect transition requires expected states")
+        current = self.get_external_effect(effect_id)
+        if current is None or current.transaction_state not in states:
+            return False
+        placeholders = ", ".join("?" for _ in states)
+        cursor = self._execute(
+            f"""
+            UPDATE external_effects
+               SET transaction_state = ?, provider_metadata_json = ?,
+                   provider_receipt_json = ?, updated_at = ?
+             WHERE effect_id = ? AND transaction_state IN ({placeholders})
+            """,
+            (
+                transaction_state,
+                dumps(provider_metadata if provider_metadata is not None else current.provider_metadata),
+                dumps(provider_receipt if provider_receipt is not None else current.provider_receipt),
+                updated_at,
+                effect_id,
+                *states,
             ),
         )
         return cursor.rowcount == 1
@@ -1725,6 +2112,10 @@ class SQLRuntimeStore:
             params,
         )
         return [self._row_to_external_effect(row) for row in rows]
+
+    def get_external_effect(self, effect_id: str) -> ExternalEffectRecord | None:
+        rows = self._query("SELECT * FROM external_effects WHERE effect_id = ?", (effect_id,))
+        return self._row_to_external_effect(rows[0]) if rows else None
 
     def insert_human_request(self, request: HumanRequest) -> None:
         self._execute(
@@ -1844,6 +2235,10 @@ class SQLRuntimeStore:
         params.append(selected_limit)
         return [self._row_to_llm_call(row) for row in self._query(sql, params)]
 
+    def get_llm_call(self, call_id: str) -> LLMCallRecord | None:
+        rows = self._query("SELECT * FROM llm_calls WHERE call_id = ?", (call_id,))
+        return self._row_to_llm_call(rows[0]) if rows else None
+
     def get_latest_llm_call(self, *, pid: str, purpose: str | None = None) -> LLMCallRecord | None:
         params: list[Any] = [pid]
         sql = "SELECT * FROM llm_calls WHERE pid = ?"
@@ -1929,12 +2324,15 @@ class SQLRuntimeStore:
         self._execute(
             """
             INSERT INTO llm_pending_actions (
-                pid, resume_token, wait_type, request_id, child_pid, response_id, tool_call_id, tool_name,
+                pid, resume_token, llm_operation_id, tool_operation_id,
+                wait_type, request_id, child_pid, response_id, tool_call_id, tool_name,
                 filters_json, action_json,
                 content_preview, tool_call_count, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pid) DO UPDATE SET
                 resume_token = excluded.resume_token,
+                llm_operation_id = excluded.llm_operation_id,
+                tool_operation_id = excluded.tool_operation_id,
                 wait_type = excluded.wait_type,
                 request_id = excluded.request_id,
                 child_pid = excluded.child_pid,
@@ -1951,6 +2349,8 @@ class SQLRuntimeStore:
             (
                 pid,
                 resume_token,
+                pending.get("llm_operation_id"),
+                pending.get("tool_operation_id"),
                 str(pending["wait_type"]),
                 pending.get("request_id"),
                 pending.get("child_pid"),
@@ -2805,11 +3205,47 @@ class SQLRuntimeStore:
                     "UPDATE processes SET llm_profile_id = ? WHERE llm_profile_id = 'default'",
                     (self.config.llm.default_profile_id,),
                 )
+        if "model_tool_table_json" not in columns:
+            self.conn.execute(
+                "ALTER TABLE processes ADD COLUMN model_tool_table_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            self.conn.execute(
+                "UPDATE processes SET model_tool_table_json = tool_table_json "
+                "WHERE model_tool_table_json = '{}'"
+            )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_processes_status_created ON processes(status, created_at, pid)"
         )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_processes_parent_created ON processes(parent_pid, created_at, pid)"
+        )
+
+    def _ensure_authority_manifest_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS authority_manifests (
+              manifest_id TEXT PRIMARY KEY,
+              pid TEXT NOT NULL UNIQUE,
+              image_id TEXT NOT NULL,
+              goal_ref TEXT,
+              authorized_capabilities_json TEXT NOT NULL,
+              required_capabilities_json TEXT NOT NULL,
+              permitted_effects_json TEXT NOT NULL,
+              resource_budget_json TEXT NOT NULL,
+              approval_policy_json TEXT NOT NULL,
+              data_flow_policy_json TEXT NOT NULL,
+              expires_at TEXT,
+              issued_by TEXT NOT NULL,
+              parent_manifest_id TEXT,
+              manifest_hash TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_authority_manifests_parent "
+            "ON authority_manifests(parent_manifest_id, created_at, manifest_id)"
         )
 
     def _ensure_resource_reservation_schema(self) -> None:
@@ -2889,6 +3325,73 @@ class SQLRuntimeStore:
             "CREATE INDEX IF NOT EXISTS idx_audit_records_correlation_created ON audit_records(correlation_id, timestamp, record_id)"
         )
 
+    def _ensure_operation_schema(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS operations (
+              operation_id TEXT PRIMARY KEY,
+              root_operation_id TEXT NOT NULL,
+              parent_operation_id TEXT,
+              kind TEXT NOT NULL,
+              name TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              pid TEXT,
+              state TEXT NOT NULL,
+              outcome TEXT NOT NULL,
+              expected_roles_json TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_operations_pid_started
+              ON operations(pid, started_at, operation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_operations_root_started
+              ON operations(root_operation_id, started_at, operation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_operations_state_updated
+              ON operations(state, updated_at, operation_id);
+
+            CREATE TABLE IF NOT EXISTS operation_evidence (
+              link_id TEXT PRIMARY KEY,
+              operation_id TEXT NOT NULL,
+              evidence_type TEXT NOT NULL,
+              evidence_id TEXT NOT NULL,
+              role TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              UNIQUE(operation_id, evidence_type, evidence_id, role)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_operation_evidence_operation_created
+              ON operation_evidence(operation_id, created_at, link_id);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_evidence_lookup
+              ON operation_evidence(evidence_type, evidence_id, operation_id);
+
+            CREATE TABLE IF NOT EXISTS context_materialization_manifests (
+              materialization_id TEXT PRIMARY KEY,
+              pid TEXT NOT NULL,
+              view_id TEXT NOT NULL,
+              policy TEXT NOT NULL,
+              budget_tokens INTEGER NOT NULL,
+              rendered_tokens INTEGER NOT NULL,
+              rendered_sha256 TEXT NOT NULL,
+              context_generation TEXT,
+              context_oid TEXT,
+              context_version INTEGER,
+              objects_json TEXT NOT NULL,
+              compaction_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_context_manifests_pid_created
+              ON context_materialization_manifests(pid, created_at, materialization_id);
+            """
+        )
+
     def _ensure_llm_call_schema(self) -> None:
         self.conn.execute(
             """
@@ -2928,6 +3431,8 @@ class SQLRuntimeStore:
             CREATE TABLE IF NOT EXISTS llm_pending_actions (
               pid TEXT PRIMARY KEY,
               resume_token TEXT,
+              llm_operation_id TEXT,
+              tool_operation_id TEXT,
               wait_type TEXT NOT NULL,
               request_id TEXT,
               child_pid TEXT,
@@ -2947,6 +3452,10 @@ class SQLRuntimeStore:
         pending_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(llm_pending_actions)")}
         if "resume_token" not in pending_columns:
             self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN resume_token TEXT")
+        if "llm_operation_id" not in pending_columns:
+            self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN llm_operation_id TEXT")
+        if "tool_operation_id" not in pending_columns:
+            self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN tool_operation_id TEXT")
         if "response_id" not in pending_columns:
             self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN response_id TEXT")
         if "tool_call_id" not in pending_columns:
@@ -3104,7 +3613,12 @@ class SQLRuntimeStore:
               information_flow INTEGER NOT NULL,
               provider_metadata_json TEXT NOT NULL,
               created_at TEXT NOT NULL,
-              effect_state TEXT NOT NULL DEFAULT 'finalized'
+              effect_state TEXT NOT NULL DEFAULT 'finalized',
+              transaction_state TEXT NOT NULL DEFAULT 'committed',
+              canonical_args_hash TEXT,
+              idempotency_key TEXT,
+              provider_receipt_json TEXT NOT NULL DEFAULT '{}',
+              updated_at TEXT
             )
             """
         )
@@ -3119,6 +3633,24 @@ class SQLRuntimeStore:
             self.conn.execute(
                 "ALTER TABLE external_effects ADD COLUMN effect_state TEXT NOT NULL DEFAULT 'finalized'"
             )
+        if "transaction_state" not in columns:
+            self.conn.execute(
+                "ALTER TABLE external_effects ADD COLUMN transaction_state TEXT NOT NULL DEFAULT 'committed'"
+            )
+        if "canonical_args_hash" not in columns:
+            self.conn.execute("ALTER TABLE external_effects ADD COLUMN canonical_args_hash TEXT")
+        if "idempotency_key" not in columns:
+            self.conn.execute("ALTER TABLE external_effects ADD COLUMN idempotency_key TEXT")
+        if "provider_receipt_json" not in columns:
+            self.conn.execute(
+                "ALTER TABLE external_effects ADD COLUMN provider_receipt_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "updated_at" not in columns:
+            self.conn.execute("ALTER TABLE external_effects ADD COLUMN updated_at TEXT")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_effects_pid_idempotency "
+            "ON external_effects(pid, idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
 
     def _ensure_skill_schema(self) -> None:
         self.conn.executescript(
@@ -3561,6 +4093,7 @@ class SQLRuntimeStore:
             dumps(process.capabilities),
             dumps(process.loaded_skills),
             dumps(process.tool_table),
+            dumps(process.model_tool_table),
             process.event_cursor,
             process.checkpoint_head,
             process.status_message,
@@ -3681,6 +4214,12 @@ class SQLRuntimeStore:
                 capabilities=loads(row["capabilities_json"], []),
                 loaded_skills=loads(row["loaded_skills_json"], {}),
                 tool_table=loads(row["tool_table_json"], {}),
+                model_tool_table=loads(
+                    row["model_tool_table_json"]
+                    if "model_tool_table_json" in row.keys()
+                    else row["tool_table_json"],
+                    {},
+                ),
                 event_cursor=row["event_cursor"],
                 checkpoint_head=row["checkpoint_head"],
                 resource_budget=ResourceBudget(**loads(row["resource_budget_json"], {})),
@@ -3696,6 +4235,27 @@ class SQLRuntimeStore:
                     if "llm_profile_id" in row.keys() and row["llm_profile_id"]
                     else self.config.llm.default_profile_id
                 ),
+            )
+
+    def _row_to_authority_manifest(self, row: sqlite3.Row) -> TaskAuthorityManifest:
+        with _persisted_model_decode(f"authority manifest {row['manifest_id']}"):
+            return TaskAuthorityManifest(
+                manifest_id=str(row["manifest_id"]),
+                pid=str(row["pid"]),
+                image_id=str(row["image_id"]),
+                goal_ref=row["goal_ref"],
+                authorized_capabilities=loads(row["authorized_capabilities_json"], []),
+                required_capabilities=loads(row["required_capabilities_json"], []),
+                permitted_effects=loads(row["permitted_effects_json"], []),
+                resource_budget=loads(row["resource_budget_json"], {}),
+                approval_policy=loads(row["approval_policy_json"], {}),
+                data_flow_policy=loads(row["data_flow_policy_json"], {}),
+                expires_at=row["expires_at"],
+                issued_by=str(row["issued_by"]),
+                parent_manifest_id=row["parent_manifest_id"],
+                manifest_hash=str(row["manifest_hash"]),
+                metadata=loads(row["metadata_json"], {}),
+                created_at=str(row["created_at"]),
             )
 
     def _row_to_resource_reservation(self, row: sqlite3.Row) -> ResourceReservation:
@@ -3768,6 +4328,56 @@ class SQLRuntimeStore:
             parent_record_id=row["parent_record_id"],
         )
 
+    def _row_to_operation(self, row: sqlite3.Row) -> OperationRecord:
+        with _persisted_model_decode(f"operation {row['operation_id']}"):
+            return OperationRecord(
+                operation_id=row["operation_id"],
+                root_operation_id=row["root_operation_id"],
+                parent_operation_id=row["parent_operation_id"],
+                kind=OperationKind(row["kind"]),
+                name=row["name"],
+                actor=row["actor"],
+                pid=row["pid"],
+                state=OperationState(row["state"]),
+                outcome=OperationOutcome(row["outcome"]),
+                expected_roles=loads(row["expected_roles_json"], []),
+                metadata=loads(row["metadata_json"], {}),
+                started_at=row["started_at"],
+                updated_at=row["updated_at"],
+                completed_at=row["completed_at"],
+            )
+
+    def _row_to_operation_evidence(self, row: sqlite3.Row) -> OperationEvidenceLink:
+        return OperationEvidenceLink(
+            link_id=row["link_id"],
+            operation_id=row["operation_id"],
+            evidence_type=row["evidence_type"],
+            evidence_id=row["evidence_id"],
+            role=row["role"],
+            created_at=row["created_at"],
+            metadata=loads(row["metadata_json"], {}),
+        )
+
+    def _row_to_context_materialization_manifest(
+        self,
+        row: sqlite3.Row,
+    ) -> ContextMaterializationManifest:
+        return ContextMaterializationManifest(
+            materialization_id=row["materialization_id"],
+            pid=row["pid"],
+            view_id=row["view_id"],
+            policy=row["policy"],
+            budget_tokens=int(row["budget_tokens"]),
+            rendered_tokens=int(row["rendered_tokens"]),
+            rendered_sha256=row["rendered_sha256"],
+            context_generation=row["context_generation"],
+            context_oid=row["context_oid"],
+            context_version=(int(row["context_version"]) if row["context_version"] is not None else None),
+            objects=loads(row["objects_json"], []),
+            compaction=loads(row["compaction_json"], {}),
+            created_at=row["created_at"],
+        )
+
     def _row_to_external_effect(self, row: sqlite3.Row) -> ExternalEffectRecord:
         with _persisted_model_decode(f"external effect {row['effect_id']}"):
             return ExternalEffectRecord(
@@ -3785,6 +4395,19 @@ class SQLRuntimeStore:
                 provider_metadata=loads(row["provider_metadata_json"], {}),
                 created_at=row["created_at"],
                 effect_state=str(row["effect_state"]),
+                transaction_state=(
+                    str(row["transaction_state"])
+                    if "transaction_state" in row.keys()
+                    else ("prepared" if str(row["effect_state"]) == "pending" else "committed")
+                ),
+                canonical_args_hash=(row["canonical_args_hash"] if "canonical_args_hash" in row.keys() else None),
+                idempotency_key=(row["idempotency_key"] if "idempotency_key" in row.keys() else None),
+                provider_receipt=(
+                    loads(row["provider_receipt_json"], {})
+                    if "provider_receipt_json" in row.keys()
+                    else {}
+                ),
+                updated_at=(row["updated_at"] if "updated_at" in row.keys() else row["created_at"]),
             )
 
     def _row_to_checkpoint(self, row: sqlite3.Row) -> Checkpoint:
@@ -3842,6 +4465,8 @@ class SQLRuntimeStore:
         return {
             "pid": row["pid"],
             "resume_token": row["resume_token"] if "resume_token" in row.keys() else None,
+            "llm_operation_id": row["llm_operation_id"] if "llm_operation_id" in row.keys() else None,
+            "tool_operation_id": row["tool_operation_id"] if "tool_operation_id" in row.keys() else None,
             "wait_type": row["wait_type"],
             "request_id": row["request_id"],
             "child_pid": row["child_pid"],

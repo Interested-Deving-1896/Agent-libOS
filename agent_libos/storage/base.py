@@ -141,6 +141,18 @@ class RuntimeStore(Protocol):
     def list_child_processes(self, parent_pid: str) -> list[Any]:
         ...
 
+    def insert_authority_manifest(self, manifest: Any) -> None:
+        ...
+
+    def get_authority_manifest(self, manifest_id: str) -> Any | None:
+        ...
+
+    def get_authority_manifest_for_process(self, pid: str) -> Any | None:
+        ...
+
+    def list_authority_manifests(self, **filters: Any) -> list[Any]:
+        ...
+
     def upsert_resource_reservation(self, reservation: Any) -> None:
         ...
 
@@ -178,6 +190,9 @@ class RuntimeStore(Protocol):
     def list_events(self, target: str | None = None) -> list[Any]:
         ...
 
+    def get_event(self, event_id: str) -> Any | None:
+        ...
+
     def insert_capability(self, cap: Any) -> None:
         ...
 
@@ -202,6 +217,9 @@ class RuntimeStore(Protocol):
     def restore_capability_use_reservation(self, reservation_id: str, *, updated_at: str) -> Any | None:
         ...
 
+    def get_capability_use_reservation(self, reservation_id: str) -> dict[str, Any] | None:
+        ...
+
     def update_capability(self, cap: Any) -> None:
         ...
 
@@ -217,16 +235,61 @@ class RuntimeStore(Protocol):
     def list_audit(self, **filters: Any) -> list[Any]:
         ...
 
+    def get_audit(self, record_id: str) -> Any | None:
+        ...
+
+    def insert_operation(self, record: Any) -> None:
+        ...
+
+    def get_operation(self, operation_id: str) -> Any | None:
+        ...
+
+    def list_operations(self, **filters: Any) -> list[Any]:
+        ...
+
+    def update_operation(self, record: Any, *, expected_states: Iterable[str] | None = None) -> bool:
+        ...
+
+    def insert_operation_evidence(self, link: Any) -> bool:
+        ...
+
+    def list_operation_evidence(self, **filters: Any) -> list[Any]:
+        ...
+
+    def insert_context_materialization_manifest(self, manifest: Any) -> None:
+        ...
+
+    def get_context_materialization_manifest(self, materialization_id: str) -> Any | None:
+        ...
+
+    def list_context_materialization_manifests(self, **filters: Any) -> list[Any]:
+        ...
+
     def insert_external_effect(self, record: Any) -> None:
         ...
 
     def finalize_external_effect(self, intent_effect_id: str, record: Any) -> bool:
         ...
 
+    def transition_external_effect(
+        self,
+        effect_id: str,
+        *,
+        expected_states: Iterable[str],
+        transaction_state: str,
+        provider_metadata: dict[str, Any] | None = None,
+        provider_receipt: dict[str, Any] | None = None,
+        updated_at: str,
+    ) -> bool:
+        ...
+
     def abandon_external_effect_intent(self, effect_id: str) -> bool:
         ...
 
     def list_external_effects(self, **filters: Any) -> list[Any]:
+        ...
+
+    def get_external_effect(self, effect_id: str) -> Any | None:
         ...
 
     def insert_human_request(self, request: Any) -> None:
@@ -245,6 +308,9 @@ class RuntimeStore(Protocol):
         ...
 
     def list_llm_calls(self, pid: str | None = None, limit: int | None = None) -> list[Any]:
+        ...
+
+    def get_llm_call(self, call_id: str) -> Any | None:
         ...
 
     def get_latest_llm_call(self, *, pid: str, purpose: str | None = None) -> Any | None:

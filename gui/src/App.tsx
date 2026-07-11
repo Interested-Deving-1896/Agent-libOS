@@ -44,6 +44,7 @@ export function App() {
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [explainLookup, setExplainLookup] = useState<{ kind: string; id: string; nonce: number } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -415,6 +416,7 @@ export function App() {
                 llmCalls={snapshot?.llm_calls ?? []}
                 events={snapshot?.events ?? []}
                 audit={snapshot?.audit ?? []}
+                onExplainEvidence={(kind, id) => setExplainLookup({ kind, id, nonce: Date.now() })}
               />
 
               <div className="composer">
@@ -455,6 +457,19 @@ export function App() {
                   if (!client) throw new Error(t("app.clientUnavailable"));
                   return client.inspectImage(imageId);
                 }}
+                onListOperations={(pid, cursor) => {
+                  if (!client) throw new Error(t("app.clientUnavailable"));
+                  return client.listOperations(pid, 100, cursor);
+                }}
+                onExplainOperation={(operationId, cursor) => {
+                  if (!client) throw new Error(t("app.clientUnavailable"));
+                  return client.explainOperation(operationId, 200, cursor);
+                }}
+                onResolveOperation={(kind, id) => {
+                  if (!client) throw new Error(t("app.clientUnavailable"));
+                  return client.resolveOperation(kind, id);
+                }}
+                explainLookup={explainLookup}
               />
             </section>
           </main>

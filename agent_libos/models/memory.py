@@ -99,6 +99,12 @@ class ObjectMetadata:
     indexes: list[str] = field(default_factory=list)
     sensitivity: str = field(default_factory=lambda: DEFAULT_CONFIG.memory.metadata_sensitivity)
     retention_policy: str = field(default_factory=lambda: DEFAULT_CONFIG.memory.metadata_retention_policy)
+    trust_level: str = "unknown"
+    integrity: str = "unknown"
+    origin: str | None = "local"
+    tenant: str | None = None
+    principal: str | None = None
+    declassification_authority: str | None = None
 
 
 @dataclass
@@ -106,6 +112,7 @@ class Provenance:
     source_refs: list[str] = field(default_factory=list)
     created_from_action: str | None = None
     parent_oids: list[OID] = field(default_factory=list)
+    source_operation_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -224,3 +231,7 @@ class MaterializedContext:
     token_count: int
     omitted_objects: list[OID]
     policy_used: str
+    materialization_id: str | None = None
+    view_id: str | None = None
+    budget_tokens: int | None = None
+    object_manifest: list[dict[str, Any]] = field(default_factory=list)

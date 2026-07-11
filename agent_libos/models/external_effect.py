@@ -45,7 +45,23 @@ class ExternalEffectRecord:
     provider_metadata: dict[str, Any]
     created_at: str
     effect_state: str = "finalized"
+    transaction_state: str = "committed"
+    canonical_args_hash: str | None = None
+    idempotency_key: str | None = None
+    provider_receipt: dict[str, Any] = field(default_factory=dict)
+    updated_at: str | None = None
 
     def __post_init__(self) -> None:
         if self.effect_state not in {"pending", "finalized"}:
             raise ValueError(f"invalid external effect state: {self.effect_state!r}")
+        if self.transaction_state not in {
+            "prepared",
+            "authorized",
+            "approved",
+            "dispatched",
+            "committed",
+            "failed",
+            "unknown",
+            "compensated",
+        }:
+            raise ValueError(f"invalid external effect transaction state: {self.transaction_state!r}")

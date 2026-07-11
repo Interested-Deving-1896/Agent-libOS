@@ -147,6 +147,48 @@ class TestGuiServer:
         assert any((profile['profile_id'] == 'gui-spawn' for profile in snapshot['llm_profiles']))
         assert any((image['image_id'] == 'base-agent:v0' for image in snapshot['images']))
 
+    def test_operation_list_detail_and_evidence_resolution_endpoints(self) -> None:
+        status, created = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'explain endpoint', 'image': 'base-agent:v0', 'auto_run': False},
+        )
+        assert status == 200
+        pid = created['pid']
+
+        status, listed = self.request('GET', f'/api/operations?pid={pid}&limit=100')
+        assert status == 200
+        operation = next(item for item in listed['operations'] if item['name'] == 'process.spawn')
+        status, explained = self.request('GET', f"/api/operations/{operation['operation_id']}")
+        assert status == 200
+        assert explained['root']['operation_id'] == operation['operation_id']
+        assert explained['evidence_complete'] is True
+        audit = next(item for item in explained['evidence'] if item['evidence_type'] == 'audit')
+
+        status, resolved = self.request(
+            'GET',
+            f"/api/operations/resolve?kind=audit&id={audit['evidence_id']}",
+        )
+        assert status == 200
+        assert resolved['root']['operation_id'] == operation['operation_id']
+        status, missing = self.request('GET', '/api/operations/op_missing')
+        assert status == 404
+        assert missing['error']['type'] == 'NotFound'
+
+        runtime = self.server.service.runtime
+        first = runtime.operations.start(kind='runtime', name='first', actor=pid, pid=pid)
+        second = runtime.operations.start(kind='runtime', name='second', actor=pid, pid=pid)
+        runtime.operations.link_evidence('audit', 'shared-http-audit', 'audit', operation_id=first.operation_id)
+        runtime.operations.link_evidence('audit', 'shared-http-audit', 'audit', operation_id=second.operation_id)
+        runtime.operations.finish('succeeded', operation_id=first.operation_id)
+        runtime.operations.finish('succeeded', operation_id=second.operation_id)
+        status, ambiguous = self.request(
+            'GET',
+            '/api/operations/resolve?kind=audit&id=shared-http-audit',
+        )
+        assert status == 409
+        assert set(ambiguous['error']['candidates']) == {first.operation_id, second.operation_id}
+
     def test_snapshot_keeps_new_pending_human_request_ahead_of_bounded_history(self) -> None:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='pending must stay visible')
@@ -1427,7 +1469,15 @@ class TestGuiServer:
 
     def test_human_request_respond_rejects_non_pending_request(self) -> None:
         runtime = self.server.service.runtime
-        pid = runtime.process.spawn(image='base-agent:v0', goal='gui human conflict')
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='gui human conflict',
+            authority_manifest={
+                'authorized_capabilities': [
+                    {'resource': DEFAULT_CONFIG.runtime.default_human_resource, 'rights': ['write']},
+                ],
+            },
+        )
         request_id = runtime.human.ask(pid, 'Approve once?', blocking=True)
         status, approved = self.request(
             'POST',
@@ -1539,7 +1589,15 @@ class TestGuiServer:
 
     def test_human_request_delta_is_emitted_for_each_changed_version(self) -> None:
         runtime = self.server.service.runtime
-        pid = runtime.process.spawn(image='base-agent:v0', goal='gui human delta')
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='gui human delta',
+            authority_manifest={
+                'authorized_capabilities': [
+                    {'resource': DEFAULT_CONFIG.runtime.default_human_resource, 'rights': ['write']},
+                ],
+            },
+        )
         cursor = self.server.service.broadcaster.replay_after(0)[-1].seq
         request_id = runtime.human.ask(pid, 'Emit both versions?', blocking=True)
 

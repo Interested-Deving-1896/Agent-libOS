@@ -294,6 +294,7 @@
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_auto_answer_post_provider_classifier_failure_keeps_pending_without_reprompt",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_read_failure_preserves_pending_request_and_effect_semantics[False]",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_read_failure_preserves_pending_request_and_effect_semantics[True]",
+        "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_human_output_not_started_abandons_effect_and_restores_one_time_authority",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_question_cannot_be_approved_without_a_typed_answer",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_multiple_blocking_requests_keep_process_waiting_until_all_are_decided",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_terminal_process_cancels_pending_human_requests[cancel]",
@@ -974,6 +975,96 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "explainable-operations-use-explicit-causality",
+      "title": "Explainable Operations persist explicit causal links, preserve wait/resume identity, and redact sensitive values.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_explainable_operations.py::test_tool_primitive_capability_effect_and_resource_evidence_form_one_tree",
+        "tests/runtime/test_explainable_operations.py::test_denied_tool_has_decision_evidence_and_no_external_effect",
+        "tests/runtime/test_explainable_operations.py::test_tool_resource_limit_is_a_denied_complete_operation",
+        "tests/runtime/test_explainable_operations.py::test_pending_provider_effect_propagates_unknown_to_llm_root",
+        "tests/runtime/test_explainable_operations.py::test_certified_pre_boundary_failure_is_not_started_not_unknown",
+        "tests/runtime/test_explainable_operations.py::test_finalized_unknown_effect_marks_operation_unknown",
+        "tests/runtime/test_explainable_operations.py::test_successful_return_cannot_hide_finalized_unknown_effect",
+        "tests/runtime/test_explainable_operations.py::test_unknown_rollback_status_does_not_hide_known_committed_outcome",
+        "tests/runtime/test_explainable_operations.py::test_human_wait_and_resume_reuse_llm_and_tool_operation_ids",
+        "tests/runtime/test_explainable_operations.py::test_explain_output_redacts_sensitive_audit_values",
+        "tests/runtime/test_explainable_operations.py::test_running_operation_is_interrupted_on_reopen_but_waiting_is_preserved",
+        "tests/runtime/test_explainable_operations.py::test_running_operation_with_pending_provider_effect_recovers_as_unknown",
+        "tests/runtime/test_explainable_operations.py::test_operation_evidence_is_deduplicated_and_paginated",
+        "tests/runtime/test_explainable_operations.py::test_unlinked_legacy_evidence_is_not_backfilled_by_pid_or_time",
+        "tests/runtime/test_explainable_operations.py::test_protected_boundary_registry_covers_core_mutation_surfaces",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_parallel_tool_calls_execute_batch_in_order_and_record_observability",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_parallel_tool_calls_message_wait_stops_batch_and_resumes_pending_action",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_parallel_tool_calls_child_wait_stops_batch_and_resumes_pending_action",
+        "tests/runtime/test_explainable_operations.py::test_explain_is_host_only_not_a_model_tool_or_syscall"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "context-manifests-are-metadata-only",
+      "title": "Context materialization manifests record selection metadata and hashes without persisting additional object payloads.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_explainable_operations.py::test_llm_request_persists_context_manifest_without_object_payloads",
+        "tests/runtime/test_explainable_operations.py::test_context_manifest_storage_accepts_explicit_truncated_transform",
+        "tests/runtime/test_explainable_operations.py::test_context_materialization_records_omission_reasons",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_replace_with_compacted_summary_matching_version_commits"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "task-authority-manifest-bounds-launch",
+      "title": "Host-authored manifests bound launch grants, requests, child transitions, budgets, and effect classes without image auto-grants.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_authority_manifest.py::test_image_requirements_are_declared_but_not_granted_by_default",
+        "tests/runtime/test_authority_manifest.py::test_host_manifest_is_hashed_persisted_and_compiles_only_declared_authority",
+        "tests/runtime/test_authority_manifest.py::test_model_permission_request_outside_manifest_is_denied_before_human_request",
+        "tests/runtime/test_authority_manifest.py::test_requestable_manifest_authority_allows_prompt_without_pregranting_capability",
+        "tests/runtime/test_authority_manifest.py::test_implicit_manifest_denies_model_requests_but_preserves_host_transition_authority",
+        "tests/runtime/test_authority_manifest.py::test_child_manifest_and_transition_api_enforce_parent_intersection",
+        "tests/runtime/test_authority_manifest.py::test_child_manifest_cannot_widen_parent_policy_ceilings",
+        "tests/runtime/test_authority_manifest.py::test_manifest_max_delegation_depth_is_compiled_and_cannot_be_broadened",
+        "tests/runtime/test_authority_manifest.py::test_checkpoint_fork_preserves_explicit_manifest_effect_ceiling"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "effect-transactions-are-idempotent-and-reconcilable",
+      "title": "Provider intents bind canonical arguments and idempotency, never replay on recovery, and bind one-time approvals to exact operations.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_effect_transactions.py::test_effect_transaction_records_hash_idempotency_dispatch_receipt_and_commit",
+        "tests/runtime/test_effect_transactions.py::test_startup_reconciliation_queries_provider_without_replaying_effect",
+        "tests/runtime/test_effect_transactions.py::test_startup_reconciliation_failure_keeps_runtime_available_and_effect_unknown",
+        "tests/runtime/test_effect_transactions.py::test_approval_binding_rejects_changed_arguments_and_target_version"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "data-labels-propagate-conservatively",
+      "title": "Derived Object labels propagate conservatively, Explain stays payload-free, and declassification requires explicit authority.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_data_labels.py::test_derived_object_conservatively_propagates_sensitivity_and_trust",
+        "tests/runtime/test_data_labels.py::test_context_manifest_and_explain_expose_labels_without_payload",
+        "tests/runtime/test_data_labels.py::test_label_downgrade_requires_explicit_declassification_capability",
+        "tests/runtime/test_data_labels.py::test_finite_declassification_capability_is_consumed_once"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "model-tool-projection-does-not-change-authority",
+      "title": "Lazy tool groups reduce model schemas through a durable projection without changing callable tools or capabilities.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_tool_projection.py::test_review_image_projects_small_model_schema_without_removing_callable_tools",
+        "tests/runtime/test_tool_projection.py::test_model_tool_projection_survives_runtime_reopen"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "runtime-safety-benchmark-is-deterministic",
       "title": "Runtime-safety benchmark tasks and smoke runs remain deterministic and token-free by default.",
       "lane": "benchmark",
@@ -984,6 +1075,19 @@
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_metrics_reject_run_missing_expected_task_runner_result",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_deterministic_smoke_run_across_baselines_and_libos",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_self_evolution_smoke_run_across_wrapper_and_libos"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "practical-native-evidence-has-no-modeled-fallback",
+      "title": "Practical native-live scenarios require real tool, state, effect, and operation evidence while modeled scenarios use a separate denominator.",
+      "lane": "benchmark",
+      "node_ids": [
+        "tests/benchmarks/test_practical_agent_workflows.py::test_native_live_workflows_have_no_modeled_fallback_and_resolve_operations",
+        "tests/benchmarks/test_practical_agent_workflows.py::test_native_live_scenario_cannot_smuggle_a_modeled_effect",
+        "tests/benchmarks/test_practical_agent_workflows.py::test_native_live_rejects_semantic_effect_not_bound_to_provider_receipt",
+        "tests/benchmarks/test_practical_agent_workflows.py::test_eva_scenario_matrix_is_migrated_as_design_only_modeled_evidence",
+        "tests/benchmarks/test_practical_agent_workflows.py::test_modeled_oracle_failure_does_not_become_runtime_evidence"
       ],
       "benchmark_attack_classes": []
     }

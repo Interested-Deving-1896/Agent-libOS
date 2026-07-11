@@ -1045,32 +1045,33 @@ class CheckpointManager:
             current = self.store.get_capability(str(row.get("cap_id")))
             if current is None or not current.active:
                 continue
-            if self._capability_is_expired(current):
+            if self.capabilities.is_expired(current):
                 continue
             # Forking is authority duplication, so a remaining-use counter
             # cannot safely be copied. Capability delegation/grant already
             # rejects finite parents for the same reason. Conservatively omit
             # every finite record rather than turning one remaining use into
             # one use in both the source and fork.
-            if current.uses_remaining is not None:
-                continue
             item = dict(row)
             item["uses_remaining"] = current.uses_remaining
             item["status"] = current.status.value
             item["rights_json"] = dumps(sorted(current.rights))
             item["effect"] = current.effect.value
-            if current.effect == CapabilityEffect.ALLOW:
-                allowed_rights = self._currently_allowed_fork_rights(current)
-                if not allowed_rights:
-                    continue
-                item["rights_json"] = dumps(allowed_rights)
+            allowed_rights = self.capabilities.transition_allowed_rights(
+                current,
+                transition_kind="checkpoint.fork",
+                duplicates_authority=True,
+            )
+            if not allowed_rights:
+                continue
+            item["rights_json"] = dumps(allowed_rights)
             kept.append(item)
         return kept
 
     def _capability_is_expired(self, capability: Any) -> bool:
         if self.capabilities is None:
             return False
-        return bool(self.capabilities._is_expired(capability))
+        return bool(self.capabilities.is_expired(capability))
 
     def _currently_allowed_fork_rights(self, capability: Any) -> list[str]:
         """Keep only rights that still survive current policy before checkpoint fork.
@@ -1085,23 +1086,11 @@ class CheckpointManager:
 
         if self.capabilities is None:
             return sorted(capability.rights)
-        restrictive = self._current_restrictive_capabilities(capability.subject)
-        allowed: list[str] = []
-        for right in sorted(capability.rights):
-            if any(
-                right in cap.rights and self._resources_may_overlap(capability.resource, cap.resource)
-                for cap in restrictive
-            ):
-                continue
-            decision = self.capabilities.authorize(
-                capability.subject,
-                capability.resource,
-                right,
-                {"primitive": "checkpoint", "operation": "fork_capability_filter"},
-            )
-            if decision.allowed and decision.selected_capability_id == capability.cap_id:
-                allowed.append(right)
-        return allowed
+        return self.capabilities.transition_allowed_rights(
+            capability,
+            transition_kind="checkpoint.restore_or_fork",
+            duplicates_authority=False,
+        )
 
     def _filter_restored_capability_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
         if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
@@ -1160,35 +1149,6 @@ class CheckpointManager:
             status=CapabilityStatus(str(row.get("status") or CapabilityStatus.ACTIVE.value)),
             metadata=loads(row.get("metadata_json"), {}),
         )
-
-    def _current_restrictive_capabilities(self, subject: str) -> list[Any]:
-        if self.capabilities is None:
-            return []
-        result = []
-        for cap in self.store.list_capabilities(subject=subject):
-            if not cap.active or self._capability_is_expired(cap):
-                continue
-            if cap.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}:
-                result.append(cap)
-        return result
-
-    def _resources_may_overlap(self, left: str, right: str) -> bool:
-        if self.capabilities is None:
-            return left == right
-        try:
-            left_pattern = self.capabilities.parse_resource_pattern(left)
-            right_pattern = self.capabilities.parse_resource_pattern(right)
-        except CapabilityDenied:
-            return left == right
-        if left_pattern.kind != right_pattern.kind:
-            return False
-        if self.capabilities._resource_matches(left, right) or self.capabilities._resource_matches(right, left):
-            return True
-        left_has_wildcard = left.endswith(":*") or left.endswith("/*")
-        right_has_wildcard = right.endswith(":*") or right.endswith("/*")
-        if left_has_wildcard or right_has_wildcard:
-            return left_pattern.body.startswith(right_pattern.body) or right_pattern.body.startswith(left_pattern.body)
-        return False
 
     def _insert_fork_rows(
         self,
@@ -1263,11 +1223,81 @@ class CheckpointManager:
                     self._insert_row(cur, "tools", row)
             for row in rows.get("processes", []):
                 self._insert_row(cur, "processes", row)
+            self._bind_fork_authority_manifests(remapped, actor=actor)
             if fork_parent_pid is not None:
                 # Storage helpers now honor the outer transaction, so the
                 # parent charge, reservation, and fork rows become visible as
                 # one unit or roll back as one unit.
                 self._charge_fork_parent_child_create(fork_parent_pid)
+
+    def _bind_fork_authority_manifests(self, remapped: dict[str, Any], *, actor: str) -> None:
+        if self.runtime is None:
+            return
+        manifests = getattr(self.runtime, "authority_manifests", None)
+        if manifests is None:
+            return
+        rows = [dict(row) for row in remapped["rows"].get("processes", [])]
+        rows_by_pid = {str(row["pid"]): row for row in rows}
+        source_by_target = {
+            str(target_pid): str(source_pid)
+            for source_pid, target_pid in remapped.get("pid_map", {}).items()
+        }
+        capability_rows = [dict(row) for row in remapped["rows"].get("capabilities", [])]
+        pending = dict(rows_by_pid)
+        bound: dict[str, str] = {}
+        while pending:
+            progressed = False
+            for target_pid, row in list(pending.items()):
+                parent_pid = str(row.get("parent_pid") or "") or None
+                if parent_pid in pending:
+                    continue
+                manifest = manifests.bind_checkpoint_fork(
+                    source_pid=source_by_target[target_pid],
+                    target_pid=target_pid,
+                    image_id=str(row["image_id"]),
+                    goal_ref=str(row["goal_oid"]) if row.get("goal_oid") is not None else None,
+                    authorized_capabilities=self._fork_manifest_capability_specs(
+                        capability_rows,
+                        target_pid=target_pid,
+                    ),
+                    resource_budget=loads(row.get("resource_budget_json"), {}),
+                    parent_manifest_id=bound.get(parent_pid) if parent_pid is not None else None,
+                    issued_by=f"checkpoint.fork:{actor}",
+                )
+                bound[target_pid] = manifest.manifest_id
+                pending.pop(target_pid)
+                progressed = True
+            if not progressed:
+                raise ValidationError("checkpoint fork process hierarchy contains a cycle")
+
+    @staticmethod
+    def _fork_manifest_capability_specs(
+        rows: list[dict[str, Any]],
+        *,
+        target_pid: str,
+    ) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for row in rows:
+            resource = str(row.get("resource") or "")
+            if (
+                str(row.get("subject")) != target_pid
+                or str(row.get("status")) != CapabilityStatus.ACTIVE.value
+                or str(row.get("effect")) != CapabilityEffect.ALLOW.value
+                or resource.startswith(("object:", "object_namespace:", "checkpoint:"))
+            ):
+                continue
+            spec: dict[str, Any] = {
+                "resource": resource,
+                "rights": loads(row.get("rights_json"), []),
+                "constraints": loads(row.get("constraints_json"), {}),
+                "delegable": bool(row.get("delegable")),
+                "revocable": bool(row.get("revocable", True)),
+            }
+            for key in ("expires_at", "uses_remaining", "max_delegation_depth"):
+                if row.get(key) is not None:
+                    spec[key] = row[key]
+            specs.append(spec)
+        return specs
 
     def _discard_remapped_jit_sources(self, remapped: dict[str, Any]) -> None:
         if self.runtime is None:

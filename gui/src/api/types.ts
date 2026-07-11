@@ -279,6 +279,71 @@ export type RuntimeSnapshot = {
   _truncated?: Record<string, unknown>;
 };
 
+export type OperationSummary = {
+  operation_id: string;
+  root_operation_id: string;
+  parent_operation_id: string | null;
+  kind: "llm_request" | "tool_call" | "syscall" | "primitive" | "runtime";
+  name: string;
+  actor: string;
+  pid: string | null;
+  state: "running" | "waiting" | "terminal";
+  outcome: "pending" | "succeeded" | "denied" | "failed" | "interrupted" | "unknown";
+  started_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
+export type OperationRecord = OperationSummary & {
+  expected_roles: string[];
+  metadata: Record<string, unknown>;
+};
+
+export type OperationEvidence = {
+  evidence_type: string;
+  evidence_id: string;
+  roles: string[];
+  occurred_at: string | null;
+  metadata: unknown;
+  data: unknown;
+};
+
+export type OperationListResponse = {
+  schema_version: number;
+  pid: string;
+  roots_only: boolean;
+  operations: OperationSummary[];
+  presentation_truncated: boolean;
+  next_cursor: string | null;
+};
+
+export type ExplainOperationResponse = {
+  schema_version: number;
+  lookup: { kind: string; id: string };
+  selected_operation_id: string;
+  root: OperationSummary;
+  summary: {
+    headline: string;
+    outcome: OperationSummary["outcome"];
+    operation_count: number;
+    authorization: unknown[];
+    human: unknown[];
+    external_effects: unknown[];
+    resource_charge_evidence_count: number;
+    resource_charge_count: number;
+    resource_consumption: unknown[];
+    context: unknown[];
+  };
+  operations: OperationRecord[];
+  edges: Array<{ from: string; to: string; relation: string }>;
+  evidence: OperationEvidence[];
+  evidence_complete: boolean;
+  missing_evidence: Array<{ operation_id: string; role: string }>;
+  uncertainties: Array<{ operation_id?: string; evidence_id?: string; reason: string }>;
+  presentation_truncated: boolean;
+  next_cursor: string | null;
+};
+
 export type GuiConnection = {
   url: string;
   token: string;

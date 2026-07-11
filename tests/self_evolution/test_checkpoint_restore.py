@@ -507,7 +507,15 @@ class TestCheckpointRestore:
     def test_restore_supersedes_post_checkpoint_mailbox_and_cancels_human_requests(self) -> None:
         runtime = Runtime.open('local')
         try:
-            pid = runtime.process.spawn(image='base-agent:v0', goal='messages')
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='messages',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {'resource': 'human:owner', 'rights': [CapabilityRight.WRITE.value]}
+                    ]
+                },
+            )
             checkpoint_id = runtime.checkpoint.create(pid, 'before messages', actor=pid)
             message = runtime.human.send_process_message(pid, 'late update')
             request_id = runtime.human.ask(pid, 'approve?', blocking=True)
@@ -796,7 +804,15 @@ class TestCheckpointRestore:
     def test_restore_reconciles_terminal_human_wait_state(self) -> None:
         runtime = Runtime.open('local')
         try:
-            pid = runtime.process.spawn(image='base-agent:v0', goal='human wait')
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='human wait',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {'resource': 'human:owner', 'rights': [CapabilityRight.WRITE.value]}
+                    ]
+                },
+            )
             request_id = runtime.human.ask(pid, 'continue?', blocking=True)
             checkpoint_id = runtime.checkpoint.create(pid, 'waiting for human', actor=pid)
             runtime.human.approve(request_id, {'approved': True, 'answer': 'yes'})

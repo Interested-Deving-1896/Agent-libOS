@@ -1008,17 +1008,54 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 service._process_summary(process.pid, include_messages=True, process=process)
                 for process in service.runtime.process.list()
             ]
+        if method == "GET" and route == ["operations"]:
+            pid = _query_str(query, "pid")
+            if not pid:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "operations requires pid")
+            return service.runtime.explain.list_operations(
+                pid,
+                limit=_query_int(query, "limit"),
+                cursor=_query_str(query, "cursor"),
+            )
+        if method == "GET" and route == ["operations", "resolve"]:
+            kind = _query_str(query, "kind")
+            evidence_id = _query_str(query, "id")
+            if not kind or not evidence_id:
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "operation resolve requires kind and id")
+            result = service.runtime.explain.resolve(
+                kind,
+                evidence_id,
+                evidence_limit=_query_int(query, "evidence_limit"),
+                cursor=_query_str(query, "cursor"),
+            )
+            if result.get("ambiguous"):
+                raise GuiServerError(
+                    HTTPStatus.CONFLICT,
+                    "operation evidence resolves to multiple causal roots",
+                    details={"candidates": result.get("candidates", [])},
+                )
+            return result
+        if method == "GET" and len(route) == 2 and route[0] == "operations":
+            return service.runtime.explain.explain_operation(
+                route[1],
+                evidence_limit=_query_int(query, "evidence_limit"),
+                cursor=_query_str(query, "cursor"),
+            )
         if method == "GET" and route == ["tools"]:
             return service._tool_summaries()
         if method == "POST" and route == ["processes"]:
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
+            authority_manifest = body.get("authority_manifest")
+            if authority_manifest is not None and not isinstance(authority_manifest, dict):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "authority_manifest must be a JSON object")
             pid = service.runtime.process.spawn(
                 image=str(body["image"]) if body.get("image") is not None else None,
                 goal=body.get("goal", ""),
                 working_directory=body.get("working_directory"),
                 llm_profile_id=llm_profile_id,
+                authority_manifest=authority_manifest,
             )
             service.publish_runtime_changes("process.spawn")
             if _json_bool(body, "auto_run", True):
@@ -1068,6 +1105,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             raw_args = body.get("args") if "args" in body else {}
             if not isinstance(raw_args, dict):
                 raise GuiServerError(HTTPStatus.BAD_REQUEST, "workflow args must be a JSON object")
+            authority_manifest = body.get("authority_manifest")
+            if authority_manifest is not None and not isinstance(authority_manifest, dict):
+                raise GuiServerError(HTTPStatus.BAD_REQUEST, "authority_manifest must be a JSON object")
             if self._workflow_requires_confirmation(service, tool, body):
                 self._require_confirmed(
                     "workflow.run",
@@ -1084,6 +1124,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 image=str(body["image"]) if body.get("image") is not None else None,
                 goal=body.get("goal"),
                 working_directory=str(body["working_directory"]) if body.get("working_directory") is not None else None,
+                authority_manifest=authority_manifest,
             )
             service.publish_runtime_changes("workflow.run")
             return to_jsonable(result)

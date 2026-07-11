@@ -28,6 +28,7 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectOwnerKind,
     ObjectType,
+    Provenance,
     ProcessStatus,
     ResourceUsage,
     ToolCallResult,
@@ -73,6 +74,56 @@ _JIT_DECLARED_PERMISSIONS = (
     "skill.read",
     "skill.write",
 )
+
+_LAZY_TOOL_CORE = (
+    "discover_tool_groups",
+    "activate_tool_group",
+    "process_exit",
+    "request_permission",
+    "ask_human",
+    "human_output",
+    "read_memory_object",
+    "create_memory_object",
+    "append_memory_object",
+    "get_current_time",
+)
+
+_TOOL_GROUPS: dict[str, tuple[str, ...]] = {
+    "filesystem": (
+        "read_text_file", "write_text_file", "read_directory", "write_directory",
+        "delete_file", "delete_directory", "create_object_from_file", "write_object_to_file",
+        "get_working_directory", "set_working_directory",
+    ),
+    "process": (
+        "list_child_processes", "spawn_child_process", "fork_child_process", "wait_child_process",
+        "signal_child_process", "merge_child_memory", "send_process_message", "read_process_messages",
+        "receive_process_messages", "exec_process",
+    ),
+    "remote": (
+        "list_jsonrpc_endpoints", "inspect_jsonrpc_endpoint", "call_jsonrpc_method",
+        "list_mcp_servers", "inspect_mcp_server", "list_mcp_tools", "call_mcp_tool",
+    ),
+    "checkpoint": (
+        "create_checkpoint", "list_checkpoints", "inspect_checkpoint", "diff_checkpoint",
+        "fork_checkpoint", "restore_checkpoint", "commit_checkpoint_to_image",
+    ),
+    "memory": (
+        "create_memory_namespace", "list_memory_namespace", "create_memory_object",
+        "append_memory_object", "read_memory_object", "create_object_from_file", "write_object_to_file",
+    ),
+    "skills": ("discover_skills", "activate_skill", "read_skill_resource", "unload_skill"),
+    "object_tasks": (
+        "start_object_task", "get_object_task", "list_object_tasks", "wait_object_task",
+        "watch_object_task_owner", "cancel_object_task",
+    ),
+    "self_evolution": (
+        "load_image_package", "propose_jit_tool", "validate_jit_tool", "register_jit_tool",
+    ),
+    "authority": ("list_capabilities", "inspect_capability", "delegate_capability", "revoke_capability"),
+    "shell": ("run_shell_command", "parse_pytest_log"),
+    "context": ("compact_process_context",),
+    "clock": ("sleep",),
+}
 
 _JIT_MULTIPLEXER_INPUT_SCHEMA = {
     "type": "object",
@@ -223,6 +274,7 @@ class ToolBroker:
             handle = self.resolve(tool)
             table[handle.name] = handle.tool_id
         process.tool_table = table
+        process.model_tool_table = dict(table)
         process.updated_at = utc_now()
         self.store.update_process(process)
         self.audit.record(
@@ -422,6 +474,7 @@ class ToolBroker:
             candidate.updated_at = utc_now()
             self.store.update_tool_candidate(candidate)
             process.tool_table[candidate.spec.name] = tool_id
+            process.model_tool_table[candidate.spec.name] = tool_id
             process.updated_at = utc_now()
             self.store.update_process(process)
             self.audit.record(
@@ -506,6 +559,73 @@ class ToolBroker:
         raise RuntimeError("Cannot call ToolBroker.call() inside a running event loop. Use await acall(...).")
 
     async def acall(
+        self,
+        pid: str,
+        tool: ToolHandle | str,
+        args: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> ToolCallResult:
+        runtime = getattr(self, "runtime", None)
+        operations = getattr(runtime, "operations", None)
+        if operations is None:
+            return await self._acall_impl(pid, tool, args, context_metadata=context_metadata)
+        selected_name = tool.name if isinstance(tool, ToolHandle) else str(tool)
+        resume_operation_id = str((context_metadata or {}).get("operation_id") or "") or None
+        parent_operation_id = str((context_metadata or {}).get("parent_operation_id") or "") or None
+        with operations.scope(
+            kind="tool_call",
+            name=f"tool.{selected_name}",
+            actor=pid,
+            pid=pid,
+            expected_roles=["invocation", "audit", "event"],
+            operation_id=resume_operation_id,
+            parent_operation_id=parent_operation_id,
+            auto_finish=False,
+        ) as operation:
+            result = await self._acall_impl(pid, tool, args, context_metadata=context_metadata)
+            operations.link_evidence(
+                "tool_call",
+                result.call_id,
+                "invocation",
+                operation_id=operation.operation_id,
+                metadata={"tool_id": result.tool_id, "tool": selected_name},
+            )
+            operations.link_evidence(
+                "tool_call",
+                result.call_id,
+                "result",
+                operation_id=operation.operation_id,
+                metadata={"ok": result.ok, "result_oid": result.result_handle.oid if result.result_handle else None},
+            )
+            if result.ok:
+                operations.finish("succeeded", operation_id=operation.operation_id)
+            else:
+                descendants = self.store.list_operations(root_operation_id=operation.root_operation_id)
+                if any(
+                    candidate.outcome.value == "unknown"
+                    and candidate.operation_id != operation.operation_id
+                    for candidate in descendants
+                ):
+                    operations.finish("unknown", operation_id=operation.operation_id)
+                    return result
+                error = str(result.error or "").lower()
+                denied = any(
+                    marker in error
+                    for marker in (
+                        "denied",
+                        "capability",
+                        "permission",
+                        "lacks ",
+                        "not in process tool table",
+                        "resource limit",
+                        "exceeded max_",
+                    )
+                )
+                operations.finish("denied" if denied else "failed", operation_id=operation.operation_id)
+            return result
+
+    async def _acall_impl(
         self,
         pid: str,
         tool: ToolHandle | str,
@@ -907,7 +1027,8 @@ class ToolBroker:
                 pid=pid,
                 object_type=ObjectType.TOOL_RESULT,
                 payload=result_payload,
-                metadata=ObjectMetadata(title=f"Tool result: {handle.name}", tags=["tool_result", handle.name]),
+                metadata=self._tool_result_metadata(handle),
+                provenance=Provenance(created_from_action=f"tool.{handle.name}"),
                 immutable=True,
             )
             if jit_session is not None:
@@ -991,6 +1112,19 @@ class ToolBroker:
             return bool(implementation.spec(config=self.config).policy.get("side_effects"))
         spec = self.store.get_tool_spec(handle.tool_id)
         return bool(spec is not None and spec.policy.get("side_effects"))
+
+    def _tool_result_metadata(self, handle: ToolHandle) -> ObjectMetadata:
+        implementation = self._tools.get(handle.tool_id)
+        spec = implementation.spec(config=self.config) if implementation is not None else self.store.get_tool_spec(handle.tool_id)
+        tags = set(spec.tags if spec is not None else [])
+        externally_sourced = bool(tags & {"remote", "provider", "jsonrpc", "mcp", "network", "shell"})
+        return ObjectMetadata(
+            title=f"Tool result: {handle.name}",
+            tags=["tool_result", handle.name],
+            origin=f"tool:{handle.name}",
+            trust_level="untrusted" if externally_sourced else "unknown",
+            integrity="unknown",
+        )
 
     def _tool_result_persistence_limit(self) -> int:
         return min(
@@ -1405,13 +1539,111 @@ class ToolBroker:
         return [row for row in self.store.list_tools() if row["tool_id"] in visible_ids]
 
     def model_visible_tools(self, pid: str) -> builtins.list[dict[str, Any]]:
-        rows = self.visible_tools(pid)
+        visible_ids = self._model_visible_tool_ids(pid)
+        rows = [row for row in self.store.list_tools() if row["tool_id"] in visible_ids]
         if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
             return rows
         static_rows = [row for row in rows if str(row.get("tool_id")) not in self._jit_sources]
         if any(str(row.get("tool_id")) in self._jit_sources for row in rows):
             static_rows.append(self._jit_multiplexer_row())
         return static_rows
+
+    def initial_tool_projection(self, image: Any) -> list[str]:
+        if not bool(getattr(image, "metadata", {}).get("lazy_tool_groups")):
+            return list(image.default_tools)
+        allowed = set(image.default_tools)
+        return [name for name in _LAZY_TOOL_CORE if name in allowed]
+
+    def tool_groups(self, pid: str) -> list[dict[str, Any]]:
+        runtime = getattr(self, "runtime", None)
+        process = self.store.get_process(pid)
+        if runtime is None or process is None:
+            raise NotFound(f"process not found: {pid}")
+        image = runtime.images.get(process.image_id)
+        if image is None:
+            raise NotFound(f"agent image not found: {process.image_id}")
+        allowed = set(process.tool_table)
+        active = set(process.model_tool_table)
+        return [
+            {
+                "group": group,
+                "tool_count": len(names),
+                "active": all(name in active for name in names),
+            }
+            for group, configured in sorted(_TOOL_GROUPS.items())
+            if (names := [name for name in configured if name in allowed])
+        ]
+
+    def tool_group_for(self, tool_name: str) -> str | None:
+        selected = str(tool_name).strip()
+        return next(
+            (group for group, names in sorted(_TOOL_GROUPS.items()) if selected in names),
+            None,
+        )
+
+    def activate_tool_group(self, pid: str, group: str) -> dict[str, Any]:
+        selected_group = str(group).strip()
+        configured = _TOOL_GROUPS.get(selected_group)
+        if configured is None:
+            raise ValidationError(f"unknown tool group: {selected_group}")
+        runtime = getattr(self, "runtime", None)
+        process = self.store.get_process(pid)
+        if runtime is None or process is None:
+            raise NotFound(f"process not found: {pid}")
+        image = runtime.images.get(process.image_id)
+        if image is None:
+            raise NotFound(f"agent image not found: {process.image_id}")
+        allowed = set(process.tool_table)
+        selected = [name for name in configured if name in allowed]
+        if not selected:
+            raise ValidationError(f"tool group is not authorized by image {image.image_id}: {selected_group}")
+        before = self.openai_tool_schemas(pid)
+        merged = sorted({*process.model_tool_table, *selected})
+        self.configure_model_tool_projection(pid, merged, assigned_by=f"tool_group:{selected_group}")
+        after = self.openai_tool_schemas(pid)
+        result = {
+            "group": selected_group,
+            "activated_tools": selected,
+            "tool_count_before": len(before),
+            "tool_count_after": len(after),
+            "schema_bytes_before": len(dumps(before).encode("utf-8")),
+            "schema_bytes_after": len(dumps(after).encode("utf-8")),
+            "authority_changed": False,
+        }
+        self.audit.record(
+            actor=pid,
+            action="process.tools.activate_group",
+            target=f"process:{pid}",
+            decision=result,
+        )
+        return result
+
+    def configure_model_tool_projection(
+        self,
+        pid: str,
+        tools: builtins.list[ToolHandle | str],
+        *,
+        assigned_by: str,
+    ) -> dict[str, str]:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        table: dict[str, str] = {}
+        for tool in tools:
+            handle = self.resolve(tool, pid=pid)
+            if process.tool_table.get(handle.name) != handle.tool_id:
+                raise ValidationError(f"tool is not authorized by process image: {handle.name}")
+            table[handle.name] = handle.tool_id
+        process.model_tool_table = table
+        process.updated_at = utc_now()
+        self.store.update_process(process)
+        self.audit.record(
+            actor=assigned_by,
+            action="process.tools.project",
+            target=f"process:{pid}",
+            decision={"tools": sorted(table), "authority_changed": False},
+        )
+        return table
 
     def model_tool_names(self, pid: str) -> builtins.list[str]:
         names = [str(row.get("name") or "") for row in self.model_visible_tools(pid)]
@@ -1453,7 +1685,7 @@ class ToolBroker:
         return self._redact_hidden_jit_names(value, hidden)
 
     def openai_tool_schemas(self, pid: str | None = None) -> builtins.list[dict[str, Any]]:
-        tool_ids = self._visible_tool_ids(pid) if pid is not None else set(self._tools)
+        tool_ids = self._model_visible_tool_ids(pid) if pid is not None else set(self._tools)
         multiplex_jit = pid is not None and self._jit_exposure_for_process(pid) == JIT_TOOL_EXPOSURE_MULTIPLEXED
         has_visible_jit = any(tool_id in self._jit_sources for tool_id in tool_ids)
         schemas: builtins.list[dict[str, Any]] = []
@@ -1680,6 +1912,12 @@ class ToolBroker:
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return set(process.tool_table.values())
+
+    def _model_visible_tool_ids(self, pid: str) -> set[str]:
+        process = self.store.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        return set(process.model_tool_table.values())
 
     def _oversize_result_observation(self) -> dict[str, Any]:
         return {

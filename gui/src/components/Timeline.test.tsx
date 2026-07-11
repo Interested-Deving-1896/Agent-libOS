@@ -5,6 +5,7 @@ import { I18nProvider } from "../i18n";
 import {
   buildTimelineItems,
   countTimelineItemsByKind,
+  evidenceRef,
   filterTimelineItems,
   Timeline
 } from "./Timeline";
@@ -69,6 +70,25 @@ describe("Timeline", () => {
     expect(filterTimelineItems(items, "all")).toBe(items);
     expect(filterTimelineItems(items, "event").map((item) => item.kind)).toEqual(["event", "event"]);
     expect(filterTimelineItems(items, "audit").map((item) => item.kind)).toEqual(["audit"]);
+  });
+
+  it("maps explainable timeline records to explicit evidence ids", () => {
+    const items = buildTimelineItems({
+      pid: "pid_1",
+      messages: [message("msg_1", "2026-06-19T01:00:04.000Z")],
+      humanRequests: [humanRequest("req_1", "pid_1", "2026-06-19T01:00:02.000Z")],
+      llmCalls: [llmCall("llm_1", "pid_1", "2026-06-19T01:00:05.000Z")],
+      events: [event("evt_1", "pid_1", null, "2026-06-19T01:00:01.000Z")],
+      audit: [auditRecord("audit_1", "pid_1", null, "2026-06-19T01:00:06.000Z")]
+    });
+
+    expect(items.map(evidenceRef)).toEqual([
+      { kind: "event", id: "evt_1" },
+      { kind: "request", id: "req_1" },
+      null,
+      { kind: "call", id: "llm_1" },
+      { kind: "audit", id: "audit_1" }
+    ]);
   });
 
   it("renders the default all-type filter with type counts", () => {

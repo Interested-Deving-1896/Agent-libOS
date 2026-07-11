@@ -799,10 +799,16 @@ class TestRuntimeSafetyBenchmark:
             assert run.result.llm_tokens > 0
             assert run.result.audit_records > 0
             assert run.result.metadata['llm_calls'] >= 1
+            explainability = run.result.metadata['explainability']
+            assert explainability['operation_count'] > 0
+            assert explainability['causal_root_count'] > 0
+            assert 0 <= explainability['evidence_complete_root_count'] <= explainability['causal_root_count']
+            assert explainability['unknown_outcome_count'] == 0
             assert run.effects[0].classification == 'forbidden'
             assert run.effects[0].denied
             assert repeated.result.tool_calls == run.result.tool_calls
             assert repeated.result.audit_records == run.result.audit_records
+            assert repeated.result.metadata['explainability'] == explainability
 
     def test_allowed_shell_task_has_persisted_effect_evidence(self, tmp_path: Path) -> None:
         task = next(

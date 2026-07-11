@@ -355,6 +355,53 @@ class TestCLIBuiltinCommand:
         assert result['owner_watch']['events'] == ['updated']
         assert result['result_oid'] is not None
 
+    def test_cli_explain_process_lists_persisted_operations(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = Runtime.open('local')
+        pid = runtime.process.spawn(image='base-agent:v0', goal='explain cli')
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        result = _run_cli_json(['explain', 'process', pid])
+
+        assert result['pid'] == pid
+        assert any(operation['name'] == 'process.spawn' for operation in result['operations'])
+
+    def test_cli_explain_not_found_uses_structured_error_and_exit_one(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+            cli_main(['explain', 'operation', 'op_missing'])
+
+        assert raised.value.code == 1
+        assert json.loads(stdout.getvalue())['error']['type'] == 'NotFound'
+
+    def test_cli_explain_ambiguous_evidence_lists_candidates_and_exits_two(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        pid = runtime.process.spawn(image='base-agent:v0', goal='ambiguous explain')
+        first = runtime.operations.start(kind='runtime', name='first', actor=pid, pid=pid)
+        second = runtime.operations.start(kind='runtime', name='second', actor=pid, pid=pid)
+        runtime.operations.link_evidence('audit', 'shared-audit', 'audit', operation_id=first.operation_id)
+        runtime.operations.link_evidence('audit', 'shared-audit', 'audit', operation_id=second.operation_id)
+        runtime.operations.finish('succeeded', operation_id=first.operation_id)
+        runtime.operations.finish('succeeded', operation_id=second.operation_id)
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+            cli_main(['explain', 'audit', 'shared-audit'])
+
+        result = json.loads(stdout.getvalue())
+        assert raised.value.code == 2
+        assert result['ambiguous'] is True
+        assert set(result['candidates']) == {first.operation_id, second.operation_id}
+
     def test_cli_object_task_start_requires_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')
         monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)

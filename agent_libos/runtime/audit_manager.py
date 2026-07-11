@@ -10,6 +10,10 @@ from agent_libos.storage import RuntimeStore
 class AuditManager:
     def __init__(self, store: RuntimeStore):
         self.store = store
+        self.operations: Any | None = None
+
+    def bind_operations(self, operations: Any) -> None:
+        self.operations = operations
 
     def record(
         self,
@@ -37,7 +41,30 @@ class AuditManager:
             parent_record_id=parent_record_id,
         )
         self.store.insert_audit(record)
+        if self.operations is not None:
+            self.operations.link_evidence("audit", record.record_id, "audit")
+            semantic_role = self._semantic_role(action)
+            if semantic_role is not None:
+                self.operations.link_evidence("audit", record.record_id, semantic_role)
         return record
+
+    @staticmethod
+    def _semantic_role(action: str) -> str | None:
+        if action == "capability.authorize":
+            return "decision"
+        if action.startswith("capability.") and any(
+            marker in action for marker in ("reserve", "consume", "restore")
+        ):
+            return "reservation"
+        if action.startswith("human.") and any(
+            marker in action for marker in ("approve", "reject", "response", "terminal")
+        ):
+            return "approval"
+        if action == "resource.charge":
+            return "resource_charge"
+        if action in {"tool.call", "syscall.result"}:
+            return "result"
+        return None
 
     def trace(
         self,

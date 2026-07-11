@@ -1,4 +1,4 @@
-import type { AgentRating, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
+import type { AgentRating, ExplainOperationResponse, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -20,6 +20,26 @@ export class LibOSClient {
 
   async health() {
     return this.request("GET", "/api/health");
+  }
+
+  async listOperations(pid: string, limit = 100, cursor?: string): Promise<OperationListResponse> {
+    const query = new URLSearchParams({ pid, limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    return this.request<OperationListResponse>("GET", `/api/operations?${query.toString()}`);
+  }
+
+  async explainOperation(operationId: string, evidenceLimit = 200, cursor?: string): Promise<ExplainOperationResponse> {
+    const query = new URLSearchParams({ evidence_limit: String(evidenceLimit) });
+    if (cursor) query.set("cursor", cursor);
+    return this.request<ExplainOperationResponse>(
+      "GET",
+      `/api/operations/${encodeURIComponent(operationId)}?${query.toString()}`
+    );
+  }
+
+  async resolveOperation(kind: string, evidenceId: string): Promise<ExplainOperationResponse> {
+    const query = new URLSearchParams({ kind, id: evidenceId });
+    return this.request<ExplainOperationResponse>("GET", `/api/operations/resolve?${query.toString()}`);
   }
 
   async images(): Promise<ImageSummary[]> {
