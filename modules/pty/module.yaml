@@ -17,11 +17,12 @@ provides:
   provider_hooks: []
   startup_hooks:
     - initialize_pty
-sha256: 0874fe40688756adf7a7d16fa92e033b88deee200acccd6f2c0805d5c9afa657
+sha256: a00d49e37c13600c3f1d09abede2bc306a815335f90141b7d8541990cf9af666
 metadata:
   owner: local
   external_effects:
     - pty.spawn
+    - pty.ingest
     - pty.write
     - pty.resize
     - pty.close

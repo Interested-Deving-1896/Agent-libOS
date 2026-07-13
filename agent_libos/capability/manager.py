@@ -855,7 +855,7 @@ class CapabilityManager:
             )
         return committed
 
-    def _restore_reserved_use(
+    def restore_reserved_use(
         self,
         reservation_id: str | None,
         *,
@@ -945,7 +945,7 @@ class CapabilityManager:
         try:
             self.store.update_capability(revoked)
         except Exception:
-            self._restore_reserved_use(
+            self.restore_reserved_use(
                 authority_reservation,
                 restored_by=revoked_by,
                 reason="one-time revoke authority restored before target mutation",

@@ -21,10 +21,8 @@ from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.models import (
-    AuditRecord,
     CapabilityEffect,
     CapabilityRight,
-    Event,
     EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -40,15 +38,14 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.external_effects import (
-    abandon_external_effect_intent,
-    begin_external_effect_intent,
-    classify_external_effect,
-    record_external_effect,
-    require_external_effect_classifier,
-)
 from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import JsonRpcProvider, ProviderEffectNotStarted
+from agent_libos.sdk import (
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
+    ResourceSettlement,
+)
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
@@ -252,118 +249,205 @@ class JsonRpcPrimitive:
         request_body = self._request_body(method, params, request_id)
         if len(request_body) > spec.max_request_bytes:
             raise ValidationError(f"JSON-RPC request exceeds max_request_bytes={spec.max_request_bytes}")
-        self._preflight_resource_usage(
-            pid,
-            ResourceUsage(jsonrpc_request_bytes=len(request_body)),
-            source="primitive.jsonrpc.call",
-            context={"endpoint_id": endpoint_id, "method_id": method_id, "request_bytes": len(request_body)},
-        )
+        resource_context = {
+            "endpoint_id": endpoint_id,
+            "method_id": method_id,
+            "request_bytes": len(request_body),
+        }
         effect_context = self._effect_context(spec, method, operation_context, request_bytes=len(request_body))
-        require_external_effect_classifier(self.provider, "call")
-        preflight_classification = classify_external_effect(self.provider, "call", effect_context, {"preflight": True})
-        reservation_id: str | None = None
-        with self.store.transaction():
-            reservation_id = self.capabilities.reserve_decision_use(
-                decision,
-                used_by="jsonrpc",
-                reason="one-time JSON-RPC method permission reserved before remote resolution",
-            )
-            effect_intent = begin_external_effect_intent(
-                self.store,
-                pid=pid,
-                provider="jsonrpc",
-                operation="call",
-                target=resource,
-                state_mutation=bool(preflight_classification.state_mutation or method.state_mutation),
-                # DNS resolution and request transmission both disclose remote
-                # target/request facts even when a manifest classifier
-                # accidentally understates information flow.
-                information_flow=True,
-                metadata={"context": effect_context},
-            )
-        try:
-            resolved_addresses = self._validate_runtime_resolution(spec)
-        except ProviderEffectNotStarted:
-            with self.store.transaction():
-                self._restore_call_reservation(reservation_id)
-                abandon_external_effect_intent(self.store, effect_intent.effect_id)
-            raise
-        except Exception as exc:
-            self._commit_call_reservation(reservation_id)
-            self._record_unknown_boundary_failure(
-                pid=pid,
-                resource=resource,
-                method=method,
-                operation_context=operation_context,
-                effect_context=effect_context,
-                effect_intent_id=effect_intent.effect_id,
-                error=exc,
-                phase="dns_resolution",
-            )
-            raise
-        # A successful DNS lookup has already crossed an information-flow
-        # boundary, so finite authority may no longer be refunded even if the
-        # subsequent transport certifies that it did not start.
-        self._commit_call_reservation(reservation_id)
-        started = time.monotonic()
-        try:
-            transport = self.provider.call(
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=resource,
+            decisions=(decision,),
+            canonical_args=operation_context,
+            observation=effect_context,
+            preflight_usage=ResourceUsage(jsonrpc_request_bytes=len(request_body)),
+            resource_source="primitive.jsonrpc.call",
+            resource_context=resource_context,
+            failure_evidence=lambda error, phase: self._protected_failure_evidence(
+                pid, resource, method, operation_context, error, phase
+            ),
+        )
+        with self._protected().start("primitive.jsonrpc.call", invocation, provider=self.provider) as protected:
+            resolved_addresses = protected.call(
+                ProviderPhase("dns_resolution", information_flow=True),
+                self._validate_runtime_resolution,
                 spec,
-                method,
-                request_body,
-                timeout_s=spec.timeout_s,
-                max_response_bytes=spec.max_response_bytes,
-                resolved_addresses=resolved_addresses,
             )
-        except ProviderEffectNotStarted as exc:
-            self._record_unknown_boundary_failure(
-                pid=pid,
-                resource=resource,
-                method=method,
-                operation_context=operation_context,
-                effect_context=effect_context,
-                effect_intent_id=effect_intent.effect_id,
-                error=exc,
-                phase="transport_not_started_after_dns",
+            started = time.monotonic()
+
+            def invoke_transport() -> JsonRpcTransportResult:
+                try:
+                    return self.provider.call(
+                        spec,
+                        method,
+                        request_body,
+                        timeout_s=spec.timeout_s,
+                        max_response_bytes=spec.max_response_bytes,
+                        resolved_addresses=resolved_addresses,
+                    )
+                except ProviderEffectNotStarted:
+                    raise
+                except Exception as exc:
+                    return JsonRpcTransportResult(
+                        status_code=None,
+                        body=b"",
+                        elapsed_s=time.monotonic() - started,
+                        response_bytes=0,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+
+            transport = protected.call(
+                ProviderPhase(
+                    "transport_not_started_after_dns",
+                    state_mutation=bool(method.state_mutation or method.right != CapabilityRight.READ.value),
+                    information_flow=True,
+                ),
+                invoke_transport,
             )
-            raise
-        except Exception as exc:
-            transport = JsonRpcTransportResult(
-                status_code=None,
-                body=b"",
-                elapsed_s=time.monotonic() - started,
-                response_bytes=0,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        result = self._call_result_from_transport(spec, method, request_id, transport)
-        event = self._emit_call_event(pid, resource, result, method)
-        audit_record = self._record_call_audit(pid, resource, result, method, operation_context)
-        self._record_external_effect(
-            pid,
-            resource,
-            effect_context,
-            result,
-            event,
-            audit_record,
-            preflight_classification=preflight_classification,
-            effect_intent_id=effect_intent.effect_id,
-        )
-        self._charge_resource_usage(
-            pid,
-            ResourceUsage(jsonrpc_request_bytes=len(request_body), jsonrpc_response_bytes=result.response_bytes),
-            source="primitive.jsonrpc.call",
-            context={
-                "endpoint_id": endpoint_id,
-                "method_id": method_id,
-                "request_bytes": len(request_body),
-                "response_bytes": result.response_bytes,
+            classification_override = None
+            if transport.error is not None:
+                classification_override = ExternalEffectClassification(
+                    rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                    rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                    state_mutation=bool(
+                        method.state_mutation or method.right != CapabilityRight.READ.value
+                    ),
+                    information_flow=True,
+                    metadata={
+                        "outcome": "unknown_transport_failure",
+                        "phase": "transport_not_started_after_dns",
+                    },
+                )
+            result = self._call_result_from_transport(spec, method, request_id, transport)
+            result_payload = {
                 "status": result.status.value,
-            },
-        )
-        return result
+                "ok": result.ok,
+                "http_status": result.http_status,
+                "response_bytes": result.response_bytes,
+                "duration_s": result.duration_s,
+            }
+            return protected.complete(
+                result,
+                self._protected_evidence(pid, resource, result, method, operation_context),
+                classification_context=effect_context,
+                classification_result=result_payload,
+                classification_override=classification_override,
+                resource=ResourceSettlement(
+                    usage=ResourceUsage(
+                        jsonrpc_request_bytes=len(request_body),
+                        jsonrpc_response_bytes=result.response_bytes,
+                    ),
+                    source="primitive.jsonrpc.call",
+                    context={
+                        **resource_context,
+                        "response_bytes": result.response_bytes,
+                        "status": result.status.value,
+                    },
+                ),
+            )
 
     async def acall(self, pid: str, endpoint_id: str, method_id: str, params: Any = None) -> JsonRpcCallResult:
         return await asyncio.to_thread(self.call, pid, endpoint_id, method_id, params)
+
+    def _protected(self):
+        sdk = getattr(self, "protected_operations", None) or getattr(
+            self.store, "protected_operation_sdk", None
+        )
+        if sdk is None:
+            raise ValidationError("JsonRpcPrimitive requires ProtectedOperationSDK")
+        return sdk
+
+    def _protected_evidence(
+        self,
+        pid: str,
+        resource: str,
+        result: JsonRpcCallResult,
+        method: JsonRpcMethodSpec,
+        operation_context: dict[str, Any],
+    ) -> ProtectedOperationEvidence:
+        event_type = (
+            EventType.EXTERNAL_WRITE
+            if method.state_mutation or method.right != CapabilityRight.READ.value
+            else EventType.EXTERNAL_READ
+        )
+        return ProtectedOperationEvidence(
+            event_type=event_type,
+            event_source=pid,
+            event_target=resource,
+            event_payload={
+                "adapter": "jsonrpc",
+                "endpoint_id": result.endpoint_id,
+                "method_id": result.method_id,
+                "status": result.status.value,
+                "ok": result.ok,
+                "http_status": result.http_status,
+                "response_bytes": result.response_bytes,
+                "duration_s": result.duration_s,
+            },
+            audit_action="primitive.jsonrpc.call",
+            audit_actor=pid,
+            audit_target=resource,
+            audit_decision={
+                "endpoint_id": result.endpoint_id,
+                "method_id": result.method_id,
+                "rpc_method": method.rpc_method,
+                "right": method.right,
+                "request_id": result.request_id,
+                "params_sha256": operation_context["params_sha256"],
+                "params_preview": operation_context["params_preview"],
+                "params_observation": operation_context["params_observation"],
+                "sandbox_profile": operation_context.get("sandbox_profile"),
+                "status": result.status.value,
+                "ok": result.ok,
+                "http_status": result.http_status,
+                "response_bytes": result.response_bytes,
+                "duration_s": result.duration_s,
+            },
+            capability_refs=tuple(operation_context.get("capability_ids") or ()),
+            effect_metadata={
+                "status": result.status.value,
+                "ok": result.ok,
+                "http_status": result.http_status,
+                "response_bytes": result.response_bytes,
+                "duration_s": result.duration_s,
+            },
+        )
+
+    def _protected_failure_evidence(
+        self,
+        pid: str,
+        resource: str,
+        method: JsonRpcMethodSpec,
+        operation_context: dict[str, Any],
+        error: BaseException,
+        phase: str,
+    ) -> ProtectedOperationEvidence:
+        result = JsonRpcCallResult(
+            endpoint_id=str(operation_context["endpoint_id"]),
+            method_id=method.method_id,
+            rpc_method=method.rpc_method,
+            request_id=str(operation_context["request_id"]),
+            status=JsonRpcCallStatus.TRANSPORT_ERROR,
+            http_status=None,
+            ok=False,
+            error={"message": {"redacted": True}, "phase": phase},
+            response_bytes=0,
+            duration_s=0.0,
+        )
+        evidence = self._protected_evidence(pid, resource, result, method, operation_context)
+        return ProtectedOperationEvidence(
+            **{
+                **evidence.__dict__,
+                "audit_decision": {
+                    **dict(evidence.audit_decision),
+                    "effect_outcome": "unknown",
+                    "error_type": type(error).__name__,
+                    "phase": phase,
+                },
+            }
+        )
 
     def grant_method(
         self,
@@ -567,212 +651,6 @@ class JsonRpcPrimitive:
             error={"message": message, **dict(extra or {})},
             response_bytes=transport.response_bytes,
             duration_s=transport.elapsed_s,
-        )
-
-    def _emit_call_event(
-        self,
-        pid: str,
-        resource: str,
-        result: JsonRpcCallResult,
-        method: JsonRpcMethodSpec,
-    ) -> Event:
-        event_type = EventType.EXTERNAL_WRITE if method.state_mutation or method.right != CapabilityRight.READ.value else EventType.EXTERNAL_READ
-        return self.events.emit(
-            event_type,
-            source=pid,
-            target=resource,
-            payload={
-                "adapter": "jsonrpc",
-                "endpoint_id": result.endpoint_id,
-                "method_id": result.method_id,
-                "status": result.status.value,
-                "ok": result.ok,
-                "http_status": result.http_status,
-                "response_bytes": result.response_bytes,
-                "duration_s": result.duration_s,
-            },
-        )
-
-    def _record_call_audit(
-        self,
-        pid: str,
-        resource: str,
-        result: JsonRpcCallResult,
-        method: JsonRpcMethodSpec,
-        operation_context: dict[str, Any],
-    ) -> AuditRecord:
-        return self.audit.record(
-            actor=pid,
-            action="primitive.jsonrpc.call",
-            target=resource,
-            decision={
-                "endpoint_id": result.endpoint_id,
-                "method_id": result.method_id,
-                "rpc_method": method.rpc_method,
-                "right": method.right,
-                "request_id": result.request_id,
-                "params_sha256": operation_context["params_sha256"],
-                "params_preview": operation_context["params_preview"],
-                "params_observation": operation_context["params_observation"],
-                "sandbox_profile": operation_context.get("sandbox_profile"),
-                "status": result.status.value,
-                "ok": result.ok,
-                "http_status": result.http_status,
-                "response_bytes": result.response_bytes,
-                "duration_s": result.duration_s,
-            },
-            capability_refs=list(operation_context.get("capability_ids") or []),
-        )
-
-    def _record_external_effect(
-        self,
-        pid: str,
-        resource: str,
-        context: dict[str, Any],
-        result: JsonRpcCallResult,
-        event: Event,
-        audit_record: AuditRecord,
-        *,
-        preflight_classification: ExternalEffectClassification,
-        effect_intent_id: str,
-    ) -> None:
-        result_payload = {
-            "status": result.status.value,
-            "ok": result.ok,
-            "http_status": result.http_status,
-            "response_bytes": result.response_bytes,
-            "duration_s": result.duration_s,
-        }
-        try:
-            classification = classify_external_effect(self.provider, "call", context, result_payload)
-        except Exception as exc:
-            # The provider effect has already happened at this point. If the
-            # post-call classifier fails, record a conservative irreversible
-            # effect instead of losing the append-only external-effect row.
-            classification = ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
-                rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
-                state_mutation=True,
-                information_flow=True,
-                metadata={
-                    **dict(preflight_classification.metadata),
-                    "classification_error": f"{type(exc).__name__}: {exc}",
-                    "classification_fallback": "post_call_failure",
-                },
-            )
-        if not classification.information_flow:
-            classification = ExternalEffectClassification(
-                rollback_class=classification.rollback_class,
-                rollback_status=classification.rollback_status,
-                state_mutation=classification.state_mutation,
-                information_flow=True,
-                metadata={**classification.metadata, "remote_information_flow": True},
-            )
-        record_external_effect(
-            self.store,
-            pid=pid,
-            provider="jsonrpc",
-            operation="call",
-            target=resource,
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={"context": context, "result": result_payload},
-            intent_effect_id=effect_intent_id,
-        )
-
-    def _commit_call_reservation(self, reservation_id: str | None) -> None:
-        self.capabilities.commit_reserved_use(
-            reservation_id,
-            committed_by="jsonrpc",
-            reason="one-time JSON-RPC method permission committed after remote information flow began",
-        )
-
-    def _restore_call_reservation(self, reservation_id: str | None) -> None:
-        self.capabilities._restore_reserved_use(
-            reservation_id,
-            restored_by="jsonrpc",
-            reason="one-time JSON-RPC method permission restored after certified pre-boundary failure",
-        )
-
-    def _record_unknown_boundary_failure(
-        self,
-        *,
-        pid: str,
-        resource: str,
-        method: JsonRpcMethodSpec,
-        operation_context: dict[str, Any],
-        effect_context: dict[str, Any],
-        effect_intent_id: str,
-        error: BaseException,
-        phase: str,
-    ) -> None:
-        result = JsonRpcCallResult(
-            endpoint_id=str(operation_context["endpoint_id"]),
-            method_id=method.method_id,
-            rpc_method=method.rpc_method,
-            request_id=str(operation_context["request_id"]),
-            status=JsonRpcCallStatus.TRANSPORT_ERROR,
-            http_status=None,
-            ok=False,
-            error={"message": sanitize_for_observability(str(error)), "phase": phase},
-            response_bytes=0,
-            duration_s=0.0,
-        )
-        event = self._emit_call_event(pid, resource, result, method)
-        audit_record = self._record_call_audit(pid, resource, result, method, operation_context)
-        record_external_effect(
-            self.store,
-            pid=pid,
-            provider="jsonrpc",
-            operation="call",
-            target=resource,
-            classification=ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=False,
-                information_flow=True,
-                metadata={"outcome": "unknown_remote_boundary_failure", "phase": phase},
-            ),
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "context": effect_context,
-                "error_type": type(error).__name__,
-                "error": sanitize_for_observability(str(error)),
-            },
-            intent_effect_id=effect_intent_id,
-        )
-
-    def _preflight_resource_usage(
-        self,
-        pid: str,
-        usage: ResourceUsage,
-        *,
-        source: str,
-        context: dict[str, Any],
-    ) -> None:
-        if self.resources is None:
-            return
-        self.resources.preflight(pid, usage, source=source, context=context)
-
-    def _charge_resource_usage(
-        self,
-        pid: str,
-        usage: ResourceUsage,
-        *,
-        source: str,
-        context: dict[str, Any],
-    ) -> None:
-        if self.resources is None:
-            return
-        self.resources.charge(
-            pid,
-            usage,
-            source=source,
-            context=context,
-            allow_overage=True,
-            kill_on_exceed=True,
         )
 
     def _operation_context(

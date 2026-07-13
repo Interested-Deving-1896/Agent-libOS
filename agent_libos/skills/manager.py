@@ -1301,7 +1301,7 @@ class SkillManager:
             exclude_capability_ids=exclude_capability_ids,
         )
         for cap_id, reservation_id in selected.items():
-            self.capabilities._restore_reserved_use(
+            self.capabilities.restore_reserved_use(
                 reservation_id,
                 restored_by="skill",
                 reason="one-time skill permission restored before commit",

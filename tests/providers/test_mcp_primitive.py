@@ -382,14 +382,19 @@ class TestMcpPrimitive:
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='mcp call not started after validation')
             runtime.mcp.register_server_from_yaml_text(
-                _stdio_manifest('call-not-started'),
+                _stdio_manifest(
+                    'call-not-started',
+                    state_mutation=True,
+                    right='write',
+                    rollback_class='irreversible',
+                ),
                 actor='cli',
                 require_capability=False,
             )
             runtime.capability.grant(
                 pid,
                 'mcp:call-not-started:echo',
-                [CapabilityRight.READ],
+                [CapabilityRight.WRITE],
                 issued_by='test',
             )
             _grant_stdio_spawn(runtime, pid)
@@ -410,6 +415,41 @@ class TestMcpPrimitive:
             assert not effect.state_mutation
             assert effect.information_flow
             assert effect.provider_metadata['outcome'] == 'call_tool_not_started_after_live_validation'
+        finally:
+            runtime.close()
+
+    def test_call_tool_provider_exception_returns_error_with_unknown_effect(self) -> None:
+        runtime = Runtime.open('local')
+        provider = _FailingCallMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp provider exception')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    'call-failed',
+                    state_mutation=True,
+                    right='write',
+                    rollback_class='irreversible',
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:call-failed:echo',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            result = runtime.mcp.call_tool(pid, 'call-failed', 'echo', {'text': 'hello'})
+
+            assert result.status.value == 'transport_error'
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.transaction_state == 'unknown'
+            assert effect.state_mutation
+            assert effect.provider_metadata['outcome'] == 'unknown_provider_exception'
+            assert 'mcp-provider-secret' not in str(effect.provider_metadata)
         finally:
             runtime.close()
 
@@ -1165,6 +1205,8 @@ def _stdio_manifest(
     env_source: str | None = None,
     cwd: str | None = None,
     state_mutation: bool = False,
+    right: str = "read",
+    rollback_class: str = "no_rollback_required",
 ) -> str:
     cwd_line = f"\n  cwd: {cwd}" if cwd is not None else ""
     env_block = f"\n  env:\n    DEMO_TOKEN: {env_source}" if env_source is not None else ""
@@ -1190,8 +1232,8 @@ stdio:
 tools:
   - tool_id: echo
     mcp_name: {mcp_name}
-    right: read
-    rollback_class: no_rollback_required
+    right: {right}
+    rollback_class: {rollback_class}
     state_mutation: {str(state_mutation).lower()}
     information_flow: true
     input_schema:
@@ -1314,6 +1356,12 @@ class _NotStartedCallMcpProvider(_RecordingMcpProvider):
     def call_tool(self, server: Any, tool: Any, arguments: dict[str, Any], **_kwargs: Any) -> McpProviderCallResult:
         self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
         raise ProviderEffectNotStarted('mcp failed before tool transport')
+
+
+class _FailingCallMcpProvider(_RecordingMcpProvider):
+    def call_tool(self, server: Any, tool: Any, arguments: dict[str, Any], **_kwargs: Any) -> McpProviderCallResult:
+        self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
+        raise RuntimeError('mcp-provider-secret')
 
 
 class _CallOnlyClassifierMcpProvider(_RecordingMcpProvider):

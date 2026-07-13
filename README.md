@@ -127,6 +127,9 @@ Start here, then read the deeper references as needed:
 - [docs/explainable_operations.md](docs/explainable_operations.md): operation
   trees, evidence completeness, Context Manifests, redaction, CLI, and GUI/API
   queries.
+- [docs/protected_operation_sdk.md](docs/protected_operation_sdk.md): stable
+  provider-operation contracts, phases, failure semantics, evidence, and
+  extension examples.
 - [docs/capabilities.md](docs/capabilities.md): resource naming, rights,
   one-shot grants, human approval, shell policy, and filesystem containment.
 - [docs/object_memory.md](docs/object_memory.md): namespaces, object rights,

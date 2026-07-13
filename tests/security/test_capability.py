@@ -873,7 +873,7 @@ class TestCapabilityManager:
             assert reservation_id is not None
 
             runtime.capability.revoke(cap.cap_id, revoked_by='issuer', reason='explicit revoke wins')
-            restored = runtime.capability._restore_reserved_use(
+            restored = runtime.capability.restore_reserved_use(
                 reservation_id,
                 restored_by='test',
                 reason='provider failed before commit',
@@ -962,7 +962,7 @@ class TestCapabilityManager:
 
             reopened = Runtime.open(db_path)
             try:
-                assert reopened.capability._restore_reserved_use(
+                assert reopened.capability.restore_reserved_use(
                     reservation_id,
                     restored_by='test',
                     reason='late cleanup from previous runtime',

@@ -137,7 +137,7 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
-    def test_direct_object_release_finalizer_failure_keeps_object_for_retry(self) -> None:
+    def test_direct_object_release_unknown_close_keeps_object_and_blocks_blind_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider(close_failures=1)
             runtime = _open_pty_runtime(temp_dir, provider)
@@ -154,9 +154,10 @@ class TestPtyModule:
                 assert runtime.store.get_object(session_oid) is not None
                 assert session_oid in _pty_adapter(runtime)._sessions
 
-                assert runtime.memory.delete_object_trusted("test", session_oid, reason="direct_release_retry")
-                assert provider.sessions[0].closed
-                assert runtime.store.get_object(session_oid) is None
+                with pytest.raises(ValidationError, match="unresolved prior close outcome"):
+                    runtime.memory.delete_object_trusted("test", session_oid, reason="direct_release_retry")
+                assert provider.sessions[0].closed is False
+                assert runtime.store.get_object(session_oid) is not None
             finally:
                 runtime.close()
 
@@ -272,6 +273,37 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_sdk_enter_failure_releases_pending_session_capacity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = _open_pty_runtime(temp_dir, FakePtyProvider(initial_outputs=[]))
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty enter failure")
+                adapter = _pty_adapter(runtime)
+
+                class FailingContext:
+                    def __enter__(self):
+                        raise RuntimeError("protected enter failed")
+
+                    def __exit__(self, *_args: Any) -> bool:
+                        return False
+
+                monkeypatch.setattr(
+                    runtime.protected_operations,
+                    "start",
+                    lambda *_args, **_kwargs: FailingContext(),
+                )
+
+                with pytest.raises(RuntimeError, match="protected enter failed"):
+                    adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0)
+
+                assert adapter._pending_session_creates == 0
+                assert adapter._pending_session_creates_by_process == {}
+            finally:
+                runtime.close()
+
     def test_pty_ambiguous_spawn_failure_commits_once_and_records_unknown_effect(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = AmbiguousFailurePtyProvider()
@@ -354,7 +386,7 @@ class TestPtyModule:
 
                 effects = runtime.store.list_external_effects(pid=pid)
                 by_operation = {effect.operation: effect for effect in effects}
-                assert set(by_operation) == {"spawn", "write", "resize", "close"}
+                assert set(by_operation) == {"spawn", "ingest", "write", "resize", "close"}
                 for operation in ("write", "resize", "close"):
                     effect = by_operation[operation]
                     assert effect.target == f"pty:{created.session_oid}"
@@ -366,6 +398,28 @@ class TestPtyModule:
                 assert by_operation["resize"].provider_metadata["cols"] == 100
                 assert by_operation["resize"].provider_metadata["rows"] == 30
                 assert by_operation["close"].provider_metadata["reason"] == "pty_close"
+            finally:
+                runtime.close()
+
+    def test_pty_background_reader_uses_runtime_internal_ingest_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = _open_pty_runtime(temp_dir, FakePtyProvider(initial_outputs=["ready\n"]))
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="pty ingest operation")
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(pid, ["git", "status"], cwd=".", startup_timeout_s=0.05)
+
+                adapter.close(pid, created.session_oid)
+
+                ingest = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "ingest"
+                    and effect.target == f"pty:{created.session_oid}"
+                ]
+                assert len(ingest) == 1
+                assert ingest[0].effect_state == "finalized"
+                assert ingest[0].information_flow is True
             finally:
                 runtime.close()
 
@@ -465,7 +519,7 @@ class TestPtyModule:
                 runtime.close()
 
     @pytest.mark.parametrize("operation", ["write", "resize", "close"])
-    def test_pty_one_time_mutation_ambiguous_failure_consumes_use_and_keeps_pending_intent(
+    def test_pty_one_time_mutation_ambiguous_failure_consumes_use_and_finalizes_unknown(
         self,
         operation: str,
         monkeypatch: pytest.MonkeyPatch,
@@ -497,7 +551,9 @@ class TestPtyModule:
                     if effect.operation == operation
                 ]
                 assert len(effects) == 1
-                assert effects[0].effect_state == "pending"
+                assert effects[0].effect_state == "finalized"
+                assert effects[0].transaction_state == "unknown"
+                assert effects[0].provider_metadata["outcome"] == "unknown_after_provider_exception"
                 assert effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
 
                 monkeypatch.setattr(handle, operation, original)
@@ -591,7 +647,7 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
-    def test_pty_auto_exit_close_pens_after_exit_code_keeps_pending_intent(
+    def test_pty_auto_exit_close_pens_after_exit_code_finalizes_partial_effect(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -621,7 +677,9 @@ class TestPtyModule:
                     if effect.operation == "close"
                 ]
                 assert len(close_effects) == 1
-                assert close_effects[0].effect_state == "pending"
+                assert close_effects[0].effect_state == "finalized"
+                assert close_effects[0].transaction_state == "committed"
+                assert close_effects[0].provider_metadata["outcome"] == "partial_not_started_after_prior_provider_effect"
                 assert close_effects[0].information_flow is True
 
                 monkeypatch.setattr(provider.sessions[0], "close", original_close)
@@ -664,7 +722,7 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
-    def test_pty_auto_exit_exit_code_ambiguous_failure_keeps_pending_intent(
+    def test_pty_auto_exit_exit_code_ambiguous_failure_finalizes_unknown(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -694,7 +752,9 @@ class TestPtyModule:
                     if effect.operation == "close"
                 ]
                 assert len(close_effects) == 1
-                assert close_effects[0].effect_state == "pending"
+                assert close_effects[0].effect_state == "finalized"
+                assert close_effects[0].transaction_state == "unknown"
+                assert close_effects[0].provider_metadata["outcome"] == "unknown_after_provider_exception"
                 assert close_effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
                 assert session.closed is False
                 assert session.closing is False
@@ -737,7 +797,8 @@ class TestPtyModule:
                     assert effect.rollback_class == ExternalEffectRollbackClass.UNKNOWN
                     assert effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
                     assert effect.provider_metadata["classification_fallback"] == "post_effect_failure"
-                    assert "classification_error" in effect.provider_metadata
+                    assert "classification_error_type" in effect.provider_metadata
+                    assert "classification_error" not in effect.provider_metadata
             finally:
                 runtime.close()
 
@@ -756,7 +817,11 @@ class TestPtyModule:
 
                 assert created.ok, created.error
                 assert provider.sessions[0].closed is False
-                effects = runtime.store.list_external_effects(pid=pid)
+                effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.operation == "spawn"
+                ]
                 assert len(effects) == 1
                 assert effects[0].rollback_class == ExternalEffectRollbackClass.UNKNOWN
                 assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
@@ -1162,12 +1227,12 @@ class TestPtyModule:
 
                 deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline:
-                    session = _pty_adapter(runtime)._sessions[first_oid]
-                    if session.closed:
+                    session = _pty_adapter(runtime)._sessions.get(first_oid)
+                    if session is None or session.closed:
                         break
                     time.sleep(0.01)
 
-                assert _pty_adapter(runtime)._sessions[first_oid].closed
+                assert first_oid not in _pty_adapter(runtime)._sessions
                 second = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
 
                 assert second.ok, second.error
@@ -1207,7 +1272,7 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
-    def test_pty_close_failure_keeps_session_registered_for_retry(self) -> None:
+    def test_pty_close_unknown_keeps_session_registered_and_blocks_blind_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider(close_failures=1)
             runtime = _open_pty_runtime(temp_dir, provider)
@@ -1226,9 +1291,10 @@ class TestPtyModule:
 
                 retried = runtime.tools.call(pid, "pty_close", {"session_oid": session_oid})
 
-                assert retried.ok, retried.error
-                assert provider.sessions[0].closed
-                assert runtime.store.get_object(session_oid) is None
+                assert not retried.ok
+                assert "unresolved prior close outcome" in (retried.error or "")
+                assert provider.sessions[0].closed is False
+                assert runtime.store.get_object(session_oid) is not None
             finally:
                 runtime.close()
 

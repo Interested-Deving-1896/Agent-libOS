@@ -13,9 +13,6 @@ from agent_libos.models import (
     AuthorityRisk,
     CapabilityEffect,
     CapabilityRight,
-    ExternalEffectClassification,
-    ExternalEffectRollbackClass,
-    ExternalEffectRollbackStatus,
     ProcessMessage,
     ProcessMessageKind,
 )
@@ -30,16 +27,14 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.external_effects import (
-    abandon_external_effect_intent,
-    begin_external_effect_intent,
-    classify_external_effect,
-    record_external_effect,
-    require_external_effect_classifier,
-)
 from agent_libos.runtime.effect_binding import canonical_effect_hash
 from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import HumanProvider, ProviderEffectNotStarted
+from agent_libos.sdk import (
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
+)
 from agent_libos.utils.serde import dumps, to_jsonable
 
 if TYPE_CHECKING:
@@ -1080,7 +1075,7 @@ class HumanObjectManager:
         )
 
     def _restore_one_time_decision(self, reservation_id: str | None) -> None:
-        self.capabilities._restore_reserved_use(
+        self.capabilities.restore_reserved_use(
             reservation_id,
             restored_by="human",
             reason="one-time human permission restored before request commit",
@@ -1318,7 +1313,6 @@ class HumanObjectManager:
     ) -> str | None:
         if operation not in {"read", "write"}:
             raise ValidationError(f"unsupported terminal human provider operation: {operation}")
-        require_external_effect_classifier(self.provider, operation)
         resource = f"human:{request.human}"
         prompt_observation = self._terminal_text_observation(text)
         request_kind = (
@@ -1336,160 +1330,155 @@ class HumanObjectManager:
             "chars": prompt_observation["chars"],
             "prompt_observation": prompt_observation,
         }
-        effect_intent = begin_external_effect_intent(
-            self.store,
+        invocation = ProtectedOperationInvocation(
             pid=request.pid,
-            provider="human",
-            operation=operation,
+            actor=request.pid,
             target=resource,
-            state_mutation=operation == "write",
-            information_flow=True,
-            metadata={"context": effect_context},
+            canonical_args={
+                "request_id": request.request_id,
+                "operation": operation,
+                "purpose": purpose,
+                "text": text,
+            },
+            observation=effect_context,
+            failure_evidence=lambda error, phase: self._protected_terminal_evidence(
+                request,
+                operation=operation,
+                resource=resource,
+                purpose=purpose,
+                prompt_observation=prompt_observation,
+                result_observation={"type": type(error).__name__},
+                failed=True,
+                phase=phase,
+            ),
         )
-        try:
-            result = self.provider.read(text) if operation == "read" else self.provider.write(text)
-        except ProviderEffectNotStarted:
-            with self.store.transaction():
-                abandon_external_effect_intent(self.store, effect_intent.effect_id)
-            raise
-        except BaseException as exc:
-            # The provider may have emitted the prompt or accepted input before
-            # failing. Preserve UNKNOWN evidence, but never persist prompt,
-            # answer, or exception text from this sensitive boundary.
-            try:
-                self._finalize_terminal_provider_failure(
+        with self._protected().start(
+            f"primitive.human.{operation}", invocation, provider=self.provider
+        ) as protected:
+            result = protected.call(
+                ProviderPhase(
+                    "terminal_io",
+                    state_mutation=operation == "write",
+                    information_flow=True,
+                ),
+                self.provider.read if operation == "read" else self.provider.write,
+                text,
+            )
+            result_observation = (
+                self._terminal_text_observation(result)
+                if isinstance(result, str)
+                else {"type": type(result).__name__}
+            )
+            return protected.complete(
+                result,
+                self._protected_terminal_evidence(
                     request,
                     operation=operation,
                     resource=resource,
                     purpose=purpose,
-                    effect_context=effect_context,
-                    effect_intent_id=effect_intent.effect_id,
-                    error=exc,
-                )
-            except Exception:
-                pass
-            raise
+                    prompt_observation=prompt_observation,
+                    result_observation=result_observation,
+                ),
+                classification_context=effect_context,
+                classification_result={
+                    "completed": True,
+                    "result_observation": result_observation,
+                },
+            )
 
-        result_observation = (
-            self._terminal_text_observation(result)
-            if isinstance(result, str)
-            else {"type": type(result).__name__}
+    def _protected(self) -> Any:
+        sdk = (
+            getattr(self, "protected_operations", None)
+            or getattr(self, "protected_operation_sdk", None)
+            or getattr(self.store, "protected_operation_sdk", None)
         )
-        try:
-            event = self.events.emit(
-                EventType.HUMAN_RESPONSE if operation == "read" else EventType.HUMAN_OUTPUT,
-                source=request.human if operation == "read" else request.pid,
-                target=resource,
-                payload={
-                    "request_id": request.request_id,
-                    "purpose": purpose,
-                    "operation": operation,
-                    "chars": result_observation.get("chars", prompt_observation["chars"]),
-                },
-            )
-            audit_record = self.audit.record(
-                actor=request.pid,
-                action=f"human.terminal.{operation}",
-                target=resource,
-                decision={
-                    "request_id": request.request_id,
-                    "purpose": purpose,
-                    "operation": operation,
-                    "prompt_observation": prompt_observation,
-                    "result_observation": result_observation,
-                },
-            )
-            classification = classify_external_effect(
-                self.provider,
-                operation,
-                effect_context,
-                {"completed": True, "result_observation": result_observation},
-            )
-            if not classification.information_flow:
-                classification = ExternalEffectClassification(
-                    rollback_class=classification.rollback_class,
-                    rollback_status=classification.rollback_status,
-                    state_mutation=classification.state_mutation,
-                    information_flow=True,
-                    metadata={**classification.metadata, "terminal_information_flow": True},
-                )
-            record_external_effect(
-                self.store,
-                pid=request.pid,
-                provider="human",
-                operation=operation,
-                target=resource,
-                classification=classification,
-                audit_record=audit_record,
-                event=event,
-                metadata={
-                    "context": effect_context,
-                    "result_observation": result_observation,
-                },
-                intent_effect_id=effect_intent.effect_id,
-            )
-        except Exception:
-            # The human interaction has already completed. Leave the durable
-            # pending intent and continue committing the chosen answer/policy
-            # so queue draining cannot repeat the prompt.
-            pass
-        return result
+        if sdk is None:
+            raise ValidationError("Human protected-operation SDK is not attached")
+        return sdk
 
-    def _finalize_terminal_provider_failure(
+    def _protected_terminal_evidence(
         self,
         request: HumanRequest,
         *,
         operation: str,
         resource: str,
         purpose: str,
-        effect_context: dict[str, Any],
-        effect_intent_id: str,
-        error: BaseException,
-    ) -> None:
-        event = self.events.emit(
-            EventType.HUMAN_RESPONSE if operation == "read" else EventType.HUMAN_OUTPUT,
-            source=request.human if operation == "read" else request.pid,
-            target=resource,
-            payload={
-                "request_id": request.request_id,
-                "purpose": purpose,
-                "operation": operation,
-                "outcome": "unknown",
-                "error_type": type(error).__name__,
-            },
-        )
-        audit_record = self.audit.record(
-            actor=request.pid,
-            action=f"human.terminal.{operation}.failed",
-            target=resource,
-            decision={
-                "request_id": request.request_id,
-                "purpose": purpose,
-                "operation": operation,
-                "effect_outcome": "unknown",
-                "error_type": type(error).__name__,
-            },
-        )
-        record_external_effect(
-            self.store,
-            pid=request.pid,
-            provider="human",
-            operation=operation,
-            target=resource,
-            classification=ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=operation == "write",
-                information_flow=True,
-                metadata={"outcome": "unknown_after_provider_exception"},
+        prompt_observation: dict[str, Any],
+        result_observation: dict[str, Any],
+        failed: bool = False,
+        phase: str | None = None,
+    ) -> ProtectedOperationEvidence:
+        result_chars = result_observation.get("chars", prompt_observation["chars"])
+        event_payload = {
+            "request_id": request.request_id,
+            "purpose": purpose,
+            "operation": operation,
+            "chars": result_chars,
+        }
+        decision = {
+            "request_id": request.request_id,
+            "purpose": purpose,
+            "operation": operation,
+            "prompt_observation": prompt_observation,
+            "result_observation": result_observation,
+        }
+        if failed:
+            event_payload.update({"outcome": "unknown", "phase": phase})
+            decision.update({"effect_outcome": "unknown", "phase": phase})
+        return ProtectedOperationEvidence(
+            event_type=(
+                EventType.HUMAN_RESPONSE if operation == "read" else EventType.HUMAN_OUTPUT
             ),
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "context": effect_context,
-                "error_type": type(error).__name__,
+            event_source=request.human if operation == "read" else request.pid,
+            event_target=resource,
+            event_payload=event_payload,
+            audit_action=f"human.terminal.{operation}{'.failed' if failed else ''}",
+            audit_actor=request.pid,
+            audit_target=resource,
+            audit_decision=decision,
+            effect_metadata={"result_observation": result_observation},
+        )
+
+    def _protected_output_evidence(
+        self,
+        request: HumanRequest,
+        resource: str,
+        channel: str,
+        *,
+        failed: bool = False,
+        phase: str | None = None,
+        error: BaseException | None = None,
+    ) -> ProtectedOperationEvidence:
+        event_payload: dict[str, Any] = {
+            "request_id": request.request_id,
+            "channel": channel,
+            "chars": int(len(str(request.payload.get("message", "")))),
+        }
+        decision: dict[str, Any] = {
+            **event_payload,
+            "delivery_committed": True,
+        }
+        if failed:
+            event_payload.update(
+                {"outcome": "unknown", "phase": phase, "error_type": type(error).__name__}
+            )
+            decision.update(
+                {"effect_outcome": "unknown", "phase": phase, "error_type": type(error).__name__}
+            )
+        return ProtectedOperationEvidence(
+            event_type=EventType.HUMAN_OUTPUT,
+            event_source=request.pid,
+            event_target=resource,
+            event_payload=event_payload,
+            audit_action="human.output.failed" if failed else "human.output",
+            audit_actor=request.pid,
+            audit_target=resource,
+            audit_decision=decision,
+            effect_metadata={
+                "delivery_committed": True,
+                "delivered": not failed,
+                **({"phase": phase, "error_type": type(error).__name__} if failed else {}),
             },
-            intent_effect_id=effect_intent_id,
         )
 
     def _terminal_text_observation(self, text: str) -> dict[str, Any]:
@@ -1556,9 +1545,10 @@ class HumanObjectManager:
             "request_id": request.request_id,
             "request_kind": "output",
         }
-        require_external_effect_classifier(self.provider, "write")
         resource = f"human:{request.human}"
-        with self.store.transaction():
+
+        def prepare() -> None:
+            nonlocal request
             latest = self.store.get_human_request(request.request_id)
             if latest is None:
                 raise NotFound(f"human request not found: {request.request_id}")
@@ -1576,91 +1566,71 @@ class HumanObjectManager:
             request.decision = {"delivery_committed": True}
             request.updated_at = utc_now()
             self.store.update_human_request(request)
-            event = self.events.emit(
-                EventType.HUMAN_OUTPUT,
-                source=request.pid,
-                target=resource,
-                payload={"request_id": request.request_id, "channel": channel, "chars": len(message)},
-            )
-            audit_record = self.audit.record(
-                actor=request.pid,
-                action="human.output",
-                target=resource,
-                decision={
-                    "request_id": request.request_id,
-                    "channel": channel,
-                    "chars": len(message),
-                    "delivery_committed": True,
-                },
-            )
-            effect_intent = begin_external_effect_intent(
-                self.store,
-                pid=request.pid,
-                provider="human",
-                operation="write",
-                target=resource,
-                state_mutation=True,
-                information_flow=True,
-                metadata={"context": effect_context, "result": {"delivery_committed": True}},
-            )
+
+        def restore_not_started() -> None:
+            latest = self.store.get_human_request(request.request_id)
+            if latest is not None and latest.status == HumanRequestStatus.DELIVERED:
+                latest.status = HumanRequestStatus.PENDING
+                latest.decision = {
+                    "delivery_committed": False,
+                    "provider_not_started": True,
+                }
+                latest.updated_at = utc_now()
+                self.store.update_human_request(latest)
+
+        def settle_success() -> None:
+            latest = self.store.get_human_request(request.request_id)
+            if latest is None:
+                raise NotFound(f"human request not found: {request.request_id}")
+            latest.decision = {"delivery_committed": True, "delivered": True}
+            latest.updated_at = utc_now()
+            self.store.update_human_request(latest)
+
+        invocation = ProtectedOperationInvocation(
+            pid=request.pid,
+            actor=request.pid,
+            target=resource,
+            canonical_args={
+                "request_id": request.request_id,
+                "channel": channel,
+                "message": message,
+            },
+            observation=effect_context,
+            prepare=prepare,
+            restore_not_started=restore_not_started,
+            failure_evidence=lambda error, phase: self._protected_output_evidence(
+                request, resource, channel, failed=True, phase=phase, error=error
+            ),
+        )
+        provider_attempted = False
         try:
-            self.provider.write(message)
+            with self._protected().start(
+                "primitive.human.write", invocation, provider=self.provider
+            ) as protected:
+                def write_once() -> None:
+                    nonlocal provider_attempted
+                    provider_attempted = True
+                    self.provider.write(message)
+
+                protected.call(
+                    ProviderPhase("output", state_mutation=True, information_flow=True),
+                    write_once,
+                )
+                result = protected.complete(
+                    request,
+                    self._protected_output_evidence(request, resource, channel),
+                    classification_context=effect_context,
+                    classification_result={"delivery_committed": True, "delivered": True},
+                    settle_success=settle_success,
+                )
         except ProviderEffectNotStarted:
-            with self.store.transaction():
-                abandon_external_effect_intent(self.store, effect_intent.effect_id)
-                latest = self.store.get_human_request(request.request_id)
-                if latest is not None and latest.status == HumanRequestStatus.DELIVERED:
-                    latest.status = HumanRequestStatus.PENDING
-                    latest.decision = {
-                        "delivery_committed": False,
-                        "provider_not_started": True,
-                    }
-                    latest.updated_at = utc_now()
-                    self.store.update_human_request(latest)
-                self.audit.record(
-                    actor=request.pid,
-                    action="human.output.not_started",
-                    target=resource,
-                    decision={
-                        "request_id": request.request_id,
-                        "channel": channel,
-                        "chars": len(message),
-                        "provider_started": False,
-                    },
-                )
             raise
-        except Exception as exc:
-            try:
-                record_external_effect(
-                    self.store,
-                    pid=request.pid,
-                    provider="human",
-                    operation="write",
-                    target=resource,
-                    classification=ExternalEffectClassification(
-                        rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                        rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                        state_mutation=True,
-                        information_flow=True,
-                        metadata={"outcome": "unknown_after_provider_exception"},
-                    ),
-                    audit_record=audit_record,
-                    event=event,
-                    metadata={
-                        "context": effect_context,
-                        "error_type": type(exc).__name__,
-                    },
-                    intent_effect_id=effect_intent.effect_id,
-                )
-            except Exception:
-                # The pre-provider pending intent remains durable.
-                pass
+        except BaseException as error:
+            if not provider_attempted:
+                raise
             request.decision = {
                 "delivery_committed": True,
-                # Provider exceptions can echo terminal payloads or transport
-                # details.  Persist only the stable error class, matching the
-                # interactive terminal path's privacy boundary.
-                "provider_error_type": type(exc).__name__,
+                "provider_error_type": type(error).__name__,
             }
             request.updated_at = utc_now()
             try:
@@ -1668,40 +1638,45 @@ class HumanObjectManager:
             except Exception:
                 pass
             raise
-        try:
-            classification = classify_external_effect(
-                self.provider,
-                "write",
-                effect_context,
-                {"delivery_committed": True, "delivered": True},
-            )
-            record_external_effect(
-                self.store,
-                pid=request.pid,
-                provider="human",
-                operation="write",
-                target=resource,
-                classification=classification,
-                audit_record=audit_record,
-                event=event,
-                metadata={
-                    "context": effect_context,
-                    "result": {"delivery_committed": True, "delivered": True},
-                },
-                intent_effect_id=effect_intent.effect_id,
-            )
-        except Exception:
-            # Delivery is at-most-once and already happened.  Do not surface a
-            # post-provider bookkeeping failure as retryable; the UNKNOWN
-            # pending intent is the fail-closed evidence.
-            pass
+
+        # PRESERVE_RESULT means bookkeeping failures after the terminal write
+        # are intentionally not retryable. Keep the request delivered even if
+        # the durable pending effect is the only surviving evidence.
         request.decision = {"delivery_committed": True, "delivered": True}
         request.updated_at = utc_now()
         try:
             self.store.update_human_request(request)
         except Exception:
             pass
-        return request
+        return result
+
+    def recover_prepared_output(self, effect: Any) -> None:
+        """Undo a durable output claim that never reached the Human provider."""
+
+        context = effect.provider_metadata.get("context")
+        request_id = context.get("request_id") if isinstance(context, dict) else None
+        if not isinstance(request_id, str) or not request_id:
+            raise ValidationError(
+                f"prepared Human output is missing request identity: {effect.effect_id}"
+            )
+        request = self.store.get_human_request(request_id)
+        if request is None:
+            raise NotFound(f"human request not found during prepared recovery: {request_id}")
+        if request.status == HumanRequestStatus.PENDING:
+            return
+        if request.status != HumanRequestStatus.DELIVERED:
+            raise ValidationError(
+                f"prepared Human output recovery found incompatible status: {request_id} "
+                f"status={request.status.value}"
+            )
+        request.status = HumanRequestStatus.PENDING
+        request.decision = {
+            "delivery_committed": False,
+            "provider_not_dispatched": True,
+            "startup_recovered": True,
+        }
+        request.updated_at = utc_now()
+        self.store.update_human_request(request)
 
     def _default_message_subject(self, kind: ProcessMessageKind) -> str:
         if kind == ProcessMessageKind.INTERRUPT:

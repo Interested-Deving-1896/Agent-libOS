@@ -33,6 +33,12 @@ multi-step effects, primitives opt out with `consume=False`, reserve the exact
 use before creating human, Skill, ObjectTask, or provider side effects, and
 then commit or restore that reservation token. An explicit revoke invalidates
 outstanding tokens, so late cleanup cannot reactivate revoked authority.
+Provider subsystems do not manage these tokens directly: the
+[`Protected Operation SDK`](protected_operation_sdk.md) reserves every distinct
+finite decision in the same transaction as local prepare state and the effect
+intent, then commits on the first effectful provider phase. The public
+`CapabilityManager.restore_reserved_use(...)` operation is revoke-safe; the SDK
+is its sole provider-effect caller.
 Reservations left in flight by a crashed runtime are abandoned fail-closed on
 the next open. A reserved use is restored only when an operation fails before
 the effect begins; after the commit/provider boundary, the one-shot use remains

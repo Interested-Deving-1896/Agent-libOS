@@ -5,4 +5,4 @@ modules:
   manifest_paths:
     - modules/pty/module.yaml
   trusted_modules:
-    - agent-libos-pty:v0:ec0166cdcea6688251132ee521b255c7ee6942a6aebd42154bee258f2bd2a9de:0874fe40688756adf7a7d16fa92e033b88deee200acccd6f2c0805d5c9afa657
+    - agent-libos-pty:v0:2f2302b698a8e6544df63cc0f19b021913fe00bb2e5b1f195243531404e659c1:a00d49e37c13600c3f1d09abede2bc306a815335f90141b7d8541990cf9af666

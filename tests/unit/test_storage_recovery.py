@@ -25,12 +25,12 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.external_effects import (
     abandon_external_effect_intent,
-    begin_external_effect_intent,
     record_external_effect,
 )
 from agent_libos.storage import SQLiteStore
 from agent_libos.storage.postgres import PostgresStore
 from agent_libos.utils.ids import utc_now
+from tests.support.external_effects import begin_external_effect_intent
 
 
 class _ConnectionProxy:

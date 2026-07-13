@@ -712,6 +712,10 @@ class SQLRuntimeStore:
             self._ensure_authority_manifest_schema()
             self._ensure_resource_reservation_schema()
             self._ensure_capability_schema()
+            # Prepared protected operations durably link reservations from the
+            # external-effect row. Ensure additive effect columns exist before
+            # stale-reservation recovery inspects those links.
+            self._ensure_external_effect_schema()
             self._abandon_stale_capability_use_reservations()
             self._ensure_audit_schema()
             self._ensure_operation_schema()
@@ -720,7 +724,6 @@ class SQLRuntimeStore:
             self._ensure_object_task_schema()
             self._ensure_agent_rating_schema()
             self._ensure_checkpoint_schema()
-            self._ensure_external_effect_schema()
             self._ensure_skill_schema()
             self._ensure_tool_candidate_schema()
             self._ensure_jsonrpc_endpoint_schema()
@@ -3296,19 +3299,46 @@ class SQLRuntimeStore:
         """Fail closed after a runtime crash during an external effect.
 
         Runtime-store leases ensure initialization cannot overlap a live
-        provider call.  A reservation still marked ``reserved`` at this point
-        therefore belongs to a previous, interrupted runtime.  Its authority
-        remains consumed; only the bookkeeping state is made terminal so a
-        later cleanup cannot refund it.
+        provider call. Reservations linked to a durable ``prepared`` protected
+        operation remain live for SDK local recovery; every other stale
+        reservation remains consumed and is made terminal so later cleanup
+        cannot refund it.
         """
-        self.conn.execute(
+        protected_reservations: set[str] = set()
+        for row in self.conn.execute(
             """
-            UPDATE capability_use_reservations
-               SET status = ?, updated_at = ?
-             WHERE status = ?
+            SELECT provider_metadata_json
+              FROM external_effects
+             WHERE effect_state = ? AND transaction_state = ?
             """,
-            ("abandoned", utc_now(), "reserved"),
+            ("pending", "prepared"),
+        ):
+            metadata = loads(row["provider_metadata_json"], {})
+            protected = metadata.get("protected_operation") if isinstance(metadata, dict) else None
+            raw_ids = protected.get("reservation_ids") if isinstance(protected, dict) else None
+            if isinstance(raw_ids, list):
+                protected_reservations.update(
+                    item for item in raw_ids if isinstance(item, str) and item
+                )
+        rows = list(
+            self.conn.execute(
+                "SELECT reservation_id FROM capability_use_reservations WHERE status = ?",
+                ("reserved",),
+            )
         )
+        now = utc_now()
+        for row in rows:
+            reservation_id = str(row["reservation_id"])
+            if reservation_id in protected_reservations:
+                continue
+            self.conn.execute(
+                """
+                UPDATE capability_use_reservations
+                   SET status = ?, updated_at = ?
+                 WHERE reservation_id = ? AND status = ?
+                """,
+                ("abandoned", now, reservation_id, "reserved"),
+            )
         self.conn.commit()
 
     def _ensure_audit_schema(self) -> None:

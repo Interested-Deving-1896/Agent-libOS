@@ -11,6 +11,12 @@ a process can change visible tools, activate Skills, register process-local JIT
 tools, register or exec AgentImages, fork children, and fork from checkpoints,
 while resource authority remains separate in Capability.
 
+Provider-backed primitive work is represented by a
+[`ProtectedOperationContract`](protected_operation_sdk.md). One logical
+operation may contain several ordered provider phases, but uses one durable
+effect id, one deduplicated reservation set, and one explicit operation/evidence
+chain. Waiting/resume behavior remains part of the enclosing logical operation.
+
 ## Process Lifecycle
 
 The current lifecycle includes:

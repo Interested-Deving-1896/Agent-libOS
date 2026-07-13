@@ -137,7 +137,7 @@ class TestCheckpointRestore:
             restored = runtime.store.get_capability(cap.cap_id)
             assert restored is not None
             assert restored.uses_remaining == 1
-            assert runtime.capability._restore_reserved_use(
+            assert runtime.capability.restore_reserved_use(
                 reservation_id,
                 restored_by='test',
                 reason='late provider cleanup after scope replacement',

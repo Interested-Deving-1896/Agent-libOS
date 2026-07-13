@@ -23,10 +23,10 @@ from tests.support.fakes import RecordingActionClient
 from tests.support.runtime import temporary_runtime, workspace_runtime
 from agent_libos.runtime.external_effects import (
     abandon_external_effect_intent,
-    begin_external_effect_intent,
     record_external_effect,
 )
 from agent_libos.runtime.runtime import Runtime
+from tests.support.external_effects import begin_external_effect_intent
 
 
 def test_direct_protected_operation_is_persisted_and_explainable() -> None:

@@ -151,6 +151,14 @@ terminal sessions. When loaded and trusted, it registers the tools
 `pty_list`, plus the `pty-agent:v0` image. The adapter, local PTY provider,
 reader thread, buffer limits, and timeout/window defaults live inside this
 module, not in the core Runtime or default Resource Provider Substrate.
+Spawn, read, write, resize, close, automatic exit cleanup, and compensating
+close phases use the same [Protected Operation SDK](protected_operation_sdk.md)
+contracts as core providers; the module does not manage effect intents or
+finite-use reservations through a private lifecycle.
+The continuous reader is one runtime-internal `pty.ingest` child operation for
+the lifetime of the session. It drains and probes the provider handle only
+inside that SDK phase, records one information-flow effect when it stops, and
+does not infer causality from thread timing.
 
 `pty_create(argv, cwd=None, cols=None, rows=None, startup_timeout_s=None,
 max_output_chars=None, name=None)` launches a local PTY through the shell
@@ -165,7 +173,8 @@ event/audit, or effect-recording step fails, the adapter closes the host handle,
 removes the in-memory session, and releases the object before returning
 failure.
 
-A finite-use shell-policy decision is reserved before `provider.spawn`.
+A finite-use shell-policy decision is reserved before the SDK's
+`provider.spawn` phase.
 The adapter then persists a structured pending spawn-effect intent before
 `provider.spawn`. `ProviderEffectNotStarted` is the only provider failure that
 certifies no child was created; reservation restoration and conditional intent
@@ -219,13 +228,16 @@ handle reusable.
 their provider operation and CAS the same id to a final event/audit-linked
 record afterward. `ProviderEffectNotStarted` abandons the pending row and
 restores an exact finite-use reservation only when the first boundary did not
-start; an ordinary provider or post-provider sink failure leaves durable unknown
-evidence. The local provider classifies write and close as
+start. An ordinary provider exception best-effort finalizes `unknown`; if
+event/audit/effect settlement itself fails, the dispatched pending intent
+remains durable. The local provider classifies write and close as
 irreversible/not-supported and resize as rollbackable/not-applied; v1 records
 that classification but does not perform compensation. If a provider does not
 classify one of those operations, or its classifier raises after the operation,
 the module finalizes an `unknown`/`unknown` fallback rather than losing the fact
-that the host boundary was crossed.
+that the host boundary was crossed. An ambiguous close keeps the Object/session
+registered but marks its close outcome unresolved; automatic cleanup and a
+second close do not blindly call the provider again.
 
 PTY sessions are memory-resident host resources. They are closed by explicit
 `pty_close`, object release, process-owned memory release on process exit,

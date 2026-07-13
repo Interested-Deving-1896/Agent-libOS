@@ -414,6 +414,20 @@ Prefer existing managers and primitives over new side channels. If a new host
 effect is needed, add or extend a primitive and provider interface rather than
 calling the host directly from a tool.
 
+Every new provider-backed primitive must also register a
+[`ProtectedOperationContract`](protected_operation_sdk.md) and execute each
+real provider boundary through the returned handle's `call()` or `acall()`.
+Declare authority mode, conservative mutation/information-flow ceiling,
+event/audit/effect evidence roles, resource policy, classifier fallback, and
+post-provider failure policy. Run
+`uv run python scripts/check_protected_operations.py`; direct effect-lifecycle
+calls from provider subsystems fail this check. The checker also rejects a
+provider-reaching helper when any call site bypasses an SDK phase and rejects
+direct provider session-handle calls such as `session.handle.read()` outside a
+phase. For `ResourcePolicy.REQUIRED`, provide measurable `failure_resource`
+settlement or deliberately accept conservative preflight charging on a
+dispatched failure.
+
 ## Dependencies
 
 Add runtime dependencies with:

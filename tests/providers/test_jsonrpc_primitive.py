@@ -772,6 +772,41 @@ class TestJsonRpcPrimitive:
         finally:
             runtime.close()
 
+    def test_transport_exception_returns_error_but_keeps_effect_unknown(self) -> None:
+        runtime = Runtime.open('local')
+        provider = _FailingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='transport failure classification')
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    'transport-failure',
+                    'http://127.0.0.1:9/rpc',
+                    with_header=False,
+                    state_mutation=True,
+                    rollback_class='irreversible',
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'jsonrpc:transport-failure:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+
+            result = runtime.jsonrpc.call(pid, 'transport-failure', 'echo', {'x': 1})
+
+            assert result.status.value == 'transport_error'
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.transaction_state == 'unknown'
+            assert effect.state_mutation
+            assert effect.provider_metadata['outcome'] == 'unknown_transport_failure'
+            assert 'transport-secret' not in str(effect.provider_metadata)
+        finally:
+            runtime.close()
+
     def test_cli_register_list_inspect_and_call(self, monkeypatch: MonkeyPatch) -> None:
         with _jsonrpc_server() as server, tempfile.TemporaryDirectory() as temp_dir:
             monkeypatch.setenv('AGENT_LIBOS_JSONRPC_TEST_TOKEN', 'cli-token')
@@ -907,6 +942,12 @@ class _PostCallClassifierFailsProvider(_RecordingJsonRpcProvider):
         if isinstance(result, dict) and result.get('preflight'):
             return super().classify_external_effect(operation, context, result)
         raise RuntimeError('classifier failed after provider call')
+
+
+class _FailingJsonRpcProvider(_RecordingJsonRpcProvider):
+    def call(self, _endpoint: Any, _method: Any, request_body: bytes, **_kwargs: Any) -> JsonRpcTransportResult:
+        self.calls.append(request_body)
+        raise RuntimeError('transport-secret')
 
 def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_rollback_required', state_mutation: bool | str=False, with_header: bool=True, literal_header: bool=False, duplicate_method: bool=False, header_prefix: str='Bearer ', header_suffix: str='', rpc_method: str='demo.echo', params_schema: str='', timeout_s: str='5', max_request_bytes: str='65536', max_response_bytes: str='1048576') -> str:
     header = ''

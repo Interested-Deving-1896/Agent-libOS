@@ -14,10 +14,10 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.external_effects import (
     abandon_external_effect_intent,
-    begin_external_effect_intent,
     record_external_effect,
 )
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from tests.support.external_effects import begin_external_effect_intent
 
 
 def test_effect_transaction_records_hash_idempotency_dispatch_receipt_and_commit() -> None:

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from agent_libos.models import (
     AgentImage,
     CapabilityDecision,
+    CapabilityEffect,
     CapabilityRight,
     EventType,
     ExternalEffectClassification,
@@ -42,14 +43,12 @@ from agent_libos.models.exceptions import (
 from agent_libos.primitives.shell import ShellAdapter, ShellPolicyDecision
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.external_effects import (
-    abandon_external_effect_intent,
-    begin_external_effect_intent,
-    classify_external_effect,
-    record_external_effect,
-    require_external_effect_classifier,
-)
 from agent_libos.substrate import ProviderEffectNotStarted, SubprocessLimits
+from agent_libos.sdk import (
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
+)
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 from agent_libos.utils.ids import new_id, utc_now
 
@@ -278,6 +277,14 @@ class LocalPtyProvider:
                     "argv": context.get("argv") if operation == "spawn" else None,
                     "cwd": context.get("cwd") if operation == "spawn" else None,
                 },
+            )
+        if operation in {"read", "ingest"}:
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={"operation": operation},
             )
         if operation == "resize":
             return ExternalEffectClassification(
@@ -673,6 +680,7 @@ class _PtyRuntimeSession:
     monitor_thread: threading.Thread | None = None
     closing: bool = False
     closed: bool = False
+    close_outcome_unknown: bool = False
     exit_code: int | None = None
     last_wall_seconds: float = 0.0
     last_cpu_seconds: float = 0.0
@@ -762,7 +770,6 @@ class PtyAdapter:
         limits = self.shell._subprocess_limits(pid)
         if limits is not None and not bool(getattr(self.provider, "supports_subprocess_limits", False)):
             raise ValidationError("PTY provider must explicitly support SubprocessLimits before budgeted execution")
-        require_external_effect_classifier(self.provider, "spawn")
         intent_record = self._record_spawn_intent(
             pid,
             resource,
@@ -776,12 +783,6 @@ class PtyAdapter:
         reserved_capacity = True
         session_id = new_id("pty")
         handle: PtySession | None = None
-        reservation_id: str | None = None
-        provider_failure_recorded = False
-        provider_started = False
-        capability_committed = False
-        failure_phase = "provider_spawn"
-        effect_intent: Any | None = None
         effect_target = f"pty:{session_id}"
         effect_context = {
             "argv": list(checked),
@@ -791,76 +792,78 @@ class PtyAdapter:
             "rows": selected_rows,
             "session_id": session_id,
         }
+        capability_decision = CapabilityDecision(
+            subject=pid,
+            resource=resource,
+            right=CapabilityRight.EXECUTE.value,
+            allowed=True,
+            effect=CapabilityEffect.ALLOW,
+            reason=decision.reason,
+            selected_capability_id=decision.consume_capability_id,
+            consume_capability_id=decision.consume_capability_id,
+            context=effect_context,
+        )
+        canonical_args = self.shell._operation_context(
+            pid,
+            checked,
+            resource,
+            timeout=selected_startup_timeout,
+            cwd=cwd,
+            profile=decision.sandbox_profile,
+            adapter="pty",
+            primitive="runtime.pty.spawn",
+            operation="pty.spawn",
+            authority_operation="pty.spawn",
+            include_timeout=False,
+            continuous_session=True,
+            extra={"startup_timeout_s": selected_startup_timeout},
+        )
+        failure_phase = {"name": "provider_spawn"}
+        cleanup_evidence = {"attempted": False, "succeeded": False}
+
+        def spawn_failure_evidence(error: BaseException, phase: str) -> ProtectedOperationEvidence:
+            evidence = self._protected_pty_failure_evidence(
+                pid,
+                session_id,
+                "spawn",
+                error,
+                failure_phase["name"] if phase == "caller_failed_after_provider" else phase,
+                correlation_id=intent_record.record_id,
+                parent_record_id=intent_record.record_id,
+            )
+            return replace(
+                evidence,
+                effect_metadata={
+                    **dict(evidence.effect_metadata),
+                    "cleanup": dict(cleanup_evidence),
+                },
+            )
+
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=effect_target,
+            decisions=(capability_decision,),
+            canonical_args=canonical_args,
+            observation=effect_context,
+            failure_evidence=spawn_failure_evidence,
+        )
+        protected_cm = self._protected().start(
+            "primitive.pty.spawn", invocation, provider=self.provider
+        )
+        protected = None
         try:
-            if decision.consume_once and decision.consume_capability_id is not None:
-                reservation_id = self.shell.capabilities.reserve_use(
-                    decision.consume_capability_id,
-                    reserved_by="pty",
-                    reason="one-time pty spawn permission reserved before provider execution",
-                )
-            try:
-                effect_intent = begin_external_effect_intent(
-                    self.runtime.store,
-                    pid=pid,
-                    provider="pty",
-                    operation="spawn",
-                    target=effect_target,
-                    state_mutation=True,
-                    information_flow=True,
-                    metadata={"context": effect_context},
-                )
-            except Exception:
-                self._restore_pty_capability(reservation_id)
-                raise
-            try:
-                handle = self.provider.spawn(
-                    checked,
-                    cwd=cwd,
-                    cols=selected_cols,
-                    rows=selected_rows,
-                    limits=limits,
-                )
-                provider_started = True
-            except ProviderEffectNotStarted as exc:
-                provider_failure_recorded = True
-                with self.runtime.store.transaction():
-                    self._restore_pty_capability(reservation_id)
-                    abandon_external_effect_intent(
-                        self.runtime.store,
-                        effect_intent.effect_id if effect_intent is not None else None,
-                    )
-                    self.audit.record(
-                        actor=pid,
-                        action="primitive.pty.failed",
-                        target=resource,
-                        decision={
-                            "argv": checked,
-                            "cwd": cwd,
-                            "effect_outcome": "not_started",
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                        },
-                        correlation_id=intent_record.record_id,
-                        parent_record_id=intent_record.record_id,
-                    )
-                raise
-            except Exception as exc:
-                provider_failure_recorded = True
-                self._record_ambiguous_spawn_failure(
-                    pid=pid,
-                    resource=resource,
-                    effect_context=effect_context,
-                    intent_record=intent_record,
-                    reservation_id=reservation_id,
-                    effect_intent_id=effect_intent.effect_id if effect_intent is not None else None,
-                    error=exc,
-                    target=effect_target,
-                )
-                raise
-            failure_phase = "capability_commit"
-            self._commit_pty_capability(reservation_id)
-            capability_committed = True
-            failure_phase = "session_object_creation"
+            protected = protected_cm.__enter__()
+            handle = protected.call(
+                ProviderPhase("spawn", state_mutation=True, information_flow=True),
+                self.provider.spawn,
+                checked,
+                cwd=cwd,
+                cols=selected_cols,
+                rows=selected_rows,
+                limits=limits,
+            )
+            failure_phase["name"] = "session_object_creation"
             session_oid, object_name, namespace = self._create_session_object(
                 pid,
                 session_id=session_id,
@@ -871,55 +874,25 @@ class PtyAdapter:
                 rows=selected_rows,
                 name=name,
             )
-        except Exception as exc:
-            cleanup: dict[str, Any] = {"attempted": False, "succeeded": False}
+        except BaseException:
             if handle is not None:
-                cleanup["attempted"] = True
                 try:
-                    cleanup["exit_code"] = handle.close(
-                        force=True,
-                        timeout_s=self.config.pty.close_timeout_s,
-                    )
-                    cleanup["succeeded"] = True
-                except Exception as cleanup_error:
-                    cleanup.update(
-                        {
-                            "error_type": type(cleanup_error).__name__,
-                            "error": str(cleanup_error),
-                        }
-                    )
+                    cleanup_evidence["attempted"] = True
+                    if protected is not None and not protected.terminal:
+                        protected.call(
+                            ProviderPhase("cleanup_close", state_mutation=True),
+                            handle.close,
+                            force=True,
+                            timeout_s=self.config.pty.close_timeout_s,
+                        )
+                    cleanup_evidence["succeeded"] = True
+                except Exception:
+                    pass
             if reserved_capacity:
                 self._release_session_capacity(pid)
-            if not provider_failure_recorded:
-                if provider_started:
-                    self._record_ambiguous_spawn_failure(
-                        pid=pid,
-                        resource=resource,
-                        effect_context={
-                            **effect_context,
-                            "backend": getattr(handle, "backend", None),
-                        },
-                        intent_record=intent_record,
-                        reservation_id=None if capability_committed else reservation_id,
-                        effect_intent_id=effect_intent.effect_id if effect_intent is not None else None,
-                        error=exc,
-                        target=effect_target,
-                        action="primitive.pty.post_spawn_failed",
-                        outcome="unknown_after_provider_success",
-                        failure_metadata={
-                            "failure_phase": failure_phase,
-                            "cleanup": cleanup,
-                        },
-                    )
-                else:
-                    self.audit.record(
-                        actor=pid,
-                        action="primitive.pty.failed",
-                        target=resource,
-                        decision={"argv": checked, "cwd": cwd, "error_type": type(exc).__name__, "error": str(exc)},
-                        correlation_id=intent_record.record_id,
-                        parent_record_id=intent_record.record_id,
-                    )
+                reserved_capacity = False
+            if protected is not None:
+                protected_cm.__exit__(*sys.exc_info())
             raise
 
         session = _PtyRuntimeSession(
@@ -940,101 +913,66 @@ class PtyAdapter:
             self._sessions[session_oid] = session
             self._release_session_capacity_locked(pid)
             reserved_capacity = False
-        effect_recorded = False
-        effect_sink_started = False
         try:
-            self._start_reader(session, resource=resource)
+            parent_operation_id = self.runtime.operations.current_id()
+            self._start_reader(
+                session,
+                resource=resource,
+                parent_operation_id=parent_operation_id,
+            )
             self._start_monitor(session, resource=resource)
             if selected_startup_timeout > 0:
                 time.sleep(selected_startup_timeout)
             output, output_truncated = self._take_output(session, selected_output_chars)
-            effect_sink_started = True
-            event = self.events.emit(
-                EventType.EXTERNAL_WRITE,
-                source=pid,
-                target=f"pty:{session_oid}",
-                payload={"operation": "spawn", "argv": checked, "cwd": cwd, "backend": session.backend},
-                correlation_id=intent_record.record_id,
+            result = PtyCreateResult(
+                session_oid=session_oid,
+                namespace=namespace,
+                name=object_name,
+                type=ObjectType.EXTERNAL_REF.value,
+                alive=protected.call(
+                    ProviderPhase("spawn_status", information_flow=True),
+                    session.handle.is_alive,
+                ),
+                output=output,
+                output_truncated=output_truncated,
+                dropped_chars=session.dropped_chars,
             )
-            audit_record = self.audit.record(
-                actor=pid,
-                action="primitive.pty.spawn",
-                target=f"pty:{session_oid}",
-                output_refs=[session_oid],
-                decision={
-                    "argv": checked,
-                    "cwd": cwd,
-                    "resource": resource,
-                    "backend": session.backend,
-                    "policy_level": decision.policy_level,
-                    "policy_reason": decision.reason,
-                    "risk": decision.risk.value,
-                    "rule_id": decision.rule_id,
-                    "cols": selected_cols,
-                    "rows": selected_rows,
-                },
-                correlation_id=intent_record.record_id,
-                parent_record_id=intent_record.record_id,
-            )
-            classification = self._classify_external_effect(
-                "spawn",
-                {
-                    "argv": checked,
-                    "resource": resource,
-                    "cwd": cwd,
+            spawn_result = {"session_oid": session_oid, "backend": session.backend}
+            protected.complete(
+                result,
+                self._protected_pty_evidence(
+                    pid,
+                    session_oid,
+                    "spawn",
+                    {
+                        "argv": checked,
+                        "cwd": cwd,
+                        "resource": resource,
+                        "backend": session.backend,
+                        "policy_level": decision.policy_level,
+                        "policy_reason": decision.reason,
+                        "risk": decision.risk.value,
+                        "rule_id": decision.rule_id,
+                        "cols": selected_cols,
+                        "rows": selected_rows,
+                    },
+                    output_refs=(session_oid,),
+                    correlation_id=intent_record.record_id,
+                    parent_record_id=intent_record.record_id,
+                ),
+                classification_context={
+                    **effect_context,
                     "backend": session.backend,
                     "session_oid": session_oid,
                 },
-                {"session_oid": session_oid, "backend": session.backend},
-                fallback_information_flow=True,
+                classification_result=spawn_result,
             )
-            record_external_effect(
-                self.runtime.store,
-                pid=pid,
-                provider="pty",
-                operation="spawn",
-                target=effect_target,
-                classification=classification,
-                audit_record=audit_record,
-                event=event,
-                metadata={"session_oid": session_oid, "resource": resource},
-                intent_effect_id=effect_intent.effect_id if effect_intent is not None else None,
-            )
-            effect_recorded = True
-        except Exception as exc:
+            protected_cm.__exit__(None, None, None)
+        except BaseException:
             self._cleanup_failed_started_session(session, actor=pid, reason="pty_create_post_spawn_failure")
-            if not effect_recorded and not effect_sink_started:
-                with contextlib.suppress(Exception):
-                    self._record_ambiguous_spawn_failure(
-                        pid=pid,
-                        resource=resource,
-                        effect_context={**effect_context, "backend": session.backend, "session_oid": session_oid},
-                        intent_record=intent_record,
-                        reservation_id=None,
-                        effect_intent_id=effect_intent.effect_id if effect_intent is not None else None,
-                        error=exc,
-                        target=effect_target,
-                        action="primitive.pty.post_spawn_failed",
-                    )
-            self.audit.record(
-                actor=pid,
-                action="primitive.pty.failed",
-                target=resource,
-                decision={"argv": checked, "cwd": cwd, "error_type": type(exc).__name__, "error": str(exc)},
-                correlation_id=intent_record.record_id,
-                parent_record_id=intent_record.record_id,
-            )
+            protected_cm.__exit__(*sys.exc_info())
             raise
-        return PtyCreateResult(
-            session_oid=session_oid,
-            namespace=namespace,
-            name=object_name,
-            type=ObjectType.EXTERNAL_REF.value,
-            alive=session.handle.is_alive(),
-            output=output,
-            output_truncated=output_truncated,
-            dropped_chars=session.dropped_chars,
-        )
+        return result
 
     def read(self, pid: str, session_oid: str, *, timeout_s: float | None = None, max_chars: int | None = None) -> PtyReadResult:
         selected_timeout = self._validate_timeout(
@@ -1049,36 +987,72 @@ class PtyAdapter:
             hard_limit=self.config.pty.read_hard_limit_chars,
             label="pty max_chars",
         )
-        self._require_object_right(pid, session_oid, ObjectRight.READ.value)
+        authority = self._require_object_right(
+            pid, session_oid, ObjectRight.READ.value, consume=False
+        )
         session = self._require_session(session_oid)
-        if selected_timeout > 0:
-            deadline = time.monotonic() + selected_timeout
-            while time.monotonic() < deadline and self._buffer_is_empty(session) and self._session_alive(session):
-                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-        output, truncated = self._take_output(session, selected_max_chars)
-        alive = self._session_alive(session)
-        exit_code = self._session_exit_code(session)
-        self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=f"pty:{session_oid}",
-            payload={"operation": "read", "chars": len(output), "truncated": truncated, "alive": alive},
-        )
-        self.audit.record(
+        effect_context = {
+            "session_oid": session_oid,
+            "backend": session.backend,
+            "timeout_s": selected_timeout,
+            "max_chars": selected_max_chars,
+        }
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
             actor=pid,
-            action="primitive.pty.read",
             target=f"pty:{session_oid}",
-            input_refs=[session_oid],
-            decision={"chars": len(output), "truncated": truncated, "alive": alive, "exit_code": exit_code},
+            decisions=(authority,),
+            canonical_args=effect_context,
+            observation=effect_context,
+            failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
+                pid, session_oid, "read", error, phase
+            ),
         )
-        return PtyReadResult(
-            session_oid=session_oid,
-            output=output,
-            output_truncated=truncated,
-            alive=alive,
-            exit_code=exit_code,
-            dropped_chars=session.dropped_chars,
-        )
+        with self._protected().start("primitive.pty.read", invocation, provider=self.provider) as protected:
+
+            def read_buffer() -> tuple[str, bool, bool, int | None, int]:
+                if selected_timeout > 0:
+                    deadline = time.monotonic() + selected_timeout
+                    while (
+                        time.monotonic() < deadline
+                        and self._buffer_is_empty(session)
+                        and self._session_alive(session)
+                    ):
+                        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                output, truncated = self._take_output(session, selected_max_chars)
+                return (
+                    output,
+                    truncated,
+                    self._session_alive(session),
+                    self._session_exit_code(session),
+                    session.dropped_chars,
+                )
+
+            output, truncated, alive, exit_code, dropped_chars = protected.call(
+                ProviderPhase("read", information_flow=True), read_buffer
+            )
+            result = PtyReadResult(
+                session_oid=session_oid,
+                output=output,
+                output_truncated=truncated,
+                alive=alive,
+                exit_code=exit_code,
+                dropped_chars=dropped_chars,
+            )
+            result_payload = {
+                "chars": len(output),
+                "truncated": truncated,
+                "alive": alive,
+                "exit_code": exit_code,
+            }
+            return protected.complete(
+                result,
+                self._protected_pty_evidence(
+                    pid, session_oid, "read", result_payload, input_refs=(session_oid,)
+                ),
+                classification_context=effect_context,
+                classification_result=result_payload,
+            )
 
     def write(self, pid: str, session_oid: str, text: str) -> PtyWriteResult:
         if "\x00" in text:
@@ -1103,70 +1077,44 @@ class PtyAdapter:
             "chars": len(text),
             "cwd": session.cwd,
         }
-        reservation_id = self._reserve_object_right(authority, operation="write")
-        try:
-            effect_intent = begin_external_effect_intent(
-                self.runtime.store,
-                pid=pid,
-                provider="pty",
-                operation="write",
-                target=f"pty:{session_oid}",
-                state_mutation=True,
-                information_flow=True,
-                metadata={"context": effect_context},
-            )
-        except Exception:
-            self._restore_object_right(reservation_id, operation="write")
-            raise
-        try:
-            bytes_written = session.handle.write(text)
-        except ProviderEffectNotStarted:
-            with self.runtime.store.transaction():
-                self._restore_object_right(reservation_id, operation="write")
-                abandon_external_effect_intent(self.runtime.store, effect_intent.effect_id)
-            raise
-        except Exception:
-            self._commit_object_right(reservation_id, operation="write")
-            raise
-        self._commit_object_right(reservation_id, operation="write")
-        alive = self._session_alive(session)
-        event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=f"pty:{session_oid}",
-            payload={"operation": "write", "chars": len(text), "bytes_written": bytes_written, "alive": alive},
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.pty.write",
-            target=f"pty:{session_oid}",
-            input_refs=[session_oid],
-            decision={"chars": len(text), "bytes_written": bytes_written, "alive": alive},
-        )
-        classification = self._classify_external_effect(
-            "write",
-            effect_context,
-            {"bytes_written": bytes_written, "alive": alive},
-            fallback_information_flow=True,
-        )
-        record_external_effect(
-            self.runtime.store,
+        invocation = ProtectedOperationInvocation(
             pid=pid,
-            provider="pty",
-            operation="write",
+            actor=pid,
             target=f"pty:{session_oid}",
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "session_oid": session_oid,
+            decisions=(authority,),
+            canonical_args={"session_oid": session_oid, "text": text},
+            observation=effect_context,
+            failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
+                pid, session_oid, "write", error, phase
+            ),
+        )
+        with self._protected().start("primitive.pty.write", invocation, provider=self.provider) as protected:
+            bytes_written = protected.call(
+                ProviderPhase("write", state_mutation=True, information_flow=True),
+                session.handle.write,
+                text,
+            )
+            alive = protected.call(
+                ProviderPhase("status", information_flow=True),
+                self._session_alive,
+                session,
+            )
+            result = PtyWriteResult(
+                session_oid=session_oid, bytes_written=bytes_written, alive=alive
+            )
+            result_payload = {
                 "chars": len(text),
                 "bytes_written": bytes_written,
                 "alive": alive,
-            },
-            intent_effect_id=effect_intent.effect_id,
-        )
-        return PtyWriteResult(session_oid=session_oid, bytes_written=bytes_written, alive=alive)
+            }
+            return protected.complete(
+                result,
+                self._protected_pty_evidence(
+                    pid, session_oid, "write", result_payload, input_refs=(session_oid,)
+                ),
+                classification_context=effect_context,
+                classification_result=result_payload,
+            )
 
     def resize(self, pid: str, session_oid: str, *, cols: int, rows: int) -> PtyResizeResult:
         selected_cols, selected_rows = self._validate_size(cols, rows)
@@ -1189,80 +1137,48 @@ class PtyAdapter:
             "cols": selected_cols,
             "rows": selected_rows,
         }
-        reservation_id = self._reserve_object_right(authority, operation="resize")
-        try:
-            effect_intent = begin_external_effect_intent(
-                self.runtime.store,
-                pid=pid,
-                provider="pty",
-                operation="resize",
-                target=f"pty:{session_oid}",
-                state_mutation=True,
-                information_flow=False,
-                metadata={"context": effect_context},
-            )
-        except Exception:
-            self._restore_object_right(reservation_id, operation="resize")
-            raise
-        try:
-            session.handle.resize(selected_cols, selected_rows)
-        except ProviderEffectNotStarted:
-            with self.runtime.store.transaction():
-                self._restore_object_right(reservation_id, operation="resize")
-                abandon_external_effect_intent(self.runtime.store, effect_intent.effect_id)
-            raise
-        except Exception:
-            self._commit_object_right(reservation_id, operation="resize")
-            raise
-        self._commit_object_right(reservation_id, operation="resize")
-        with session.lock:
-            session.cols = selected_cols
-            session.rows = selected_rows
-        alive = self._session_alive(session)
-        event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=f"pty:{session_oid}",
-            payload={
-                "operation": "resize",
-                "cols": selected_cols,
-                "rows": selected_rows,
-                "alive": alive,
-            },
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.pty.resize",
-            target=f"pty:{session_oid}",
-            input_refs=[session_oid],
-            decision={"cols": selected_cols, "rows": selected_rows, "alive": alive},
-        )
-        classification = self._classify_external_effect(
-            "resize",
-            effect_context,
-            {"cols": selected_cols, "rows": selected_rows, "alive": alive},
-            fallback_information_flow=False,
-        )
-        record_external_effect(
-            self.runtime.store,
+        invocation = ProtectedOperationInvocation(
             pid=pid,
-            provider="pty",
-            operation="resize",
+            actor=pid,
             target=f"pty:{session_oid}",
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "session_oid": session_oid,
-                "previous_cols": previous_cols,
-                "previous_rows": previous_rows,
-                "cols": selected_cols,
-                "rows": selected_rows,
-                "alive": alive,
-            },
-            intent_effect_id=effect_intent.effect_id,
+            decisions=(authority,),
+            canonical_args=effect_context,
+            observation=effect_context,
+            failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
+                pid, session_oid, "resize", error, phase
+            ),
         )
-        return PtyResizeResult(session_oid=session_oid, cols=selected_cols, rows=selected_rows, alive=alive)
+        with self._protected().start("primitive.pty.resize", invocation, provider=self.provider) as protected:
+            protected.call(
+                ProviderPhase("resize", state_mutation=True),
+                session.handle.resize,
+                selected_cols,
+                selected_rows,
+            )
+
+            def settle_success() -> None:
+                with session.lock:
+                    session.cols = selected_cols
+                    session.rows = selected_rows
+
+            alive = protected.call(
+                ProviderPhase("status", information_flow=True),
+                self._session_alive,
+                session,
+            )
+            result = PtyResizeResult(
+                session_oid=session_oid, cols=selected_cols, rows=selected_rows, alive=alive
+            )
+            result_payload = {"cols": selected_cols, "rows": selected_rows, "alive": alive}
+            return protected.complete(
+                result,
+                self._protected_pty_evidence(
+                    pid, session_oid, "resize", result_payload, input_refs=(session_oid,)
+                ),
+                classification_context=effect_context,
+                classification_result=result_payload,
+                settle_success=settle_success,
+            )
 
     def close(
         self,
@@ -1284,7 +1200,6 @@ class PtyAdapter:
             ObjectRight.DELETE.value,
             consume=False,
         )
-        reservation_id = self._reserve_object_right(authority, operation="close")
         exit_code = self._close_session(
             session_oid,
             actor=pid,
@@ -1292,7 +1207,7 @@ class PtyAdapter:
             force=force,
             timeout_s=selected_timeout,
             wait_if_closing=True,
-            capability_reservation_id=reservation_id,
+            authority_decision=authority,
         )
         self.runtime.memory.delete_object_trusted(pid, session_oid, reason="pty_close")
         return PtyCloseResult(session_oid=session_oid, closed=True, exit_code=exit_code)
@@ -1310,6 +1225,7 @@ class PtyAdapter:
             except (CapabilityDenied, NotFound):
                 continue
             with session.lock:
+                alive = not session.closed and session.exit_code is None
                 entries.append(
                     PtySessionListEntry(
                         session_oid=session.session_oid,
@@ -1318,8 +1234,8 @@ class PtyAdapter:
                         argv=list(session.argv),
                         cwd=session.cwd,
                         backend=session.backend,
-                        alive=self._session_alive(session),
-                        exit_code=self._session_exit_code(session),
+                        alive=alive,
+                        exit_code=session.exit_code,
                         cols=session.cols,
                         rows=session.rows,
                         dropped_chars=session.dropped_chars,
@@ -1352,12 +1268,11 @@ class PtyAdapter:
                 wait_if_closing=True,
             )
         except Exception:
-            with self._lock:
-                self._sessions.pop(session.session_oid, None)
-            try:
-                session.handle.close(force=True, timeout_s=self.config.pty.close_timeout_s)
-            except Exception:
-                pass
+            # The close phase already crossed a protected provider boundary.
+            # An ambiguous result must not be retried blindly; keep the session
+            # tracked so shutdown/reconciliation evidence is not replaced by a
+            # false local-cleanup claim.
+            pass
         try:
             self.runtime.memory.delete_object_trusted("runtime.pty", session.session_oid, reason=reason)
         except Exception:
@@ -1449,12 +1364,18 @@ class PtyAdapter:
             self.runtime.store.update_process(process)
         return handle.oid, obj.name, obj.namespace
 
-    def _start_reader(self, session: _PtyRuntimeSession, *, resource: str) -> None:
+    def _start_reader(
+        self,
+        session: _PtyRuntimeSession,
+        *,
+        resource: str,
+        parent_operation_id: str | None,
+    ) -> None:
         # The reader drains continuously so interactive children cannot block on
         # a full PTY output buffer while the model is between tool calls.
         thread = threading.Thread(
             target=self._reader_loop,
-            args=(session, resource),
+            args=(session, resource, parent_operation_id),
             name=f"agent-libos-pty-reader-{session.session_id}",
             daemon=True,
         )
@@ -1489,38 +1410,85 @@ class PtyAdapter:
                 session.monitor_thread = None
                 raise
 
-    def _reader_loop(self, session: _PtyRuntimeSession, resource: str) -> None:
+    def _reader_loop(
+        self,
+        session: _PtyRuntimeSession,
+        resource: str,
+        parent_operation_id: str | None,
+    ) -> None:
         try:
-            exited = False
-            while not session.stop_event.is_set():
-                try:
-                    chunk = session.handle.read(timeout_s=0.05)
-                    if session.stop_event.is_set():
-                        break
-                    if chunk:
-                        self._append_output(session, chunk)
-                    if session.stop_event.is_set():
-                        break
-                    if not session.handle.is_alive() and not chunk:
-                        exited = True
-                        break
-                except Exception as exc:
-                    if session.stop_event.is_set() or self._session_is_closing_or_closed(session):
-                        return
-                    self.audit.record(
-                        actor="runtime.pty",
-                        action="primitive.pty.reader_failed",
-                        target=f"pty:{session.session_oid}",
-                        decision={"error_type": type(exc).__name__, "error": str(exc)},
+            operation_context = (
+                self.runtime.operations.attach(parent_operation_id)
+                if parent_operation_id is not None
+                else contextlib.nullcontext()
+            )
+            with operation_context:
+                effect_context = {
+                    "session_oid": session.session_oid,
+                    "backend": session.backend,
+                    "resource": resource,
+                    "mode": "continuous_drain",
+                }
+                invocation = ProtectedOperationInvocation(
+                    pid=session.owner_pid,
+                    actor="runtime.pty",
+                    target=f"pty:{session.session_oid}",
+                    canonical_args=effect_context,
+                    observation=effect_context,
+                    failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
+                        "runtime.pty", session.session_oid, "ingest", error, phase
+                    ),
+                )
+                with self._protected().start(
+                    "primitive.pty.ingest", invocation, provider=self.provider
+                ) as protected:
+                    result = protected.call(
+                        ProviderPhase("ingest", information_flow=True),
+                        self._reader_provider_phase,
+                        session,
                     )
-                    return
-            if session.stop_event.is_set():
-                session.exit_code = session.handle.exit_code()
-                return
-            if exited:
+                    protected.complete(
+                        result,
+                        self._protected_pty_evidence(
+                            "runtime.pty",
+                            session.session_oid,
+                            "ingest",
+                            result,
+                            input_refs=(session.session_oid,),
+                        ),
+                        classification_context=effect_context,
+                        classification_result=result,
+                    )
+            if result["exited"]:
                 self._mark_session_exited(session, resource=resource)
         finally:
             self._worker_finished(threading.current_thread())
+
+    def _reader_provider_phase(self, session: _PtyRuntimeSession) -> dict[str, Any]:
+        chars = 0
+        exited = False
+        while not session.stop_event.is_set():
+            try:
+                chunk = session.handle.read(timeout_s=0.05)
+                if session.stop_event.is_set():
+                    break
+                if chunk:
+                    self._append_output(session, chunk)
+                    chars += len(chunk)
+                if session.stop_event.is_set():
+                    break
+                if not session.handle.is_alive() and not chunk:
+                    exited = True
+                    break
+            except Exception:
+                if session.stop_event.is_set() or self._session_is_closing_or_closed(session):
+                    break
+                raise
+        return {
+            "chars": chars,
+            "exited": exited,
+            "stopped": session.stop_event.is_set(),
+        }
 
     def _monitor_loop(self, session: _PtyRuntimeSession, resource: str) -> None:
         try:
@@ -1528,9 +1496,6 @@ class PtyAdapter:
                 try:
                     self._sample_and_charge(session, resource)
                     if session.stop_event.is_set():
-                        return
-                    if not self._session_is_closing_or_closed(session) and not session.handle.is_alive():
-                        self._mark_session_exited(session, resource=resource)
                         return
                 except Exception as exc:
                     if session.stop_event.is_set() or self._session_is_closing_or_closed(session):
@@ -1716,20 +1681,20 @@ class PtyAdapter:
         force: bool,
         timeout_s: float,
         wait_if_closing: bool = False,
-        capability_reservation_id: str | None = None,
+        authority_decision: CapabilityDecision | None = None,
     ) -> int | None:
         with self._lock:
             session = self._sessions.get(session_oid)
         if session is None:
-            self._commit_object_right(capability_reservation_id, operation="close")
             return None
         wait_for_close: threading.Event | None = None
-        provider_close_performed = False
-        effect_intent: Any | None = None
         with session.lock:
+            if session.close_outcome_unknown:
+                raise ValidationError(
+                    f"PTY session has an unresolved prior close outcome and cannot be retried: {session_oid}"
+                )
             if session.closing:
                 if not wait_if_closing:
-                    self._restore_object_right(capability_reservation_id, operation="close")
                     raise ValidationError(f"PTY session close is already in progress: {session_oid}")
                 wait_for_close = session.close_complete
             if session.closed:
@@ -1745,11 +1710,9 @@ class PtyAdapter:
                 exit_code = session.exit_code
         if wait_for_close is not None:
             if not wait_for_close.wait(timeout=max(0.0, timeout_s)):
-                self._restore_object_right(capability_reservation_id, operation="close")
                 raise ValidationError(f"timed out waiting for PTY session close: {session_oid}")
             with session.lock:
                 if not session.closed:
-                    self._restore_object_right(capability_reservation_id, operation="close")
                     raise ValidationError(f"PTY session close did not complete: {session_oid}")
                 exit_code = session.exit_code
         if not remove_only:
@@ -1761,110 +1724,111 @@ class PtyAdapter:
                 "timeout_s": timeout_s,
                 "provider_close_performed": True,
             }
-            try:
-                effect_intent = begin_external_effect_intent(
-                    self.runtime.store,
-                    pid=session.owner_pid,
-                    provider="pty",
-                    operation="close",
-                    target=f"pty:{session_oid}",
-                    state_mutation=True,
-                    information_flow=False,
-                    metadata={"context": close_effect_context},
-                )
-            except Exception:
-                self._restore_object_right(capability_reservation_id, operation="close")
+
+            def restore_not_started() -> None:
                 with session.lock:
                     session.closing = False
                     session.close_complete.set()
-                raise
+
+            contract_name = (
+                "primitive.pty.close"
+                if authority_decision is not None
+                else "primitive.pty.close.internal"
+            )
+            invocation = ProtectedOperationInvocation(
+                pid=session.owner_pid,
+                actor=actor,
+                target=f"pty:{session_oid}",
+                decisions=(authority_decision,) if authority_decision is not None else (),
+                canonical_args=close_effect_context,
+                observation=close_effect_context,
+                restore_not_started=restore_not_started,
+                failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
+                    actor, session_oid, "close", error, phase
+                ),
+            )
             try:
-                exit_code = session.handle.close(force=force, timeout_s=timeout_s)
-                provider_close_performed = True
-            except ProviderEffectNotStarted:
-                with self.runtime.store.transaction():
-                    self._restore_object_right(capability_reservation_id, operation="close")
-                    abandon_external_effect_intent(
-                        self.runtime.store,
-                        effect_intent.effect_id if effect_intent is not None else None,
+                with self._protected().start(
+                    contract_name, invocation, provider=self.provider
+                ) as protected:
+                    if reason == "process_exit":
+                        protected.call(
+                            ProviderPhase("exit_code", information_flow=True),
+                            session.handle.exit_code,
+                        )
+                    exit_code = protected.call(
+                        ProviderPhase(
+                            "close",
+                            state_mutation=True,
+                            information_flow=reason == "process_exit",
+                        ),
+                        session.handle.close,
+                        force=force,
+                        timeout_s=timeout_s,
                     )
+                    session.stop_event.set()
+                    self._join_session_workers(session, timeout_s=min(timeout_s, 1.0))
+
+                    def settle_success() -> None:
+                        with session.lock:
+                            session.closed = True
+                            session.closing = False
+                            session.exit_code = exit_code
+                            session.close_complete.set()
+                        with self._lock:
+                            self._sessions.pop(session_oid, None)
+
+                    result_payload = {
+                        "reason": reason,
+                        "force": force,
+                        "exit_code": exit_code,
+                        "closed": True,
+                        "provider_close_performed": True,
+                    }
+                    evidence_operation = "exit" if reason == "process_exit" else "close"
+                    protected.complete(
+                        exit_code,
+                        self._protected_pty_evidence(
+                            actor,
+                            session_oid,
+                            evidence_operation,
+                            result_payload,
+                            input_refs=(session_oid,),
+                        ),
+                        classification_context=close_effect_context,
+                        classification_result=result_payload,
+                        settle_success=settle_success,
+                    )
+            except BaseException:
+                uncertain_close = any(
+                    effect.operation == "close"
+                    and effect.target == f"pty:{session_oid}"
+                    and (
+                        effect.effect_state == "pending"
+                        or effect.transaction_state == "unknown"
+                    )
+                    for effect in self.runtime.store.list_external_effects(
+                        pid=session.owner_pid
+                    )
+                )
                 with session.lock:
                     session.closing = False
+                    session.close_outcome_unknown = uncertain_close
                     session.close_complete.set()
                 raise
-            except Exception:
-                self._commit_object_right(capability_reservation_id, operation="close")
-                with session.lock:
-                    session.closing = False
-                    session.close_complete.set()
-                raise
-            self._commit_object_right(capability_reservation_id, operation="close")
-            session.stop_event.set()
-            self._join_session_workers(session, timeout_s=min(timeout_s, 1.0))
-            with session.lock:
-                session.closed = True
-                session.closing = False
-                session.exit_code = exit_code
-                session.close_complete.set()
         else:
             # Another closer (or the natural-exit cleanup) already crossed the
             # provider boundary. This caller still consumes DELETE authority
             # because it completes the runtime Object release, but it must not
             # fabricate a second provider effect or intent.
-            self._commit_object_right(capability_reservation_id, operation="close")
-        with self._lock:
-            removed = self._sessions.pop(session_oid, None) is session
-        if not removed:
-            return exit_code
-        event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=actor,
-            target=f"pty:{session_oid}",
-            payload={"operation": "close", "reason": reason, "exit_code": exit_code},
-        )
-        audit_record = self.audit.record(
-            actor=actor,
-            action="primitive.pty.close",
-            target=f"pty:{session_oid}",
-            input_refs=[session_oid],
-            decision={"reason": reason, "force": force, "exit_code": exit_code},
-        )
-        if effect_intent is not None:
-            classification = self._classify_external_effect(
-                "close",
-                {
-                    "session_oid": session_oid,
-                    "backend": session.backend,
-                    "reason": reason,
-                    "force": force,
-                    "timeout_s": timeout_s,
-                    "provider_close_performed": provider_close_performed,
-                },
-                {
-                    "exit_code": exit_code,
-                    "closed": True,
-                    "provider_close_performed": provider_close_performed,
-                },
-                fallback_information_flow=False,
-            )
-            record_external_effect(
-                self.runtime.store,
-                pid=session.owner_pid,
-                provider="pty",
-                operation="close",
-                target=f"pty:{session_oid}",
-                classification=classification,
-                audit_record=audit_record,
-                event=event,
-                metadata={
-                    "session_oid": session_oid,
-                    "reason": reason,
-                    "force": force,
-                    "exit_code": exit_code,
-                    "provider_close_performed": provider_close_performed,
-                },
-                intent_effect_id=effect_intent.effect_id,
-            )
+            if authority_decision is not None:
+                self.runtime.capability.claim_decision_use(
+                    authority_decision,
+                    used_by=actor,
+                    reason="PTY close completed after another closer crossed the provider boundary",
+                )
+            with self._lock:
+                self._sessions.pop(session_oid, None)
         return exit_code
 
     def _session_is_closing_or_closed(self, session: _PtyRuntimeSession) -> bool:
@@ -1907,6 +1871,74 @@ class PtyAdapter:
             raise NotFound(f"PTY session is not active: {session_oid}")
         return session
 
+    def _protected(self) -> Any:
+        sdk = getattr(self.runtime, "protected_operations", None)
+        if sdk is None:
+            raise ValidationError("PTY protected-operation SDK is not attached")
+        return sdk
+
+    def _protected_pty_evidence(
+        self,
+        actor: str,
+        session_oid: str,
+        operation: str,
+        result: dict[str, Any],
+        *,
+        input_refs: tuple[str, ...] = (),
+        output_refs: tuple[str, ...] = (),
+        correlation_id: str | None = None,
+        parent_record_id: str | None = None,
+    ) -> ProtectedOperationEvidence:
+        return ProtectedOperationEvidence(
+            event_type=(
+                EventType.EXTERNAL_READ
+                if operation in {"read", "ingest"}
+                else EventType.EXTERNAL_WRITE
+            ),
+            event_source=actor,
+            event_target=f"pty:{session_oid}",
+            event_payload={"operation": operation, **result},
+            audit_action=f"primitive.pty.{operation}",
+            audit_actor=actor,
+            audit_target=f"pty:{session_oid}",
+            audit_decision=result,
+            input_refs=input_refs,
+            output_refs=output_refs,
+            correlation_id=correlation_id,
+            parent_record_id=parent_record_id,
+            effect_metadata={"session_oid": session_oid, **result},
+        )
+
+    def _protected_pty_failure_evidence(
+        self,
+        actor: str,
+        session_oid: str,
+        operation: str,
+        error: BaseException,
+        phase: str,
+        *,
+        correlation_id: str | None = None,
+        parent_record_id: str | None = None,
+    ) -> ProtectedOperationEvidence:
+        result = {
+            "outcome": "unknown",
+            "phase": phase,
+            "failure_phase": phase,
+            "error_type": type(error).__name__,
+        }
+        evidence = self._protected_pty_evidence(
+            actor,
+            session_oid,
+            operation,
+            result,
+            correlation_id=correlation_id,
+            parent_record_id=parent_record_id,
+        )
+        return replace(
+            evidence,
+            audit_action=f"primitive.pty.{operation}.failed",
+        )
+
     def _require_session_open(self, session: _PtyRuntimeSession) -> None:
         with session.lock:
             if session.closed:
@@ -1928,113 +1960,34 @@ class PtyAdapter:
         with session.lock:
             if session.closed or session.closing:
                 return
-            session.closing = True
-            session.close_complete.clear()
-        effect_context = {
-            "session_oid": session.session_oid,
-            "backend": session.backend,
-            "resource": resource,
-            "reason": "process_exit",
-            "force": True,
-            "timeout_s": 0.0,
-            "includes_exit_code_read": True,
-        }
         try:
-            effect_intent = begin_external_effect_intent(
-                self.runtime.store,
-                pid=session.owner_pid,
-                provider="pty",
-                operation="close",
-                target=f"pty:{session.session_oid}",
-                state_mutation=True,
-                information_flow=True,
-                metadata={"context": effect_context},
+            self._close_session(
+                session.session_oid,
+                actor="runtime.pty",
+                reason="process_exit",
+                force=True,
+                timeout_s=0.0,
+                wait_if_closing=False,
             )
-        except Exception:
-            with session.lock:
-                session.closing = False
-                session.close_complete.set()
-            raise
-        information_observed = False
-        try:
-            exit_code = session.handle.exit_code()
-            information_observed = True
-            exit_code = session.handle.close(force=True, timeout_s=0.0)
-        except ProviderEffectNotStarted as exc:
-            if not information_observed:
-                with self.runtime.store.transaction():
-                    abandon_external_effect_intent(self.runtime.store, effect_intent.effect_id)
-            with session.lock:
-                session.closing = False
-                session.close_complete.set()
+        except Exception as error:
+            pending = any(
+                effect.operation == "close"
+                and effect.target == f"pty:{session.session_oid}"
+                and effect.effect_state == "pending"
+                for effect in self.runtime.store.list_external_effects(pid=session.owner_pid)
+            )
+            if pending:
+                raise
             self.audit.record(
                 actor="runtime.pty",
                 action="primitive.pty.exit_cleanup_failed",
                 target=f"pty:{session.session_oid}",
                 decision={
-                    "effect_outcome": "unknown" if information_observed else "not_started",
-                    "information_observed": information_observed,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "resource": resource,
+                    "error_type": type(error).__name__,
+                    "fail_closed": True,
                 },
             )
-            return
-        except Exception as exc:
-            with session.lock:
-                session.closing = False
-                session.close_complete.set()
-            self.audit.record(
-                actor="runtime.pty",
-                action="primitive.pty.exit_cleanup_failed",
-                target=f"pty:{session.session_oid}",
-                decision={"error_type": type(exc).__name__, "error": str(exc)},
-            )
-            return
-        session.stop_event.set()
-        with session.lock:
-            session.closed = True
-            session.closing = False
-            session.exit_code = exit_code
-            session.close_complete.set()
-        event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source="runtime.pty",
-            target=f"pty:{session.session_oid}",
-            payload={"operation": "exit", "reason": "process_exit", "exit_code": exit_code},
-        )
-        audit_record = self.audit.record(
-            actor="runtime.pty",
-            action="primitive.pty.exit",
-            target=f"pty:{session.session_oid}",
-            input_refs=[session.session_oid],
-            decision={"resource": resource, "exit_code": exit_code},
-        )
-        classification = self._classify_external_effect(
-            "close",
-            effect_context,
-            {"exit_code": exit_code, "closed": True, "information_observed": True},
-            fallback_information_flow=True,
-        )
-        if not classification.information_flow:
-            classification = replace(classification, information_flow=True)
-        record_external_effect(
-            self.runtime.store,
-            pid=session.owner_pid,
-            provider="pty",
-            operation="close",
-            target=f"pty:{session.session_oid}",
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "session_oid": session.session_oid,
-                "resource": resource,
-                "reason": "process_exit",
-                "exit_code": exit_code,
-                "information_observed": True,
-            },
-            intent_effect_id=effect_intent.effect_id,
-        )
 
     def _require_object_right(
         self,
@@ -2053,27 +2006,6 @@ class PtyAdapter:
             consume=consume,
             used_by="pty",
             reason="one-time PTY object permission consumed",
-        )
-
-    def _reserve_object_right(self, decision: CapabilityDecision, *, operation: str) -> str | None:
-        return self.runtime.capability.reserve_decision_use(
-            decision,
-            used_by="pty",
-            reason=f"one-time PTY {operation} permission reserved before provider execution",
-        )
-
-    def _commit_object_right(self, reservation_id: str | None, *, operation: str) -> None:
-        self.runtime.capability.commit_reserved_use(
-            reservation_id,
-            committed_by="pty",
-            reason=f"one-time PTY {operation} permission committed after provider execution began",
-        )
-
-    def _restore_object_right(self, reservation_id: str | None, *, operation: str) -> None:
-        self.runtime.capability._restore_reserved_use(
-            reservation_id,
-            restored_by="pty",
-            reason=f"one-time PTY {operation} permission restored after certified pre-effect failure",
         )
 
     def _reserve_session_capacity(self, pid: str) -> None:
@@ -2160,113 +2092,6 @@ class PtyAdapter:
                 "continuous_session": True,
             },
         )
-
-    def _commit_pty_capability(self, reservation_id: str | None) -> None:
-        self.shell.capabilities.commit_reserved_use(
-            reservation_id,
-            committed_by="pty",
-            reason="one-time pty spawn permission committed after provider execution began",
-        )
-
-    def _restore_pty_capability(self, reservation_id: str | None) -> None:
-        self.shell.capabilities._restore_reserved_use(
-            reservation_id,
-            restored_by="pty",
-            reason="one-time pty spawn permission restored after certified pre-effect failure",
-        )
-
-    def _record_ambiguous_spawn_failure(
-        self,
-        *,
-        pid: str,
-        resource: str,
-        effect_context: dict[str, Any],
-        intent_record: Any,
-        reservation_id: str | None,
-        effect_intent_id: str | None,
-        error: BaseException,
-        target: str | None = None,
-        action: str = "primitive.pty.spawn_failed",
-        outcome: str = "unknown_after_provider_exception",
-        failure_metadata: dict[str, Any] | None = None,
-    ) -> None:
-        self._commit_pty_capability(reservation_id)
-        selected_target = target or resource
-        selected_failure_metadata = dict(failure_metadata or {})
-        event = self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=selected_target,
-            payload={
-                "adapter": "pty",
-                "operation": "spawn",
-                "outcome": "unknown",
-                "failure_phase": selected_failure_metadata.get("failure_phase"),
-                "error_type": type(error).__name__,
-            },
-            correlation_id=intent_record.record_id,
-            causality={"audit_parent_record_id": intent_record.record_id},
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action=action,
-            target=selected_target,
-            decision={
-                "argv": list(effect_context.get("argv") or []),
-                "cwd": effect_context.get("cwd"),
-                "effect_outcome": "unknown",
-                "failure_phase": selected_failure_metadata.get("failure_phase"),
-                "error_type": type(error).__name__,
-                "error": str(error),
-            },
-            correlation_id=intent_record.record_id,
-            parent_record_id=intent_record.record_id,
-        )
-        record_external_effect(
-            self.runtime.store,
-            pid=pid,
-            provider="pty",
-            operation="spawn",
-            target=selected_target,
-            classification=ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=True,
-                information_flow=True,
-                metadata={"outcome": outcome},
-            ),
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "context": dict(effect_context),
-                "error_type": type(error).__name__,
-                "error": str(error),
-                **selected_failure_metadata,
-            },
-            intent_effect_id=effect_intent_id,
-        )
-
-    def _classify_external_effect(
-        self,
-        operation: str,
-        context: dict[str, Any],
-        result: Any,
-        *,
-        fallback_information_flow: bool,
-    ) -> ExternalEffectClassification:
-        try:
-            return classify_external_effect(self.provider, operation, context, result)
-        except Exception as exc:
-            return ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=True,
-                information_flow=fallback_information_flow,
-                metadata={
-                    "classification_error": f"{type(exc).__name__}: {exc}",
-                    "classification_fallback": "post_effect_failure",
-                },
-            )
 
     def _request_human_approval(
         self,

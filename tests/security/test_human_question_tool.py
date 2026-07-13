@@ -83,7 +83,7 @@ class TestHumanQuestionTool:
         assert 'Sensitive deployment secret?' not in metadata
         assert 'private-answer' not in metadata
 
-    def test_auto_answer_post_provider_classifier_failure_keeps_pending_without_reprompt(
+    def test_auto_answer_classifier_failure_uses_conservative_fallback_without_reprompt(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -107,7 +107,8 @@ class TestHumanQuestionTool:
         assert len(self.human_output) == 1
         effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
         assert len(effects) == 1
-        assert effects[0].effect_state == 'pending'
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].provider_metadata['classification_fallback'] == 'post_effect_failure'
 
     @pytest.mark.parametrize('certified_not_started', [False, True])
     def test_terminal_read_failure_preserves_pending_request_and_effect_semantics(

@@ -68,6 +68,11 @@ when a real capability decision is made. Crossing a provider boundary adds
 `effect`, `event`, and `audit`. Therefore an operation denied before the
 provider is not incorrectly reported as missing effect evidence.
 
+The [Protected Operation SDK](protected_operation_sdk.md) declares these roles
+from the registered contract and links the prepared/finalized effect to the
+same primitive operation. Multi-phase DNS, validation, transport, and cleanup
+steps do not rely on timestamp correlation or create competing root causes.
+
 `evidence_complete` means all declared roles have at least one explicit link.
 It is provenance completeness, not a security or semantic-quality score.
 `missing_evidence` names the operation and role; `uncertainties` separately

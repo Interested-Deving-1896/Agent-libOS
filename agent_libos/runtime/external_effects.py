@@ -1,3 +1,9 @@
+"""Runtime-internal external-effect ledger helpers.
+
+Provider-facing subsystems must use :mod:`agent_libos.sdk`; direct lifecycle
+calls from extension code bypass authority and exception settlement guarantees.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, replace
@@ -117,7 +123,7 @@ def record_external_effect(
     return record
 
 
-def begin_external_effect_intent(
+def prepare_external_effect_intent(
     store: RuntimeStore,
     *,
     pid: str,
@@ -128,8 +134,15 @@ def begin_external_effect_intent(
     information_flow: bool,
     metadata: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
+    canonical_args: dict[str, Any] | None = None,
 ) -> ExternalEffectRecord:
-    """Persist conservative evidence immediately before a provider boundary."""
+    """Persist conservative evidence before a provider boundary.
+
+    The returned transaction remains ``prepared``.  Callers must CAS it to
+    ``dispatched`` immediately before invoking a provider.  Keeping these two
+    steps separate lets the protected-operation SDK distinguish a local
+    pre-provider abort from a process crash at the provider boundary.
+    """
 
     manifests = getattr(store, "authority_manifest_manager", None)
     manifest = None
@@ -137,13 +150,17 @@ def begin_external_effect_intent(
         manifests.assert_effect(pid, f"{provider}.{operation}")
         manifest = manifests.get_for_process(pid)
     context = dict((metadata or {}).get("context") or metadata or {})
+    binding_context = dict(canonical_args) if canonical_args is not None else context
     approval_binding = current_approval_effect_binding(store)
     effect_id = approval_binding["effect_id"] if approval_binding is not None else new_id("effintent")
-    args_hash = (
-        approval_binding["canonical_args_hash"]
-        if approval_binding is not None
-        else canonical_effect_hash(context)
-    )
+    computed_args_hash = canonical_effect_hash(binding_context)
+    if (
+        approval_binding is not None
+        and canonical_args is not None
+        and approval_binding["canonical_args_hash"] != computed_args_hash
+    ):
+        raise ValidationError("protected operation arguments do not match the approved external effect")
+    args_hash = approval_binding["canonical_args_hash"] if approval_binding is not None else computed_args_hash
     operations = getattr(store, "operation_manager", None)
     operation_id = operations.current_id() if operations is not None else None
     selected_idempotency_key = idempotency_key or hashlib.sha256(
@@ -236,17 +253,17 @@ def begin_external_effect_intent(
         raise
     operations = getattr(store, "operation_manager", None)
     if operations is not None:
-        operations.expect("effect", "event", "audit")
+        # Event/audit roles become required only after the provider has
+        # actually returned or become ambiguous. A pre-dispatch abort or a
+        # first-phase ProviderEffectNotStarted must not report false gaps.
+        operations.expect("effect")
         operations.link_evidence(
             "external_effect",
             record.effect_id,
             "effect",
             metadata={"effect_state": "pending", "provider": provider, "operation": operation},
         )
-    # The caller invokes this helper immediately before entering a provider
-    # boundary. Persist the dispatch transition separately so a crash cannot
-    # erase whether reconciliation is required.
-    return mark_external_effect_dispatched(store, record.effect_id)
+    return record
 
 
 def mark_external_effect_dispatched(store: RuntimeStore, effect_id: str) -> ExternalEffectRecord:
@@ -301,6 +318,12 @@ def reconcile_pending_external_effects(store: RuntimeStore, substrate: Any) -> l
     reconciled: list[ExternalEffectRecord] = []
     for effect in store.list_external_effects():
         if effect.effect_state != "pending":
+            continue
+        protected = effect.provider_metadata.get("protected_operation")
+        if effect.transaction_state == "prepared" and isinstance(protected, dict):
+            # The SDK owns local prepare recovery, including capability and
+            # domain-state restoration. Never ask a provider about a boundary
+            # that was durably proven not to have been dispatched.
             continue
         provider = getattr(substrate, effect.provider, None)
         reconcile = getattr(provider, "reconcile_external_effect", None)

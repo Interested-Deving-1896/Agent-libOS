@@ -143,7 +143,7 @@ class TestExternalBoundary:
         assert self.runtime.human.process_next_terminal() is None
         assert 'human.output' not in self._audit_actions()
 
-    def test_human_output_visible_write_is_not_left_pending_if_final_status_update_fails(
+    def test_human_output_settlement_failure_preserves_pending_intent_without_replay(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -166,10 +166,14 @@ class TestExternalBoundary:
         assert result.ok, result.error
         assert self.human_output == ['visible']
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
-        assert 'human.output' in self._audit_actions()
+        assert 'human.output' not in self._audit_actions()
+        effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
+        assert len(effects) == 1
+        assert effects[0].effect_state == 'pending'
+        assert effects[0].transaction_state == 'dispatched'
         assert [item for item in self.runtime.store.list_external_effects() if item.provider == 'human']
 
-    def test_human_output_post_provider_classifier_failure_keeps_pending_effect_evidence(
+    def test_human_output_classifier_failure_uses_conservative_finalization(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -186,7 +190,8 @@ class TestExternalBoundary:
         assert self.human_output == ['visible once']
         effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
         assert len(effects) == 1
-        assert effects[0].effect_state == 'pending'
+        assert effects[0].effect_state == 'finalized'
+        assert effects[0].provider_metadata['classification_fallback'] == 'post_effect_failure'
         assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
 
     def test_human_output_provider_failure_does_not_persist_exception_text(self) -> None:

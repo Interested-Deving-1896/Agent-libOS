@@ -352,7 +352,7 @@ class LocalFilesystemProvider:
                 information_flow=False,
                 metadata={"namespace": self.namespace, "path": context.get("path")},
             )
-        if operation in {"read_bytes", "list_directory"}:
+        if operation in {"state", "read_bytes", "list_directory"}:
             return ExternalEffectClassification(
                 rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
                 rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,

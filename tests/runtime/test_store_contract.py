@@ -15,6 +15,9 @@ from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import (
     CapabilityRight,
     ContextMaterializationManifest,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     LLMCallRecord,
@@ -26,6 +29,11 @@ from agent_libos.models import (
     OperationState,
 )
 from agent_libos.runtime.runtime import Runtime
+from agent_libos.sdk import (
+    ProtectedOperationContract,
+    ProtectedOperationInvocation,
+    ResourcePolicy,
+)
 from agent_libos.utils.ids import utc_now
 from agent_libos.models.exceptions import ValidationError
 
@@ -303,3 +311,80 @@ def test_object_payload_is_runtime_only_across_reopen(kind: str, tmp_path: Path)
             assert json.loads(row["payload_json"]) == {"storage": "runtime_memory", "present": False}
         finally:
             reopened.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_prepared_protected_operation_restores_reservation_across_reopen(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    class Provider:
+        def classify_external_effect(self, _operation, _context, _result):
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+            )
+
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        try:
+            pid = runtime.process.spawn(goal=f"{kind} prepared recovery")
+            capability = runtime.capability.issue_trusted(
+                pid,
+                "test:prepared-recovery",
+                [CapabilityRight.READ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            decision = runtime.capability.require(
+                pid,
+                capability.resource,
+                CapabilityRight.READ,
+                consume=False,
+            )
+            contract = ProtectedOperationContract(
+                name="primitive.test.prepared_recovery",
+                provider="test",
+                operation="read",
+                evidence_roles=("audit", "event", "effect"),
+                resource_policy=ResourcePolicy.NONE,
+                information_flow=True,
+            )
+            runtime.protected_operations.register_contract(contract)
+            invocation = ProtectedOperationInvocation(
+                pid=pid,
+                actor=pid,
+                target=capability.resource,
+                decisions=(decision,),
+                canonical_args={"item": "secret"},
+                observation={"item_sha256": "safe"},
+            )
+            operation = runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=Provider(),
+            )
+            operation.__enter__()
+            effect_id = operation.effect_id
+            assert effect_id is not None
+            scope = operation._operation_cm
+            assert scope is not None
+            interrupted = RuntimeError("simulated runtime crash")
+            scope.__exit__(type(interrupted), interrupted, interrupted.__traceback__)
+            operation._operation_cm = None
+            runtime.store.close()
+            runtime._closed = True
+
+            reopened = Runtime.open(target, config=config)
+            try:
+                restored = reopened.store.get_capability(capability.cap_id)
+                assert restored is not None
+                assert restored.uses_remaining == 1
+                assert reopened.store.get_external_effect(effect_id) is None
+            finally:
+                reopened.close()
+        finally:
+            if not runtime._closed:
+                runtime.close()

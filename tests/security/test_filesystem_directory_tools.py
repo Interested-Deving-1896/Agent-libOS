@@ -105,7 +105,10 @@ class TestFilesystemDirectoryTool:
         effects = self.runtime.store.list_external_effects(pid=pid)
         assert len(effects) == 1
         assert effects[0].effect_state == 'finalized'
-        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.NOT_REQUIRED
+        assert effects[0].state_mutation is False
+        assert effects[0].information_flow is True
+        assert effects[0].provider_metadata['outcome'] == 'rejected_after_state_observation'
         with pytest.raises(CapabilityDenied):
             getattr(self.runtime.filesystem, operation)(pid, path)
 
@@ -152,6 +155,33 @@ class TestFilesystemDirectoryTool:
         assert effects[0].rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
         assert effects[0].rollback_status == ExternalEffectRollbackStatus.NOT_REQUIRED
         assert effects[0].provider_metadata['result']['outcome'] == outcome
+
+    def test_write_local_type_rejection_finalizes_read_only_state_effect(self) -> None:
+        path = f'agent_outputs/write_directory_target_{uuid4().hex}'
+        (self.runtime.workspace_root / path).mkdir(parents=True)
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='reject directory write target')
+        resource = self.runtime.filesystem.resource_for_path(path)
+        self.runtime.capability.issue_trusted(
+            pid,
+            resource,
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+
+        with pytest.raises(CapabilityDenied, match='path is not a file'):
+            self.runtime.filesystem.write_text(pid, path, 'content')
+
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        effect = effects[0]
+        assert effect.effect_state == 'finalized'
+        assert effect.transaction_state == 'committed'
+        assert effect.state_mutation is False
+        assert effect.information_flow is True
+        assert effect.provider_metadata['outcome'] == 'rejected_after_state_observation'
+        assert effect.provider_metadata['provider_phases'] == [
+            {'name': 'state', 'state_mutation': False, 'information_flow': True}
+        ]
 
     def test_validate_directory_not_started_restores_one_time_read_and_abandons_intent(
         self,
@@ -563,7 +593,7 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
-    def test_one_time_mutation_capability_survives_provider_failure(self) -> None:
+    def test_one_time_mutation_capability_is_consumed_after_state_observation(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             root = Path(workspace)
             provider = FailingMutationProvider(root)
@@ -580,12 +610,15 @@ class TestFilesystemDirectoryTool:
                 )
                 with pytest.raises(ProviderEffectNotStarted, match='simulated write failure'):
                     runtime.filesystem.write_text(pid, 'out.txt', 'content')
-                assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 1
+                # The state phase already crossed an information-flow boundary,
+                # so a later certified-not-started mutation cannot restore the
+                # one-time authority.
+                assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 0
                 write_effect = runtime.store.list_external_effects(pid=pid)[0]
                 assert write_effect.effect_state == 'finalized'
                 assert write_effect.state_mutation is False
                 assert write_effect.information_flow is True
-                assert write_effect.rollback_status == ExternalEffectRollbackStatus.NOT_REQUIRED
+                assert write_effect.rollback_status == ExternalEffectRollbackStatus.UNKNOWN
 
                 (root / 'delete.txt').write_text('delete me', encoding='utf-8')
                 delete_cap = runtime.capability.grant_once(
@@ -596,7 +629,7 @@ class TestFilesystemDirectoryTool:
                 )
                 with pytest.raises(ProviderEffectNotStarted, match='simulated delete failure'):
                     runtime.filesystem.delete_file(pid, 'delete.txt')
-                assert runtime.store.get_capability(delete_cap.cap_id).uses_remaining == 1
+                assert runtime.store.get_capability(delete_cap.cap_id).uses_remaining == 0
                 assert (root / 'delete.txt').exists()
                 effects = runtime.store.list_external_effects(pid=pid)
                 assert len(effects) == 2

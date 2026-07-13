@@ -1453,7 +1453,7 @@ class CheckpointManager:
         try:
             yield
         except BaseException:
-            self.capabilities._restore_reserved_use(
+            self.capabilities.restore_reserved_use(
                 reservation,
                 restored_by=actor,
                 reason=f"{purpose} failed before completion",

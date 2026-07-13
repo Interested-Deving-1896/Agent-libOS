@@ -1146,7 +1146,7 @@ class ObjectTaskManager:
                 issued_by=used_by,
             )
         except Exception:
-            self.runtime.capability._restore_reserved_use(
+            self.runtime.capability.restore_reserved_use(
                 reservation_id,
                 restored_by=used_by,
                 reason="object task notify-result handle issuance failed",
@@ -1283,7 +1283,7 @@ class ObjectTaskManager:
 
     def _restore_owner_decisions(self, reservation_ids: list[str]) -> None:
         for reservation_id in reservation_ids:
-            self.runtime.capability._restore_reserved_use(
+            self.runtime.capability.restore_reserved_use(
                 reservation_id,
                 restored_by="object_task",
                 reason="one-time object task owner permission restored before task commit",

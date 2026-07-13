@@ -26,6 +26,8 @@ from agent_libos.models import (
     AgentImage,
     CapabilityRight,
     EventType,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     ForkMode,
     MemoryView,
     MemoryViewSpec,
@@ -52,6 +54,13 @@ from agent_libos.runtime.image_registry import ImageRegistryPrimitive
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.object_tasks import ObjectTaskManager
 from agent_libos.runtime.operation_manager import OperationManager
+from agent_libos.sdk import (
+    AuthorityMode,
+    PostProviderFailureMode,
+    ProtectedOperationContract,
+    ProtectedOperationSDK,
+    ResourcePolicy,
+)
 from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.ratings import AgentRatingManager
 from agent_libos.runtime.resource_manager import ResourceManager
@@ -126,6 +135,16 @@ class Runtime:
         self.provider_hooks: dict[str, list[Any]] = {}
         self._shutdown_finalizers: list[Any] = []
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
+        self.protected_operations = ProtectedOperationSDK(
+            store=store,
+            capabilities=self.capability,
+            audit=self.audit,
+            events=self.events,
+            resources=self.resources,
+            operations=self.operations,
+        )
+        self.store.protected_operation_sdk = self.protected_operations
+        self._register_protected_operation_contracts()
         self.memory = ObjectMemoryManager(
             store,
             self.capability,
@@ -142,6 +161,11 @@ class Runtime:
             provider=self.substrate.human,
             config=self.config,
         )
+        self.human.protected_operations = self.protected_operations
+        self.protected_operations.register_prepared_recovery(
+            "human_output_delivery",
+            self.human.recover_prepared_output,
+        )
         self.messages = ProcessMessageManager(store, self.audit, self.events, config=self.config)
         self.human.bind_messages(self.messages)
         self.clock = ClockPrimitive(
@@ -151,6 +175,7 @@ class Runtime:
             max_sleep_seconds=self.config.tools.max_sleep_seconds,
             provider=self.substrate.clock,
         )
+        self.clock.protected_operations = self.protected_operations
         self.filesystem = FilesystemAdapter(
             self.capability,
             self.audit,
@@ -160,6 +185,7 @@ class Runtime:
             resources=self.resources,
             config=self.config,
         )
+        self.filesystem.protected_operations = self.protected_operations
         self.shell = ShellAdapter(
             self.capability,
             self.audit,
@@ -169,6 +195,7 @@ class Runtime:
             config=self.config,
             resources=self.resources,
         )
+        self.shell.protected_operations = self.protected_operations
         self.jsonrpc = JsonRpcPrimitive(
             store,
             self.capability,
@@ -179,6 +206,7 @@ class Runtime:
             config=self.config,
             resources=self.resources,
         )
+        self.jsonrpc.protected_operations = self.protected_operations
         self.mcp = McpPrimitive(
             store,
             self.capability,
@@ -189,6 +217,7 @@ class Runtime:
             config=self.config,
             resources=self.resources,
         )
+        self.mcp.protected_operations = self.protected_operations
         self.images: dict[str, AgentImage] = {}
         self.authority_manifests = AuthorityManifestManager(
             store,
@@ -273,10 +302,145 @@ class Runtime:
         self.image_registry.load_persisted_images()
         self._rehydrate_registered_jit_tools()
         self.modules.run_startup_hooks()
+        self.recovered_prepared_operations = self.protected_operations.recover_prepared()
         self.reconciled_external_effects = reconcile_pending_external_effects(self.store, self.substrate)
         self._install_operation_boundaries()
         self._closed = False
         self._shutdown_reason: str | None = None
+
+    def _register_protected_operation_contracts(self) -> None:
+        def contract(
+            name: str,
+            provider: str,
+            operation: str,
+            *,
+            resource_policy: ResourcePolicy,
+            **kwargs: Any,
+        ) -> ProtectedOperationContract:
+            return ProtectedOperationContract(
+                name,
+                provider,
+                operation,
+                evidence_roles=("audit", "event", "effect"),
+                resource_policy=resource_policy,
+                **kwargs,
+            )
+
+        contracts = (
+            contract("primitive.filesystem.validate_directory", "filesystem", "state", resource_policy=ResourcePolicy.OPTIONAL, information_flow=True),
+            contract("primitive.filesystem.read_text", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True),
+            contract("primitive.filesystem.read_bytes", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True),
+            contract("primitive.filesystem.write_text", "filesystem", "write_text", resource_policy=ResourcePolicy.REQUIRED, state_mutation=True, information_flow=True),
+            contract("primitive.filesystem.read_directory", "filesystem", "list_directory", resource_policy=ResourcePolicy.REQUIRED, information_flow=True),
+            contract("primitive.filesystem.write_directory", "filesystem", "make_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.filesystem.delete_file", "filesystem", "delete_file", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.filesystem.delete_directory", "filesystem", "delete_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.clock.now", "clock", "now", resource_policy=ResourcePolicy.NONE, information_flow=True),
+            contract("primitive.clock.sleep", "clock", "sleep", resource_policy=ResourcePolicy.NONE, information_flow=True),
+            contract("primitive.shell.run", "shell", "run", resource_policy=ResourcePolicy.OPTIONAL, state_mutation=True, information_flow=True),
+            contract(
+                "primitive.jsonrpc.call",
+                "jsonrpc",
+                "call",
+                resource_policy=ResourcePolicy.REQUIRED,
+                state_mutation=True,
+                information_flow=True,
+                classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+                classifier_failure_label="post_call_failure",
+            ),
+            contract(
+                "primitive.mcp.list_tools",
+                "mcp",
+                "list_tools",
+                resource_policy=ResourcePolicy.OPTIONAL,
+                information_flow=True,
+                preflight_classifier=True,
+                classifier_failure_rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                classifier_failure_label="post_list_tools_failure",
+            ),
+            contract(
+                "primitive.mcp.list_tools.internal",
+                "mcp",
+                "list_tools",
+                resource_policy=ResourcePolicy.OPTIONAL,
+                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+                information_flow=True,
+                internal_reason="host registry refresh is an operator-controlled provider operation",
+                preflight_classifier=True,
+                classifier_failure_rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                classifier_failure_label="post_list_tools_failure",
+            ),
+            contract(
+                "primitive.mcp.call",
+                "mcp",
+                "call_tool",
+                resource_policy=ResourcePolicy.REQUIRED,
+                state_mutation=True,
+                information_flow=True,
+                preflight_classifier=True,
+                classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+                classifier_failure_label="post_call_failure",
+            ),
+            contract(
+                "primitive.human.read",
+                "human",
+                "read",
+                resource_policy=ResourcePolicy.NONE,
+                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+                information_flow=True,
+                post_provider_failure_mode=PostProviderFailureMode.PRESERVE_RESULT,
+                internal_reason="terminal queue already owns an authorized Human request",
+            ),
+            contract(
+                "primitive.human.write",
+                "human",
+                "write",
+                resource_policy=ResourcePolicy.NONE,
+                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+                state_mutation=True,
+                information_flow=True,
+                post_provider_failure_mode=PostProviderFailureMode.PRESERVE_RESULT,
+                internal_reason="terminal queue already owns an authorized Human request",
+                prepared_recovery="human_output_delivery",
+            ),
+            contract("primitive.pty.spawn", "pty", "spawn", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.pty.read", "pty", "read", resource_policy=ResourcePolicy.NONE, state_mutation=False, information_flow=True),
+            contract(
+                "primitive.pty.ingest",
+                "pty",
+                "ingest",
+                resource_policy=ResourcePolicy.NONE,
+                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+                state_mutation=False,
+                information_flow=True,
+                internal_reason=(
+                    "runtime continuously drains an already-authorized PTY session so the "
+                    "child process cannot block on its output buffer"
+                ),
+            ),
+            contract("primitive.pty.write", "pty", "write", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.pty.resize", "pty", "resize", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=False),
+            contract("primitive.pty.close", "pty", "close", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract(
+                "primitive.pty.close.internal",
+                "pty",
+                "close",
+                resource_policy=ResourcePolicy.NONE,
+                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+                state_mutation=True,
+                information_flow=True,
+                internal_reason="runtime lifecycle finalizer owns the PTY session being closed",
+            ),
+        )
+        for contract in contracts:
+            self.protected_operations.register_contract(contract)
+        self.external_primitive_boundary_names = frozenset(
+            contract.name for contract in contracts
+        )
 
     def _install_operation_boundaries(self) -> None:
         """Attach explainable scopes to documented protected public boundaries."""
@@ -378,7 +542,10 @@ class Runtime:
                 result_pid=result_pid,
             )(method)
             setattr(owner, method_name, wrapped)
-        self.explainable_boundary_names = frozenset(name for _, _, _, name, *_ in boundaries)
+        self.explainable_boundary_names = frozenset(
+            {name for _, _, _, name, *_ in boundaries}
+            | set(self.external_primitive_boundary_names)
+        )
 
     @classmethod
     def open(

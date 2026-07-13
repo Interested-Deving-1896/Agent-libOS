@@ -46,6 +46,16 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `effect-transactions-are-idempotent-and-reconcilable`: provider intents bind
   canonical arguments and idempotency keys, approval leases bind exact effects,
   and startup reconciliation queries but never replays providers.
+- `protected-provider-operations-use-sdk`: filesystem, clock, shell, JSON-RPC,
+  MCP, Human, and PTY provider effects share one contract registry and one
+  prepare/dispatch/finalize state machine. Static coverage rejects direct
+  low-level lifecycle and out-of-phase provider calls, while generic tests
+  cover sync/async phases, restart recovery of prepared local state and finite
+  authority, not-started restoration, partial effects, unknown outcomes,
+  conservative classification, at-most-once settlement, evidence, and resource
+  charge order. Required-resource failure paths settle measured partial usage
+  or conservatively charge their preflight envelope; static coverage follows
+  provider-reaching helpers and session handles at each call site.
 - `data-labels-propagate-conservatively`: derived Object sensitivity, trust,
   and integrity labels merge conservatively; manifests expose metadata only;
   label downgrade requires declassification authority.
@@ -91,8 +101,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   multiple blockers remain waiting, and terminal processes cancel requests.
   Blocking terminal provider I/O runs outside the selection lock so exit/cancel
   never waits for human input, and GUI history bounds never omit pending rows.
-  Human output commits delivered state/event/audit/pending intent before the
-  provider and remains at-most-once after provider or classifier failure.
+  Human output commits its delivered marker and pending intent before the
+  provider; event/audit/effect finalization follows provider success. A later
+  settlement failure preserves the dispatched pending intent and never replays
+  the Human sink. Classifier failure uses the conservative contract ceiling.
   Terminal prompt reads and automatic-response writes also use structured
   pending intents; they retain only length/hash observations, never raw
   prompt, answer, or provider exception text. Human output provider failures

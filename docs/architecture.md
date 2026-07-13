@@ -92,6 +92,13 @@ The Resource Provider Substrate owns concrete host calls. A provider is a
 backend, not a security bypass. Replacing the filesystem or shell provider must
 not change tool schemas or skip primitive authorization.
 
+Filesystem, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
+the public [`agent_libos.sdk`](protected_operation_sdk.md) contract. The SDK is
+the only provider-facing lifecycle for finite capability reservation, effect
+prepare/dispatch/finalize, classification fallback, event/audit evidence, and
+resource settlement. Low-level effect-ledger functions remain Runtime-internal
+for the SDK and startup reconciliation.
+
 Providers are also the source of truth for successful external-effect rollback
 classification. Effectful provider calls must expose a classifier to the
 primitive; the runtime persists the result for checkpoint reports, but v1 does
@@ -139,7 +146,8 @@ and abandon; every later sleep, cancellation, or measurement failure consumes
 the use and finalizes unknown. The successful elapsed-time result is also an
 information flow.
 
-Once the provider boundary is crossed, the reservation is committed. Timeout,
+Once the first provider phase that may produce an effect is crossed, the
+reservation is committed. Timeout,
 cancellation, resource-limit, ordinary provider exception, or post-effect
 classifier failure cannot prove non-execution, so authority stays consumed and
 the primitive records or retains a conservative `unknown` effect. This makes a

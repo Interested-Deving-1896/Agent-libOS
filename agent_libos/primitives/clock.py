@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import math
 from dataclasses import dataclass
 from datetime import timedelta, timezone
@@ -14,20 +13,15 @@ from agent_libos.models import (
     CapabilityDecision,
     CapabilityRight,
     EventType,
-    ExternalEffectClassification,
-    ExternalEffectRollbackClass,
-    ExternalEffectRollbackStatus,
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.external_effects import (
-    abandon_external_effect_intent,
-    begin_external_effect_intent,
-    classify_external_effect,
-    record_external_effect,
-    require_external_effect_classifier,
+from agent_libos.sdk import (
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
 )
-from agent_libos.substrate import ClockProvider, LocalClockProvider, ProviderEffectNotStarted
+from agent_libos.substrate import ClockProvider, LocalClockProvider
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CLOCK_NOW_RESOURCE = "clock:now"
@@ -86,220 +80,125 @@ class ClockPrimitive:
             consume=False,
         )
         effect_context = {"timezone": tz, "resource": resource}
-        require_external_effect_classifier(self.provider, "now")
-        reservation = self._reserve_one_time_decision(decision, operation="now")
-        try:
-            effect_intent = begin_external_effect_intent(
-                self.audit.store,
-                pid=pid,
-                provider="clock",
-                operation="now",
-                target=resource,
-                state_mutation=False,
-                information_flow=True,
-                metadata={"context": effect_context},
-            )
-        except Exception:
-            self._restore_one_time_decision(reservation, operation="now")
-            raise
-        try:
-            current = self.provider.now(selected_tz)
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="now",
-                target=resource,
-                context=effect_context,
-                reservation_id=reservation,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-            )
-            raise
-        self._commit_one_time_decision(reservation, operation="now")
-        result = ClockNowResult(
-            iso8601=current.isoformat(),
-            unix_seconds=current.timestamp(),
-            timezone=tz,
-        )
-        event = self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=resource,
-            payload={"adapter": "clock", "operation": "now", "timezone": tz, "iso8601": result.iso8601},
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.clock.now",
-            target=resource,
-            decision={"timezone": tz, "iso8601": result.iso8601},
-        )
-        classification = self._classify_external_effect(
-            "now",
-            effect_context,
-            result.__dict__,
-            information_flow=True,
-        )
-        record_external_effect(
-            self.audit.store,
+        invocation = ProtectedOperationInvocation(
             pid=pid,
-            provider="clock",
-            operation="now",
+            actor=pid,
             target=resource,
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={"context": effect_context, "result": result.__dict__},
-            intent_effect_id=effect_intent.effect_id,
+            decisions=(decision,),
+            canonical_args=operation_context,
+            observation=effect_context,
         )
-        return result
+        with self._protected().start("primitive.clock.now", invocation, provider=self.provider) as operation:
+            current = operation.call(
+                ProviderPhase("now", information_flow=True),
+                self.provider.now,
+                selected_tz,
+            )
+            result = ClockNowResult(
+                iso8601=current.isoformat(),
+                unix_seconds=current.timestamp(),
+                timezone=tz,
+            )
+            return operation.complete(
+                result,
+                self._evidence(pid, "now", resource, result.__dict__),
+                classification_context=effect_context,
+                classification_result=result.__dict__,
+            )
 
     def sleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
         decision = self._authorize_sleep(pid, duration)
-        require_external_effect_classifier(self.provider, "sleep")
-        reservation = self._reserve_one_time_decision(decision, operation="sleep")
         effect_context = {"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE}
-        try:
-            effect_intent = begin_external_effect_intent(
-                self.audit.store,
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=_CLOCK_SLEEP_RESOURCE,
+            decisions=(decision,),
+            canonical_args=self._authorization_context(
                 pid=pid,
-                provider="clock",
+                resource=_CLOCK_SLEEP_RESOURCE,
+                primitive="runtime.clock.sleep",
                 operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                state_mutation=False,
-                information_flow=True,
-                metadata={"context": effect_context},
+                extra={"requested_seconds": duration},
+            ),
+            observation=effect_context,
+        )
+        with self._protected().start("primitive.clock.sleep", invocation, provider=self.provider) as operation:
+            started = operation.call(ProviderPhase("monotonic.start", information_flow=True), self.provider.monotonic)
+            operation.call(ProviderPhase("sleep", information_flow=True), self.provider.sleep, duration)
+            elapsed = operation.call(
+                ProviderPhase("monotonic.end", information_flow=True),
+                self.provider.monotonic,
+            ) - started
+            result = SleepResult(requested_seconds=duration, elapsed_seconds=elapsed)
+            return operation.complete(
+                result,
+                self._evidence(pid, "sleep", _CLOCK_SLEEP_RESOURCE, result.__dict__),
+                classification_context=effect_context,
+                classification_result=result.__dict__,
             )
-        except Exception:
-            self._restore_one_time_decision(reservation, operation="sleep")
-            raise
-        try:
-            started = self.provider.monotonic()
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context=effect_context,
-                reservation_id=reservation,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-            )
-            raise
-        try:
-            self.provider.sleep(duration)
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
-                reservation_id=reservation,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-                effect_started=True,
-            )
-            raise
-        self._commit_one_time_decision(reservation, operation="sleep")
-        try:
-            elapsed = self.provider.monotonic() - started
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
-                reservation_id=None,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-                effect_started=True,
-            )
-            raise
-        return self._record_sleep(pid, duration, elapsed, effect_intent_id=effect_intent.effect_id)
 
     async def asleep(self, pid: str, seconds: float) -> SleepResult:
         duration = self._validate_sleep_duration(seconds)
         decision = self._authorize_sleep(pid, duration)
-        require_external_effect_classifier(self.provider, "sleep")
-        reservation = self._reserve_one_time_decision(decision, operation="sleep")
         effect_context = {"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE}
-        try:
-            effect_intent = begin_external_effect_intent(
-                self.audit.store,
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=_CLOCK_SLEEP_RESOURCE,
+            decisions=(decision,),
+            canonical_args=self._authorization_context(
                 pid=pid,
-                provider="clock",
+                resource=_CLOCK_SLEEP_RESOURCE,
+                primitive="runtime.clock.sleep",
                 operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                state_mutation=False,
-                information_flow=True,
-                metadata={"context": effect_context},
+                extra={"requested_seconds": duration},
+            ),
+            observation=effect_context,
+        )
+        with self._protected().start("primitive.clock.sleep", invocation, provider=self.provider) as operation:
+            started = operation.call(ProviderPhase("monotonic.start", information_flow=True), self.provider.monotonic)
+            await operation.acall(ProviderPhase("sleep", information_flow=True), self.provider.asleep, duration)
+            elapsed = operation.call(
+                ProviderPhase("monotonic.end", information_flow=True),
+                self.provider.monotonic,
+            ) - started
+            result = SleepResult(requested_seconds=duration, elapsed_seconds=elapsed)
+            return operation.complete(
+                result,
+                self._evidence(pid, "sleep", _CLOCK_SLEEP_RESOURCE, result.__dict__),
+                classification_context=effect_context,
+                classification_result=result.__dict__,
             )
-        except Exception:
-            self._restore_one_time_decision(reservation, operation="sleep")
-            raise
-        try:
-            started = self.provider.monotonic()
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context=effect_context,
-                reservation_id=reservation,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-            )
-            raise
-        try:
-            await self.provider.asleep(duration)
-        except asyncio.CancelledError as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
-                reservation_id=reservation,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-                effect_started=True,
-            )
-            raise
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
-                reservation_id=reservation,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-                effect_started=True,
-            )
-            raise
-        self._commit_one_time_decision(reservation, operation="sleep")
-        try:
-            elapsed = self.provider.monotonic() - started
-        except Exception as exc:
-            self._handle_provider_failure(
-                pid=pid,
-                operation="sleep",
-                target=_CLOCK_SLEEP_RESOURCE,
-                context={"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE},
-                reservation_id=None,
-                error=exc,
-                information_flow=True,
-                effect_intent_id=effect_intent.effect_id,
-                effect_started=True,
-            )
-            raise
-        return self._record_sleep(pid, duration, elapsed, effect_intent_id=effect_intent.effect_id)
+
+    def _protected(self):
+        sdk = getattr(self, "protected_operations", None) or getattr(
+            self.audit.store, "protected_operation_sdk", None
+        )
+        if sdk is None:
+            raise ValidationError("ClockPrimitive requires ProtectedOperationSDK")
+        return sdk
+
+    def _evidence(
+        self,
+        pid: str,
+        operation: str,
+        target: str,
+        result: dict[str, Any],
+    ) -> ProtectedOperationEvidence:
+        payload = {"adapter": "clock", "operation": operation, **result}
+        return ProtectedOperationEvidence(
+            event_type=EventType.EXTERNAL_READ,
+            event_source=pid,
+            event_target=target,
+            event_payload=payload,
+            audit_action=f"primitive.clock.{operation}",
+            audit_actor=pid,
+            audit_target=target,
+            audit_decision=result,
+            effect_metadata=result,
+        )
 
     def _validate_sleep_duration(self, seconds: float) -> float:
         duration = float(seconds)
@@ -310,83 +209,6 @@ class ClockPrimitive:
         if duration > self.max_sleep_seconds:
             raise ValidationError(f"sleep seconds exceeds max_sleep_seconds={self.max_sleep_seconds}")
         return duration
-
-    def _record_sleep(
-        self,
-        pid: str,
-        duration: float,
-        elapsed: float,
-        *,
-        effect_intent_id: str,
-    ) -> SleepResult:
-        result = SleepResult(requested_seconds=duration, elapsed_seconds=elapsed)
-        effect_context = {"requested_seconds": duration, "resource": _CLOCK_SLEEP_RESOURCE}
-        event = self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=_CLOCK_SLEEP_RESOURCE,
-            payload={
-                "adapter": "clock",
-                "operation": "sleep",
-                "requested_seconds": duration,
-                "elapsed_seconds": elapsed,
-            },
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action="primitive.clock.sleep",
-            target=_CLOCK_SLEEP_RESOURCE,
-            decision={"requested_seconds": duration, "elapsed_seconds": elapsed},
-        )
-        classification = self._classify_external_effect(
-            "sleep",
-            effect_context,
-            result.__dict__,
-            information_flow=True,
-        )
-        if not classification.information_flow:
-            classification = ExternalEffectClassification(
-                rollback_class=classification.rollback_class,
-                rollback_status=classification.rollback_status,
-                state_mutation=classification.state_mutation,
-                information_flow=True,
-                metadata={**classification.metadata, "elapsed_observed": True},
-            )
-        record_external_effect(
-            self.audit.store,
-            pid=pid,
-            provider="clock",
-            operation="sleep",
-            target=_CLOCK_SLEEP_RESOURCE,
-            classification=classification,
-            audit_record=audit_record,
-            event=event,
-            metadata={"context": effect_context, "result": result.__dict__},
-            intent_effect_id=effect_intent_id,
-        )
-        return result
-
-    def _classify_external_effect(
-        self,
-        operation: str,
-        context: dict[str, Any],
-        result: Any,
-        *,
-        information_flow: bool,
-    ) -> ExternalEffectClassification:
-        try:
-            return classify_external_effect(self.provider, operation, context, result)
-        except Exception as exc:
-            return ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=False,
-                information_flow=information_flow,
-                metadata={
-                    "classification_error": f"{type(exc).__name__}: {exc}",
-                    "classification_fallback": "post_effect_failure",
-                },
-            )
 
     def _timezone(self, tz: str):
         if tz.upper() == "UTC":
@@ -430,88 +252,3 @@ class ClockPrimitive:
             "right": CapabilityRight.READ.value,
             **extra,
         }
-
-    def _reserve_one_time_decision(self, decision: CapabilityDecision, *, operation: str) -> str | None:
-        return self.capabilities.reserve_decision_use(
-            decision,
-            used_by="clock",
-            reason=f"one-time clock {operation} permission reserved",
-        )
-
-    def _commit_one_time_decision(self, reservation_id: str | None, *, operation: str) -> None:
-        self.capabilities.commit_reserved_use(
-            reservation_id,
-            committed_by="clock",
-            reason=f"one-time clock {operation} permission committed",
-        )
-
-    def _restore_one_time_decision(self, reservation_id: str | None, *, operation: str) -> None:
-        self.capabilities._restore_reserved_use(
-            reservation_id,
-            restored_by="clock",
-            reason=f"one-time clock {operation} permission restored after provider failure",
-        )
-
-    def _handle_provider_failure(
-        self,
-        *,
-        pid: str,
-        operation: str,
-        target: str,
-        context: dict[str, Any],
-        reservation_id: str | None,
-        error: BaseException,
-        information_flow: bool,
-        effect_intent_id: str,
-        effect_started: bool = False,
-    ) -> None:
-        if isinstance(error, ProviderEffectNotStarted) and not effect_started:
-            with self.audit.store.transaction():
-                self._restore_one_time_decision(reservation_id, operation=operation)
-                abandon_external_effect_intent(self.audit.store, effect_intent_id)
-            return
-
-        self._commit_one_time_decision(reservation_id, operation=operation)
-        event = self.events.emit(
-            EventType.EXTERNAL_READ,
-            source=pid,
-            target=target,
-            payload={
-                "adapter": "clock",
-                "operation": operation,
-                "outcome": "unknown",
-                "error_type": type(error).__name__,
-            },
-        )
-        audit_record = self.audit.record(
-            actor=pid,
-            action=f"primitive.clock.{operation}.failed",
-            target=target,
-            decision={
-                "effect_outcome": "unknown",
-                "error_type": type(error).__name__,
-                "error": str(error),
-            },
-        )
-        record_external_effect(
-            self.audit.store,
-            pid=pid,
-            provider="clock",
-            operation=operation,
-            target=target,
-            classification=ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=False,
-                information_flow=information_flow,
-                metadata={"outcome": "unknown_after_provider_exception"},
-            ),
-            audit_record=audit_record,
-            event=event,
-            metadata={
-                "context": context,
-                "error_type": type(error).__name__,
-                "error": str(error),
-            },
-            intent_effect_id=effect_intent_id,
-        )
