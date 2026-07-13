@@ -1,0 +1,28 @@
+from __future__ import annotations
+
+from dataclasses import fields
+import re
+from pathlib import Path
+
+from agent_libos.config import DEFAULT_CONFIG
+
+
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_DOC = ROOT / "docs" / "configuration.md"
+_ROW = re.compile(r"^\| `(?P<group>[a-z_]+)` \| (?P<fields>.+) \|$")
+_FIELD = re.compile(r"`([a-z][a-z0-9_]*)`")
+
+
+def test_configuration_reference_lists_every_default_dataclass_field() -> None:
+    documented: dict[str, list[str]] = {}
+    for line in CONFIG_DOC.read_text(encoding="utf-8").splitlines():
+        match = _ROW.match(line)
+        if match:
+            documented[match.group("group")] = _FIELD.findall(match.group("fields"))
+
+    expected = {
+        field.name: [nested.name for nested in fields(getattr(DEFAULT_CONFIG, field.name))]
+        for field in fields(DEFAULT_CONFIG)
+    }
+
+    assert documented == expected

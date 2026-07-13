@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -19,6 +20,22 @@ class AgentRatingManager:
     def get(self, pid: str, *, rater: str | None = None, source: str = "gui") -> AgentRating | None:
         self._require_process(pid)
         return self.store.get_agent_rating(pid, rater or self.config.runtime.default_human, source)
+
+    def get_many(
+        self,
+        pids: Iterable[str],
+        *,
+        rater: str | None = None,
+        source: str = "gui",
+    ) -> dict[str, AgentRating]:
+        selected = sorted({str(pid) for pid in pids if str(pid)})
+        if not selected:
+            return {}
+        return self.store.get_agent_ratings_for_processes(
+            selected,
+            rater=rater or self.config.runtime.default_human,
+            source=source,
+        )
 
     def upsert(
         self,

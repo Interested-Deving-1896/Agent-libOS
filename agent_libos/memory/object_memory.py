@@ -813,12 +813,6 @@ class ObjectMemoryManager:
         dst: ObjectHandle,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
-        if not src_decision.allowed:
-            raise CapabilityDenied(src_decision.reason)
-        dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
-        if not dst_decision.allowed:
-            raise CapabilityDenied(dst_decision.reason)
         link = ObjectLink(
             link_id=new_id("lnk"),
             src=src.oid,
@@ -828,7 +822,35 @@ class ObjectMemoryManager:
             created_by=pid,
             created_at=utc_now(),
         )
-        with self.store.transaction():
+        # Link publication follows the same ownership-lock -> store-transaction
+        # order as object updates and releases.  Authorization and LIVE-state
+        # checks happen inside that boundary, so a revoke/release that commits
+        # first is observed and a competing mutation that comes later cannot
+        # invalidate the preflight before this link commits.
+        with self._ownership_lock, self.store.transaction():
+            src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
+            if not src_decision.allowed:
+                raise CapabilityDenied(src_decision.reason)
+            dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
+            if not dst_decision.allowed:
+                raise CapabilityDenied(dst_decision.reason)
+            # Revalidate both exact handles after the complete two-sided
+            # preflight.  Besides defending re-entrant Host callbacks, this
+            # ensures the decisions consumed below are the ones valid at the
+            # publication point rather than stale decisions retained across a
+            # second authorization.
+            src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
+            if not src_decision.allowed:
+                raise CapabilityDenied(src_decision.reason)
+            dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
+            if not dst_decision.allowed:
+                raise CapabilityDenied(dst_decision.reason)
+            current_src = self.store.get_object(src.oid)
+            current_dst = self.store.get_object(dst.oid)
+            if current_src is None or current_src.lifecycle_state != ObjectLifecycleState.LIVE:
+                raise NotFound(f"object not found: {src.oid}")
+            if current_dst is None or current_dst.lifecycle_state != ObjectLifecycleState.LIVE:
+                raise NotFound(f"object not found: {dst.oid}")
             self._consume_one_time_decisions([src_decision, dst_decision])
             self.store.insert_link(link)
             event = self.events.emit(

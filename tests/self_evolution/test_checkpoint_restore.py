@@ -8,14 +8,86 @@ import pytest
 
 from agent_libos import AgentImage, Runtime
 from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
-from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectType, ProcessMessageStatus, ProcessStatus
+from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectTaskStatus, ObjectType, ProcessMessageStatus, ProcessStatus
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.substrate import LocalHumanProvider, LocalResourceProviderSubstrate
+from agent_libos.tools.builtin.checkpoint import RestoreCheckpointOutput
 from agent_libos.utils.serde import loads
 from tests.support.checkpoints import ClassifiedShellProvider
 
 
 class TestCheckpointRestore:
+    def test_restore_reserves_composite_one_shot_authority_until_main_commit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-composite-reservation:v0'
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id=image_id,
+                    name='checkpoint-composite-reservation',
+                    system_prompt='captured prompt',
+                ),
+                actor='test',
+            )
+            owner = runtime.process.spawn(image=image_id, goal='checkpoint authority owner')
+            controller = runtime.process.spawn(image='base-agent:v0', goal='checkpoint authority controller')
+            checkpoint_id = runtime.checkpoint.create(owner, 'composite authority', actor=owner)
+            runtime.register_image(
+                AgentImage(
+                    image_id=image_id,
+                    name='checkpoint-composite-reservation',
+                    system_prompt='current prompt',
+                ),
+                actor='test',
+                replace=True,
+            )
+            checkpoint_cap = runtime.capability.grant_once(
+                controller,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            image_cap = runtime.capability.grant_once(
+                controller,
+                f'image:{image_id}',
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            original_validate = runtime.checkpoint._validate_snapshot_restore_assets
+            fail_once = True
+
+            def injected_preflight_failure(snapshot: dict[str, object]) -> None:
+                nonlocal fail_once
+                if fail_once:
+                    fail_once = False
+                    raise ValidationError('injected restore preflight failure')
+                original_validate(snapshot)
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_validate_snapshot_restore_assets',
+                injected_preflight_failure,
+            )
+
+            with pytest.raises(ValidationError, match='injected restore preflight failure'):
+                runtime.checkpoint.restore(controller, checkpoint_id)
+
+            assert runtime.store.get_capability(checkpoint_cap.cap_id).uses_remaining == 1
+            assert runtime.store.get_capability(image_cap.cap_id).uses_remaining == 1
+            assert runtime.get_image(image_id).system_prompt == 'current prompt'
+
+            restored = runtime.checkpoint.restore(controller, checkpoint_id)
+
+            assert restored['main_state_committed'] is True
+            assert runtime.store.get_capability(checkpoint_cap.cap_id).uses_remaining == 0
+            assert runtime.store.get_capability(image_cap.cap_id).uses_remaining == 0
+            assert runtime.get_image(image_id).system_prompt == 'captured prompt'
+        finally:
+            runtime.close()
+
     def test_checkpoint_create_audit_failure_rolls_back_row_head_capability_and_event(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -849,7 +921,255 @@ class TestCheckpointRestore:
         finally:
             runtime.close()
 
-    def test_restore_does_not_replace_current_image_without_image_write(self) -> None:
+    def test_restore_supersedes_terminal_object_task_completed_after_checkpoint(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='terminal object task restore')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            owner = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {'name': 'owner'},
+                metadata=ObjectMetadata(title='owner'),
+                immutable=False,
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'before terminal task', actor=pid)
+            task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.runner_pid is not None
+            old_runner_pid = str(completed.runner_pid)
+            old_result_oid = str(completed.result_oid) if completed.result_oid is not None else None
+
+            result = runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored_task = runtime.object_tasks.get(task.task_id, actor_pid=pid)
+            assert restored_task.status == ObjectTaskStatus.SUPERSEDED_BY_RESTORE
+            assert restored_task.runner_pid is None
+            assert restored_task.result_oid is None
+            assert restored_task.wait['superseded_by_restore'] == checkpoint_id
+            assert restored_task.wait['previous_status'] == ObjectTaskStatus.SUCCEEDED.value
+            assert restored_task.wait['previous_runner_pid'] == old_runner_pid
+            assert restored_task.wait['previous_result_oid'] == old_result_oid
+            assert runtime.store.get_process(old_runner_pid) is None
+            if old_result_oid is not None:
+                assert runtime.store.get_object(old_result_oid) is None
+            assert result['superseded_object_tasks'] == [task.task_id]
+            validated_output = RestoreCheckpointOutput.model_validate(result)
+            assert validated_output.superseded_object_tasks == [task.task_id]
+        finally:
+            runtime.close()
+
+    def test_reopen_then_restore_supersedes_task_completed_after_checkpoint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        database = tmp_path / 'checkpoint-object-task-post-success.sqlite'
+        runtime = Runtime.open(database)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reopen post-checkpoint task')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            owner = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {'name': 'owner'},
+                metadata=ObjectMetadata(title='owner'),
+                immutable=False,
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'before terminal task', actor=pid)
+            task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.runner_pid is not None
+            assert completed.result_oid is not None
+            old_runner_pid = str(completed.runner_pid)
+            old_result_oid = str(completed.result_oid)
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            degraded = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert degraded.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert degraded.runner_pid == old_runner_pid
+            assert degraded.result_oid is None
+            assert degraded.wait['previous_result_oid'] == old_result_oid
+
+            original_reconcile = reopened.checkpoint._reconcile_restored_wait_states
+
+            def fail_restore_after_task_supersede(cur: object, pids: list[str]) -> None:
+                original_reconcile(cur, pids)
+                raise RuntimeError('injected failure after ObjectTask supersede')
+
+            monkeypatch.setattr(
+                reopened.checkpoint,
+                '_reconcile_restored_wait_states',
+                fail_restore_after_task_supersede,
+            )
+            with pytest.raises(RuntimeError, match='injected failure after ObjectTask supersede'):
+                reopened.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+            rolled_back_task = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert rolled_back_task.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert rolled_back_task.runner_pid == old_runner_pid
+            assert reopened.store.get_process(old_runner_pid) is not None
+            monkeypatch.setattr(
+                reopened.checkpoint,
+                '_reconcile_restored_wait_states',
+                original_reconcile,
+            )
+
+            result = reopened.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored_task = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert restored_task.status == ObjectTaskStatus.SUPERSEDED_BY_RESTORE
+            assert restored_task.runner_pid is None
+            assert restored_task.result_oid is None
+            assert restored_task.wait['previous_status'] == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN.value
+            assert restored_task.wait['previous_runner_pid'] == old_runner_pid
+            assert restored_task.wait['previous_result_oid'] == old_result_oid
+            assert reopened.store.get_process(old_runner_pid) is None
+            assert reopened.store.get_object(old_result_oid) is None
+            assert result['superseded_object_tasks'] == [task.task_id]
+        finally:
+            reopened.close()
+
+    def test_reopen_then_restore_repairs_task_result_captured_by_checkpoint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        database = tmp_path / 'checkpoint-object-task-pre-success.sqlite'
+        runtime = Runtime.open(database)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reopen pre-checkpoint task')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            owner = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {'name': 'owner'},
+                metadata=ObjectMetadata(title='owner'),
+                immutable=False,
+            )
+            task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.runner_pid is not None
+            assert completed.result_oid is not None
+            old_runner_pid = str(completed.runner_pid)
+            old_result_oid = str(completed.result_oid)
+            checkpoint_id = runtime.checkpoint.create(pid, 'after terminal task', actor=pid)
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            degraded = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert degraded.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert degraded.result_oid is None
+            assert reopened.store.get_object(old_result_oid) is None
+
+            original_reconcile = reopened.checkpoint._reconcile_restored_object_task_results
+
+            def fail_restore_after_result_repair(
+                cur: object,
+                snapshot: dict[str, object],
+                checkpoint: object,
+            ) -> list[str]:
+                original_reconcile(cur, snapshot, checkpoint)  # type: ignore[arg-type]
+                raise RuntimeError('injected failure after ObjectTask result repair')
+
+            monkeypatch.setattr(
+                reopened.checkpoint,
+                '_reconcile_restored_object_task_results',
+                fail_restore_after_result_repair,
+            )
+            with pytest.raises(RuntimeError, match='injected failure after ObjectTask result repair'):
+                reopened.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+            rolled_back_task = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert rolled_back_task.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert rolled_back_task.result_oid is None
+            assert reopened.store.get_object(old_result_oid) is None
+            monkeypatch.setattr(
+                reopened.checkpoint,
+                '_reconcile_restored_object_task_results',
+                original_reconcile,
+            )
+
+            result = reopened.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored_task = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert restored_task.status == ObjectTaskStatus.SUCCEEDED
+            assert restored_task.runner_pid == old_runner_pid
+            assert restored_task.result_oid == old_result_oid
+            assert restored_task.error is None
+            assert restored_task.wait['result_restored_by_checkpoint'] == checkpoint_id
+            assert reopened.store.get_process(old_runner_pid) is not None
+            assert reopened.store.get_object(old_result_oid) is not None
+            assert result['superseded_object_tasks'] == []
+        finally:
+            reopened.close()
+
+    def test_restore_keeps_task_completed_before_checkpoint_when_notification_finishes_afterward(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        notification_started = threading.Event()
+        release_notification = threading.Event()
+        original_notify = runtime.object_tasks._notify
+
+        def delayed_notify(task: object, *, phase: str) -> object:
+            if phase == 'completed':
+                notification_started.set()
+                if not release_notification.wait(timeout=5):
+                    raise TimeoutError('timed out waiting to release ObjectTask notification')
+            return original_notify(task, phase=phase)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runtime.object_tasks, '_notify', delayed_notify)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='terminal timestamp restore race')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            owner = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {'name': 'owner'},
+                metadata=ObjectMetadata(title='owner'),
+                immutable=False,
+            )
+            task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
+            assert notification_started.wait(timeout=3)
+
+            terminal_before_checkpoint = runtime.store.get_object_task(task.task_id)
+            assert terminal_before_checkpoint is not None
+            assert terminal_before_checkpoint.status == ObjectTaskStatus.SUCCEEDED
+            assert terminal_before_checkpoint.completed_at is not None
+            result_oid = terminal_before_checkpoint.result_oid
+            assert result_oid is not None
+            checkpoint_id = runtime.checkpoint.create(pid, 'after terminal transition', actor=pid)
+            checkpoint = next(
+                item
+                for item in runtime.store.list_checkpoints(pid=pid)
+                if item.checkpoint_id == checkpoint_id
+            )
+
+            release_notification.set()
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.updated_at >= checkpoint.created_at
+
+            result = runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            restored_task = runtime.object_tasks.get(task.task_id, actor_pid=pid)
+            assert restored_task.status == ObjectTaskStatus.SUCCEEDED
+            assert restored_task.result_oid == result_oid
+            assert runtime.store.get_object(result_oid) is not None
+            assert result['superseded_object_tasks'] == []
+        finally:
+            release_notification.set()
+            runtime.close()
+
+    def test_restore_requires_image_admin_to_replace_current_image(self) -> None:
         runtime = Runtime.open('local')
         image_id = 'checkpoint-restore-image:v0'
         try:
@@ -871,9 +1191,136 @@ class TestCheckpointRestore:
 
             assert runtime.get_image(image_id).system_prompt == 'current prompt'
             runtime.capability.grant(pid, runtime.image_registry.resource_for(image_id), [CapabilityRight.WRITE], issued_by='test')
+            with pytest.raises(CapabilityDenied, match=f'image:{image_id}'):
+                runtime.checkpoint.restore(pid, checkpoint_id)
+            assert runtime.get_image(image_id).system_prompt == 'current prompt'
+            runtime.capability.grant(pid, runtime.image_registry.resource_for(image_id), [CapabilityRight.ADMIN], issued_by='test')
             restored = runtime.checkpoint.restore(pid, checkpoint_id)
             assert restored['status'] == 'restored'
             assert runtime.get_image(image_id).system_prompt == 'snapshot prompt'
+        finally:
+            runtime.close()
+
+    def test_restore_holds_registry_lifecycle_lock_through_registry_reconciliation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        load_entered = threading.Event()
+        allow_load = threading.Event()
+        images_entered = threading.Event()
+        allow_images = threading.Event()
+        probe_acquired = threading.Event()
+        restore_result: list[dict[str, object]] = []
+        failures: list[BaseException] = []
+        restore_thread: threading.Thread | None = None
+        probe_thread: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='registry-ordered restore')
+            checkpoint_id = runtime.checkpoint.create(pid, 'registry lock boundary', actor=pid)
+            original_load = runtime.checkpoint._load_checkpoint
+            original_restore_images = runtime.checkpoint._restore_images
+
+            def gated_load(selected_checkpoint_id: str):
+                load_entered.set()
+                if not allow_load.wait(timeout=3):
+                    raise RuntimeError('timed out waiting to continue checkpoint load')
+                return original_load(selected_checkpoint_id)
+
+            def gated_restore_images(snapshot: dict[str, object], *, overwrite_existing: bool = True) -> None:
+                images_entered.set()
+                if not allow_images.wait(timeout=3):
+                    raise RuntimeError('timed out waiting to continue image reconciliation')
+                original_restore_images(snapshot, overwrite_existing=overwrite_existing)
+
+            monkeypatch.setattr(runtime.checkpoint, '_load_checkpoint', gated_load)
+            monkeypatch.setattr(runtime.checkpoint, '_restore_images', gated_restore_images)
+
+            def restore() -> None:
+                try:
+                    restore_result.append(
+                        runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            def probe_registry() -> None:
+                with runtime._registry_lifecycle_lock:
+                    probe_acquired.set()
+
+            restore_thread = threading.Thread(target=restore)
+            restore_thread.start()
+            assert load_entered.wait(timeout=3)
+
+            probe_thread = threading.Thread(target=probe_registry)
+            probe_thread.start()
+            assert not probe_acquired.wait(timeout=0.2)
+
+            allow_load.set()
+            assert images_entered.wait(timeout=3)
+            assert not probe_acquired.wait(timeout=0.2)
+
+            allow_images.set()
+            restore_thread.join(timeout=3)
+            probe_thread.join(timeout=3)
+
+            assert not restore_thread.is_alive()
+            assert not probe_thread.is_alive()
+            assert failures == []
+            assert restore_result[0]['status'] == 'restored'
+            assert probe_acquired.is_set()
+        finally:
+            allow_load.set()
+            allow_images.set()
+            if restore_thread is not None:
+                restore_thread.join(timeout=3)
+            if probe_thread is not None:
+                probe_thread.join(timeout=3)
+            runtime.close()
+
+    def test_restore_image_write_failure_keeps_cache_and_store_in_sync(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-restore-atomic-image:v0'
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id=image_id,
+                    name='checkpoint-restore-atomic-image',
+                    system_prompt='captured prompt',
+                ),
+                actor='test',
+            )
+            pid = runtime.process.spawn(image=image_id, goal='atomic image reconciliation')
+            checkpoint_id = runtime.checkpoint.create(pid, 'captured image', actor=pid)
+            runtime.register_image(
+                AgentImage(
+                    image_id=image_id,
+                    name='checkpoint-restore-atomic-image',
+                    system_prompt='current prompt',
+                ),
+                actor='test',
+                replace=True,
+            )
+            original_upsert = runtime.store.upsert_image
+
+            def fail_captured_image_write(image: AgentImage, *args: object, **kwargs: object) -> None:
+                if image.image_id == image_id and image.system_prompt == 'captured prompt':
+                    raise RuntimeError('injected restored image write failure')
+                original_upsert(image, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.store, 'upsert_image', fail_captured_image_write)
+
+            result = runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            persisted = runtime.store.get_image(image_id)
+            assert persisted is not None
+            assert result['status'] == 'restored_with_warnings'
+            assert [failure['phase'] for failure in result['post_commit_failures']] == ['image_reconciliation']
+            assert runtime.get_image(image_id).system_prompt == 'current prompt'
+            assert persisted[0].system_prompt == 'current prompt'
         finally:
             runtime.close()
 

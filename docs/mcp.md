@@ -78,9 +78,14 @@ refresh require server metadata read authority when called by a process.
 recorded as an MCP external read effect. Host/admin refreshes that bypass
 process capability checks still record the external read attempt under a host
 actor. For `stdio` servers, actor-mode registration, live tool refresh, and tool
-calls also require `process:spawn` `write` because the provider starts a local
-child process. `call_mcp_tool` requires the right declared by the tool spec on
-`mcp:<server_id>:<tool_id>`.
+calls also require `process:spawn` `write` plus `execute` on the exact
+`mcp_stdio:<sha256>` launch resource. Registration authorizes persisting that
+executable launch surface; live refresh and calls are the operations that
+actually start the local child process.
+`inspect_mcp_server` returns that value as `stdio_authority_resource`; its hash
+covers the canonical command, args, environment mapping, and cwd. HTTP servers
+return `null` for this field. `call_mcp_tool` requires the right declared by the
+tool spec on `mcp:<server_id>:<tool_id>`.
 
 For a live refresh/call, every finite decision needed by that one composite
 boundary is reserved together before provider work: the main tool or server
@@ -120,11 +125,21 @@ stdio transport uses argv, not a shell string. The command must be a single
 argv token; args are separate strings. Environment injection is explicit and
 restricted by `mcp.stdio_env_allowlist`. A stdio manifest is still a local
 process-launch surface, so process actors need explicit `process:spawn` `write`
-in addition to MCP server/tool authority.
+and exact `mcp_stdio:<sha256>` `execute` in addition to MCP server/tool
+authority. Each newline-delimited raw stdio response frame is capped at the
+manifest's `max_response_bytes` before JSON parsing or SDK materialization, so
+an oversized frame is rejected without first constructing an unbounded text or
+JSON value.
 
 MCP call arguments and audit context are bounded and sanitized. MCP result
 payloads are JSON-serializable; binary-like content is represented by bounded
-metadata rather than raw bytes.
+metadata rather than raw bytes. The serialized-result check applies to all
+transports. Streamable HTTP is also bounded before SDK materialization: ordinary
+JSON/other response bodies have one cumulative `max_response_bytes` limit, while
+long-lived `text/event-stream` responses reset the same limit at each raw SSE
+blank-line frame boundary. Requests force `Accept-Encoding: identity`, and a
+response carrying any other `Content-Encoding` is rejected before decoding to
+avoid an encoded response expanding past the raw limit.
 
 ## External Effects
 
@@ -161,6 +176,8 @@ uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
 uv run agent-libos --db .agent_libos.sqlite mcp list
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp_stdio:<sha256-from-inspect> --rights execute
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
 uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
@@ -170,12 +187,17 @@ Registry commands accept `--actor-pid <pid>` to enforce that process's
 `mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
 audited admin registry operations.
 
+For stdio actor mode, run `mcp inspect` after host/admin registration and use
+the returned `stdio_authority_resource` verbatim for the exact execute grant.
+
 Per-server register/replace/inspect/tools/unregister authority is checked before
 the store loads existing server metadata. `replace=true` always requires
 server `admin`; non-replace registration requires `write`. Registration,
 replacement, and unregistration commit the server row, stale tool-grant
-invalidation, event, and audit in one store transaction, so a sink failure
-cannot leave a half-published registry mutation.
+invalidation, finite composite authority reservation/commit, event, and audit
+in one store transaction. Local validation or an event/audit sink failure
+therefore restores all reservations and cannot leave a half-published registry
+mutation.
 
 The optional SDK-backed provider requires:
 

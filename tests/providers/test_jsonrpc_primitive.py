@@ -122,6 +122,66 @@ class TestJsonRpcPrimitive:
         finally:
             runtime.close()
 
+    def test_registry_mutations_settle_one_shot_authority_with_their_transaction(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='one-shot JSON-RPC registry')
+            endpoint_id = 'one-shot-registry'
+            original_record = runtime.audit.record
+            failing_actions = {'jsonrpc.endpoint.register'}
+
+            def fail_selected_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') in failing_actions:
+                    raise RuntimeError(f"injected {kwargs['action']} audit failure")
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_selected_audit)
+            register_cap = runtime.capability.grant_once(
+                actor,
+                runtime.jsonrpc.endpoint_resource(endpoint_id),
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+
+            with pytest.raises(RuntimeError, match='endpoint.register'):
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest(endpoint_id, 'https://safe.example.test/jsonrpc', with_header=False),
+                    actor=actor,
+                )
+
+            assert runtime.store.get_capability(register_cap.cap_id).uses_remaining == 1
+            assert runtime.store.get_jsonrpc_endpoint(endpoint_id) is None
+
+            failing_actions.clear()
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(endpoint_id, 'https://safe.example.test/jsonrpc', with_header=False),
+                actor=actor,
+            )
+            assert runtime.store.get_capability(register_cap.cap_id).uses_remaining == 0
+
+            unregister_cap = runtime.capability.grant_once(
+                actor,
+                runtime.jsonrpc.endpoint_resource(endpoint_id),
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            failing_actions.add('jsonrpc.endpoint.unregister')
+            with pytest.raises(RuntimeError, match='endpoint.unregister'):
+                runtime.jsonrpc.unregister_endpoint(endpoint_id, actor=actor)
+
+            assert runtime.store.get_capability(unregister_cap.cap_id).uses_remaining == 1
+            assert runtime.store.get_jsonrpc_endpoint(endpoint_id) is not None
+
+            failing_actions.clear()
+            assert runtime.jsonrpc.unregister_endpoint(endpoint_id, actor=actor)['deleted'] is True
+            assert runtime.store.get_capability(unregister_cap.cap_id).uses_remaining == 0
+            assert runtime.store.get_jsonrpc_endpoint(endpoint_id) is None
+        finally:
+            runtime.close()
+
     def test_manifest_validation_rejects_unsafe_endpoint_shapes(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -141,6 +201,26 @@ class TestJsonRpcPrimitive:
                 runtime.jsonrpc.list_endpoints(require_capability=False, limit=0)
             with pytest.raises(ValidationError, match='limit'):
                 runtime.jsonrpc.list_endpoints(require_capability=False, limit=runtime.config.jsonrpc.list_limit + 1)
+        finally:
+            runtime.close()
+
+    def test_list_endpoints_window_reports_rows_beyond_requested_limit(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            for index in range(3):
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest(f'window-{index}', 'https://api.example.test/jsonrpc'),
+                    actor='cli',
+                    require_capability=False,
+                )
+
+            bounded, has_more = runtime.jsonrpc.list_endpoints_window(require_capability=False, limit=2)
+            complete, complete_has_more = runtime.jsonrpc.list_endpoints_window(require_capability=False, limit=3)
+
+            assert len(bounded) == 2
+            assert has_more is True
+            assert len(complete) == 3
+            assert complete_has_more is False
         finally:
             runtime.close()
 

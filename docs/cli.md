@@ -125,6 +125,7 @@ module id is known.
 init          initialize a runtime database
 demo          run the deterministic local demo
 audit         print audit records
+explain       inspect evidence-backed protected-operation causal trees
 llm-calls     print persisted LLM call records
 processes     print process table
 resources     print process resource budget, usage, and remaining budget
@@ -555,8 +556,9 @@ the checkpoint are copied into the committed image's `required_modules`, so the
 image cannot boot unless those same module sources are loaded again.
 
 Passing `--actor-pid <pid>` makes the CLI enforce that process's checkpoint
-read and image write capabilities. Without it, the command runs as audited
-admin CLI.
+read capability plus exact write capability on a new target image id.
+`--replace` instead requires exact admin capability on the existing target
+image. Without `--actor-pid`, the command runs as audited admin CLI.
 
 ## Checkpoint Commands
 
@@ -570,9 +572,11 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint fork <checkpoint_id> --pa
 uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <event_id>
 ```
 
-`--actor-pid <pid>` makes the CLI enforce that process's checkpoint
-capabilities. Without it, the command runs as an audited admin actor named
-`cli`.
+`--actor-pid <pid>` makes the CLI enforce that process's operation-specific
+checkpoint capabilities. Restore requires checkpoint `admin`, exact image
+`admin` for every existing image changed by the snapshot, and exact image
+`write` for every missing image it reintroduces. Without `--actor-pid`, the
+command runs as an audited admin actor named `cli`.
 Restore prints `status: restored` after complete reconciliation, or
 `status: restored_with_warnings` with `main_state_committed: true` and
 `post_commit_failures` when image/JIT/finalizer reconciliation or the final
@@ -653,6 +657,8 @@ uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
 uv run agent-libos --db .agent_libos.sqlite mcp list
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
 uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
@@ -663,8 +669,12 @@ Registry commands accept `--actor-pid <pid>` to enforce that process's
 audited admin registry operations.
 
 `mcp call` always runs as the target process pid and requires that pid to hold
-the tool capability, such as `mcp:demo-mcp:forecast read`. The CLI cannot
-supply arbitrary transports, commands, URLs, headers, or raw MCP tool names.
+the tool capability, such as `mcp:demo-mcp:forecast read`. For a stdio server,
+the pid additionally needs `process:spawn write` and `execute` on the exact
+`stdio_authority_resource` returned by `mcp inspect`; do not reconstruct or
+wildcard that digest. Streamable HTTP servers do not need those two local-spawn
+grants. The CLI cannot supply arbitrary transports, commands, URLs, headers, or
+raw MCP tool names.
 
 ## Runtime Module Commands
 

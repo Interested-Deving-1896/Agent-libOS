@@ -372,6 +372,13 @@ PostgreSQL uses a database/schema-scoped session advisory lock. Another
 writable Runtime cannot open the same database until the active Runtime closes
 and releases the lease.
 
+Audit and event rows are append-only through the Runtime API and participate in
+the same store transactions as the state transitions they evidence. This is an
+application contract, not cryptographic tamper evidence: a database or storage
+administrator can edit the underlying store, and v1 does not externally anchor,
+sign, or hash-chain the log. Deployments that need evidence against storage
+administrators must add an external immutable audit sink or anchoring layer.
+
 The GUI adds a service-level drain around this contract. It stops background
 scheduling, rejects new runtime users, waits for tracked request handlers, and
 only then calls `Runtime.shutdown()`. A timeout returns failure and reopens the
@@ -398,8 +405,12 @@ bound an entire child tree. The complete child-to-ancestor usage update,
 reservation consumption, resource event, and audit row commit in one store
 transaction; a failure at any point leaves none of that charge published. If an
 overage kills a process subtree, terminal Human/Object-task/finalizer callbacks
-run only after the store transaction and lock are released. Fork and spawn may
-request a child budget, but it must fit within the parent's remaining budget.
+run only after the store transaction and lock are released. Per killed process,
+Object finalization, `PROCESS_EXITED` publication, and terminal notification are
+attempted independently across the whole subtree; aggregated cleanup failures
+are recorded as `resource.limit_finalize_failed` when the warning sink remains
+available. Fork and spawn may request a child budget, but it must fit within the
+parent's remaining budget.
 `exec_process` keeps the same pid and does not reset usage or increase budget.
 Checkpoint restore replays recorded process rows, including their resource
 state, for the restored processes.
@@ -421,14 +432,17 @@ the final rendered `llm_context:<pid>` prompt context is the charged unit;
 source object materialization for delta capture does not double-charge the same
 quantum, and over-budget rendered context fails closed before the model call.
 
-Shell and Deno subprocesses are run through provider-level monitors. The
-default local provider uses cross-platform process-tree sampling to enforce wall
-time, CPU time, and peak RSS budgets, then records metrics and audits limit
-exceedance. Deno additionally runs behind a host-lifetime supervisor (a POSIX
-death pipe or Windows `KILL_ON_JOB_CLOSE` Job Object), so a hard host exit does
-not orphan untrusted JIT code. In-process Python primitives are not hard CPU/RSS isolated; they
-remain bounded by call count, wall time, byte limits, and primitive-specific
-caps.
+Shell and Deno subprocesses are run through provider-level monitors. On
+supported POSIX hosts, the default local Shell provider samples the process tree
+to enforce wall time, CPU time, and peak RSS budgets, then records metrics and
+audits limit exceedance. The Windows Shell provider rejects execution when a
+`SubprocessLimits` profile is supplied instead of silently running an
+unaccounted budgeted command. Deno uses its separate POSIX/Windows supervisor
+and budget backend and fails closed when those controls cannot be installed; its
+host-lifetime supervisor is a POSIX death pipe or Windows `KILL_ON_JOB_CLOSE`
+Job Object, so a hard host exit does not orphan untrusted JIT code. In-process
+Python primitives are not hard CPU/RSS isolated; they remain bounded by call
+count, wall time, byte limits, and primitive-specific caps.
 
 ## Human Queue
 
@@ -570,7 +584,18 @@ action. Terminal child state, budget release, exit evidence, and parent wakeup
 commit atomically, so an evidence failure leaves the child retryable rather than
 terminal with a stranded parent.
 
-Signals can pause, resume, cancel, interrupt, or terminate direct children.
+Signals can pause, resume, cancel, or terminate direct children.
+`ProcessSignal.INTERRUPT` is retained as a compatibility enum value but is
+rejected as a signal because it has no durable state transition. Send a durable
+process message with kind `interrupt` through the message CLI/tool/API when a
+recipient needs a preemption notice.
+Pause/resume and terminal signal state, child-budget release, signal evidence,
+and a matching parent wake are one store transaction. Cancel/terminate then
+run Human/ObjectTask terminal notification and Object/host finalization as
+independent post-commit phases: failure in one does not skip the other or make
+the durable terminal transition retryable. Cleanup failures are appended as
+`process.signal_finalize_failed` audit warnings when that sink remains
+available.
 
 ## Process Exit
 
@@ -580,8 +605,12 @@ as the process result. Cleanup follows explicit Object Memory owner fields, not
 the object's creator provenance, and release revokes stale object capabilities.
 The terminal row, child-budget release, exit evidence, and parent wake commit
 together. Object/host finalizers and ObjectTask terminal notification run after
-that commit because their provider cleanup cannot be rolled back; a later
-cleanup error does not make the terminal transition uncommitted.
+that commit because their provider cleanup cannot be rolled back. Human-request
+cancellation and ObjectTask notification are attempted independently, as are
+notification and Object finalization; a later cleanup error does not make the
+terminal transition uncommitted. Best-effort cleanup failures are appended as
+`process.exit_finalize_failed` audit warnings with the failed phase when the
+audit sink remains available.
 
 When a Deno JIT tool calls `process.exit` or `process.exec`, the syscall records
 a deferred lifecycle change. The runtime applies that change only after the JIT

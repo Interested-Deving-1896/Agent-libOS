@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 from agent_libos.tools.builtin.capabilities import DelegateCapabilityTool
 from agent_libos.tools.builtin.checkpoint import RestoreCheckpointTool
+from agent_libos.tools.builtin.images import CommitCheckpointToImageTool, LoadImagePackageTool
 from agent_libos.tools.builtin.process import ProcessExitTool
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
 from agent_libos.tools.builtin.object_tasks import StartObjectTaskTool, WatchObjectTaskOwnerTool
@@ -78,11 +79,19 @@ class TestToolPolicyAndObservability:
         process_exit = ProcessExitTool().spec()
         delegate = DelegateCapabilityTool().spec()
         restore = RestoreCheckpointTool().spec()
+        load_image_package = LoadImagePackageTool().spec()
+        commit_checkpoint = CommitCheckpointToImageTool().spec()
 
         assert process_exit.policy["side_effects"] is True
         assert "process.lifecycle" in process_exit.side_effects
         assert "capability.write" in delegate.side_effects
         assert "checkpoint.restore" in restore.side_effects
+        assert {"image.write", "image.admin"} <= restore.policy["declared_permissions"]
+        assert {"image.write", "image.admin"} <= load_image_package.policy["declared_permissions"]
+        assert {"image.write", "image.admin"} <= commit_checkpoint.policy["declared_permissions"]
+        assert "exact image admin" in restore.description
+        assert "replace=true requires exact image admin" in load_image_package.description
+        assert "replace=true requires exact image admin" in commit_checkpoint.description
 
     def test_observability_sanitizes_sensitive_fields_without_hashing_secret_values(self) -> None:
         secret = "SECRET_TOKEN_SHOULD_NOT_APPEAR"

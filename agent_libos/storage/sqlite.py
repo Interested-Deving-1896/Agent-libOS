@@ -345,6 +345,12 @@ class SQLRuntimeStore:
                   causality_json TEXT NOT NULL
                 );
 
+                CREATE INDEX IF NOT EXISTS idx_events_created
+                  ON events(created_at, event_id);
+
+                CREATE INDEX IF NOT EXISTS idx_events_target_created
+                  ON events(target, created_at, event_id);
+
                 CREATE TABLE IF NOT EXISTS capabilities (
                   cap_id TEXT PRIMARY KEY,
                   subject TEXT NOT NULL,
@@ -555,6 +561,9 @@ class SQLRuntimeStore:
 
                 CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_status_kind
                   ON process_messages(recipient_pid, status, kind, channel, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_created
+                  ON process_messages(recipient_pid, created_at, message_id);
 
                 CREATE INDEX IF NOT EXISTS idx_process_messages_correlation
                   ON process_messages(recipient_pid, correlation_id, status, created_at);
@@ -1151,8 +1160,48 @@ class SQLRuntimeStore:
         rows = self._query("SELECT * FROM processes WHERE pid = ?", (pid,))
         return self._row_to_process(rows[0]) if rows else None
 
-    def list_processes(self) -> list[AgentProcess]:
-        return [self._row_to_process(row) for row in self._query("SELECT * FROM processes")]
+    def list_processes(self, limit: int | None = None, *, active_first: bool = False) -> list[AgentProcess]:
+        params: list[Any] = []
+        sql = "SELECT * FROM processes"
+        if active_first:
+            sql += " ORDER BY CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END, updated_at DESC, pid DESC"
+            params.extend(
+                [
+                    ProcessStatus.EXITED.value,
+                    ProcessStatus.FAILED.value,
+                    ProcessStatus.KILLED.value,
+                ]
+            )
+        else:
+            sql += " ORDER BY created_at, pid"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        return [self._row_to_process(row) for row in self._query(sql, params)]
+
+    def get_processes_with_ancestors(self, pids: Iterable[str]) -> list[AgentProcess]:
+        selected = sorted({str(pid) for pid in pids if str(pid)})
+        if not selected:
+            return []
+        placeholders = ", ".join("?" for _ in selected)
+        rows = self._query(
+            f"""
+            WITH RECURSIVE ancestors(pid) AS (
+                SELECT pid FROM processes WHERE pid IN ({placeholders})
+                UNION
+                SELECT processes.parent_pid
+                  FROM processes
+                  JOIN ancestors ON processes.pid = ancestors.pid
+                 WHERE processes.parent_pid IS NOT NULL
+            )
+            SELECT processes.*
+              FROM processes
+              JOIN ancestors ON ancestors.pid = processes.pid
+             ORDER BY processes.created_at, processes.pid
+            """,
+            selected,
+        )
+        return [self._row_to_process(row) for row in rows]
 
     def list_processes_by_status(self, status: ProcessStatus | str) -> list[AgentProcess]:
         selected = ProcessStatus(status).value
@@ -1273,13 +1322,22 @@ class SQLRuntimeStore:
         self,
         *,
         parent_pid: str | None = None,
+        parent_pids: Iterable[str] | None = None,
         child_pid: str | None = None,
     ) -> list[ResourceReservation]:
+        if parent_pid is not None and parent_pids is not None:
+            raise ValueError("resource reservation query cannot combine parent_pid and parent_pids")
         clauses: list[str] = []
         params: list[Any] = []
         if parent_pid is not None:
             clauses.append("parent_pid = ?")
             params.append(parent_pid)
+        if parent_pids is not None:
+            selected_parent_pids = sorted({str(pid) for pid in parent_pids if str(pid)})
+            if not selected_parent_pids:
+                return []
+            clauses.append(f"parent_pid IN ({', '.join('?' for _ in selected_parent_pids)})")
+            params.extend(selected_parent_pids)
         if child_pid is not None:
             clauses.append("child_pid = ?")
             params.append(child_pid)
@@ -1401,13 +1459,60 @@ class SQLRuntimeStore:
             ),
         )
 
-    def list_events(self, target: str | None = None) -> list[Event]:
-        if target is None:
-            rows = self._query("SELECT * FROM events ORDER BY created_at")
-        else:
+    def list_events(
+        self,
+        target: str | None = None,
+        limit: int | None = None,
+        before_event_id: str | None = None,
+        after_event_id: str | None = None,
+    ) -> list[Event]:
+        if before_event_id is not None and after_event_id is not None:
+            raise ValueError("event query cannot use before_event_id and after_event_id together")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if target is not None:
+            clauses.append("(target IS NULL OR target = ?)")
+            params.append(target)
+        if before_event_id is not None:
+            cursor_rows = self._query(
+                "SELECT created_at, event_id FROM events WHERE event_id = ?",
+                (before_event_id,),
+            )
+            if not cursor_rows:
+                return []
+            cursor = cursor_rows[0]
+            clauses.append("(created_at < ? OR (created_at = ? AND event_id < ?))")
+            params.extend((cursor["created_at"], cursor["created_at"], cursor["event_id"]))
+        if after_event_id is not None:
+            cursor_rows = self._query(
+                "SELECT created_at, event_id FROM events WHERE event_id = ?",
+                (after_event_id,),
+            )
+            if not cursor_rows:
+                return []
+            cursor = cursor_rows[0]
+            clauses.append("(created_at > ? OR (created_at = ? AND event_id > ?))")
+            params.extend((cursor["created_at"], cursor["created_at"], cursor["event_id"]))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        if limit is None:
             rows = self._query(
-                "SELECT * FROM events WHERE target IS NULL OR target = ? ORDER BY created_at",
-                (target,),
+                f"SELECT * FROM events{where} ORDER BY created_at, event_id",
+                params,
+            )
+        elif after_event_id is not None:
+            params.append(max(0, int(limit)))
+            rows = self._query(
+                f"SELECT * FROM events{where} ORDER BY created_at, event_id LIMIT ?",
+                params,
+            )
+        else:
+            selected_limit = max(0, int(limit))
+            params.append(selected_limit)
+            rows = self._query(
+                "SELECT * FROM ("
+                f"SELECT * FROM events{where} ORDER BY created_at DESC, event_id DESC LIMIT ?"
+                ") AS recent_events ORDER BY created_at, event_id",
+                params,
             )
         return [self._row_to_event(row) for row in rows]
 
@@ -2518,6 +2623,105 @@ class SQLRuntimeStore:
         rows = self._query(f"SELECT * FROM process_messages{where} ORDER BY created_at, message_id{limit_sql}", params)
         return [self._row_to_process_message(row) for row in rows]
 
+    def get_process_activity_summaries(
+        self,
+        pids: Iterable[str],
+        *,
+        recent_message_limit: int,
+        recent_llm_call_limit: int,
+    ) -> dict[str, dict[str, Any]]:
+        """Return bounded GUI-oriented process activity without per-pid queries."""
+
+        selected = sorted({str(pid) for pid in pids if str(pid)})
+        if not selected:
+            return {}
+        selected_message_limit = max(0, int(recent_message_limit))
+        selected_llm_limit = max(0, int(recent_llm_call_limit))
+        placeholders = ", ".join("?" for _ in selected)
+        stats_rows = self._query(
+            f"""
+            SELECT processes.pid,
+                   (
+                       SELECT COUNT(*)
+                         FROM process_messages
+                        WHERE process_messages.recipient_pid = processes.pid
+                          AND process_messages.status = ?
+                   ) AS unread_message_count,
+                   (
+                       SELECT COUNT(*)
+                         FROM process_messages
+                        WHERE process_messages.recipient_pid = processes.pid
+                          AND process_messages.status = ?
+                          AND process_messages.kind = ?
+                   ) AS interrupt_count
+              FROM processes
+             WHERE processes.pid IN ({placeholders})
+            """,
+            [
+                ProcessMessageStatus.UNREAD.value,
+                ProcessMessageStatus.UNREAD.value,
+                ProcessMessageKind.INTERRUPT.value,
+                *selected,
+            ],
+        )
+        summaries: dict[str, dict[str, Any]] = {
+            str(row["pid"]): {
+                "unread_message_count": int(row["unread_message_count"] or 0),
+                "interrupt_count": int(row["interrupt_count"] or 0),
+                "llm_call_count": 0,
+                "token_total": 0,
+                "messages": [],
+            }
+            for row in stats_rows
+        }
+        if selected_message_limit > 0:
+            recent_rows = self._query(
+                f"""
+                SELECT *
+                  FROM (
+                        SELECT process_messages.*,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY recipient_pid
+                                   ORDER BY created_at DESC, message_id DESC
+                               ) AS snapshot_row_number
+                          FROM process_messages
+                         WHERE recipient_pid IN ({placeholders})
+                       ) AS ranked_messages
+                 WHERE snapshot_row_number <= ?
+                 ORDER BY recipient_pid, created_at, message_id
+                """,
+                [*selected, selected_message_limit],
+            )
+            for row in recent_rows:
+                pid = str(row["recipient_pid"])
+                if pid in summaries:
+                    summaries[pid]["messages"].append(self._row_to_process_message(row))
+        if selected_llm_limit > 0:
+            llm_rows = self._query(
+                f"""
+                SELECT pid, usage_json
+                  FROM (
+                        SELECT pid, usage_json,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY pid
+                                   ORDER BY created_at DESC, call_id DESC
+                               ) AS snapshot_row_number
+                          FROM llm_calls
+                         WHERE pid IN ({placeholders})
+                       ) AS ranked_llm_calls
+                 WHERE snapshot_row_number <= ?
+                """,
+                [*selected, selected_llm_limit],
+            )
+            for row in llm_rows:
+                pid = str(row["pid"])
+                if pid not in summaries:
+                    continue
+                usage = loads(row["usage_json"], {})
+                summaries[pid]["llm_call_count"] += 1
+                summaries[pid]["token_total"] += int(usage.get("total_tokens", 0) or 0)
+        return summaries
+
     def insert_object_task(self, task: ObjectTask) -> None:
         self._execute(
             """
@@ -2592,6 +2796,8 @@ class SQLRuntimeStore:
                 ObjectTaskStatus.FAILED.value,
                 ObjectTaskStatus.CANCELLED.value,
                 ObjectTaskStatus.ABANDONED.value,
+                ObjectTaskStatus.SUPERSEDED_BY_RESTORE.value,
+                ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN.value,
             ]
             clauses.append(f"status NOT IN ({', '.join('?' for _ in terminal)})")
             params.extend(terminal)
@@ -2639,6 +2845,30 @@ class SQLRuntimeStore:
             (pid, rater, source),
         )
         return self._row_to_agent_rating(rows[0]) if rows else None
+
+    def get_agent_ratings_for_processes(
+        self,
+        pids: Iterable[str],
+        *,
+        rater: str,
+        source: str = "gui",
+    ) -> dict[str, AgentRating]:
+        selected = sorted({str(pid) for pid in pids if str(pid)})
+        if not selected:
+            return {}
+        placeholders = ", ".join("?" for _ in selected)
+        rows = self._query(
+            f"""
+            SELECT *
+              FROM agent_ratings
+             WHERE pid IN ({placeholders})
+               AND rater = ?
+               AND source = ?
+             ORDER BY pid
+            """,
+            [*selected, rater, source],
+        )
+        return {str(row["pid"]): self._row_to_agent_rating(row) for row in rows}
 
     def list_agent_ratings(self, pid: str | None = None, limit: int | None = None) -> list[AgentRating]:
         params: list[Any] = []
@@ -2718,8 +2948,13 @@ class SQLRuntimeStore:
             return None
         return self._dict_to_tool_spec(loads(rows[0]["spec_json"]))
 
-    def list_tools(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self._query("SELECT * FROM tools ORDER BY created_at")]
+    def list_tools(self, limit: int | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        sql = "SELECT * FROM tools ORDER BY created_at, tool_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        return [dict(row) for row in self._query(sql, params)]
 
     def insert_tool_candidate(self, candidate: ToolCandidate) -> None:
         self._execute(
@@ -3008,10 +3243,15 @@ class SQLRuntimeStore:
         row = rows[0]
         return self._dict_to_agent_image(loads(row["manifest_json"], {})), self._image_row_metadata(row)
 
-    def list_images(self) -> list[tuple[AgentImage, dict[str, Any]]]:
+    def list_images(self, limit: int | None = None) -> list[tuple[AgentImage, dict[str, Any]]]:
+        params: list[Any] = []
+        sql = "SELECT * FROM images ORDER BY image_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
         return [
             (self._dict_to_agent_image(loads(row["manifest_json"], {})), self._image_row_metadata(row))
-            for row in self._query("SELECT * FROM images ORDER BY image_id")
+            for row in self._query(sql, params)
         ]
 
     def delete_image(self, image_id: str, *, registered_by: str | None = None) -> None:
@@ -3539,6 +3779,12 @@ class SQLRuntimeStore:
             """
             CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_status_kind
               ON process_messages(recipient_pid, status, kind, channel, created_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_created
+              ON process_messages(recipient_pid, created_at, message_id)
             """
         )
         self.conn.execute(

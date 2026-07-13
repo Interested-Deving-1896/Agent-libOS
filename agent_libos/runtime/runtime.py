@@ -7,6 +7,7 @@ import inspect
 import os
 import re
 import shutil
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -120,6 +121,11 @@ class Runtime:
         self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
         self.store = store
         self.store.config = self.config
+        # Trusted module hooks can snapshot and roll back several runtime
+        # registries at once. All official registry lifecycle mutations share
+        # this re-entrant boundary so a failed rollback cannot clobber a
+        # concurrent successful publication.
+        self._registry_lifecycle_lock = threading.RLock()
         self.operations = OperationManager(store)
         self.store.operation_manager = self.operations
         self.operations.interrupt_stale_running()
@@ -818,12 +824,21 @@ class Runtime:
         self._shutdown_finalizers.append(finalizer)
 
     def _notify_process_terminal(self, pid: str) -> None:
-        self.human.cancel_pending_for_process(
-            pid,
-            actor="runtime.process_terminal",
-            reason="process reached a terminal state",
-        )
-        self.object_tasks.notify_process_terminal(pid)
+        errors: list[str] = []
+        try:
+            self.human.cancel_pending_for_process(
+                pid,
+                actor="runtime.process_terminal",
+                reason="process reached a terminal state",
+            )
+        except Exception as exc:
+            errors.append(f"human: {type(exc).__name__}: {exc}")
+        try:
+            self.object_tasks.notify_process_terminal(pid)
+        except Exception as exc:
+            errors.append(f"object_tasks: {type(exc).__name__}: {exc}")
+        if errors:
+            raise RuntimeError("terminal process notification failed: " + "; ".join(errors))
 
     async def _ashutdown_component(self, component: Any) -> bool:
         if component is None:
@@ -2360,7 +2375,7 @@ class Runtime:
         for loaded in updated.values():
             if not isinstance(loaded, dict):
                 continue
-            for key in ["tool_ids", "jit_tool_ids"]:
+            for key in ["tool_ids", "jit_tool_ids", "base_tool_ids", "base_model_tool_ids"]:
                 mapping = loaded.get(key)
                 if not isinstance(mapping, dict):
                     continue

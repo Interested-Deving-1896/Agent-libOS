@@ -450,8 +450,6 @@ class TestConfigDefaults:
             AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, object_task_wait_default_timeout_s=5, object_task_wait_max_timeout_s=4))
         with pytest.raises(PydanticValidationError, match='agent_rating_comment_max_chars'):
             AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, agent_rating_comment_max_chars=0))
-        with pytest.raises(PydanticValidationError, match='trusted_issuer_prefixes'):
-            AgentLibOSConfig(capability=replace(DEFAULT_CONFIG.capability, trusted_issuer_prefixes=('',)))
 
     def test_sqlite_store_llm_call_limits_use_runtime_config(self) -> None:
         config = AgentLibOSConfig(llm=LLMDefaults(call_record_list_limit=1, call_record_hard_limit=2))

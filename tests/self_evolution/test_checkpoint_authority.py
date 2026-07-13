@@ -9,12 +9,21 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight
-from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from tests.support.checkpoints import checkpoint_cli_json
 
 
 class TestCheckpointAuthority:
+
+    def test_checkpoint_list_rejects_unbounded_limits(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            for limit in (0, -1, True, runtime.config.checkpoint.list_limit + 1):
+                with pytest.raises(ValidationError, match='limit'):
+                    runtime.checkpoint.list(require_capability=False, limit=limit)  # type: ignore[arg-type]
+        finally:
+            runtime.close()
 
     def test_one_shot_checkpoint_read_is_consumed_by_inspect(self) -> None:
         runtime = Runtime.open('local')

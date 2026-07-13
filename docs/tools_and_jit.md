@@ -162,7 +162,10 @@ The manual lifecycle is:
    tool table.
 
 Each lifecycle transition commits its durable row, process-local alias, audit
-record, and in-memory executable handle atomically. Manual validation failures
+record, TypeScript source, and in-memory executable handle atomically. JIT
+registration and resolver calls share the runtime registry lifecycle lock; the
+source/handle is installed before the durable alias commits and removed again
+if commit or observability fails, so no resolver observes only one side. Manual validation failures
 remain inspectable as rejected candidates. Composite Skill activation or image
 package boot discards candidates that it created when the enclosing operation
 fails, including their Object Memory descriptors, so unpublished source and

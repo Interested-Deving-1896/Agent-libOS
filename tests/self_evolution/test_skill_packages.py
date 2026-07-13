@@ -11,7 +11,7 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, SkillDefaults
-from agent_libos.models import CapabilityRight
+from agent_libos.models import AgentImage, CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
@@ -19,6 +19,43 @@ from tests.support.skills import write_raw_skill, write_skill_package
 
 
 class TestSkillPackageLoading:
+    def test_skill_discovery_window_reports_registered_packages_beyond_requested_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime = Runtime.open('local')
+            try:
+                for index in range(3):
+                    skill_dir = write_skill_package(root, f'window-skill-{index}', allowed_tools=['echo'])
+                    package, _source = runtime.skills._load_package_from_host_path(skill_dir)
+                    runtime.skills.register_skill_package(package, actor='cli', require_capability=False)
+
+                bounded, has_more = runtime.skills.discover_skills_window(
+                    actor='test',
+                    require_capability=False,
+                    limit=2,
+                )
+                complete, complete_has_more = runtime.skills.discover_skills_window(
+                    actor='test',
+                    require_capability=False,
+                    limit=3,
+                )
+
+                assert len(bounded) == 2
+                assert has_more is True
+                assert len(complete) == 3
+                assert complete_has_more is False
+            finally:
+                runtime.close()
+
+    def test_skill_discovery_rejects_unbounded_limits(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            for limit in (0, -1, True, runtime.config.skills.discover_limit + 1):
+                with pytest.raises(ValidationError, match='limit'):
+                    runtime.skills.discover_skills(require_capability=False, limit=limit)  # type: ignore[arg-type]
+        finally:
+            runtime.close()
+
 
     def test_standard_package_validation_and_global_trust(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -460,6 +497,112 @@ class TestSkillPackageLoading:
                 assert 'echo' not in runtime.process.get(pid).tool_table
             finally:
                 runtime.close()
+
+    def test_unload_skill_restores_same_tool_from_process_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(Path(temp_dir), 'image-shared-skill', allowed_tools=['echo'])
+            runtime = Runtime.open('local')
+            try:
+                image_id = 'skill-shared-image:v0'
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name='skill-shared-image',
+                        default_tools=['echo'],
+                    ),
+                    actor='test',
+                )
+                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                pid = runtime.process.spawn(image=image_id, goal='preserve image tool after skill unload')
+                before_tool_table = dict(runtime.process.get(pid).tool_table)
+                before_model_tool_table = dict(runtime.process.get(pid).model_tool_table)
+
+                runtime.activate_skill(pid, 'image-shared-skill')
+                runtime.unload_skill(pid, 'image-shared-skill')
+
+                restored = runtime.process.get(pid)
+                assert restored.tool_table == before_tool_table
+                assert restored.model_tool_table == before_model_tool_table
+            finally:
+                runtime.close()
+
+    def test_unload_one_of_two_skills_keeps_shared_tool_until_last_source_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_dir = write_skill_package(root, 'shared-tool-first', allowed_tools=['echo'])
+            second_dir = write_skill_package(root, 'shared-tool-second', allowed_tools=['echo'])
+            runtime = Runtime.open('local')
+            try:
+                runtime.skills.register_skill_from_path(first_dir, actor='cli', require_capability=False)
+                runtime.skills.register_skill_from_path(second_dir, actor='cli', require_capability=False)
+                pid = runtime.process.spawn(image='base-agent:v0', goal='shared skill tool provenance')
+                runtime.activate_skill(pid, 'shared-tool-first')
+                runtime.activate_skill(pid, 'shared-tool-second')
+
+                runtime.unload_skill(pid, 'shared-tool-first')
+
+                after_first_unload = runtime.process.get(pid)
+                assert 'shared-tool-second' in after_first_unload.loaded_skills
+                assert 'echo' in after_first_unload.tool_table
+                assert 'echo' in after_first_unload.model_tool_table
+
+                runtime.unload_skill(pid, 'shared-tool-second')
+                after_last_unload = runtime.process.get(pid)
+                assert 'echo' not in after_last_unload.tool_table
+                assert 'echo' not in after_last_unload.model_tool_table
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("base_source", ["image", "manual"])
+    def test_unload_legacy_persisted_skill_row_backfills_base_tool_provenance(
+        self,
+        tmp_path: Path,
+        base_source: str,
+    ) -> None:
+        skill_dir = write_skill_package(tmp_path, f'legacy-{base_source}-skill', allowed_tools=['echo'])
+        database = tmp_path / f'legacy-{base_source}-skill.sqlite'
+        runtime = Runtime.open(database)
+        try:
+            image_id = 'base-agent:v0'
+            if base_source == 'image':
+                image_id = 'legacy-skill-base-image:v0'
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name='legacy-skill-base-image',
+                        default_tools=['echo'],
+                    ),
+                    actor='test',
+                )
+            runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+            pid = runtime.process.spawn(image=image_id, goal='legacy Skill provenance migration')
+            if base_source == 'manual':
+                runtime.tools.configure_process_tools(pid, ['echo'], assigned_by='test:manual-base')
+            runtime.activate_skill(pid, f'legacy-{base_source}-skill')
+            process = runtime.process.get(pid)
+            loaded = dict(process.loaded_skills[f'legacy-{base_source}-skill'])
+            loaded.pop('base_tool_ids', None)
+            loaded.pop('base_model_tool_ids', None)
+            process.loaded_skills[f'legacy-{base_source}-skill'] = loaded
+            runtime.store.update_process(process)
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            reopened.unload_skill(pid, f'legacy-{base_source}-skill')
+
+            process = reopened.process.get(pid)
+            assert 'echo' in process.tool_table
+            assert 'echo' in process.model_tool_table
+            audit = [
+                record
+                for record in reopened.audit.trace(target=f'process:{pid}')
+                if record.action == 'skill.unload'
+            ]
+            assert audit[-1].decision['legacy_provenance_backfilled'] is True
+        finally:
+            reopened.close()
 
     def _run(self, awaitable: Any) -> Any:
         return asyncio.run(awaitable)

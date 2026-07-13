@@ -54,11 +54,15 @@ uv run python scripts/test_matrix.py --lane runtime --workers auto
 
 `--workers` applies only to Python lanes. The `runtime` and `all` lanes default
 to bounded parallel execution with at most four workers and `--dist worksteal`,
-which keeps CI runtime below the lane budget while balancing long persistence and
+which keeps CI runtime bounded while balancing long persistence and
 runtime-reopen tests. Pass `--workers 1` for serial failure diagnosis, or set
 `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to override defaults in CI.
-Run the `gui` lane separately because it writes shared frontend build artifacts;
-install GUI dependencies first with `npm --prefix gui install`.
+`--max-lane-seconds` is a hard process-tree timeout for every selected lane,
+including `all`; timeout exits with status 124 after terminating the process
+group/tree. CI also keeps an outer job timeout. Run the `gui` lane separately;
+it cleans Electron output before production compilation, excludes generated
+`dist-electron` files from Vitest, and never emits test files into the production
+Electron tree. Install GUI dependencies first with `npm --prefix gui install`.
 
 Pytest cleans files created under the ignored `agent_outputs/` directory at the
 end of each test session, while preserving anything that existed before the
@@ -98,6 +102,10 @@ uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 ```
 
 `.benchmark_runs/` is ignored and should not be committed.
+
+The deterministic matrix is not the full platform release matrix. See
+[support_matrix.md](support_matrix.md) before claiming Windows/macOS, packaged
+Electron, real MCP, or real LLM coverage.
 
 The practical runner separates `native-live` from `modeled` scenarios. Native
 scenarios fail when a semantic effect lacks a real ToolBroker call, state
@@ -297,6 +305,9 @@ Module paths in `config.modules.manifest_paths` resolve from the project root.
 The loader starts from `DEFAULT_CONFIG`, recursively merges mapping fields,
 replaces scalar/list/tuple fields, and then constructs a fresh
 `AgentLibOSConfig`; it does not mutate `DEFAULT_CONFIG`.
+See [configuration.md](configuration.md) for the complete precedence rules,
+field-level group inventory, secret handling, and a command that prints the
+exact defaults for the current checkout.
 
 Library and test code should keep passing explicit config objects when a custom
 runtime is required:
@@ -320,10 +331,11 @@ Current default groups include:
 - ObjectTask notification, owner-watch, and shutdown limits,
 - shell policy allow/block lists,
 - JSON-RPC endpoint manifest, timeout, and request/response limits,
+- MCP server manifest, HTTP/stdio environment allowlists, timeout, and
+  request/response limits,
 - image registry limits,
 - image commit limits,
 - Object Memory and LLM context defaults,
-- capability trusted issuer settings,
 - GUI HTTP/event/request limits,
 - checkpoint snapshot limits,
 - Skill package source, trust, resource, and `SKILL.md` limits,
@@ -335,6 +347,12 @@ Resource budgets use integer fields for discrete calls, tokens, bytes, and peak
 memory, while `max_runtime_seconds`, `max_subprocess_wall_seconds`, and
 `max_subprocess_cpu_seconds` accept finite non-negative fractional seconds.
 Booleans are not accepted as numbers.
+
+Event limits are storage-selection bounds, not only renderer truncation. Each
+LLM context preparation reads at most `llm_context.recent_event_limit` rows
+newer than the process cursor. GUI snapshots read only the newest
+`gui.snapshot_event_limit` rows, and process-event pagination uses the same
+maximum with a `before` cursor. Durable event rows remain in the store.
 
 Shell policy labels are protocol semantics, not user-remappable aliases. A
 config may choose `shell.default_policy_level` and replace exact/prefix command

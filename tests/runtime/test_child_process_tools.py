@@ -5,7 +5,16 @@ import json
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, EventType, ObjectOwnerKind, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models import (
+    CapabilityRight,
+    EventType,
+    ObjectOwnerKind,
+    ObjectType,
+    ProcessMessageKind,
+    ProcessSignal,
+    ProcessStatus,
+    ResourceBudget,
+)
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from scripts.llm_context_probe import last_tool_result, static_prefix
@@ -20,6 +29,39 @@ def _grant_image_read(runtime: Runtime, pid: str, image_id: str) -> None:
 
 
 class TestChildProcessTool:
+
+    def test_interrupt_signal_is_rejected_and_durable_interrupt_message_remains_supported(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='interrupt child')
+            child = runtime.process.fork(parent, goal='receive an interrupt')
+            before_events = [
+                event.event_id
+                for event in runtime.events.list(target=child)
+                if event.type == EventType.PROCESS_SIGNAL
+            ]
+
+            with pytest.raises(ProcessError, match='durable interrupt process message'):
+                runtime.process.signal_child(parent, child, ProcessSignal.INTERRUPT, reason='read this first')
+
+            assert runtime.process.get(child).status == ProcessStatus.RUNNABLE
+            assert [
+                event.event_id
+                for event in runtime.events.list(target=child)
+                if event.type == EventType.PROCESS_SIGNAL
+            ] == before_events
+
+            message = runtime.messages.send_from_process(
+                parent,
+                child,
+                kind=ProcessMessageKind.INTERRUPT,
+                subject='Parent interrupt',
+                body='read this first',
+            )
+
+            assert runtime.messages.unread(child, kind=ProcessMessageKind.INTERRUPT) == [message]
+        finally:
+            runtime.close()
 
     def test_fork_wait_tool_blocks_parent_until_child_exits_and_exposes_result(self) -> None:
         runtime = Runtime.open('local')

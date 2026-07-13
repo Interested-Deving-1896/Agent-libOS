@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
 
@@ -19,5 +19,8 @@ export default defineConfig({
       strict: true,
       allow: [guiRoot]
     }
+  },
+  test: {
+    exclude: [...configDefaults.exclude, "dist/**", "dist-electron/**"]
   }
 });

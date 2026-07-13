@@ -1,13 +1,14 @@
 {
   "name": "agent-libos-gui",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc -p tsconfig.json && vite build && tsc -p tsconfig.electron.json",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.electron.json",
+    "clean:electron": "node scripts/clean-electron-build.mjs",
+    "build": "npm run clean:electron && tsc -p tsconfig.json && vite build && tsc -p tsconfig.electron.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.electron.json --noEmit",
     "test": "vitest run",
     "electron:dev": "npm run build && electron dist-electron/main.js"
   },

@@ -5,7 +5,14 @@ import tempfile
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.models import ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage
+from agent_libos.models import (
+    EventType,
+    ObjectMetadata,
+    ObjectType,
+    ProcessStatus,
+    ResourceBudget,
+    ResourceUsage,
+)
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 
 
@@ -94,6 +101,37 @@ class TestResourceManager:
         finally:
             runtime.close()
 
+    def test_killed_process_cleanup_attempts_event_and_notifier_after_finalizer_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='independent killed cleanup phases')
+            process = runtime.process.get(pid)
+            process.status = ProcessStatus.KILLED
+            runtime.store.update_process(process)
+            notified: list[str] = []
+            runtime.process.bind_object_task_terminal_notifier(notified.append)
+
+            def fail_finalize(process: object, preserve_oids: set[str]) -> None:
+                raise RuntimeError('injected killed finalizer failure')
+
+            monkeypatch.setattr(runtime.process, '_finalize_terminal_process', fail_finalize)
+
+            with pytest.raises(RuntimeError, match='process_finalize.*injected killed finalizer failure'):
+                runtime.process.finalize_killed_processes([pid], reason='test independent phases')
+
+            assert notified == [pid]
+            assert any(
+                event.type == EventType.PROCESS_EXITED
+                and event.source == pid
+                and event.payload.get('reason') == 'test independent phases'
+                for event in runtime.events.list()
+            )
+        finally:
+            runtime.close()
+
     def test_resource_models_reject_non_finite_numbers(self) -> None:
         with pytest.raises(ValueError, match="finite"):
             ResourceBudget(max_tool_calls=float("inf"))
@@ -161,6 +199,41 @@ class TestResourceManager:
             assert runtime.process.get(parent).resource_usage.tool_calls == 1
             assert runtime.process.get(child).resource_usage.llm_total_tokens == 7
             assert runtime.process.get(parent).resource_usage.llm_total_tokens == 7
+        finally:
+            runtime.close()
+
+    def test_remaining_budgets_batches_hierarchy_and_child_reservations(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="batched parent budget",
+                resource_budget=ResourceBudget(max_tool_calls=10, max_llm_total_tokens=100),
+            )
+            child = runtime.process.spawn_child(
+                parent,
+                goal="batched child budget",
+                resource_budget=ResourceBudget(max_tool_calls=4, max_llm_total_tokens=30),
+            )
+
+            before = runtime.resources.remaining_budgets([parent, child])
+
+            assert before[parent].max_tool_calls == 6
+            assert before[child].max_tool_calls == 4
+            assert before[parent].max_llm_total_tokens == 70
+            assert before[child].max_llm_total_tokens == 30
+
+            runtime.resources.charge(
+                child,
+                ResourceUsage(tool_calls=1, llm_total_tokens=7),
+                source="test",
+            )
+            after = runtime.resources.remaining_budgets([child, parent])
+
+            assert after[parent].max_tool_calls == 6
+            assert after[child].max_tool_calls == 3
+            assert after[parent].max_llm_total_tokens == 70
+            assert after[child].max_llm_total_tokens == 23
         finally:
             runtime.close()
 

@@ -184,7 +184,22 @@ superseded JIT ids after the replacement commits.
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill, along with the loaded Skill's process-local JIT tool and candidate
 rows and executable aliases. It does not revoke capabilities, delete audit
-history, or roll back external side effects.
+history, or roll back external side effects. Activation records the full-tool
+and model-projection bindings that existed independently before each Skill
+claimed an alias. Unload first selects a still-loaded Skill source, otherwise
+restores that recorded base binding, and removes the alias only when no source
+remains. Thus unloading a Skill cannot erase an image/manual base tool or a
+static tool shared by another loaded Skill. A JIT registration is retired only
+after no remaining loaded Skill references its tool id. Checkpoint/image remap
+paths preserve these provenance ids together with the ordinary loaded-Skill
+tool ids. On an older persisted row that lacks provenance fields, unload first
+reconstructs static base bindings from the image declaration and the latest
+explicit `process.tools.configure/project` audit evidence; it never infers an
+ephemeral JIT id as a base source.
+
+Skill discovery accepts only positive integer limits up to
+`SkillDefaults.discover_limit`; boolean, zero/negative, and above-config values
+are rejected before a result set can become unbounded.
 
 ## Process Semantics
 

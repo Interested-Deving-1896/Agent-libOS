@@ -106,7 +106,10 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("tools", help="Print registered tools")
     workflow_parser = sub.add_parser("workflow", help="Run a user-facing workflow tool directly")
     _add_workflow_parser_args(workflow_parser)
-    object_task_parser = sub.add_parser("object-task", help="Start, inspect, wait for, or cancel Object tasks")
+    object_task_parser = sub.add_parser(
+        "object-task",
+        help="Start, get, list, cancel, wait for, or watch Object tasks",
+    )
     _add_object_task_parser_args(object_task_parser)
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image")
@@ -160,17 +163,32 @@ def main(argv: list[str] | None = None) -> None:
     _add_message_parser_args(message_parser)
     interrupt_parser = sub.add_parser("interrupt", help="Send a human interrupt process message")
     _add_message_parser_args(interrupt_parser, include_kind=False)
-    checkpoint_parser = sub.add_parser("checkpoint", help="Create, inspect, diff, restore, fork, or replay checkpoints")
+    checkpoint_parser = sub.add_parser(
+        "checkpoint",
+        help="Create, list, inspect, diff, restore, fork, or replay checkpoints",
+    )
     _add_checkpoint_parser_args(checkpoint_parser)
-    skills_parser = sub.add_parser("skills", help="Discover, inspect, register, trust, activate, or unload skills")
+    skills_parser = sub.add_parser(
+        "skills",
+        help=(
+            "Discover, inspect, validate, register, trust, untrust, activate, "
+            "or unload skills"
+        ),
+    )
     _add_skills_parser_args(skills_parser)
     capabilities_parser = sub.add_parser("capabilities", help="List, inspect, grant, delegate, revoke, or explain capabilities")
     _add_capabilities_parser_args(capabilities_parser)
-    images_parser = sub.add_parser("images", help="List, inspect, or commit AgentImages")
+    images_parser = sub.add_parser("images", help="List, inspect, validate, register, or commit AgentImages")
     _add_images_parser_args(images_parser)
-    jsonrpc_parser = sub.add_parser("jsonrpc", help="Register, inspect, or call JSON-RPC over HTTP endpoints")
+    jsonrpc_parser = sub.add_parser(
+        "jsonrpc",
+        help="Register, list, inspect, call, or unregister JSON-RPC over HTTP endpoints",
+    )
     _add_jsonrpc_parser_args(jsonrpc_parser)
-    mcp_parser = sub.add_parser("mcp", help="Register, inspect, or call MCP servers")
+    mcp_parser = sub.add_parser(
+        "mcp",
+        help="Register, list, inspect, enumerate tools, call, or unregister MCP servers",
+    )
     _add_mcp_parser_args(mcp_parser)
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
     _add_modules_parser_args(modules_parser)

@@ -156,12 +156,28 @@ class McpPrimitive:
         source: str | None = None,
     ) -> dict[str, Any]:
         spec = self._coerce_server(server)
+        authority_decisions: list[Any] = []
         if require_capability:
             required_right = CapabilityRight.ADMIN if replace else CapabilityRight.WRITE
-            self.capabilities.require(actor, self.server_resource(spec.server_id), required_right)
-            self._require_stdio_process_spawn(actor, spec)
+            authority_decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.server_resource(spec.server_id),
+                    required_right,
+                    consume=False,
+                )
+            )
+            authority_decisions.extend(self._require_stdio_process_spawn(actor, spec, consume=False))
         now = utc_now()
+        # Registry mutation, composite one-shot authority settlement, and
+        # evidence are one store transaction. Local validation or a sink
+        # failure rolls every reservation back to its pre-call state.
         with self.store.transaction():
+            reservations = self._reserve_registry_authority(
+                authority_decisions,
+                actor=actor,
+                operation="register",
+            )
             existing = self.store.get_mcp_server(spec.server_id)
             if existing is not None and not replace:
                 raise ValidationError(f"MCP server already exists: {spec.server_id}")
@@ -186,6 +202,7 @@ class McpPrimitive:
                     "source": source,
                 },
             )
+            self._commit_registry_authority(reservations, actor=actor, operation="register")
         return self.inspect_server(spec.server_id, actor=actor, require_capability=False)
 
     def register_server_from_yaml_text(
@@ -220,14 +237,33 @@ class McpPrimitive:
         text: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        servers, _has_more = self.list_servers_window(
+            actor=actor,
+            require_capability=require_capability,
+            text=text,
+            limit=limit,
+        )
+        return servers
+
+    def list_servers_window(
+        self,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        text: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return one bounded page plus an exact signal that another row exists."""
+
         if require_capability and actor is not None:
             self.capabilities.require(actor, self.config.mcp.registry_resource, CapabilityRight.READ)
         selected_limit = self._bounded_list_limit(limit)
         servers: list[dict[str, Any]] = []
-        for spec, metadata in self.store.list_mcp_servers(text=text, limit=selected_limit):
+        rows = self.store.list_mcp_servers(text=text, limit=selected_limit + 1)
+        for spec, metadata in rows[:selected_limit]:
             self._validate_server(spec)
             servers.append(self._server_to_json(spec, metadata, include_sensitive_fields=False))
-        return servers
+        return servers, len(rows) > selected_limit
 
     def inspect_server(
         self,
@@ -395,9 +431,22 @@ class McpPrimitive:
         actor: str = "runtime",
         require_capability: bool = True,
     ) -> dict[str, Any]:
+        authority_decisions: list[Any] = []
         if require_capability:
-            self.capabilities.require(actor, self.server_resource(server_id), CapabilityRight.ADMIN)
+            authority_decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.server_resource(server_id),
+                    CapabilityRight.ADMIN,
+                    consume=False,
+                )
+            )
         with self.store.transaction():
+            reservations = self._reserve_registry_authority(
+                authority_decisions,
+                actor=actor,
+                operation="unregister",
+            )
             self._load_server(server_id)
             self._disable_replaced_server_tool_capabilities(server_id, actor=actor)
             self.store.delete_mcp_server(server_id)
@@ -413,6 +462,7 @@ class McpPrimitive:
                 target=self.server_resource(server_id),
                 decision={"server_id": server_id},
             )
+            self._commit_registry_authority(reservations, actor=actor, operation="unregister")
         return {"server_id": server_id, "deleted": True}
 
     def call_tool(self, pid: str, server_id: str, tool_id: str, arguments: Any = None) -> McpCallResult:
@@ -740,6 +790,41 @@ class McpPrimitive:
             )
         )
         return decisions
+
+    def _reserve_registry_authority(
+        self,
+        decisions: list[Any],
+        *,
+        actor: str,
+        operation: str,
+    ) -> dict[str, str]:
+        reservations: dict[str, str] = {}
+        for decision in decisions:
+            cap_id = str(decision.consume_capability_id) if decision.consume_capability_id is not None else None
+            if cap_id is None or cap_id in reservations:
+                continue
+            reservation_id = self.capabilities.reserve_decision_use(
+                decision,
+                used_by=actor,
+                reason=f"one-time MCP {operation} authority reserved",
+            )
+            if reservation_id is not None:
+                reservations[cap_id] = reservation_id
+        return reservations
+
+    def _commit_registry_authority(
+        self,
+        reservations: dict[str, str],
+        *,
+        actor: str,
+        operation: str,
+    ) -> None:
+        for cap_id, reservation_id in reservations.items():
+            self.capabilities.commit_reserved_use(
+                reservation_id,
+                committed_by=actor,
+                reason=f"one-time MCP {operation} authority committed: {cap_id}",
+            )
 
     def _call_result_from_provider(
         self,
@@ -1478,6 +1563,7 @@ class McpPrimitive:
             "schema_version": server.schema_version,
             "server_id": server.server_id,
             "transport": transport,
+            "stdio_authority_resource": self.stdio_resource_for_server(server),
             "tools": [self._tool_to_json(server.server_id, tool) for tool in server.tools],
             "timeout_s": server.timeout_s,
             "max_request_bytes": server.max_request_bytes,

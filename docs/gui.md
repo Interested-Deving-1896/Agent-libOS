@@ -54,7 +54,13 @@ surface over the same primitives, Capability checks, human approval flow,
 events, and audit records used by the CLI. Its Python entrypoint lives under
 `agent_libos.api.gui` with the CLI because both are host-facing API surfaces.
 Only a bearer token holder on the same machine can use it; CORS is limited to
-loopback HTTP(S) browser origins and does not accept `Origin: null`.
+loopback HTTP(S) browser origins plus the exact packaged-renderer origin
+`agent-libos://app`; it does not accept `Origin: null` or other custom-scheme
+hosts. Packaged Electron serves `gui/dist` through that privileged, secure
+custom protocol instead of `file://`, giving browser requests a stable origin
+without broadening the server allowlist. The protocol resolver rejects other
+authorities, credentials, ports, traversal, and paths outside the distribution
+root.
 
 For endpoints that accept an optional `actor`, omitting `actor` runs in GUI
 admin mode. Supplying `actor` opts into process-authority mode and requires
@@ -67,12 +73,18 @@ mutates Runtime state registers as an in-flight runtime user, including the
 non-serialized health and ObjectTask-wait paths. Shutdown rejects new users,
 drains the registered handlers and the runtime lock within one bounded deadline,
 then closes the owned Runtime only after its own scheduler/ObjectTask drain
-succeeds. A timeout or failed runtime drain leaves the store and broadcaster
-open, clears the transient `closing` gate, and returns failure so shutdown can
-be retried after work settles. It never closes a database handle underneath a
-live worker. Host shutdown does not mark AgentProcess records as exited;
-process lifecycle changes still go through the runtime `process.exit`
-primitive/tool path.
+succeeds. `POST /api/shutdown` returns `200 {ok: true, status: "stopped"}` only
+after that teardown completes. A drain that has not begun closing the Runtime
+returns retryable `503`, leaves the store/broadcaster open, and reopens the
+transient gate; once Runtime teardown has begun the API stays closed and a
+later shutdown call can continue the phased teardown. The top-level server
+retries teardown and fails visibly instead of exiting successfully while the
+Runtime is still open. Electron treats only the explicit `stopped` response as
+graceful acknowledgement and otherwise uses its bounded process-tree kill
+fallback. The sequence never closes a database handle underneath a live
+worker. Host shutdown does not mark AgentProcess records as exited; process
+lifecycle changes still go through the runtime `process.exit` primitive/tool
+path.
 
 ## Development
 
@@ -120,12 +132,30 @@ npm --prefix gui run build
 uv run python scripts/test_matrix.py --lane gui
 ```
 
+`npm --prefix gui run build` removes `dist-electron` before compiling. Vitest
+excludes both renderer and Electron build output, and the production Electron
+TypeScript configuration excludes `*.test.ts`; generated JavaScript therefore
+cannot become a second copy of the source test suite. A useful clean-build
+check is:
+
+```bash
+npm --prefix gui run test
+npm --prefix gui run typecheck
+npm --prefix gui run build
+find gui/dist-electron -name '*.test.js'
+npm --prefix gui run test
+```
+
+The `find` command should print nothing, and the two Vitest runs should discover
+the same source tests.
+
 The Electron smoke path can be run headlessly with
 `AGENT_LIBOS_GUI_SMOKE=1`. By default it verifies the Electron main process,
 Python GUI server startup, authenticated `/api/health`, and graceful shutdown
-without creating a BrowserWindow. Set `AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a
-machine has a working desktop/GPU stack and you specifically want to exercise
-the preload bridge.
+against an in-memory `local` store without creating a BrowserWindow. Set
+`AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a machine has a working desktop/GPU stack
+and you specifically want to exercise the packaged custom-protocol renderer,
+its API origin, and the preload bridge.
 
 The Vite development server is bound to `127.0.0.1` and restricts file serving
 to the `gui/` directory. Production dependency audit should remain clean; any
@@ -229,6 +259,26 @@ Snapshot payloads keep field shapes stable when bounding large values: long
 strings are returned as truncated strings, and truncation metadata is reported
 under the snapshot-level `_truncated` map.
 
+Top-level snapshot collections are bounded before response assembly. Processes,
+pending-first Human requests, tools, images, Skills, JSON-RPC endpoints, MCP
+servers, Runtime Modules, and LLM profiles fetch at most
+`snapshot_collection_max_items + 1`, subject to any stricter subsystem list
+maximum. Skills, JSON-RPC, and MCP list APIs perform one additional internal
+lookahead even when that subsystem maximum is stricter than the GUI maximum.
+Either kind of lookahead becomes a `source_limited` lower-bound entry in
+`_truncated` and is not serialized.
+The process window orders non-terminal processes before the most recently
+updated terminal history, so a full snapshot does not hide current work behind
+old completed rows. If the bounded window contains a child but not its parent,
+the process tree renders that child as a temporary root rather than making it
+unreachable.
+Process message/count, bounded LLM-call-window count/token usage, rating,
+ancestor reservation, and hierarchical remaining-budget data are loaded through
+batch queries. Message and LLM windows select the newest configured rows per
+process; messages are returned chronologically. Snapshot construction therefore
+does not issue one message, LLM-call, rating, or resource query for every listed
+process.
+
 ## High-Risk Operations
 
 The GUI requires explicit confirmation for high-risk operations before sending
@@ -263,9 +313,29 @@ only; it does not grant the target image's declared capabilities. Package
 workspace grants apply only to the private materialized copy declared by the
 package manifest.
 
-Skill registration is the exception to the payload-only pattern today: the GUI
-server still calls the path-based Skill registration API. Global Skill trust is
-not exposed as a GUI endpoint; manage trust through CLI/admin configuration.
+GUI Skill registration requires both an `actor` pid and a workspace-relative
+`path`. The server resolves that path through the actor-scoped workspace
+filesystem and applies the normal filesystem, Human approval, and `skill:<id>`
+authority checks. There is no GUI host/admin path-registration fallback;
+registering a host path remains a CLI/admin workflow. Global Skill trust is not
+exposed as a GUI endpoint and must likewise be managed through CLI/admin
+configuration.
+
+## API Contract Boundary
+
+The Electron renderer and Python server are shipped and tested as one build.
+The local `/api` surface is not a complete, independently versioned public REST
+API, and compatibility for arbitrary external clients is not promised. The
+machine-readable [GUI API contract subset v1](gui_api_schema.json) deliberately
+covers the snapshot response, JSON error envelope, and payloads for every
+operation that the server gates with explicit confirmation. It is JSON Schema,
+not a complete OpenAPI document.
+
+`tests/unit/test_gui_api_schema.py` parses that schema, validates representative
+payloads, and compares its high-risk operation map with the server's
+`_require_confirmed` calls. Renderer types and routes outside this subset remain
+same-build implementation details and must be changed together with their
+server handlers and GUI tests.
 
 ## API Summary
 
@@ -275,12 +345,14 @@ Important endpoints:
 - `POST /api/shutdown`
 - `GET /api/snapshot`
 - `GET /api/events/stream?cursor=<id>`
-- `GET /api/tools`
+- `GET /api/tools?limit=<n>` (default and maximum
+  `gui.snapshot_collection_max_items`)
 - `GET /api/llm-profiles`,
   `POST /api/llm-profiles`,
   `PUT /api/llm-profiles/{profile_id}`, and
   `DELETE /api/llm-profiles/{profile_id}` for user-level GUI model profiles.
-- `GET /api/processes`, `POST /api/processes`
+- `GET /api/processes?limit=<n>` (default and maximum
+  `gui.snapshot_collection_max_items`), `POST /api/processes`
 - `GET /api/operations?pid=...`, `GET /api/operations/{operation_id}`, and
   `GET /api/operations/resolve?kind=...&id=...` for host-only deterministic
   operation explanations. List/detail responses support cursor pagination;
@@ -289,7 +361,13 @@ Important endpoints:
 - `POST /api/scheduler/auto`, `POST /api/scheduler/pause`
 - `GET /api/processes/{pid}`
 - `POST /api/processes/{pid}/run|step|pause|resume|signal|message|interrupt|cd|exec|exit`
-- `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`
+- `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`.
+  The LLM-call route's `limit` defaults to and cannot exceed
+  `gui.snapshot_process_llm_call_limit`.
+  The events route accepts `limit=<n>` (default and maximum
+  `gui.snapshot_event_limit`) and `before=<event_id>` for older pages. It selects
+  the bounded newest/cursor window in storage and returns that page in
+  chronological order; it is not an unbounded full-log endpoint.
 - `GET /api/processes/{pid}/rating` and
   `POST /api/processes/{pid}/rating` for the selected process's 1-5 human
   score and optional comment.

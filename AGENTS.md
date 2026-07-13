@@ -10,8 +10,10 @@ test matrix lanes: `unit`, `runtime`, `security`, `self-evolution`,
 `providers`, `benchmark`, and `gui`; some lane names differ from directory
 names, for example `self-evolution` maps to `tests/self_evolution` and
 `benchmark` maps to `tests/benchmarks`. Shared helpers live in
-`tests/support/`. Benchmark code and
-fixtures are under `benchmarks/runtime_safety/`, with runners in `experiments/`.
+`tests/support/`. Runtime-safety task fixtures, runner implementations, oracle,
+and metrics live under `benchmarks/runtime_safety/`; practical evidence-level
+scenarios live under `benchmarks/practical_agent_workflows/`. User-facing
+benchmark entrypoints are in `experiments/`.
 Documentation is in `docs/`; the Electron/React frontend is in `gui/`; example
 skills live in `skills/`.
 
@@ -30,6 +32,7 @@ skills live in `skills/`.
   coverage manifest.
 - `uv run agent-libos --help`: inspect CLI commands.
 - `uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/smoke`: run a deterministic benchmark smoke.
+- `uv run python experiments/run_practical_evaluation.py --output .benchmark_runs/practical/report.json`: run practical workflows while preserving native/mocked/modeled evidence labels.
 - `uv run python scripts/test_matrix.py --lane gui`: run GUI Vitest,
   typecheck, and build. Run `npm --prefix gui install` first in a fresh
   checkout.
@@ -65,6 +68,8 @@ include GUI screenshots for visible frontend changes.
 
 Never commit local/real `.env`, credentials, benchmark outputs, generated
 `agent_outputs/`, or GUI build artifacts.
-Remote access must go through registered JSON-RPC endpoints, not model-supplied
-URLs. Checkpoint restore and image commit do not roll back or package external
-provider state; provider-classified effects remain append-only audit records.
+Remote access must go through registered JSON-RPC endpoints or MCP servers, not
+model-supplied URLs or commands. Checkpoint restore and image commit do not roll
+back or package external provider state; provider-classified effects remain
+append-only RuntimeStore evidence, not tamper-proof evidence against a direct
+database administrator.

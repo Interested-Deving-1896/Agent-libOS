@@ -14,8 +14,15 @@ from typing import Any
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, McpHttpTransportSpec, McpServerSpec
+from agent_libos.models import (
+    CapabilityRight,
+    McpCallStatus,
+    McpHttpTransportSpec,
+    McpServerSpec,
+    McpToolSpec,
+)
 from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
+from agent_libos.substrate.local import _McpHttpResponseLimiter, _mcp_stdio_read_size
 
 pytestmark = pytest.mark.mcp
 
@@ -39,6 +46,21 @@ def _grant_stdio_spawn(
 
 
 class TestMcpSdkIntegration:
+    def test_stdio_receive_size_never_reads_past_frame_limit_sentinel(self) -> None:
+        assert _mcp_stdio_read_size(0, 2_048) == 2_049
+        assert _mcp_stdio_read_size(2_048, 2_048) == 1
+        assert _mcp_stdio_read_size(0, 1_000_000) == 64 * 1_024
+
+    def test_http_sse_limiter_resets_each_crlf_frame_and_bounds_cross_chunk_event(self) -> None:
+        limiter = _McpHttpResponseLimiter(max_response_bytes=18, is_sse=True)
+
+        assert limiter.feed(b'data: first\r') is None
+        assert limiter.feed(b'\n\r\n') is None
+        assert limiter.feed(b'data: second\r\n\r') is None
+        assert limiter.feed(b'\n') is None
+        assert limiter.feed(b'data: oversized-') is None
+        assert limiter.feed(b'event') == 'MCP HTTP SSE frame exceeded max_response_bytes=18'
+
     def test_stdio_fastmcp_tool_call(self, tmp_path: Path) -> None:
         server_path = _write_fastmcp_stdio_server(tmp_path)
         runtime = Runtime.open("local")
@@ -96,6 +118,27 @@ class TestMcpSdkIntegration:
         finally:
             runtime.close()
 
+    def test_stdio_raw_response_frame_exceeding_limit_is_rejected(self, tmp_path: Path) -> None:
+        server_path = _write_fastmcp_large_stdio_server(tmp_path)
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='mcp stdio raw frame limit')
+            args = [str(server_path)]
+            spec = _server_spec('stdio-frame-limit', sys.executable, args)
+            spec['tools'] = [_tool_spec(tool_id='large', mcp_name='demo.large')]
+            spec['max_response_bytes'] = 2_048
+            runtime.mcp.register_server(spec, actor='cli', require_capability=False)
+            runtime.capability.grant(pid, 'mcp:stdio-frame-limit:large', [CapabilityRight.READ], issued_by='test')
+            _grant_stdio_spawn(runtime, pid, sys.executable, args)
+
+            result = runtime.mcp.call_tool(pid, 'stdio-frame-limit', 'large', {})
+
+            assert not result.ok
+            assert result.status == McpCallStatus.TRANSPORT_ERROR
+            assert 'MCP stdio frame exceeded max_response_bytes=2048' in result.error['message']
+        finally:
+            runtime.close()
+
     def test_streamable_http_fastmcp_tool_call(self, tmp_path: Path) -> None:
         port = _free_local_port()
         server_path = _write_fastmcp_http_server(tmp_path)
@@ -127,6 +170,157 @@ class TestMcpSdkIntegration:
                 proc.kill()
                 proc.wait(timeout=5)
 
+    def test_streamable_http_raw_response_exceeding_limit_is_rejected(self, tmp_path: Path) -> None:
+        port = _free_local_port()
+        server_path = _write_fastmcp_http_server(tmp_path)
+        proc = subprocess.Popen(
+            [sys.executable, str(server_path), str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_port(port)
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='mcp http raw response limit')
+                spec = _http_server_spec('http-limit-it', f'http://127.0.0.1:{port}/mcp')
+                spec['tools'] = [_tool_spec(tool_id='large', mcp_name='demo.large')]
+                spec['max_response_bytes'] = 2_048
+                runtime.mcp.register_server(spec, actor='cli', require_capability=False)
+                runtime.capability.grant(pid, 'mcp:http-limit-it:large', [CapabilityRight.READ], issued_by='test')
+
+                result = runtime.mcp.call_tool(pid, 'http-limit-it', 'large', {})
+
+                assert not result.ok
+                assert result.status == McpCallStatus.TRANSPORT_ERROR
+                assert 'MCP HTTP' in result.error['message']
+                assert 'max_response_bytes=2048' in result.error['message']
+            finally:
+                runtime.close()
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_streamable_http_provider_honors_call_limit_below_manifest_limit(self, tmp_path: Path) -> None:
+        port = _free_local_port()
+        server_path = _write_fastmcp_http_server(tmp_path)
+        proc = subprocess.Popen(
+            [sys.executable, str(server_path), str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_port(port)
+            tool = McpToolSpec(
+                tool_id='large',
+                mcp_name='demo.large',
+                right='read',
+                rollback_class='no_rollback_required',
+                state_mutation=False,
+                information_flow=True,
+            )
+            spec = McpServerSpec(
+                schema_version=1,
+                server_id='http-provider-limit-it',
+                transport='streamable_http',
+                http=McpHttpTransportSpec(url=f'http://127.0.0.1:{port}/mcp'),
+                tools=[tool],
+                timeout_s=10,
+                max_request_bytes=65536,
+                max_response_bytes=1048576,
+            )
+
+            with pytest.raises(RuntimeError, match='max_response_bytes=2048'):
+                SdkMcpProvider().call_tool(
+                    spec,
+                    tool,
+                    {},
+                    timeout_s=10,
+                    max_response_bytes=2_048,
+                )
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_streamable_http_rejects_content_encoding_before_decode(self) -> None:
+        port = _free_local_port()
+        handler = _encoded_response_handler()
+        server = ThreadingHTTPServer(('127.0.0.1', port), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        provider = SdkMcpProvider()
+        try:
+            spec = McpServerSpec(
+                schema_version=1,
+                server_id='encoded-it',
+                transport='streamable_http',
+                http=McpHttpTransportSpec(url=f'http://127.0.0.1:{port}/mcp'),
+                tools=[],
+                timeout_s=5,
+                max_request_bytes=65536,
+                max_response_bytes=2048,
+            )
+
+            async def request_encoded() -> None:
+                async with provider._http_client(
+                    spec,
+                    timeout_s=5,
+                    max_response_bytes=spec.max_response_bytes,
+                ) as client:
+                    await client.get(f'http://127.0.0.1:{port}/encoded')
+
+            with pytest.raises(RuntimeError, match='unsupported Content-Encoding=gzip'):
+                asyncio.run(request_encoded())
+            assert handler.accept_encodings == ['identity']
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_streamable_http_json_body_is_bounded_before_materialization(self) -> None:
+        port = _free_local_port()
+        handler = _large_json_response_handler()
+        server = ThreadingHTTPServer(('127.0.0.1', port), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        provider = SdkMcpProvider()
+        try:
+            spec = McpServerSpec(
+                schema_version=1,
+                server_id='large-json-it',
+                transport='streamable_http',
+                http=McpHttpTransportSpec(url=f'http://127.0.0.1:{port}/mcp'),
+                tools=[],
+                timeout_s=5,
+                max_request_bytes=65536,
+                max_response_bytes=2048,
+            )
+
+            async def request_large_json() -> None:
+                async with provider._http_client(
+                    spec,
+                    timeout_s=5,
+                    max_response_bytes=spec.max_response_bytes,
+                ) as client:
+                    await client.get(f'http://127.0.0.1:{port}/large-json')
+
+            with pytest.raises(RuntimeError, match='MCP HTTP response exceeded max_response_bytes=2048'):
+                asyncio.run(request_large_json())
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def test_streamable_http_client_does_not_follow_redirects(self) -> None:
         port = _free_local_port()
         handler = _redirect_handler(f"http://127.0.0.1:{port}/private")
@@ -147,7 +341,11 @@ class TestMcpSdkIntegration:
             )
 
             async def request_redirect() -> int:
-                async with provider._http_client(spec, timeout_s=5) as client:
+                async with provider._http_client(
+                    spec,
+                    timeout_s=5,
+                    max_response_bytes=spec.max_response_bytes,
+                ) as client:
                     response = await client.get(f"http://127.0.0.1:{port}/redirect")
                     return int(response.status_code)
 
@@ -209,6 +407,26 @@ if __name__ == "__main__":
     return path
 
 
+def _write_fastmcp_large_stdio_server(root: Path) -> Path:
+    path = root / 'large_stdio_server.py'
+    path.write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("stdio-frame-limit")
+
+@mcp.tool(name="demo.large")
+def large() -> dict[str, str]:
+    return {"blob": "x" * 16384}
+
+if __name__ == "__main__":
+    mcp.run("stdio")
+""".strip(),
+        encoding='utf-8',
+    )
+    return path
+
+
 def _write_fastmcp_http_server(root: Path) -> Path:
     path = root / "http_server.py"
     path.write_text(
@@ -224,6 +442,10 @@ mcp = FastMCP("http-it", host="127.0.0.1", port=int(sys.argv[1]), streamable_htt
 @mcp.tool(name="demo.echo")
 def echo(text: str) -> dict[str, str]:
     return {"echo": text}
+
+@mcp.tool(name="demo.large")
+def large() -> dict[str, str]:
+    return {"blob": "x" * 16384}
 
 if __name__ == "__main__":
     mcp.run("streamable-http")
@@ -306,3 +528,35 @@ def _redirect_handler(location: str) -> type[BaseHTTPRequestHandler]:
             return
 
     return RedirectHandler
+
+
+def _encoded_response_handler() -> type[BaseHTTPRequestHandler]:
+    class EncodedResponseHandler(BaseHTTPRequestHandler):
+        accept_encodings: list[str] = []
+
+        def do_GET(self) -> None:
+            type(self).accept_encodings.append(self.headers.get('Accept-Encoding', ''))
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Encoding', 'gzip')
+            self.end_headers()
+            self.wfile.write(b'not-actually-compressed')
+
+        def log_message(self, _format: str, *_args: Any) -> None:
+            return
+
+    return EncodedResponseHandler
+
+
+def _large_json_response_handler() -> type[BaseHTTPRequestHandler]:
+    class LargeJsonResponseHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"blob":"' + (b'x' * 16384) + b'"}')
+
+        def log_message(self, _format: str, *_args: Any) -> None:
+            return
+
+    return LargeJsonResponseHandler

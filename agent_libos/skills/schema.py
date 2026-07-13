@@ -77,3 +77,8 @@ class LoadedSkill:
     jit_tool_ids: dict[str, str]
     instructions_hash: str
     package_snapshot: dict[str, Any] = field(default_factory=dict)
+    # Bindings that existed independently of this Skill before activation.
+    # They let unload restore image/manual visibility without treating a
+    # shared alias as owned by whichever Skill happens to be removed first.
+    base_tool_ids: dict[str, str] = field(default_factory=dict)
+    base_model_tool_ids: dict[str, str] = field(default_factory=dict)

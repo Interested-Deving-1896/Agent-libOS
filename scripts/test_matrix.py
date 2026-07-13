@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,8 @@ PYTHON_LANES = tuple(LANE_PATHS)
 DEFAULT_MAX_LANE_SECONDS = 300.0
 DEFAULT_WORKERS = "1"
 DEFAULT_PARALLEL_WORKER_CAP = 4
+PROCESS_TIMEOUT_EXIT_CODE = 124
+PROCESS_TERMINATION_GRACE_SECONDS = 2.0
 PARALLEL_BY_DEFAULT_LANES = {"runtime", "all"}
 DEFAULT_SERIAL_DIST = "loadfile"
 DEFAULT_PARALLEL_DIST = "worksteal"
@@ -36,7 +39,7 @@ class Command:
     name: str
     argv: list[str]
     env: dict[str, str] | None = None
-    enforce_duration: bool = True
+    enforce_timeout: bool = True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,9 +60,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-mcp", action="store_true", help="include tests marked mcp")
     parser.add_argument(
         "--max-lane-seconds",
-        type=float,
+        type=_positive_seconds,
         default=DEFAULT_MAX_LANE_SECONDS,
-        help="duration budget for individual lanes; ignored by --lane all",
+        help="hard process-tree timeout for the selected lane command",
     )
     parser.add_argument(
         "-n",
@@ -103,7 +106,6 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
                 f"pytest all deterministic lanes{_worker_suffix(args)}",
                 _pytest_args(("tests",), args),
                 env=_pytest_env(args),
-                enforce_duration=False,
             )
         ]
     return [
@@ -209,18 +211,111 @@ def _run(command: Command, *, max_seconds: float) -> int:
     if command.env:
         env.update(command.env)
     started = time.perf_counter()
-    result = subprocess.run(command.argv, cwd=ROOT, env=env)
-    elapsed = time.perf_counter() - started
-    print(f"==> {command.name} finished in {elapsed:.2f}s", flush=True)
-    if result.returncode != 0:
-        return result.returncode
-    if command.enforce_duration and elapsed > max_seconds:
+    process = subprocess.Popen(command.argv, cwd=ROOT, env=env, **_process_group_options())
+    try:
+        returncode = process.wait(timeout=max_seconds if command.enforce_timeout else None)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        elapsed = time.perf_counter() - started
         print(
-            f"{command.name} exceeded lane budget: {elapsed:.2f}s > {max_seconds:.2f}s",
+            f"{command.name} timed out after {elapsed:.2f}s (limit {max_seconds:.2f}s); process tree terminated",
             file=sys.stderr,
         )
-        return 2
-    return 0
+        return PROCESS_TIMEOUT_EXIT_CODE
+    elapsed = time.perf_counter() - started
+    print(f"==> {command.name} finished in {elapsed:.2f}s", flush=True)
+    return returncode
+
+
+def _process_group_options() -> dict[str, object]:
+    if os.name == "posix":
+        return {"start_new_session": True}
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {}
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    parent_exited = process.poll() is not None
+    if parent_exited and not (
+        os.name == "posix" and _posix_process_group_exists(process.pid)
+    ):
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.terminate()
+        else:
+            deadline = time.monotonic() + PROCESS_TERMINATION_GRACE_SECONDS
+            while _posix_process_group_exists(process.pid) and time.monotonic() < deadline:
+                process.poll()
+                time.sleep(0.02)
+            if _posix_process_group_exists(process.pid):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    process.kill()
+            try:
+                process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            return
+    elif os.name == "nt" and process.pid is not None:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            process.terminate()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.kill()
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _posix_process_group_exists(group_id: int) -> bool:
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        selected = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number") from exc
+    if not selected > 0 or not selected < float("inf"):
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return selected
 
 
 def _required_tool(name: str) -> str:

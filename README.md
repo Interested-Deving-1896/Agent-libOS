@@ -112,14 +112,19 @@ The implementation currently includes:
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
   denominators.
+- A checked-in practical-workflow suite that keeps `native-live`,
+  `native-partial`, `mocked`, and `modeled` evidence levels separate and never
+  fills a native row with modeled fallback evidence.
 
 ## Documentation
 
 Start here, then read the deeper references as needed:
 
+- [docs/release_status.md](docs/release_status.md): living, commit/dirty-state
+  validation ledger for the current release candidate or development snapshot.
 - [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
-  2026-07-10 subsystem review, fixes, impact assessment, documentation audit,
-  validation evidence, and remaining release gates.
+  historical, commit-bound 2026-07-10 subsystem review and validation snapshot;
+  it is not the current release-status source.
 - [docs/architecture.md](docs/architecture.md): runtime layers, provider
   substrate, and the tool/primitive boundary.
 - [docs/runtime_model.md](docs/runtime_model.md): process lifecycle, scheduler,
@@ -130,6 +135,8 @@ Start here, then read the deeper references as needed:
 - [docs/protected_operation_sdk.md](docs/protected_operation_sdk.md): stable
   provider-operation contracts, phases, failure semantics, evidence, and
   extension examples.
+- [docs/providers.md](docs/providers.md): provider inventory, authority/effect
+  contracts, containment limits, and extension checklist.
 - [docs/capabilities.md](docs/capabilities.md): resource naming, rights,
   one-shot grants, human approval, shell policy, and filesystem containment.
 - [docs/object_memory.md](docs/object_memory.md): namespaces, object rights,
@@ -149,15 +156,21 @@ Start here, then read the deeper references as needed:
   replay diagnostics, append-only history, and external effects.
 - [docs/storage.md](docs/storage.md): transaction rollback/poison semantics,
   Object payload durability, schema recovery, and active-runtime leases.
+- [docs/configuration.md](docs/configuration.md): load precedence, field-level
+  config inventory, secrets, and bounded-window defaults.
 - [docs/cli.md](docs/cli.md): stable CLI command reference and examples.
 - [docs/gui.md](docs/gui.md): Electron desktop console, local GUI server,
-  HTTP/SSE APIs, and development commands.
+  HTTP/SSE APIs, same-build contract boundary, and development commands.
+- [docs/gui_api_schema.json](docs/gui_api_schema.json): versioned JSON Schema
+  subset for snapshots, errors, and confirmed high-risk GUI mutations.
 - [docs/benchmark.md](docs/benchmark.md): M1 runtime-safety benchmark tasks,
   runners, oracle, outputs, and metrics.
 - [docs/mini_swe_agent_image.md](docs/mini_swe_agent_image.md): package-only
   `mini-swe-agent` image behavior and known interface differences.
 - [docs/development.md](docs/development.md): setup, tests, real LLM smoke,
   configuration defaults, and contribution rules.
+- [docs/support_matrix.md](docs/support_matrix.md): declared support, CI-covered
+  environments, and explicit platform/provider release gates.
 - [docs/invariants.md](docs/invariants.md): current invariant-to-test map.
 - [docs/artifact_anonymity.md](docs/artifact_anonymity.md): anonymous artifact
   hygiene checklist.
@@ -229,12 +242,26 @@ The benchmark defaults to mock/planned actions and does not spend model tokens.
 Real-model benchmark smoke is opt-in and must be scoped with `--llm real
 --limit 1` or a single `--task`.
 
-In the current deterministic `agent_libos_full` 27-task validation, outputs are
-valid with 27/27 task success and safety pass, unauthorized side effects 0/22,
-zero unknown effects, and false denials 0/22 (0%). The denominator is allowed
-attempts with a definite performed/denied outcome; it is not the older 43-record
-normalization. Missing/unknown effect evidence invalidates rates instead of
-being inferred from `result.ok`. See [docs/benchmark.md](docs/benchmark.md).
+The last recorded deterministic `agent_libos_full` 27-task snapshot had valid
+outputs with 27/27 task success and safety pass, unauthorized side effects
+0/22, zero unknown effects, and false denials 0/22 (0%). Those counts are
+historical evidence, not a claim about the current dirty working tree; see the
+[living release ledger](docs/release_status.md) before reusing them. The
+denominator is allowed attempts with a definite performed/denied outcome, not
+the older 43-record normalization. Missing/unknown effect evidence invalidates
+rates instead of being inferred from `result.ok`. See
+[docs/benchmark.md](docs/benchmark.md).
+
+Run the practical workflow evidence suite separately:
+
+```bash
+uv run python experiments/run_practical_evaluation.py \
+  --output .benchmark_runs/practical/report.json
+```
+
+Its evidence-level labels are part of the result contract. In particular,
+`native-live` requires real ToolBroker, state, external-effect, and Explain
+evidence; it never falls back to a modeled success.
 
 ## Persistent Runtime
 
@@ -394,9 +421,17 @@ Register and call a preconfigured MCP tool:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
+uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-tools
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-tools:forecast --rights read
 uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-tools forecast --arguments-json '{"city":"Beijing"}'
 ```
+
+The `process:spawn` and exact `mcp_stdio:<sha256>` grants are required only for
+stdio servers. Copy `stdio_authority_resource` from `mcp inspect`; do not derive
+it from a model-supplied command or replace it with a wildcard. Streamable HTTP
+servers need the exact MCP tool capability but do not spawn a local server.
 
 Inspect or change runtime authority:
 
@@ -434,6 +469,10 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   image, checkpoint, JSON-RPC, or MCP remote authority.
 - JIT syscalls bypass the LLM-facing tool table but not primitive capability
   checks, permission policy, human approval, or audit.
+- The local shell provider is command/environment/cwd/resource mediation, not a
+  general OS sandbox for hostile native binaries. Strong hostile-code isolation
+  requires a container, WASM, or service provider with an explicit deployment
+  trust boundary.
 - Deno JIT validation may resolve pinned allowlisted JSR dependencies; runtime
   execution uses cached dependencies only, so a tool call cannot implicitly
   fetch remote code.
@@ -491,6 +530,10 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   `restore_external_policy="report_only"`.
 - Resource Provider Substrate backends perform host effects, but primitives own
   capability checks, policy decisions, events, and audit.
+- Audit and external-effect history is append-only through RuntimeStore APIs,
+  not tamper-proof against a host administrator with direct database write
+  access. Deployments needing independent integrity must add signed or remote
+  append-only evidence outside that trust boundary.
 
 See [docs/invariants.md](docs/invariants.md) for test coverage.
 
@@ -526,6 +569,8 @@ checkpoint defaults. Optional modules such as `modules/pty` keep their own
 module-local settings outside `AgentLibOSConfig`.
 `AgentLibOSConfig` is validated at construction time, so invalid or inverted
 bounds fail before a Runtime starts.
+See [docs/configuration.md](docs/configuration.md) for precedence and the
+field-level inventory, including MCP and bounded event-window settings.
 
 Add runtime dependencies with `uv add <package>` and development dependencies
 with `uv add --dev <package>`. Commit both `pyproject.toml` and `uv.lock` after

@@ -9,6 +9,7 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     AgentImage,
     Capability,
+    CapabilityDecision,
     CapabilityEffect,
     CapabilityRight,
     CapabilityStatus,
@@ -16,6 +17,7 @@ from agent_libos.models import (
     EventType,
     HumanRequestStatus,
     ObjectOwnerKind,
+    ObjectTaskStatus,
     ObjectType,
     ProcessMessageStatus,
     ProcessStatus,
@@ -96,6 +98,27 @@ class CheckpointManager:
         actor: str | None = None,
         require_capability: bool = True,
         metadata: dict[str, Any] | None = None,
+    ) -> str:
+        # Module discovery acquires the shared registry lifecycle lock. Take it
+        # before any capability/store access so checkpoint creation follows the
+        # same registry -> store order as module load/unload.
+        with self._runtime_registry_lifecycle_quiescent():
+            return self._create_registry_locked(
+                pid,
+                reason,
+                actor=actor,
+                require_capability=require_capability,
+                metadata=metadata,
+            )
+
+    def _create_registry_locked(
+        self,
+        pid: str,
+        reason: str,
+        *,
+        actor: str | None,
+        require_capability: bool,
+        metadata: dict[str, Any] | None,
     ) -> str:
         selected_actor = actor or pid
         if require_capability:
@@ -183,13 +206,25 @@ class CheckpointManager:
         require_capability: bool = True,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        selected_limit = self._bounded_list_limit(limit)
         if require_capability and actor is not None:
             if pid is None:
                 self._require_checkpoint_right(actor, "*", CapabilityRight.READ)
             else:
                 self._require_process_right(actor, pid, CapabilityRight.READ)
-        selected_limit = self.config.checkpoint.list_limit if limit is None else limit
         return [self._checkpoint_summary(item) for item in self.store.list_checkpoints(pid=pid, limit=selected_limit)]
+
+    def _bounded_list_limit(self, limit: int | None) -> int:
+        selected = self.config.checkpoint.list_limit if limit is None else limit
+        if isinstance(selected, bool) or not isinstance(selected, int):
+            raise ValidationError("checkpoint list limit must be an integer")
+        if selected < 1:
+            raise ValidationError("checkpoint list limit must be >= 1")
+        if selected > self.config.checkpoint.list_limit:
+            raise ValidationError(
+                f"checkpoint list limit exceeds configured maximum {self.config.checkpoint.list_limit}"
+            )
+        return selected
 
     def inspect(
         self,
@@ -274,53 +309,87 @@ class CheckpointManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         with self._runtime_quiescent_for_restore():
-            with self._runtime_object_ownership_quiescent():
-                # Scheduler quiescence stops model quanta. The ownership and
-                # store locks are the common mutation boundaries for host-side
-                # process, capability, Object Memory, mailbox, and ObjectTask
-                # APIs. Keep them from the first preflight read through commit.
-                with self.store.locked():
-                    # Preflight: every check in this section is required to
-                    # finish before reconstructable state is mutated.
-                    checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
-                    if require_capability:
-                        self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.ADMIN)
-                    self._require_snapshot_modules(snapshot)
-                    current_pids = self._subtree_pids(checkpoint.pid)
-                    snapshot_pids = list(snapshot.get("subtree_pids", []))
-                    self._reject_active_object_tasks_for_restore(snapshot, current_pids)
-                    self._validate_snapshot_restore_assets(snapshot)
-                    if require_capability:
-                        self._require_snapshot_image_restore_rights(actor, snapshot, overwrite_existing=True)
-                    stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(snapshot, current_pids)
-                    external_effect_pids = self._external_effect_pids(
-                        checkpoint,
-                        snapshot=snapshot,
-                        current_pids=current_pids,
-                    )
-                    external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
-                    external_effect_summary = self._external_effect_summary_since(
-                        checkpoint,
-                        pids=external_effect_pids,
-                    )
-                    # Commit: this transaction either replaces all scoped
-                    # durable rows/payloads or leaves pre-restore state intact.
-                    cancelled_human_requests, superseded_messages, release_finalizer_objects = self._restore_scoped_rows(
-                        snapshot,
-                        current_pids,
-                        checkpoint,
-                    )
-            # Post-commit reconciliation touches global image/JIT registries and
-            # external object finalizers. It cannot roll back the committed
-            # process state, so failures are reported explicitly and audited
-            # instead of being re-raised as if the restore had not happened.
-            post_commit_failures = self._run_restore_post_commit_phases(
-                actor=actor,
-                checkpoint=checkpoint,
-                snapshot=snapshot,
-                stale_tool_ids=stale_tool_ids,
-                scoped_pids=set(snapshot_pids) | set(current_pids),
-                release_finalizer_objects=release_finalizer_objects,
+            # Global image/JIT reconciliation and module lifecycle hooks share
+            # one registry lock. It must be acquired before Object Memory and
+            # store locks to avoid the inverse order used by module rollback.
+            with self._runtime_registry_lifecycle_quiescent():
+                with self._runtime_object_ownership_quiescent():
+                    # Scheduler quiescence stops model quanta. The ownership and
+                    # store locks are the common mutation boundaries for host-side
+                    # process, capability, Object Memory, mailbox, and ObjectTask
+                    # APIs. Keep them from the first preflight read through commit.
+                    with self.store.locked():
+                        # Preflight: every check in this section is required to
+                        # finish before reconstructable state is mutated.
+                        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+                        restore_right_decisions: list[CapabilityDecision] = []
+                        if require_capability:
+                            checkpoint_decision = self._require_checkpoint_right(
+                                actor,
+                                checkpoint_id,
+                                CapabilityRight.ADMIN,
+                                consume=False,
+                            )
+                            if checkpoint_decision is not None:
+                                restore_right_decisions.append(checkpoint_decision)
+                            restore_right_decisions.extend(
+                                self._require_snapshot_image_restore_rights(
+                                    actor,
+                                    snapshot,
+                                    overwrite_existing=True,
+                                    consume=False,
+                                )
+                            )
+                        reservations = self._reserve_restore_rights(restore_right_decisions, actor=actor)
+                        try:
+                            self._require_snapshot_modules(snapshot)
+                            current_pids = self._subtree_pids(checkpoint.pid)
+                            snapshot_pids = list(snapshot.get("subtree_pids", []))
+                            self._reject_active_object_tasks_for_restore(snapshot, current_pids)
+                            self._validate_snapshot_restore_assets(snapshot)
+                            stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(snapshot, current_pids)
+                            external_effect_pids = self._external_effect_pids(
+                                checkpoint,
+                                snapshot=snapshot,
+                                current_pids=current_pids,
+                            )
+                            external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
+                            external_effect_summary = self._external_effect_summary_since(
+                                checkpoint,
+                                pids=external_effect_pids,
+                            )
+                            # Authority settlement and reconstructable-state
+                            # replacement commit together. A failed preflight or
+                            # commit restores the exact composite reservations.
+                            with self.store.transaction(include_object_payloads=True):
+                                self._commit_restore_rights(reservations, actor=actor)
+                                (
+                                    cancelled_human_requests,
+                                    superseded_messages,
+                                    superseded_object_tasks,
+                                    release_finalizer_objects,
+                                ) = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
+                        except BaseException:
+                            self._restore_restore_rights(reservations, actor=actor)
+                            raise
+                # Registry reconciliation is post-commit but remains inside the
+                # lifecycle lock, so module rollback cannot interleave with the
+                # image and JIT cache/store updates.
+                post_commit_failures = self._run_restore_registry_post_commit_phases(
+                    actor=actor,
+                    checkpoint=checkpoint,
+                    snapshot=snapshot,
+                    stale_tool_ids=stale_tool_ids,
+                    scoped_pids=set(snapshot_pids) | set(current_pids),
+                )
+            # External release hooks are deliberately outside all registry,
+            # ownership, and store locks because they may call host code.
+            post_commit_failures.extend(
+                self._run_restore_object_release_finalizer_phase(
+                    actor=actor,
+                    checkpoint=checkpoint,
+                    release_finalizer_objects=release_finalizer_objects,
+                )
             )
             try:
                 self.events.emit(
@@ -330,6 +399,7 @@ class CheckpointManager:
                     payload={
                         "checkpoint_id": checkpoint_id,
                         "restored_pids": snapshot_pids,
+                        "superseded_object_tasks": superseded_object_tasks,
                         "external_effects_since_checkpoint": len(external_effects),
                         "external_effect_summary": external_effect_summary,
                         "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
@@ -358,6 +428,7 @@ class CheckpointManager:
                         "previous_pids": current_pids,
                         "cancelled_human_requests": cancelled_human_requests,
                         "superseded_messages": superseded_messages,
+                        "superseded_object_tasks": superseded_object_tasks,
                         "external_effects_since_checkpoint": external_effects,
                         "external_effect_summary": external_effect_summary,
                         "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
@@ -387,6 +458,7 @@ class CheckpointManager:
                 "previous_pids": current_pids,
                 "cancelled_human_requests": cancelled_human_requests,
                 "superseded_messages": superseded_messages,
+                "superseded_object_tasks": superseded_object_tasks,
                 "external_effects_since_checkpoint": external_effects,
                 "external_effect_summary": external_effect_summary,
                 "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
@@ -402,6 +474,24 @@ class CheckpointManager:
         *,
         parent_pid: str | None = None,
         require_capability: bool = True,
+    ) -> dict[str, Any]:
+        # Fork preparation and publication both touch the global JIT/image
+        # registries. Keep the lifecycle lock outside every store transaction.
+        with self._runtime_registry_lifecycle_quiescent():
+            return self._fork_from_checkpoint_registry_locked(
+                actor,
+                checkpoint_id,
+                parent_pid=parent_pid,
+                require_capability=require_capability,
+            )
+
+    def _fork_from_checkpoint_registry_locked(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        *,
+        parent_pid: str | None,
+        require_capability: bool,
     ) -> dict[str, Any]:
         checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
         # Preflight without consuming finite authority. The authoritative
@@ -657,6 +747,10 @@ class CheckpointManager:
             return quiescent_state(reason="checkpoint restore")
         return _NullContext()
 
+    def _runtime_registry_lifecycle_quiescent(self):
+        lock = getattr(self.runtime, "_registry_lifecycle_lock", None) if self.runtime is not None else None
+        return lock if lock is not None else _NullContext()
+
     def _runtime_object_ownership_quiescent(self):
         memory = getattr(self.runtime, "memory", None) if self.runtime is not None else None
         ownership_locked = getattr(memory, "ownership_locked", None)
@@ -688,7 +782,7 @@ class CheckpointManager:
         snapshot: dict[str, Any],
         current_pids: list[str],
         checkpoint: Checkpoint,
-    ) -> tuple[list[str], list[str], list[Any]]:
+    ) -> tuple[list[str], list[str], list[str], list[Any]]:
         rows = snapshot["rows"]
         snapshot_object_oids = self._snapshot_owned_object_oids(snapshot)
         current_object_oids = set(self._current_scoped_object_oids(current_pids))
@@ -718,6 +812,12 @@ class CheckpointManager:
             # object payloads.
             cancelled_human_requests = self._cancel_pending_human_requests(cur, current_pids, checkpoint)
             superseded_messages = self._supersede_post_checkpoint_messages(cur, current_pids, checkpoint)
+            superseded_object_tasks = self._supersede_post_checkpoint_object_tasks(
+                cur,
+                current_pids,
+                object_oids,
+                checkpoint,
+            )
             self._invalidate_scoped_capability_use_reservations(cur, current_pids, object_oids)
             self._delete_object_links(cur, object_oids)
             self._delete_rows_by_ids(cur, "objects", "oid", object_oids)
@@ -776,9 +876,14 @@ class CheckpointManager:
                 # after the restored checkpoint.
                 self.store.set_llm_context_generation(str(row["pid"]), new_id("llmctx"))
             self._reconcile_restored_wait_states(cur, [str(row["pid"]) for row in restored_process_rows])
-        return cancelled_human_requests, superseded_messages, release_finalizer_objects
+            self._reconcile_restored_object_task_results(
+                cur,
+                snapshot,
+                checkpoint,
+            )
+        return cancelled_human_requests, superseded_messages, superseded_object_tasks, release_finalizer_objects
 
-    def _run_restore_post_commit_phases(
+    def _run_restore_registry_post_commit_phases(
         self,
         *,
         actor: str,
@@ -786,7 +891,6 @@ class CheckpointManager:
         snapshot: dict[str, Any],
         stale_tool_ids: set[str],
         scoped_pids: set[str],
-        release_finalizer_objects: list[Any],
     ) -> list[dict[str, str]]:
         phases = [
             ("image_reconciliation", lambda: self._restore_images(snapshot)),
@@ -794,14 +898,6 @@ class CheckpointManager:
             (
                 "jit_pruning",
                 lambda: self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=scoped_pids),
-            ),
-            (
-                "object_release_finalizers",
-                lambda: self._run_object_release_finalizers_for_objects(
-                    release_finalizer_objects,
-                    actor="checkpoint.restore",
-                    reason="checkpoint_restore",
-                ),
             ),
         ]
         failures: list[dict[str, str]] = []
@@ -818,6 +914,30 @@ class CheckpointManager:
                     )
                 )
         return failures
+
+    def _run_restore_object_release_finalizer_phase(
+        self,
+        *,
+        actor: str,
+        checkpoint: Checkpoint,
+        release_finalizer_objects: list[Any],
+    ) -> list[dict[str, str]]:
+        try:
+            self._run_object_release_finalizers_for_objects(
+                release_finalizer_objects,
+                actor="checkpoint.restore",
+                reason="checkpoint_restore",
+            )
+        except Exception as exc:
+            return [
+                self._restore_post_commit_failure(
+                    actor=actor,
+                    checkpoint=checkpoint,
+                    phase="object_release_finalizers",
+                    exc=exc,
+                )
+            ]
+        return []
 
     def _restore_status(self, failures: list[dict[str, str]]) -> str:
         return "restored_with_warnings" if failures else "restored"
@@ -1415,11 +1535,11 @@ class CheckpointManager:
         right: CapabilityRight,
         *,
         consume: bool = True,
-    ) -> None:
+    ) -> CapabilityDecision | None:
         if self.capabilities is None:
-            return
+            return None
         resource = "checkpoint:*" if checkpoint_id == "*" else self.checkpoint_resource(checkpoint_id)
-        self.capabilities.require(actor, resource, right, consume=consume)
+        return self.capabilities.require(actor, resource, right, consume=consume)
 
     @contextmanager
     def _checkpoint_or_process_read_scope(
@@ -1811,49 +1931,117 @@ class CheckpointManager:
         *,
         overwrite_existing: bool,
         consume: bool = True,
-    ) -> None:
+    ) -> list[CapabilityDecision]:
         runtime = self.runtime
         if self.capabilities is None or runtime is None:
-            return
+            return []
         registry = getattr(runtime, "image_registry", None)
+        decisions: list[CapabilityDecision] = []
         for image_id in self._snapshot_image_ids_to_restore(snapshot, overwrite_existing=overwrite_existing):
             resource = registry.resource_for(image_id) if registry is not None else f"image:{image_id}"
-            self.capabilities.require(actor, resource, CapabilityRight.WRITE, consume=consume)
+            required_right = (
+                CapabilityRight.ADMIN
+                if overwrite_existing and image_id in runtime.images
+                else CapabilityRight.WRITE
+            )
+            decisions.append(
+                self.capabilities.require(actor, resource, required_right, consume=consume)
+            )
+        return decisions
+
+    def _reserve_restore_rights(
+        self,
+        decisions: Iterable[CapabilityDecision],
+        *,
+        actor: str,
+    ) -> dict[str, str]:
+        if self.capabilities is None:
+            return {}
+        reservations: dict[str, str] = {}
+        try:
+            for decision in decisions:
+                cap_id = str(decision.consume_capability_id) if decision.consume_capability_id is not None else None
+                if cap_id is None or cap_id in reservations:
+                    continue
+                reservation_id = self.capabilities.reserve_decision_use(
+                    decision,
+                    used_by=actor,
+                    reason="one-time checkpoint restore authority reserved",
+                )
+                if reservation_id is not None:
+                    reservations[cap_id] = reservation_id
+        except BaseException:
+            self._restore_restore_rights(reservations, actor=actor)
+            raise
+        return reservations
+
+    def _commit_restore_rights(self, reservations: dict[str, str], *, actor: str) -> None:
+        if self.capabilities is None:
+            return
+        for reservation_id in reservations.values():
+            if not self.capabilities.commit_reserved_use(
+                reservation_id,
+                committed_by=actor,
+                reason="one-time checkpoint restore authority committed",
+            ):
+                raise CapabilityDenied("checkpoint restore authority reservation is no longer active")
+
+    def _restore_restore_rights(self, reservations: dict[str, str], *, actor: str) -> None:
+        if self.capabilities is None:
+            return
+        for reservation_id in reversed(list(reservations.values())):
+            self.capabilities.restore_reserved_use(
+                reservation_id,
+                restored_by=actor,
+                reason="checkpoint restore failed before main-state commit",
+            )
 
     def _restore_images(self, snapshot: dict[str, Any], *, overwrite_existing: bool = True) -> None:
         runtime = self.runtime
         if runtime is None:
             return
-        restored_artifact_ids: set[str] | None = set() if not overwrite_existing else None
-        for image_id, data in snapshot.get("images", {}).items():
-            if not overwrite_existing and image_id in runtime.images:
-                continue
-            image = AgentImage(**data)
-            runtime.images[image_id] = image
-            runtime.store.upsert_image(
-                image,
-                registered_by="checkpoint.restore",
-                source=f"checkpoint:{snapshot.get('checkpoint_id')}",
-                created_at=utc_now(),
-            )
-            if restored_artifact_ids is not None:
-                artifact_id = str(image.boot.get("artifact_id") or "")
-                if artifact_id:
-                    restored_artifact_ids.add(artifact_id)
-        for artifact_id, data in snapshot.get("image_artifacts", {}).items():
-            if restored_artifact_ids is not None and artifact_id not in restored_artifact_ids:
-                continue
-            if runtime.store.get_image_artifact(artifact_id) is not None:
-                continue
-            runtime.store.insert_image_artifact(
-                artifact_id=artifact_id,
-                kind=str(data.get("kind", "checkpoint_commit")),
-                artifact=data.get("artifact", {}),
-                sha256=str(data.get("sha256", "")),
-                created_by="checkpoint.restore",
-                created_at=utc_now(),
-                metadata=data.get("metadata", {}),
-            )
+        images = snapshot.get("images", {})
+        registry = getattr(runtime, "image_registry", None)
+        atomic_registrations = getattr(registry, "_atomic_image_registrations", None)
+        atomic_scope = (
+            atomic_registrations(images)
+            if callable(atomic_registrations)
+            else runtime.store.transaction()
+        )
+        # A restore may reconcile several images and their artifacts. Treat the
+        # cache and durable rows as one batch so any failed write restores the
+        # complete pre-reconciliation cache, not a partially updated prefix.
+        with atomic_scope:
+            restored_artifact_ids: set[str] | None = set() if not overwrite_existing else None
+            for image_id, data in images.items():
+                if not overwrite_existing and image_id in runtime.images:
+                    continue
+                image = AgentImage(**data)
+                runtime.images[image_id] = image
+                runtime.store.upsert_image(
+                    image,
+                    registered_by="checkpoint.restore",
+                    source=f"checkpoint:{snapshot.get('checkpoint_id')}",
+                    created_at=utc_now(),
+                )
+                if restored_artifact_ids is not None:
+                    artifact_id = str(image.boot.get("artifact_id") or "")
+                    if artifact_id:
+                        restored_artifact_ids.add(artifact_id)
+            for artifact_id, data in snapshot.get("image_artifacts", {}).items():
+                if restored_artifact_ids is not None and artifact_id not in restored_artifact_ids:
+                    continue
+                if runtime.store.get_image_artifact(artifact_id) is not None:
+                    continue
+                runtime.store.insert_image_artifact(
+                    artifact_id=artifact_id,
+                    kind=str(data.get("kind", "checkpoint_commit")),
+                    artifact=data.get("artifact", {}),
+                    sha256=str(data.get("sha256", "")),
+                    created_by="checkpoint.restore",
+                    created_at=utc_now(),
+                    metadata=data.get("metadata", {}),
+                )
 
     def _object_payload_snapshot(self, object_oids: list[str]) -> dict[str, Any]:
         payloads: dict[str, Any] = {}
@@ -1993,6 +2181,149 @@ class CheckpointManager:
                 )
                 superseded.append(message.message_id)
         return superseded
+
+    def _supersede_post_checkpoint_object_tasks(
+        self,
+        cur: Any,
+        pids: list[str],
+        object_oids: set[str],
+        checkpoint: Checkpoint,
+    ) -> list[str]:
+        """Preserve task history without retaining post-checkpoint success claims.
+
+        ObjectTask rows are append-only execution history rather than
+        reconstructable worker state.  A terminal transition that happened
+        after the checkpoint may point at a runner or result Object removed by
+        restore; make that historical fact explicit and clear the live
+        references in the same transaction that replaces the scoped rows.
+        """
+
+        scoped_pids = {str(pid) for pid in pids}
+        scoped_oids = {str(oid) for oid in object_oids}
+        terminal_statuses = {
+            ObjectTaskStatus.SUCCEEDED,
+            ObjectTaskStatus.FAILED,
+            ObjectTaskStatus.CANCELLED,
+            ObjectTaskStatus.ABANDONED,
+            ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN,
+        }
+        superseded: list[str] = []
+        now = utc_now()
+        for task in self.store.list_object_tasks(include_terminal=True):
+            # ``updated_at`` also moves when terminal notification metadata is
+            # settled.  Use the actual terminal transition time so a task that
+            # completed before the checkpoint cannot be superseded merely
+            # because its notification was recorded afterward.  Legacy rows
+            # without ``completed_at`` retain the old conservative fallback.
+            terminal_at = task.completed_at or task.updated_at
+            if task.status not in terminal_statuses or terminal_at <= checkpoint.created_at:
+                continue
+            if not (
+                str(task.creator_pid) in scoped_pids
+                or (task.runner_pid is not None and str(task.runner_pid) in scoped_pids)
+                or str(task.owner_oid) in scoped_oids
+            ):
+                continue
+            wait = {
+                **task.wait,
+                "superseded_by_restore": checkpoint.checkpoint_id,
+                "superseded_at": now,
+                "previous_status": task.status.value,
+                "previous_runner_pid": str(task.runner_pid) if task.runner_pid is not None else None,
+                "previous_result_oid": (
+                    str(task.result_oid)
+                    if task.result_oid is not None
+                    else task.wait.get("previous_result_oid")
+                ),
+                "previous_error": task.error,
+            }
+            cur.execute(
+                """
+                UPDATE object_tasks
+                   SET runner_pid = NULL,
+                       status = ?,
+                       result_oid = NULL,
+                       error = ?,
+                       wait_json = ?,
+                       updated_at = ?
+                 WHERE task_id = ?
+                """,
+                (
+                    ObjectTaskStatus.SUPERSEDED_BY_RESTORE.value,
+                    f"superseded by checkpoint restore {checkpoint.checkpoint_id}",
+                    dumps(wait),
+                    now,
+                    task.task_id,
+                ),
+            )
+            superseded.append(str(task.task_id))
+        return sorted(superseded)
+
+    def _reconcile_restored_object_task_results(
+        self,
+        cur: Any,
+        snapshot: dict[str, Any],
+        checkpoint: Checkpoint,
+    ) -> list[str]:
+        """Reattach pre-checkpoint task successes to reconstructed results.
+
+        Reopening a persistent runtime explicitly downgrades successful tasks
+        whose runtime-only result payload is gone.  When restore reconstructs
+        that exact result from the checkpoint, the durable task claim becomes
+        valid again and must be repaired in the same transaction as the Object
+        row.  Post-checkpoint completions have already been superseded above
+        and therefore cannot be revived here.
+        """
+
+        snapshot_pids = {str(pid) for pid in snapshot.get("subtree_pids", [])}
+        snapshot_oids = self._snapshot_owned_object_oids(snapshot)
+        restored: list[str] = []
+        now = utc_now()
+        for task in self.store.list_object_tasks(include_terminal=True):
+            if task.status != ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN:
+                continue
+            terminal_at = task.completed_at or task.updated_at
+            if terminal_at > checkpoint.created_at:
+                continue
+            if task.wait.get("previous_status") != ObjectTaskStatus.SUCCEEDED.value:
+                continue
+            previous_result_oid = task.wait.get("previous_result_oid")
+            if not isinstance(previous_result_oid, str) or previous_result_oid not in snapshot_oids:
+                continue
+            if not (
+                str(task.creator_pid) in snapshot_pids
+                or (task.runner_pid is not None and str(task.runner_pid) in snapshot_pids)
+                or str(task.owner_oid) in snapshot_oids
+            ):
+                continue
+            if self.store.get_object(previous_result_oid) is None:
+                continue
+            wait = {
+                **task.wait,
+                "result_restored_by_checkpoint": checkpoint.checkpoint_id,
+                "result_restored_at": now,
+            }
+            cur.execute(
+                """
+                UPDATE object_tasks
+                   SET status = ?,
+                       result_oid = ?,
+                       error = ?,
+                       wait_json = ?,
+                       updated_at = ?
+                 WHERE task_id = ?
+                """,
+                (
+                    ObjectTaskStatus.SUCCEEDED.value,
+                    previous_result_oid,
+                    task.wait.get("previous_error"),
+                    dumps(wait),
+                    now,
+                    task.task_id,
+                ),
+            )
+            restored.append(str(task.task_id))
+        return sorted(restored)
 
     def _reconcile_restored_wait_states(self, cur: Any, pids: list[str]) -> None:
         for pid in pids:
@@ -2332,7 +2663,7 @@ class CheckpointManager:
         for loaded in loaded_skills.values():
             if not isinstance(loaded, dict):
                 continue
-            for field in ("tool_ids", "jit_tool_ids"):
+            for field in ("tool_ids", "jit_tool_ids", "base_tool_ids", "base_model_tool_ids"):
                 identifiers = loaded.get(field)
                 if not isinstance(identifiers, dict):
                     continue

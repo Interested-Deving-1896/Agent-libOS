@@ -12,7 +12,9 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     ObjectOwnerKind,
 )
+from experiments import collect_metrics as collect_metrics_module
 from experiments import run_benchmark as run_benchmark_module
+from benchmarks.runtime_safety import runners as runners_module
 from benchmarks.runtime_safety.fixtures import prepare_workspace
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.metrics import METRIC_COLUMNS, collect_metrics, write_metrics
@@ -787,6 +789,26 @@ class TestRuntimeSafetyBenchmark:
         summary = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
         assert summary['runner_failures'] == 0
         assert summary['invalid_runs'] == 1
+        metadata = json.loads((output / 'metadata.json').read_text(encoding='utf-8'))
+        provenance = metadata['provenance']
+        assert provenance['schema_version'] == 1
+        assert isinstance(provenance['git']['dirty'], bool)
+        assert provenance['git']['commit']
+        assert len(provenance['git']['working_tree_sha256']) == 64
+        assert provenance['workload']['tasks'][0]['task_id'] == metadata['tasks'][0]
+        assert len(provenance['workload']['tasks'][0]['sha256']) == 64
+        assert len(provenance['workload']['fixtures'][0]['sha256']) == 64
+        assert len(provenance['config']['default_config_sha256']) == 64
+        assert provenance['runners']['selected'] == metadata['runners']
+        assert provenance['runners']['interventions']['agent_libos_full']
+        assert provenance['environment']['python_version']
+
+    def test_collect_metrics_cli_returns_nonzero_for_invalid_output(self, tmp_path: Path) -> None:
+        (tmp_path / 'results.jsonl').write_text('', encoding='utf-8')
+        (tmp_path / 'effects.jsonl').write_text('', encoding='utf-8')
+        assert collect_metrics_module.main([str(tmp_path)]) == 2
+        metrics = json.loads((tmp_path / 'metrics.json').read_text(encoding='utf-8'))
+        assert metrics['valid'] is False
 
     def test_agent_libos_runner_denies_missing_authority_and_records_llm(self) -> None:
         task = next((task for task in load_tasks(SUITE_ROOT) if task.id == 'fs_secret_read_001'))
@@ -847,12 +869,30 @@ class TestRuntimeSafetyBenchmark:
         assert run.effects[0].outcome == 'simulated'
         assert run.effects[0].evidence == 'benchmark_simulation'
 
-    def test_no_audit_linkage_ablation_reports_zero_completeness(self) -> None:
+    def test_no_audit_linkage_ablation_withholds_audit_from_effect_normalization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         task = next((task for task in load_tasks(SUITE_ROOT) if task.id == 'fs_secret_read_001'))
+        original = runners_module._effects_from_runtime_results
+        observed_audit_rows: list[AuditRecord] = []
+
+        def capture_audit_rows(*args: object, **kwargs: object) -> list[EffectRecord]:
+            observed_audit_rows.extend(kwargs['audit_records'])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(runners_module, '_effects_from_runtime_results', capture_audit_rows)
         with tempfile.TemporaryDirectory() as temp_dir:
             run = run_task(task, SUITE_ROOT, temp_dir, runner='no_audit_linkage')
             assert run.result.audit_records == 0
             assert run.result.audit_completeness == 0.0
+            assert observed_audit_rows == []
+            assert all(effect.evidence != 'runtime_audit' for effect in run.effects)
+            assert run.result.metadata['explainability'] == {
+                'withheld_by_ablation': True,
+                'reason': 'no_audit_linkage',
+            }
+            assert 'observer ablation' in run.result.metadata['runner_intervention']
 
     @pytest.mark.real_llm
     def test_real_llm_smoke_is_opt_in(self) -> None:

@@ -1,0 +1,367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-libos.local/schemas/gui-api/v1.json",
+  "title": "Agent libOS local GUI API contract subset v1",
+  "description": "Machine-readable same-build contract for snapshot responses, JSON error envelopes, and explicit-confirmation mutation payloads. It is not a complete public REST/OpenAPI specification.",
+  "x-agent-libos-schema-version": 1,
+  "x-agent-libos-contract-scope": {
+    "snapshot": "GET /api/snapshot",
+    "error_envelope": "JSON errors from /api routes",
+    "confirmed_operations": {
+      "workflow.run": { "route": "POST /api/workflows/run", "request_def": "workflowRunPayload", "conditional": "Only workflow requests classified as high-risk require confirmed=true." },
+      "process.signal": { "route": "POST /api/processes/{pid}/signal", "request_def": "processSignalPayload", "confirmed_values": ["cancel", "terminate"] },
+      "process.exec": { "route": "POST /api/processes/{pid}/exec", "request_def": "processExecPayload" },
+      "process.exit": { "route": "POST /api/processes/{pid}/exit", "request_def": "processExitPayload" },
+      "checkpoint.restore": { "route": "POST /api/checkpoints/{checkpoint_id}/restore", "request_def": "checkpointRestorePayload" },
+      "checkpoint.fork": { "route": "POST /api/checkpoints/{checkpoint_id}/fork", "request_def": "checkpointForkPayload" },
+      "skill.register": { "route": "POST /api/skills/register", "request_def": "skillRegisterPayload" },
+      "skill.activate": { "route": "POST /api/skills/{skill_id}/activate", "request_def": "skillProcessMutationPayload" },
+      "skill.unload": { "route": "POST /api/skills/{skill_id}/unload", "request_def": "skillProcessMutationPayload" },
+      "capability.grant": { "route": "POST /api/capabilities/grant", "request_def": "capabilityGrantPayload" },
+      "capability.delegate": { "route": "POST /api/capabilities/delegate", "request_def": "capabilityDelegatePayload" },
+      "capability.revoke": { "route": "POST /api/capabilities/{capability_id}/revoke", "request_def": "capabilityRevokePayload" },
+      "image.register": { "route": "POST /api/images/register", "request_def": "imageRegisterPayload" },
+      "image.commit": { "route": "POST /api/images/commit", "request_def": "imageCommitPayload" },
+      "jsonrpc.register": { "route": "POST /api/jsonrpc/register", "request_def": "registryManifestPayload" },
+      "jsonrpc.call": { "route": "POST /api/jsonrpc/{endpoint_id}/call", "request_def": "jsonRpcCallPayload" },
+      "mcp.register": { "route": "POST /api/mcp/register", "request_def": "registryManifestPayload" },
+      "mcp.call": { "route": "POST /api/mcp/{server_id}/call", "request_def": "mcpCallPayload" }
+    }
+  },
+  "$defs": {
+    "jsonObject": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "capabilityRights": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonEmptyString" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      ]
+    },
+    "confirmedMutation": {
+      "type": "object",
+      "required": ["confirmed"],
+      "properties": {
+        "confirmed": { "const": true },
+        "actor": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "schedulerStatus": {
+      "type": "object",
+      "required": ["auto_run", "running", "paused"],
+      "properties": {
+        "auto_run": { "type": "boolean" },
+        "running": { "type": "boolean" },
+        "paused": { "type": "boolean" },
+        "task_id": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] },
+        "last_result": { "type": "array" },
+        "last_error": { "type": ["string", "null"] },
+        "started_at": { "type": ["number", "null"] },
+        "finished_at": { "type": ["number", "null"] },
+        "default_max_quanta": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "processSummary": {
+      "type": "object",
+      "required": ["pid", "status"],
+      "properties": {
+        "pid": { "$ref": "#/$defs/nonEmptyString" },
+        "status": { "$ref": "#/$defs/nonEmptyString" },
+        "messages": { "type": "array" },
+        "terminal": { "type": "boolean" },
+        "unread_message_count": { "type": "integer", "minimum": 0 },
+        "interrupt_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "snapshotResponse": {
+      "type": "object",
+      "required": [
+        "db",
+        "scheduler",
+        "processes",
+        "human_requests",
+        "events",
+        "audit",
+        "llm_calls",
+        "object_tasks",
+        "tools",
+        "images",
+        "skills",
+        "jsonrpc_endpoints",
+        "mcp_servers",
+        "modules",
+        "llm_profiles"
+      ],
+      "properties": {
+        "db": { "type": "string" },
+        "scheduler": { "$ref": "#/$defs/schedulerStatus" },
+        "processes": { "type": "array", "items": { "$ref": "#/$defs/processSummary" } },
+        "human_requests": { "type": "array" },
+        "events": { "type": "array" },
+        "audit": { "type": "array" },
+        "llm_calls": { "type": "array" },
+        "object_tasks": { "type": "array" },
+        "tools": { "type": "array" },
+        "images": { "type": "array" },
+        "skills": { "type": "array" },
+        "jsonrpc_endpoints": { "type": "array" },
+        "mcp_servers": { "type": "array" },
+        "modules": { "type": "array" },
+        "llm_profiles": { "type": "array" },
+        "_truncated": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": true
+    },
+    "errorEnvelope": {
+      "type": "object",
+      "required": ["ok", "error"],
+      "properties": {
+        "ok": { "const": false },
+        "error": {
+          "type": "object",
+          "required": ["message"],
+          "properties": {
+            "type": { "type": "string" },
+            "message": { "type": "string" },
+            "confirmation_required": { "type": "boolean" },
+            "action": { "type": "string" },
+            "preview": { "type": "object", "additionalProperties": true },
+            "retryable": { "type": "boolean" },
+            "status": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "workflowRunPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["tool"],
+          "properties": {
+            "tool": { "$ref": "#/$defs/nonEmptyString" },
+            "args": { "$ref": "#/$defs/jsonObject" },
+            "image": { "type": "string" },
+            "working_directory": { "type": "string" },
+            "authority_manifest": { "$ref": "#/$defs/jsonObject" }
+          }
+        }
+      ]
+    },
+    "processSignalPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["signal"],
+          "properties": {
+            "signal": { "enum": ["cancel", "terminate"] },
+            "payload": { "$ref": "#/$defs/jsonObject" }
+          }
+        }
+      ]
+    },
+    "processExecPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["image"],
+          "properties": {
+            "image": { "$ref": "#/$defs/nonEmptyString" },
+            "goal": { "type": ["string", "null"] },
+            "llm_profile": { "type": ["string", "null"] },
+            "args": { "$ref": "#/$defs/jsonObject" },
+            "preserve_memory": { "type": "boolean" },
+            "preserve_capabilities": { "type": "boolean" },
+            "auto_run": { "type": "boolean" },
+            "max_quanta": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    },
+    "processExitPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "properties": {
+            "failed": { "type": "boolean" },
+            "message": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "checkpointRestorePayload": {
+      "allOf": [{ "$ref": "#/$defs/confirmedMutation" }]
+    },
+    "checkpointForkPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        { "properties": { "parent_pid": { "type": ["string", "null"] } } }
+      ]
+    },
+    "skillRegisterPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["actor", "path"],
+          "properties": {
+            "actor": { "$ref": "#/$defs/nonEmptyString" },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+"
+            },
+            "replace": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "skillProcessMutationPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["pid"],
+          "properties": { "pid": { "$ref": "#/$defs/nonEmptyString" } }
+        }
+      ]
+    },
+    "capabilityGrantPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["subject", "resource"],
+          "properties": {
+            "subject": { "$ref": "#/$defs/nonEmptyString" },
+            "resource": { "$ref": "#/$defs/nonEmptyString" },
+            "rights": { "$ref": "#/$defs/capabilityRights" }
+          }
+        }
+      ]
+    },
+    "capabilityDelegatePayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["parent", "child", "resource"],
+          "properties": {
+            "parent": { "$ref": "#/$defs/nonEmptyString" },
+            "child": { "$ref": "#/$defs/nonEmptyString" },
+            "resource": { "$ref": "#/$defs/nonEmptyString" },
+            "rights": { "$ref": "#/$defs/capabilityRights" }
+          }
+        }
+      ]
+    },
+    "capabilityRevokePayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        { "properties": { "reason": { "type": ["string", "null"] } } }
+      ]
+    },
+    "imageRegisterPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["files"],
+          "properties": {
+            "files": {
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": { "$ref": "#/$defs/nonEmptyString" },
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "string" },
+                  {
+                    "type": "object",
+                    "required": ["base64"],
+                    "properties": { "base64": { "type": "string" } },
+                    "additionalProperties": true
+                  }
+                ]
+              }
+            },
+            "replace": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "imageCommitPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["checkpoint_id", "image_id", "name"],
+          "properties": {
+            "checkpoint_id": { "$ref": "#/$defs/nonEmptyString" },
+            "image_id": { "$ref": "#/$defs/nonEmptyString" },
+            "name": { "$ref": "#/$defs/nonEmptyString" },
+            "version": { "$ref": "#/$defs/nonEmptyString" },
+            "replace": { "type": "boolean" },
+            "metadata": { "$ref": "#/$defs/jsonObject" }
+          }
+        }
+      ]
+    },
+    "registryManifestPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["manifest_text"],
+          "not": { "required": ["path"] },
+          "properties": {
+            "manifest_text": { "$ref": "#/$defs/nonEmptyString" },
+            "replace": { "type": "boolean" },
+            "source": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "jsonRpcCallPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["pid", "method_id"],
+          "properties": {
+            "pid": { "$ref": "#/$defs/nonEmptyString" },
+            "method_id": { "$ref": "#/$defs/nonEmptyString" },
+            "params": {}
+          }
+        }
+      ]
+    },
+    "mcpCallPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        {
+          "required": ["pid", "tool_id"],
+          "properties": {
+            "pid": { "$ref": "#/$defs/nonEmptyString" },
+            "tool_id": { "$ref": "#/$defs/nonEmptyString" },
+            "arguments": {
+              "oneOf": [
+                { "$ref": "#/$defs/jsonObject" },
+                { "type": "null" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

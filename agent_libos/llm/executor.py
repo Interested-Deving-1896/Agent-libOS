@@ -164,7 +164,11 @@ class LLMProcessExecutor:
                 correlation_id=self.runtime.tools.redact_model_context(pid, event.correlation_id),
                 causality=self.runtime.tools.redact_model_context(pid, event.causality),
             )
-            for event in self.runtime.events.list(target=pid)
+            for event in self.runtime.events.list(
+                target=pid,
+                limit=self.runtime.config.llm_context.recent_event_limit,
+                after_event_id=process.event_cursor,
+            )
         ]
         capabilities = self.runtime.capability.capabilities_for(pid)
         # The prompt-visible tool list must match the process tool table. The
@@ -196,6 +200,12 @@ class LLMProcessExecutor:
                 decision={"error": str(exc)},
             )
             return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
+        if events:
+            current = self.runtime.process.get(pid)
+            if current.event_cursor != events[-1].event_id:
+                current.event_cursor = events[-1].event_id
+                current.updated_at = utc_now()
+                self.runtime.store.update_process(current)
         messages = [
             {"role": "system", "content": build_system_prompt(image)},
             {

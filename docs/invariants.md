@@ -36,6 +36,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   revoke-wins restoration, crash abandonment, grant-as-transfer,
   parent-linked delegation attenuation, restrictive parent boundaries,
   malformed authority-rule fail-closed behavior, and ISO-normalized leases.
+  Delegation publishes its row/process attachment/evidence atomically, and a
+  multi-spec authority derivation is prevalidated and committed all-or-nothing.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority. Cwd selection requires filesystem directory read,
   and explicit child/PTY cwd probes occur only after their higher-level
@@ -82,6 +84,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   races, concurrent updates, and owner ABA fail closed. Trusted delete rolls
   back Object release, capability revocation, audit, and in-memory payload
   together; a multi-Object ownership transfer and its audit are all-or-nothing.
+  Link authorization, both Objects' LIVE checks, finite-use consumption, and
+  evidence share that same ownership-lock/transaction linearization point.
 - `runtime-store-single-active-writer`: a writable persistent runtime store has
   at most one active Runtime opener across canonical/symlink path aliases.
   SQLite validates a no-follow regular-file lease or uses its kernel exclusive
@@ -137,6 +141,16 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `audit-query-windows-retain-latest-records`: limited audit queries select the
   latest matching records before returning them chronologically, and process
   audit views filter before applying their limit.
+- `event-query-windows-are-store-bounded`: LLM context and GUI process-event
+  reads apply cursor/filter and limit in the store, return the newest bounded
+  matching window in order, and do not materialize an unbounded event history.
+- `gui-snapshot-reads-are-source-bounded`: top-level snapshot collections fetch
+  at most the configured collection window plus one lookahead row before
+  assembly. Process unread/interrupt counts, recent messages, bounded LLM
+  count/token windows, ratings, ancestor reservations, and hierarchical
+  remaining budgets use batch queries rather than one set of queries per
+  visible process; GUI-level omissions detected by lookahead remain explicit in
+  `_truncated`, while stricter subsystem list maxima remain authoritative.
 - `tool-observability-redacts-sensitive-payloads`: tool audit/event
   observability stores bounded preview, hash, size, and truncation metadata
   instead of raw sensitive args or results.
@@ -160,13 +174,19 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   parent/message waiter transitions do not publish partial authoritative state
   when an in-transaction sink fails. Higher-level image boot uses compensating
   restore rather than claiming one transaction across host/package work.
+  Terminal signals use the same durable boundary; independent post-commit
+  terminal notifier/finalizer failures cannot strand the other cleanup phase.
 - `scheduler-quantum-ownership-is-serialized`: scheduler and direct pid
   single-step APIs share the same runtime lock, store claim, and resource-charge
   boundary, so one process cannot be re-entered concurrently.
 - `runtime-shutdown-is-drained-and-retry-safe`: scheduler work, ObjectTask
   executors, PTY reader/monitor workers, and GUI runtime users drain before
   shared state closes; a timed-out shutdown leaves storage open and can be
-  retried.
+  retried. The HTTP endpoint acknowledges success only after completed Runtime
+  teardown, while process exit fails visibly if bounded retries still fail.
+- `gui-local-control-surface-is-origin-bound`: browser CORS accepts loopback
+  development origins and exactly `agent-libos://app` for the packaged
+  renderer, while rejecting `null` and every other custom origin.
 - `object-task-entry-uses-toolbroker-and-object-authority`: Object-bound
   background tasks run tools through ToolBroker, process tool tables, Object
   capabilities, owner-watch Object Memory primitive notifications, and
@@ -223,12 +243,18 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   committed only with that mutation. Registry/trust/audit state changes are
   transactional; failed activation cannot leave a visible JIT alias, and
   reactivation or unload retires the exact superseded process-local JIT rows.
+  Loaded-Skill provenance preserves a base/shared alias until its last actual
+  source is unloaded; legacy persisted rows backfill image/manual static base
+  bindings before unload. Discovery rejects non-positive, boolean, and
+  above-config limits.
 - `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
   trust to the current source hash, reject ambiguous manifests and duplicate
   module ids, resolve import strings without executing untrusted package code,
   bound source hashing, and roll back failed declared or hook-created
   tool/image/syscall/hook registrations so persisted module status stays
-  aligned with loaded runtime state.
+  aligned with loaded runtime state. One shared runtime registry lock serializes
+  the full module lifecycle with official Tool/Image publications, preventing
+  a failed snapshot restore from clobbering a concurrent successful load.
 - `checkpoint-restore-and-fork-are-scoped`: checkpoint creation atomically
   captures one consistent store snapshot and publishes its row, head, initial
   read capability, event, and audit. Restore/fork are scoped,
@@ -238,6 +264,21 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   snapshot authority is never copied. Fork revalidates/consumes actor authority
   only in its publication transaction, global Skill/Image rows are not replaced
   by fork, and post-commit failures are reported without claiming rollback.
+  Post-checkpoint terminal ObjectTask history is retained as
+  `superseded_by_restore` with stale live runner/result references cleared;
+  the comparison uses the terminal transition time so delayed notification
+  bookkeeping cannot supersede a task captured as complete. A normal store
+  reopen also changes a persisted success with a missing runtime-only result
+  payload to `result_unavailable_after_reopen` instead of leaving a dangling
+  `result_oid`. Restore reserves checkpoint admin plus every changed-image
+  right as one composite set and settles it only with the main transaction;
+  replacing an existing image requires `admin`, while restoring a missing
+  image requires `write`.
+  Checkpoint create/restore/fork acquire the shared registry lifecycle lock
+  before Object Memory ownership and store locks; image/JIT reconciliation
+  remains inside that lifecycle boundary, while host release finalizers run
+  outside it. Multi-image reconciliation commits cache, image rows, and artifact
+  rows as one batch or restores the complete prior cache.
   The implementation uses one reservation scope for diagnostic
   inspect/diff/replay; the mapped one-shot regression directly proves inspect
   consumes the selected finite checkpoint/process read exactly once.
@@ -248,7 +289,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   workspace and unpublished JIT source/candidate state. Registry callers and
   getters receive isolated deep copies, concurrent same-id registrations are
   serialized and revalidated in the cache/store critical section, and
-  committed-image boot does not overwrite the global Skill registry.
+  committed-image boot does not overwrite the global Skill registry. New image
+  publication requires `write`, replacement requires `admin`, and finite image
+  plus checkpoint-read authority settles in the registry mutation transaction.
 - `agent-output-is-not-control-channel`: untrusted command output cannot trigger
   lifecycle control actions; submission/exit must use explicit tool or syscall
   arguments.
@@ -256,7 +299,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   registration and calls use registered endpoint/method authority, gate calls
   and per-item registry operations before manifest metadata is exposed, and
   classify provider effects. Registry row/stale-grant/event/audit mutations are
-  transactional. A call reserves finite authority and persists pending evidence
+  transactional, including finite registry-authority reservation/settlement.
+  A call reserves finite authority and persists pending evidence
   before non-local DNS and transport; DNS observation prevents later transport
   PENS from erasing information flow or restoring the use.
 - `mcp-provider-effects-are-registered-and-classified`: MCP server registration

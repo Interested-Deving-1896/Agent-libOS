@@ -6,7 +6,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage, ToolCandidateStatus
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
@@ -14,6 +14,60 @@ from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.skills import write_skill_package
 
 class TestImageCommit:
+
+    def test_commit_settles_checkpoint_read_and_image_write_only_with_image_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='base-agent:v0', goal='commit source')
+            controller = runtime.process.spawn(image='base-agent:v0', goal='commit controller')
+            checkpoint_id = runtime.checkpoint.create(source, 'one-shot commit point', actor=source)
+            checkpoint_cap = runtime.capability.grant_once(
+                controller,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            image_cap = runtime.capability.grant_once(
+                controller,
+                'image:one-shot-commit:v0',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            original_record = runtime.audit.record
+            fail_commit_audit = True
+
+            def fail_once(*args: Any, **kwargs: Any) -> Any:
+                if fail_commit_audit and kwargs.get('action') == 'image.commit':
+                    raise RuntimeError('injected image commit audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_once)
+            with pytest.raises(RuntimeError, match='image commit audit failure'):
+                runtime.image_registry.commit_from_checkpoint(
+                    actor=controller,
+                    checkpoint_id=checkpoint_id,
+                    image_id='one-shot-commit:v0',
+                    name='one-shot-commit',
+                )
+
+            assert runtime.store.get_capability(checkpoint_cap.cap_id).uses_remaining == 1
+            assert runtime.store.get_capability(image_cap.cap_id).uses_remaining == 1
+            assert runtime.store.get_image('one-shot-commit:v0') is None
+            assert 'one-shot-commit:v0' not in runtime.images
+
+            fail_commit_audit = False
+            result = runtime.image_registry.commit_from_checkpoint(
+                actor=controller,
+                checkpoint_id=checkpoint_id,
+                image_id='one-shot-commit:v0',
+                name='one-shot-commit',
+            )
+
+            assert result.image.image_id == 'one-shot-commit:v0'
+            assert runtime.store.get_capability(checkpoint_cap.cap_id).uses_remaining == 0
+            assert runtime.store.get_capability(image_cap.cap_id).uses_remaining == 0
 
     def test_commit_requires_checkpoint_read_and_image_write(self) -> None:
         with _runtime() as runtime:

@@ -12,7 +12,10 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 class LoadImagePackageArgs(BaseModel):
     path: str = Field(description="Workspace-relative image package directory containing IMAGE.yaml.")
-    replace: bool = Field(default=False, description="Whether an existing image with the same id may be replaced.")
+    replace: bool = Field(
+        default=False,
+        description="Replace an existing image with the same id; this requires exact image admin authority.",
+    )
 
 
 class LoadImagePackageOutput(BaseModel):
@@ -32,10 +35,13 @@ class LoadImagePackageOutput(BaseModel):
 
 class CommitCheckpointToImageArgs(BaseModel):
     checkpoint_id: str = Field(description="Checkpoint id to commit into an immutable image artifact.")
-    image_id: str = Field(description="New AgentImage id.")
+    image_id: str = Field(description="Target AgentImage id; a new id requires exact image write authority.")
     name: str = Field(description="Human-readable image name.")
     version: str = Field(default="v0", description="Image version.")
-    replace: bool = Field(default=False, description="Whether an existing image id may be replaced.")
+    replace: bool = Field(
+        default=False,
+        description="Replace an existing target image; this requires exact image admin authority.",
+    )
     metadata: dict[str, object] = Field(default_factory=dict, description="Optional image metadata.")
 
 
@@ -55,14 +61,15 @@ class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
     name = "load_image_package"
     description = (
         "Read an AgentImage package directory from the workspace and register it with the runtime. "
-        "The filesystem primitive enforces file read authority; the image registry primitive enforces image write authority."
+        "The filesystem primitive enforces file read authority. Registering a new id requires exact image write authority; "
+        "replace=true requires exact image admin authority."
     )
     args_schema = LoadImagePackageArgs
     output_schema = LoadImagePackageOutput
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"filesystem.read", "image.write"},
+        declared_permissions={"filesystem.read", "image.write", "image.admin"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["image", "registry", "package", "side_effect"]
@@ -104,14 +111,15 @@ class CommitCheckpointToImageTool(SyncAgentTool[CommitCheckpointToImageArgs]):
     name = "commit_checkpoint_to_image"
     description = (
         "Commit a process checkpoint into a new checkpoint-derived AgentImage. "
-        "The image captures reconstructable internal runtime state only and does not grant external capabilities."
+        "The image captures reconstructable internal runtime state only and does not grant external capabilities. "
+        "A new id requires exact image write authority; replace=true requires exact image admin authority."
     )
     args_schema = CommitCheckpointToImageArgs
     output_schema = CommitCheckpointToImageOutput
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"checkpoint.read", "image.write"},
+        declared_permissions={"checkpoint.read", "image.write", "image.admin"},
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["image", "checkpoint", "commit", "self_evolution", "high_risk"]

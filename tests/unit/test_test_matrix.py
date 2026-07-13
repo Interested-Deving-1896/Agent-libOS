@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import time
 
+import psutil
 import pytest
 
 from scripts import test_matrix
@@ -70,6 +73,11 @@ class TestTestMatrix:
         assert args.workers == "2"
         assert args.dist == "worksteal"
 
+    def test_all_lane_uses_the_same_hard_timeout_contract(self) -> None:
+        command = test_matrix._commands_for(_args(lane="all"))[0]
+
+        assert command.enforce_timeout is True
+
     def test_non_runtime_lane_defaults_to_serial_execution(self) -> None:
         parser = argparse.ArgumentParser()
         args = _args(lane="security", workers=None, dist=None)
@@ -117,6 +125,92 @@ class TestTestMatrix:
             test_matrix._worker_count("0")
         with pytest.raises(argparse.ArgumentTypeError):
             test_matrix._worker_count("maybe")
+
+    def test_max_lane_seconds_requires_a_finite_positive_value(self) -> None:
+        assert test_matrix._positive_seconds("0.25") == 0.25
+        for value in ("0", "-1", "nan", "inf", "not-a-number"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                test_matrix._positive_seconds(value)
+
+    def test_individual_lane_timeout_terminates_the_command(self) -> None:
+        started = time.monotonic()
+
+        status = test_matrix._run(
+            test_matrix.Command(
+                "timeout regression child",
+                [test_matrix.sys.executable, "-c", "import time; time.sleep(30)"],
+            ),
+            max_seconds=0.05,
+        )
+
+        assert status == test_matrix.PROCESS_TIMEOUT_EXIT_CODE
+        assert time.monotonic() - started < 5
+
+    def test_timeout_terminates_a_spawned_descendant(self, tmp_path: Path) -> None:
+        child_pid_file = tmp_path / "child.pid"
+        child_ready_file = tmp_path / "child.ready"
+        child_code = """
+import pathlib
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path(sys.argv[1]).write_text("ready")
+time.sleep(30)
+"""
+        parent_code = """
+import pathlib
+import subprocess
+import sys
+import time
+
+ready = pathlib.Path(sys.argv[1])
+child = subprocess.Popen([sys.executable, "-c", sys.argv[2], str(ready)])
+deadline = time.monotonic() + 5
+while not ready.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not ready.exists():
+    raise RuntimeError("descendant did not become ready")
+pathlib.Path(sys.argv[3]).write_text(str(child.pid))
+time.sleep(30)
+"""
+
+        status = test_matrix._run(
+            test_matrix.Command(
+                "process-tree timeout regression",
+                [
+                    test_matrix.sys.executable,
+                    "-c",
+                    parent_code,
+                    str(child_ready_file),
+                    child_code,
+                    str(child_pid_file),
+                ],
+            ),
+            max_seconds=1,
+        )
+
+        assert status == test_matrix.PROCESS_TIMEOUT_EXIT_CODE
+        assert child_pid_file.exists(), "parent did not spawn the descendant before timeout"
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 2
+        while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+            try:
+                if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.01)
+        try:
+            final_status = psutil.Process(child_pid).status()
+        except psutil.NoSuchProcess:
+            final_status = None
+        assert final_status in {None, psutil.STATUS_ZOMBIE}
+
+    @pytest.mark.skipif(test_matrix.os.name != "posix", reason="POSIX process-group assertion")
+    def test_timeout_commands_start_in_a_new_posix_session(self) -> None:
+        assert test_matrix._process_group_options() == {"start_new_session": True}
 
     def test_gui_lane_rejects_workers(self) -> None:
         parser = argparse.ArgumentParser()

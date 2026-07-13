@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,15 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 class TestRuntimeModule:
+
+    def test_module_discovery_rejects_unbounded_limits(self) -> None:
+        runtime = Runtime.open()
+        try:
+            for limit in (0, -1, True, runtime.config.modules.discover_limit + 1):
+                with pytest.raises(ValidationError, match='limit'):
+                    runtime.modules.list_modules(limit=limit)  # type: ignore[arg-type]
+        finally:
+            runtime.close()
 
     def test_trusted_startup_module_registers_tool_image_syscall_and_hook(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -802,6 +812,88 @@ sha256: {package_sha}
                 assert runtime.modules.inspect_module('mutating-hook-module:v0')['status'] == 'failed'
             finally:
                 runtime.close()
+
+    def test_failed_module_rollback_cannot_clobber_concurrent_successful_module_load(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        failing_root = tmp_path / 'failing'
+        successful_root = tmp_path / 'successful'
+        failing_root.mkdir()
+        successful_root.mkdir()
+        failing_manifest, failing_sha = _write_mutating_hook_module(failing_root)
+        successful_manifest, successful_sha = _write_module(successful_root)
+        failing_trust = _module_trust_key('mutating-hook-module:v0', failing_manifest, failing_sha)
+        successful_trust = _module_trust_key('test-module:v0', successful_manifest, successful_sha)
+        runtime = Runtime.open()
+        failing_hook_entered = threading.Event()
+        release_failing_hook = threading.Event()
+        successful_load_entered = threading.Event()
+        original_run_hook = runtime.modules._run_module_hook
+        original_require_available = runtime.modules._require_module_id_available
+        failures: list[BaseException] = []
+
+        def blocked_run_hook(
+            module_id: str,
+            hook_name: str,
+            hook: object,
+            *,
+            kind: str,
+        ) -> None:
+            if module_id == 'mutating-hook-module:v0':
+                failing_hook_entered.set()
+                if not release_failing_hook.wait(timeout=5):
+                    raise TimeoutError('timed out waiting to release failing module hook')
+            original_run_hook(module_id, hook_name, hook, kind=kind)  # type: ignore[arg-type]
+
+        def observed_require_available(module_id: str, source_sha256: str) -> None:
+            if module_id == 'test-module:v0':
+                successful_load_entered.set()
+            original_require_available(module_id, source_sha256)
+
+        monkeypatch.setattr(runtime.modules, '_run_module_hook', blocked_run_hook)
+        monkeypatch.setattr(runtime.modules, '_require_module_id_available', observed_require_available)
+
+        def load_failing() -> None:
+            try:
+                runtime.modules.load_module_manifest(failing_manifest, trusted_modules=(failing_trust,))
+            except BaseException as exc:
+                failures.append(exc)
+
+        def load_successful() -> None:
+            try:
+                runtime.modules.load_module_manifest(successful_manifest, trusted_modules=(successful_trust,))
+            except BaseException as exc:
+                failures.append(exc)
+
+        failing_thread = threading.Thread(target=load_failing)
+        successful_thread = threading.Thread(target=load_successful)
+        try:
+            failing_thread.start()
+            assert failing_hook_entered.wait(timeout=3)
+            successful_thread.start()
+            assert not successful_load_entered.wait(timeout=0.2)
+
+            release_failing_hook.set()
+            failing_thread.join(timeout=5)
+            successful_thread.join(timeout=5)
+
+            assert not failing_thread.is_alive()
+            assert not successful_thread.is_alive()
+            assert len(failures) == 1
+            assert 'mutating startup hook failed' in str(failures[0])
+            assert successful_load_entered.is_set()
+            assert runtime.modules.inspect_module('test-module:v0')['status'] == 'loaded'
+            assert runtime.tools.resolve('module_echo').name == 'module_echo'
+            assert 'module-agent:v0' in runtime.images
+            assert runtime.syscalls.get('module.ping') is not None
+            assert runtime.modules.inspect_module('mutating-hook-module:v0')['status'] == 'failed'
+        finally:
+            release_failing_hook.set()
+            failing_thread.join(timeout=5)
+            successful_thread.join(timeout=5)
+            runtime.close()
 
     def test_duplicate_module_id_does_not_overwrite_loaded_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

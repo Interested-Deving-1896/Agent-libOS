@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import fields
 from typing import Any
 
@@ -310,20 +310,78 @@ class ResourceManager:
                     )
 
     def remaining_budget(self, pid: str) -> ResourceBudget:
+        return self.remaining_budgets([pid])[pid]
+
+    def remaining_budgets(self, pids: Iterable[str]) -> dict[str, ResourceBudget]:
+        """Compute hierarchical remaining budgets with a constant query count."""
+
+        selected = sorted({str(pid) for pid in pids if str(pid)})
+        if not selected:
+            return {}
         with self.store.locked():
-            values: dict[str, Any] = {
-                "max_context_materialization_tokens": self.context_materialization_window_limit(pid),
+            process_by_pid = {
+                process.pid: process
+                for process in self.store.get_processes_with_ancestors(selected)
             }
-            for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
-                if budget_field == "max_subprocess_memory_bytes":
-                    values[budget_field] = self.peak_limit(pid, budget_field)
-                    continue
-                remaining = self._remaining_budget_field_locked(pid, budget_field, usage_fields)
-                if remaining is None:
-                    values[budget_field] = None
-                else:
-                    values[budget_field] = int(remaining) if remaining.is_integer() else remaining
-            return ResourceBudget(**values)
+            missing = [pid for pid in selected if pid not in process_by_pid]
+            if missing:
+                raise NotFound(f"process not found: {missing[0]}")
+            reservations = self.store.list_resource_reservations(parent_pids=process_by_pid)
+            reserved_by_parent: dict[str, dict[str, float]] = {}
+            for reservation in reservations:
+                totals = reserved_by_parent.setdefault(reservation.parent_pid, {})
+                for budget_field, value in reservation.reserved.items():
+                    totals[budget_field] = totals.get(budget_field, 0.0) + float(value)
+
+            result: dict[str, ResourceBudget] = {}
+            for pid in selected:
+                chain: list[AgentProcess] = []
+                seen: set[str] = set()
+                current = process_by_pid[pid]
+                while True:
+                    if current.pid in seen:
+                        raise ValidationError(f"process parent cycle detected: {current.pid}")
+                    seen.add(current.pid)
+                    chain.append(current)
+                    if current.parent_pid is None:
+                        break
+                    parent = process_by_pid.get(current.parent_pid)
+                    if parent is None:
+                        raise NotFound(f"process not found: {current.parent_pid}")
+                    current = parent
+
+                values: dict[str, Any] = {
+                    "max_context_materialization_tokens": min(
+                        int(process.resource_budget.max_context_materialization_tokens)
+                        for process in chain
+                    ),
+                }
+                for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
+                    if budget_field == "max_subprocess_memory_bytes":
+                        limits = [
+                            int(limit)
+                            for process in chain
+                            if (limit := getattr(process.resource_budget, budget_field)) is not None
+                        ]
+                        values[budget_field] = min(limits) if limits else None
+                        continue
+                    remaining: float | None = None
+                    for process in chain:
+                        limit = getattr(process.resource_budget, budget_field)
+                        if limit is None:
+                            continue
+                        used = sum(float(getattr(process.resource_usage, field)) for field in usage_fields)
+                        if budget_field not in _NON_RESERVABLE_BUDGET_FIELDS:
+                            used += reserved_by_parent.get(process.pid, {}).get(budget_field, 0.0)
+                        process_remaining = max(0.0, float(limit) - used)
+                        remaining = process_remaining if remaining is None else min(remaining, process_remaining)
+                    values[budget_field] = (
+                        None
+                        if remaining is None
+                        else int(remaining) if remaining.is_integer() else remaining
+                    )
+                result[pid] = ResourceBudget(**values)
+            return result
 
     def reserve_child_budget(self, parent_pid: str, child_pid: str, child_budget: ResourceBudget) -> None:
         with self.store.locked():

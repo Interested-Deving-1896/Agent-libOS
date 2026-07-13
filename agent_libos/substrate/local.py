@@ -61,6 +61,7 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 _MCP_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _MCP_FORBIDDEN_HOSTS = {"metadata.google.internal"}
+_MCP_STDIO_READ_CHUNK_BYTES = 64 * 1024
 _SAFE_SHELL_ENV_KEYS = {
     "COMSPEC",
     "LANG",
@@ -1490,7 +1491,11 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
     ) -> McpToolListResult:
-        return _run_mcp_async(self._alist_tools(server, timeout_s=timeout_s, max_response_bytes=max_response_bytes))
+        try:
+            return _run_mcp_async(self._alist_tools(server, timeout_s=timeout_s, max_response_bytes=max_response_bytes))
+        except BaseExceptionGroup as exc:
+            self._raise_mcp_transport_limit_error(exc)
+            raise
 
     def call_tool(
         self,
@@ -1501,15 +1506,45 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
     ) -> McpProviderCallResult:
-        return _run_mcp_async(
-            self._acall_tool(
-                server,
-                tool,
-                arguments,
-                timeout_s=timeout_s,
-                max_response_bytes=max_response_bytes,
+        try:
+            return _run_mcp_async(
+                self._acall_tool(
+                    server,
+                    tool,
+                    arguments,
+                    timeout_s=timeout_s,
+                    max_response_bytes=max_response_bytes,
+                )
             )
-        )
+        except BaseExceptionGroup as exc:
+            self._raise_mcp_transport_limit_error(exc)
+            raise
+
+    @staticmethod
+    def _raise_mcp_transport_limit_error(error: BaseException) -> None:
+        pending: list[BaseException] = [error]
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            message = str(current)
+            if message.startswith(
+                (
+                    "MCP stdio frame exceeded max_response_bytes=",
+                    "MCP HTTP response exceeded max_response_bytes=",
+                    "MCP HTTP SSE frame exceeded max_response_bytes=",
+                    "MCP HTTP response uses unsupported Content-Encoding=",
+                )
+            ):
+                raise RuntimeError(message) from error
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
 
     async def _alist_tools(
         self,
@@ -1519,7 +1554,11 @@ class SdkMcpProvider:
         max_response_bytes: int,
     ) -> McpToolListResult:
         started = time.monotonic()
-        async with self._session(server, timeout_s=timeout_s) as session:
+        async with self._session(
+            server,
+            timeout_s=timeout_s,
+            max_response_bytes=max_response_bytes,
+        ) as session:
             result = await asyncio.wait_for(session.list_tools(), timeout=timeout_s)
         tools = [
             McpProviderTool(
@@ -1550,7 +1589,11 @@ class SdkMcpProvider:
         max_response_bytes: int,
     ) -> McpProviderCallResult:
         started = time.monotonic()
-        async with self._session(server, timeout_s=timeout_s) as session:
+        async with self._session(
+            server,
+            timeout_s=timeout_s,
+            max_response_bytes=max_response_bytes,
+        ) as session:
             result = await asyncio.wait_for(session.call_tool(tool.mcp_name, arguments), timeout=timeout_s)
         content = _jsonable_mcp_value(getattr(result, "content", None))
         structured = _jsonable_mcp_value(
@@ -1571,7 +1614,13 @@ class SdkMcpProvider:
         )
 
     @contextlib.asynccontextmanager
-    async def _session(self, server: McpServerSpec, *, timeout_s: float):
+    async def _session(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ):
         try:
             from mcp import ClientSession
             from mcp.client.stdio import StdioServerParameters
@@ -1589,7 +1638,10 @@ class SdkMcpProvider:
                 env=self._resolved_stdio_env(server),
                 cwd=self._resolved_stdio_cwd(server),
             )
-            async with _strict_stdio_client(params) as (read, write):
+            async with _strict_stdio_client(
+                params,
+                max_frame_bytes=max_response_bytes,
+            ) as (read, write):
                 async with ClientSession(read, write) as session:
                     await asyncio.wait_for(session.initialize(), timeout=timeout_s)
                     yield session
@@ -1597,7 +1649,11 @@ class SdkMcpProvider:
         if server.transport == "streamable_http":
             if server.http is None:
                 raise RuntimeError("MCP streamable_http transport is missing HTTP configuration")
-            async with self._http_client(server, timeout_s=timeout_s) as http_client:
+            async with self._http_client(
+                server,
+                timeout_s=timeout_s,
+                max_response_bytes=max_response_bytes,
+            ) as http_client:
                 async with streamable_http_client(
                     server.http.url,
                     http_client=http_client,
@@ -1609,7 +1665,13 @@ class SdkMcpProvider:
         raise RuntimeError(f"unsupported MCP transport: {server.transport}")
 
     @contextlib.asynccontextmanager
-    async def _http_client(self, server: McpServerSpec, *, timeout_s: float):
+    async def _http_client(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+    ):
         try:
             import httpx
         except ModuleNotFoundError as exc:
@@ -1618,14 +1680,24 @@ class SdkMcpProvider:
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
         timeout = httpx.Timeout(timeout_s, read=timeout_s)
-        async with httpx.AsyncClient(
-            headers=self._resolved_http_headers(server),
-            follow_redirects=False,
-            timeout=timeout,
-            transport=_McpPolicyAsyncHTTPTransport(),
-            trust_env=False,
-        ) as client:
-            yield client
+        headers = self._resolved_http_headers(server)
+        headers["Accept-Encoding"] = "identity"
+        transport = _McpPolicyAsyncHTTPTransport(max_response_bytes=max_response_bytes)
+        try:
+            async with httpx.AsyncClient(
+                headers=headers,
+                follow_redirects=False,
+                timeout=timeout,
+                transport=transport,
+                trust_env=False,
+            ) as client:
+                yield client
+                if transport.limit_error is not None:
+                    raise transport.limit_error
+        except BaseException as exc:
+            if transport.limit_error is not None and exc is not transport.limit_error:
+                raise transport.limit_error from exc
+            raise
 
     def _resolved_http_headers(self, server: McpServerSpec) -> dict[str, str]:
         if server.http is None:
@@ -1701,9 +1773,9 @@ class SdkMcpProvider:
 
 
 class _McpPolicyAsyncHTTPTransport:
-    """httpx async transport with MCP address policy enforced at connect time."""
+    """MCP address policy plus pre-materialization HTTP response bounds."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_response_bytes: int) -> None:
         try:
             import httpcore
             import httpx
@@ -1712,6 +1784,10 @@ class _McpPolicyAsyncHTTPTransport:
                 "MCP HTTP transport requires httpx/httpcore from the optional MCP dependency; "
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
+        if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
+            raise ValidationError("MCP HTTP max_response_bytes must be a positive integer")
+        self.max_response_bytes = max_response_bytes
+        self.limit_error: RuntimeError | None = None
         self._delegate = httpx.AsyncHTTPTransport(trust_env=False)
         self._delegate._pool = httpcore.AsyncConnectionPool(  # type: ignore[attr-defined]
             ssl_context=ssl.create_default_context(),
@@ -1732,10 +1808,105 @@ class _McpPolicyAsyncHTTPTransport:
         await self._delegate.__aexit__(exc_type, exc_value, traceback)
 
     async def handle_async_request(self, request: Any) -> Any:
-        return await self._delegate.handle_async_request(request)
+        request.headers["Accept-Encoding"] = "identity"
+        response = await self._delegate.handle_async_request(request)
+        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+        if content_encoding and content_encoding != "identity":
+            error = self._limit_failure(
+                f"MCP HTTP response uses unsupported Content-Encoding={content_encoding}"
+            )
+            await response.aclose()
+            raise error
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        response.stream = _bounded_mcp_http_stream(
+            response.stream,
+            max_response_bytes=self.max_response_bytes,
+            is_sse=content_type == "text/event-stream",
+            fail=self._limit_failure,
+        )
+        return response
+
+    def _limit_failure(self, message: str) -> RuntimeError:
+        error = RuntimeError(message)
+        self.limit_error = error
+        return error
 
     async def aclose(self) -> None:
         await self._delegate.aclose()
+
+
+class _McpHttpResponseLimiter:
+    """Count a complete body or one raw SSE event without buffering it."""
+
+    def __init__(self, *, max_response_bytes: int, is_sse: bool) -> None:
+        self.max_response_bytes = max_response_bytes
+        self.is_sse = is_sse
+        self.body_bytes = 0
+        self.frame_bytes = 0
+        self.line_has_data = False
+        self.pending_cr = False
+        self.pending_cr_reset = False
+
+    def feed(self, chunk: bytes) -> str | None:
+        if not self.is_sse:
+            self.body_bytes += len(chunk)
+            if self.body_bytes > self.max_response_bytes:
+                return f"MCP HTTP response exceeded max_response_bytes={self.max_response_bytes}"
+            return None
+        for value in chunk:
+            if self.pending_cr:
+                self.pending_cr = False
+                if value == 0x0A:
+                    if not self.pending_cr_reset:
+                        self.frame_bytes += 1
+                    self.pending_cr_reset = False
+                    if self.frame_bytes > self.max_response_bytes:
+                        return f"MCP HTTP SSE frame exceeded max_response_bytes={self.max_response_bytes}"
+                    continue
+                self.pending_cr_reset = False
+            self.frame_bytes += 1
+            if value == 0x0D:
+                blank_line = not self.line_has_data
+                self.line_has_data = False
+                self.pending_cr = True
+                self.pending_cr_reset = blank_line
+                if blank_line:
+                    self.frame_bytes = 0
+            elif value == 0x0A:
+                blank_line = not self.line_has_data
+                self.line_has_data = False
+                if blank_line:
+                    self.frame_bytes = 0
+            else:
+                self.line_has_data = True
+            if self.frame_bytes > self.max_response_bytes:
+                return f"MCP HTTP SSE frame exceeded max_response_bytes={self.max_response_bytes}"
+        return None
+
+
+def _bounded_mcp_http_stream(
+    stream: Any,
+    *,
+    max_response_bytes: int,
+    is_sse: bool,
+    fail: Callable[[str], RuntimeError],
+) -> Any:
+    import httpx
+
+    limiter = _McpHttpResponseLimiter(max_response_bytes=max_response_bytes, is_sse=is_sse)
+
+    class BoundedMcpHttpStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            async for chunk in stream:
+                message = limiter.feed(chunk)
+                if message is not None:
+                    raise fail(message)
+                yield chunk
+
+        async def aclose(self) -> None:
+            await stream.aclose()
+
+    return BoundedMcpHttpStream()
 
 
 class _McpPolicyNetworkBackend:
@@ -1838,12 +2009,11 @@ def _mcp_platform_env() -> dict[str, str]:
 
 
 @contextlib.asynccontextmanager
-async def _strict_stdio_client(server: Any):
+async def _strict_stdio_client(server: Any, *, max_frame_bytes: int):
     try:
         import anyio
         import anyio.lowlevel
         import mcp.types as mcp_types
-        from anyio.streams.text import TextReceiveStream
         from mcp.os.posix.utilities import terminate_posix_process_tree
         from mcp.os.win32.utilities import create_windows_process, get_windows_executable_command, terminate_windows_process_tree
         from mcp.shared.message import SessionMessage
@@ -1854,6 +2024,7 @@ async def _strict_stdio_client(server: Any):
         ) from exc
     read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
     write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
+    reader_errors: list[RuntimeError] = []
     process = None
     command = get_windows_executable_command(server.command) if sys.platform == "win32" else server.command
     try:
@@ -1878,15 +2049,42 @@ async def _strict_stdio_client(server: Any):
         assert process is not None and process.stdout
         try:
             async with read_stream_writer:
-                buffer = ""
-                async for chunk in TextReceiveStream(
-                    process.stdout,
-                    encoding=server.encoding,
-                    errors=server.encoding_error_handler,
-                ):
-                    lines = (buffer + chunk).split("\n")
-                    buffer = lines.pop()
-                    for line in lines:
+                buffer = bytearray()
+                while True:
+                    # Ask the byte stream for only the remaining frame capacity
+                    # plus one sentinel byte. The transport buffer therefore
+                    # never grows beyond max_frame_bytes + 1 before rejection,
+                    # even when AnyIO's default receive chunk is much larger.
+                    read_size = _mcp_stdio_read_size(len(buffer), max_frame_bytes)
+                    try:
+                        chunk = await process.stdout.receive(max_bytes=read_size)
+                    except anyio.EndOfStream:
+                        break
+                    if not chunk:
+                        break
+                    buffer.extend(chunk)
+                    while True:
+                        newline = buffer.find(b"\n")
+                        if newline < 0:
+                            if len(buffer) > max_frame_bytes:
+                                error = RuntimeError(
+                                    "MCP stdio frame exceeded "
+                                    f"max_response_bytes={max_frame_bytes}"
+                                )
+                                reader_errors.append(error)
+                                await read_stream_writer.send(error)
+                                return
+                            break
+                        if newline > max_frame_bytes:
+                            error = RuntimeError(
+                                "MCP stdio frame exceeded "
+                                f"max_response_bytes={max_frame_bytes}"
+                            )
+                            reader_errors.append(error)
+                            await read_stream_writer.send(error)
+                            return
+                        line = bytes(buffer[:newline])
+                        del buffer[: newline + 1]
                         try:
                             message = mcp_types.JSONRPCMessage.model_validate_json(line)
                         except Exception as exc:
@@ -1915,7 +2113,12 @@ async def _strict_stdio_client(server: Any):
         task_group.start_soon(stdout_reader)
         task_group.start_soon(stdin_writer)
         try:
-            yield read_stream, write_stream
+            try:
+                yield read_stream, write_stream
+            except BaseException as exc:
+                if reader_errors:
+                    raise reader_errors[0] from exc
+                raise
         finally:
             if process.stdin:
                 with contextlib.suppress(Exception):
@@ -1934,6 +2137,15 @@ async def _strict_stdio_client(server: Any):
             await write_stream.aclose()
             await read_stream_writer.aclose()
             await write_stream_reader.aclose()
+
+
+def _mcp_stdio_read_size(buffered_bytes: int, max_frame_bytes: int) -> int:
+    if max_frame_bytes < 1:
+        raise ValueError("max_frame_bytes must be positive")
+    remaining_with_sentinel = max_frame_bytes + 1 - buffered_bytes
+    if remaining_with_sentinel < 1:
+        raise ValueError("MCP stdio frame buffer already exceeds its hard limit")
+    return min(_MCP_STDIO_READ_CHUNK_BYTES, remaining_with_sentinel)
 
 
 def _run_mcp_async(awaitable: Any) -> Any:

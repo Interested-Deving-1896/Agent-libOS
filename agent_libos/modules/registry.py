@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -22,6 +23,7 @@ class RuntimeModuleRegistry:
     def __init__(self, runtime: "Runtime", *, config: AgentLibOSConfig | None = None) -> None:
         self.runtime = runtime
         self.config = config or DEFAULT_CONFIG
+        self._lifecycle_lock = getattr(runtime, "_registry_lifecycle_lock", threading.RLock())
         self._provider_hooks: list[tuple[str, str, StartupHook]] = []
         self._startup_hooks: list[tuple[str, str, StartupHook]] = []
         self._loaded_modules: dict[str, dict[str, Any]] = {}
@@ -31,6 +33,10 @@ class RuntimeModuleRegistry:
         self._startup_hooks_ran = False
 
     def load_core_module(self) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            return self._load_core_module_locked()
+
+    def _load_core_module_locked(self) -> dict[str, Any]:
         from agent_libos.modules.core import register_module
 
         manifest = ModuleManifest(
@@ -54,6 +60,20 @@ class RuntimeModuleRegistry:
         return self._load_from_entrypoint(source, register_module, enforce_provides=False)
 
     def load_startup_modules(
+        self,
+        manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
+        *,
+        trusted_modules: list[str] | tuple[str, ...] | None = None,
+        trusted_sha256: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lifecycle_lock:
+            return self._load_startup_modules_locked(
+                manifests,
+                trusted_modules=trusted_modules,
+                trusted_sha256=trusted_sha256,
+            )
+
+    def _load_startup_modules_locked(
         self,
         manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
         *,
@@ -94,6 +114,20 @@ class RuntimeModuleRegistry:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            return self._load_module_manifest_locked(
+                manifest_path,
+                trusted_modules=trusted_modules,
+                trusted_sha256=trusted_sha256,
+            )
+
+    def _load_module_manifest_locked(
+        self,
+        manifest_path: str | Path,
+        *,
+        trusted_modules: list[str] | tuple[str, ...] | None = None,
+        trusted_sha256: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         loader = ModuleLoader(
             self.config,
             trusted_modules=tuple(trusted_modules or ()),
@@ -123,33 +157,59 @@ class RuntimeModuleRegistry:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
-        loader = ModuleLoader(
-            self.config,
-            trusted_modules=tuple(trusted_modules or ()),
-            trusted_sha256=tuple(trusted_sha256 or ()),
-        )
-        return loader.verify(manifest_path)
+        with self._lifecycle_lock:
+            loader = ModuleLoader(
+                self.config,
+                trusted_modules=tuple(trusted_modules or ()),
+                trusted_sha256=tuple(trusted_sha256 or ()),
+            )
+            return loader.verify(manifest_path)
 
     def list_modules(self, limit: int | None = None) -> list[dict[str, Any]]:
-        selected_limit = self.config.modules.discover_limit if limit is None else limit
-        return self.runtime.store.list_runtime_modules(limit=selected_limit)
+        with self._lifecycle_lock:
+            selected_limit = self._bounded_discover_limit(limit)
+            return self.runtime.store.list_runtime_modules(limit=selected_limit)
+
+    def _bounded_discover_limit(self, limit: int | None) -> int:
+        selected = self.config.modules.discover_limit if limit is None else limit
+        if isinstance(selected, bool) or not isinstance(selected, int):
+            raise ValidationError("Runtime Module discover limit must be an integer")
+        if selected < 1:
+            raise ValidationError("Runtime Module discover limit must be >= 1")
+        if selected > self.config.modules.discover_limit:
+            raise ValidationError(
+                f"Runtime Module discover limit exceeds configured maximum {self.config.modules.discover_limit}"
+            )
+        return selected
 
     def inspect_module(self, module_id: str) -> dict[str, Any]:
-        found = self.runtime.store.get_runtime_module(module_id)
-        if found is None:
-            raise NotFound(f"runtime module not found: {module_id}")
-        return found
+        with self._lifecycle_lock:
+            found = self.runtime.store.get_runtime_module(module_id)
+            if found is None:
+                raise NotFound(f"runtime module not found: {module_id}")
+            return found
 
     def is_loaded(self, module_id: str, source_sha256: str | None = None) -> bool:
-        found = self._loaded_modules.get(module_id)
-        if found is None:
-            return False
-        return source_sha256 is None or found.get("source_sha256") == source_sha256
+        with self._lifecycle_lock:
+            found = self._loaded_modules.get(module_id)
+            if found is None:
+                return False
+            return source_sha256 is None or found.get("source_sha256") == source_sha256
 
-    def loaded_module_summaries(self) -> list[dict[str, Any]]:
-        return [dict(item) for item in sorted(self._loaded_modules.values(), key=lambda value: value["module_id"])]
+    def loaded_module_summaries(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValidationError("Runtime Module list limit must be a positive integer")
+        with self._lifecycle_lock:
+            selected = sorted(self._loaded_modules.values(), key=lambda value: value["module_id"])
+            if limit is not None:
+                selected = selected[:limit]
+            return [dict(item) for item in selected]
 
     def run_startup_hooks(self) -> None:
+        with self._lifecycle_lock:
+            self._run_startup_hooks_locked()
+
+    def _run_startup_hooks_locked(self) -> None:
         if self._startup_hooks_ran:
             return
         surface_snapshot = self._snapshot_runtime_surfaces()
@@ -171,10 +231,27 @@ class RuntimeModuleRegistry:
         self._startup_hooks_ran = True
 
     def shutdown(self) -> bool:
-        self._cleanup_all_module_imports()
-        return True
+        with self._lifecycle_lock:
+            self._cleanup_all_module_imports()
+            return True
 
     def _load_from_entrypoint(
+        self,
+        source: ModuleSource,
+        entrypoint: Any,
+        *,
+        enforce_provides: bool,
+        import_cleanup: tuple[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            return self._load_from_entrypoint_locked(
+                source,
+                entrypoint,
+                enforce_provides=enforce_provides,
+                import_cleanup=import_cleanup,
+            )
+
+    def _load_from_entrypoint_locked(
         self,
         source: ModuleSource,
         entrypoint: Any,

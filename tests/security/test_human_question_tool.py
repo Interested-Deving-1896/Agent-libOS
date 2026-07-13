@@ -7,12 +7,13 @@ import tempfile
 import threading
 import time
 from agent_libos import Runtime
-from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
+from agent_libos.models.exceptions import HumanResponseRequired, ProcessError, ValidationError
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     CapabilityRight,
     ExternalEffectRollbackStatus,
     HumanRequestStatus,
+    ProcessSignal,
     ProcessStatus,
 )
 from agent_libos.substrate import ProviderEffectNotStarted
@@ -26,6 +27,15 @@ class TestHumanQuestionTool:
 
     def teardown_method(self) -> None:
         self.runtime.close()
+
+    def test_human_process_interrupt_signal_rejects_message_semantics(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='reject ambiguous interrupt signal')
+
+        with pytest.raises(ProcessError, match='durable interrupt process message'):
+            self.runtime.human.interrupt(pid, ProcessSignal.INTERRUPT, {'reason': 'read this first'})
+
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert self.runtime.messages.unread(pid) == []
 
     def test_ask_human_tool_waits_and_returns_answer_after_queue_processing(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask a human')
@@ -264,6 +274,127 @@ class TestHumanQuestionTool:
         assert request.decision['reason']
         with pytest.raises(ValidationError, match='not pending'):
             self.runtime.human.approve(request_id, {'approved': True, 'answer': 'late'})
+
+    def test_signal_audit_failure_rolls_back_terminal_state_event_and_human_request(self, monkeypatch) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='atomic terminal signal')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Still pending after rollback?'},
+            blocking=True,
+        )
+        before_signal_events = [
+            event.event_id
+            for event in self.runtime.events.list(target=pid)
+            if event.type.value == 'process_signal'
+        ]
+        original_record = self.runtime.audit.record
+
+        def fail_signal_audit(*args, **kwargs):
+            if kwargs.get('action') == 'process.signal':
+                raise RuntimeError('injected signal audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_signal_audit)
+        with pytest.raises(RuntimeError, match='injected signal audit failure'):
+            self.runtime.process.cancel(pid, 'rollback the whole signal')
+
+        assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+        assert self.runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        assert [
+            event.event_id
+            for event in self.runtime.events.list(target=pid)
+            if event.type.value == 'process_signal'
+        ] == before_signal_events
+
+    def test_terminal_signal_attempts_notifier_when_process_finalizer_fails(self, monkeypatch) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='independent terminal cleanup')
+        notified: list[str] = []
+
+        monkeypatch.setattr(
+            self.runtime.process,
+            '_object_task_terminal_notifier',
+            notified.append,
+        )
+        monkeypatch.setattr(
+            self.runtime.process,
+            '_finalize_terminal_process',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('injected finalizer failure')),
+        )
+
+        self.runtime.process.cancel(pid, 'terminal cleanup failure is post-commit')
+
+        assert self.runtime.process.get(pid).status == ProcessStatus.KILLED
+        assert notified == [pid]
+        warnings = [
+            record
+            for record in self.runtime.audit.trace()
+            if record.action == 'process.signal_finalize_failed'
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].decision['errors'][0]['phase'] == 'process_finalize'
+
+    def test_process_exit_attempts_notifier_when_process_finalizer_fails(self, monkeypatch) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='independent exit cleanup')
+        notified: list[str] = []
+        monkeypatch.setattr(self.runtime.process, '_object_task_terminal_notifier', notified.append)
+        monkeypatch.setattr(
+            self.runtime.process,
+            '_finalize_terminal_process',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('injected exit finalizer failure')),
+        )
+
+        self.runtime.process.exit(pid, message='exit cleanup failure is post-commit')
+
+        assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
+        assert notified == [pid]
+        warnings = [
+            record
+            for record in self.runtime.audit.trace()
+            if record.action == 'process.exit_finalize_failed'
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].decision['errors'][0]['phase'] == 'process_finalize'
+
+    def test_process_exit_attempts_finalizer_when_terminal_notifier_fails(self, monkeypatch) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='independent exit notification')
+        finalized: list[str] = []
+        monkeypatch.setattr(
+            self.runtime.process,
+            '_object_task_terminal_notifier',
+            lambda _pid: (_ for _ in ()).throw(RuntimeError('injected exit notifier failure')),
+        )
+        monkeypatch.setattr(
+            self.runtime.process,
+            '_finalize_terminal_process',
+            lambda process, **_kwargs: finalized.append(process.pid),
+        )
+
+        self.runtime.process.exit(pid, message='exit notifier failure is post-commit')
+
+        assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
+        assert finalized == [pid]
+        warnings = [
+            record
+            for record in self.runtime.audit.trace()
+            if record.action == 'process.exit_finalize_failed'
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].decision['errors'][0]['phase'] == 'terminal_notify'
+
+    def test_terminal_notifier_attempts_object_tasks_when_human_cancellation_fails(self, monkeypatch) -> None:
+        notified: list[str] = []
+        monkeypatch.setattr(
+            self.runtime.human,
+            'cancel_pending_for_process',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('injected human failure')),
+        )
+        monkeypatch.setattr(self.runtime.object_tasks, 'notify_process_terminal', notified.append)
+
+        with pytest.raises(RuntimeError, match='terminal process notification failed'):
+            self.runtime._notify_process_terminal('agent_test')
+
+        assert notified == ['agent_test']
 
     def test_terminal_exit_does_not_wait_for_blocked_human_provider_read(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='cancel blocked human read')

@@ -93,21 +93,6 @@ class CapabilityDefaults:
     max_constraints_bytes: int = 16_384
     list_limit: int = 100
     decision_explain_preview_chars: int = 2_000
-    trusted_issuers: tuple[str, ...] = (
-        "system",
-        "runtime",
-        "runtime.bootstrap",
-        "cli",
-        "cli.admin",
-        "human:owner",
-        "human.approval",
-        "process.exec",
-        "process.spawn",
-        "checkpoint.restore",
-        "checkpoint.fork",
-        "checkpoint.create",
-    )
-    trusted_issuer_prefixes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -654,8 +639,6 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _nonnegative("capability.max_constraints_bytes", capability.max_constraints_bytes)
     _positive("capability.list_limit", capability.list_limit)
     _nonnegative("capability.decision_explain_preview_chars", capability.decision_explain_preview_chars)
-    _require_non_empty_items("capability.trusted_issuers", capability.trusted_issuers)
-    _require_non_empty_items("capability.trusted_issuer_prefixes", capability.trusted_issuer_prefixes)
 
     scheduler = config.scheduler
     _positive_optional("scheduler.max_quanta", scheduler.max_quanta)

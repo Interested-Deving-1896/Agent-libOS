@@ -16,6 +16,8 @@ class ObjectTaskStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     ABANDONED = "abandoned"
+    SUPERSEDED_BY_RESTORE = "superseded_by_restore"
+    RESULT_UNAVAILABLE_AFTER_REOPEN = "result_unavailable_after_reopen"
 
 
 class ObjectTaskNotificationStatus(StrEnum):

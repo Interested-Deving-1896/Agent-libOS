@@ -71,6 +71,7 @@ class RestoreCheckpointOutput(BaseModel):
         serialization_alias=_CANCELLED_HUMAN_REQS_KEY,
     )
     superseded_messages: list[str]
+    superseded_object_tasks: list[str]
     external_effects_since_checkpoint: list[dict[str, Any]]
 
 
@@ -149,13 +150,23 @@ class DiffCheckpointTool(SyncAgentTool[DiffCheckpointArgs]):
 
 class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
     name = "restore_checkpoint"
-    description = "Restore this checkpoint's process subtree. Requires checkpoint admin capability."
+    description = (
+        "Restore this checkpoint's process subtree. Requires checkpoint admin capability plus exact image admin "
+        "authority for each existing image changed by the snapshot, or exact image write authority for each missing image."
+    )
     args_schema = RestoreCheckpointArgs
     output_schema = RestoreCheckpointOutput
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"capability.write", "checkpoint.restore", "object.write", "process.lifecycle"},
+        declared_permissions={
+            "capability.write",
+            "checkpoint.restore",
+            "image.admin",
+            "image.write",
+            "object.write",
+            "process.lifecycle",
+        },
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["checkpoint", "restore", "high_risk"]

@@ -1508,6 +1508,65 @@ class TestObjectMemoryName:
         assert self.runtime.store.get_capability(src_once.capability_id).uses_remaining == 1
         assert self.runtime.store.get_capability(dst_once.capability_id).uses_remaining == 1
 
+    def test_link_objects_rechecks_source_authority_after_destination_preflight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='link revoke race')
+        src = self.runtime.memory.create_object(pid, ObjectType.ARTIFACT, {'side': 'src'})
+        dst = self.runtime.memory.create_object(pid, ObjectType.ARTIFACT, {'side': 'dst'})
+        original_authorize = self.runtime.capability.authorize_handle
+        revoked = False
+
+        def revoke_source_after_destination(*args, **kwargs):
+            nonlocal revoked
+            decision = original_authorize(*args, **kwargs)
+            handle = args[1]
+            if handle.oid == dst.oid and not revoked:
+                revoked = True
+                self.runtime.capability.revoke(
+                    src.capability_id,
+                    revoked_by='test',
+                    require_authority=False,
+                )
+            return decision
+
+        monkeypatch.setattr(self.runtime.capability, 'authorize_handle', revoke_source_after_destination)
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.link_objects(pid, src, 'references', dst)
+
+        assert self.runtime.store.list_links(src=src.oid) == []
+
+    def test_link_objects_rechecks_live_objects_after_destination_preflight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='link release race')
+        src = self.runtime.memory.create_object(pid, ObjectType.ARTIFACT, {'side': 'src'})
+        dst = self.runtime.memory.create_object(pid, ObjectType.ARTIFACT, {'side': 'dst'})
+        original_authorize = self.runtime.capability.authorize_handle
+        released = False
+
+        def release_source_after_destination(*args, **kwargs):
+            nonlocal released
+            decision = original_authorize(*args, **kwargs)
+            handle = args[1]
+            if handle.oid == dst.oid and not released:
+                released = True
+                assert self.runtime.memory.delete_object_trusted(
+                    'test',
+                    src.oid,
+                    reason='inject release between link checks',
+                )
+            return decision
+
+        monkeypatch.setattr(self.runtime.capability, 'authorize_handle', release_source_after_destination)
+        with pytest.raises((CapabilityDenied, NotFound)):
+            self.runtime.memory.link_objects(pid, src, 'references', dst)
+
+        assert self.runtime.store.get_object(src.oid) is None
+        assert self.runtime.store.list_links(src=src.oid) == []
+
     def test_delete_object_trusted_rolls_back_when_audit_write_fails(
         self,
         monkeypatch: pytest.MonkeyPatch,

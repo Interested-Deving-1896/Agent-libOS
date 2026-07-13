@@ -43,22 +43,35 @@ copied to temporary output directories so checked-in fixtures are not mutated.
 
 ## Runners
 
-Supported runner names are:
+Supported runner names and interventions are:
 
-- `direct_tool_wrapper`
-- `confirmation_wrapper`
-- `sandbox_only`
-- `agent_libos_full`
-- `no_primitive_approval`
-- `no_audit_linkage`
-- `no_namespace_isolation`
-- `no_fork_attenuation`
+| Runner | Intervention |
+| --- | --- |
+| `direct_tool_wrapper` | Direct wrapper baseline without Agent libOS primitive enforcement. |
+| `confirmation_wrapper` | Wrapper baseline that asks before configured risky actions. |
+| `sandbox_only` | Sandbox baseline without Agent libOS capability and audit enforcement. |
+| `agent_libos_full` | Full Agent libOS runtime boundary and evidence pipeline. |
+| `no_primitive_approval` | Agent libOS benchmark policy with primitive approval disabled. |
+| `no_audit_linkage` | Audit-linkage **observer** ablation described below. |
+| `no_namespace_isolation` | Benchmark Object Memory namespace isolation removed. |
+| `no_fork_attenuation` | Benchmark child-authority attenuation removed. |
 
 Wrapper and sandbox runners are baselines, not trusted security boundaries.
 Risky shell/network behavior is simulated where needed and recorded as effects.
 
 Agent libOS runners execute through the runtime, using process capabilities,
 primitive checks, human policy, audit records, and persisted LLM calls.
+
+`no_audit_linkage` does not pretend that the runtime stopped producing audit
+rows. Its precise intervention is at the benchmark observer: audit rows are not
+passed to normalized-effect reconstruction, audit completeness is reported as
+zero, and the Explain summary is withheld. Persisted external-effect rows and
+explicit runtime-result denials remain available because they are independent
+evidence channels. An action that has no such evidence becomes missing/invalid;
+the ablation never reconstructs it from the hidden audit log. Operational call
+counters may still be measured internally, but they do not supply the safety
+oracle. The exact intervention strings are emitted in run provenance and result
+metadata so downstream tables cannot silently reinterpret the runner name.
 
 ## Running
 
@@ -112,7 +125,8 @@ The command rejects broad real-model runs unless `--limit 1` or exactly one
 
 `run_benchmark.py` writes:
 
-- `metadata.json`: selected suite, tasks, runners, LLM mode, and process id.
+- `metadata.json`: selected suite, tasks, runners, LLM mode, process id, and
+  CLI-run provenance.
 - `results.jsonl`: one `BenchmarkResult` row per task/runner.
 - `effects.jsonl`: one `EffectRecord` row per modeled effect.
 - `summary.json`: result/effect/ok/safety counts, selected runner and task id
@@ -241,6 +255,11 @@ rate fields (including task/safety/audit rates) become `null`, and the benchmark
 CLI exits nonzero. Invalid evidence is never silently folded into a favorable
 rate.
 
+Both entrypoints preserve that automation contract: `run_benchmark.py` exits
+nonzero after writing an invalid run, and a later standalone
+`collect_metrics.py <run-dir>` recomputation returns exit code 2 when
+`valid: false`.
+
 `metadata.json` is also a completion manifest. `run_benchmark.py` writes it
 before runner execution; its non-empty, unique `tasks` and `runners` lists
 therefore define the intended task×runner Cartesian product. Metrics are valid
@@ -255,16 +274,33 @@ caller supplied every task it originally intended; callers that need
 completion checking must write the intended metadata before execution, as the
 benchmark CLI does.
 
+CLI-created metadata also includes `provenance.schema_version: 1` with:
+
+- Git commit, dirty state, and a hash of tracked changes plus untracked file
+  content;
+- each selected task-file hash and each selected fixture-tree hash;
+- the serialized `DEFAULT_CONFIG` hash plus LLM mode and quantum bound;
+- selected runner intervention text and runner/oracle/metrics source hash;
+- Python implementation/version, OS release/architecture, dependency versions,
+  deterministic-Deno mode, and only a boolean for real-LLM credential presence.
+
+No credential value, hostname, or executable path is recorded. These fields let
+an artifact consumer distinguish code/workload/config/environment snapshots;
+the metrics collector currently checks matrix completeness, while release or
+paper packaging should additionally recompute and compare provenance hashes.
+Programmatic `write_run_outputs(...)` fallback metadata remains intentionally
+post-hoc and is not a provenance attestation.
+
 Do not mix the benchmark's counting layers when reporting results: `tasks` is
 the number of result rows, the rate denominators above count different qualified
 subsets of normalized effect records, and `tool_calls` / `primitive_calls` are
 runner-reported execution trace counts. `metrics.json` records these units in
 `count_units`.
 
-## Current Deterministic Validation Snapshot
+## Last Recorded Deterministic Validation Snapshot
 
-The repository's current token-free `agent_libos_full` 27-task run is valid and
-reports 27/27 task success, 27/27 safety pass, zero unauthorized performed
+The last recorded token-free `agent_libos_full` 27-task run was valid and
+reported 27/27 task success, 27/27 safety pass, zero unauthorized performed
 effects out of 22 definitely performed effects, zero unknown effects, and zero
 allowed denials out of 22 allowed performed-or-denied attempts
 (`false_denial_rate = 0/22 = 0%`). Human approval and the authorized attenuated
@@ -274,8 +310,10 @@ incompatible
 
 The cross-runner smoke over eight runners and three selected tasks produces 24
 result rows with no infrastructure failure or invalid output. These are
-repository validation snapshots, not a claim that the current 27-task harness
-is a complete paper evaluation.
+historical repository snapshots, neither validation of the current dirty
+working tree nor a claim that the 27-task harness is a complete paper
+evaluation. Consult [release_status.md](release_status.md) for current gates and
+rerun with provenance before publishing the counts.
 
 ## Practical workflow evidence levels
 

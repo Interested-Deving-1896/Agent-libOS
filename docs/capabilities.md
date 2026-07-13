@@ -75,7 +75,11 @@ Authority derivation uses public CapabilityManager transition APIs.
 `transition_allowed_rights()` reapplies expiry, finite-use duplication rules,
 and current restrictive policy for checkpoint/fork/restore transitions. These
 surfaces replace subsystem-local resource matching as the transition policy
-boundary.
+boundary. A single delegation commits its capability row, process attachment,
+grant event, and delegation audit together. Batch derivation validates every
+requested spec before publishing the first child record, then commits all
+delegations and the transition summary in one transaction. A late validation
+or evidence-sink failure therefore publishes none of the batch.
 
 ## Rights
 
@@ -187,14 +191,17 @@ Rules are not LLM judgments. They are local, deterministic policy facts. Unknown
 rule shapes, unknown constraint keys, and malformed values for known conditions
 fail closed. The primitive converts the final capability decision into a sandbox
 profile and records that profile in approval context, audit, and external-effect
-metadata where applicable.
+metadata where applicable. In particular, `timeout_s` and `timeout_max_s`
+conditions, and the operation `timeout_s` compared against them, must be finite
+non-negative numbers. Booleans, NaN, positive or negative infinity, and negative
+values are malformed and fail closed; zero and fractional values are valid.
 
 ## Issue, Delegate, Revoke
 
 All authority mutation goes through explicit operations:
 
-- `issue(actor, subject, spec)`: `actor` must be trusted, hold covering
-  `admin` authority, or hold both covering `grant` authority and covering
+- `issue(actor, subject, spec)`: `actor` must hold covering `admin` authority,
+  or hold both covering `grant` authority and covering
   `allow` capabilities for every right being transferred. `grant` is not a
   capability-minting right: it can only transfer rights the actor already has,
   cannot create `deny`/`ask` policy records, and cannot transfer finite-use
@@ -207,18 +214,24 @@ All authority mutation goes through explicit operations:
   later parent revocation or expiry stops the child record from authorizing.
   Child records cannot drop parent constraints such as `shell_policy_level`.
   Delegation also cannot launder an overlapping parent `deny`/`ask` or malformed
-  authority rule by selecting a narrower allow.
-- `revoke(actor, cap_id)`: allowed for trusted issuers, the original issuer,
-  the holder relinquishing its own capability, or an actor with covering
-  `revoke`/`admin` authority.
+  authority rule by selecting a narrower allow. The child record is not
+  observable unless its process attachment, event, and audit evidence all
+  commit.
+- `revoke(actor, cap_id)`: allowed for the original issuer, the holder
+  relinquishing its own capability, or an actor with covering `revoke`/`admin`
+  authority. Target mutation, finite authority reservation/commit, the revoke
+  event, and revoke audit all share one store transaction. A validation or
+  evidence-sink failure therefore neither publishes the revocation nor consumes
+  its finite authority.
 
 Runtime bootstrap, image bootstrap, human approval, admin CLI, checkpoint
-restore/fork, and tests use explicit trusted issuer paths and emit audit
-records. Trusted issuers are exact configured actor names by default. The host
-configuration can also allow audited trusted issuer prefixes for controlled
-local integrations; the default prefix list is empty.
-Ordinary AgentProcess, Skill, and JIT tool execution has no implicit signing
-authority.
+restore/fork, and tests use explicit embedding-host paths such as
+`issue_trusted()` and emit audit records. These methods, along with operations
+that explicitly set `require_authority=false`, are host API bypasses: the actor
+string is attribution, not authentication, and no configured name or prefix
+makes an ordinary caller trusted. They must not be exposed to an AgentProcess,
+model, Skill, or JIT tool. Ordinary execution must use the checked `issue()`,
+delegation, and revocation paths and has no implicit signing authority.
 
 Fork and spawn inherit authority only through delegation/attenuation. Exec
 switches the image/tool table and may shrink capabilities, but it never grants
@@ -447,6 +460,13 @@ exact finite-use mutation right is reserved and one pending effect intent spans
 both `state()` and the mutation. Read/list similarly use one reservation and
 intent across their state and data/metadata reads.
 
+That shared intent is an authorization and durable-evidence boundary, not a
+serializable host-filesystem transaction. Runtime state checks and provider
+mutation are separate host operations, and another host process can race them.
+The provider therefore revalidates containment and no-follow conditions at the
+mutation boundary, but callers must not interpret the prior `state()` result as
+a globally locked filesystem snapshot.
+
 If the first provider observation certifies `ProviderEffectNotStarted`, the
 reservation and pending row are atomically restored/abandoned. If `state()`
 already returned information but the main mutation then certifies not-started,
@@ -499,6 +519,17 @@ For bare executables, the local provider resolves argv[0] on a safe host PATH
 and refuses a resolution inside the workspace or selected process cwd. Shell
 subprocesses receive a constrained environment with `HOME` and `USERPROFILE`
 pointing at the workspace root instead of the host user's real home.
+
+An authorized Shell subprocess still runs as the host user. Argv policy, safe
+PATH resolution, the constrained environment, and resource monitoring are not
+an operating-system filesystem or network sandbox. Filesystem and JSON-RPC
+Capabilities govern their corresponding runtime primitives; they cannot mediate
+direct file or network I/O performed by an authorized child executable. Use the
+Deno JIT boundary when code requires an OS-backed syscall allowlist. On Windows,
+the local Shell provider rejects budgeted execution that supplies
+`SubprocessLimits` because it cannot enforce that profile; unbudgeted Shell
+execution may still run, while Deno uses its separate Windows supervision and
+budget backend.
 
 Shell command risk is classified by argv-token rules before the provider runs:
 

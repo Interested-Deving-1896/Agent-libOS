@@ -113,6 +113,13 @@ host-side effects that the runtime cannot compensate, so hooks should be kept
 small and idempotent and should not treat a registry rollback as an
 external-effect rollback.
 
+The runtime serializes module resolution, import, buffered application, hook
+execution, rollback, failed-record publication, and shutdown cleanup with the
+same re-entrant registry lifecycle lock used by ToolBroker and ImageRegistry.
+A failed module snapshot restore therefore cannot erase a successful module or
+registry publication that raced with it. Module list limits must be positive
+integers no larger than `ModuleDefaults.discover_limit`.
+
 `Runtime.open()` runs all configured startup hooks before returning. If host code
 manually calls `runtime.modules.load_module_manifest()` after startup has already
 completed, that module's provider and startup hooks run immediately; failure

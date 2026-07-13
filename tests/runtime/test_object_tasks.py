@@ -78,6 +78,63 @@ class SlowSyncSideEffectTool(SyncAgentTool[EmptyArgs]):
 
 
 class TestObjectTasks:
+    def test_runtime_reopen_marks_terminal_result_unavailable_when_payload_was_runtime_only(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / "object-task-result-reopen.sqlite"
+        runtime = Runtime.open(database)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="persist ObjectTask history")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.completed_at is not None
+            assert completed.result_oid is not None
+            result_oid = str(completed.result_oid)
+            completed_at = completed.completed_at
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            recovered = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert recovered.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert recovered.result_oid is None
+            assert recovered.completed_at == completed_at
+            assert recovered.wait["result_unavailable_after_reopen"] is True
+            assert recovered.wait["previous_status"] == ObjectTaskStatus.SUCCEEDED.value
+            assert recovered.wait["previous_result_oid"] == result_oid
+            assert "runtime reopen" in str(recovered.error)
+            assert reopened.store.get_object(result_oid) is None
+            assert any(
+                entry.action == "object_task.result_unavailable_recovered"
+                and task.task_id in entry.decision.get("task_ids", [])
+                for entry in reopened.audit.trace()
+            )
+        finally:
+            reopened.close()
+
+        reopened_again = Runtime.open(database)
+        try:
+            recovered_again = reopened_again.object_tasks.get(task.task_id, actor_pid=pid)
+            assert recovered_again.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert recovered_again.result_oid is None
+            assert recovered_again.completed_at == completed_at
+            assert recovered_again.wait["previous_result_oid"] == result_oid
+            assert len(
+                [
+                    entry
+                    for entry in reopened_again.audit.trace()
+                    if entry.action == "object_task.result_unavailable_recovered"
+                    and task.task_id in entry.decision.get("task_ids", [])
+                ]
+            ) == 1
+        finally:
+            reopened_again.close()
+
     def test_cross_actor_task_view_and_cancel_consume_one_shot_authority(self) -> None:
         runtime = Runtime.open("local")
         try:

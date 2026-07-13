@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -163,6 +164,12 @@ class CapabilityManager:
         revocable: bool = True,
         max_delegation_depth: int | None = None,
     ) -> Capability:
+        """Issue authority from a trusted embedding-host code path.
+
+        This is an explicit host bypass, not an actor-name authentication
+        mechanism. Process, model, Skill, and JIT surfaces must use ``issue``
+        or a primitive that performs the corresponding authority checks.
+        """
         return self.issue(
             actor=issued_by,
             subject=subject,
@@ -222,6 +229,22 @@ class CapabilityManager:
         actor: str | None = None,
     ) -> Capability:
         selected = self._coerce_spec(spec)
+        # A delegated capability is not visible until its process attachment,
+        # grant event, and audit evidence can all commit together.  In
+        # particular, an audit sink failure must not leave the caller with an
+        # active child capability after delegate() reports an error.
+        with self.store.transaction():
+            cap = self._delegate_selected(parent, child, selected, actor=actor)
+        return cap
+
+    def _delegate_selected(
+        self,
+        parent: str,
+        child: str,
+        selected: CapabilitySpec,
+        *,
+        actor: str | None,
+    ) -> Capability:
         parent_cap = self._find_delegation_parent(parent, selected)
         self._validate_delegation_parent(parent_cap, selected)
         child_max_depth = self._delegated_max_delegation_depth(parent_cap, selected)
@@ -354,33 +377,42 @@ class CapabilityManager:
         """Derive child authority through one audited transition entry point."""
 
         ceiling = list(ceiling_specs or [])
+        selected_specs = [self._coerce_spec(requested) for requested in requested_specs]
         derived: list[Capability] = []
-        for requested in requested_specs:
-            selected = self._coerce_spec(requested)
-            if ceiling and not any(self.spec_covers(limit, selected) for limit in ceiling):
-                raise CapabilityDenied(
-                    f"{transition_kind} authority exceeds transition ceiling: "
-                    f"{selected.resource} rights={sorted(selected.rights)}"
+        transition_actor = actor or f"authority_transition:{transition_kind}"
+        # Validate the complete transition before publishing its first grant,
+        # then keep all delegated rows and evidence under one outer
+        # transaction.  The store lock also prevents a parent capability from
+        # changing between validation and insertion.
+        with self.store.transaction():
+            for selected in selected_specs:
+                if ceiling and not any(self.spec_covers(limit, selected) for limit in ceiling):
+                    raise CapabilityDenied(
+                        f"{transition_kind} authority exceeds transition ceiling: "
+                        f"{selected.resource} rights={sorted(selected.rights)}"
+                    )
+                parent_cap = self._find_delegation_parent(source_subject, selected)
+                self._validate_delegation_parent(parent_cap, selected)
+            for selected in selected_specs:
+                derived.append(
+                    self._delegate_selected(
+                        source_subject,
+                        target_subject,
+                        selected,
+                        actor=transition_actor,
+                    )
                 )
-            derived.append(
-                self.delegate(
-                    source_subject,
-                    target_subject,
-                    selected,
-                    actor=actor or f"authority_transition:{transition_kind}",
-                )
+            self.audit.record(
+                actor=actor or source_subject,
+                action="capability.derive_authority",
+                target=f"{source_subject}->{target_subject}",
+                capability_refs=[cap.cap_id for cap in derived],
+                decision={
+                    "transition_kind": transition_kind,
+                    "derived": len(derived),
+                    "ceiling_applied": bool(ceiling),
+                },
             )
-        self.audit.record(
-            actor=actor or source_subject,
-            action="capability.derive_authority",
-            target=f"{source_subject}->{target_subject}",
-            capability_refs=[cap.cap_id for cap in derived],
-            decision={
-                "transition_kind": transition_kind,
-                "derived": len(derived),
-                "ceiling_applied": bool(ceiling),
-            },
-        )
         return derived
 
     def is_expired(self, capability: Capability) -> bool:
@@ -936,39 +968,40 @@ class CapabilityManager:
             authority_decision = self._require_revoke_authority(revoked_by, cap)
         else:
             authority_decision = None
-        authority_reservation = self.reserve_decision_use(
-            authority_decision,
-            used_by=revoked_by,
-            reason="one-time revoke authority reserved",
-        )
-        revoked = replace(cap, status=CapabilityStatus.REVOKED)
-        try:
-            self.store.update_capability(revoked)
-        except Exception:
-            self.restore_reserved_use(
-                authority_reservation,
-                restored_by=revoked_by,
-                reason="one-time revoke authority restored before target mutation",
+        # The target mutation, finite authority settlement, event, and audit
+        # are one authority transition. A sink failure must not leave either a
+        # revoked target or a consumed one-shot revoke grant behind.
+        with self.store.transaction():
+            current = self.store.get_capability(cap_id)
+            if current is None:
+                raise NotFound(f"capability not found: {cap_id}")
+            if not current.revocable:
+                raise CapabilityDenied(f"capability is not revocable: {cap_id}")
+            authority_reservation = self.reserve_decision_use(
+                authority_decision,
+                used_by=revoked_by,
+                reason="one-time revoke authority reserved",
             )
-            raise
-        self.commit_reserved_use(
-            authority_reservation,
-            committed_by=revoked_by,
-            reason="one-time revoke authority committed",
-        )
-        self.events.emit(
-            EventType.CAPABILITY_REVOKED,
-            source=revoked_by,
-            target=cap.subject,
-            payload={"capability_id": cap_id, "reason": reason},
-        )
-        self.audit.record(
-            actor=revoked_by,
-            action="capability.revoke",
-            target=cap.resource,
-            capability_refs=[cap_id],
-            decision={"revoked": True, "reason": reason, "subject": cap.subject},
-        )
+            revoked = replace(current, status=CapabilityStatus.REVOKED)
+            self.store.update_capability(revoked)
+            self.commit_reserved_use(
+                authority_reservation,
+                committed_by=revoked_by,
+                reason="one-time revoke authority committed",
+            )
+            self.events.emit(
+                EventType.CAPABILITY_REVOKED,
+                source=revoked_by,
+                target=current.subject,
+                payload={"capability_id": cap_id, "reason": reason},
+            )
+            self.audit.record(
+                actor=revoked_by,
+                action="capability.revoke",
+                target=current.resource,
+                capability_refs=[cap_id],
+                decision={"revoked": True, "reason": reason, "subject": current.subject},
+            )
         return revoked
 
     def disable_subject_capability(
@@ -1797,11 +1830,8 @@ class CapabilityManager:
                 except re.error:
                     malformed.append("regex_token")
         for key in ("timeout_s", "timeout_max_s"):
-            if key in conditions:
-                try:
-                    float(conditions[key])
-                except (TypeError, ValueError):
-                    malformed.append(key)
+            if key in conditions and self._finite_nonnegative_timeout(conditions[key]) is None:
+                malformed.append(key)
         return sorted(set(malformed))
 
     def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
@@ -1851,18 +1881,28 @@ class CapabilityManager:
             if key in conditions and context.get(key) != conditions[key]:
                 return False
         if "timeout_s" in conditions:
-            try:
-                if float(context.get("timeout_s")) != float(conditions["timeout_s"]):
-                    return False
-            except (TypeError, ValueError):
+            actual_timeout = self._finite_nonnegative_timeout(context.get("timeout_s"))
+            expected_timeout = self._finite_nonnegative_timeout(conditions["timeout_s"])
+            if actual_timeout is None or expected_timeout is None or actual_timeout != expected_timeout:
                 return False
         if "timeout_max_s" in conditions:
-            try:
-                if float(context.get("timeout_s")) > float(conditions["timeout_max_s"]):
-                    return False
-            except (TypeError, ValueError):
+            actual_timeout = self._finite_nonnegative_timeout(context.get("timeout_s"))
+            maximum_timeout = self._finite_nonnegative_timeout(conditions["timeout_max_s"])
+            if actual_timeout is None or maximum_timeout is None or actual_timeout > maximum_timeout:
                 return False
         return True
+
+    @staticmethod
+    def _finite_nonnegative_timeout(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            selected = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(selected) or selected < 0:
+            return None
+        return selected
 
     def _argv_condition_matches(self, conditions: dict[str, Any], context: dict[str, Any]) -> bool:
         expected = conditions.get("argv")
@@ -1944,11 +1984,6 @@ class CapabilityManager:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
-
-    def _is_trusted_issuer(self, actor: str) -> bool:
-        if actor in self.config.capability.trusted_issuers:
-            return True
-        return any(actor.startswith(prefix) for prefix in self.config.capability.trusted_issuer_prefixes)
 
     def _issuer_chain(self, cap: Capability) -> list[str]:
         chain: list[str] = []

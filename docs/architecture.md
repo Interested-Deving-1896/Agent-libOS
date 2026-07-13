@@ -90,7 +90,9 @@ causality from pid and time proximity. See
 
 The Resource Provider Substrate owns concrete host calls. A provider is a
 backend, not a security bypass. Replacing the filesystem or shell provider must
-not change tool schemas or skip primitive authorization.
+not change tool schemas or skip primitive authorization. The concrete provider
+inventory, containment guarantees, extension checklist, and environment
+limitations are documented in [Providers](providers.md).
 
 Filesystem, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
 the public [`agent_libos.sdk`](protected_operation_sdk.md) contract. The SDK is
@@ -312,13 +314,24 @@ cache snapshot. If rollback or savepoint cleanup also fails, the store is
 poisoned and closed; every later operation fails closed. See
 [Runtime Storage](storage.md) for the complete recovery and lease contract.
 
-Audit and events are append-only. Checkpoint restore must not delete them.
+Audit and events are append-only through the Runtime Store API, and checkpoint
+restore must not delete them. This is a runtime invariant rather than a claim
+that a host or database administrator cannot tamper with storage; deployments
+that require independently verifiable evidence need an external immutable sink
+or signed export.
 Limited audit views select the latest matching records first and return that
 window in chronological order, so GUI snapshots and per-process audit pages keep
 showing new records as the log grows. Shell execution records an intent audit
 record immediately before crossing into the shell provider; the result, timeout,
 or resource-limit audit record uses the intent record as its parent and
 correlation id.
+
+Event consumers are bounded at query time rather than loading the durable log
+and slicing it in application memory. Runtime/LLM context uses its configured
+recent-event limit; GUI snapshots use `gui.snapshot_event_limit`; and the
+per-process GUI route accepts a bounded `limit` plus a `before` event-id cursor
+for older pages. Each newest or cursor-bounded SQL window is returned in
+chronological order. The GUI does not expose an unbounded "all events" API.
 
 ## Module Map
 

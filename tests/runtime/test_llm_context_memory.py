@@ -47,6 +47,54 @@ def _grant_context_compressor_authority(runtime: Runtime, pid: str) -> None:
 
 class TestLLMContextMemory:
 
+    def test_llm_quantum_reads_a_store_bounded_event_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm_context=replace(DEFAULT_CONFIG.llm_context, recent_event_limit=3),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='bounded events')
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 2}},
+            ])
+            original_list_events = runtime.store.list_events
+            calls: list[tuple[str | None, int | None, str | None]] = []
+
+            def tracked_list_events(
+                target: str | None = None,
+                limit: int | None = None,
+                before_event_id: str | None = None,
+                after_event_id: str | None = None,
+            ) -> list[Any]:
+                calls.append((target, limit, after_event_id))
+                return original_list_events(
+                    target=target,
+                    limit=limit,
+                    before_event_id=before_event_id,
+                    after_event_id=after_event_id,
+                )
+
+            monkeypatch.setattr(runtime.store, 'list_events', tracked_list_events)
+
+            runtime.run_next_process_once()
+            first_cursor = runtime.process.get(pid).event_cursor
+            assert first_cursor is not None
+            runtime.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source='event-cursor-test',
+                target=pid,
+                payload={'step': 2},
+            )
+            runtime.run_next_process_once()
+
+            assert (pid, 3, None) in calls
+            assert (pid, 3, first_cursor) in calls
+            assert runtime.process.get(pid).event_cursor != first_cursor
+        finally:
+            runtime.close()
+
     def test_llm_context_is_process_readable_writable_memory_object(self) -> None:
         runtime = Runtime.open('local')
         try:

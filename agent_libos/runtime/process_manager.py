@@ -580,17 +580,15 @@ class ProcessManager:
     ) -> AgentProcess:
         child_proc = self._require_child(pid, child)
         sig = ProcessSignal(signal)
-        self._apply_signal(
+        updated = self._apply_signal(
             child_proc,
             sig,
             payload={"reason": reason} if reason else {},
             actor=pid,
             action="process.signal_child",
         )
-        updated = self._get(child)
         if updated.status in self.TERMINAL_STATUSES:
-            self._wake_parent_waiting_on_child(updated)
-            self._notify_object_task_process_terminal(updated.pid)
+            self._complete_terminal_signal(updated, actor=pid, signal=sig)
         return updated
 
     def merge_child_memory(
@@ -627,11 +625,9 @@ class ProcessManager:
     def signal(self, target: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> None:
         proc = self._get(target)
         sig = ProcessSignal(signal)
-        self._apply_signal(proc, sig, payload=payload or {}, actor="runtime", action="process.signal")
-        updated = self._get(target)
+        updated = self._apply_signal(proc, sig, payload=payload or {}, actor="runtime", action="process.signal")
         if updated.status in self.TERMINAL_STATUSES:
-            self._wake_parent_waiting_on_child(updated)
-            self._notify_object_task_process_terminal(updated.pid)
+            self._complete_terminal_signal(updated, actor="runtime", signal=sig)
 
     def _apply_signal(
         self,
@@ -640,38 +636,93 @@ class ProcessManager:
         payload: dict[str, Any],
         actor: str,
         action: str,
-    ) -> None:
-        if proc.status in self.TERMINAL_STATUSES:
-            raise ProcessError(f"cannot signal terminal process: {proc.pid} status={proc.status.value}")
-        if sig == ProcessSignal.PAUSE:
-            if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
-                raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
-            proc.status = ProcessStatus.PAUSED
-        elif sig == ProcessSignal.RESUME:
-            if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
-                raise ProcessError(f"cannot resume waiting process: {proc.pid} status={proc.status.value}")
-            if proc.status in {ProcessStatus.PAUSED, ProcessStatus.SUSPENDED}:
-                proc.status = ProcessStatus.RUNNABLE
-        elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
-            proc.status = ProcessStatus.KILLED
-        proc.status_message = payload.get("reason")
-        proc.updated_at = utc_now()
-        self.store.update_process(proc)
-        if proc.status in self.TERMINAL_STATUSES:
-            self._release_child_budget(proc.pid)
-            self._finalize_terminal_process(proc, preserve_oids=set())
-        self.events.emit(
-            EventType.PROCESS_SIGNAL,
-            source=actor,
-            target=proc.pid,
-            payload={"signal": sig.value, "payload": payload or {}},
-        )
-        self.audit.record(
+    ) -> AgentProcess:
+        # Persist the process state, reservation release, parent wakeup, event,
+        # and audit as one lifecycle transition.  Object/Host cleanup and
+        # terminal callbacks remain post-commit because their external effects
+        # cannot be rolled back with the SQL transaction.
+        with self.store.transaction():
+            proc = self._get(proc.pid)
+            if proc.status in self.TERMINAL_STATUSES:
+                raise ProcessError(f"cannot signal terminal process: {proc.pid} status={proc.status.value}")
+            if sig == ProcessSignal.INTERRUPT:
+                raise ProcessError(
+                    "process interrupt signals are not state transitions; "
+                    "send a durable interrupt process message instead"
+                )
+            if sig == ProcessSignal.PAUSE:
+                if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
+                    raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
+                proc.status = ProcessStatus.PAUSED
+            elif sig == ProcessSignal.RESUME:
+                if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
+                    raise ProcessError(f"cannot resume waiting process: {proc.pid} status={proc.status.value}")
+                if proc.status in {ProcessStatus.PAUSED, ProcessStatus.SUSPENDED}:
+                    proc.status = ProcessStatus.RUNNABLE
+            elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
+                proc.status = ProcessStatus.KILLED
+            proc.status_message = payload.get("reason")
+            proc.updated_at = utc_now()
+            self.store.update_process(proc)
+            if proc.status in self.TERMINAL_STATUSES:
+                self._release_child_budget(proc.pid)
+            self.events.emit(
+                EventType.PROCESS_SIGNAL,
+                source=actor,
+                target=proc.pid,
+                payload={"signal": sig.value, "payload": payload or {}},
+            )
+            self.audit.record(
+                actor=actor,
+                action=action,
+                target=f"process:{proc.pid}",
+                decision={"signal": sig.value, "payload": payload or {}},
+            )
+            if proc.status in self.TERMINAL_STATUSES:
+                self._wake_parent_waiting_on_child(proc)
+        return proc
+
+    def _complete_terminal_signal(self, process: AgentProcess, *, actor: str, signal: ProcessSignal) -> None:
+        self._complete_terminal_cleanup(
+            process,
             actor=actor,
-            action=action,
-            target=f"process:{proc.pid}",
-            decision={"signal": sig.value, "payload": payload or {}},
+            audit_action="process.signal_finalize_failed",
+            preserve_oids=set(),
+            context={"signal": signal.value},
         )
+
+    def _complete_terminal_cleanup(
+        self,
+        process: AgentProcess,
+        *,
+        actor: str,
+        audit_action: str,
+        preserve_oids: set[str],
+        context: dict[str, Any],
+    ) -> None:
+        errors: list[dict[str, str]] = []
+        try:
+            self._notify_object_task_process_terminal(process.pid)
+        except Exception as exc:
+            errors.append({"phase": "terminal_notify", "error": f"{type(exc).__name__}: {exc}"})
+        try:
+            self._finalize_terminal_process(process, preserve_oids=preserve_oids)
+        except Exception as exc:
+            errors.append({"phase": "process_finalize", "error": f"{type(exc).__name__}: {exc}"})
+        if not errors:
+            return
+        try:
+            self.audit.record(
+                actor=actor,
+                action=audit_action,
+                target=f"process:{process.pid}",
+                decision={**context, "errors": errors},
+            )
+        except Exception:
+            # The terminal transition is already durable.  A secondary warning
+            # sink failure must not turn a committed signal into a retryable
+            # API error or skip the remaining cleanup phase.
+            pass
 
     def pause(self, pid: str, reason: str) -> None:
         self.signal(pid, ProcessSignal.PAUSE, {"reason": reason})
@@ -714,8 +765,13 @@ class ProcessManager:
                 decision={"status": process.status.value, "message": message},
             )
             self._wake_parent_waiting_on_child(process)
-        self._finalize_terminal_process(process, preserve_oids={result.oid} if result is not None else set())
-        self._notify_object_task_process_terminal(process.pid)
+        self._complete_terminal_cleanup(
+            process,
+            actor=pid,
+            audit_action="process.exit_finalize_failed",
+            preserve_oids={result.oid} if result is not None else set(),
+            context={"status": process.status.value, "result_oid": result.oid if result is not None else None},
+        )
 
     def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:
         errors: list[str] = []
@@ -725,18 +781,25 @@ class ProcessManager:
                 continue
             try:
                 self._finalize_terminal_process(process, preserve_oids=set())
+            except Exception as exc:
+                errors.append(f"{pid}: process_finalize: {type(exc).__name__}: {exc}")
+            try:
                 self.events.emit(
                     EventType.PROCESS_EXITED,
                     source=pid,
                     target=process.parent_pid,
                     payload={"pid": pid, "status": process.status.value, "result_oid": None, "reason": reason},
                 )
+            except Exception as exc:
+                errors.append(f"{pid}: exit_event: {type(exc).__name__}: {exc}")
+            try:
                 self._notify_object_task_process_terminal(pid)
             except Exception as exc:
                 # A resource kill can cover an entire descendant tree. One
-                # process' cleanup failure must not strand every later killed
-                # process; report the aggregate after attempting them all.
-                errors.append(f"{pid}: {type(exc).__name__}: {exc}")
+                # phase or process' cleanup failure must not skip the remaining
+                # phases or strand every later killed process. Report the
+                # aggregate after attempting them all.
+                errors.append(f"{pid}: terminal_notify: {type(exc).__name__}: {exc}")
         if errors:
             raise RuntimeError("killed process finalization failed: " + "; ".join(errors))
 
@@ -770,8 +833,17 @@ class ProcessManager:
     def get(self, pid: str) -> AgentProcess:
         return self._get(pid)
 
-    def list(self) -> builtins.list[AgentProcess]:
-        return self.store.list_processes()
+    def list(
+        self,
+        *,
+        limit: int | None = None,
+        active_first: bool = False,
+    ) -> builtins.list[AgentProcess]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValidationError("process list limit must be a positive integer")
+        if not isinstance(active_first, bool):
+            raise ValidationError("process active_first must be boolean")
+        return self.store.list_processes(limit=limit, active_first=active_first)
 
     def _get(self, pid: str) -> AgentProcess:
         process = self.store.get_process(pid)

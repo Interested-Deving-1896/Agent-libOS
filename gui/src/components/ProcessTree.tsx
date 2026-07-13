@@ -32,8 +32,12 @@ export function ProcessTree({ processes, selectedPid, onSelect }: ProcessTreePro
 export function indexProcessTree(processes: RuntimeProcess[]) {
   const roots: RuntimeProcess[] = [];
   const children = new Map<string, RuntimeProcess[]>();
+  const visiblePids = new Set(processes.map((process) => process.pid));
   for (const process of processes) {
-    if (!process.parent_pid) {
+    // A source-bounded snapshot can contain a high-priority child while its
+    // lower-priority ancestor falls outside the visible window. Keep that
+    // child reachable instead of attaching it to an absent node.
+    if (!process.parent_pid || !visiblePids.has(process.parent_pid)) {
       roots.push(process);
       continue;
     }

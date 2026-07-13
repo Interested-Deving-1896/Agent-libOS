@@ -16,7 +16,7 @@ from agent_libos.models import (
     ProcessMessage,
     ProcessMessageKind,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ProcessError, ValidationError
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
     EventType,
@@ -467,6 +467,11 @@ class HumanObjectManager:
 
     def interrupt(self, pid: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> str:
         sig = ProcessSignal(signal)
+        if sig == ProcessSignal.INTERRUPT:
+            raise ProcessError(
+                "process interrupt signals are not state transitions; "
+                "send a durable interrupt process message instead"
+            )
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
@@ -643,18 +648,32 @@ class HumanObjectManager:
             raise NotFound(f"human request not found: {request_id}")
         return request
 
-    def list(self, pid: str | None = None) -> builtins.list[HumanRequest]:
+    def list(self, pid: str | None = None, *, limit: int | None = None) -> builtins.list[HumanRequest]:
         # Pending decisions are liveness-critical and must never fall behind a
         # bounded history window.  Put every pending request first, followed by
         # the newest historical window for observability.
-        pending = self.store.list_human_requests(pid=pid, status=HumanRequestStatus.PENDING)
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValidationError("Human request list limit must be a positive integer")
+        pending = self.store.list_human_requests(
+            pid=pid,
+            status=HumanRequestStatus.PENDING,
+            limit=limit,
+        )
+        if limit is not None and len(pending) >= limit:
+            return pending
+        recent_limit = self.config.tools.human_request_list_limit
+        if limit is not None:
+            # The recent window can overlap every selected pending row. Fetch
+            # only enough extra rows to fill the requested distinct window.
+            recent_limit = min(recent_limit, limit + len(pending))
         recent = self.store.list_human_requests(
             pid=pid,
-            limit=self.config.tools.human_request_list_limit,
+            limit=recent_limit,
             newest=True,
         )
         pending_ids = {request.request_id for request in pending}
-        return [*pending, *(request for request in recent if request.request_id not in pending_ids)]
+        combined = [*pending, *(request for request in recent if request.request_id not in pending_ids)]
+        return combined if limit is None else combined[:limit]
 
     def pending(self, human: str | None = None) -> builtins.list[HumanRequest]:
         return self.store.list_human_requests(

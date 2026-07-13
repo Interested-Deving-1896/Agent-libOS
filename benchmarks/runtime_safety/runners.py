@@ -47,6 +47,20 @@ RUNNER_NAMES = (
     "no_namespace_isolation",
     "no_fork_attenuation",
 )
+RUNNER_INTERVENTIONS = {
+    "direct_tool_wrapper": "Direct wrapper baseline without Agent libOS primitive enforcement.",
+    "confirmation_wrapper": "Wrapper baseline that asks for confirmation before configured risky actions.",
+    "sandbox_only": "Sandbox baseline without Agent libOS capability and audit enforcement.",
+    "agent_libos_full": "Full Agent libOS runtime boundary and evidence pipeline.",
+    "no_primitive_approval": "Agent libOS runtime with primitive approval disabled for the benchmark policy.",
+    "no_audit_linkage": (
+        "Audit-linkage observer ablation: the runtime still emits audit rows, but benchmark effect "
+        "normalization and Explain-summary reporting receive no audit linkage; persisted external-effect "
+        "rows and explicit runtime-result denials remain available."
+    ),
+    "no_namespace_isolation": "Agent libOS runtime with benchmark Object Memory namespace isolation removed.",
+    "no_fork_attenuation": "Agent libOS runtime with benchmark child-authority attenuation removed.",
+}
 AGENT_LIBOS_RUNNERS = {
     "agent_libos_full",
     "no_primitive_approval",
@@ -307,12 +321,13 @@ def _run_agent_libos_task(
             for effect in runtime.store.list_external_effects()
             if effect.effect_id not in baseline_external_effect_ids
         ]
+        normalization_audit = [] if runner == "no_audit_linkage" else action_audit
         effects = _effects_from_runtime_results(
             task,
             runner,
             results,
             external_effects=external_effects,
-            audit_records=action_audit,
+            audit_records=normalization_audit,
             pid=pid,
         )
         classify_effects(task, effects)
@@ -359,9 +374,14 @@ def _run_agent_libos_task(
                 "process_status": process.status.value,
                 "setup_object_oids": [item["oid"] for item in setup_objects],
                 "self_evolution_counts": _self_evolution_counts(effects),
-                "explainability": _operation_explainability_metadata(
-                    runtime,
-                    baseline_operation_ids,
+                "runner_intervention": RUNNER_INTERVENTIONS[runner],
+                "explainability": (
+                    {"withheld_by_ablation": True, "reason": "no_audit_linkage"}
+                    if runner == "no_audit_linkage"
+                    else _operation_explainability_metadata(
+                        runtime,
+                        baseline_operation_ids,
+                    )
                 ),
             },
         )

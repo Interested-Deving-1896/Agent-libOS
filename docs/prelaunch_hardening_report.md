@@ -2,6 +2,13 @@
 
 日期：2026-07-10
 
+> **历史、commit-bound 快照。** 本报告描述并验证的是 Git commit
+> `3681d80b86e754ffc3ac6beae63ac76f1454432c` 当时的实现、命令面、测试数量与
+> 本机环境。它不是当前分支或 dirty working tree 的实时发布状态；后续提交的
+> 命令数、测试数、benchmark 计数和剩余环境 gate 不应回填或从本报告推断。
+> 当前行为以 [README](../README.md)、实现文档和
+> [支持与验证矩阵](support_matrix.md) 为准。
+
 ## 结论摘要
 
 本轮评审覆盖运行时、Capability、Object Memory、存储、Provider

@@ -1,0 +1,61 @@
+# Support and Validation Matrix
+
+This is the living distinction between code that exists, package versions the
+project intends to support, and environments exercised on every change. A
+feature is not “CI-covered” merely because it has a platform branch or mock
+test. The historical prelaunch report is not the current status source.
+
+Legend:
+
+- **CI**: exercised by the checked-in GitHub Actions workflow.
+- **Deterministic**: token-free/local test coverage, possibly with a fake or
+  loopback provider.
+- **Environment gate**: requires a real OS, desktop, service, SDK, or credential
+  and is intentionally outside the default deterministic matrix.
+- **Not implemented**: documentation must not present the surface as current.
+
+## Runtime and platform coverage
+
+| Surface | Declared/current implementation | Per-change CI | Remaining boundary |
+| --- | --- | --- | --- |
+| Python | Package declares 3.11–3.14 | Ubuntu on 3.11 and 3.14 for Python lanes | 3.12/3.13 are inside the declared range but are not separate per-change jobs |
+| SQLite RuntimeStore | Default local backend, file and in-memory targets | Ubuntu deterministic lanes | macOS/Windows filesystem ACL and locking behavior need native release-gate runs |
+| PostgreSQL RuntimeStore | Optional `postgres` extra | PostgreSQL 17 service on Ubuntu/Python 3.11 | Other supported server versions and deployment TLS/auth topology are operator gates |
+| Core process/shell containment | POSIX process groups plus platform-specific fallbacks | Ubuntu security/runtime/provider lanes | macOS and Windows native process-tree/resource behavior are not CI-covered |
+| Deno/TypeScript JIT | Deno required for real JIT; deterministic benchmark also has an explicit fake backend | Deno LTS on Ubuntu; real-Deno tests run when installed | Windows parent-death Job Object and macOS native behavior need release-gate runs |
+| PTY Runtime Module | POSIX PTY and optional Windows `pywinpty`/ConPTY path | POSIX paths on Ubuntu plus deterministic branch tests | Real Windows PTY/resize/close/parent-death integration is an environment gate |
+| JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
+| MCP client | Tools-only v1 over Streamable HTTP or stdio | Deterministic primitive/provider tests | Real MCP SDK/server integration uses the optional `mcp` extra and `--run-mcp` environment gate; Resources/Prompts are not implemented |
+| Real LLM | OpenAI Responses and OpenAI-compatible Chat profiles | Mock/action-selection paths only | Credentials and token-spending smoke are opt-in with `--run-real-llm`; run one scoped task/profile per release target |
+
+## GUI and API coverage
+
+| Surface | Per-change CI | Environment gate |
+| --- | --- | --- |
+| React/Vitest | Ubuntu, Node 24, source tests | Browser accessibility and operator usability study are not automated |
+| Web and Electron TypeScript | Typecheck and production build on Ubuntu | Native Electron packaging/signing/notarization are not configured release jobs |
+| Python GUI HTTP/SSE server | Providers lane exercises auth, route validation, bounded event windows, shutdown, CORS, and snapshots | Native desktop process lifecycle remains platform-specific |
+| Headless Electron main-process smoke | Not in the default GUI lane | Run `AGENT_LIBOS_GUI_SMOKE=1 npm --prefix gui run electron:dev` |
+| Packaged custom-protocol BrowserWindow smoke | Not in CI | On a desktop/GPU runner use `AGENT_LIBOS_GUI_SMOKE=1 AGENT_LIBOS_GUI_SMOKE_WINDOW=1 npm --prefix gui run electron:dev` |
+| Local GUI API compatibility | Server and renderer tests cover the matching checkout | The unversioned `/api` surface is an internal same-build contract, not a stable third-party REST API |
+
+## Evaluation coverage
+
+| Suite | Default evidence | Boundary |
+| --- | --- | --- |
+| `benchmarks/runtime_safety` | Deterministic schema-v1 task×runner matrix, fail-closed metrics, provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof |
+| `benchmarks/practical_agent_workflows` | Separates `native-live`, `native-partial`, `mocked`, and `modeled`; native has no modeled fallback | Checked-in scenarios do not imply a real GitHub/provider integration |
+| Real-model benchmark | One explicitly selected task with real LLM profile | Token/credential gate; results must retain model/profile/environment provenance |
+
+## Release-gate policy
+
+The deterministic `scripts/test_matrix.py --lane all`, invariant checker, GUI
+lane, PostgreSQL CI job, and runtime-safety smoke are necessary but not
+sufficient for a cross-platform release. Before advertising a platform or
+provider configuration as release-validated, record a fresh native run for the
+corresponding environment-gate cells above. Do not copy counts or “remaining
+gates” from `docs/prelaunch_hardening_report.md`; that file is bound to its
+historical commit.
+
+When a new environment becomes CI-covered, update this matrix and
+`docs/invariants.md` Known Test Gaps in the same change.

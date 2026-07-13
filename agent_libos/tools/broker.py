@@ -4,6 +4,7 @@ import asyncio
 import builtins
 import hashlib
 import inspect
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -200,8 +201,28 @@ class ToolBroker:
         self._tool_ids_by_name: dict[str, str] = {}
         self._handles: dict[str, ToolHandle] = {}
         self._jit_sources: dict[str, str] = {}
+        self._registry_lifecycle_fallback = threading.RLock()
+
+    def _registry_lifecycle_lock(self) -> threading.RLock:
+        runtime = getattr(self, "runtime", None)
+        return getattr(runtime, "_registry_lifecycle_lock", self._registry_lifecycle_fallback)
 
     def register_tool(
+        self,
+        tool: BaseAgentTool,
+        registered_by: str = "runtime",
+        scope: str = "static",
+        ephemeral: bool = False,
+    ) -> ToolHandle:
+        with self._registry_lifecycle_lock():
+            return self._register_tool_locked(
+                tool,
+                registered_by=registered_by,
+                scope=scope,
+                ephemeral=ephemeral,
+            )
+
+    def _register_tool_locked(
         self,
         tool: BaseAgentTool,
         registered_by: str = "runtime",
@@ -216,48 +237,79 @@ class ToolBroker:
             digest_chars=self.config.tools.static_tool_id_digest_chars,
         )
         handle = ToolHandle(tool_id=tool_id, name=spec.name, capability_id=None, scope=scope)
-        self._tools[tool_id] = tool
-        self._tool_ids_by_name[spec.name] = tool_id
-        self._handles[tool_id] = handle
         existing = next((row for row in self.store.list_tools() if row["tool_id"] == tool_id), None)
         if existing is not None and existing["name"] != spec.name:
             raise ValueError(f"tool id collision: {tool_id}")
-        if existing is None:
-            self.store.insert_tool(handle, spec, registered_by=registered_by, created_at=utc_now(), ephemeral=ephemeral)
-        else:
-            self.store.update_tool(handle, spec, registered_by=registered_by, ephemeral=ephemeral)
-        self.audit.record(
-            actor=registered_by,
-            action="tool.register",
-            target=f"tool:{tool_id}",
-            decision={
-                "name": spec.name,
-                "version": spec.version,
-                "policy": spec.policy,
-                "tags": spec.tags,
-            },
-        )
+        try:
+            with self.store.transaction():
+                if existing is None:
+                    self.store.insert_tool(
+                        handle,
+                        spec,
+                        registered_by=registered_by,
+                        created_at=utc_now(),
+                        ephemeral=ephemeral,
+                    )
+                else:
+                    self.store.update_tool(handle, spec, registered_by=registered_by, ephemeral=ephemeral)
+                self._tools[tool_id] = tool
+                self._tool_ids_by_name[spec.name] = tool_id
+                self._handles[tool_id] = handle
+                self.audit.record(
+                    actor=registered_by,
+                    action="tool.register",
+                    target=f"tool:{tool_id}",
+                    decision={
+                        "name": spec.name,
+                        "version": spec.version,
+                        "policy": spec.policy,
+                        "tags": spec.tags,
+                    },
+                )
+        except BaseException:
+            self._tools.pop(tool_id, None)
+            if self._tool_ids_by_name.get(spec.name) == tool_id:
+                self._tool_ids_by_name.pop(spec.name, None)
+            self._handles.pop(tool_id, None)
+            raise
         return handle
 
     def unregister_tool(self, tool: ToolHandle | str, *, registered_by: str | None = None) -> bool:
+        with self._registry_lifecycle_lock():
+            return self._unregister_tool_locked(tool, registered_by=registered_by)
+
+    def _unregister_tool_locked(self, tool: ToolHandle | str, *, registered_by: str | None = None) -> bool:
         handle = self._handle_for_unregistration(tool)
         if handle is None:
             return False
         row = next((item for item in self.store.list_tools() if item["tool_id"] == handle.tool_id), None)
         if registered_by is not None and row is not None and row.get("registered_by") != registered_by:
             return False
-        self._tools.pop(handle.tool_id, None)
-        self._jit_sources.pop(handle.tool_id, None)
-        self._handles.pop(handle.tool_id, None)
-        if self._tool_ids_by_name.get(handle.name) == handle.tool_id:
-            self._tool_ids_by_name.pop(handle.name, None)
-        self.store.delete_tool(handle.tool_id, registered_by=registered_by)
-        self.audit.record(
-            actor=registered_by or "tool_broker",
-            action="tool.unregister",
-            target=f"tool:{handle.tool_id}",
-            decision={"name": handle.name},
-        )
+        implementation = self._tools.get(handle.tool_id)
+        jit_source = self._jit_sources.get(handle.tool_id)
+        try:
+            with self.store.transaction():
+                self._tools.pop(handle.tool_id, None)
+                self._jit_sources.pop(handle.tool_id, None)
+                self._handles.pop(handle.tool_id, None)
+                if self._tool_ids_by_name.get(handle.name) == handle.tool_id:
+                    self._tool_ids_by_name.pop(handle.name, None)
+                self.store.delete_tool(handle.tool_id, registered_by=registered_by)
+                self.audit.record(
+                    actor=registered_by or "tool_broker",
+                    action="tool.unregister",
+                    target=f"tool:{handle.tool_id}",
+                    decision={"name": handle.name},
+                )
+        except BaseException:
+            if implementation is not None:
+                self._tools[handle.tool_id] = implementation
+            if jit_source is not None:
+                self._jit_sources[handle.tool_id] = jit_source
+            self._handles[handle.tool_id] = handle
+            if row is not None and not bool(row.get("ephemeral")):
+                self._tool_ids_by_name[handle.name] = handle.tool_id
+            raise
         return True
 
     def configure_process_tools(
@@ -435,6 +487,23 @@ class ToolBroker:
         scope: str = "ephemeral_process",
         replace_tool_id: str | None = None,
     ) -> ToolHandle:
+        with self._registry_lifecycle_lock():
+            return self._register_jit_locked(
+                pid,
+                candidate_id,
+                approver=approver,
+                scope=scope,
+                replace_tool_id=replace_tool_id,
+            )
+
+    def _register_jit_locked(
+        self,
+        pid: str,
+        candidate_id: str,
+        approver: str = "policy:local",
+        scope: str = "ephemeral_process",
+        replace_tool_id: str | None = None,
+    ) -> ToolHandle:
         candidate = self._get_candidate(candidate_id)
         self._require_candidate_owner(candidate, pid)
         if candidate.status == ToolCandidateStatus.REGISTERED:
@@ -451,44 +520,58 @@ class ToolBroker:
         # not add them to the global name index, otherwise later pid-less
         # resolve(name) calls can turn one process' JIT into a globally
         # referenceable tool.
-        with self.store.transaction():
-            candidate = self._get_candidate(candidate_id)
-            self._require_candidate_owner(candidate, pid)
-            if candidate.status == ToolCandidateStatus.REGISTERED:
-                raise ValidationError(f"tool candidate is already registered: {candidate_id}")
-            if candidate.status != ToolCandidateStatus.VALIDATED:
-                raise ValidationError(f"tool candidate is not validated: {candidate_id}")
-            process = self.store.get_process(pid)
-            if process is None:
-                raise NotFound(f"process not found: {pid}")
-            existing_tool_id = process.tool_table.get(candidate.spec.name)
-            if existing_tool_id is not None and existing_tool_id != replace_tool_id:
-                raise ValidationError(f"process already has a tool named: {candidate.spec.name}")
-            if existing_tool_id is None and replace_tool_id is not None:
-                raise ValidationError(
-                    f"tool replacement target is stale for {candidate.spec.name}: {replace_tool_id}"
+        try:
+            with self.store.transaction():
+                candidate = self._get_candidate(candidate_id)
+                self._require_candidate_owner(candidate, pid)
+                if candidate.status == ToolCandidateStatus.REGISTERED:
+                    raise ValidationError(f"tool candidate is already registered: {candidate_id}")
+                if candidate.status != ToolCandidateStatus.VALIDATED:
+                    raise ValidationError(f"tool candidate is not validated: {candidate_id}")
+                process = self.store.get_process(pid)
+                if process is None:
+                    raise NotFound(f"process not found: {pid}")
+                existing_tool_id = process.tool_table.get(candidate.spec.name)
+                if existing_tool_id is not None and existing_tool_id != replace_tool_id:
+                    raise ValidationError(f"process already has a tool named: {candidate.spec.name}")
+                if existing_tool_id is None and replace_tool_id is not None:
+                    raise ValidationError(
+                        f"tool replacement target is stale for {candidate.spec.name}: {replace_tool_id}"
+                    )
+                self.store.insert_tool(
+                    handle,
+                    candidate.spec,
+                    registered_by=approver,
+                    created_at=utc_now(),
+                    ephemeral=True,
                 )
-            self.store.insert_tool(handle, candidate.spec, registered_by=approver, created_at=utc_now(), ephemeral=True)
-            candidate.status = ToolCandidateStatus.REGISTERED
-            candidate.registered_tool_id = tool_id
-            candidate.updated_at = utc_now()
-            self.store.update_tool_candidate(candidate)
-            process.tool_table[candidate.spec.name] = tool_id
-            process.model_tool_table[candidate.spec.name] = tool_id
-            process.updated_at = utc_now()
-            self.store.update_process(process)
-            self.audit.record(
-                actor=approver,
-                action="tool.register",
-                target=f"tool:{tool_id}",
-                decision={
-                    "candidate_id": candidate_id,
-                    "scope": scope,
-                    "replaced_tool_id": replace_tool_id,
-                },
-            )
-        self._jit_sources[tool_id] = candidate.source_code
-        self._handles[tool_id] = handle
+                candidate.status = ToolCandidateStatus.REGISTERED
+                candidate.registered_tool_id = tool_id
+                candidate.updated_at = utc_now()
+                self.store.update_tool_candidate(candidate)
+                process.tool_table[candidate.spec.name] = tool_id
+                process.model_tool_table[candidate.spec.name] = tool_id
+                process.updated_at = utc_now()
+                self.store.update_process(process)
+                # Publish the executable source and handle before the durable
+                # alias commits. Resolver calls share the lifecycle lock, so
+                # no caller can observe one side without the other.
+                self._jit_sources[tool_id] = candidate.source_code
+                self._handles[tool_id] = handle
+                self.audit.record(
+                    actor=approver,
+                    action="tool.register",
+                    target=f"tool:{tool_id}",
+                    decision={
+                        "candidate_id": candidate_id,
+                        "scope": scope,
+                        "replaced_tool_id": replace_tool_id,
+                    },
+                )
+        except BaseException:
+            self._jit_sources.pop(tool_id, None)
+            self._handles.pop(tool_id, None)
+            raise
         return handle
 
     def discard_candidate(
@@ -1487,6 +1570,10 @@ class ToolBroker:
         return max(0.0, time.perf_counter() - started_at)
 
     def resolve(self, tool: ToolHandle | str, pid: str | None = None) -> ToolHandle:
+        with self._registry_lifecycle_lock():
+            return self._resolve_locked(tool, pid=pid)
+
+    def _resolve_locked(self, tool: ToolHandle | str, pid: str | None = None) -> ToolHandle:
         if isinstance(tool, ToolHandle):
             return tool
         process_tool_id: str | None = None
@@ -1531,8 +1618,10 @@ class ToolBroker:
             return handle
         raise NotFound(f"tool not found: {tool}")
 
-    def list(self) -> builtins.list[dict[str, Any]]:
-        return self.store.list_tools()
+    def list(self, *, limit: int | None = None) -> builtins.list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValidationError("tool list limit must be a positive integer")
+        return self.store.list_tools(limit=limit)
 
     def visible_tools(self, pid: str) -> builtins.list[dict[str, Any]]:
         visible_ids = self._visible_tool_ids(pid)

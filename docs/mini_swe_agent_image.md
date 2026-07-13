@@ -9,8 +9,13 @@ uv run agent-libos --db .agent_libos.sqlite images validate images/mini-swe-agen
 uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agent
 ```
 
-Omitting `--db` uses the default `local` in-memory runtime store, so the
-registration is not available to later CLI invocations.
+The CLI loads the project-root `config.yaml` when it is present. In this
+checkout that configuration selects `.agent_libos.sqlite`, so omitting `--db`
+persists the registration there. A checkout without project configuration
+falls back to `DEFAULT_CONFIG`, whose `local` store is in memory and therefore
+does not survive a later CLI invocation. Use an explicit `--db` when the
+artifact must be reproducible independent of the caller's current directory or
+local configuration.
 
 The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 `default_tools: []`. At boot, the image package registers one process-local JIT

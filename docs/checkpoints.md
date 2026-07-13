@@ -186,9 +186,12 @@ subtree. If the scheduler is actively running a quantum or still has active
 futures, restore is rejected and the caller must retry after the runtime is
 quiescent. Unrelated processes are not restored.
 
-After scheduler quiescence, restore holds the Object ownership boundary and the
-store mutation lock continuously from the first preflight read through the
-main-state commit. Host-side process, capability, Object Memory, mailbox, and
+After scheduler quiescence, restore acquires the shared registry lifecycle lock,
+then the Object ownership boundary, then the store mutation lock. It holds the
+ownership/store boundary continuously from the first preflight read through the
+main-state commit, and keeps the registry lock through image/JIT reconciliation.
+That fixed order matches Runtime Module load/unload and prevents registry/store
+lock inversion. Host-side process, capability, Object Memory, mailbox, and
 ObjectTask mutations therefore linearize wholly before or after restore; they
 cannot slip between validation and row replacement. Capability rows are
 filtered inside that boundary against current active/expiry/restrictive policy
@@ -199,18 +202,24 @@ Restore has three explicit phases:
 
 1. **Preflight** validates checkpoint authority, required Runtime Modules,
    image artifacts, JIT metadata, and the absence of active scoped ObjectTasks.
-   A preflight failure makes no reconstructable-state changes.
+   Checkpoint `admin` and all changed-image rights are reserved as one
+   deduplicated set. Restoring over an image id that is already registered
+   requires `admin` on that exact `image:<image_id>` resource; reintroducing a
+   missing image requires `write`. A preflight failure restores those exact
+   reservations and makes no reconstructable-state changes.
 2. **Commit** replaces scoped SQL rows and in-memory Object payloads in one
    transaction. Only owned Objects/namespaces are deleted or replaced; borrowed
-   roots remain references to current lender state. A commit failure rolls that
-   transaction back.
-3. **Post-commit reconciliation** re-upserts captured image metadata, restores
-   and prunes process-local JIT registries, and runs release finalizers for
-   scoped Objects removed by the commit. It never applies captured global Skill
-   rows. These operations touch global registries or host resources and cannot
-   undo the committed process-state transaction. The restore event and final
-   restore audit are also post-commit observability sinks; their failure cannot
-   undo that transaction either.
+   roots remain references to current lender state. The composite finite-use
+   set is settled in this transaction; a commit failure rolls back both state
+   and authority settlement.
+3. **Post-commit reconciliation** atomically reconciles captured image cache,
+   image rows, and artifact rows, then restores and prunes process-local JIT
+   registries while still holding the lifecycle lock. It never applies captured
+   global Skill rows. The lifecycle lock is released before running release
+   finalizers for scoped Objects removed by the commit, because finalizers may
+   call host code. These operations cannot undo the committed process-state
+   transaction. The restore event and final restore audit are also post-commit
+   observability sinks; their failure cannot undo that transaction either.
 
 A successful commit returns `main_state_committed: true`. If every
 post-commit phase succeeds, `status` is `restored`; otherwise `status` is
@@ -222,6 +231,20 @@ reconciliation/event/audit phase and error. Each recordable failure appends a
 All post-checkpoint pending human requests for restored processes are cancelled.
 Post-checkpoint mailbox entries are kept in history but marked as superseded by
 restore so they are not delivered as unread by default.
+
+ObjectTask rows are append-only execution history rather than reconstructable
+worker state. Restore still refuses any active task in the affected process or
+Object scope. If a scoped task reached a terminal state after the checkpoint,
+restore keeps its row but changes the status to `superseded_by_restore`, clears
+the now-invalid runner/result references, and stores the previous status,
+runner, result, and error in the task's wait metadata. The restore response,
+event, and audit list those task ids as `superseded_object_tasks`. A task that
+was already terminal at checkpoint time keeps its ordinary status because its
+referenced process/Object state was part of the captured scope. This boundary
+uses the task's terminal `completed_at`, not `updated_at`: late notification
+delivery may update the row after checkpoint creation without changing when
+the task actually became terminal. Legacy rows that have no `completed_at`
+fall back conservatively to `updated_at`.
 
 After restored process rows are written, restore reconciles wait states against
 the restored runtime facts. A process waiting on an already-terminal child or a
@@ -297,7 +320,9 @@ uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --go
 The model-visible commit path is the `commit_checkpoint_to_image` tool; the JIT
 syscall path is `image.commit_checkpoint`. Actor-mode commits require `write`
 on the target `image:<image_id>` and read authority on either the checkpoint or
-the checkpointed process.
+the checkpointed process. Replacing an existing target image requires `admin`
+instead of `write`. Both finite decisions settle with artifact/manifest/event/
+audit publication, so a failed commit does not burn either one-shot grant.
 
 ## Fork From Checkpoint
 
@@ -381,6 +406,10 @@ Checkpoint defaults live in `CheckpointDefaults`:
 - payload capture limit,
 - snapshot hard byte limit,
 - diff preview size.
+
+Checkpoint list callers may request only positive integer limits no larger
+than `CheckpointDefaults.list_limit`; `0`, negative values, booleans, and larger
+values are rejected rather than being passed through as unbounded SQL limits.
 
 There is no automatic high-risk checkpoint setting. The former
 `auto_high_risk_checkpoint` config field described an unimplemented idea and is

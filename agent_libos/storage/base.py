@@ -132,7 +132,10 @@ class RuntimeStore(Protocol):
     def get_process(self, pid: str) -> Any | None:
         ...
 
-    def list_processes(self) -> list[Any]:
+    def list_processes(self, limit: int | None = None, *, active_first: bool = False) -> list[Any]:
+        ...
+
+    def get_processes_with_ancestors(self, pids: Iterable[str]) -> list[Any]:
         ...
 
     def list_processes_by_status(self, status: Any) -> list[Any]:
@@ -159,7 +162,13 @@ class RuntimeStore(Protocol):
     def get_resource_reservation(self, parent_pid: str, child_pid: str) -> Any | None:
         ...
 
-    def list_resource_reservations(self, *, parent_pid: str | None = None, child_pid: str | None = None) -> list[Any]:
+    def list_resource_reservations(
+        self,
+        *,
+        parent_pid: str | None = None,
+        parent_pids: Iterable[str] | None = None,
+        child_pid: str | None = None,
+    ) -> list[Any]:
         ...
 
     def delete_resource_reservation(self, parent_pid: str, child_pid: str) -> None:
@@ -187,7 +196,13 @@ class RuntimeStore(Protocol):
     def insert_event(self, event: Any) -> None:
         ...
 
-    def list_events(self, target: str | None = None) -> list[Any]:
+    def list_events(
+        self,
+        target: str | None = None,
+        limit: int | None = None,
+        before_event_id: str | None = None,
+        after_event_id: str | None = None,
+    ) -> list[Any]:
         ...
 
     def get_event(self, event_id: str) -> Any | None:
@@ -360,6 +375,15 @@ class RuntimeStore(Protocol):
     def list_process_messages(self, pid: str, **filters: Any) -> list[Any]:
         ...
 
+    def get_process_activity_summaries(
+        self,
+        pids: Iterable[str],
+        *,
+        recent_message_limit: int,
+        recent_llm_call_limit: int,
+    ) -> dict[str, dict[str, Any]]:
+        ...
+
     def insert_object_task(self, task: Any) -> None:
         ...
 
@@ -381,6 +405,15 @@ class RuntimeStore(Protocol):
     def get_agent_rating(self, pid: str, rater: str, source: str = "gui") -> Any | None:
         ...
 
+    def get_agent_ratings_for_processes(
+        self,
+        pids: Iterable[str],
+        *,
+        rater: str,
+        source: str = "gui",
+    ) -> dict[str, Any]:
+        ...
+
     def insert_tool(self, handle: Any, spec: Any, registered_by: str, created_at: str, ephemeral: bool) -> None:
         ...
 
@@ -393,7 +426,7 @@ class RuntimeStore(Protocol):
     def get_tool_spec(self, tool_id: str) -> Any | None:
         ...
 
-    def list_tools(self) -> list[dict[str, Any]]:
+    def list_tools(self, limit: int | None = None) -> list[dict[str, Any]]:
         ...
 
     def insert_tool_candidate(self, candidate: Any) -> None:
@@ -453,7 +486,7 @@ class RuntimeStore(Protocol):
     def get_image(self, image_id: str) -> Any | None:
         ...
 
-    def list_images(self) -> list[Any]:
+    def list_images(self, limit: int | None = None) -> list[Any]:
         ...
 
     def delete_image(self, image_id: str, *, registered_by: str | None = None) -> None:

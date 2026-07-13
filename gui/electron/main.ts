@@ -1,12 +1,19 @@
-import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell, type OpenDialogOptions } from "electron";
 import { ChildProcess, ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { databaseTargetFromRenderer } from "./database.js";
 import { requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
+import {
+  productionRendererEntryUrl,
+  productionRendererOrigin,
+  productionRendererScheme,
+  resolveProductionRendererPath
+} from "./rendererProtocol.js";
+import { isCompletedShutdownResponse } from "./shutdown.js";
 
 type ServerConnection = {
   url: string;
@@ -23,6 +30,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
 const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
+const smokeWindowMode = smokeMode && process.env.AGENT_LIBOS_GUI_SMOKE_WINDOW === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
 const imageManifestMaxBytes = 1_048_576;
 const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
@@ -37,6 +45,18 @@ const productionCsp = [
   "base-uri 'none'",
   "frame-ancestors 'none'"
 ].join("; ");
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: productionRendererScheme,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true
+    }
+  }
+]);
 
 if (smokeMode) {
   const smokeUserDataPath = path.join(repoRoot, "gui", ".smoke-user-data");
@@ -56,6 +76,7 @@ let connection: ServerConnection | null = null;
 let stoppingServer: Promise<void> | null = null;
 let startingServer: Promise<ServerConnection> | null = null;
 let quittingAfterServerStop = false;
+let productionRendererProtocolInstalled = false;
 
 function smokeLog(stage: string, details: Record<string, unknown> = {}) {
   if (!smokeMode) return;
@@ -82,21 +103,28 @@ async function stopRuntimeServerInstance(
   { graceful = true, timeoutMs = 2500 }: { graceful?: boolean; timeoutMs?: number } = {}
 ) {
   if (!child) return;
+  let gracefulAcknowledged = false;
   if (graceful && currentConnection) {
-    await requestServerShutdown(currentConnection, timeoutMs);
-    await waitForExit(child, timeoutMs);
+    gracefulAcknowledged = await requestServerShutdown(currentConnection, timeoutMs);
+    if (gracefulAcknowledged) await waitForExit(child, timeoutMs);
+  }
+  const forced = child.exitCode === null && !child.killed;
+  if (graceful && currentConnection && !gracefulAcknowledged) {
+    console.warn("Agent libOS GUI server did not confirm completed teardown; forcing process termination.");
   }
   if (child.exitCode === null && !child.killed) {
     await killProcessTree(child, timeoutMs);
   }
+  smokeLog("server.stop.completed", { gracefulAcknowledged, forced });
 }
 
-async function requestServerShutdown(selected: ServerConnection, timeoutMs: number) {
+async function requestServerShutdown(selected: ServerConnection, timeoutMs: number): Promise<boolean> {
   try {
-    await requestServer(selected, "/api/shutdown", "POST", timeoutMs);
+    return isCompletedShutdownResponse(await requestServer(selected, "/api/shutdown", "POST", timeoutMs));
   } catch {
     // If the server is already exiting or the request races process teardown,
     // the follow-up wait/kill path below still provides bounded shutdown.
+    return false;
   }
 }
 
@@ -331,9 +359,11 @@ function resolveRuntimeServerCommand(): RuntimeServerCommand {
 
 async function createWindow() {
   smokeLog("window.create.start");
-  connection = await startRuntimeServer();
+  // Smoke validation must never open or mutate an operator's default
+  // persistent database merely because the command runs from the repo root.
+  connection = await startRuntimeServer(smokeMode ? "local" : undefined);
   smokeLog("window.server.ready", { db: connection.db, url: connection.url });
-  if (smokeMode && process.env.AGENT_LIBOS_GUI_SMOKE_WINDOW !== "1") {
+  if (smokeMode && !smokeWindowMode) {
     const health = await withTimeout(requestServer(connection, "/api/health", "GET", 5000), 5000, "server health");
     smokeLog("server.health.checked", { ok: health.ok, status: health.status });
     await stopRuntimeServer({ graceful: true, timeoutMs: 3000 });
@@ -369,33 +399,47 @@ async function createWindow() {
     mainWindow = null;
   });
 
-  if (smokeMode) {
-    await withTimeout(
-      mainWindow.loadURL("data:text/html;charset=utf-8,<html lang=\"zh-Hans\"><body>Agent libOS smoke</body></html>"),
-      15000,
-      "renderer smoke loadURL"
-    );
-  } else if (process.env.VITE_DEV_SERVER_URL) {
+  if (!smokeWindowMode && process.env.VITE_DEV_SERVER_URL) {
     await withTimeout(mainWindow.loadURL(requireLoopbackDevServerUrl(process.env.VITE_DEV_SERVER_URL)), 15000, "renderer loadURL");
   } else {
+    installProductionRendererProtocol();
     installProductionCsp(mainWindow);
-    await withTimeout(mainWindow.loadFile(path.join(repoRoot, "gui", "dist", "index.html")), 15000, "renderer loadFile");
+    await withTimeout(mainWindow.loadURL(productionRendererEntryUrl), 15000, "renderer loadURL");
   }
   smokeLog("window.loaded");
   if (smokeMode) {
-    const preloadReady = await withTimeout(
+    const rendererProbe = await withTimeout(
       mainWindow.webContents.executeJavaScript(
-        "Boolean(window.libosApi) && window.libosApi.getConnection().then((connection) => Boolean(connection && connection.url && connection.token))"
+        `(async () => {
+          const api = window.libosApi;
+          if (!api) return { preloadReady: false, apiReady: false, origin: window.location.origin };
+          const selected = await api.getConnection();
+          const preloadReady = Boolean(selected && selected.url && selected.token);
+          if (!preloadReady) return { preloadReady, apiReady: false, origin: window.location.origin };
+          const response = await fetch(selected.url + "/api/health", {
+            headers: { Authorization: "Bearer " + selected.token }
+          });
+          const body = await response.json();
+          return {
+            preloadReady,
+            apiReady: response.ok && body && body.ok === true,
+            origin: window.location.origin
+          };
+        })()`
       ),
       5000,
-      "preload bridge"
+      "packaged renderer probe"
     );
-    smokeLog("window.preload.checked", { preloadReady });
-    smokeLog("smoke.complete", { preloadReady, db: connection?.db ?? null, pid: process.pid });
+    const preloadReady = rendererProbe?.preloadReady === true;
+    const apiReady = rendererProbe?.apiReady === true;
+    const originReady = rendererProbe?.origin === productionRendererOrigin;
+    const smokePassed = preloadReady && apiReady && originReady;
+    smokeLog("window.renderer.checked", { preloadReady, apiReady, origin: rendererProbe?.origin, originReady });
+    smokeLog("smoke.complete", { preloadReady, apiReady, originReady, db: connection?.db ?? null, pid: process.pid });
     await stopRuntimeServer({ graceful: true, timeoutMs: 3000 });
-    smokeLog("smoke.exiting", { code: preloadReady ? 0 : 2 });
-    app.exit(preloadReady ? 0 : 2);
-    process.exit(preloadReady ? 0 : 2);
+    smokeLog("smoke.exiting", { code: smokePassed ? 0 : 2 });
+    app.exit(smokePassed ? 0 : 2);
+    process.exit(smokePassed ? 0 : 2);
   }
 }
 
@@ -454,7 +498,7 @@ function isAllowedExternalUrl(url: string): boolean {
 }
 
 function installProductionCsp(window: BrowserWindow) {
-  window.webContents.session.webRequest.onHeadersReceived({ urls: ["file://*/*"] }, (details, callback) => {
+  window.webContents.session.webRequest.onHeadersReceived({ urls: [`${productionRendererScheme}://*/*`] }, (details, callback) => {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
@@ -462,6 +506,19 @@ function installProductionCsp(window: BrowserWindow) {
       }
     });
   });
+}
+
+function installProductionRendererProtocol() {
+  if (productionRendererProtocolInstalled) return;
+  const distRoot = path.join(repoRoot, "gui", "dist");
+  protocol.handle(productionRendererScheme, (request) => {
+    const target = resolveProductionRendererPath(distRoot, request.url);
+    if (target === null || !fs.existsSync(target) || !fs.statSync(target).isFile()) {
+      return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    }
+    return net.fetch(pathToFileURL(target).toString());
+  });
+  productionRendererProtocolInstalled = true;
 }
 
 app.whenReady().then(createWindow).catch((error) => {

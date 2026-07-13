@@ -15,6 +15,7 @@ from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import (
     CapabilityRight,
     ContextMaterializationManifest,
+    EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
@@ -27,6 +28,8 @@ from agent_libos.models import (
     ObjectType,
     OperationOutcome,
     OperationState,
+    ProcessMessageKind,
+    ProcessStatus,
 )
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.sdk import (
@@ -266,6 +269,101 @@ def test_runtime_store_contract_core_records(kind: str, tmp_path: Path) -> None:
         assert stored_operation.outcome.value == "succeeded"
         assert runtime.store.list_operation_evidence(operation_ids=[operation.operation_id])
         assert runtime.store.get_context_materialization_manifest(manifest.materialization_id) == manifest
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_runtime_store_event_limit_returns_newest_matching_events_in_order(kind: str, tmp_path: Path) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(goal="bounded event history")
+        emitted = [
+            runtime.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source="event-limit-test",
+                target=pid,
+                payload={"index": index},
+            )
+            for index in range(5)
+        ]
+        runtime.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source="event-limit-test",
+            target="another-process",
+            payload={"index": 99},
+        )
+
+        selected = runtime.events.list(target=pid, limit=2)
+        previous = runtime.events.list(target=pid, limit=2, before_event_id=selected[0].event_id)
+        following = runtime.events.list(target=pid, limit=2, after_event_id=emitted[1].event_id)
+
+        assert [event.event_id for event in selected] == [emitted[-2].event_id, emitted[-1].event_id]
+        assert [event.payload["index"] for event in selected] == [3, 4]
+        assert [event.event_id for event in previous] == [emitted[-4].event_id, emitted[-3].event_id]
+        assert [event.payload["index"] for event in previous] == [1, 2]
+        assert [event.event_id for event in following] == [emitted[2].event_id, emitted[3].event_id]
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_runtime_store_process_snapshot_queries_are_bounded_and_batched(kind: str, tmp_path: Path) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        parent = runtime.process.spawn(goal="snapshot parent")
+        child = runtime.process.spawn_child(parent, goal="snapshot child")
+        third = runtime.process.spawn(goal="snapshot third")
+        terminal = runtime.process.get(third)
+        terminal.status = ProcessStatus.EXITED
+        runtime.store.update_process(terminal)
+        messages = [
+            runtime.messages.post(sender="test", recipient_pid=child, body=f"message-{index}")
+            for index in range(3)
+        ]
+        interrupt = runtime.messages.post(
+            sender="test",
+            recipient_pid=child,
+            kind=ProcessMessageKind.INTERRUPT,
+            body="interrupt",
+        )
+        runtime.ratings.upsert(child, score=4, comment="batch")
+        for index in range(3):
+            runtime.store.insert_llm_call(
+                LLMCallRecord(
+                    call_id=f"snapshot-call-{index}",
+                    pid=child,
+                    image_id="base-agent:v0",
+                    purpose="snapshot",
+                    status="ok",
+                    usage={"total_tokens": 10 + index},
+                    created_at=utc_now(),
+                )
+            )
+
+        listed = runtime.store.list_processes(limit=2)
+        active_first = runtime.store.list_processes(limit=2, active_first=True)
+        ancestors = runtime.store.get_processes_with_ancestors([child])
+        activity = runtime.store.get_process_activity_summaries(
+            [parent, child, third],
+            recent_message_limit=2,
+            recent_llm_call_limit=2,
+        )
+        ratings = runtime.store.get_agent_ratings_for_processes(
+            [child, third],
+            rater=runtime.config.runtime.default_human,
+        )
+
+        assert len(listed) == 2
+        assert third not in {process.pid for process in active_first}
+        assert {process.pid for process in ancestors} == {parent, child}
+        assert activity[child]["unread_message_count"] == 4
+        assert activity[child]["interrupt_count"] == 1
+        assert activity[child]["llm_call_count"] == 2
+        assert activity[child]["token_total"] == 23
+        assert activity[parent]["llm_call_count"] == 0
+        assert activity[parent]["token_total"] == 0
+        assert [message.message_id for message in activity[child]["messages"]] == [
+            messages[-1].message_id,
+            interrupt.message_id,
+        ]
+        assert activity[third]["messages"] == []
+        assert ratings[child].score == 4
+        assert third not in ratings
 
 
 def test_sqlite_file_store_rejects_concurrent_active_runtime_and_reopens_after_close(tmp_path: Path) -> None:

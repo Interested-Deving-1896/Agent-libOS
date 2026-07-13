@@ -15,6 +15,16 @@ describe("indexProcessTree", () => {
     expect(indexed.children.get("root")).toEqual([firstChild, secondChild]);
     expect(indexed.children.size).toBe(1);
   });
+
+  it("keeps a source-window child visible when its parent is omitted", () => {
+    const orphanedChild = process("active-child", "omitted-parent");
+    const root = process("visible-root", null);
+
+    const indexed = indexProcessTree([orphanedChild, root]);
+
+    expect(indexed.roots).toEqual([orphanedChild, root]);
+    expect(indexed.children.size).toBe(0);
+  });
 });
 
 function process(pid: string, parentPid: string | null): RuntimeProcess {

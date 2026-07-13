@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -115,6 +116,129 @@ class TestJitSecurity:
         assert 'libos.syscall' in candidate.spec.side_effects
         assert 'filesystem.write' in candidate.spec.side_effects
         assert 'jsonrpc.call' in candidate.spec.side_effects
+
+    def test_jit_registration_publishes_durable_alias_and_executable_handle_together(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self.runtime.tools.sandbox = NoLimitValidationSandbox()
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='atomic JIT publication')
+        candidate_id = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'atomic_jit_publication',
+                'description': 'Exercise the JIT publication boundary.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {'type': 'object'},
+            },
+            source_code='export function run(args, libos) { return { ok: true }; }',
+        )
+        assert self.runtime.tools.validate(candidate_id).ok
+        registration_before_commit = threading.Event()
+        release_registration = threading.Event()
+        resolver_done = threading.Event()
+        original_record = self.runtime.audit.record
+        registered: list[Any] = []
+        resolved: list[Any] = []
+        errors: list[BaseException] = []
+
+        def delayed_record(*args: Any, **kwargs: Any) -> Any:
+            decision = kwargs.get('decision')
+            if (
+                kwargs.get('action') == 'tool.register'
+                and isinstance(decision, dict)
+                and decision.get('candidate_id') == candidate_id
+            ):
+                registration_before_commit.set()
+                if not release_registration.wait(timeout=5):
+                    raise TimeoutError('timed out waiting to release JIT registration')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', delayed_record)
+
+        def register() -> None:
+            try:
+                registered.append(self.runtime.tools.register(pid, candidate_id))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def resolve() -> None:
+            try:
+                resolved.append(self.runtime.tools.resolve('atomic_jit_publication', pid=pid))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                resolver_done.set()
+
+        registration_thread = threading.Thread(target=register)
+        resolver_thread = threading.Thread(target=resolve)
+        try:
+            registration_thread.start()
+            assert registration_before_commit.wait(timeout=3)
+            resolver_thread.start()
+            assert not resolver_done.wait(timeout=0.2)
+
+            release_registration.set()
+            registration_thread.join(timeout=5)
+            resolver_thread.join(timeout=5)
+
+            assert errors == []
+            assert registered and resolved
+            assert registered[0].tool_id == resolved[0].tool_id
+            tool_id = registered[0].tool_id
+            assert self.runtime.process.get(pid).tool_table['atomic_jit_publication'] == tool_id
+            assert tool_id in self.runtime.tools._jit_sources
+            assert tool_id in self.runtime.tools._handles
+            assert any(row['tool_id'] == tool_id for row in self.runtime.store.list_tools())
+        finally:
+            release_registration.set()
+            registration_thread.join(timeout=5)
+            resolver_thread.join(timeout=5)
+
+    def test_jit_registration_audit_failure_rolls_back_alias_source_and_handle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self.runtime.tools.sandbox = NoLimitValidationSandbox()
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='JIT publication rollback')
+        candidate_id = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'rollback_jit_publication',
+                'description': 'Exercise JIT publication rollback.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {'type': 'object'},
+            },
+            source_code='export function run(args, libos) { return { ok: true }; }',
+        )
+        assert self.runtime.tools.validate(candidate_id).ok
+        before_handles = set(self.runtime.tools._handles)
+        before_sources = set(self.runtime.tools._jit_sources)
+        original_record = self.runtime.audit.record
+
+        def fail_registration_audit(*args: Any, **kwargs: Any) -> Any:
+            decision = kwargs.get('decision')
+            if (
+                kwargs.get('action') == 'tool.register'
+                and isinstance(decision, dict)
+                and decision.get('candidate_id') == candidate_id
+            ):
+                raise RuntimeError('injected JIT registration audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_registration_audit)
+
+        with pytest.raises(RuntimeError, match='injected JIT registration audit failure'):
+            self.runtime.tools.register(pid, candidate_id)
+
+        candidate = self.runtime.store.get_tool_candidate(candidate_id)
+        assert candidate is not None
+        assert candidate.status.value == 'validated'
+        assert candidate.registered_tool_id is None
+        assert 'rollback_jit_publication' not in self.runtime.process.get(pid).tool_table
+        assert set(self.runtime.tools._handles) == before_handles
+        assert set(self.runtime.tools._jit_sources) == before_sources
+        assert all(row['name'] != 'rollback_jit_publication' for row in self.runtime.store.list_tools())
 
     def test_jit_proposal_failure_rolls_back_candidate_and_descriptor(
         self,

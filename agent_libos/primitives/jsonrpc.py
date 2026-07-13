@@ -102,17 +102,33 @@ class JsonRpcPrimitive:
         source: str | None = None,
     ) -> dict[str, Any]:
         spec = self._coerce_endpoint(endpoint)
+        authority_decision = None
         if require_capability:
             required_right = CapabilityRight.ADMIN if replace else CapabilityRight.WRITE
-            self.capabilities.require(actor, self.endpoint_resource(spec.endpoint_id), required_right)
+            authority_decision = self.capabilities.require(
+                actor,
+                self.endpoint_resource(spec.endpoint_id),
+                required_right,
+                consume=False,
+            )
         now = utc_now()
         with self.store.transaction():
             existing = self.store.get_jsonrpc_endpoint(spec.endpoint_id)
             if existing is not None and not replace:
                 raise ValidationError(f"JSON-RPC endpoint already exists: {spec.endpoint_id}")
+            authority_reservation = self.capabilities.reserve_decision_use(
+                authority_decision,
+                used_by=actor,
+                reason="one-time JSON-RPC endpoint registry authority reserved",
+            )
             self.store.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
             if existing is not None:
                 self._disable_replaced_endpoint_method_capabilities(spec.endpoint_id, actor=actor)
+            self.capabilities.commit_reserved_use(
+                authority_reservation,
+                committed_by=actor,
+                reason="one-time JSON-RPC endpoint registry authority committed",
+            )
             self.events.emit(
                 EventType.EXTERNAL_WRITE,
                 source=actor,
@@ -164,14 +180,33 @@ class JsonRpcPrimitive:
         text: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        endpoints, _has_more = self.list_endpoints_window(
+            actor=actor,
+            require_capability=require_capability,
+            text=text,
+            limit=limit,
+        )
+        return endpoints
+
+    def list_endpoints_window(
+        self,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        text: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return one bounded page plus an exact signal that another row exists."""
+
         if require_capability and actor is not None:
             self.capabilities.require(actor, self.config.jsonrpc.registry_resource, CapabilityRight.READ)
         selected_limit = self._bounded_list_limit(limit)
         endpoints: list[dict[str, Any]] = []
-        for spec, metadata in self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit):
+        rows = self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit + 1)
+        for spec, metadata in rows[:selected_limit]:
             self._validate_endpoint(spec)
             endpoints.append(self._endpoint_to_json(spec, metadata, include_sensitive_fields=False))
-        return endpoints
+        return endpoints, len(rows) > selected_limit
 
     def inspect_endpoint(
         self,
@@ -193,12 +228,28 @@ class JsonRpcPrimitive:
         actor: str = "runtime",
         require_capability: bool = True,
     ) -> dict[str, Any]:
+        authority_decision = None
         if require_capability:
-            self.capabilities.require(actor, self.endpoint_resource(endpoint_id), CapabilityRight.ADMIN)
+            authority_decision = self.capabilities.require(
+                actor,
+                self.endpoint_resource(endpoint_id),
+                CapabilityRight.ADMIN,
+                consume=False,
+            )
         with self.store.transaction():
             self._load_endpoint(endpoint_id)
+            authority_reservation = self.capabilities.reserve_decision_use(
+                authority_decision,
+                used_by=actor,
+                reason="one-time JSON-RPC endpoint unregister authority reserved",
+            )
             self._disable_replaced_endpoint_method_capabilities(endpoint_id, actor=actor)
             self.store.delete_jsonrpc_endpoint(endpoint_id)
+            self.capabilities.commit_reserved_use(
+                authority_reservation,
+                committed_by=actor,
+                reason="one-time JSON-RPC endpoint unregister authority committed",
+            )
             self.events.emit(
                 EventType.EXTERNAL_WRITE,
                 source=actor,

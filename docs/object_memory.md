@@ -155,6 +155,17 @@ leave durable authority behind.
 `ObjectPatch()` leaves object payload unchanged. `ObjectPatch(payload=None)`
 explicitly writes JSON `null` as the payload.
 
+## Object Links
+
+Creating a link requires `link` on the source handle and `read` on the
+destination handle. The manager holds the Object ownership transition lock and
+one store transaction while it authorizes both exact handles, revalidates them
+after the two-sided preflight, checks that both Objects are still `live`,
+consumes finite-use decisions, and publishes the link/event/audit evidence.
+Consequently, a capability revoke or Object release that linearizes first makes
+link creation fail; it cannot leave a dangling link based on stale preflight
+state.
+
 ## Object Tasks
 
 An Object can own background tool tasks. A task records its owner oid, creator
@@ -172,7 +183,13 @@ only when explicitly delegated.
 ObjectTask rows are persisted, but active task execution is runtime-local. When
 a runtime reopens an existing store, unfinished tasks are marked `abandoned`,
 their runner processes are terminalized, and owner pins are cleaned up. The
-original tool arguments are not persisted for replay.
+original tool arguments are not persisted for replay. Ordinary Object payloads
+are runtime-only as well. If a persisted `succeeded` task refers to a result
+Object whose payload cannot be reconstructed on reopen, startup changes the
+task to the explicit terminal status `result_unavailable_after_reopen`, clears
+the live `result_oid`, and preserves the previous status and oid in wait
+metadata. Checkpoint/image reconstruction is different because those formats
+explicitly capture the payloads they promise to restore.
 
 Successful tasks keep the tool result as a new Object Memory object and link
 the owner object to it with `PRODUCED`. That link is part of the start-time

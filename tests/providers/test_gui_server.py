@@ -13,6 +13,7 @@ from agent_libos.api.gui.server import (
     GuiRuntimeService,
     GuiServerError,
     _BoundedSeenKeys,
+    _shutdown_gui_service_before_exit,
     _sse_payload_data,
     create_gui_http_server,
 )
@@ -227,6 +228,152 @@ class TestGuiServer:
         assert status == 200
         assert pending_id in {request['request_id'] for request in snapshot['human_requests']}
 
+    def test_snapshot_source_bounds_process_and_registry_reads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        for index in range(17):
+            runtime.process.spawn(image='base-agent:v0', goal=f'source-bound-{index}')
+        runtime.config = replace(
+            runtime.config,
+            gui=replace(runtime.config.gui, snapshot_collection_max_items=16),
+        )
+        service._static_snapshot_dirty = True
+        seen: dict[str, list[int | None]] = {}
+
+        def spy_limit(owner: object, attribute: str, label: str) -> None:
+            original = getattr(owner, attribute)
+
+            def wrapped(*args: object, **kwargs: object) -> object:
+                seen.setdefault(label, []).append(kwargs.get('limit'))
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(owner, attribute, wrapped)
+
+        spy_limit(runtime.process, 'list', 'processes')
+        spy_limit(runtime.human, 'list', 'human_requests')
+        spy_limit(runtime.tools, 'list', 'tools')
+        spy_limit(runtime.image_registry, 'list_images', 'images')
+        spy_limit(runtime.skills, 'discover_skills_window', 'skills')
+        spy_limit(runtime.jsonrpc, 'list_endpoints_window', 'jsonrpc_endpoints')
+        spy_limit(runtime.mcp, 'list_servers_window', 'mcp_servers')
+        spy_limit(runtime.modules, 'loaded_module_summaries', 'modules')
+        spy_limit(service, '_llm_profile_summaries', 'llm_profiles')
+
+        snapshot = service.snapshot()
+
+        assert len(snapshot['processes']) == 16
+        assert len(snapshot['tools']) == 16
+        assert seen == {
+            'processes': [17],
+            'human_requests': [17],
+            'tools': [17],
+            'images': [17],
+            'skills': [17],
+            'jsonrpc_endpoints': [17],
+            'mcp_servers': [17],
+            'modules': [17],
+            'llm_profiles': [17],
+        }
+        assert snapshot['_truncated']['processes']['source_limited'] is True
+        assert snapshot['_truncated']['processes']['omitted_is_lower_bound'] is True
+        assert snapshot['_truncated']['tools']['source_limited'] is True
+
+    def test_snapshot_reports_truncation_at_stricter_jsonrpc_source_limit(self) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        runtime.config = replace(
+            runtime.config,
+            jsonrpc=replace(runtime.config.jsonrpc, list_limit=2),
+        )
+        runtime.jsonrpc.config = runtime.config
+        for index in range(3):
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _gui_jsonrpc_manifest(f'gui-source-limit-{index}'),
+                actor='test',
+                require_capability=False,
+            )
+        service._static_snapshot_dirty = True
+
+        snapshot = service.snapshot()
+
+        assert len(snapshot['jsonrpc_endpoints']) == 2
+        assert snapshot['_truncated']['jsonrpc_endpoints'] == {
+            'kind': 'array',
+            'returned': 2,
+            'omitted': 1,
+            'omitted_is_lower_bound': True,
+            'source_limited': True,
+        }
+
+    def test_snapshot_batches_process_activity_rating_and_resource_queries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        pids = [runtime.process.spawn(image='base-agent:v0', goal=f'batch-{index}') for index in range(3)]
+        for index, pid in enumerate(pids):
+            runtime.messages.post(sender='gui-test', recipient_pid=pid, body=f'message-{index}')
+        runtime.ratings.upsert(pids[0], score=5, comment='batched')
+
+        calls = {'activity': 0, 'remaining': 0, 'ratings': 0}
+        original_activity = runtime.store.get_process_activity_summaries
+        original_remaining = runtime.resources.remaining_budgets
+        original_ratings = runtime.ratings.get_many
+        original_list_llm_calls = runtime.store.list_llm_calls
+
+        def activity(*args: object, **kwargs: object) -> object:
+            calls['activity'] += 1
+            return original_activity(*args, **kwargs)
+
+        def remaining(*args: object, **kwargs: object) -> object:
+            calls['remaining'] += 1
+            return original_remaining(*args, **kwargs)
+
+        def ratings(*args: object, **kwargs: object) -> object:
+            calls['ratings'] += 1
+            return original_ratings(*args, **kwargs)
+
+        def list_llm_calls(pid: str | None = None, limit: int | None = None) -> object:
+            assert pid is None, 'snapshot must not load LLM call rows once per process'
+            return original_list_llm_calls(pid=pid, limit=limit)
+
+        def unexpected_single_process_query(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError('snapshot used a per-process manager query')
+
+        monkeypatch.setattr(runtime.store, 'get_process_activity_summaries', activity)
+        monkeypatch.setattr(runtime.resources, 'remaining_budgets', remaining)
+        monkeypatch.setattr(runtime.ratings, 'get_many', ratings)
+        monkeypatch.setattr(runtime.store, 'list_llm_calls', list_llm_calls)
+        monkeypatch.setattr(runtime.messages, 'list', unexpected_single_process_query)
+        monkeypatch.setattr(runtime.resources, 'remaining_budget', unexpected_single_process_query)
+        monkeypatch.setattr(runtime.ratings, 'get', unexpected_single_process_query)
+
+        snapshot = service.snapshot()
+
+        assert calls == {'activity': 1, 'remaining': 1, 'ratings': 1}
+        by_pid = {process['pid']: process for process in snapshot['processes']}
+        assert set(by_pid) == set(pids)
+        assert all(process['unread_message_count'] == 1 for process in by_pid.values())
+        assert by_pid[pids[0]]['rating']['score'] == 5
+
+    def test_snapshot_selects_recent_process_messages_at_the_source(self) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        runtime.config = replace(
+            runtime.config,
+            gui=replace(runtime.config.gui, snapshot_process_message_limit=2),
+        )
+        pid = runtime.process.spawn(image='base-agent:v0', goal='recent message window')
+        for index in range(5):
+            runtime.messages.post(sender='gui-test', recipient_pid=pid, body=f'message-{index}')
+
+        snapshot = service.snapshot()
+        process = next(item for item in snapshot['processes'] if item['pid'] == pid)
+
+        assert process['unread_message_count'] == 5
+        assert [message['body'] for message in process['messages']] == ['message-3', 'message-4']
+
     def test_llm_profile_endpoints_persist_user_profiles_and_reject_secrets(self, monkeypatch) -> None:
         monkeypatch.setenv('KIMI_API_KEY', 'secret')
 
@@ -418,6 +565,22 @@ class TestGuiServer:
         status, headers, _body = self.request_raw(
             'OPTIONS',
             '/api/health',
+            extra_headers={'Origin': 'agent-libos://app'},
+        )
+        assert status == 204
+        assert headers['access-control-allow-origin'] == 'agent-libos://app'
+
+        status, headers, _body = self.request_raw(
+            'OPTIONS',
+            '/api/health',
+            extra_headers={'Origin': 'agent-libos://untrusted'},
+        )
+        assert status == 204
+        assert 'access-control-allow-origin' not in headers
+
+        status, headers, _body = self.request_raw(
+            'OPTIONS',
+            '/api/health',
             extra_headers={'Origin': 'null'},
         )
         assert status == 204
@@ -539,6 +702,36 @@ class TestGuiServer:
         assert not any(event.get('truncated') is True for event in snapshot['events'])
         assert snapshot['_truncated']['events']['kind'] == 'array'
         assert snapshot['_truncated']['events']['omitted'] == 5
+
+    def test_process_events_endpoint_is_store_bounded(self) -> None:
+        pid = self.server.service.runtime.process.spawn(goal='bounded event api')
+        self.server.service.runtime.config = replace(
+            self.server.service.runtime.config,
+            gui=replace(self.server.service.runtime.config.gui, snapshot_event_limit=3),
+        )
+        emitted = [
+            self.server.service.runtime.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source='gui-test',
+                target=pid,
+                payload={'index': index},
+            )
+            for index in range(5)
+        ]
+
+        status, events = self.request('GET', f'/api/processes/{pid}/events?limit=2')
+        previous_status, previous = self.request(
+            'GET',
+            f'/api/processes/{pid}/events?limit=2&before={events[0]["event_id"]}',
+        )
+        invalid_status, invalid = self.request('GET', f'/api/processes/{pid}/events?limit=4')
+
+        assert status == 200
+        assert [event['event_id'] for event in events] == [emitted[-2].event_id, emitted[-1].event_id]
+        assert previous_status == 200
+        assert [event['event_id'] for event in previous] == [emitted[-4].event_id, emitted[-3].event_id]
+        assert invalid_status == 400
+        assert 'at most 3' in invalid['error']['message']
 
     def test_oversized_snapshot_sse_payload_uses_explicit_truncated_event(self) -> None:
         event_name, payload = _sse_payload_data(
@@ -1702,12 +1895,59 @@ class TestGuiServer:
         try:
             status, body = self.request('POST', '/api/shutdown', {})
             assert status == 200
-            assert body['status'] == 'shutting_down'
+            assert body['status'] == 'stopped'
         except ConnectionResetError:
             pass
         self.thread.join(timeout=5)
         assert not self.thread.is_alive()
         self.server.service.shutdown()
+
+    def test_shutdown_endpoint_reports_incomplete_teardown_and_remains_retryable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        original_shutdown = self.server.service.shutdown
+        monkeypatch.setattr(self.server.service, 'shutdown', lambda timeout_s=None: False)
+
+        status, body = self.request('POST', '/api/shutdown', {})
+
+        assert status == 503
+        assert body['ok'] is False
+        assert body['error']['retryable'] is True
+        assert self.thread.is_alive()
+
+        monkeypatch.setattr(self.server.service, 'shutdown', original_shutdown)
+        status, body = self.request('POST', '/api/shutdown', {})
+        assert status == 200
+        assert body == {'ok': True, 'status': 'stopped'}
+        self.thread.join(timeout=5)
+        assert not self.thread.is_alive()
+
+    def test_serve_teardown_retries_and_fails_visibly_if_runtime_never_closes(self) -> None:
+        class FakeService:
+            def __init__(self, results: list[bool | Exception]):
+                self.results = iter(results)
+                self.calls = 0
+
+            def shutdown(self) -> bool:
+                self.calls += 1
+                result = next(self.results)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        retrying = FakeService([False, True])
+        _shutdown_gui_service_before_exit(retrying)
+        assert retrying.calls == 2
+
+        exception_retry = FakeService([RuntimeError('first teardown attempt failed'), True])
+        _shutdown_gui_service_before_exit(exception_retry)
+        assert exception_retry.calls == 2
+
+        incomplete = FakeService([False, False])
+        with pytest.raises(RuntimeError, match='teardown remained incomplete'):
+            _shutdown_gui_service_before_exit(incomplete)
+        assert incomplete.calls == 2
 
 
 def _request_to_server(

@@ -163,6 +163,87 @@ class TestImageRegistration:
         finally:
             runtime.close()
 
+    def test_image_registry_mutations_require_admin_for_replace_and_settle_one_shot_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'one-shot-image-registry:v0'
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='one-shot image registry')
+            original_record = runtime.audit.record
+            failing_actions = {'image.register'}
+
+            def fail_selected_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') in failing_actions:
+                    raise RuntimeError(f"injected {kwargs['action']} audit failure")
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_selected_audit)
+            write_cap = runtime.capability.grant_once(
+                actor,
+                runtime.image_registry.resource_for(image_id),
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            original = AgentImage(image_id=image_id, name='one-shot-image-registry', version='v1')
+
+            with pytest.raises(RuntimeError, match='image.register'):
+                runtime.image_registry.register(original, actor=actor, require_capability=True)
+
+            assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 1
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+
+            failing_actions.clear()
+            runtime.image_registry.register(original, actor=actor, require_capability=True)
+            assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 0
+
+            runtime.capability.grant(
+                actor,
+                runtime.image_registry.resource_for(image_id),
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            with pytest.raises(CapabilityDenied):
+                runtime.image_registry.register(
+                    AgentImage(image_id=image_id, name='one-shot-image-registry', version='v2'),
+                    actor=actor,
+                    replace=True,
+                    require_capability=True,
+                )
+
+            admin_cap = runtime.capability.grant_once(
+                actor,
+                runtime.image_registry.resource_for(image_id),
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+            failing_actions.add('image.replace')
+            replacement = AgentImage(image_id=image_id, name='one-shot-image-registry', version='v2')
+            with pytest.raises(RuntimeError, match='image.replace'):
+                runtime.image_registry.register(
+                    replacement,
+                    actor=actor,
+                    replace=True,
+                    require_capability=True,
+                )
+
+            assert runtime.store.get_capability(admin_cap.cap_id).uses_remaining == 1
+            assert runtime.get_image(image_id).version == 'v1'
+
+            failing_actions.clear()
+            runtime.image_registry.register(
+                replacement,
+                actor=actor,
+                replace=True,
+                require_capability=True,
+            )
+            assert runtime.store.get_capability(admin_cap.cap_id).uses_remaining == 0
+            assert runtime.get_image(image_id).version == 'v2'
+        finally:
+            runtime.close()
+
     def test_image_package_registration_failure_removes_new_artifact_and_manifest(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -46,6 +46,26 @@ def _grant_stdio_spawn(
 
 
 class TestMcpPrimitive:
+    def test_list_servers_window_reports_rows_beyond_requested_limit(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            for index in range(3):
+                runtime.mcp.register_server_from_yaml_text(
+                    _stdio_manifest(f'window-{index}'),
+                    actor='cli',
+                    require_capability=False,
+                )
+
+            bounded, has_more = runtime.mcp.list_servers_window(require_capability=False, limit=2)
+            complete, complete_has_more = runtime.mcp.list_servers_window(require_capability=False, limit=3)
+
+            assert len(bounded) == 2
+            assert has_more is True
+            assert len(complete) == 3
+            assert complete_has_more is False
+        finally:
+            runtime.close()
+
     @pytest.mark.parametrize('operation', ['inspect', 'list_tools', 'unregister', 'register', 'replace'])
     @pytest.mark.parametrize('server_id', ['secret-existing', 'secret-missing'])
     def test_registry_item_authority_precedes_server_metadata_load(
@@ -99,6 +119,96 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_registry_register_sink_failure_restores_composite_finite_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='finite mcp register rollback')
+            server_id = 'register-finite-rollback'
+            authority = [
+                runtime.capability.grant_once(
+                    actor,
+                    f'mcp_server:{server_id}',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                ),
+                runtime.capability.grant_once(
+                    actor,
+                    'process:spawn',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                ),
+                runtime.capability.grant_once(
+                    actor,
+                    runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server']),
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                ),
+            ]
+            original_record = runtime.audit.record
+
+            def fail_register_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'mcp.server.register':
+                    raise RuntimeError('injected finite register audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_register_audit)
+            with pytest.raises(RuntimeError, match='finite register audit failure'):
+                runtime.mcp.register_server_from_yaml_text(
+                    _stdio_manifest(server_id),
+                    actor=actor,
+                    require_capability=True,
+                )
+
+            assert runtime.store.get_mcp_server(server_id) is None
+            for cap in authority:
+                persisted = runtime.store.get_capability(cap.cap_id)
+                assert persisted is not None and persisted.active and persisted.uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_registry_register_commits_composite_finite_authority_and_exposes_stdio_resource(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='finite mcp register commit')
+            server_id = 'register-finite-commit'
+            stdio_resource = runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server'])
+            authority = [
+                runtime.capability.grant_once(
+                    actor,
+                    f'mcp_server:{server_id}',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                ),
+                runtime.capability.grant_once(
+                    actor,
+                    'process:spawn',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                ),
+                runtime.capability.grant_once(
+                    actor,
+                    stdio_resource,
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                ),
+            ]
+
+            registered = runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(server_id),
+                actor=actor,
+                require_capability=True,
+            )
+
+            assert registered['stdio_authority_resource'] == stdio_resource
+            for cap in authority:
+                persisted = runtime.store.get_capability(cap.cap_id)
+                assert persisted is not None and not persisted.active and persisted.uses_remaining == 0
+        finally:
+            runtime.close()
+
     def test_registry_unregister_audit_failure_rolls_back_server_and_tool_caps(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -117,6 +227,13 @@ class TestMcpPrimitive:
                 [CapabilityRight.READ],
                 issued_by='test',
             )
+            actor = runtime.process.spawn(image='base-agent:v0', goal='finite mcp unregister rollback')
+            authority = runtime.capability.grant_once(
+                actor,
+                'mcp_server:unregister-rollback',
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
             original_record = runtime.audit.record
 
             def fail_unregister_audit(*args: Any, **kwargs: Any) -> Any:
@@ -128,13 +245,42 @@ class TestMcpPrimitive:
             with pytest.raises(RuntimeError, match='unregister audit failure'):
                 runtime.mcp.unregister_server(
                     'unregister-rollback',
-                    actor='cli',
-                    require_capability=False,
+                    actor=actor,
+                    require_capability=True,
                 )
 
             assert runtime.store.get_mcp_server('unregister-rollback') is not None
             persisted = runtime.store.get_capability(cap.cap_id)
             assert persisted is not None and persisted.active and not persisted.revoked
+            persisted_authority = runtime.store.get_capability(authority.cap_id)
+            assert persisted_authority is not None and persisted_authority.active
+            assert persisted_authority.uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_registry_unregister_commits_finite_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            server_id = 'unregister-finite-commit'
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(server_id),
+                actor='cli',
+                require_capability=False,
+            )
+            actor = runtime.process.spawn(image='base-agent:v0', goal='finite mcp unregister commit')
+            authority = runtime.capability.grant_once(
+                actor,
+                f'mcp_server:{server_id}',
+                [CapabilityRight.ADMIN],
+                issued_by='test',
+            )
+
+            result = runtime.mcp.unregister_server(server_id, actor=actor, require_capability=True)
+
+            assert result == {'server_id': server_id, 'deleted': True}
+            assert runtime.store.get_mcp_server(server_id) is None
+            persisted = runtime.store.get_capability(authority.cap_id)
+            assert persisted is not None and not persisted.active and persisted.uses_remaining == 0
         finally:
             runtime.close()
 

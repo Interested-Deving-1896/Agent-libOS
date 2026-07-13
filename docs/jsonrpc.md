@@ -157,7 +157,9 @@ an existing id from a missing one. `replace=true` always requests `admin` and a
 non-replace registration always requests `write`; the right does not depend on
 an existence lookup. Registration, replacement, and unregistration commit the
 endpoint row, stale method-grant invalidation, event, and audit in one store
-transaction.
+transaction. Finite registry authority is reserved after duplicate/not-found
+preflight and committed inside that same transaction, so validation or
+event/audit failure leaves the exact one-shot grant available.
 
 Tool visibility does not grant remote authority. Default images expose
 `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, and

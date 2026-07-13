@@ -424,6 +424,137 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize(
+        ('condition_name', 'condition_value'),
+        [
+            ('timeout_s', True),
+            ('timeout_s', float('nan')),
+            ('timeout_s', float('inf')),
+            ('timeout_s', -0.1),
+            ('timeout_max_s', False),
+            ('timeout_max_s', float('nan')),
+            ('timeout_max_s', float('-inf')),
+            ('timeout_max_s', -1),
+        ],
+    )
+    def test_authority_rule_rejects_invalid_timeout_condition(
+        self,
+        condition_name: str,
+        condition_value: object,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='invalid authority timeout')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': f'test.timeout.invalid.{condition_name}',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'low',
+                            'conditions': {condition_name: condition_value},
+                        }
+                    ]
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'timeout_s': 1.0},
+            )
+
+            assert not decision.allowed
+            assert decision.constraint_results['authority_rules']['malformed_conditions'] == [condition_name]
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('actual_timeout', [True, float('nan'), float('inf'), -0.1])
+    def test_authority_rule_timeout_ceiling_rejects_invalid_operation_timeout(self, actual_timeout: object) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='invalid operation timeout')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.timeout.ceiling',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'low',
+                            'conditions': {'timeout_max_s': 5.0},
+                        }
+                    ]
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'timeout_s': actual_timeout},
+            )
+
+            assert not decision.allowed
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('conditions', 'actual_timeout'),
+        [
+            ({'timeout_s': 0.0}, 0.0),
+            ({'timeout_s': 0.25}, 0.25),
+            ({'timeout_max_s': 0.0}, 0.0),
+            ({'timeout_max_s': 1.5}, 1.25),
+        ],
+    )
+    def test_authority_rule_accepts_finite_nonnegative_timeout(
+        self,
+        conditions: dict[str, float],
+        actual_timeout: float,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='valid authority timeout')
+            runtime.capability.issue_trusted(
+                pid,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'test.timeout.valid',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'low',
+                            'conditions': conditions,
+                        }
+                    ]
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {'authority_operation': 'shell.run', 'operation': 'shell.run', 'timeout_s': actual_timeout},
+            )
+
+            assert decision.allowed
+        finally:
+            runtime.close()
+
     def test_one_shot_grant_authority_is_consumed_after_successful_issue(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -605,6 +736,131 @@ class TestCapabilityManager:
             assert not runtime.capability.check(child, 'filesystem:workspace:src/main.py', CapabilityRight.WRITE)
             with pytest.raises(CapabilityDenied):
                 runtime.capability.delegate(parent, child, CapabilitySpec(resource='filesystem:workspace:other.py', rights={CapabilityRight.READ.value}))
+        finally:
+            runtime.close()
+
+    def test_delegate_audit_failure_rolls_back_capability_attachment_and_event(self, monkeypatch) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='atomic delegator')
+            child = runtime.process.spawn(image='base-agent:v0', goal='atomic delegatee')
+            runtime.capability.grant(
+                parent,
+                'object:delegated-atomic',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            before_capabilities = list(runtime.process.get(child).capabilities)
+            before_events = [
+                event.event_id
+                for event in runtime.events.list(target=child)
+                if event.type == EventType.CAPABILITY_GRANTED
+            ]
+            original_record = runtime.audit.record
+
+            def fail_delegate_audit(*args, **kwargs):
+                if kwargs.get('action') == 'capability.delegate':
+                    raise RuntimeError('injected delegate audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_delegate_audit)
+            with pytest.raises(RuntimeError, match='injected delegate audit failure'):
+                runtime.capability.delegate(
+                    parent,
+                    child,
+                    CapabilitySpec(
+                        resource='object:delegated-atomic',
+                        rights={CapabilityRight.READ.value},
+                    ),
+                )
+
+            assert runtime.process.get(child).capabilities == before_capabilities
+            assert not runtime.capability.check(child, 'object:delegated-atomic', CapabilityRight.READ)
+            assert [
+                event.event_id
+                for event in runtime.events.list(target=child)
+                if event.type == EventType.CAPABILITY_GRANTED
+            ] == before_events
+        finally:
+            runtime.close()
+
+    def test_derive_authority_late_validation_failure_is_all_or_nothing(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='atomic authority source')
+            child = runtime.process.spawn(image='base-agent:v0', goal='atomic authority target')
+            runtime.capability.grant(
+                parent,
+                'object:allowed',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            before_capabilities = list(runtime.process.get(child).capabilities)
+
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.derive_authority(
+                    source_subject=parent,
+                    target_subject=child,
+                    requested_specs=[
+                        CapabilitySpec(
+                            resource='object:allowed',
+                            rights={CapabilityRight.READ.value},
+                        ),
+                        CapabilitySpec(
+                            resource='object:not-allowed',
+                            rights={CapabilityRight.READ.value},
+                        ),
+                    ],
+                    transition_kind='test_atomic_transition',
+                )
+
+            assert runtime.process.get(child).capabilities == before_capabilities
+            assert not runtime.capability.check(child, 'object:allowed', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_derive_authority_final_audit_failure_rolls_back_every_delegation(self, monkeypatch) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='atomic authority source')
+            child = runtime.process.spawn(image='base-agent:v0', goal='atomic authority target')
+            for resource in ['object:first', 'object:second']:
+                runtime.capability.grant(
+                    parent,
+                    resource,
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    delegable=True,
+                )
+            before_capabilities = list(runtime.process.get(child).capabilities)
+            before_event_ids = [event.event_id for event in runtime.events.list(target=child)]
+            before_audit_ids = [record.record_id for record in runtime.audit.trace()]
+            original_record = runtime.audit.record
+
+            def fail_final_derive_audit(*args, **kwargs):
+                if kwargs.get('action') == 'capability.derive_authority':
+                    raise RuntimeError('injected derive audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_final_derive_audit)
+            with pytest.raises(RuntimeError, match='injected derive audit failure'):
+                runtime.capability.derive_authority(
+                    source_subject=parent,
+                    target_subject=child,
+                    requested_specs=[
+                        CapabilitySpec(resource='object:first', rights={CapabilityRight.READ.value}),
+                        CapabilitySpec(resource='object:second', rights={CapabilityRight.READ.value}),
+                    ],
+                    transition_kind='test_atomic_transition',
+                )
+
+            assert runtime.process.get(child).capabilities == before_capabilities
+            assert not runtime.capability.check(child, 'object:first', CapabilityRight.READ)
+            assert not runtime.capability.check(child, 'object:second', CapabilityRight.READ)
+            assert [event.event_id for event in runtime.events.list(target=child)] == before_event_ids
+            assert [record.record_id for record in runtime.audit.trace()] == before_audit_ids
         finally:
             runtime.close()
 
@@ -850,6 +1106,60 @@ class TestCapabilityManager:
             }
             assert sorted(results) == ['denied', 'ok']
             assert statuses == {'active', 'revoked'}
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('failed_sink', ['event', 'audit'])
+    def test_revoke_sink_failure_rolls_back_target_and_one_time_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failed_sink: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='revoke rollback owner')
+            actor = runtime.process.spawn(image='base-agent:v0', goal='revoke rollback actor')
+            target = runtime.capability.issue_trusted(
+                owner,
+                'object:revoke-atomic',
+                [CapabilityRight.READ],
+                issued_by='issuer',
+            )
+            authority = runtime.capability.issue_trusted(
+                actor,
+                target.resource,
+                [CapabilityRight.REVOKE],
+                issued_by='issuer',
+                uses_remaining=1,
+            )
+            if failed_sink == 'event':
+                original_emit = runtime.events.emit
+
+                def fail_revoke_event(event_type, *args, **kwargs):
+                    if event_type == EventType.CAPABILITY_REVOKED:
+                        raise RuntimeError('injected revoke event failure')
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_revoke_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_revoke_audit(*args, **kwargs):
+                    if kwargs.get('action') == 'capability.revoke':
+                        raise RuntimeError('injected revoke audit failure')
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_revoke_audit)
+
+            with pytest.raises(RuntimeError, match=f'revoke {failed_sink} failure'):
+                runtime.capability.revoke(target.cap_id, revoked_by=actor)
+
+            persisted_target = runtime.store.get_capability(target.cap_id)
+            persisted_authority = runtime.store.get_capability(authority.cap_id)
+            assert persisted_target is not None and persisted_target.active
+            assert persisted_authority is not None and persisted_authority.active
+            assert persisted_authority.uses_remaining == 1
+            assert runtime.capability.check(owner, target.resource, CapabilityRight.READ)
         finally:
             runtime.close()
 

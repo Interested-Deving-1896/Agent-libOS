@@ -68,6 +68,8 @@ real Deno installation skip with a clear message when `deno` is missing; use
 ## Documentation Consistency
 
 - README is the current project entrypoint and documentation index.
+- `docs/release_status.md` is the living, commit/working-tree-bound validation
+  ledger; `docs/prelaunch_hardening_report.md` is historical evidence only.
 - `agent_libos_design_doc.md` is a historical design archive.
 - `docs/invariants.md` is the invariant-to-test map.
 - `docs/paper_thesis.md` carries the fixed paper title, thesis, contributions,
@@ -75,8 +77,12 @@ real Deno installation skip with a clear message when `deno` is missing; use
 - `docs/architecture.md`, `docs/runtime_model.md`, `docs/capabilities.md`,
   `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
   `docs/checkpoints.md`, `docs/jsonrpc.md`, `docs/mcp.md`, `docs/modules.md`,
-  `docs/storage.md`, `docs/gui.md`, `docs/cli.md`, `docs/development.md`, and
+  `docs/storage.md`, `docs/gui.md`, `docs/cli.md`, `docs/configuration.md`,
+  `docs/providers.md`, `docs/support_matrix.md`, `docs/development.md`, and
   `docs/benchmark.md` are the core implementation guides.
+- `docs/gui_api_schema.json` is the versioned machine-readable subset for GUI
+  snapshots, errors, and confirmed high-risk mutations; it is not a complete
+  public OpenAPI contract.
 - `docs/mini_swe_agent_image.md` documents the package-only mini-swe-agent
   compatibility image.
 - `benchmarks/runtime_safety/schema.md` defines benchmark task shape for the M1

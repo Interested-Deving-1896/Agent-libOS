@@ -9,10 +9,10 @@ import re
 import stat
 import threading
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
 from jsonschema.validators import validator_for as jsonschema_validator_for
@@ -22,6 +22,7 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     AgentImage,
     Capability,
+    CapabilityDecision,
     CapabilityRight,
     EventType,
     JIT_MULTIPLEXER_TOOL_NAME,
@@ -143,17 +144,31 @@ class ImageRegistryPrimitive:
     def _atomic_image_registration(self, image_id: str) -> Iterator[None]:
         """Keep the durable registry, audit/event rows, and cache in lockstep."""
 
+        with self._atomic_image_registrations((image_id,)):
+            yield
+
+    @contextmanager
+    def _atomic_image_registrations(self, image_ids: Iterable[str]) -> Iterator[None]:
+        """Atomically update one or more durable image rows and cache entries."""
+
         transaction_store = self.store or self.audit.store
-        with self._registration_lock:
-            previous = self.images.get(image_id)
+        lifecycle_lock = getattr(self.runtime, "_registry_lifecycle_lock", self._registration_lock)
+        selected_ids = tuple(dict.fromkeys(str(image_id) for image_id in image_ids))
+        with lifecycle_lock, self._registration_lock:
+            previous = {
+                image_id: self.images[image_id]
+                for image_id in selected_ids
+                if image_id in self.images
+            }
             try:
                 with transaction_store.transaction():
                     yield
-            except Exception:
-                if previous is None:
-                    self.images.pop(image_id, None)
-                else:
-                    self.images[image_id] = previous
+            except BaseException:
+                for image_id in selected_ids:
+                    if image_id in previous:
+                        self.images[image_id] = previous[image_id]
+                    else:
+                        self.images.pop(image_id, None)
                 raise
 
     def register(
@@ -166,8 +181,12 @@ class ImageRegistryPrimitive:
         source: str | None = None,
     ) -> ImageRegistrationResult:
         candidate = self._coerce_image(image)
-        if require_capability:
-            self.capabilities.require(actor, self.resource_for(candidate.image_id), CapabilityRight.WRITE)
+        authority_decision = self._authorize_registry_mutation(
+            actor,
+            candidate.image_id,
+            replace=replace,
+            require_capability=require_capability,
+        )
         self._validate_image(candidate)
         with self._atomic_image_registration(candidate.image_id):
             # This check must share the cache/store registration critical
@@ -177,11 +196,21 @@ class ImageRegistryPrimitive:
             existing = self.images.get(candidate.image_id)
             if existing is not None and not replace:
                 raise ValidationError(f"agent image already exists: {candidate.image_id}")
+            authority_reservation = self._reserve_registry_mutation(
+                authority_decision,
+                actor=actor,
+                operation="image registration",
+            )
             self.images[candidate.image_id] = candidate
             now = utc_now()
             if self.store is not None:
                 self.store.upsert_image(candidate, registered_by=actor, source=source, created_at=now)
             action = "image.replace" if existing is not None else "image.register"
+            self._commit_registry_mutation(
+                authority_reservation,
+                actor=actor,
+                operation="image registration",
+            )
             self.events.emit(
                 EventType.IMAGE_REGISTERED,
                 source=actor,
@@ -276,11 +305,12 @@ class ImageRegistryPrimitive:
             raise ValidationError("image package registration requires runtime store artifact persistence")
         normalized_files = self._normalize_package_files(files)
         image, artifact = self._image_package_from_files(normalized_files, source=source)
-        if require_capability:
-            self.capabilities.require(actor, self.resource_for(image.image_id), CapabilityRight.WRITE)
-        existing = self.images.get(image.image_id)
-        if existing is not None and not replace:
-            raise ValidationError(f"agent image already exists: {image.image_id}")
+        authority_decision = self._authorize_registry_mutation(
+            actor,
+            image.image_id,
+            replace=replace,
+            require_capability=require_capability,
+        )
         artifact_json = dumps(artifact)
         artifact_bytes = len(artifact_json.encode("utf-8"))
         if artifact_bytes > self.config.image_commit.artifact_hard_limit_bytes:
@@ -325,6 +355,14 @@ class ImageRegistryPrimitive:
         )
         self._validate_image(image)
         with self._atomic_image_registration(image.image_id):
+            existing = self.images.get(image.image_id)
+            if existing is not None and not replace:
+                raise ValidationError(f"agent image already exists: {image.image_id}")
+            authority_reservation = self._reserve_registry_mutation(
+                authority_decision,
+                actor=actor,
+                operation="image package registration",
+            )
             created_at = utc_now()
             if self.store.get_image_artifact(artifact_id) is None:
                 self.store.insert_image_artifact(
@@ -366,6 +404,11 @@ class ImageRegistryPrimitive:
                     "jit_tool_exposure": image.jit_tool_exposure,
                     "replaced": result.replaced,
                 },
+            )
+            self._commit_registry_mutation(
+                authority_reservation,
+                actor=actor,
+                operation="image package registration",
             )
         return result
 
@@ -1014,12 +1057,17 @@ class ImageRegistryPrimitive:
             self._validate_persisted_image(image)
             self.images[image.image_id] = image
 
-    def list_images(self) -> list[dict[str, Any]]:
+    def list_images(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValidationError("image list limit must be a positive integer")
         if self.store is None:
-            return [self._image_summary(image, {}) for image in sorted(self.images.values(), key=lambda item: item.image_id)]
+            images = sorted(self.images.values(), key=lambda item: item.image_id)
+            if limit is not None:
+                images = images[:limit]
+            return [self._image_summary(image, {}) for image in images]
         return [
             self._image_summary(self._validate_persisted_image(image), metadata)
-            for image, metadata in self.store.list_images()
+            for image, metadata in self.store.list_images(limit=limit)
         ]
 
     def inspect(self, image_id: str) -> dict[str, Any]:
@@ -1087,15 +1135,66 @@ class ImageRegistryPrimitive:
         if found is None:
             raise NotFound(f"checkpoint not found: {checkpoint_id}")
         checkpoint, snapshot = found
-        if require_capability:
-            self.capabilities.require(actor, self.resource_for(image_id), CapabilityRight.WRITE)
-            self.runtime.checkpoint._require_checkpoint_or_process_read(actor, checkpoint)
+        authority_decision = self._authorize_registry_mutation(
+            actor,
+            image_id,
+            replace=replace,
+            require_capability=require_capability,
+        )
+        checkpoint_scope = (
+            self.runtime.checkpoint._checkpoint_or_process_read_scope(
+                actor,
+                checkpoint,
+                purpose="checkpoint image commit read",
+            )
+            if require_capability
+            else nullcontext()
+        )
+        # The image mutation, image finite-use settlement, and checkpoint-read
+        # settlement share the same outer store/cache transaction.
+        with self._atomic_image_registration(image_id), checkpoint_scope:
+            if image_id in self.images and not replace:
+                raise ValidationError(f"agent image already exists: {image_id}")
+            authority_reservation = self._reserve_registry_mutation(
+                authority_decision,
+                actor=actor,
+                operation="checkpoint image commit",
+            )
+            result = self._commit_from_checkpoint_locked(
+                actor=actor,
+                checkpoint_id=checkpoint_id,
+                checkpoint=checkpoint,
+                snapshot=snapshot,
+                image_id=image_id,
+                name=name,
+                version=version,
+                replace=replace,
+                metadata=metadata,
+            )
+            self._commit_registry_mutation(
+                authority_reservation,
+                actor=actor,
+                operation="checkpoint image commit",
+            )
+            return result
+
+    def _commit_from_checkpoint_locked(
+        self,
+        *,
+        actor: str,
+        checkpoint_id: str,
+        checkpoint: Any,
+        snapshot: dict[str, Any],
+        image_id: str,
+        name: str,
+        version: str,
+        replace: bool,
+        metadata: dict[str, Any] | None,
+    ) -> ImageRegistrationResult:
         self.runtime.checkpoint._require_snapshot_modules(snapshot)
         self._validate_identifier(image_id, "image_id", self.config.image.id_max_chars)
         self._validate_string_length(name, "name", self.config.image.name_max_chars)
         self._validate_string_length(version, "version", self.config.image.version_max_chars)
-        if image_id in self.images and not replace:
-            raise ValidationError(f"agent image already exists: {image_id}")
         artifact = self._build_commit_artifact(snapshot, checkpoint_id=checkpoint_id)
         artifact_json = dumps(artifact)
         artifact_bytes = len(artifact_json.encode("utf-8"))
@@ -1140,55 +1239,54 @@ class ImageRegistryPrimitive:
                 "root_only": True,
             },
         )
-        with self._atomic_image_registration(image_id):
-            created_at = utc_now()
-            if self.store.get_image_artifact(artifact_id) is None:
-                self.store.insert_image_artifact(
-                    artifact_id=artifact_id,
-                    kind="checkpoint_commit",
-                    artifact=artifact,
-                    sha256=artifact_sha256,
-                    created_by=actor,
-                    created_at=created_at,
-                    metadata={
-                        "source_checkpoint_id": checkpoint_id,
-                        "source_pid": checkpoint.pid,
-                        "artifact_bytes": artifact_bytes,
-                    },
-                )
-            result = self.register(
-                image,
-                actor=actor,
-                replace=replace,
-                require_capability=False,
-                source=f"checkpoint:{checkpoint_id}",
-            )
-            self.events.emit(
-                EventType.IMAGE_COMMITTED,
-                source=actor,
-                target=self.resource_for(image_id),
-                payload={
-                    "image_id": image_id,
-                    "checkpoint_id": checkpoint_id,
-                    "artifact_id": artifact_id,
-                    "artifact_sha256": artifact_sha256,
-                    "artifact_bytes": artifact_bytes,
-                },
-            )
-            self.audit.record(
-                actor=actor,
-                action="image.commit",
-                target=self.resource_for(image_id),
-                decision={
-                    "checkpoint_id": checkpoint_id,
+        created_at = utc_now()
+        if self.store.get_image_artifact(artifact_id) is None:
+            self.store.insert_image_artifact(
+                artifact_id=artifact_id,
+                kind="checkpoint_commit",
+                artifact=artifact,
+                sha256=artifact_sha256,
+                created_by=actor,
+                created_at=created_at,
+                metadata={
+                    "source_checkpoint_id": checkpoint_id,
                     "source_pid": checkpoint.pid,
-                    "artifact_id": artifact_id,
-                    "artifact_sha256": artifact_sha256,
                     "artifact_bytes": artifact_bytes,
-                    "required_capabilities": len(image.required_capabilities),
-                    "required_modules": len(image.required_modules),
                 },
             )
+        result = self.register(
+            image,
+            actor=actor,
+            replace=replace,
+            require_capability=False,
+            source=f"checkpoint:{checkpoint_id}",
+        )
+        self.events.emit(
+            EventType.IMAGE_COMMITTED,
+            source=actor,
+            target=self.resource_for(image_id),
+            payload={
+                "image_id": image_id,
+                "checkpoint_id": checkpoint_id,
+                "artifact_id": artifact_id,
+                "artifact_sha256": artifact_sha256,
+                "artifact_bytes": artifact_bytes,
+            },
+        )
+        self.audit.record(
+            actor=actor,
+            action="image.commit",
+            target=self.resource_for(image_id),
+            decision={
+                "checkpoint_id": checkpoint_id,
+                "source_pid": checkpoint.pid,
+                "artifact_id": artifact_id,
+                "artifact_sha256": artifact_sha256,
+                "artifact_bytes": artifact_bytes,
+                "required_capabilities": len(image.required_capabilities),
+                "required_modules": len(image.required_modules),
+            },
+        )
         return result
 
     def grant_register(
@@ -1210,6 +1308,53 @@ class ImageRegistryPrimitive:
 
     def registry_resource(self) -> str:
         return self.config.image.registry_resource
+
+    def _authorize_registry_mutation(
+        self,
+        actor: str,
+        image_id: str,
+        *,
+        replace: bool,
+        require_capability: bool,
+    ) -> CapabilityDecision | None:
+        if not require_capability:
+            return None
+        required_right = CapabilityRight.ADMIN if replace else CapabilityRight.WRITE
+        return self.capabilities.require(
+            actor,
+            self.resource_for(image_id),
+            required_right,
+            consume=False,
+        )
+
+    def _reserve_registry_mutation(
+        self,
+        decision: CapabilityDecision | None,
+        *,
+        actor: str,
+        operation: str,
+    ) -> str | None:
+        return self.capabilities.reserve_decision_use(
+            decision,
+            used_by=actor,
+            reason=f"one-time {operation} authority reserved",
+        )
+
+    def _commit_registry_mutation(
+        self,
+        reservation_id: str | None,
+        *,
+        actor: str,
+        operation: str,
+    ) -> None:
+        if reservation_id is None:
+            return
+        if not self.capabilities.commit_reserved_use(
+            reservation_id,
+            committed_by=actor,
+            reason=f"one-time {operation} authority committed",
+        ):
+            raise CapabilityDenied(f"{operation} authority reservation is no longer active")
 
     def _coerce_image(self, image: AgentImage | dict[str, Any]) -> AgentImage:
         if isinstance(image, AgentImage):

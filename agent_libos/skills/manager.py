@@ -299,6 +299,24 @@ class SkillManager:
         require_capability: bool = True,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        skills, _has_more = self.discover_skills_window(
+            text,
+            actor=actor,
+            require_capability=require_capability,
+            limit=limit,
+        )
+        return skills
+
+    def discover_skills_window(
+        self,
+        text: str | None = None,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        limit: int | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return one bounded catalog page plus an exact next-item signal."""
+
         reservations: dict[str, str] = {}
         if require_capability and actor is not None:
             decision = self.capabilities.require(
@@ -309,22 +327,37 @@ class SkillManager:
             )
             reservations = self._reserve_skill_rights([decision], used_by="skill")
         try:
-            selected_limit = self.config.skills.discover_limit if limit is None else limit
-            registered = [self._skill_summary(skill, metadata) for skill, metadata in self.store.list_skills(text=text, limit=selected_limit)]
-            if actor is None:
-                discovered = self._discover_host_skill_catalog(text=text, limit=selected_limit)
+            selected_limit = self._bounded_discover_limit(limit)
+            registered = [
+                self._skill_summary(skill, metadata)
+                for skill, metadata in self.store.list_skills(text=text, limit=selected_limit + 1)
+            ]
+            if actor is None and len(registered) <= selected_limit:
                 seen = {item["skill_id"] for item in registered}
-                for item in discovered:
-                    if item["skill_id"] not in seen:
-                        registered.append(item)
-                        seen.add(item["skill_id"])
-                    if len(registered) >= selected_limit:
-                        break
+                registered.extend(
+                    self._discover_host_skill_catalog(
+                        text=text,
+                        limit=selected_limit + 1 - len(registered),
+                        exclude_skill_ids=seen,
+                    )
+                )
         except Exception:
             self._restore_skill_rights(reservations)
             raise
         self._commit_skill_rights(reservations)
-        return registered
+        return registered[:selected_limit], len(registered) > selected_limit
+
+    def _bounded_discover_limit(self, limit: int | None) -> int:
+        selected = self.config.skills.discover_limit if limit is None else limit
+        if isinstance(selected, bool) or not isinstance(selected, int):
+            raise ValidationError("Skill discover limit must be an integer")
+        if selected < 1:
+            raise ValidationError("Skill discover limit must be >= 1")
+        if selected > self.config.skills.discover_limit:
+            raise ValidationError(
+                f"Skill discover limit exceeds configured maximum {self.config.skills.discover_limit}"
+            )
+        return selected
 
     def inspect_skill(
         self,
@@ -416,6 +449,7 @@ class SkillManager:
         try:
             if process is None:
                 raise NotFound(f"process not found: {pid}")
+            runtime = self._runtime()
             preflight_loaded = process.loaded_skills.get(skill.skill_id)
             preflight_jit_ids = self._loaded_tool_id_map(preflight_loaded, "jit_tool_ids")
             self._validate_loadable(
@@ -425,82 +459,99 @@ class SkillManager:
                 replacing_jit_tool_ids=preflight_jit_ids,
             )
             prepared_jit_tools = self._prepare_jit_tools(pid, skill)
-            with self.store.transaction() as cur:
-                process = self.store.get_process(pid)
-                if process is None:
-                    raise NotFound(f"process not found: {pid}")
-                previous_loaded = process.loaded_skills.get(skill.skill_id)
-                previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
-                previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
-                self._validate_loadable(
-                    pid,
-                    skill,
-                    process.tool_table,
-                    replacing_jit_tool_ids=previous_jit_ids,
-                )
-                existing_handles = self._resolve_existing_tools(skill.allowed_tools)
-                jit_handles = self._register_prepared_jit_tools(
-                    pid,
-                    skill,
-                    prepared_jit_tools,
-                    replacing_jit_tool_ids=previous_jit_ids,
-                )
-                tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
-                jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
-                updated_table = dict(process.tool_table)
-                updated_model_table = dict(process.model_tool_table)
-                for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
-                    if updated_table.get(name) == tool_id:
-                        updated_table.pop(name, None)
-                    if updated_model_table.get(name) == tool_id:
-                        updated_model_table.pop(name, None)
-                for name, handle in {**existing_handles, **jit_handles}.items():
-                    updated_table[name] = handle.tool_id
-                    # Loading a Skill is an explicit tool-visibility action,
-                    # independent of the base image's lazy built-in groups.
-                    updated_model_table[name] = handle.tool_id
-                loaded = LoadedSkill(
-                    skill_id=skill.skill_id,
-                    version=skill.version,
-                    source=metadata.get("source"),
-                    package_sha256=skill.package_sha256,
-                    loaded_at=utc_now(),
-                    tool_names=sorted([*tool_ids, *jit_tool_ids]),
-                    tool_ids=tool_ids,
-                    jit_tool_ids=jit_tool_ids,
-                    instructions_hash=self._hash_text(skill.instructions),
-                    package_snapshot=self._skill_snapshot(skill),
-                )
-                process.tool_table = updated_table
-                process.model_tool_table = updated_model_table
-                process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
-                process.updated_at = utc_now()
-                self.store.update_process(process)
-                retired_jit_ids = set(previous_jit_ids.values()) - set(jit_tool_ids.values())
-                self._delete_jit_rows(cur, pid, retired_jit_ids)
-                self.events.emit(
-                    EventType.SKILL_LOADED,
-                    source=selected_actor,
-                    target=pid,
-                    payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
-                )
-                self.audit.record(
-                    actor=selected_actor,
-                    action="skill.activate",
-                    target=f"process:{pid}",
-                    decision={
-                        "skill_id": skill.skill_id,
-                        "version": skill.version,
-                        "replaced_loaded_version": self._loaded_version(previous_loaded),
-                        "tool_ids": tool_ids,
-                        "jit_tool_ids": jit_tool_ids,
-                        "retired_jit_tool_ids": sorted(retired_jit_ids),
-                        "source": metadata.get("source"),
-                        "package_sha256": skill.package_sha256,
-                    },
-                )
+            # Tool registry lifecycle operations acquire this lock before the
+            # store lock. Skill activation must use the same order because it
+            # resolves/registers tools while its store transaction is open.
+            with runtime._registry_lifecycle_lock:
+                try:
+                    with self.store.transaction() as cur:
+                        process = self.store.get_process(pid)
+                        if process is None:
+                            raise NotFound(f"process not found: {pid}")
+                        previous_loaded = process.loaded_skills.get(skill.skill_id)
+                        previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
+                        previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
+                        self._validate_loadable(
+                            pid,
+                            skill,
+                            process.tool_table,
+                            replacing_jit_tool_ids=previous_jit_ids,
+                        )
+                        existing_handles = self._resolve_existing_tools(skill.allowed_tools)
+                        jit_handles = self._register_prepared_jit_tools(
+                            pid,
+                            skill,
+                            prepared_jit_tools,
+                            replacing_jit_tool_ids=previous_jit_ids,
+                        )
+                        tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
+                        jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
+                        base_tool_ids, base_model_tool_ids = self._activation_base_bindings(
+                            process,
+                            skill.skill_id,
+                            set(tool_ids) | set(jit_tool_ids),
+                        )
+                        updated_table = dict(process.tool_table)
+                        updated_model_table = dict(process.model_tool_table)
+                        for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
+                            if updated_table.get(name) == tool_id:
+                                updated_table.pop(name, None)
+                            if updated_model_table.get(name) == tool_id:
+                                updated_model_table.pop(name, None)
+                        for name, handle in {**existing_handles, **jit_handles}.items():
+                            updated_table[name] = handle.tool_id
+                            # Loading a Skill is an explicit tool-visibility action,
+                            # independent of the base image's lazy built-in groups.
+                            updated_model_table[name] = handle.tool_id
+                        loaded = LoadedSkill(
+                            skill_id=skill.skill_id,
+                            version=skill.version,
+                            source=metadata.get("source"),
+                            package_sha256=skill.package_sha256,
+                            loaded_at=utc_now(),
+                            tool_names=sorted([*tool_ids, *jit_tool_ids]),
+                            tool_ids=tool_ids,
+                            jit_tool_ids=jit_tool_ids,
+                            instructions_hash=self._hash_text(skill.instructions),
+                            package_snapshot=self._skill_snapshot(skill),
+                            base_tool_ids=base_tool_ids,
+                            base_model_tool_ids=base_model_tool_ids,
+                        )
+                        process.tool_table = updated_table
+                        process.model_tool_table = updated_model_table
+                        process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
+                        process.updated_at = utc_now()
+                        self.store.update_process(process)
+                        retired_jit_ids = set(previous_jit_ids.values()) - set(jit_tool_ids.values())
+                        self._delete_jit_rows(cur, pid, retired_jit_ids)
+                        self.events.emit(
+                            EventType.SKILL_LOADED,
+                            source=selected_actor,
+                            target=pid,
+                            payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
+                        )
+                        self.audit.record(
+                            actor=selected_actor,
+                            action="skill.activate",
+                            target=f"process:{pid}",
+                            decision={
+                                "skill_id": skill.skill_id,
+                                "version": skill.version,
+                                "replaced_loaded_version": self._loaded_version(previous_loaded),
+                                "tool_ids": tool_ids,
+                                "jit_tool_ids": jit_tool_ids,
+                                "retired_jit_tool_ids": sorted(retired_jit_ids),
+                                "source": metadata.get("source"),
+                                "package_sha256": skill.package_sha256,
+                            },
+                        )
+                except Exception:
+                    # Do not expose in-memory JIT handles after the outer store
+                    # transaction rolled back and before releasing the lock.
+                    self._discard_uncommitted_jit_tools(jit_handles)
+                    raise
+                self._forget_jit_tool_ids(retired_jit_ids)
         except Exception as exc:
-            self._discard_uncommitted_jit_tools(jit_handles)
             try:
                 self._discard_prepared_jit_candidates(pid, prepared_jit_tools)
             except Exception as cleanup_exc:
@@ -510,7 +561,6 @@ class SkillManager:
                 )
             self._restore_skill_rights(reservations)
             raise
-        self._forget_jit_tool_ids(retired_jit_ids)
         self._commit_skill_rights(reservations)
         return {
             "pid": pid,
@@ -543,46 +593,75 @@ class SkillManager:
             reservations = {}
         removed: list[str] = []
         jit_tool_ids: dict[str, str] = {}
+        retired_jit_ids: set[str] = set()
         try:
-            with self.store.transaction() as cur:
-                process = self.store.get_process(pid)
-                if process is None:
-                    raise NotFound(f"process not found: {pid}")
-                loaded = process.loaded_skills.get(skill_id)
-                if loaded is None:
-                    raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
-                tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
-                jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
-                for name, tool_id in {**tool_ids, **jit_tool_ids}.items():
-                    if process.tool_table.get(name) == tool_id:
-                        process.tool_table.pop(name, None)
-                        removed.append(name)
-                    if process.model_tool_table.get(name) == tool_id:
-                        process.model_tool_table.pop(name, None)
-                process.loaded_skills.pop(skill_id, None)
-                process.updated_at = utc_now()
-                self.store.update_process(process)
-                self._delete_jit_rows(cur, pid, set(jit_tool_ids.values()))
-                self.events.emit(
-                    EventType.SKILL_UNLOADED,
-                    source=selected_actor,
-                    target=pid,
-                    payload={"skill_id": skill_id, "removed_tools": sorted(removed)},
-                )
-                self.audit.record(
-                    actor=selected_actor,
-                    action="skill.unload",
-                    target=f"process:{pid}",
-                    decision={
-                        "skill_id": skill_id,
-                        "removed_tools": sorted(removed),
-                        "retired_jit_tool_ids": sorted(jit_tool_ids.values()),
-                    },
-                )
+            runtime = self._runtime()
+            with runtime._registry_lifecycle_lock:
+                with self.store.transaction() as cur:
+                    process = self.store.get_process(pid)
+                    if process is None:
+                        raise NotFound(f"process not found: {pid}")
+                    loaded = process.loaded_skills.get(skill_id)
+                    if loaded is None:
+                        raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
+                    loaded, legacy_provenance_backfilled = self._backfill_legacy_loaded_skill_provenance(
+                        process,
+                        skill_id,
+                        loaded,
+                    )
+                    tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+                    jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
+                    base_tool_ids = self._loaded_tool_id_map(loaded, "base_tool_ids")
+                    base_model_tool_ids = self._loaded_tool_id_map(loaded, "base_model_tool_ids")
+                    process.loaded_skills.pop(skill_id, None)
+                    for name, tool_id in {**tool_ids, **jit_tool_ids}.items():
+                        if process.tool_table.get(name) == tool_id:
+                            replacement = self._remaining_skill_binding(process.loaded_skills, name)
+                            if replacement is None:
+                                replacement = base_tool_ids.get(name)
+                            if replacement is None:
+                                process.tool_table.pop(name, None)
+                                removed.append(name)
+                            else:
+                                process.tool_table[name] = replacement
+                        if process.model_tool_table.get(name) == tool_id:
+                            replacement = self._remaining_skill_binding(process.loaded_skills, name)
+                            if replacement is None:
+                                replacement = base_model_tool_ids.get(name)
+                            if replacement is None:
+                                process.model_tool_table.pop(name, None)
+                            else:
+                                process.model_tool_table[name] = replacement
+                    process.updated_at = utc_now()
+                    self.store.update_process(process)
+                    remaining_jit_ids = {
+                        tool_id
+                        for remaining in process.loaded_skills.values()
+                        for tool_id in self._loaded_tool_id_map(remaining, "jit_tool_ids").values()
+                    }
+                    retired_jit_ids = set(jit_tool_ids.values()) - remaining_jit_ids
+                    self._delete_jit_rows(cur, pid, retired_jit_ids)
+                    self.events.emit(
+                        EventType.SKILL_UNLOADED,
+                        source=selected_actor,
+                        target=pid,
+                        payload={"skill_id": skill_id, "removed_tools": sorted(removed)},
+                    )
+                    self.audit.record(
+                        actor=selected_actor,
+                        action="skill.unload",
+                        target=f"process:{pid}",
+                        decision={
+                            "skill_id": skill_id,
+                            "removed_tools": sorted(removed),
+                            "retired_jit_tool_ids": sorted(retired_jit_ids),
+                            "legacy_provenance_backfilled": legacy_provenance_backfilled,
+                        },
+                    )
+                self._forget_jit_tool_ids(retired_jit_ids)
         except Exception:
             self._restore_skill_rights(reservations)
             raise
-        self._forget_jit_tool_ids(set(jit_tool_ids.values()))
         self._commit_skill_rights(reservations)
         return {"pid": pid, "skill_id": skill_id, "removed_tools": sorted(removed)}
 
@@ -992,8 +1071,15 @@ class SkillManager:
             )
         return SkillResource(path=path, size_bytes=len(content), sha256=sha, kind="text", content=text)
 
-    def _discover_host_skill_catalog(self, *, text: str | None, limit: int) -> list[dict[str, Any]]:
+    def _discover_host_skill_catalog(
+        self,
+        *,
+        text: str | None,
+        limit: int,
+        exclude_skill_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
+        seen = set(exclude_skill_ids or ())
         roots = [Path("skills"), Path(".agents") / "skills", Path(".claude") / "skills"]
         roots.extend(Path(root).expanduser() for root in self.config.skills.global_dirs)
         needle = text.lower() if text else None
@@ -1028,7 +1114,11 @@ class SkillManager:
                     }
                 if needle and needle not in dumps(summary).lower():
                     continue
+                skill_id = str(summary["skill_id"])
+                if skill_id in seen:
+                    continue
                 result.append(summary)
+                seen.add(skill_id)
                 if len(result) >= limit:
                     return result
         return result
@@ -1208,6 +1298,138 @@ class SkillManager:
         if not isinstance(loaded, dict) or not isinstance(loaded.get(field), dict):
             return {}
         return {str(name): str(tool_id) for name, tool_id in loaded[field].items()}
+
+    def _backfill_legacy_loaded_skill_provenance(
+        self,
+        process: Any,
+        skill_id: str,
+        loaded: Any,
+    ) -> tuple[Any, bool]:
+        """Recover independent static aliases for pre-provenance loaded rows.
+
+        Older persisted ``loaded_skills`` entries did not record which aliases
+        came from the process image or an explicit ToolBroker configuration.
+        Both paths leave durable ``process.tools.configure/project`` evidence,
+        so use the latest such tables (with the image declaration as fallback)
+        to reconstruct only static bindings.  Ephemeral JIT ids are never
+        inferred as a base source.
+        """
+
+        if not isinstance(loaded, dict) or (
+            "base_tool_ids" in loaded and "base_model_tool_ids" in loaded
+        ):
+            return loaded, False
+
+        runtime = self._runtime()
+        image = runtime.images.get(process.image_id)
+        full_names = set(getattr(image, "default_tools", []) if image is not None else [])
+        model_names = set(runtime.tools.initial_tool_projection(image) if image is not None else [])
+        for record in self.audit.trace(target=f"process:{process.pid}"):
+            tools = record.decision.get("tools") if isinstance(record.decision, dict) else None
+            if not isinstance(tools, list):
+                continue
+            selected = {str(name) for name in tools}
+            if record.action == "process.tools.configure":
+                full_names = selected
+                # ToolBroker.configure_process_tools publishes the same table
+                # to the model projection before any later explicit project.
+                model_names = selected
+            elif record.action == "process.tools.project":
+                model_names = selected
+
+        static_by_name = {
+            str(row["name"]): str(row["tool_id"])
+            for row in self.store.list_tools()
+            if not bool(row.get("ephemeral"))
+        }
+        contributed_names = {
+            *self._loaded_tool_id_map(loaded, "tool_ids"),
+            *self._loaded_tool_id_map(loaded, "jit_tool_ids"),
+        }
+        migrated = dict(loaded)
+        if "base_tool_ids" not in migrated:
+            migrated["base_tool_ids"] = {
+                name: static_by_name[name]
+                for name in sorted(contributed_names & full_names)
+                if name in static_by_name
+            }
+        if "base_model_tool_ids" not in migrated:
+            migrated["base_model_tool_ids"] = {
+                name: static_by_name[name]
+                for name in sorted(contributed_names & model_names)
+                if name in static_by_name
+            }
+        migrated["provenance_migration"] = {
+            "kind": "legacy_base_binding_backfill",
+            "migrated_at": utc_now(),
+        }
+        process.loaded_skills[skill_id] = migrated
+        return migrated, True
+
+    def _activation_base_bindings(
+        self,
+        process: Any,
+        skill_id: str,
+        names: set[str],
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        previous = process.loaded_skills.get(skill_id)
+        base_tools = self._loaded_tool_id_map(previous, "base_tool_ids")
+        base_model_tools = self._loaded_tool_id_map(previous, "base_model_tool_ids")
+        previous_skill_bindings = {
+            **self._loaded_tool_id_map(previous, "tool_ids"),
+            **self._loaded_tool_id_map(previous, "jit_tool_ids"),
+        }
+        other_skills = {
+            loaded_skill_id: loaded
+            for loaded_skill_id, loaded in process.loaded_skills.items()
+            if loaded_skill_id != skill_id
+        }
+        for name in names:
+            if name not in base_tools:
+                inherited = self._remaining_skill_base_binding(other_skills, name, "base_tool_ids")
+                if inherited is not None:
+                    base_tools[name] = inherited
+                elif (
+                    name not in previous_skill_bindings
+                    and self._remaining_skill_binding(other_skills, name) is None
+                ):
+                    current = process.tool_table.get(name)
+                    if current is not None:
+                        base_tools[name] = str(current)
+            if name not in base_model_tools:
+                inherited = self._remaining_skill_base_binding(other_skills, name, "base_model_tool_ids")
+                if inherited is not None:
+                    base_model_tools[name] = inherited
+                elif (
+                    name not in previous_skill_bindings
+                    and self._remaining_skill_binding(other_skills, name) is None
+                ):
+                    current = process.model_tool_table.get(name)
+                    if current is not None:
+                        base_model_tools[name] = str(current)
+        return base_tools, base_model_tools
+
+    def _remaining_skill_binding(self, loaded_skills: dict[str, Any], name: str) -> str | None:
+        for loaded in reversed(list(loaded_skills.values())):
+            jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
+            if name in jit_tool_ids:
+                return jit_tool_ids[name]
+            tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+            if name in tool_ids:
+                return tool_ids[name]
+        return None
+
+    def _remaining_skill_base_binding(
+        self,
+        loaded_skills: dict[str, Any],
+        name: str,
+        field: str,
+    ) -> str | None:
+        for loaded in reversed(list(loaded_skills.values())):
+            binding = self._loaded_tool_id_map(loaded, field).get(name)
+            if binding is not None:
+                return binding
+        return None
 
     def _loaded_version(self, loaded: Any) -> str | None:
         if not isinstance(loaded, dict):

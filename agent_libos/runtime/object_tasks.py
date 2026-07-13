@@ -55,6 +55,8 @@ _TERMINAL_STATUSES = {
     ObjectTaskStatus.FAILED,
     ObjectTaskStatus.CANCELLED,
     ObjectTaskStatus.ABANDONED,
+    ObjectTaskStatus.SUPERSEDED_BY_RESTORE,
+    ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN,
 }
 _OWNER_WATCH_EVENTS = {"updated", "linked"}
 _MESSAGE_REPLAY_SAFE_TOOLS = {"receive_process_messages"}
@@ -114,6 +116,53 @@ class ObjectTaskManager:
                 target="object_tasks",
                 decision={"task_ids": abandoned},
             )
+        self._reconcile_missing_terminal_results_after_reopen()
+
+    def _reconcile_missing_terminal_results_after_reopen(self) -> list[str]:
+        """Clear success references whose runtime-only Object payload is gone.
+
+        A normal persistent-store reopen releases live Object rows whose payload
+        cache cannot be reconstructed.  Terminal ObjectTask rows are durable
+        history, so leaving their old ``result_oid`` attached would falsely
+        advertise a live result.  Preserve the old claim in wait metadata and
+        publish an explicit terminal status instead.
+        """
+
+        unavailable: list[str] = []
+        now = utc_now()
+        with self.runtime.store.transaction():
+            for task in self.runtime.store.list_object_tasks(include_terminal=True):
+                if task.status != ObjectTaskStatus.SUCCEEDED or task.result_oid is None:
+                    continue
+                result_oid = str(task.result_oid)
+                if self.runtime.store.get_object(result_oid) is not None:
+                    continue
+                wait = {
+                    **task.wait,
+                    "result_unavailable_after_reopen": True,
+                    "result_unavailable_at": now,
+                    "previous_status": task.status.value,
+                    "previous_result_oid": result_oid,
+                    "previous_error": task.error,
+                }
+                updated = replace(
+                    task,
+                    status=ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN,
+                    result_oid=None,
+                    error="result unavailable after runtime reopen: runtime-only Object payload was not reconstructable",
+                    wait=wait,
+                    updated_at=now,
+                )
+                self.runtime.store.update_object_task(updated)
+                unavailable.append(str(task.task_id))
+            if unavailable:
+                self.runtime.audit.record(
+                    actor="object_task",
+                    action="object_task.result_unavailable_recovered",
+                    target="object_tasks",
+                    decision={"task_ids": sorted(unavailable)},
+                )
+        return sorted(unavailable)
 
     def start(
         self,

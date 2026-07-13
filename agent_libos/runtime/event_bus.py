@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import Event, EventPriority, EventType
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.storage import RuntimeStore
 
 
@@ -44,5 +45,20 @@ class EventBus:
                 self.operations.link_evidence("event", event.event_id, "resource_charge")
         return event
 
-    def list(self, target: str | None = None) -> builtins.list[Event]:
-        return self.store.list_events(target=target)
+    def list(
+        self,
+        target: str | None = None,
+        limit: int | None = None,
+        before_event_id: str | None = None,
+        after_event_id: str | None = None,
+    ) -> builtins.list[Event]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+            raise ValidationError("event list limit must be a positive integer")
+        if before_event_id is not None and after_event_id is not None:
+            raise ValidationError("event query cannot use before_event_id and after_event_id together")
+        return self.store.list_events(
+            target=target,
+            limit=limit,
+            before_event_id=before_event_id,
+            after_event_id=after_event_id,
+        )

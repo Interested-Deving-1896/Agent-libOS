@@ -1,0 +1,137 @@
+# Configuration Reference
+
+Agent libOS keeps non-secret runtime defaults in the frozen, validated
+`agent_libos.config.DEFAULT_CONFIG` object. The canonical field declarations
+and numeric defaults live in `agent_libos/config/defaults.py`; this document
+defines loading, precedence, security handling, and a field-level inventory so
+operators do not have to infer those rules from example YAML.
+
+## Loading and precedence
+
+Product entrypoints use this order:
+
+1. Start from a fresh `DEFAULT_CONFIG` value.
+2. If `--config <path>` is present, recursively merge that YAML mapping.
+3. Otherwise load the repository/project-root `config.yaml` when it exists.
+   The loader does not search the caller's current working directory.
+4. Replace scalar, list, and tuple fields supplied by the overlay; recursively
+   merge mapping fields such as `llm.profiles`.
+5. For CLI and GUI-server entrypoints, an explicit `--db` store target overrides
+   the selected runtime store target.
+6. Construct and validate a new frozen `AgentLibOSConfig`. Unknown fields and
+   unsafe, inverted, non-finite, or incorrectly typed bounds fail before the
+   Runtime opens.
+
+There is no runtime hot reload. Change the host configuration and open a new
+Runtime. Library callers should pass an explicit config object when they need a
+different composition:
+
+```python
+from agent_libos import Runtime
+from agent_libos.config import load_config_file
+
+runtime = Runtime.open(config=load_config_file("agent-config.yaml"))
+```
+
+The checked-in repository `config.yaml` selects `.agent_libos.sqlite` and loads
+the trusted PTY Runtime Module. Consequently, omitting `--db` while using this
+checkout selects that persistent store. In an installed package or source tree
+without a project-root config, `DEFAULT_CONFIG.runtime.local_store_target` is
+`local`, an in-memory SQLite store. Scripts and documentation that require state
+across separate CLI invocations should always pass `--db` explicitly.
+
+## Inspecting exact defaults
+
+Defaults change with the code. Print the exact values for the current checkout
+instead of copying a stale sample:
+
+```bash
+uv run python -c 'import json; from agent_libos.config import DEFAULT_CONFIG; from agent_libos.utils.serde import to_jsonable; print(json.dumps(to_jsonable(DEFAULT_CONFIG), indent=2, sort_keys=True))'
+```
+
+The following inventory is intentionally field-level but leaves values in the
+typed source and live dump above. A field addition must update this table in the
+same change.
+
+| Group | Fields |
+| --- | --- |
+| `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode` |
+| `gui` | `event_buffer_limit`, `request_body_max_bytes`, `scheduler_shutdown_join_timeout_s`, `http_shutdown_delay_s`, `object_task_wait_default_timeout_s`, `object_task_wait_max_timeout_s`, `snapshot_event_limit`, `snapshot_audit_limit`, `snapshot_llm_call_limit`, `snapshot_process_message_limit`, `snapshot_process_llm_call_limit`, `snapshot_object_task_limit`, `snapshot_collection_max_items`, `snapshot_string_max_chars`, `sse_payload_max_bytes`, `agent_rating_comment_max_chars` |
+| `capability` | `default_delegation_depth`, `max_rights_per_capability`, `max_constraints_bytes`, `list_limit`, `decision_explain_preview_chars` |
+| `scheduler` | `max_quanta`, `poll_interval_s`, `max_workers`, `drain_window_s`, `shutdown_join_timeout_s` |
+| `process` | `max_tool_calls`, `max_child_processes`, `max_runtime_seconds`, `max_context_materialization_tokens`, `max_context_materialization_total_tokens`, `max_llm_calls`, `max_llm_total_tokens`, `max_subprocess_wall_seconds`, `max_subprocess_cpu_seconds`, `max_subprocess_memory_bytes`, `max_external_read_bytes`, `max_external_write_bytes`, `max_jsonrpc_bytes`, `max_mcp_bytes`, `max_deno_syscalls`, `default_goal_text`, `default_working_directory`, `fork_budget_divisor`, `fork_min_tool_calls`, `fork_min_child_processes` |
+| `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `compatibility_retry_attempts`, `action_repair_attempts`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
+| `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s` |
+| `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
+| `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
+| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
+| `image` | `registry_resource`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `manifest_hard_limit_bytes`, `structured_field_hard_limit_bytes`, `max_default_tools`, `max_required_capabilities`, `max_required_modules`, `package_manifest_name`, `package_workspace_dir`, `package_tools_dir`, `package_resources_dir`, `materialized_workspace_root`, `package_manifest_max_bytes`, `package_manifest_hard_limit_bytes`, `package_file_max_bytes`, `package_max_bytes`, `package_max_files`, `prompt_max_chars`, `max_package_jit_tools`, `max_workspace_grants` |
+| `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
+| `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix` |
+| `object_tasks` | `max_running_global`, `max_running_per_object`, `notification_channel`, `owner_watch_channel`, `owner_watch_events`, `shutdown_join_timeout_s` |
+| `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit` |
+| `checkpoint` | `snapshot_version`, `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
+| `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities` |
+| `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
+| `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
+| `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
+
+The table is checked against the dataclass fields by
+`tests/unit/test_configuration_docs.py`. Values and nested `LLMProfile` fields
+remain authoritative in the live dump and typed source. Optional Runtime
+Modules may also own module-local settings that are not fields of
+`AgentLibOSConfig`.
+
+## Security-sensitive settings
+
+- `runtime.store_dsn` may contain PostgreSQL credentials. Prefer an
+  environment-specific untracked overlay; never commit a real DSN.
+- LLM profiles store an `api_key_env` variable name, never the API-key value.
+  Only the selected host process reads that environment variable.
+- JSON-RPC/MCP header and stdio allowlists contain environment-variable names.
+  Manifests reference those names; resolved secret values must not be persisted
+  in registry rows, audit metadata, benchmark provenance, or GUI responses.
+- `llm.persist_full_io` defaults to true. Set it to false when the deployment's
+  user agreement does not authorize retention of full prompts, tool schemas,
+  reasoning, outputs, and raw provider payloads.
+- Provider-side Responses storage and chaining remain opt-in through
+  `llm.store` and `llm.responses_previous_response_id`.
+- `runtime.launch_authority_mode: manifest_required` treats image capability
+  requirements as declarations, not grants. The legacy mode is a compatibility
+  choice and must not be inferred from an image.
+
+## Bounded windows
+
+GUI and context limits operate at two different layers and must not be treated
+as equivalent:
+
+- `llm_context.recent_event_limit` bounds the newest post-cursor event rows
+  loaded from SQL for one LLM context preparation.
+- `gui.snapshot_event_limit` bounds snapshot event reads and is also the maximum
+  accepted `limit` for the process-events API. Older pages use its `before`
+  cursor rather than loading all process events.
+- The audit, global LLM-call, per-process message, and ObjectTask snapshot
+  limits are passed to their store/provider queries, so those sources select a
+  bounded window before response assembly. `snapshot_process_llm_call_limit`
+  bounds the newest per-process LLM rows contributing to each process summary
+  and is also the default and maximum size of the per-process LLM-call API.
+  The snapshot selects those per-process windows in one SQL query and aggregates
+  their count and token usage without materializing full call records.
+- `gui.snapshot_collection_max_items` bounds process, pending-first Human,
+  tool, image, Skill, JSON-RPC, MCP, Runtime Module, and LLM-profile reads at
+  their source. A subsystem's own lower list maximum remains authoritative.
+  Where the source permits the GUI collection limit plus one, the snapshot uses
+  that lookahead, clips before assembly, and records the detected omission as a
+  source-limited lower bound in `_truncated`. Process message/count, LLM-window
+  count/token usage, rating, ancestor, reservation, and remaining-budget data
+  are fetched in batches rather than once per pid.
+- `gui.snapshot_string_max_chars` and the recursive collection bound still
+  protect nested values during final response shaping. Final shaping is a
+  second defense; it is no longer the only bound for top-level snapshot
+  collections.
+- `gui.event_buffer_limit` is the separate in-process SSE replay window; an
+  evicted cursor causes explicit snapshot invalidation.
+
+None of these windows deletes durable records. Source-level limits prevent
+unbounded reads; final shaping limits protect the serialized payload but cannot
+by themselves cap database or in-process assembly work.

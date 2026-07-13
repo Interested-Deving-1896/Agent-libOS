@@ -42,8 +42,10 @@ from agent_libos.storage import display_store_target
 from agent_libos.utils.serde import to_jsonable
 
 _GUI_DEFAULTS = DEFAULT_CONFIG.gui
+_GUI_PRODUCTION_RENDERER_ORIGIN = "agent-libos://app"
 _TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _CONFIG_DEFAULT = object()
+_SUMMARY_UNSET = object()
 _GUI_BOOL_FIELDS = {
     "approved",
     "allow_custom_base_url",
@@ -142,7 +144,13 @@ def _bounded_gui_value(
     return jsonable
 
 
-def _bounded_gui_payload(value: Any, *, string_limit: int, collection_limit: int) -> Any:
+def _bounded_gui_payload(
+    value: Any,
+    *,
+    string_limit: int,
+    collection_limit: int,
+    pre_truncated: dict[str, Any] | None = None,
+) -> Any:
     truncated: dict[str, Any] = {}
     bounded = _bounded_gui_value(
         value,
@@ -150,9 +158,33 @@ def _bounded_gui_payload(value: Any, *, string_limit: int, collection_limit: int
         collection_limit=collection_limit,
         truncated=truncated,
     )
-    if truncated and isinstance(bounded, dict):
-        bounded["_truncated"] = truncated
+    if isinstance(bounded, dict):
+        combined = {**truncated, **dict(pre_truncated or {})}
+        if combined:
+            bounded["_truncated"] = combined
     return bounded
+
+
+def _take_source_window(
+    values: list[Any],
+    *,
+    limit: int,
+    path: str,
+    truncated: dict[str, Any],
+    source_has_more: bool = False,
+) -> list[Any]:
+    """Clip a bounded source window and preserve its next-row signal."""
+
+    if len(values) <= limit and not source_has_more:
+        return values
+    truncated[path] = {
+        "kind": "array",
+        "returned": min(len(values), limit),
+        "omitted": max(0, len(values) - limit) + (1 if source_has_more else 0),
+        "omitted_is_lower_bound": True,
+        "source_limited": True,
+    }
+    return values[:limit]
 
 
 def _sse_payload_data(
@@ -530,6 +562,7 @@ class GuiRuntimeService:
         self.scheduler = SchedulerController(self, auto_run=auto_run, default_max_quanta=selected_max_quanta, paused=not auto_run)
         self._closed = False
         self._static_snapshot_cache: dict[str, Any] | None = None
+        self._static_snapshot_truncated: dict[str, Any] = {}
         self._static_snapshot_dirty = True
         dedupe_limit = max(1, self.runtime.config.gui.event_buffer_limit * 2)
         self._seen_event_ids = _BoundedSeenKeys(max(dedupe_limit, self.runtime.config.gui.snapshot_event_limit * 2))
@@ -684,35 +717,101 @@ class GuiRuntimeService:
 
     def snapshot(self) -> dict[str, Any]:
         with self.runtime_lock:
-            processes = [
-                self._process_summary(process.pid, include_messages=True, process=process)
-                for process in self.runtime.process.list()
-            ]
+            collection_limit = self.runtime.config.gui.snapshot_collection_max_items
+            source_truncated: dict[str, Any] = {}
+            processes = self._process_summaries(
+                limit=collection_limit,
+                include_messages=True,
+                truncated=source_truncated,
+            )
+            human_requests = _take_source_window(
+                to_jsonable(self.runtime.human.list(limit=collection_limit + 1)),
+                limit=collection_limit,
+                path="human_requests",
+                truncated=source_truncated,
+            )
             static = self._static_snapshot()
+            source_truncated.update(self._static_snapshot_truncated)
             snapshot = {
                 "db": self.db,
                 "scheduler": self.scheduler.status(),
                 "processes": processes,
-                "human_requests": to_jsonable(self.runtime.human.list()),
-                "events": to_jsonable(self.runtime.events.list()[-self.runtime.config.gui.snapshot_event_limit :]),
+                "human_requests": human_requests,
+                "events": to_jsonable(
+                    self.runtime.events.list(limit=self.runtime.config.gui.snapshot_event_limit)
+                ),
                 "audit": to_jsonable(self.runtime.audit.trace(limit=self.runtime.config.gui.snapshot_audit_limit)),
                 "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=self.runtime.config.gui.snapshot_llm_call_limit)),
                 "object_tasks": to_jsonable(self.runtime.object_tasks.list(limit=self.runtime.config.gui.snapshot_object_task_limit)),
                 **static,
             }
-            return self._bounded_snapshot(snapshot)
+            return self._bounded_snapshot(snapshot, source_truncated=source_truncated)
 
     def _static_snapshot(self) -> dict[str, Any]:
         if self._static_snapshot_cache is None or self._static_snapshot_dirty:
+            limit = self.runtime.config.gui.snapshot_collection_max_items
+            fetch_limit = limit + 1
+            truncated: dict[str, Any] = {}
+            skills, skills_have_more = self.runtime.skills.discover_skills_window(
+                require_capability=False,
+                limit=min(fetch_limit, self.runtime.config.skills.discover_limit),
+            )
+            jsonrpc_endpoints, jsonrpc_endpoints_have_more = self.runtime.jsonrpc.list_endpoints_window(
+                require_capability=False,
+                limit=min(fetch_limit, self.runtime.config.jsonrpc.list_limit),
+            )
+            mcp_servers, mcp_servers_have_more = self.runtime.mcp.list_servers_window(
+                require_capability=False,
+                limit=min(fetch_limit, self.runtime.config.mcp.list_limit),
+            )
             self._static_snapshot_cache = {
-                "tools": self._tool_summaries(),
-                "images": to_jsonable(self.runtime.image_registry.list_images()),
-                "skills": to_jsonable(self.runtime.skills.discover_skills(require_capability=False)),
-                "jsonrpc_endpoints": to_jsonable(self.runtime.jsonrpc.list_endpoints(require_capability=False)),
-                "mcp_servers": to_jsonable(self.runtime.mcp.list_servers(require_capability=False)),
-                "modules": to_jsonable(self.runtime.modules.loaded_module_summaries()),
-                "llm_profiles": self._llm_profile_summaries(),
+                "tools": _take_source_window(
+                    self._tool_summaries(limit=fetch_limit),
+                    limit=limit,
+                    path="tools",
+                    truncated=truncated,
+                ),
+                "images": _take_source_window(
+                    to_jsonable(self.runtime.image_registry.list_images(limit=fetch_limit)),
+                    limit=limit,
+                    path="images",
+                    truncated=truncated,
+                ),
+                "skills": _take_source_window(
+                    to_jsonable(skills),
+                    limit=limit,
+                    path="skills",
+                    truncated=truncated,
+                    source_has_more=skills_have_more,
+                ),
+                "jsonrpc_endpoints": _take_source_window(
+                    to_jsonable(jsonrpc_endpoints),
+                    limit=limit,
+                    path="jsonrpc_endpoints",
+                    truncated=truncated,
+                    source_has_more=jsonrpc_endpoints_have_more,
+                ),
+                "mcp_servers": _take_source_window(
+                    to_jsonable(mcp_servers),
+                    limit=limit,
+                    path="mcp_servers",
+                    truncated=truncated,
+                    source_has_more=mcp_servers_have_more,
+                ),
+                "modules": _take_source_window(
+                    to_jsonable(self.runtime.modules.loaded_module_summaries(limit=fetch_limit)),
+                    limit=limit,
+                    path="modules",
+                    truncated=truncated,
+                ),
+                "llm_profiles": _take_source_window(
+                    self._llm_profile_summaries(limit=fetch_limit),
+                    limit=limit,
+                    path="llm_profiles",
+                    truncated=truncated,
+                ),
             }
+            self._static_snapshot_truncated = truncated
             self._static_snapshot_dirty = False
         return dict(self._static_snapshot_cache)
 
@@ -725,37 +824,102 @@ class GuiRuntimeService:
         *,
         include_messages: bool = False,
         process: Any | None = None,
+        activity: dict[str, Any] | None = None,
+        resource_remaining: Any | None = None,
+        rating: Any = _SUMMARY_UNSET,
     ) -> dict[str, Any]:
         process = process if process is not None else self.runtime.process.get(pid)
-        unread = self.runtime.messages.list(pid, include_acked=False)
-        messages = (
-            self.runtime.messages.list(pid, include_acked=True, limit=self.runtime.config.gui.snapshot_process_message_limit)
-            if include_messages
-            else []
+        selected_activity = (
+            activity
+            if activity is not None
+            else self.runtime.store.get_process_activity_summaries(
+                [pid],
+                recent_message_limit=(
+                    self.runtime.config.gui.snapshot_process_message_limit if include_messages else 0
+                ),
+                recent_llm_call_limit=self.runtime.config.gui.snapshot_process_llm_call_limit,
+            )
         )
-        calls = self.runtime.store.list_llm_calls(pid=pid, limit=self.runtime.config.gui.snapshot_process_llm_call_limit)
+        activity_row = selected_activity.get(
+            pid,
+            {
+                "unread_message_count": 0,
+                "interrupt_count": 0,
+                "llm_call_count": 0,
+                "token_total": 0,
+                "messages": [],
+            },
+        )
         return {
             **to_jsonable(process),
             "terminal": process.status in _TERMINAL,
-            "unread_message_count": len(unread),
-            "interrupt_count": len([item for item in unread if item.kind == ProcessMessageKind.INTERRUPT]),
-            "messages": to_jsonable(messages),
-            "llm_call_count": len(calls),
-            "token_total": sum(int((call.usage or {}).get("total_tokens", 0) or 0) for call in calls),
-            "resource_remaining": to_jsonable(self.runtime.resources.remaining_budget(pid)),
-            "rating": to_jsonable(self.runtime.ratings.get(pid)),
+            "unread_message_count": int(activity_row["unread_message_count"]),
+            "interrupt_count": int(activity_row["interrupt_count"]),
+            "messages": to_jsonable(activity_row["messages"] if include_messages else []),
+            "llm_call_count": int(activity_row["llm_call_count"]),
+            "token_total": int(activity_row["token_total"]),
+            "resource_remaining": to_jsonable(
+                resource_remaining
+                if resource_remaining is not None
+                else self.runtime.resources.remaining_budget(pid)
+            ),
+            "rating": to_jsonable(
+                self.runtime.ratings.get(pid) if rating is _SUMMARY_UNSET else rating
+            ),
         }
 
-    def _bounded_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _process_summaries(
+        self,
+        *,
+        limit: int,
+        include_messages: bool,
+        truncated: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        selected_truncated = truncated if truncated is not None else {}
+        processes = _take_source_window(
+            self.runtime.process.list(limit=limit + 1, active_first=True),
+            limit=limit,
+            path="processes",
+            truncated=selected_truncated,
+        )
+        pids = [process.pid for process in processes]
+        activity = self.runtime.store.get_process_activity_summaries(
+            pids,
+            recent_message_limit=(
+                self.runtime.config.gui.snapshot_process_message_limit if include_messages else 0
+            ),
+            recent_llm_call_limit=self.runtime.config.gui.snapshot_process_llm_call_limit,
+        )
+        remaining = self.runtime.resources.remaining_budgets(pids)
+        ratings = self.runtime.ratings.get_many(pids)
+        return [
+            self._process_summary(
+                process.pid,
+                include_messages=include_messages,
+                process=process,
+                activity=activity,
+                resource_remaining=remaining[process.pid],
+                rating=ratings.get(process.pid),
+            )
+            for process in processes
+        ]
+
+    def _bounded_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        source_truncated: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return _bounded_gui_payload(
             snapshot,
             string_limit=self.runtime.config.gui.snapshot_string_max_chars,
             collection_limit=self.runtime.config.gui.snapshot_collection_max_items,
+            pre_truncated=source_truncated,
         )
 
-    def _tool_summaries(self) -> list[dict[str, Any]]:
+    def _tool_summaries(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
-        for tool in self.runtime.tools.list():
+        for tool in self.runtime.tools.list(limit=limit):
             try:
                 spec = json.loads(tool.get("spec_json") or "{}")
             except json.JSONDecodeError:
@@ -784,7 +948,9 @@ class GuiRuntimeService:
             self.runtime.llms.register_profile(profile_id, profile)
         return profiles
 
-    def _llm_profile_summaries(self) -> list[dict[str, Any]]:
+    def _llm_profile_summaries(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValidationError("LLM profile list limit must be a positive integer")
         default_profile_id = self.runtime.config.llm.default_profile_id
         summaries: list[dict[str, Any]] = []
         for profile_id, profile in sorted(self.runtime.config.llm.profiles.items()):
@@ -797,6 +963,8 @@ class GuiRuntimeService:
                     default_profile_id=default_profile_id,
                 )
             )
+            if limit is not None and len(summaries) >= limit:
+                return summaries
         for profile_id, profile in sorted(self._user_llm_profile_cache.items()):
             summaries.append(
                 summarize_llm_profile(
@@ -807,6 +975,8 @@ class GuiRuntimeService:
                     default_profile_id=default_profile_id,
                 )
             )
+            if limit is not None and len(summaries) >= limit:
+                break
         return summaries
 
     def require_llm_profile_id(self, value: Any) -> str | None:
@@ -999,15 +1169,23 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and route == ["health"]:
             return service.health()
         if method == "POST" and route == ["shutdown"]:
-            service.scheduler.pause()
-            return {"ok": True, "status": "shutting_down"}
+            if not service.shutdown():
+                raise GuiServerError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "GUI runtime teardown is incomplete; retry shutdown",
+                    details={"retryable": True, "status": "shutdown_incomplete"},
+                )
+            return {"ok": True, "status": "stopped"}
         if method == "GET" and route == ["snapshot"]:
             return service.snapshot()
         if method == "GET" and route == ["processes"]:
-            return [
-                service._process_summary(process.pid, include_messages=True, process=process)
-                for process in service.runtime.process.list()
-            ]
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=service.runtime.config.gui.snapshot_collection_max_items,
+                maximum=service.runtime.config.gui.snapshot_collection_max_items,
+            )
+            return service._process_summaries(limit=limit, include_messages=True)
         if method == "GET" and route == ["operations"]:
             pid = _query_str(query, "pid")
             if not pid:
@@ -1042,7 +1220,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 cursor=_query_str(query, "cursor"),
             )
         if method == "GET" and route == ["tools"]:
-            return service._tool_summaries()
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=service.runtime.config.gui.snapshot_collection_max_items,
+                maximum=service.runtime.config.gui.snapshot_collection_max_items,
+            )
+            return service._tool_summaries(limit=limit)
         if method == "POST" and route == ["processes"]:
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
@@ -1227,7 +1411,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and route == ["human-requests"]:
             return to_jsonable(service.runtime.human.list(pid=pid))
         if method == "GET" and route == ["llm-calls"]:
-            return to_jsonable(service.runtime.store.list_llm_calls(pid=pid, limit=_query_int(query, "limit")))
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=service.runtime.config.gui.snapshot_process_llm_call_limit,
+                maximum=service.runtime.config.gui.snapshot_process_llm_call_limit,
+            )
+            return to_jsonable(service.runtime.store.list_llm_calls(pid=pid, limit=limit))
         if method == "GET" and route == ["rating"]:
             return to_jsonable(service.runtime.ratings.get(pid))
         if method == "POST" and route == ["rating"]:
@@ -1249,7 +1439,19 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 )
             )
         if method == "GET" and route == ["events"]:
-            return to_jsonable(service.runtime.events.list(target=pid))
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=service.runtime.config.gui.snapshot_event_limit,
+                maximum=service.runtime.config.gui.snapshot_event_limit,
+            )
+            return to_jsonable(
+                service.runtime.events.list(
+                    target=pid,
+                    limit=limit,
+                    before_event_id=_query_str(query, "before"),
+                )
+            )
         if method == "GET" and route == ["capabilities"]:
             return to_jsonable(service.runtime.capability.list_subject(pid, include_inactive=True))
         if method == "GET" and route == ["checkpoints"]:
@@ -1951,8 +2153,33 @@ def serve(
     try:
         server.serve_forever()
     finally:
-        server.service.shutdown()
-        server.server_close()
+        try:
+            _shutdown_gui_service_before_exit(server.service)
+        finally:
+            server.server_close()
+
+
+def _shutdown_gui_service_before_exit(service: GuiRuntimeService, *, attempts: int = 2) -> None:
+    """Finish owned Runtime teardown or make process exit fail visibly."""
+
+    selected_attempts = max(1, int(attempts))
+    failures: list[str] = []
+    last_error: Exception | None = None
+    for _attempt in range(selected_attempts):
+        try:
+            if service.shutdown():
+                return
+            failures.append("shutdown returned false")
+        except Exception as exc:
+            last_error = exc
+            failures.append(f"{type(exc).__name__}: {exc}")
+    error = RuntimeError(
+        f"GUI runtime teardown remained incomplete after {selected_attempts} attempts: "
+        + "; ".join(failures)
+    )
+    if last_error is not None:
+        raise error from last_error
+    raise error
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -2051,6 +2278,23 @@ def _query_int(query: dict[str, list[str]], key: str) -> int | None:
     return _int_or_none(values[0]) if values else None
 
 
+def _bounded_query_limit(
+    query: dict[str, list[str]],
+    key: str,
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    selected = _query_int(query, key)
+    if selected is None:
+        return default
+    if selected <= 0:
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{key} must be a positive integer")
+    if selected > maximum:
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, f"{key} must be at most {maximum}")
+    return selected
+
+
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
@@ -2121,6 +2365,8 @@ def _object_task_owner_watch_body(body: dict[str, Any]) -> dict[str, Any] | bool
 def _allowed_cors_origin(origin: str | None) -> str | None:
     if not origin:
         return None
+    if origin == _GUI_PRODUCTION_RENDERER_ORIGIN:
+        return origin
     parsed = urlparse(origin)
     if parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost"}:
         return origin
