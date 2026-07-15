@@ -8,15 +8,347 @@ import pytest
 
 from agent_libos import AgentImage, Runtime
 from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
-from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectTaskStatus, ObjectType, ProcessMessageStatus, ProcessStatus
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models import CapabilityEffect, CapabilityRight, DataFlowContext, DataLabels, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectTaskStatus, ObjectType, ProcessMessageStatus, ProcessStatus
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessWaitRequired, ValidationError
 from agent_libos.substrate import LocalHumanProvider, LocalResourceProviderSubstrate
 from agent_libos.tools.builtin.checkpoint import RestoreCheckpointOutput
-from agent_libos.utils.serde import loads
+from agent_libos.utils.serde import dumps, loads
 from tests.support.checkpoints import ClassifiedShellProvider
 
 
 class TestCheckpointRestore:
+    def test_legacy_history_row_insert_derives_gui_visibility(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            event = runtime.events.emit(
+                EventType.HUMAN_OUTPUT,
+                source='test',
+                target='human:owner',
+                payload={'purpose': 'gui_presentation'},
+            )
+            record = runtime.audit.record(
+                actor='test',
+                action='data_flow.egress',
+                target='human:owner:gui',
+                decision={},
+            )
+            event_row = runtime.store.select_table_rows(
+                'events',
+                'event_id = ?',
+                (event.event_id,),
+            )[0]
+            audit_row = runtime.store.select_table_rows(
+                'audit_records',
+                'record_id = ?',
+                (record.record_id,),
+            )[0]
+            event_row['event_id'] = 'legacy-gui-event'
+            audit_row['record_id'] = 'legacy-gui-audit'
+            event_row.pop('gui_snapshot_visible')
+            audit_row.pop('gui_snapshot_visible')
+
+            with runtime.store.transaction() as cur:
+                runtime.checkpoint._insert_row(cur, 'events', event_row)
+                runtime.checkpoint._insert_row(cur, 'audit_records', audit_row)
+
+            inserted_event = runtime.store.select_table_rows(
+                'events',
+                'event_id = ?',
+                ('legacy-gui-event',),
+            )[0]
+            inserted_audit = runtime.store.select_table_rows(
+                'audit_records',
+                'record_id = ?',
+                ('legacy-gui-audit',),
+            )[0]
+            assert inserted_event['gui_snapshot_visible'] == 0
+            assert inserted_audit['gui_snapshot_visible'] == 0
+        finally:
+            runtime.close()
+
+    def test_restore_legacy_snapshot_flow_carriers_fail_closed(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='restore legacy flow carriers conservatively',
+            )
+            message = runtime.messages.post(
+                sender='legacy.sender',
+                recipient_pid=pid,
+                subject='legacy snapshot message',
+                body='classification unavailable in old snapshot',
+            )
+            runtime.store.upsert_llm_pending_action(
+                pid,
+                {
+                    'resume_token': 'legacy-checkpoint-token',
+                    'wait_type': 'message',
+                    'filters': {'channel': 'legacy-checkpoint'},
+                    'action': {
+                        'action': 'receive_process_messages',
+                        'channel': 'legacy-checkpoint',
+                    },
+                    'data_flow_context': DataFlowContext(
+                        labels=DataLabels(sensitivity='secret')
+                    ).to_dict(),
+                    'content_preview': '',
+                    'tool_call_count': 1,
+                    'status': 'pending',
+                },
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'legacy checkpoint flow state',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            pending_rows = snapshot['rows']['llm_pending_actions']
+            message_rows = snapshot['rows']['process_messages']
+            assert len(pending_rows) == 1
+            assert len(message_rows) == 1
+            pending_rows[0].pop('data_flow_context_json')
+            message_rows[0].pop('metadata_json')
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+            runtime.store._execute(
+                "UPDATE process_messages SET metadata_json = '{}' WHERE message_id = ?",
+                (message.message_id,),
+            )
+
+            finalizer_registry_lock_checks: list[bool] = []
+
+            def assert_registry_lock_available(_obj, _actor, _reason) -> None:
+                acquired: list[bool] = []
+
+                def acquire_from_peer() -> None:
+                    locked = runtime._registry_lifecycle_lock.acquire(timeout=2)
+                    acquired.append(locked)
+                    if locked:
+                        runtime._registry_lifecycle_lock.release()
+
+                peer = threading.Thread(target=acquire_from_peer)
+                peer.start()
+                peer.join(timeout=3)
+                finalizer_registry_lock_checks.append(
+                    not peer.is_alive() and acquired == [True]
+                )
+
+            runtime.memory.bind_object_release_finalizer(assert_registry_lock_available)
+
+            result = runtime.checkpoint.restore(
+                'cli',
+                checkpoint_id,
+                require_capability=False,
+            )
+
+            assert result['main_state_committed'] is True
+            restored = runtime.process.get(pid)
+            assert restored.status == ProcessStatus.FAILED
+            assert 'legacy pending LLM action' in (restored.status_message or '')
+            pending = runtime.store.get_llm_pending_action(pid)
+            assert pending is not None
+            assert pending['status'] == 'legacy_data_flow_reconciled'
+            pending_context = DataFlowContext.from_dict(pending['data_flow_context'])
+            assert pending_context.labels.sensitivity.value == 'secret'
+            restored_message = runtime.store.get_process_message(message.message_id)
+            assert restored_message is not None
+            assert restored_message.metadata['data_labels']['sensitivity'] == 'secret'
+            assert restored_message.metadata['data_labels']['trust_level'] == 'untrusted'
+            assert restored.goal_oid is not None
+            assert runtime.store.get_object(restored.goal_oid) is None
+            goal_rows = runtime.store.select_table_rows(
+                'objects',
+                'oid = ?',
+                (restored.goal_oid,),
+            )
+            assert goal_rows[0]['lifecycle_state'] == 'released'
+            assert finalizer_registry_lock_checks
+            assert all(finalizer_registry_lock_checks)
+        finally:
+            runtime.close()
+
+    def test_restore_completed_legacy_pending_history_does_not_fail_process(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='keep completed legacy pending history inert',
+            )
+            runtime.store.upsert_llm_pending_action(
+                pid,
+                {
+                    'resume_token': 'completed-legacy-checkpoint-token',
+                    'wait_type': 'message',
+                    'filters': {},
+                    'action': {'action': 'receive_process_messages'},
+                    'data_flow_context': DataFlowContext().to_dict(),
+                    'content_preview': '',
+                    'tool_call_count': 1,
+                    'status': 'completed',
+                },
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'completed legacy pending history',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            pending_rows = snapshot['rows']['llm_pending_actions']
+            assert len(pending_rows) == 1
+            pending_rows[0].pop('data_flow_context_json')
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            result = runtime.checkpoint.restore(
+                'cli',
+                checkpoint_id,
+                require_capability=False,
+            )
+
+            assert result['main_state_committed'] is True
+            restored = runtime.process.get(pid)
+            assert restored.status == ProcessStatus.RUNNABLE
+            pending = runtime.store.get_llm_pending_action(pid)
+            assert pending is not None
+            assert pending['status'] == 'completed'
+            pending_context = DataFlowContext.from_dict(pending['data_flow_context'])
+            assert pending_context.labels.sensitivity.value == 'secret'
+            assert pending_context.labels.trust_level.value == 'untrusted'
+        finally:
+            runtime.close()
+
+    def test_restore_canonicalizes_minimal_message_metadata_for_observation_cas(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='restore minimal message metadata',
+            )
+            message = runtime.messages.post(
+                sender='legacy.sender',
+                recipient_pid=pid,
+                metadata={'custom': 'preserved'},
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'minimal message metadata',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            message_row = next(
+                row
+                for row in snapshot['rows']['process_messages']
+                if row['message_id'] == message.message_id
+            )
+            message_row['metadata_json'] = dumps(
+                {
+                    'custom': 'preserved',
+                    'data_labels': {
+                        'sensitivity': 'normal',
+                        'trust_level': 'trusted',
+                        'integrity': 'verified',
+                    },
+                }
+            )
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+            restored = runtime.store.get_process_message(message.message_id)
+            assert restored is not None
+            assert restored.metadata['custom'] == 'preserved'
+
+            observed = runtime.messages.observe_labels(pid, [restored])
+
+            assert len(observed) == 1
+            persisted = runtime.store.get_process_message(message.message_id)
+            assert persisted is not None
+            assert persisted.metadata['label_carrier_oid'] == observed[0]
+        finally:
+            runtime.close()
+
+    def test_restore_legacy_pending_child_runs_terminal_lifecycle(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='legacy checkpoint parent',
+            )
+            child = runtime.process.spawn_child(parent, 'legacy checkpoint child')
+            runtime.capability.grant_once(
+                child,
+                'human:owner',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            request_id = runtime.human.ask(child, 'request must be cancelled after restore')
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
+            runtime.store.upsert_llm_pending_action(
+                child,
+                {
+                    'resume_token': 'legacy-checkpoint-child-token',
+                    'wait_type': 'human',
+                    'request_id': request_id,
+                    'filters': {},
+                    'action': {'action': 'ask_human'},
+                    'data_flow_context': DataFlowContext().to_dict(),
+                    'content_preview': '',
+                    'tool_call_count': 1,
+                    'status': 'pending',
+                },
+            )
+            assert runtime.store.list_resource_reservations(child_pid=child)
+            checkpoint_id = runtime.checkpoint.create(
+                parent,
+                'legacy child lifecycle',
+                actor=parent,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            pending = next(
+                row
+                for row in snapshot['rows']['llm_pending_actions']
+                if row['pid'] == child
+            )
+            pending.pop('data_flow_context_json')
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            result = runtime.checkpoint.restore(
+                'cli',
+                checkpoint_id,
+                require_capability=False,
+            )
+
+            assert result['main_state_committed'] is True
+            assert result['post_commit_failures'] == []
+            assert runtime.process.get(child).status == ProcessStatus.FAILED
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+            assert runtime.store.list_resource_reservations(child_pid=child) == []
+            assert runtime.human.get(request_id).status == HumanRequestStatus.CANCELLED
+            migrated = runtime.store.get_llm_pending_action(child)
+            assert migrated is not None
+            assert migrated['status'] == 'legacy_data_flow_reconciled'
+        finally:
+            runtime.close()
+
     def test_restore_reserves_composite_one_shot_authority_until_main_commit(
         self,
         monkeypatch: pytest.MonkeyPatch,

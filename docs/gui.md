@@ -62,6 +62,11 @@ without broadening the server allowlist. The protocol resolver rejects other
 authorities, credentials, ports, traversal, and paths outside the distribution
 root.
 
+The GUI can display data-flow Audit/Event/Explain evidence produced by runtime
+operations, but it does not expose a Sink-trust mutation route or model tool.
+Sink trust remains Host configuration/API state; adding a GUI view later must
+not turn renderer visibility into `data_flow_sink_registry:*` authority.
+
 For endpoints that accept an optional `actor`, omitting `actor` runs in GUI
 admin mode. Supplying `actor` opts into process-authority mode and requires
 that process to hold the capability needed by the underlying primitive, keeping
@@ -227,6 +232,33 @@ an answer for a pending human request. A human must decide through a request
 card (or another explicit host terminal surface), after which normal runtime
 wakeup/resume semantics apply.
 
+GUI request serialization is itself a protected Human information-flow exit.
+For a conditional high-sensitivity request, the first snapshot/list response
+contains a metadata-only release card ahead of a redacted parent request. The
+raw request is returned only after that GUI-specific exact release is approved
+and consumed; the durable presentation binding prevents duplicate release
+requests across polling or Runtime reopen. The withheld parent card has no
+answer or decision controls, and the server returns `409 Conflict` if a client
+tries to respond to it before protected GUI presentation consumes the release.
+The release card shows only the bound Sink, sensitivity, tenant/principal,
+payload size and SHA-256, source count, and operation. Arbitrary nested payload
+values are not included in pre-release previews. The exact release hashes the
+complete gate-independent public view handed to the GUI provider, including
+status, timestamps, and `decision`; internal release-link/visibility metadata
+does not perturb that view. A source, Sink-trust registry, Task Authority
+manifest, public-view, or release-binding change invalidates the durable visible
+marker; the parent is redacted again and requires a fresh exact release before
+projection (including a newly recorded decision) or response. The freshness guard and Human
+decision commit share one store transaction, so concurrent Host registry or
+source mutations cannot land between them. Bounded snapshots project only the
+final rows they will return: lookahead and release/parent pairing never consume
+a release or mark a parent visible for a row cropped from the JSON response.
+For an unchanged unrestricted view, one authenticated GUI provider session may
+reuse a bounded in-memory presentation receipt after rechecking the exact view
+hash and current source/Sink policy under the Store lock. A new server/provider
+session never inherits that receipt, so reopen cannot silently reuse ephemeral
+presentation evidence.
+
 Pending Human requests are liveness-critical. The Human list returns every
 pending request first, followed by a bounded newest-history window. A snapshot
 then applies the GUI's general collection-size bound to that pending-first
@@ -267,6 +299,11 @@ maximum. Skills, JSON-RPC, and MCP list APIs perform one additional internal
 lookahead even when that subsystem maximum is stricter than the GUI maximum.
 Either kind of lookahead becomes a `source_limited` lower-bound entry in
 `_truncated` and is not serialized.
+Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
+queries filter that indexed flag before applying `LIMIT`, preventing internal
+GUI-presentation evidence from displacing causal runtime rows. Upgrades fill
+legacy null flags in bounded, resumable batches; the full event/audit ledgers
+remain unchanged and can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
 updated terminal history, so a full snapshot does not hide current work behind
 old completed rows. If the bounded window contains a child but not its parent,
@@ -381,6 +418,10 @@ Important endpoints:
 - `GET /api/human-requests`
 - `POST /api/human-requests/{request_id}/respond` approves or rejects only
   pending requests; terminal or cancelled requests return a conflict.
+  A conditional parent that has not completed its exact GUI presentation also
+  returns a conflict without changing the request or process; approving the
+  metadata release alone is insufficient until a GUI snapshot/list consumes
+  that release through the protected presentation operation.
   `approved` must be a JSON boolean. Permission requests require
   `decision.policy` equal to `always_allow`, `always_deny`, or
   `ask_each_time`, consistent with approval/rejection. Approved questions

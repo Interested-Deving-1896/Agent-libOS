@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.memory.data_labels import propagate_object_labels
 from agent_libos.models import ObjectMetadata, ObjectType, Provenance, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
@@ -136,19 +137,51 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        metadata = ObjectMetadata(
-            title=args.metadata.get("title"),
-            summary=args.metadata.get("summary"),
-            tags=args.metadata.get("tags", []),
-            mime_type=args.metadata.get("mime_type"),
-            sensitivity=args.metadata.get("sensitivity", _MEMORY_DEFAULTS.metadata_sensitivity),
-            retention_policy=args.metadata.get("retention_policy", _MEMORY_DEFAULTS.metadata_retention_policy),
-            trust_level=args.metadata.get("trust_level", "unknown"),
-            integrity=args.metadata.get("integrity", "unknown"),
-            origin=args.metadata.get("origin", "llm"),
-            tenant=args.metadata.get("tenant"),
-            principal=args.metadata.get("principal"),
-            declassification_authority=args.metadata.get("declassification_authority"),
+        if args.metadata.get("declassification_authority") not in {None, ""}:
+            raise ToolExecutionError(
+                "LLM-created objects cannot assert declassification authority.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
+        if args.metadata.get("trust_level", "unknown") not in {"untrusted", "unknown"}:
+            raise ToolExecutionError(
+                "LLM-created objects cannot elevate trust_level.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
+        if args.metadata.get("integrity", "unknown") not in {"untrusted", "unknown"}:
+            raise ToolExecutionError(
+                "LLM-created objects cannot elevate integrity.",
+                code=ToolErrorCode.PERMISSION_DENIED,
+            )
+        try:
+            metadata = ObjectMetadata(
+                title=args.metadata.get("title"),
+                summary=args.metadata.get("summary"),
+                tags=args.metadata.get("tags", []),
+                mime_type=args.metadata.get("mime_type"),
+                sensitivity=args.metadata.get("sensitivity", _MEMORY_DEFAULTS.metadata_sensitivity),
+                retention_policy=args.metadata.get(
+                    "retention_policy",
+                    _MEMORY_DEFAULTS.metadata_retention_policy,
+                ),
+                trust_level=args.metadata.get("trust_level", "unknown"),
+                integrity=args.metadata.get("integrity", "unknown"),
+                origin="llm",
+                tenant=args.metadata.get("tenant"),
+                principal=args.metadata.get("principal"),
+                declassification_authority=None,
+            )
+        except ValueError as exc:
+            raise ToolExecutionError(str(exc), code=ToolErrorCode.VALIDATION_ERROR) from exc
+        flow = runtime.data_flow.current_context()
+        metadata = propagate_object_labels(
+            metadata,
+            [ObjectMetadata(**flow.labels.to_dict())],
+        )
+        flow_parent_oids, durable_source_refs = (
+            runtime.data_flow.provenance_sources(flow)
+        )
+        parent_oids = list(
+            dict.fromkeys([*args.parent_oids, *flow_parent_oids])
         )
         handle = runtime.memory.create_object(
             pid=ctx.pid,
@@ -157,7 +190,8 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             metadata=metadata,
             provenance=Provenance(
                 created_from_action="llm.create_memory_object",
-                parent_oids=list(args.parent_oids),
+                parent_oids=parent_oids,
+                source_refs=list(durable_source_refs),
             ),
             immutable=args.immutable,
             name=args.name,
@@ -171,6 +205,9 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
             elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
                 process.memory_view.roots.append(handle)
             runtime.store.update_process(process)
+        runtime.data_flow.observe_ingress(
+            runtime.data_flow.context_from_trusted_source_oids([obj.oid])
+        )
         return CreateMemoryObjectOutput(oid=handle.oid, namespace=obj.namespace, name=obj.name, type=args.type)
 
 
@@ -242,6 +279,11 @@ class ListMemoryNamespaceTool(SyncAgentTool[ListMemoryNamespaceArgs]):
             MemoryNamespaceEntry(namespace=namespace.namespace, parent_namespace=namespace.parent_namespace)
             for namespace in listing["namespaces"]
         ]
+        runtime.data_flow.observe_ingress(
+            runtime.data_flow.context_from_trusted_source_oids(
+                [obj.oid for obj in listing["objects"]]
+            )
+        )
         return ListMemoryNamespaceOutput(
             namespace=listing["namespace"],
             objects=objects,
@@ -270,6 +312,9 @@ class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         obj = runtime.memory.get_object_by_name(ctx.pid, args.name, namespace=args.namespace)
+        runtime.data_flow.observe_ingress(
+            runtime.data_flow.context_from_trusted_source_oids([obj.oid])
+        )
         payload = obj.payload
         rendered = repr(payload)
         truncated = len(rendered) > args.max_payload_chars
@@ -306,6 +351,10 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        source_context = runtime.data_flow.current_context()
+        parent_oids, durable_source_refs = runtime.data_flow.provenance_sources(
+            source_context
+        )
         updated, list_field, length = runtime.memory.append_object_by_name(
             ctx.pid,
             args.name,
@@ -313,6 +362,12 @@ class AppendMemoryObjectTool(SyncAgentTool[AppendMemoryObjectArgs]):
             args.list_field,
             namespace=args.namespace,
             issued_by="append_memory_object_tool",
+            source_oids=parent_oids,
+            provenance_source_refs=durable_source_refs,
+            source_context=source_context,
+        )
+        runtime.data_flow.observe_ingress(
+            runtime.data_flow.context_from_trusted_source_oids([updated.oid])
         )
         return AppendMemoryObjectOutput(
             oid=updated.oid,

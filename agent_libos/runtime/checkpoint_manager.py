@@ -14,6 +14,8 @@ from agent_libos.models import (
     CapabilityRight,
     CapabilityStatus,
     Checkpoint,
+    DataFlowContext,
+    DataLabels,
     EventType,
     HumanRequestStatus,
     ObjectOwnerKind,
@@ -25,11 +27,20 @@ from agent_libos.models import (
     ResourceUsage,
     ToolHandle,
 )
+from agent_libos.models.messages import conservative_legacy_process_message_metadata
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import external_effect_summary, external_effect_to_json
 from agent_libos.storage import RuntimeStore
+from agent_libos.storage.base import (
+    LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS as _LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS,
+    LEGACY_PENDING_DATA_FLOW_MESSAGE as _LEGACY_PENDING_DATA_FLOW_MESSAGE,
+)
+from agent_libos.storage.gui_visibility import (
+    is_gui_presentation_audit_fields,
+    is_gui_presentation_event_fields,
+)
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
 
@@ -54,6 +65,8 @@ class CheckpointManager:
         ProcessStatus.WAITING_TOOL.value,
         ProcessStatus.WAITING_HUMAN.value,
     }
+    LEGACY_PENDING_DATA_FLOW_STATUS = _LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS
+    LEGACY_PENDING_DATA_FLOW_MESSAGE = _LEGACY_PENDING_DATA_FLOW_MESSAGE
 
     def __init__(
         self,
@@ -382,8 +395,23 @@ class CheckpointManager:
                     stale_tool_ids=stale_tool_ids,
                     scoped_pids=set(snapshot_pids) | set(current_pids),
                 )
-            # External release hooks are deliberately outside all registry,
+            # Terminal reconciliation and external release hooks are deliberately
+            # outside all registry,
             # ownership, and store locks because they may call host code.
+            try:
+                if self.runtime is not None:
+                    self.runtime._reconcile_legacy_pending_action_terminals(
+                        pids=set(snapshot_pids)
+                    )
+            except Exception as exc:
+                post_commit_failures.append(
+                    self._restore_post_commit_failure(
+                        actor=actor,
+                        checkpoint=checkpoint,
+                        phase="legacy_pending_terminal_reconciliation",
+                        exc=exc,
+                    )
+                )
             post_commit_failures.extend(
                 self._run_restore_object_release_finalizer_phase(
                     actor=actor,
@@ -783,7 +811,7 @@ class CheckpointManager:
         current_pids: list[str],
         checkpoint: Checkpoint,
     ) -> tuple[list[str], list[str], list[str], list[Any]]:
-        rows = snapshot["rows"]
+        rows = self._restore_rows_with_legacy_flow_migration(snapshot["rows"])
         snapshot_object_oids = self._snapshot_owned_object_oids(snapshot)
         current_object_oids = set(self._current_scoped_object_oids(current_pids))
         object_oids = snapshot_object_oids | current_object_oids
@@ -882,6 +910,106 @@ class CheckpointManager:
                 checkpoint,
             )
         return cancelled_human_requests, superseded_messages, superseded_object_tasks, release_finalizer_objects
+
+    def _restore_rows_with_legacy_flow_migration(
+        self,
+        source_rows: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        rows = deepcopy(source_rows)
+        invalidated_pids: set[str] = set()
+        conservative_context = dumps(
+            DataFlowContext(
+                labels=DataLabels(
+                    sensitivity="secret",
+                    trust_level="untrusted",
+                    integrity="untrusted",
+                    origin="legacy",
+                )
+            ).to_dict()
+        )
+        for pending in rows.get("llm_pending_actions", []):
+            raw_context = pending.get("data_flow_context_json")
+            canonical_context = self._canonical_snapshot_data_flow_context(raw_context)
+            if canonical_context is not None:
+                pending["data_flow_context_json"] = dumps(canonical_context)
+                continue
+            pending["data_flow_context_json"] = conservative_context
+            if str(pending.get("status") or "") in {"pending", "resuming"}:
+                pending["status"] = self.LEGACY_PENDING_DATA_FLOW_STATUS
+                pending["updated_at"] = utc_now()
+                invalidated_pids.add(str(pending.get("pid") or ""))
+
+        for message in rows.get("process_messages", []):
+            raw_metadata = message.get("metadata_json")
+            canonical_metadata = self._canonical_snapshot_message_metadata(raw_metadata)
+            if canonical_metadata is not None:
+                message["metadata_json"] = dumps(canonical_metadata)
+                continue
+            try:
+                decoded_metadata = (
+                    loads(raw_metadata)
+                    if isinstance(raw_metadata, str)
+                    else raw_metadata
+                )
+            except (TypeError, ValueError):
+                decoded_metadata = None
+            message["metadata_json"] = dumps(
+                conservative_legacy_process_message_metadata(
+                    decoded_metadata if isinstance(decoded_metadata, dict) else None
+                )
+            )
+
+        for process in rows.get("processes", []):
+            if str(process.get("pid") or "") not in invalidated_pids:
+                continue
+            if str(process.get("status") or "") in {
+                ProcessStatus.EXITED.value,
+                ProcessStatus.FAILED.value,
+                ProcessStatus.KILLED.value,
+            }:
+                continue
+            process["status"] = ProcessStatus.FAILED.value
+            process["status_message"] = self.LEGACY_PENDING_DATA_FLOW_MESSAGE
+            process["updated_at"] = utc_now()
+        return rows
+
+    @staticmethod
+    def _canonical_snapshot_data_flow_context(value: Any) -> dict[str, Any] | None:
+        try:
+            decoded = loads(value) if isinstance(value, str) else value
+            if not isinstance(decoded, dict) or not decoded:
+                return None
+            labels = decoded.get("labels")
+            if not isinstance(labels, dict) or not {
+                "sensitivity",
+                "trust_level",
+                "integrity",
+            }.issubset(labels):
+                return None
+            return DataFlowContext.from_dict(decoded).to_dict()
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _canonical_snapshot_message_metadata(value: Any) -> dict[str, Any] | None:
+        try:
+            decoded = loads(value) if isinstance(value, str) else value
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        labels = decoded.get("data_labels")
+        if not isinstance(labels, dict) or not {
+            "sensitivity",
+            "trust_level",
+            "integrity",
+        }.issubset(labels):
+            return None
+        try:
+            decoded["data_labels"] = DataLabels.from_dict(labels).to_dict()
+        except (TypeError, ValueError):
+            return None
+        return decoded
 
     def _run_restore_registry_post_commit_phases(
         self,
@@ -1084,7 +1212,7 @@ class CheckpointManager:
             if row["parent_pid"] in pid_map and row["child_pid"] in pid_map
         ]
         rows["process_messages"] = [
-            self._remap_message_row(row, pid_map)
+            self._remap_message_row(row, pid_map, object_map)
             for row in rows.get("process_messages", [])
             if row["recipient_pid"] in pid_map
         ]
@@ -2567,7 +2695,25 @@ class CheckpointManager:
 
     def _insert_row(self, cur: Any, table: str, row: dict[str, Any]) -> None:
         table = self.store.validate_table_identifier(table)
-        item = self._object_row_with_lifecycle_defaults(row) if table == "objects" else row
+        if table == "objects":
+            item = self._object_row_with_lifecycle_defaults(row)
+        else:
+            item = dict(row)
+        if table == "events" and "gui_snapshot_visible" not in item:
+            item["gui_snapshot_visible"] = int(
+                not is_gui_presentation_event_fields(
+                    item.get("type"),
+                    loads(item.get("payload_json"), {}),
+                )
+            )
+        if table == "audit_records" and "gui_snapshot_visible" not in item:
+            item["gui_snapshot_visible"] = int(
+                not is_gui_presentation_audit_fields(
+                    item.get("action"),
+                    item.get("target"),
+                    loads(item.get("decision_json"), {}),
+                )
+            )
         columns = list(item)
         for column in columns:
             self.store.validate_column_identifier(table, column)
@@ -2784,13 +2930,41 @@ class CheckpointManager:
         item["updated_at"] = now
         return item
 
-    def _remap_message_row(self, row: dict[str, Any], pid_map: dict[str, str]) -> dict[str, Any]:
+    def _remap_message_row(
+        self,
+        row: dict[str, Any],
+        pid_map: dict[str, str],
+        object_map: dict[str, str],
+    ) -> dict[str, Any]:
         item = dict(row)
         item["message_id"] = new_id("pmsg")
         item["recipient_pid"] = pid_map[item["recipient_pid"]]
         if item["sender"] in pid_map:
             item["sender"] = pid_map[item["sender"]]
         item["payload_json"] = dumps({**loads(item["payload_json"], {}), "forked_from_message_id": row["message_id"]})
+        raw_metadata = item.get("metadata_json")
+        metadata = (
+            loads(raw_metadata)
+            if isinstance(raw_metadata, str)
+            else (raw_metadata if raw_metadata is not None else {})
+        )
+        if not isinstance(metadata, dict):
+            raise ValidationError("checkpoint process message metadata must be a JSON object")
+        canonical_metadata = self._canonical_snapshot_message_metadata(metadata)
+        metadata = (
+            canonical_metadata
+            if canonical_metadata is not None
+            else conservative_legacy_process_message_metadata(metadata)
+        )
+        carrier_oid = str(metadata.get("label_carrier_oid") or "").strip()
+        if carrier_oid:
+            remapped_carrier_oid = object_map.get(carrier_oid)
+            if remapped_carrier_oid is None:
+                raise ValidationError(
+                    "checkpoint process message label carrier is outside the fork Object scope"
+                )
+            metadata["label_carrier_oid"] = remapped_carrier_oid
+        item["metadata_json"] = dumps(metadata)
         item["created_at"] = utc_now()
         item["updated_at"] = utc_now()
         item["acked_at"] = None

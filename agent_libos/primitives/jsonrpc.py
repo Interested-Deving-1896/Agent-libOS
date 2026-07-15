@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import ipaddress
 import json
@@ -23,6 +22,7 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
+    DataSink,
     EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -270,19 +270,44 @@ class JsonRpcPrimitive:
         endpoint_id: str,
         method_id: str,
         params: Any = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> JsonRpcCallResult:
         resource = self.method_resource(endpoint_id, method_id)
         self._validate_json_value(params, "params")
         visibility_context = self._visibility_operation_context(pid, endpoint_id, method_id, params)
-        self._authorize_call_visibility(pid, resource, visibility_context)
+        self._authorize_call_visibility(
+            pid,
+            resource,
+            visibility_context,
+            source_oids=source_oids,
+        )
         spec, _metadata = self._load_endpoint(endpoint_id)
         method = spec.method_by_id(method_id)
         if method is None:
             raise NotFound(f"JSON-RPC method not found: {endpoint_id}/{method_id}")
         request_id = new_id("jrpc")
         operation_context = self._operation_context(pid, spec, method, params, request_id=request_id)
-        decision = self._authorize_call(pid, resource, method.right, operation_context)
         self._validate_params_against_schema(method, params)
+        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        sink = DataSink(
+            f"jsonrpc:{endpoint_id}:{method_id}",
+            self._endpoint_identity_sha256(spec, method),
+        )
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=params,
+            operation="jsonrpc.call",
+        )
+        decision = self._authorize_call(
+            pid,
+            resource,
+            method.right,
+            operation_context,
+            source_oids=source_oids,
+        )
         profile = self.capabilities.profiles.jsonrpc(
             resource=resource,
             effect=decision.effect or CapabilityEffect.DENY,
@@ -296,7 +321,6 @@ class JsonRpcPrimitive:
                 "sandbox_profile": self._profile_json(profile),
             }
         )
-        self._require_header_environment(spec)
         request_body = self._request_body(method, params, request_id)
         if len(request_body) > spec.max_request_bytes:
             raise ValidationError(f"JSON-RPC request exceeds max_request_bytes={spec.max_request_bytes}")
@@ -319,8 +343,17 @@ class JsonRpcPrimitive:
             failure_evidence=lambda error, phase: self._protected_failure_evidence(
                 pid, resource, method, operation_context, error, phase
             ),
+            data_sink=sink,
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                flow_context,
+                origin="external:jsonrpc",
+            ),
+            data_flow_payload=params,
+            data_flow_operation="jsonrpc.call",
         )
         with self._protected().start("primitive.jsonrpc.call", invocation, provider=self.provider) as protected:
+            self._require_header_environment(spec)
             resolved_addresses = protected.call(
                 ProviderPhase("dns_resolution", information_flow=True),
                 self._validate_runtime_resolution,
@@ -379,7 +412,7 @@ class JsonRpcPrimitive:
                 "response_bytes": result.response_bytes,
                 "duration_s": result.duration_s,
             }
-            return protected.complete(
+            completed = protected.complete(
                 result,
                 self._protected_evidence(pid, resource, result, method, operation_context),
                 classification_context=effect_context,
@@ -398,9 +431,25 @@ class JsonRpcPrimitive:
                     },
                 ),
             )
+            return completed
 
-    async def acall(self, pid: str, endpoint_id: str, method_id: str, params: Any = None) -> JsonRpcCallResult:
-        return await asyncio.to_thread(self.call, pid, endpoint_id, method_id, params)
+    async def acall(
+        self,
+        pid: str,
+        endpoint_id: str,
+        method_id: str,
+        params: Any = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> JsonRpcCallResult:
+        return await self._data_flow().run_sync_in_worker(
+            self.call,
+            pid,
+            endpoint_id,
+            method_id,
+            params,
+            source_oids=source_oids,
+        )
 
     def _protected(self):
         sdk = getattr(self, "protected_operations", None) or getattr(
@@ -409,6 +458,33 @@ class JsonRpcPrimitive:
         if sdk is None:
             raise ValidationError("JsonRpcPrimitive requires ProtectedOperationSDK")
         return sdk
+
+    def _data_flow(self) -> Any:
+        manager = getattr(self, "data_flow", None) or getattr(
+            self._protected(),
+            "data_flow",
+            None,
+        )
+        if manager is None:
+            raise ValidationError("JSON-RPC data-flow manager is not attached")
+        return manager
+
+    @staticmethod
+    def _endpoint_identity_sha256(
+        spec: JsonRpcEndpointSpec,
+        method: JsonRpcMethodSpec,
+    ) -> str:
+        return hashlib.sha256(
+            dumps(
+                to_jsonable(
+                    {
+                        "schema_version": 1,
+                        "endpoint": spec,
+                        "method": method,
+                    }
+                )
+            ).encode("utf-8")
+        ).hexdigest()
 
     def _protected_evidence(
         self,
@@ -518,7 +594,15 @@ class JsonRpcPrimitive:
             delegable=delegable,
         )
 
-    def _authorize_call(self, pid: str, resource: str, right: str, context: dict[str, Any]) -> Any:
+    def _authorize_call(
+        self,
+        pid: str,
+        resource: str,
+        right: str,
+        context: dict[str, Any],
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> Any:
         decision = self.capabilities.authorize(pid, resource, right, context, audit=True)
         if decision.allowed:
             return decision
@@ -547,6 +631,7 @@ class JsonRpcPrimitive:
                     "context": approval_context,
                 },
                 blocking=True,
+                source_oids=source_oids,
             )
             raise HumanApprovalRequired(
                 request_id=request_id,
@@ -554,16 +639,37 @@ class JsonRpcPrimitive:
             )
         raise CapabilityDenied(decision.reason)
 
-    def _authorize_call_visibility(self, pid: str, resource: str, context: dict[str, Any]) -> None:
+    def _authorize_call_visibility(
+        self,
+        pid: str,
+        resource: str,
+        context: dict[str, Any],
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         for right in (CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.EXECUTE):
             decision = self.capabilities.authorize(pid, resource, right, {**context, "right": str(right)})
             if decision.allowed:
                 return
             if decision.policy == CapabilityManager.ASK_EACH_TIME:
-                self._request_visibility_approval(pid, resource, str(right), context)
+                self._request_visibility_approval(
+                    pid,
+                    resource,
+                    str(right),
+                    context,
+                    source_oids=source_oids,
+                )
         raise CapabilityDenied(f"{pid} lacks JSON-RPC call authority on {resource}")
 
-    def _request_visibility_approval(self, pid: str, resource: str, right: str, context: dict[str, Any]) -> None:
+    def _request_visibility_approval(
+        self,
+        pid: str,
+        resource: str,
+        right: str,
+        context: dict[str, Any],
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for JSON-RPC call on {resource}")
         profile = self.capabilities.profiles.jsonrpc(
@@ -588,6 +694,7 @@ class JsonRpcPrimitive:
                 "context": approval_context,
             },
             blocking=True,
+            source_oids=source_oids,
         )
         raise HumanApprovalRequired(
             request_id=request_id,

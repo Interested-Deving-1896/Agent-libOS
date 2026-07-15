@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.memory.object_memory import ObjectVersionConflict
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
@@ -16,6 +16,7 @@ from agent_libos.models import (
     AgentProcess,
     Capability,
     ContextMaterializationManifest,
+    DataLabels,
     Event,
     MaterializedContext,
     MemoryView,
@@ -27,7 +28,11 @@ from agent_libos.models import (
     ResourceUsage,
     ViewMode,
 )
-from agent_libos.memory.data_labels import labels_for_explain
+from agent_libos.memory.data_labels import (
+    labels_for_explain,
+    metadata_from_labels,
+    propagate_object_labels,
+)
 
 _LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
 LLM_CONTEXT_POLICY = _LLM_CONTEXT_DEFAULTS.policy
@@ -39,6 +44,9 @@ class LLMContextMemory:
 
     def __init__(self, runtime: Any):
         self.runtime = runtime
+
+    def object_name(self, pid: str) -> str:
+        return context_object_name(pid, config=self.runtime.config)
 
     def prepare(
         self,
@@ -62,17 +70,28 @@ class LLMContextMemory:
             capabilities=capabilities,
             tools=tools,
         )
+        metadata = self._context_metadata(
+            pid=pid,
+            title=f"LLM context for {pid}",
+            summary="Append-only process prompt context optimized for prompt caching.",
+            tags=["llm_context", "prompt_cache"],
+            token_estimate=estimate_tokens(payload),
+            historical=obj.metadata,
+            source_context=source_context,
+            events=events,
+        )
+        metadata = self._persist_context_label_history(pid, metadata)
+        label_history = labels_for_explain(metadata)
+        if payload.get("label_history") != label_history:
+            payload["label_history"] = label_history
+            changed = True
         if changed:
-            metadata = ObjectMetadata(
-                title=f"LLM context for {pid}",
-                summary="Append-only process prompt context optimized for prompt caching.",
-                tags=["llm_context", "prompt_cache"],
-                token_estimate=estimate_tokens(payload),
-            )
+            metadata.token_estimate = estimate_tokens(payload)
             self.runtime.memory.update_object(
                 pid,
                 handle,
                 ObjectPatch(payload=payload, metadata=metadata),
+                _trusted_label_propagation=True,
             )
             obj = self.runtime.memory.get_object(pid, handle)
         rendered = self.render(obj.payload)
@@ -158,7 +177,7 @@ class LLMContextMemory:
         )
 
     def ensure(self, pid: str, image: AgentImage, process: AgentProcess, tools: list[dict[str, Any]]) -> ObjectHandle:
-        name = context_object_name(pid)
+        name = self.object_name(pid)
         namespace = self.runtime.memory.resolve_namespace(pid)
         existing = self.runtime.store.get_object_by_name(name, namespace=namespace)
         rights = {
@@ -169,15 +188,22 @@ class LLMContextMemory:
             ObjectRight.DIFF.value,
         }
         if existing is None:
+            payload = self._initial_payload(pid, image, process, tools)
+            metadata = ObjectMetadata(
+                title=f"LLM context for {pid}",
+                summary="Append-only process prompt context optimized for prompt caching.",
+                tags=["llm_context", "prompt_cache"],
+            )
+            durable_metadata = self._durable_context_label_metadata(pid)
+            if durable_metadata is not None:
+                metadata = propagate_object_labels(metadata, [durable_metadata])
+                payload["label_history"] = labels_for_explain(metadata)
+                metadata.token_estimate = estimate_tokens(payload)
             handle = self.runtime.memory.create_object(
                 pid=pid,
                 object_type=ObjectType.PROCESS_STATE,
-                payload=self._initial_payload(pid, image, process, tools),
-                metadata=ObjectMetadata(
-                    title=f"LLM context for {pid}",
-                    summary="Append-only process prompt context optimized for prompt caching.",
-                    tags=["llm_context", "prompt_cache"],
-                ),
+                payload=payload,
+                metadata=metadata,
                 immutable=False,
                 name=name,
             )
@@ -243,7 +269,7 @@ class LLMContextMemory:
             )
         if obj is None:
             current = self.runtime.store.get_object_by_name(
-                context_object_name(pid),
+                self.object_name(pid),
                 namespace=self.runtime.memory.resolve_namespace(pid),
             )
             if current is not None:
@@ -286,6 +312,31 @@ class LLMContextMemory:
             ],
             token_estimate=estimate_tokens(compacted_payload),
         )
+        historical_metadata = (
+            obj.metadata
+            if obj is not None
+            else metadata_from_labels(compacted_payload.get("label_history"))
+        )
+        if historical_metadata is None:
+            # A payload-only recovery cannot prove the original classification.
+            # Preserve confidentiality by choosing the top/lowest labels instead
+            # of silently recreating a normal, unknown-integrity context.
+            historical_metadata = ObjectMetadata(
+                sensitivity="secret",
+                trust_level="untrusted",
+                integrity="untrusted",
+                origin="derived",
+                tenant="mixed",
+                principal="mixed",
+            )
+        historical_sources = [historical_metadata]
+        durable_metadata = self._durable_context_label_metadata(pid)
+        if durable_metadata is not None:
+            historical_sources.append(durable_metadata)
+        metadata = propagate_object_labels(metadata, historical_sources)
+        metadata = self._persist_context_label_history(pid, metadata)
+        compacted_payload["label_history"] = labels_for_explain(metadata)
+        metadata.token_estimate = estimate_tokens(compacted_payload)
         if obj is None:
             handle = self.runtime.memory.create_object(
                 pid=pid,
@@ -293,7 +344,7 @@ class LLMContextMemory:
                 payload=compacted_payload,
                 metadata=metadata,
                 immutable=False,
-                name=context_object_name(pid),
+                name=self.object_name(pid),
             )
             updated_obj = self.runtime.memory.get_object(pid, handle)
         else:
@@ -310,6 +361,7 @@ class LLMContextMemory:
                     handle,
                     ObjectPatch(payload=compacted_payload, metadata=metadata),
                     expected_version=expected_version,
+                    _trusted_label_propagation=True,
                 )
             except ObjectVersionConflict as exc:
                 raise ValidationError(
@@ -566,6 +618,92 @@ class LLMContextMemory:
 
         return changed
 
+    def _context_metadata(
+        self,
+        *,
+        pid: str,
+        title: str,
+        summary: str,
+        tags: list[str],
+        token_estimate: int,
+        historical: ObjectMetadata,
+        source_context: MaterializedContext,
+        events: list[Event],
+    ) -> ObjectMetadata:
+        sources = [
+            historical,
+            *self._source_context_metadata(source_context),
+            *self._event_metadata(events),
+        ]
+        durable_metadata = self._durable_context_label_metadata(pid)
+        if durable_metadata is not None:
+            sources.append(durable_metadata)
+        return propagate_object_labels(
+            ObjectMetadata(
+                title=title,
+                summary=summary,
+                tags=tags,
+                token_estimate=token_estimate,
+            ),
+            sources,
+        )
+
+    @staticmethod
+    def _event_metadata(events: list[Event]) -> list[ObjectMetadata]:
+        """Recover trusted labels for event payloads copied into the prompt."""
+
+        sources: list[ObjectMetadata] = []
+        for event in events:
+            labels = metadata_from_labels(event.payload.get("data_labels"))
+            if labels is not None:
+                sources.append(labels)
+        return sources
+
+    def _durable_context_label_metadata(self, pid: str) -> ObjectMetadata | None:
+        labels = self.runtime.store.get_llm_context_label_history(pid)
+        return metadata_from_labels(labels)
+
+    def _persist_context_label_history(
+        self,
+        pid: str,
+        metadata: ObjectMetadata,
+    ) -> ObjectMetadata:
+        labels = self.runtime.store.merge_llm_context_label_history(
+            pid,
+            DataLabels.from_object_metadata(metadata),
+        )
+        durable_metadata = metadata_from_labels(labels)
+        if durable_metadata is None:
+            raise ValidationError("persisted LLM context label history is missing")
+        return propagate_object_labels(metadata, [durable_metadata])
+
+    def _source_context_metadata(self, source_context: MaterializedContext) -> list[ObjectMetadata]:
+        """Recover immutable label evidence for every included prompt source."""
+
+        sources: list[ObjectMetadata] = []
+        manifested_oids: set[str] = set()
+        for item in source_context.object_manifest:
+            if not isinstance(item, dict) or item.get("disposition") != "included":
+                continue
+            oid = str(item.get("oid") or "")
+            labels = metadata_from_labels(item.get("labels"))
+            if not oid or labels is None:
+                raise ValidationError("included LLM context source is missing trusted label evidence")
+            manifested_oids.add(oid)
+            sources.append(labels)
+
+        for oid in dict.fromkeys(source_context.object_refs):
+            obj = self.runtime.store.get_object(oid)
+            if obj is not None:
+                # Also merge the live label in case classification increased
+                # after materialization but before provider dispatch.
+                sources.append(obj.metadata)
+            elif oid not in manifested_oids:
+                raise ValidationError(
+                    f"included LLM context source has no recoverable labels: {oid}"
+                )
+        return sources
+
     def _object_entry(self, oid: str) -> dict[str, Any]:
         obj = self.runtime.store.get_object(oid)
         if obj is None:
@@ -596,7 +734,7 @@ class LLMContextMemory:
 
     def _context_oid(self, pid: str) -> str | None:
         obj = self.runtime.store.get_object_by_name(
-            context_object_name(pid),
+            self.object_name(pid),
             namespace=self.runtime.memory.resolve_namespace(pid),
         )
         return obj.oid if obj is not None else None
@@ -616,8 +754,13 @@ class LLMContextMemory:
         self.runtime.store.update_process(process)
 
 
-def context_object_name(pid: str) -> str:
-    return f"{_LLM_CONTEXT_DEFAULTS.object_name_prefix}:{pid}"
+def context_object_name(
+    pid: str,
+    *,
+    config: AgentLibOSConfig | None = None,
+) -> str:
+    selected = config.llm_context if config is not None else _LLM_CONTEXT_DEFAULTS
+    return f"{selected.object_name_prefix}:{pid}"
 
 
 def _tool_name(tool: dict[str, Any]) -> str | None:

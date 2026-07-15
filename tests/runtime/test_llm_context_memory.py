@@ -19,9 +19,12 @@ from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
+    DataFlowContext,
+    DataLabels,
     EventType,
     JIT_MULTIPLEXER_TOOL_NAME,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
+    ObjectMetadata,
     ObjectPatch,
     ObjectRight,
     ObjectType,
@@ -29,6 +32,8 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessStatus,
     ResourceBudget,
+    SinkTrustLevel,
+    SinkTrustRule,
     ViewMode,
 )
 from tests.support.deno import COUNT_CHARS_SOURCE
@@ -137,6 +142,1036 @@ class TestLLMContextMemory:
             assert len(second) > len(first)
         finally:
             runtime.close()
+
+    def test_llm_context_updates_and_compaction_preserve_highest_historical_labels(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 2}},
+            ])
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='llm:default',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    tenants=('tenant-a',),
+                    identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                ),
+                actor='test',
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(image='base-agent:v0', goal='preserve context labels')
+            tenant_a = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'tenant-a'},
+                metadata=ObjectMetadata(sensitivity='secret', tenant='tenant-a'),
+            )
+            process = runtime.process.get(pid)
+            process.memory_view = runtime.memory.create_view(pid, [tenant_a], mode=ViewMode.READ_ONLY)
+            runtime.store.update_process(process)
+
+            first = runtime.run_next_process_once()
+            assert first['ok'], first
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert context is not None
+            assert context.metadata.sensitivity == 'secret'
+            assert context.metadata.tenant == 'tenant-a'
+            assert context.payload['label_history']['sensitivity'] == 'secret'
+
+            runtime.llm.context_memory.replace_with_compacted_summary(
+                pid,
+                context_oid=context.oid,
+                expected_version=context.version,
+                summary=_compact_summary('retain classified context'),
+                compaction_method='test_compaction',
+                preserve_recent_entries=1,
+                source_tokens=1000,
+                target_tokens=512,
+                compressor_pids=[],
+            )
+            compacted = runtime.store.get_object(context.oid)
+            assert compacted is not None
+            assert compacted.metadata.sensitivity == 'secret'
+            assert compacted.metadata.tenant == 'tenant-a'
+            assert compacted.payload['label_history']['sensitivity'] == 'secret'
+
+            later_normal = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'value': 'later normal context'},
+                metadata=ObjectMetadata(sensitivity='normal', tenant='tenant-a'),
+            )
+            process = runtime.process.get(pid)
+            process.memory_view = runtime.memory.create_view(pid, [later_normal], mode=ViewMode.READ_ONLY)
+            runtime.store.update_process(process)
+
+            second = runtime.run_next_process_once()
+            assert second['ok'], second
+            updated = runtime.store.get_object(context.oid)
+            assert updated is not None
+            assert updated.metadata.sensitivity == 'secret'
+            assert updated.metadata.tenant == 'tenant-a'
+            assert updated.payload['label_history']['tenant'] == 'tenant-a'
+        finally:
+            runtime.close()
+
+    def test_llm_message_event_labels_gate_provider_egress(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            client = RecordingActionClient([
+                {
+                    'action': 'create_memory_object',
+                    'type': 'observation',
+                    'payload': {'received': True},
+                }
+            ])
+            runtime.llm.client = client
+            denied_pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='deny a secret message event',
+            )
+            denied_source = runtime.memory.create_object(
+                denied_pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'MESSAGE_EVENT_SECRET_SENTINEL'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            runtime.messages.post(
+                sender='human:test',
+                recipient_pid=denied_pid,
+                subject='MESSAGE_EVENT_SECRET_SENTINEL',
+                source_oids=[denied_source.oid],
+            )
+
+            denied = runtime.run_process_once(denied_pid)
+
+            assert not denied['ok']
+            assert 'data-flow denied egress' in denied['error']
+            assert client.user_prompts == []
+            denied_decisions = runtime.store.list_data_flow_decisions(
+                pid=denied_pid,
+                outcome='deny',
+            )
+            assert denied_decisions
+            assert denied_decisions[-1].labels.sensitivity.value == 'secret'
+            assert denied_decisions[-1].sink == 'llm:default'
+            assert any(
+                record.action == 'data_flow.egress'
+                and record.target == 'llm:default'
+                and record.decision.get('outcome') == 'deny'
+                for record in runtime.audit.trace()
+            )
+            assert any(
+                event.type == EventType.DATA_FLOW_DECISION
+                and event.payload.get('outcome') == 'deny'
+                for event in runtime.events.list(
+                    target='data_flow_sink:llm:default',
+                )
+            )
+
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='llm:default',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                ),
+                actor='test',
+                require_capability=False,
+            )
+            allowed_pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='allow a secret message event',
+            )
+            allowed_source = runtime.memory.create_object(
+                allowed_pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'MESSAGE_EVENT_SECRET_SENTINEL'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            runtime.messages.post(
+                sender='human:test',
+                recipient_pid=allowed_pid,
+                subject='MESSAGE_EVENT_SECRET_SENTINEL',
+                source_oids=[allowed_source.oid],
+            )
+
+            allowed = runtime.run_process_once(allowed_pid)
+
+            assert allowed['ok'], allowed
+            assert len(client.user_prompts) == 1
+            assert 'MESSAGE_EVENT_SECRET_SENTINEL' in client.user_prompts[0]
+            context = runtime.store.get_object_by_name(
+                context_object_name(allowed_pid),
+                namespace=runtime.memory.resolve_namespace(allowed_pid),
+            )
+            assert context is not None
+            assert context.metadata.sensitivity == 'secret'
+            assert context.payload['label_history']['sensitivity'] == 'secret'
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("publisher", ["create", "update", "append"])
+    def test_secret_off_view_object_event_labels_gate_provider_egress(
+        self,
+        publisher: str,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            client = RecordingActionClient(
+                [
+                    {
+                        "action": "create_memory_object",
+                        "type": "observation",
+                        "payload": {"should_not_run": True},
+                    }
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal=f"deny a secret {publisher} Object event",
+            )
+            name = f"secret.{publisher}.event.marker"
+            handle = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {"entries": []},
+                metadata=ObjectMetadata(
+                    sensitivity="secret",
+                    trust_level="untrusted",
+                    tenant="tenant-a",
+                    principal="principal-a",
+                ),
+                name=name,
+                immutable=False,
+            )
+            if publisher != "create":
+                process = runtime.process.get(pid)
+                process.event_cursor = runtime.store.list_events(target=pid)[-1].event_id
+                runtime.store.update_process(process)
+                if publisher == "update":
+                    runtime.memory.update_object(
+                        pid,
+                        handle,
+                        ObjectPatch(name=f"{name}.updated"),
+                    )
+                else:
+                    runtime.memory.append_object_by_name(
+                        pid,
+                        name,
+                        {"marker": "classified append"},
+                    )
+
+            object_event = runtime.store.list_events(target=pid)[-1]
+            assert object_event.type in {EventType.OBJECT_CREATED, EventType.OBJECT_UPDATED}
+            assert object_event.payload["data_labels"] == {
+                "sensitivity": "secret",
+                "trust_level": "untrusted",
+                "integrity": "unknown",
+                "origin": "local",
+                "tenant": "tenant-a",
+                "principal": "principal-a",
+                "declassification_authority": None,
+            }
+
+            denied = runtime.run_process_once(pid)
+
+            assert not denied["ok"]
+            assert "data-flow denied egress" in denied["error"]
+            assert client.user_prompts == []
+            decisions = runtime.store.list_data_flow_decisions(pid=pid, outcome="deny")
+            assert decisions
+            assert decisions[-1].labels.sensitivity.value == "secret"
+            assert decisions[-1].labels.tenant == "tenant-a"
+            assert decisions[-1].labels.principal == "principal-a"
+        finally:
+            runtime.close()
+
+    def test_normal_off_view_object_event_still_reaches_provider(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            client = RecordingActionClient(
+                [{"action": "process_exit", "payload": {"done": True}}]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="allow a normal Object event",
+            )
+            runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {"value": "normal"},
+                metadata=ObjectMetadata(sensitivity="normal"),
+                name="normal.object.event.marker",
+            )
+
+            allowed = runtime.run_process_once(pid)
+
+            assert allowed["ok"], allowed
+            assert len(client.user_prompts) == 1
+            assert "normal.object.event.marker" in client.user_prompts[0]
+        finally:
+            runtime.close()
+
+    def test_llm_context_label_high_water_survives_persistent_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                runtime.llm.client = RecordingActionClient([
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+                ])
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern='llm:default',
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity='secret',
+                        tenants=('tenant-a',),
+                        principals=('analyst-a',),
+                        identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                    ),
+                    actor='test',
+                    require_capability=False,
+                )
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='persist context label high water',
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {'secret': 'persistent-context-sentinel'},
+                    metadata=ObjectMetadata(
+                        sensitivity='secret',
+                        tenant='tenant-a',
+                        principal='analyst-a',
+                    ),
+                )
+                process = runtime.process.get(pid)
+                process.memory_view = runtime.memory.create_view(
+                    pid,
+                    [source],
+                    mode=ViewMode.READ_ONLY,
+                )
+                runtime.store.update_process(process)
+
+                first = runtime.run_next_process_once()
+                assert first['ok'], first
+                before = runtime.store.get_object_by_name(
+                    context_object_name(pid),
+                    namespace=runtime.memory.resolve_namespace(pid),
+                )
+                assert before is not None
+                assert before.metadata.sensitivity == 'secret'
+                assert before.metadata.tenant == 'tenant-a'
+                assert before.metadata.principal == 'analyst-a'
+                assert before.payload['label_history']['sensitivity'] == 'secret'
+                before_oid = before.oid
+            finally:
+                runtime.close()
+
+            # Simulate a database produced before the durable watermark column
+            # was populated. Reopen must recover labels from the live context
+            # metadata before runtime-only payload recovery releases the Object.
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    "UPDATE llm_context_generations SET labels_json = NULL WHERE pid = ?",
+                    (pid,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            reopened = Runtime.open(db)
+            try:
+                process = reopened.process.get(pid)
+                handle = reopened.llm.context_memory.ensure(
+                    pid,
+                    reopened.images[process.image_id],
+                    process,
+                    reopened.tools.visible_tools(pid),
+                )
+                restored = reopened.memory.get_object(pid, handle)
+
+                assert restored.oid != before_oid
+                assert restored.metadata.sensitivity == 'secret'
+                assert restored.metadata.tenant == 'tenant-a'
+                assert restored.metadata.principal == 'analyst-a'
+                assert restored.payload['label_history']['sensitivity'] == 'secret'
+                assert restored.payload['label_history']['tenant'] == 'tenant-a'
+                assert restored.payload['label_history']['principal'] == 'analyst-a'
+
+                later_normal = reopened.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {'value': 'later normal context'},
+                    metadata=ObjectMetadata(
+                        sensitivity='normal',
+                        tenant='tenant-a',
+                        principal='analyst-a',
+                    ),
+                )
+                process = reopened.process.get(pid)
+                process.memory_view = reopened.memory.create_view(
+                    pid,
+                    [later_normal],
+                    mode=ViewMode.READ_ONLY,
+                )
+                reopened.store.update_process(process)
+                reopened.llm.client = RecordingActionClient([
+                    {
+                        'action': 'create_memory_object',
+                        'type': 'observation',
+                        'payload': {'step': 2},
+                    },
+                ])
+
+                second = reopened.run_process_once(pid)
+                assert second['ok'], second
+                updated = reopened.store.get_object(restored.oid)
+                assert updated is not None
+                assert updated.metadata.sensitivity == 'secret'
+                assert updated.metadata.tenant == 'tenant-a'
+                assert updated.metadata.principal == 'analyst-a'
+            finally:
+                reopened.close()
+
+    def test_custom_context_prefix_migrates_historical_default_named_context(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm_context=replace(
+                DEFAULT_CONFIG.llm_context,
+                object_name_prefix='custom_context',
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='migrate historical default context name',
+                )
+                old_context = runtime.memory.create_object(
+                    pid,
+                    ObjectType.PROCESS_STATE,
+                    {'kind': 'llm_context', 'entries': []},
+                    metadata=ObjectMetadata(
+                        sensitivity='secret',
+                        trust_level='untrusted',
+                        integrity='untrusted',
+                    ),
+                    name=context_object_name(pid),
+                    immutable=False,
+                )
+                old_oid = old_context.oid
+            finally:
+                runtime.close()
+
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    """
+                    UPDATE objects
+                       SET lifecycle_state = 'released',
+                           deleted_at = '2000-01-01T00:00:00+00:00'
+                     WHERE oid = ?
+                    """,
+                    (old_context.oid,),
+                )
+                connection.execute(
+                    'ALTER TABLE llm_context_generations DROP COLUMN labels_schema_version'
+                )
+                connection.execute(
+                    'ALTER TABLE llm_context_generations DROP COLUMN labels_json'
+                )
+                connection.commit()
+
+            reopened = Runtime.open(db, config=config)
+            try:
+                history = reopened.store.get_llm_context_label_history(pid)
+                assert history is not None
+                assert history.sensitivity.value == 'secret'
+                assert reopened.store.get_object(old_oid) is None
+
+                process = reopened.process.get(pid)
+                handle = reopened.llm.context_memory.ensure(
+                    pid,
+                    reopened.images[process.image_id],
+                    process,
+                    reopened.tools.visible_tools(pid),
+                )
+                context = reopened.memory.get_object(pid, handle)
+                assert context.name == context_object_name(pid, config=config)
+                assert context.name == f'custom_context:{pid}'
+                assert context.metadata.sensitivity == 'secret'
+            finally:
+                reopened.close()
+
+    def test_custom_context_prefix_migrates_tagged_historical_custom_prefix(self) -> None:
+        legacy_config = replace(
+            DEFAULT_CONFIG,
+            llm_context=replace(
+                DEFAULT_CONFIG.llm_context,
+                object_name_prefix='legacy_custom_context',
+            ),
+        )
+        replacement_config = replace(
+            DEFAULT_CONFIG,
+            llm_context=replace(
+                DEFAULT_CONFIG.llm_context,
+                object_name_prefix='replacement_custom_context',
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db, config=legacy_config)
+            try:
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='migrate tagged custom context name',
+                )
+                old_context = runtime.memory.create_object(
+                    pid,
+                    ObjectType.PROCESS_STATE,
+                    {'kind': 'llm_context', 'entries': []},
+                    metadata=ObjectMetadata(
+                        sensitivity='confidential',
+                        tags=['llm_context', 'prompt_cache'],
+                    ),
+                    name=context_object_name(pid, config=legacy_config),
+                    immutable=False,
+                )
+                decoy = runtime.memory.create_object(
+                    pid,
+                    ObjectType.PROCESS_STATE,
+                    {'kind': 'unrelated_process_state'},
+                    metadata=ObjectMetadata(sensitivity='secret'),
+                    name='unrelated_process_state',
+                    immutable=False,
+                )
+            finally:
+                runtime.close()
+
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    """
+                    UPDATE objects
+                       SET lifecycle_state = 'released',
+                           deleted_at = '2000-01-01T00:00:00+00:00'
+                     WHERE oid = ?
+                    """,
+                    (old_context.oid,),
+                )
+                connection.execute(
+                    'ALTER TABLE llm_context_generations DROP COLUMN labels_schema_version'
+                )
+                connection.execute(
+                    'ALTER TABLE llm_context_generations DROP COLUMN labels_json'
+                )
+                connection.commit()
+
+            reopened = Runtime.open(db, config=replacement_config)
+            try:
+                history = reopened.store.get_llm_context_label_history(pid)
+                assert history is not None
+                assert history.sensitivity.value == 'confidential'
+                assert reopened.store.get_object(old_context.oid) is None
+                assert reopened.store.get_object(decoy.oid) is None
+
+                process = reopened.process.get(pid)
+                handle = reopened.llm.context_memory.ensure(
+                    pid,
+                    reopened.images[process.image_id],
+                    process,
+                    reopened.tools.visible_tools(pid),
+                )
+                context = reopened.memory.get_object(pid, handle)
+                assert context.name == context_object_name(
+                    pid,
+                    config=replacement_config,
+                )
+                assert context.metadata.sensitivity == 'confidential'
+            finally:
+                reopened.close()
+
+    def test_legacy_unknown_context_labels_migrate_to_conservative_high_water(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='migrate historical custom labels',
+                )
+                context = runtime.memory.create_object(
+                    pid,
+                    ObjectType.PROCESS_STATE,
+                    {'kind': 'llm_context', 'entries': []},
+                    metadata=ObjectMetadata(),
+                    name=context_object_name(pid),
+                    immutable=False,
+                )
+                context_oid = context.oid
+            finally:
+                runtime.close()
+
+            with sqlite3.connect(db) as connection:
+                row = connection.execute(
+                    'SELECT metadata_json FROM objects WHERE oid = ?',
+                    (context_oid,),
+                ).fetchone()
+                metadata = json.loads(row[0])
+                metadata.update(
+                    {
+                        'sensitivity': ['internal'],
+                        'trust_level': 'partner_asserted',
+                        'integrity': 'best_effort',
+                        'origin': '',
+                        'tenant': ' invalid ',
+                        'principal': '',
+                        'declassification_authority': 'mixed',
+                    }
+                )
+                connection.execute(
+                    'UPDATE objects SET metadata_json = ? WHERE oid = ?',
+                    (json.dumps(metadata), context_oid),
+                )
+                connection.execute(
+                    'ALTER TABLE llm_context_generations DROP COLUMN labels_schema_version'
+                )
+                connection.execute(
+                    'ALTER TABLE llm_context_generations DROP COLUMN labels_json'
+                )
+                connection.commit()
+
+            reopened = Runtime.open(db)
+            try:
+                history = reopened.store.get_llm_context_label_history(pid)
+                assert history is not None
+                assert history.sensitivity.value == 'secret'
+                assert history.trust_level.value == 'untrusted'
+                assert history.integrity.value == 'untrusted'
+                assert history.origin == 'derived'
+                assert history.tenant == 'mixed'
+                assert history.principal == 'mixed'
+                assert history.declassification_authority is None
+            finally:
+                reopened.close()
+
+    def test_context_label_backfill_does_not_rewrite_existing_high_water(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            runtime = Runtime.open(db)
+            try:
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='keep watermark update stable',
+                )
+                runtime.memory.create_object(
+                    pid,
+                    ObjectType.PROCESS_STATE,
+                    {'kind': 'llm_context', 'entries': []},
+                    metadata=ObjectMetadata(sensitivity='secret'),
+                    name=context_object_name(pid),
+                    immutable=False,
+                )
+                runtime.store.merge_llm_context_label_history(
+                    pid,
+                    DataLabels(sensitivity='secret'),
+                )
+                before = runtime.store.select_table_rows(
+                    'llm_context_generations',
+                    'pid = ?',
+                    (pid,),
+                )[0]['updated_at']
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db)
+            try:
+                after = reopened.store.select_table_rows(
+                    'llm_context_generations',
+                    'pid = ?',
+                    (pid,),
+                )[0]['updated_at']
+                assert after == before
+            finally:
+                reopened.close()
+
+    def test_conditional_llm_release_replays_exact_prepared_request_once(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            client = RecordingActionClient([
+                {'action': 'process_exit', 'payload': {'done': True}},
+            ])
+            runtime.llm.client = client
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='llm:default',
+                    trust_level=SinkTrustLevel.CONDITIONAL,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='resume exact conditional LLM request',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'CONDITIONAL_LLM_RELEASE_SENTINEL'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            process = runtime.process.get(pid)
+            process.memory_view = runtime.memory.create_view(
+                pid,
+                [source],
+                mode=ViewMode.READ_ONLY,
+            )
+            runtime.store.update_process(process)
+
+            waiting = runtime.run_next_process_once()
+
+            assert waiting['waiting_human']
+            assert client.user_prompts == []
+            durable = runtime.store.get_llm_pending_action(pid)
+            assert durable is not None
+            assert durable['wait_type'] == 'llm_release'
+            request_id = waiting['request_id']
+            runtime.human.drain_terminal_queue(auto_approve=True)
+
+            replacement = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'value': 'MUST_NOT_REBUILD_APPROVED_LLM_REQUEST'},
+            )
+            process = runtime.process.get(pid)
+            process.memory_view = runtime.memory.create_view(
+                pid,
+                [replacement],
+                mode=ViewMode.READ_ONLY,
+            )
+            runtime.store.update_process(process)
+
+            resumed = runtime.run_next_process_once()
+
+            assert resumed['ok'], resumed
+            assert resumed['resumed_after_human']
+            assert resumed['action']['action'] == 'process_exit'
+            assert len(client.user_prompts) == 1
+            assert 'MUST_NOT_REBUILD_APPROVED_LLM_REQUEST' not in client.user_prompts[0]
+            assert runtime.human.get(request_id).status.value == 'approved'
+            assert runtime.human.pending() == []
+            completed = runtime.store.get_llm_pending_action(pid)
+            assert completed is not None and completed['status'] == 'completed'
+            assert len([
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'llm.release_waiting_human'
+            ]) == 1
+        finally:
+            runtime.close()
+
+    def test_rejected_conditional_llm_release_pauses_without_reprompting(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            client = RecordingActionClient([
+                {'action': 'process_exit', 'payload': {'must_not_run': True}},
+            ])
+            runtime.llm.client = client
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='llm:default',
+                    trust_level=SinkTrustLevel.CONDITIONAL,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='do not recreate a rejected conditional LLM request',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'REJECTED_LLM_RELEASE_SENTINEL'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            process = runtime.process.get(pid)
+            process.memory_view = runtime.memory.create_view(
+                pid,
+                [source],
+                mode=ViewMode.READ_ONLY,
+            )
+            runtime.store.update_process(process)
+
+            waiting = runtime.run_next_process_once()
+            request_id = waiting['request_id']
+            runtime.human.reject(request_id, {'approved': False, 'reason': 'test rejection'})
+
+            rejected = runtime.run_next_process_once()
+
+            assert rejected['llm_release_rejected'] is True
+            assert rejected['request_id'] == request_id
+            assert runtime.process.get(pid).status == ProcessStatus.PAUSED
+            assert runtime.run_next_process_once() is None
+            assert runtime.human.pending() == []
+            assert client.user_prompts == []
+            assert len([
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'llm.release_waiting_human'
+            ]) == 1
+        finally:
+            runtime.close()
+
+    def test_parent_cannot_resume_child_after_conditional_llm_release_rejection(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            client = RecordingActionClient([
+                {'action': 'process_exit', 'payload': {'must_not_run': True}},
+            ])
+            runtime.llm.client = client
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='llm:default',
+                    trust_level=SinkTrustLevel.CONDITIONAL,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            parent = runtime.process.spawn(image='base-agent:v0', goal='manage child')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(
+                parent,
+                'require Host resume after rejected LLM release',
+            )
+            source = runtime.memory.create_object(
+                child,
+                ObjectType.EVIDENCE,
+                {'secret': 'REJECTED_CHILD_LLM_RELEASE_SENTINEL'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            process = runtime.process.get(child)
+            process.memory_view = runtime.memory.create_view(
+                child,
+                [source],
+                mode=ViewMode.READ_ONLY,
+            )
+            runtime.store.update_process(process)
+
+            waiting = runtime.run_process_once(child)
+            request_id = waiting['request_id']
+            runtime.human.reject(request_id, {'approved': False, 'reason': 'test rejection'})
+            rejected = runtime.run_process_once(child)
+
+            assert rejected['llm_release_rejected'] is True
+            assert runtime.process.get(child).status == ProcessStatus.PAUSED
+
+            gated_message = runtime.process.get(child).status_message
+            model_pause = runtime.tools.call(
+                parent,
+                'signal_child_process',
+                {
+                    'child_pid': child,
+                    'signal': 'pause',
+                    'reason': 'model must not replace the Host-only gate',
+                },
+            )
+
+            assert model_pause.ok, model_pause.error
+            assert runtime.process.get(child).status_message == gated_message
+
+            model_resume = runtime.tools.call(
+                parent,
+                'signal_child_process',
+                {'child_pid': child, 'signal': 'resume'},
+            )
+
+            assert not model_resume.ok
+            assert 'Host resume' in (model_resume.error or '')
+            assert runtime.process.get(child).status == ProcessStatus.PAUSED
+            assert runtime.run_process_once(child)['skipped'] is True
+            assert runtime.human.pending() == []
+            assert client.user_prompts == []
+            assert len([
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'llm.release_waiting_human'
+            ]) == 1
+
+            runtime.process.resume(child)
+            renewed = runtime.run_process_once(child)
+
+            assert renewed['waiting_human'] is True
+            assert renewed['request_id'] != request_id
+            assert len([
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'llm.release_waiting_human'
+            ]) == 2
+        finally:
+            runtime.close()
+
+    def test_conditional_llm_release_opt_out_does_not_persist_prepared_prompt(self) -> None:
+        sentinel = 'CONDITIONAL_LLM_RELEASE_NO_RETENTION_SENTINEL'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            config = replace(
+                DEFAULT_CONFIG,
+                llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False),
+            )
+            runtime = Runtime.open(db, config=config)
+            try:
+                client = RecordingActionClient([
+                    {'action': 'process_exit', 'payload': {'done': True}},
+                ])
+                runtime.llm.client = client
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern='llm:default',
+                        trust_level=SinkTrustLevel.CONDITIONAL,
+                        max_sensitivity='secret',
+                        identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                    ),
+                    actor='test.host',
+                    require_capability=False,
+                )
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='do not retain a conditional LLM prompt',
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {'secret': sentinel},
+                    metadata=ObjectMetadata(sensitivity='secret'),
+                )
+                process = runtime.process.get(pid)
+                process.memory_view = runtime.memory.create_view(
+                    pid,
+                    [source],
+                    mode=ViewMode.READ_ONLY,
+                )
+                runtime.store.update_process(process)
+
+                waiting = runtime.run_next_process_once()
+
+                assert waiting['waiting_human']
+                assert client.user_prompts == []
+                with sqlite3.connect(db) as conn:
+                    row = conn.execute(
+                        'SELECT action_json FROM llm_pending_actions WHERE pid = ?',
+                        (pid,),
+                    ).fetchone()
+                assert row is not None
+                assert sentinel not in row[0]
+                durable = runtime.store.get_llm_pending_action(pid)
+                assert durable is not None
+                assert durable['action']['kind'] == 'llm_release_request_redacted'
+                assert durable['action']['prepared_request_sha256']
+                assert 'request_messages' not in durable['action']
+                assert 'egress_payload' not in durable['action']
+
+                runtime.human.drain_terminal_queue(auto_approve=True)
+                resumed = runtime.run_next_process_once()
+
+                assert resumed['ok'], resumed
+                assert resumed['resumed_after_human']
+                assert len(client.user_prompts) == 1
+                assert sentinel in client.user_prompts[0]
+                completed = runtime.store.get_llm_pending_action(pid)
+                assert completed is not None and completed['status'] == 'completed'
+                assert sentinel not in json.dumps(completed['action'], sort_keys=True)
+            finally:
+                runtime.close()
+
+    def test_redacted_conditional_llm_release_fails_closed_after_reopen(self) -> None:
+        sentinel = 'CONDITIONAL_LLM_RELEASE_REOPEN_SENTINEL'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = f'{temp_dir}/runtime.sqlite'
+            config = replace(
+                DEFAULT_CONFIG,
+                llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False),
+            )
+            runtime = Runtime.open(db, config=config)
+            try:
+                runtime.llm.client = RecordingActionClient([
+                    {'action': 'process_exit', 'payload': {'must_not_run': True}},
+                ])
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern='llm:default',
+                        trust_level=SinkTrustLevel.CONDITIONAL,
+                        max_sensitivity='secret',
+                        identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                    ),
+                    actor='test.host',
+                    require_capability=False,
+                )
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='fail a redacted release closed after reopen',
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {'secret': sentinel},
+                    metadata=ObjectMetadata(sensitivity='secret'),
+                )
+                process = runtime.process.get(pid)
+                process.memory_view = runtime.memory.create_view(
+                    pid,
+                    [source],
+                    mode=ViewMode.READ_ONLY,
+                )
+                runtime.store.update_process(process)
+                waiting = runtime.run_next_process_once()
+                request_id = waiting['request_id']
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db, config=config)
+            try:
+                client = RecordingActionClient([
+                    {'action': 'process_exit', 'payload': {'must_not_run': True}},
+                ])
+                reopened.llm.client = client
+
+                assert client.user_prompts == []
+                assert reopened.process.get(pid).status == ProcessStatus.FAILED
+                assert reopened.human.get(request_id).status.value == 'cancelled'
+                pending = reopened.store.get_llm_pending_action(pid)
+                assert pending is not None and pending['status'] == 'resuming'
+                assert any(
+                    record.action == 'llm.release_resume_payload_unavailable'
+                    and record.target == f'human_request:{request_id}'
+                    and record.decision.get('replayed') is False
+                    for record in reopened.audit.trace()
+                )
+                assert any(
+                    event.type == EventType.PROCESS_EXITED
+                    and event.source == pid
+                    and event.payload.get('status') == ProcessStatus.FAILED.value
+                    for event in reopened.events.list()
+                )
+            finally:
+                reopened.close()
 
     def test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call(self) -> None:
         runtime = Runtime.open('local')
@@ -891,6 +1926,166 @@ class TestLLMContextMemory:
             finally:
                 runtime.close()
 
+    def test_openai_responses_state_chain_stays_stateless_without_credential_fingerprint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("AGENT_LIBOS_TEST_MISSING_PROVIDER_KEY", raising=False)
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, store=True, responses_previous_response_id=True),
+        )
+        client = LLMClient(
+            model="gpt-test",
+            api_key=None,
+            api_key_env="AGENT_LIBOS_TEST_MISSING_PROVIDER_KEY",
+            api_mode="responses",
+            store=True,
+            responses_previous_response_id=True,
+            defaults=config.llm,
+        )
+        fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_tool_call(
+                    "resp_unverified_first",
+                    "create_memory_object",
+                    {"type": "note", "name": "step", "payload": {"ok": True}},
+                ),
+                _responses_tool_call(
+                    "resp_unverified_second",
+                    "process_exit",
+                    {"payload": {"done": True}},
+                ),
+            ]
+        )
+        client._async_client = fake
+        runtime = Runtime.open("local", config=config)
+        try:
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="keep unverified provider response state stateless",
+            )
+
+            first = runtime.run_next_process_once()
+            second = runtime.run_next_process_once()
+
+            assert first["action"]["action"] == "create_memory_object"
+            assert second["action"]["action"] == "process_exit"
+            assert len(fake.responses.payloads) == 2
+            assert all(
+                "previous_response_id" not in payload
+                for payload in fake.responses.payloads
+            )
+            assert not any(
+                item.get("type") == "function_call_output"
+                for item in fake.responses.payloads[1]["input"]
+            )
+            calls = runtime.store.list_llm_calls(pid)
+            assert [
+                call.request_options["openai_provider_chain_eligible"]
+                for call in calls
+            ] == [False, False]
+            assert all(
+                call.request_options["openai_provider_chain_fingerprint"] is None
+                for call in calls
+            )
+            assert calls[1].request_options["openai_previous_response_id"] is None
+        finally:
+            runtime.close()
+
+    def test_openai_responses_state_chain_resets_when_sink_registry_changes_before_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, store=True, responses_previous_response_id=True),
+        )
+        client = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=True,
+            responses_previous_response_id=True,
+            defaults=config.llm,
+        )
+        fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_tool_call(
+                    'resp_before_registry_change',
+                    'create_memory_object',
+                    {'type': 'note', 'name': 'registry-step', 'payload': {'ok': True}},
+                ),
+                _responses_tool_call(
+                    'resp_after_registry_change',
+                    'process_exit',
+                    {'payload': {'done': True}},
+                ),
+            ]
+        )
+        client._async_client = fake
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = client
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='llm:default',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='normal',
+                    identity_sha256=runtime.llms.profile_identity_sha256('default'),
+                ),
+                actor='test',
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(image='base-agent:v0', goal='reset raced response chain')
+            first = runtime.run_next_process_once()
+            assert first['action']['action'] == 'create_memory_object'
+
+            original_start = runtime.protected_operations.start
+            replaced = False
+
+            def replace_registry_before_start(
+                contract: Any,
+                invocation: Any,
+                *,
+                provider: Any,
+            ) -> Any:
+                nonlocal replaced
+                contract_name = contract if isinstance(contract, str) else contract.name
+                if contract_name == 'primitive.llm.complete' and not replaced:
+                    active = runtime.data_flow.inspect_sink_trust('llm:default')
+                    assert active is not None
+                    runtime.data_flow.register_sink_trust(
+                        active.rule,
+                        actor='test',
+                        replace=True,
+                        require_capability=False,
+                    )
+                    replaced = True
+                return original_start(contract, invocation, provider=provider)
+
+            monkeypatch.setattr(runtime.protected_operations, 'start', replace_registry_before_start)
+            second = runtime.run_next_process_once()
+
+            assert replaced
+            assert second['action']['action'] == 'process_exit'
+            assert len(fake.responses.payloads) == 2
+            assert 'previous_response_id' not in fake.responses.payloads[1]
+            assert not any(
+                item.get('type') == 'function_call_output'
+                for item in fake.responses.payloads[1]['input']
+            )
+            calls = runtime.store.list_llm_calls(pid)
+            assert [call.status for call in calls] == ['ok', 'ok']
+            assert calls[1].request_options['openai_previous_response_id'] is None
+            assert (
+                calls[0].request_options['data_flow_provider_chain_fingerprint']
+                != calls[1].request_options['data_flow_provider_chain_fingerprint']
+            )
+        finally:
+            runtime.close()
+
     def test_openai_responses_state_chain_persists_parallel_tool_outputs(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
@@ -1218,6 +2413,7 @@ class TestLLMContextMemory:
                     'wait_type': 'message',
                     'filters': {'channel': 'claim-once'},
                     'action': {'action': 'receive_process_messages', 'channel': 'claim-once'},
+                    'data_flow_context': DataFlowContext().to_dict(),
                     'content_preview': '',
                     'tool_call_count': 1,
                     'status': 'pending',
@@ -1263,6 +2459,7 @@ class TestLLMContextMemory:
                 'request_id': 'human_first',
                 'resume_token': 'wait_first',
                 'action': {'action': 'ask_human', 'question': 'first?'},
+                'data_flow_context': DataFlowContext().to_dict(),
                 'content_preview': '',
                 'tool_call_count': 1,
                 'status': 'pending',
@@ -1333,6 +2530,7 @@ class TestLLMContextMemory:
                         'wait_type': 'human',
                         'request_id': 'human_interrupted',
                         'action': {'action': 'write_text_file', 'path': 'agent_outputs/no-replay.txt', 'content': 'x'},
+                        'data_flow_context': DataFlowContext().to_dict(),
                         'content_preview': '',
                         'tool_call_count': 1,
                         'status': 'resuming',

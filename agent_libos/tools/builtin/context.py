@@ -214,7 +214,7 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
 
 
 def _load_context(runtime: Any, pid: str, *, required: bool = True) -> Any | None:
-    name = context_object_name(pid)
+    name = context_object_name(pid, config=runtime.config)
     try:
         handle = runtime.memory.handle_for_name(
             pid,

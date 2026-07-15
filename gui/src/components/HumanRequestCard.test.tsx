@@ -2,7 +2,13 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { HumanRequest } from "../api/types";
 import { I18nProvider } from "../i18n";
-import { buildHumanResponse, humanDecisionReducer, HumanRequestCard, type HumanDecisionState } from "./HumanRequestCard";
+import {
+  buildHumanResponse,
+  humanDecisionReducer,
+  HumanRequestCard,
+  parseDataReleaseApprovalContext,
+  type HumanDecisionState
+} from "./HumanRequestCard";
 
 describe("HumanRequestCard", () => {
   it("builds directionally valid permission decisions", () => {
@@ -53,6 +59,90 @@ describe("HumanRequestCard", () => {
     });
   });
 
+  it("blocks a withheld parent until its data release request is handled", () => {
+    const request = humanRequest("question", {
+      question: "ORIGINAL_PARENT_SECRET_MUST_NOT_RENDER",
+      release_required: true,
+      release_request_id: "request_release_1"
+    });
+
+    expect(buildHumanResponse(request, true, { answer: "must not submit", policy: "ask_each_time" })).toEqual({
+      error: "release_required"
+    });
+
+    const html = render(request);
+    expect(html).toContain("Data release required");
+    expect(html).toContain("request_release_1");
+    expect(html).not.toContain("ORIGINAL_PARENT_SECRET_MUST_NOT_RENDER");
+    expect(html).not.toContain('name="human-answer"');
+    expect(html).not.toContain("<button");
+  });
+
+  it("renders only structured metadata for a data release approval", () => {
+    const payloadSha256 = "a".repeat(64);
+    const request = humanRequest("data_release_approval", {
+      question: "Release this labeled payload?",
+      original_payload: "ORIGINAL_RELEASE_PAYLOAD_MUST_NOT_RENDER",
+      context: {
+        sink: "human:owner:gui",
+        sensitivity: "secret",
+        tenant: "tenant-alpha",
+        principal: "principal-beta",
+        payload_bytes: 87,
+        payload_sha256: payloadSha256,
+        source_count: 3,
+        operation: "human.gui.present"
+      }
+    });
+
+    expect(parseDataReleaseApprovalContext(request.payload)).toEqual({
+      sink: "human:owner:gui",
+      sensitivity: "secret",
+      tenant: "tenant-alpha",
+      principal: "principal-beta",
+      payload_bytes: 87,
+      payload_sha256: payloadSha256,
+      source_count: 3,
+      operation: "human.gui.present"
+    });
+
+    const html = render(request);
+    expect(html).toContain("Data release approval");
+    expect(html).toContain("Destination sink");
+    expect(html).toContain("human:owner:gui");
+    expect(html).toContain("Sensitivity");
+    expect(html).toContain("secret");
+    expect(html).toContain("tenant-alpha");
+    expect(html).toContain("principal-beta");
+    expect(html).toContain("Payload bytes");
+    expect(html).toContain("87");
+    expect(html).toContain(payloadSha256);
+    expect(html).toContain("Source count");
+    expect(html).toContain("3");
+    expect(html).toContain("human.gui.present");
+    expect(html).not.toContain("ORIGINAL_RELEASE_PAYLOAD_MUST_NOT_RENDER");
+    expect(html.match(/<button/g)).toHaveLength(2);
+  });
+
+  it("disables approval when release metadata fails strict validation", () => {
+    const request = humanRequest("data_release_approval", {
+      context: {
+        sink: "human:owner:gui",
+        sensitivity: "secret",
+        payload_bytes: 87,
+        payload_sha256: "not-a-sha256",
+        source_count: 3,
+        operation: "human.gui.present"
+      }
+    });
+
+    expect(parseDataReleaseApprovalContext(request.payload)).toBeNull();
+    const html = render(request);
+    expect(html).toContain("Release metadata is incomplete");
+    expect(html).toMatch(/<button disabled="">Approve<\/button>/);
+    expect(html).toMatch(/<button class="danger">Reject<\/button>/);
+  });
+
   it("keeps the draft when submission fails instead of optimistically clearing it", () => {
     const state: HumanDecisionState = {
       answer: "carefully chosen answer",
@@ -87,18 +177,18 @@ describe("HumanRequestCard", () => {
 
 function render(request: HumanRequest): string {
   return renderToStaticMarkup(
-    <I18nProvider>
+    <I18nProvider initialLanguage="en">
       <HumanRequestCard request={request} onRespond={async () => true} />
     </I18nProvider>
   );
 }
 
-function humanRequest(type: string): HumanRequest {
+function humanRequest(type: string, payload: Record<string, unknown> = {}): HumanRequest {
   return {
     request_id: `request_${type}`,
     pid: "pid_1",
     human: "owner",
-    payload: { type, question: `Handle ${type}?` },
+    payload: { type, question: `Handle ${type}?`, ...payload },
     status: "pending",
     decision: null,
     blocking: true,

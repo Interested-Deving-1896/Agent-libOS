@@ -62,7 +62,7 @@ async def run_interleaved_clock_demo(
                 "authorized_capabilities": [
                     {"resource": _RUNTIME_DEFAULTS.default_human_resource, "rights": ["write"]},
                 ],
-                "permitted_effects": ["clock.*", "human.*"],
+                "permitted_effects": ["llm.*", "clock.*", "human.*"],
                 "metadata": {"provided_by": "async_clock_interleave_smoke"},
             },
         )
@@ -73,7 +73,7 @@ async def run_interleaved_clock_demo(
                 "authorized_capabilities": [
                     {"resource": _RUNTIME_DEFAULTS.default_human_resource, "rights": ["write"]},
                 ],
-                "permitted_effects": ["clock.*", "human.*"],
+                "permitted_effects": ["llm.*", "clock.*", "human.*"],
                 "metadata": {"provided_by": "async_clock_interleave_smoke"},
             },
         )

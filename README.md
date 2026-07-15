@@ -15,7 +15,7 @@ self-evolution mechanisms do not grant resource authority by themselves.
 The current contribution is the runtime authority boundary:
 
 ```text
-process identity + capability + primitive + audit
+process identity + capability + data labels + Host Sink trust + primitive + audit
 ```
 
 LLM-facing tools, Skills, JIT tools, image definitions, child processes,
@@ -72,6 +72,12 @@ The implementation currently includes:
   process, image, checkpoint, skill, and Object Memory primitives, including
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.
+- Runtime-enforced source-to-Sink data labels for LLM, Human, JSON-RPC, MCP,
+  filesystem writes, Shell/PTY input and session control, and process handoffs.
+  Unmatched Sinks are untrusted/normal; Host-trusted Sinks accept data only
+  within sensitivity and tenant/principal clearance, while conditional
+  high-sensitivity sends require an exact one-shot release. See
+  [docs/data_flow.md](docs/data_flow.md).
 - Durable Host-authored Task Authority Manifests that compile launch authority,
   budgets, approval policy, and effect ceilings while treating image
   `required_capabilities` as declarations only. See
@@ -108,7 +114,7 @@ The implementation currently includes:
   tool capabilities, provider-classified external effects, audit, and resource
   accounting, with the same authority-before-lookup and transactional registry
   semantics.
-- A deterministic runtime-safety benchmark harness with 27 checked-in schema-v1
+- A deterministic runtime-safety benchmark harness with 28 checked-in schema-v1
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
   denominators.
@@ -139,6 +145,9 @@ Start here, then read the deeper references as needed:
   contracts, containment limits, and extension checklist.
 - [docs/capabilities.md](docs/capabilities.md): resource naming, rights,
   one-shot grants, human approval, shell policy, and filesystem containment.
+- [docs/data_flow.md](docs/data_flow.md): label integrity, Host Sink trust,
+  exact release, exit coverage, process identity domains, persistence, and
+  guarantee boundaries.
 - [docs/object_memory.md](docs/object_memory.md): namespaces, object rights,
   file/object bridge, context materialization, and payload persistence.
 - [docs/tools_and_jit.md](docs/tools_and_jit.md): built-in tools,
@@ -242,15 +251,25 @@ The benchmark defaults to mock/planned actions and does not spend model tokens.
 Real-model benchmark smoke is opt-in and must be scoped with `--llm real
 --limit 1` or a single `--task`.
 
-The last recorded deterministic `agent_libos_full` 27-task snapshot had valid
-outputs with 27/27 task success and safety pass, unauthorized side effects
-0/22, zero unknown effects, and false denials 0/22 (0%). Those counts are
-historical evidence, not a claim about the current dirty working tree; see the
-[living release ledger](docs/release_status.md) before reusing them. The
-denominator is allowed attempts with a definite performed/denied outcome, not
-the older 43-record normalization. Missing/unknown effect evidence invalidates
-rates instead of being inferred from `result.ok`. See
-[docs/benchmark.md](docs/benchmark.md).
+The historical deterministic snapshot was produced from clean
+source snapshot `c03a4ec764e02bd4df59e2769edeb1278d5ea545`; its ignored local
+artifact is `.benchmark_runs/release-c03a4ec`. For that source snapshot it is
+valid with 28/28 task
+success and
+safety pass, 122 normalized effects, unauthorized performed effects `0/97`,
+allowed denials `0/97`, and zero unknown outcomes/classifications. Its
+`metadata.json` SHA-256 is
+`7ef7b0054f1e4fbd2bcb9b33e803016e62010254a122dffa8c692f0837ba6b54` and its
+`metrics.json` SHA-256 is
+`f6b3b0aa5e2a403c3ed0a7c848dcbccffa7faabe5eda7edf6cfe26ebccde53b6`.
+That artifact is not evidence for the current tree: its counts do not carry
+over across history consolidation or later runtime changes unless content
+identity is proved and the release ledger explicitly records that proof.
+The two rate denominators are qualified effect populations, not task counts,
+and missing/unknown evidence invalidates rates instead of being inferred from
+`result.ok`. The ignored artifact must be packaged separately. See the
+[living release ledger](docs/release_status.md) and
+[benchmark contract](docs/benchmark.md).
 
 Run the practical workflow evidence suite separately:
 
@@ -483,6 +502,17 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   final failure, not a pending/retry protocol. Run-local automatic decisions
   are isolated across concurrent scheduler workers, and terminal process states
   cancel pending requests.
+- Runtime-mediated egress requires both ordinary operation authority and Sink
+  clearance. Trusted Sink configuration cannot grant a capability, bypass a
+  Task Authority effect ceiling or budget, or be forged by a model/child
+  manifest. Conditional release is bound to the exact Sink, trust generation,
+  manifest, source versions, labels, payload hash, operation, and target state;
+  untrusted Sinks cannot be elevated above `normal` by Human approval.
+- The data-flow guarantee ends at the mediated Sink. Trusting Shell, PTY, or MCP
+  stdio means the Host trusts that executable to receive the payload; it is not
+  OS network/filesystem isolation and does not control later native I/O or Sink
+  forwarding. Trusted modules/providers, Host administrators, and direct
+  database writes remain outside this boundary.
 - When the optional PTY module is loaded, PTY sessions are host runtime
   resources bound to mutable Object Memory `EXTERNAL_REF` handles. Shell policy
   authorizes creation; object read, write, and delete rights authorize read,

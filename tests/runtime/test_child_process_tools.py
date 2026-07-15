@@ -235,7 +235,12 @@ class TestChildProcessTool:
 
             process = runtime.process.get(pid)
             assert process.status == ProcessStatus.EXITED
-            assert process.status_message == 'done'
+            assert process.status_message is not None
+            assert process.status_message.startswith('result_oid:')
+            result = runtime.store.get_object(process.status_message.split(':', 1)[1])
+            assert result is not None
+            assert result.payload == {'message': 'done'}
+            assert 'late overwrite' not in str(result.payload)
         finally:
             runtime.close()
 
@@ -586,6 +591,51 @@ class TestChildProcessTool:
 
             monkeypatch.setattr(runtime.events, 'emit', original_emit)
             runtime.process.exit(child)
+            assert runtime.process.get(child).status == ProcessStatus.EXITED
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_process_exit_generated_result_rolls_back_with_terminal_transition(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='wait for atomic exit')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'publish one atomic final result')
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
+            payload = {'sentinel': 'PROCESS_EXIT_ATOMIC_RESULT_SENTINEL'}
+            original_emit = runtime.events.emit
+
+            def fail_exit_event(event_type: EventType, *args: Any, **kwargs: Any) -> Any:
+                if event_type == EventType.PROCESS_EXITED:
+                    raise RuntimeError('injected generated-result exit failure')
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, 'emit', fail_exit_event)
+            failed = runtime.tools.call(child, 'process_exit', {'payload': payload})
+
+            assert not failed.ok
+            assert runtime.process.get(child).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+            assert [
+                obj.oid
+                for obj in runtime.store.list_objects()
+                if obj.type == ObjectType.SUMMARY and obj.payload == payload
+            ] == []
+
+            monkeypatch.setattr(runtime.events, 'emit', original_emit)
+            exited = runtime.tools.call(child, 'process_exit', {'payload': payload})
+
+            assert exited.ok, exited.error
+            result_oid = exited.payload['result_oid']
+            result = runtime.store.get_object(result_oid)
+            assert result is not None
+            assert result.payload == payload
+            assert result.provenance.created_from_action == 'process.exit'
             assert runtime.process.get(child).status == ProcessStatus.EXITED
             assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
         finally:

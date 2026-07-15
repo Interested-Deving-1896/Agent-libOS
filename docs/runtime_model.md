@@ -126,6 +126,54 @@ durable generation before payload replacement; checkpoint restore also advances
 it so a local rollback cannot chain to a response produced from post-checkpoint
 state.
 
+Provider-side chaining is also bound to the data-flow clearance fingerprint:
+the LLM Sink/profile identity, active Sink-registry generation and trust hash,
+Task Authority manifest hash, and current sensitivity/tenant/principal domain.
+A profile identity includes the effective provider retention/chaining policy,
+and precheck plus client resolution use one frozen Host snapshot; a cached
+client is rebuilt when that identity changes. A change resets to a stateless
+request. Source Object versions and inbound
+trust/integrity can change after each result without changing the provider's
+confidentiality clearance; high-sensitivity history is retained by the LLM
+context label high-water mark. The LLM request is a formal bidirectional
+protected operation, and its unclassified response is aggregated as
+`normal/untrusted` rather than replacing request labels.
+
+## Data-flow state
+
+Every runtime-mediated payload exit constructs a typed `DataSink` and a
+runtime-owned `DataFlowContext`. The context contains strict labels and exact
+Object id/version/content hashes from materialization, explicit Host
+`source_oids`, and ambient process observations. External LLM, Human,
+JSON-RPC, MCP, filesystem write, Shell, and PTY paths check Host Sink clearance
+before ordinary approval/provider state and revalidate immediately before
+dispatch. Prompt-visible process events contribute their trusted labels to the
+durable LLM context before this check. Process goals/messages/results and
+Object Tasks propagate the same identity domain internally without downgrading
+it.
+
+The durable Sink registry is separate from `TaskAuthorityManifest`. The
+manifest can only constrain which tenant/principal data a process may receive;
+it cannot create external trust. A conditional high-sensitivity exit blocks on
+a metadata-only Human release bound to the exact Sink, source versions, labels,
+payload, operation, manifest, and registry generation. See
+[Data Flow](data_flow.md) for trust levels, identities, persistence, and the
+guarantee boundary.
+
+When that exit is the LLM provider request itself, the default
+`llm.persist_full_io=true` policy persists the fully prepared messages, tools,
+request options, profile/Sink identity, provider-state scope, and flow binding
+in the `llm_release` wait generation. With `persist_full_io=false`, SQL keeps
+only the prepared-request and payload hashes plus non-sensitive resume
+metadata, while the exact request remains in executor memory. The same runtime
+can resume that hash-bound request once; after reopen or any loss of the
+in-memory generation, the runtime fails closed before provider dispatch rather
+than rebuilding it. Profile identity drift or an already-claimed generation
+also fails closed. Rejection clears the prepared generation and installs a
+Host-only pause marker. Direct-child model signals cannot resume through that
+marker; an explicit Host resume begins a fresh turn rather than replaying or
+silently regenerating the rejected request.
+
 LLM-selected blocking actions use durable wait generations. Each row has a
 unique `resume_token` plus the causal LLM and Tool operation ids; one executor
 CASes `pending -> resuming` before crossing
@@ -210,6 +258,19 @@ process-owned memory cleanup, direct trusted delete, or runtime shutdown, the
 module-bound Object release or shutdown finalizer closes the underlying PTY as
 the object's RAII resource.
 
+PTY spawn uses `pty:spawn:<resolved-executable>` plus the executable content
+hash for data-flow clearance and revalidates both before spawn. The session
+records that immutable trust identity at creation; later input, resize,
+and public close use the visible `pty:session:<session-id>` Sink but resolve
+trust only through the spawn identity. Successful or ambiguously applied input
+and resize operations raise the session's label high-water; an ambiguous public
+close does the same while the session remains unresolved. Internal lifecycle
+close remains separate so cleanup cannot be blocked by Sink clearance. A
+session cannot switch to a differently trusted executable. Trusting that Sink
+means the Host trusts the native program to receive argv, stdin, and session
+control signals; it does not constrain additional file/network I/O performed
+by that program.
+
 Finite object write/delete decisions for `pty_write`, `pty_resize`, and
 `pty_close` are reserved before the host call. A certified not-started result
 restores that exact reservation only when no earlier provider observation in
@@ -238,7 +299,7 @@ releases stale PTY objects rather than trying to reconnect a host process.
 
 ## External Effect Ledger
 
-Filesystem, clock, shell, human output/terminal I/O, PTY, JSON-RPC, and live MCP
+LLM, filesystem, clock, shell, human output/terminal I/O, PTY, JSON-RPC, and live MCP
 primitives close the crash gap around provider calls with a durable
 external-effect intent.
 Immediately before the provider boundary they insert an `unknown` record with
@@ -463,6 +524,17 @@ Human interaction is modeled as runtime objects, not raw prompt text.
   classification/final persistence fails, the pending row remains and the call
   is not retried. Thus output is at-most-once: no post-provider failure can
   leave a replayable request or restore already committed one-shot authority.
+- Questions, permission context, approval prompts, and output are also
+  data-flow checked against `human:<recipient>:<channel>`. A conditional
+  release request contains public metadata and hashes only; it never embeds the
+  protected payload, and approving ordinary capability cannot elevate an
+  untrusted Human Sink above `normal`. The release and protected Human request
+  are durably linked: rejecting or ambiguously delivering the release
+  terminates the protected request without exposing its payload, while a
+  provider-certified not-started result remains retryable and reuses the same
+  release after reopen. A resumed answer restores the persisted request labels
+  and aggregates them with `normal/untrusted` Human ingress, even when the
+  resume call begins with a clean context.
 - Per-use approvals can create one-shot capabilities. Side-effectful primitives
   reserve the use before commit, restore it if a pre-commit failure aborts the
   operation, and leave it consumed once the operation crosses its commit or
@@ -595,7 +667,9 @@ run Human/ObjectTask terminal notification and Object/host finalization as
 independent post-commit phases: failure in one does not skip the other or make
 the durable terminal transition retryable. Cleanup failures are appended as
 `process.signal_finalize_failed` audit warnings when that sink remains
-available.
+available. A process paused after rejection of an exact conditional LLM release
+also carries a Host-only resume marker: direct-child pause/resume signals cannot
+erase or cross it, while a Host `ProcessManager.resume` clears it deliberately.
 
 ## Process Exit
 

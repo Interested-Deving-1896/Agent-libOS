@@ -194,6 +194,14 @@ retains the non-replayable state, and audits
 `llm.pending_action_resume_interrupted` instead of automatically replaying a
 tool whose external effect may already have happened.
 
+Conditional LLM release waits follow the same claim discipline, but their
+prepared provider request follows `llm.persist_full_io`. With full-I/O
+retention disabled, SQL stores only non-sensitive identifiers and hashes while
+the exact request remains in the current executor's memory. Approval can still
+resume that exact request in the same runtime. A reopen cannot reconstruct it:
+startup atomically claims the redacted generation, fails the process closed,
+cancels its pending Human request, and audits that no provider replay occurred.
+
 Protected public boundaries are registered by the runtime composition root for
 Explainable Operations. New process, Object Memory, checkpoint, capability,
 Human, ObjectTask, Skill/Image/remote-registry, or external primitive mutation
@@ -203,6 +211,15 @@ do not declare provider evidence unconditionally for preflight denial paths.
 Tests should cover the operation outcome, expected-role completeness, explicit
 evidence resolution, and redacted output in addition to the original audit and
 effect assertions. See [explainable_operations.md](explainable_operations.md).
+
+Every new protected operation must also declare `data_flow_direction`. Egress
+or bidirectional operations must provide stable Sink and trusted-source
+descriptors and route their final dispatch through the SDK's transactional
+data-flow revalidation. Do not infer egress from the older
+`information_flow` flag: reads, DNS, and clock observation use that flag too.
+Run `uv run python scripts/check_protected_operations.py`; its static checks
+reject egress contracts that omit those descriptors or bypass the common SDK.
+See [data_flow.md](data_flow.md).
 
 Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
 provider return multiple tool calls in one action-selection response. Agent
@@ -288,7 +305,10 @@ Set `llm.persist_full_io: false` in a config overlay, or construct a replacement
 output, tool call, reasoning, and raw response persistence. The config
 dataclasses are frozen, so do not mutate `DEFAULT_CONFIG` in place. When full
 I/O persistence is disabled, the durable row keeps bounded previews, byte
-counts, truncation flags, and hashes instead of the raw values.
+counts, truncation flags, and hashes instead of the raw values. This policy also
+applies before dispatch to conditional LLM release rows; `request_messages`,
+`egress_payload`, and the rest of the prepared provider request are never
+written to `llm_pending_actions.action_json` in opt-out mode.
 
 The default remains `llm.persist_full_io: true` for deployments that use
 complete LLM call records for self-evolution training or fine-tuning.
@@ -333,6 +353,8 @@ Current default groups include:
 - JSON-RPC endpoint manifest, timeout, and request/response limits,
 - MCP server manifest, HTTP/stdio environment allowlists, timeout, and
   request/response limits,
+- data-label defaults, Host Sink trust rules, registry resource, and bounded
+  registry/decision/file-binding queries,
 - image registry limits,
 - image commit limits,
 - Object Memory and LLM context defaults,
@@ -425,6 +447,9 @@ Preserve the boundary:
   endpoint/method capability gate before loading manifest metadata or schemas;
 - MCP remote tool calls likewise gate on `server_id` and `tool_id` before
   loading server metadata or input schemas;
+- runtime-mediated egress declares a stable Sink and trusted source descriptor,
+  enforces the Host Sink registry independently of ordinary capability, and
+  revalidates both at the provider boundary;
 - checkpoint restore is scoped and append-only outside reconstructable state;
   provider-classified external effects are report-only in v1.
 
@@ -436,8 +461,10 @@ Every new provider-backed primitive must also register a
 [`ProtectedOperationContract`](protected_operation_sdk.md) and execute each
 real provider boundary through the returned handle's `call()` or `acall()`.
 Declare authority mode, conservative mutation/information-flow ceiling,
-event/audit/effect evidence roles, resource policy, classifier fallback, and
-post-provider failure policy. Run
+event/audit/effect evidence roles, resource policy, classifier fallback,
+`data_flow_direction`, and post-provider failure policy. Egress/bidirectional
+contracts must also declare and populate their Sink/source/payload descriptors.
+Run
 `uv run python scripts/check_protected_operations.py`; direct effect-lifecycle
 calls from provider subsystems fail this check. The checker also rejects a
 provider-reaching helper when any call site bypasses an SDK phase and rejects

@@ -93,7 +93,7 @@ async def run_file_viewer(
                         "rights": ["read"],
                     },
                 ],
-                "permitted_effects": ["human.*", "filesystem.*"],
+                "permitted_effects": ["llm.*", "human.*", "filesystem.*"],
                 "metadata": {"provided_by": "ask_file_then_show"},
             },
         )

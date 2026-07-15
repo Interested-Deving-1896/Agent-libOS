@@ -1,5 +1,6 @@
 from __future__ import annotations
 import contextlib
+import json
 import os
 import pytest
 import psutil
@@ -7,17 +8,63 @@ import signal
 import sys
 import tempfile
 import time
+import venv
 from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.primitives.shell import ShellAdapter
+import agent_libos.substrate.base as substrate_base
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
+from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, resolve_runtime_python_alias, snapshot_executable, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 from modules.pty.pty_module import LocalPtyProvider, _PosixPtySession
 
 class TestResourceProviderSubstrate:
+
+    def test_runtime_python_alias_requires_an_external_host_interpreter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        external = tmp_path / "host-runtime" / "python3"
+        workspace.mkdir()
+        monkeypatch.setattr(substrate_base.sys, "_base_executable", str(external))
+        monkeypatch.setattr(substrate_base.sys, "executable", str(external))
+
+        assert resolve_runtime_python_alias(
+            "python",
+            workspace_root=workspace,
+        ) == str(external.resolve(strict=False))
+        assert resolve_runtime_python_alias(
+            "python3",
+            workspace_root=workspace,
+        ) == str(external.resolve(strict=False))
+        assert resolve_runtime_python_alias(
+            "pip",
+            workspace_root=workspace,
+        ) is None
+        assert resolve_runtime_python_alias(
+            "bin/python",
+            workspace_root=workspace,
+        ) is None
+
+        workspace_interpreter = workspace / ".venv" / "bin" / "python"
+        monkeypatch.setattr(
+            substrate_base.sys,
+            "_base_executable",
+            str(workspace_interpreter),
+        )
+        monkeypatch.setattr(
+            substrate_base.sys,
+            "executable",
+            str(workspace_interpreter),
+        )
+        assert resolve_runtime_python_alias(
+            "python",
+            workspace_root=workspace,
+        ) is None
 
     def test_runtime_filesystem_primitive_uses_injected_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -130,6 +177,36 @@ class TestResourceProviderSubstrate:
             assert result.returncode == 0
             assert len(result.stdout) == 200000
             assert result.metrics is not None
+
+    def test_local_shell_snapshot_preserves_explicit_virtualenv_argv0(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("POSIX executable/argv[0] separation is not available on Windows")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        environment = workspace / ".venv"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+        executable = environment / "bin" / "python"
+        provider = LocalShellProvider(workspace)
+        argv = [
+            ".venv/bin/python",
+            "-c",
+            (
+                "import json, sys; "
+                "print(json.dumps({'prefix': sys.prefix, 'executable': sys.executable}))"
+            ),
+        ]
+        resolved = provider.resolve_argv(argv)
+
+        with snapshot_executable(resolved[0]) as snapshot:
+            result = provider.run(argv, executable_snapshot=snapshot)
+
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert Path(payload["prefix"]) == environment
+        assert Path(payload["executable"]) == executable
 
     @pytest.mark.parametrize("mode", ["success", "wall", "timeout"])
     def test_local_shell_provider_without_cpu_memory_limits_tolerates_tree_enumeration_denial(
@@ -352,6 +429,44 @@ class TestResourceProviderSubstrate:
                 assert "PTY_PROVIDER_SMOKE" in output
             finally:
                 session.close(force=True, timeout_s=1.0)
+
+    def test_local_pty_snapshot_preserves_explicit_virtualenv_argv0(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("POSIX executable/argv[0] separation is not available on Windows")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        environment = workspace / ".venv"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+        executable = environment / "bin" / "python"
+        provider = LocalPtyProvider(workspace)
+        argv = [
+            ".venv/bin/python",
+            "-c",
+            (
+                "import json, sys; "
+                "print(json.dumps({'prefix': sys.prefix, 'executable': sys.executable}), flush=True)"
+            ),
+        ]
+        resolved = provider.resolve_argv(argv)
+        snapshot = snapshot_executable(resolved[0])
+        session = provider.spawn(argv, executable_snapshot=snapshot)
+        output = ""
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                output += session.read(timeout_s=0.1)
+                if not session.is_alive():
+                    output += session.read(timeout_s=0.0)
+                    break
+        finally:
+            session.close(force=True, timeout_s=1.0)
+
+        payload = json.loads(output.replace("\r", "").strip())
+        assert Path(payload["prefix"]) == environment
+        assert Path(payload["executable"]) == executable
 
     def test_local_pty_provider_close_terminates_child_process_tree(self) -> None:
         if sys.platform == "win32":

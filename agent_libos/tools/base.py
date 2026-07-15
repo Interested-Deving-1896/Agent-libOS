@@ -21,11 +21,38 @@ from agent_libos.models.exceptions import (
     ProcessWaitRequired,
     ValidationError as LibOSValidationError,
 )
-from agent_libos.models import ToolSpec
+from agent_libos.models import DataFlowContext, ToolSpec
 
 InputT = TypeVar("InputT", bound=BaseModel)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_WAIT_DATA_FLOW_CONTEXT_ATTR = "_agent_libos_wait_data_flow_context"
+_DATA_FLOW_WAIT_EXCEPTIONS = (
+    HumanApprovalRequired,
+    ProcessWaitRequired,
+    ProcessMessageWaitRequired,
+)
+
+
+def attach_wait_data_flow_context(
+    exc: BaseException,
+    context: DataFlowContext,
+) -> None:
+    """Attach trusted flow state to a supported wait without changing its text."""
+
+    if isinstance(exc, _DATA_FLOW_WAIT_EXCEPTIONS):
+        setattr(exc, _WAIT_DATA_FLOW_CONTEXT_ATTR, context.to_dict())
+
+
+def wait_data_flow_context(exc: BaseException) -> DataFlowContext | None:
+    """Read the Host-private flow carrier from a supported wait exception."""
+
+    if not isinstance(exc, _DATA_FLOW_WAIT_EXCEPTIONS):
+        return None
+    serialized = getattr(exc, _WAIT_DATA_FLOW_CONTEXT_ATTR, None)
+    if not isinstance(serialized, dict):
+        return None
+    return DataFlowContext.from_dict(serialized)
 
 
 class ToolErrorCode(str, Enum):
@@ -111,6 +138,21 @@ class ToolResult(BaseModel):
         )
 
 
+def _merge_result_data_flow_context(
+    raw_result: Any,
+    returned_context: DataFlowContext,
+) -> DataFlowContext:
+    """Conservatively combine a tool-owned carrier with worker-observed flow."""
+
+    if not isinstance(raw_result, ToolResult):
+        return returned_context
+    serialized = raw_result.metadata.get("data_flow_context")
+    if not isinstance(serialized, Mapping):
+        return returned_context
+    explicit_context = DataFlowContext.from_dict(dict(serialized))
+    return DataFlowContext.aggregate((returned_context, explicit_context))
+
+
 class ToolExecutionError(Exception):
     def __init__(
         self,
@@ -185,7 +227,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
             return ToolResult.failure(
                 code=ToolErrorCode.VALIDATION_ERROR,
                 message=f"Invalid arguments for tool `{self.name}`.",
-                details={"errors": exc.errors()},
+                details={"errors": exc.errors(include_input=False)},
                 metadata=self._base_metadata(ctx, started_at),
             )
         except Exception as exc:
@@ -197,14 +239,67 @@ class BaseAgentTool(ABC, Generic[InputT]):
             )
 
         try:
+            runtime = ctx.runtime
+            manager = getattr(runtime, "data_flow", None) if runtime is not None else None
+            cancelled_context = (
+                [manager.current_context()] if manager is not None else []
+            )
+
+            async def execute_with_flow() -> Any:
+                if manager is None:
+                    return await self.execute(args, ctx)
+                try:
+                    raw_result = await self.execute(args, ctx)
+                    returned_context = manager.current_context()
+                    cancelled_context[:] = [returned_context]
+                    return True, raw_result, returned_context
+                except asyncio.CancelledError:
+                    # ``asyncio.wait_for`` cancels this child Task on a real
+                    # deadline. ContextVar mutations are task-local, so export
+                    # the post-read context through a parent-visible holder
+                    # before the cancellation destroys the child context.
+                    cancelled_context[:] = [manager.current_context()]
+                    raise
+                except BaseException as exc:
+                    # ``asyncio.wait_for`` may execute the tool in a child
+                    # Task, whose ContextVar mutations do not flow back to the
+                    # caller. Return the trusted post-call context alongside
+                    # both successful and failed outcomes.
+                    returned_context = manager.current_context()
+                    cancelled_context[:] = [returned_context]
+                    return False, exc, returned_context
+
             if self.policy.timeout_s is None or not self.enforce_timeout:
-                raw_result = await self.execute(args, ctx)
+                executed = await execute_with_flow()
             else:
-                raw_result = await asyncio.wait_for(self.execute(args, ctx), timeout=self.policy.timeout_s)
+                executed = await asyncio.wait_for(
+                    execute_with_flow(), timeout=self.policy.timeout_s
+                )
+            if manager is None:
+                raw_result = executed
+            else:
+                succeeded, raw_result, returned_context = executed
+                manager.observe_ingress(returned_context)
+                if not succeeded:
+                    ctx.metadata["_agent_libos_returned_data_flow_context"] = (
+                        returned_context.to_dict()
+                    )
+                    attach_wait_data_flow_context(raw_result, returned_context)
+                    raise raw_result
             result = self._normalize_result(raw_result)
+            if manager is not None:
+                result.metadata.setdefault(
+                    "data_flow_context", returned_context.to_dict()
+                )
             result.metadata.update(self._base_metadata(ctx, started_at))
             return result
         except asyncio.TimeoutError:
+            if manager is not None and cancelled_context:
+                returned_context = cancelled_context[-1]
+                manager.observe_ingress(returned_context)
+                ctx.metadata["_agent_libos_returned_data_flow_context"] = (
+                    returned_context.to_dict()
+                )
             return ToolResult.failure(
                 code=ToolErrorCode.TIMEOUT,
                 message=f"Tool `{self.name}` timed out.",
@@ -215,7 +310,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
             return ToolResult.failure(
                 code=ToolErrorCode.VALIDATION_ERROR,
                 message=f"Invalid output for tool `{self.name}`.",
-                details={"errors": exc.errors()},
+                details={"errors": exc.errors(include_input=False)},
                 metadata=self._base_metadata(ctx, started_at),
             )
         except ToolExecutionError as exc:
@@ -336,13 +431,19 @@ class BaseAgentTool(ABC, Generic[InputT]):
             raise TypeError("`output_schema` must be a Pydantic BaseModel subclass.")
 
     def _base_metadata(self, ctx: ToolContext, started_at: float) -> dict[str, Any]:
-        return {
+        metadata = {
             "tool_name": self.name,
             "tool_version": self.version,
             "trace_id": ctx.trace_id,
             "call_id": ctx.call_id,
             "duration_ms": round((time.perf_counter() - started_at) * 1000, 3),
         }
+        returned_context = ctx.metadata.get(
+            "_agent_libos_returned_data_flow_context"
+        )
+        if isinstance(returned_context, dict):
+            metadata["data_flow_context"] = returned_context
+        return metadata
 
     @abstractmethod
     async def execute(self, args: InputT, ctx: ToolContext) -> Any:
@@ -357,7 +458,47 @@ class SyncAgentTool(BaseAgentTool[InputT], ABC):
     enforce_timeout: ClassVar[bool] = False
 
     async def execute(self, args: InputT, ctx: ToolContext) -> Any:
-        return await asyncio.to_thread(self.run, args, ctx)
+        runtime = ctx.runtime
+        manager = getattr(runtime, "data_flow", None) if runtime is not None else None
+        if manager is None:
+            return await asyncio.to_thread(self.run, args, ctx)
+
+        # ``asyncio.to_thread`` copies ContextVars into the worker but does not
+        # copy mutations back into the event-loop task.  Return the trusted
+        # post-call flow explicitly so ToolBroker can label the result Object
+        # with every source observed by synchronous primitives.
+        def run_with_flow() -> tuple[bool, Any, Any]:
+            try:
+                return True, self.run(args, ctx), manager.current_context()
+            except BaseException as exc:
+                # Exceptions are part of the tool output surface too. Capture
+                # the worker's post-call ContextVar before it is discarded so
+                # an error derived from a labeled source cannot become an
+                # unlabeled model-visible result.
+                return False, exc, manager.current_context()
+
+        succeeded, raw_result, returned_context = await asyncio.to_thread(run_with_flow)
+        returned_context = _merge_result_data_flow_context(
+            raw_result,
+            returned_context,
+        )
+        if not succeeded:
+            manager.observe_ingress(returned_context)
+            ctx.metadata["_agent_libos_returned_data_flow_context"] = (
+                returned_context.to_dict()
+            )
+            attach_wait_data_flow_context(raw_result, returned_context)
+            raise raw_result
+        # Merge the worker context before output validation. Pydantic failures
+        # are model-visible tool results too and must retain every source the
+        # synchronous implementation observed.
+        manager.observe_ingress(returned_context)
+        ctx.metadata["_agent_libos_returned_data_flow_context"] = (
+            returned_context.to_dict()
+        )
+        result = self._normalize_result(raw_result)
+        result.metadata["data_flow_context"] = returned_context.to_dict()
+        return result
 
     @abstractmethod
     def run(self, args: InputT, ctx: ToolContext) -> Any:

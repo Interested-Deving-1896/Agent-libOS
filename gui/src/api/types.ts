@@ -61,16 +61,43 @@ export type ProcessMessage = {
   payload: Record<string, unknown>;
 };
 
+export type HumanRequestPayload = Record<string, unknown> & {
+  type?: string;
+  question?: string;
+  reason?: string;
+  context?: Record<string, unknown>;
+  release_required?: boolean;
+  release_request_id?: string | null;
+};
+
+export type DataReleaseApprovalContext = Record<string, unknown> & {
+  sink: string;
+  sensitivity: string;
+  tenant: string | null;
+  principal: string | null;
+  payload_bytes: number;
+  payload_sha256: string;
+  source_count: number;
+  operation: string;
+};
+
+export type DataReleaseApprovalPayload = HumanRequestPayload & {
+  type: "data_release_approval";
+  context: DataReleaseApprovalContext;
+};
+
 export type HumanRequest = {
   request_id: string;
   pid: string;
   human: string;
-  payload: Record<string, unknown>;
+  payload: HumanRequestPayload;
   status: string;
   decision: Record<string, unknown> | null;
   blocking: boolean;
   created_at: string;
   updated_at: string;
+  release_request_id?: string;
+  release_for_request_id?: string;
 };
 
 export type HumanPermissionPolicy = "always_allow" | "ask_each_time" | "always_deny";

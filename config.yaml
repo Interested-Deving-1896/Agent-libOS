@@ -5,4 +5,9 @@ modules:
   manifest_paths:
     - modules/pty/module.yaml
   trusted_modules:
-    - agent-libos-pty:v0:2f2302b698a8e6544df63cc0f19b021913fe00bb2e5b1f195243531404e659c1:a00d49e37c13600c3f1d09abede2bc306a815335f90141b7d8541990cf9af666
+    - agent-libos-pty:v0:0bc16f2f506bae6c323051c2e88e0f701402653f9745787e77d66d0c60968fa4:e7c011b933bb48930be7e69b7a163c3021d2aca763b9bc0b30c151c2245e4b1e
+
+data_flow:
+  default_trust_level: untrusted
+  default_max_sensitivity: normal
+  sink_rules: []

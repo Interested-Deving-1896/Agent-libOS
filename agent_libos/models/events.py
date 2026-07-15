@@ -49,6 +49,9 @@ class EventType(StrEnum):
     HUMAN_OUTPUT = "human_output"
     RESOURCE_CHARGED = "resource_charged"
     RESOURCE_LIMIT_EXCEEDED = "resource_limit_exceeded"
+    SINK_TRUST_REGISTERED = "sink_trust_registered"
+    SINK_TRUST_UNREGISTERED = "sink_trust_unregistered"
+    DATA_FLOW_DECISION = "data_flow_decision"
 
 
 class EventPriority(StrEnum):

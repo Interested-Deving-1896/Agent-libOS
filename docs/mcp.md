@@ -103,6 +103,36 @@ validation has passed.
 Tool visibility is not authority. Default images can see the MCP tools, but a
 process cannot call a registered MCP tool without the matching capability.
 
+## Data-flow Sink
+
+Tool arguments are egress to `mcp:<server_id>:<tool_id>`. The Sink identity hash
+covers the complete server/transport manifest and selected tool manifest, so a
+command, URL, header/env mapping, cwd, tool name/schema, limit, or effect-policy
+change invalidates prior high-sensitivity trust. The early tool-capability
+visibility gate still runs before server metadata lookup; after lookup,
+clearance is enforced before argument-schema validation that could otherwise
+start a stdio provider, runtime env resolution, live validation, DNS, stdio
+spawn, or `call_tool`.
+
+Cached `list_tools(refresh=false)` reads registered metadata only and is treated
+as public. A process-initiated live refresh is a bidirectional protected
+provider operation with Sink `mcp:<server_id>:list_tools`: the caller's current
+flow context is checked before DNS/stdio/provider dispatch, and live metadata
+or an after-dispatch provider error is aggregated back as `normal/untrusted`
+ingress. A provider-certified not-started failure adds no ingress. A
+Host-internal refresh with no process actor uses a public/verified request
+context. A trusted MCP Sink does not grant the MCP tool right, `process:spawn`, exact
+`mcp_stdio:<hash>` execute authority, effect permission, or budget. Conditional
+release is exact and one-shot; untrusted MCP cannot send above `normal`.
+
+For stdio, Host trust means the executable is an approved recipient of the
+arguments. Agent libOS supervises the registered process lifecycle but does not
+claim OS-level control over other file/network I/O performed by that program.
+For an executable resolved inside the mutable workspace, both live validation
+and tool dispatch run a private Host-owned content snapshot rather than
+reopening the authorized path after the final identity check.
+See [Data Flow](data_flow.md).
+
 ## Security Rules
 
 Only manifest-declared tools may be called. Argument schema failures, missing
@@ -168,6 +198,10 @@ not-started, the validation already flowed server metadata: the intent is finali
 
 Checkpoint reports and benchmark evidence include both finalized and still
 pending MCP effects. v1 does not compensate remote MCP state.
+
+Call-effect metadata includes the data-flow decision, trust generation/hash,
+label/source hashes, and exact Object source refs without persisting the raw
+arguments as data-flow evidence.
 
 ## CLI
 

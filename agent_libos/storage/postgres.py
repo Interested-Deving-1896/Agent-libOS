@@ -42,13 +42,15 @@ class _PostgresDialect:
             re.search(r"\bINSERT\s+OR\s+REPLACE\s+INTO\s+skill_trust\b", sql, re.IGNORECASE)
         )
         transformed = sql
+        # SQLite's default/BINARY path ordering and PostgreSQL's database
+        # locale can disagree. Shared prefix-range queries and their indexes use
+        # an explicit bytewise collation on both backends.
+        transformed = transformed.replace("COLLATE BINARY", 'COLLATE "C"')
         transformed = transformed.replace("INSERT OR IGNORE INTO", "INSERT INTO")
         transformed = transformed.replace(
             "INSERT OR REPLACE INTO skill_trust",
             "INSERT INTO skill_trust",
         )
-        transformed = transformed.replace("rowid AS _audit_rowid", "record_id AS _audit_rowid")
-        transformed = re.sub(r"\browid\b", "record_id", transformed)
         transformed = _prepare_parameterized_sql(transformed) if with_params else transformed.replace("?", "%s")
         if was_insert_or_ignore_namespace and "ON CONFLICT" not in transformed:
             transformed = f"{transformed.rstrip()} ON CONFLICT (namespace) DO NOTHING"

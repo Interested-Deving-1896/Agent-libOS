@@ -18,7 +18,7 @@ A manifest records:
   deterministic SHA-256 hash;
 - authorized and image-required capability specs;
 - permitted provider effect classes;
-- resource budget, approval policy, and observe-only data-flow policy;
+- resource budget, approval policy, and process receive-domain data-flow policy;
 - operator metadata that does not contain task payloads or credentials.
 
 Root launch compiles only the authorized capability specs. Child launch uses
@@ -86,3 +86,33 @@ authority, unmet image requirements, effect ceiling, budget, and policies.
 The manifest is not a substitute for primitive capability checks. Tool
 projection, Skills, image metadata, and requirement declarations remain
 visibility or planning inputs only.
+
+## Data identity domain
+
+`data_flow_policy` has one strict v1 shape:
+
+```json
+{
+  "schema_version": 1,
+  "allowed_tenants": ["tenant-a"],
+  "allowed_principals": ["analyst-a"]
+}
+```
+
+Unknown keys, unsupported versions, wildcard/`mixed` entries, malformed
+identities, and non-list fields fail closed. A child/fork manifest inherits the
+parent sets when omitted and may only keep or remove entries. Empty sets allow
+only data without a tenant/principal.
+
+This policy controls what identity domain a process may receive through a
+goal, message, result, Object Task notification, memory merge, fork, or exec.
+Those boundaries preserve the source labels; observing a labeled message also
+creates a metadata-only process carrier so later text goals or replies inherit
+the same label.
+
+It is deliberately not an external Sink allowlist or trust root. A manifest
+cannot mark `llm:*`, `jsonrpc:*`, a file, executable, or Human recipient as
+trusted, cannot lower a Host Sink clearance, and does not need to repeat a
+trusted Sink pattern. External transmission is governed by the independent
+Host registry described in [Data Flow](data_flow.md), followed by ordinary
+capability, `permitted_effects`, approval, and budget checks.

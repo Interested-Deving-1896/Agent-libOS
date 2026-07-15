@@ -1694,6 +1694,12 @@ class TestObjectMemoryName:
                 old_row = reopened.store.select_table_rows('objects', 'oid = ?', (old.oid,))[0]
                 assert old_row['lifecycle_state'] == 'released'
                 assert old_row['deleted_at'] is not None
+                assert json.loads(old_row['payload_json']) == {
+                    'storage': 'runtime_memory',
+                    'present': False,
+                    'recovered_after_reopen': True,
+                }
+                assert reopened.store.is_recovered_object_payload(old.oid)
 
                 replacement = reopened.memory.create_object(
                     pid=pid,

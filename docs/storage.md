@@ -13,10 +13,87 @@ persist bounded payload snapshots. A live marker that cannot be reconstructed
 on reopen is released fail-closed rather than interpreted as user data.
 
 LLM call records, pending-action generations, context-generation markers, and
-eligible full-I/O Responses tool outputs are durable SQL metadata. Provider-side
-response state is not in this database; the runtime continues an opt-in chain
-only after validating these local rows against the current profile, scope, and
-credential-keyed non-secret provider identity fingerprint.
+eligible Responses tool outputs are durable SQL records. By default,
+`llm.persist_full_io=true` retains complete prompts, visible tools, outputs,
+tool calls, reasoning, raw provider payloads, and complete conditional-release
+prepared requests. With `persist_full_io=false`, sensitive fields are replaced
+by bounded previews, hashes, and resume metadata; an approved conditional
+release can resume only while its hash-bound request remains in the same
+executor's memory, and loss of that request fails closed before provider
+dispatch. Provider-side response state is not in this database; the runtime
+continues an opt-in chain only after validating these local rows against the
+current profile, scope, and credential-keyed non-secret provider identity
+fingerprint plus the current Sink/trust generation, clearance domain, Task
+Authority manifest, and context epoch. Durable pending LLM actions also store
+their metadata-only `DataFlowContext` so Human/message/child resume cannot lose
+source labels.
+`llm_context_generations` additionally stores a versioned, metadata-only label
+high-water mark. Context preparation and compaction merge that row
+monotonically before publishing a runtime-only context update, while
+`LLMContextMemory.ensure()` seeds any replacement Object from it. During
+upgrade/reopen, startup recovers a missing watermark from LIVE or RELEASED
+process-state metadata before runtime-only payload recovery discards its
+payload. It recognizes current and historical context-name prefixes as well as
+durable `llm_context`/`prompt_cache` tags. SQLite and PostgreSQL use the same
+validation and merge implementation.
+
+Legacy pending-action and process-message carriers are canonicalized in
+bounded, resumable migrations recorded in `storage_migrations`. Each migration
+commits its cursor with the corresponding batch; a completed migration marker
+skips rescanning historical rows on later opens. A marker version newer than
+the running binary is rejected instead of rewriting future-format data.
+A syntactically valid minimal
+`DataFlowContext` is expanded to canonical defaults without changing its wait
+state. Missing, partial, malformed, or otherwise invalid active pending context
+is replaced with conservative secret/untrusted labels and marked for terminal
+reconciliation; completed history receives only the conservative carrier.
+Legacy message metadata is likewise canonicalized, preserving unrelated
+fields, while incomplete labels discard an untrusted carrier id and become
+conservative before delivery. Historical released-result Object metadata uses
+a compatibility decoder: unknown ordered labels become
+secret/untrusted/untrusted and invalid identity fields are reduced
+conservatively, while structurally corrupt metadata still fails as a storage
+validation error.
+
+After Human, ObjectTask, Object Memory, and process callbacks are bound,
+startup claims every invalidated pending action through a durable
+invalidated/reconciling/reconciled state machine. For a non-terminal migrated
+process, the in-store FAILED transition, reservation release, parent wakeup,
+event, and audit commit together. An already-terminal row keeps its historical
+status and result and completes only the missing budget/manager/finalizer
+cleanup. Human/ObjectTask cancellation and the normal Object/Host terminal
+finalizers run outside that transaction, preserving the result Object and
+mergeable child memory until the parent adopts or discards it. A crash or
+cleanup failure leaves `reconciling` so a later open retries cleanup without
+replaying an exit event. One process failure does not prevent later migration
+candidates from being attempted, although the open still reports the aggregated
+error and fails closed.
+
+Data-flow persistence uses the same SQLite/PostgreSQL repository contract:
+
+- `sink_trust_registry` stores the active global generation;
+- `sink_trust_records` retains versioned active/inactive rules and deterministic
+  hashes;
+- `data_flow_decisions` is append-only runtime evidence containing Sink,
+  labels/source refs and hashes, outcome, reason, trust hash, and generation,
+  never payload;
+- `file_label_bindings` retains canonical path generations, content hash,
+  labels, source refs, and tombstones;
+- exact release bindings live in ordinary capability constraints and are
+  abandoned/revoked with the normal finite-use lifecycle.
+
+Current subtree label reads use an indexed, bytewise-collated prefix range and
+bounded keyset batches on both backends; wildcard characters in path names do
+not widen the tree. GUI snapshot event/audit reads similarly persist and index
+a derived presentation-visibility flag, filter it before `LIMIT`, and backfill
+legacy null flags in resumable batches. These derived flags affect bounded GUI
+windows only, not the append-only evidence ledgers.
+
+Registry replacement, generation advance, event, and audit publish in one
+transaction. A data-flow decision, its event, and audit record likewise commit
+together. The protected-operation prepare transaction rechecks generation and
+source versions before reserving ordinary/release uses and inserting the
+external-effect intent.
 
 Explainable Operations adds three additive metadata tables shared by SQLite and
 PostgreSQL: `operations`, deduplicated `operation_evidence`, and
@@ -45,6 +122,11 @@ intent abandonment share one transaction.
 from the complete callable image tool table. External effects have a unique
 partial index on `(pid, idempotency_key)`. All fields are additive in the shared
 SQLite/PostgreSQL schema contract.
+
+These rows are append-only/versioned through runtime APIs, not cryptographically
+tamper-proof. A database administrator can alter labels, trust, decisions, or
+capabilities and is part of the Host trust boundary. Independent evidence
+integrity requires external signed/append-only storage or attestation.
 
 ## Transaction Failure Semantics
 
@@ -129,6 +211,10 @@ lease because each connection is a distinct store.
   `flock`.
 - PostgreSQL credentials belong in environment-specific configuration. Lease
   diagnostics identify only the database/schema pair, not the DSN secret.
+- Do not edit Sink trust, release, file-label, or decision rows directly. A
+  supported registry mutation must advance generation and emit its coupled
+  audit/event evidence; stale releases and provider chains depend on that
+  generation.
 
 See [CLI Reference](cli.md) for backend selection and
 [Architecture](architecture.md) for the boundary between durable metadata,

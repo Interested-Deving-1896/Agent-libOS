@@ -12,6 +12,7 @@ from typing import Any, TYPE_CHECKING
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import (
     HumanApprovalRequired,
+    NotFound,
     ProcessMessageWaitRequired,
     ProcessWaitRequired,
     ResourceLimitExceeded,
@@ -26,7 +27,12 @@ from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.models import (
+    DataFlowContext,
+    DataSink,
     EventType,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     HumanRequestStatus,
     LLMCallRecord,
     ObjectHandle,
@@ -36,9 +42,35 @@ from agent_libos.models import (
     ResourceUsage,
     ViewMode,
 )
+from agent_libos.sdk import (
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
+)
+from agent_libos.substrate import ProviderEffectNotStarted
 
 if TYPE_CHECKING:
     from agent_libos.runtime.runtime import Runtime
+
+
+class _LLMProviderChainScopeChanged(ProviderEffectNotStarted):
+    """The selected provider-side state no longer matches the dispatch scope."""
+
+
+class _LLMReleaseApprovalRequired(HumanApprovalRequired):
+    """A conditional LLM request whose exact prepared payload must be resumed."""
+
+    def __init__(
+        self,
+        original: HumanApprovalRequired,
+        prepared_request: dict[str, Any],
+    ) -> None:
+        super().__init__(original.request_id, str(original))
+        self.prepared_request = prepared_request
+
+
+class _LLMReleasePayloadUnavailable(RuntimeError):
+    """An opt-out release cannot be resumed after its in-memory payload is lost."""
 
 
 class LLMProcessExecutor:
@@ -53,6 +85,7 @@ class LLMProcessExecutor:
         # not received a tool result yet. The action is retried after the human
         # queue records a decision, without asking the model for a new action.
         self._pending_human_actions: dict[str, dict[str, Any]] = {}
+        self._pending_llm_release_actions: dict[str, dict[str, Any]] = {}
         self._pending_wait_actions: dict[str, dict[str, Any]] = {}
         self._pending_message_actions: dict[str, dict[str, Any]] = {}
         self.context_memory = LLMContextMemory(runtime)
@@ -119,6 +152,11 @@ class LLMProcessExecutor:
         if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
             return {"ok": False, "skipped": True, "status": process.status.value}
         durable_pending = self._synchronize_pending_action(pid)
+        if pid in self._pending_llm_release_actions:
+            return await self._resume_pending_action_fail_closed(
+                pid,
+                self._resume_pending_llm_release_action,
+            )
         if pid in self._pending_human_actions:
             return await self._resume_pending_action_fail_closed(pid, self._resume_pending_human_action)
         if pid in self._pending_wait_actions:
@@ -200,6 +238,7 @@ class LLMProcessExecutor:
                 decision={"error": str(exc)},
             )
             return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
+        flow_context = self.runtime.data_flow.context_from_materialization(pid, context)
         if events:
             current = self.runtime.process.get(pid)
             if current.event_cursor != events[-1].event_id:
@@ -228,6 +267,7 @@ class LLMProcessExecutor:
             input_refs=context.object_refs,
             decision={"messages": len(messages), "policy": image.context_policy},
         )
+        flow_token = self.runtime.data_flow.push(flow_context)
         try:
             openai_tools = self.runtime.tools.openai_tool_schemas(pid)
             response_scope_fingerprint = self._responses_state_scope_fingerprint(
@@ -242,54 +282,14 @@ class LLMProcessExecutor:
                 openai_tools,
                 response_scope_fingerprint=response_scope_fingerprint,
             )
-            action = actions[-1]
-            if parallel_tool_calls and len(actions) > 1:
-                return await self._dispatch_action_batch(
-                    pid=pid,
-                    completion=completion,
-                    actions=actions,
-                )
-            tool_call_context = self._selected_completion_tool_call_context(completion)
-            try:
-                result = await self.adispatch(pid, action)
-            except HumanApprovalRequired as exc:
-                return self._wait_for_human_action(
-                    pid=pid,
-                    action=action,
-                    request_id=exc.request_id,
-                    message=str(exc),
-                    content_preview=completion.content[: self.config.llm.content_preview_chars],
-                    tool_call_count=len(completion.tool_calls),
-                    **tool_call_context,
-                )
-            except ProcessWaitRequired as exc:
-                return self._wait_for_child_action(
-                    pid=pid,
-                    action=exc.resume_action or action,
-                    child_pid=exc.child_pid,
-                    message=str(exc),
-                    content_preview=completion.content[: self.config.llm.content_preview_chars],
-                    tool_call_count=len(completion.tool_calls),
-                    **tool_call_context,
-                )
-            except ProcessMessageWaitRequired as exc:
-                return self._wait_for_message_action(
-                    pid=pid,
-                    action=action,
-                    filters=exc.filters,
-                    message=str(exc),
-                    content_preview=completion.content[: self.config.llm.content_preview_chars],
-                    tool_call_count=len(completion.tool_calls),
-                    **tool_call_context,
-                )
-            self._persist_response_tool_output(pid=pid, result=result, **tool_call_context)
-            return self._completed_action_result(
+            return await self._dispatch_completed_llm_action(
                 pid=pid,
-                action=action,
-                result=result,
-                content_preview=completion.content[: self.config.llm.content_preview_chars],
-                tool_call_count=len(completion.tool_calls),
+                completion=completion,
+                actions=actions,
+                parallel_tool_calls=parallel_tool_calls,
             )
+        except _LLMReleaseApprovalRequired as exc:
+            return self._wait_for_llm_release(pid, exc)
         except HumanApprovalRequired as exc:
             self.runtime.audit.record(
                 actor=pid,
@@ -332,6 +332,8 @@ class LLMProcessExecutor:
                 decision={"error": str(exc)},
             )
             return {"ok": False, "error": str(exc)}
+        finally:
+            self.runtime.data_flow.reset(flow_token)
 
     def _completed_action_result(
         self,
@@ -362,6 +364,71 @@ class LLMProcessExecutor:
         if resumed_after_message:
             payload["resumed_after_message"] = True
         return payload
+
+    async def _dispatch_completed_llm_action(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+        actions: list[dict[str, Any]],
+        parallel_tool_calls: bool,
+        resumed_after_human: bool = False,
+    ) -> dict[str, Any]:
+        if parallel_tool_calls and len(actions) > 1:
+            return await self._dispatch_action_batch(
+                pid=pid,
+                completion=completion,
+                actions=actions,
+            )
+        action = actions[-1]
+        tool_call_context = self._selected_completion_tool_call_context(completion)
+        content_preview = str(completion.content)[: self.config.llm.content_preview_chars]
+        tool_call_count = len(completion.tool_calls)
+        try:
+            result = await self.adispatch(pid, action)
+        except HumanApprovalRequired as exc:
+            return self._wait_for_human_action(
+                pid=pid,
+                action=action,
+                request_id=exc.request_id,
+                message=str(exc),
+                content_preview=content_preview,
+                tool_call_count=tool_call_count,
+                **tool_call_context,
+            )
+        except ProcessWaitRequired as exc:
+            return self._wait_for_child_action(
+                pid=pid,
+                action=exc.resume_action or action,
+                child_pid=exc.child_pid,
+                message=str(exc),
+                content_preview=content_preview,
+                tool_call_count=tool_call_count,
+                **tool_call_context,
+            )
+        except ProcessMessageWaitRequired as exc:
+            return self._wait_for_message_action(
+                pid=pid,
+                action=action,
+                filters=exc.filters,
+                message=str(exc),
+                content_preview=content_preview,
+                tool_call_count=tool_call_count,
+                **tool_call_context,
+            )
+        self._persist_response_tool_output(
+            pid=pid,
+            result=result,
+            **tool_call_context,
+        )
+        return self._completed_action_result(
+            pid=pid,
+            action=action,
+            result=result,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+            resumed_after_human=resumed_after_human,
+        )
 
     async def _dispatch_action_batch(
         self,
@@ -615,6 +682,141 @@ class LLMProcessExecutor:
         )
         return {"ok": False, "waiting_human": True, "request_id": request_id}
 
+    def _wait_for_llm_release(
+        self,
+        pid: str,
+        exc: _LLMReleaseApprovalRequired,
+    ) -> dict[str, Any]:
+        prepared = dict(exc.prepared_request)
+        durable_action = (
+            prepared
+            if self.config.llm.persist_full_io
+            else self._redacted_llm_release_action(prepared)
+        )
+        resume_token = self._persist_pending_action(
+            pid,
+            wait_type="llm_release",
+            request_id=exc.request_id,
+            action=durable_action,
+            content_preview="",
+            tool_call_count=0,
+        )
+        operation_context = self.runtime.store.get_llm_pending_action(pid) or {}
+        self._pending_llm_release_actions[pid] = {
+            "request_id": exc.request_id,
+            "resume_token": resume_token,
+            "llm_operation_id": operation_context.get("llm_operation_id"),
+            "tool_operation_id": operation_context.get("tool_operation_id"),
+            "action": prepared,
+            "data_flow_context": dict(
+                operation_context.get("data_flow_context") or {}
+            ),
+        }
+        self.runtime.audit.record(
+            actor=pid,
+            action="llm.release_waiting_human",
+            target=f"human_request:{exc.request_id}",
+            decision={
+                "request_id": exc.request_id,
+                "profile_id": prepared.get("profile_id"),
+                "payload_sha256": dict(prepared.get("canonical_args") or {}).get(
+                    "payload_sha256"
+                ),
+                "attempt": prepared.get("attempt"),
+            },
+        )
+        return {
+            "ok": False,
+            "waiting_human": True,
+            "request_id": exc.request_id,
+        }
+
+    @classmethod
+    def _redacted_llm_release_action(
+        cls,
+        prepared: dict[str, Any],
+    ) -> dict[str, Any]:
+        canonical_args = dict(prepared.get("canonical_args") or {})
+        return {
+            "kind": "llm_release_request_redacted",
+            "schema_version": 1,
+            "pid": prepared.get("pid"),
+            "call_id": prepared.get("call_id"),
+            "profile_id": prepared.get("profile_id"),
+            "payload_sha256": canonical_args.get("payload_sha256"),
+            "prepared_request_sha256": cls._prepared_llm_release_sha256(prepared),
+            "attempt": prepared.get("attempt"),
+            "payload_retained": False,
+        }
+
+    @staticmethod
+    def _prepared_llm_release_sha256(prepared: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            dumps(to_jsonable(prepared)).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _resolve_pending_llm_release_payload(
+        cls,
+        *,
+        in_memory_action: dict[str, Any],
+        durable_action: dict[str, Any],
+    ) -> dict[str, Any]:
+        durable_kind = str(durable_action.get("kind") or "")
+        if durable_kind == "llm_release_request":
+            return durable_action
+        if durable_kind != "llm_release_request_redacted":
+            raise RuntimeError("durable pending LLM release has an invalid payload kind")
+        if durable_action.get("schema_version") != 1:
+            raise RuntimeError(
+                "durable pending LLM release has an unsupported redacted schema"
+            )
+
+        expected_sha256 = str(
+            durable_action.get("prepared_request_sha256") or ""
+        )
+        if len(expected_sha256) != 64:
+            raise RuntimeError(
+                "durable pending LLM release is missing its prepared-request hash"
+            )
+        if str(in_memory_action.get("kind") or "") != "llm_release_request":
+            raise _LLMReleasePayloadUnavailable(
+                "prepared LLM release payload is unavailable because full-I/O "
+                "retention was disabled and the exact in-memory request was lost"
+            )
+        actual_sha256 = cls._prepared_llm_release_sha256(in_memory_action)
+        if not hmac.compare_digest(actual_sha256, expected_sha256):
+            raise RuntimeError(
+                "in-memory prepared LLM release does not match its durable hash"
+            )
+        return in_memory_action
+
+    def _record_llm_release_payload_unavailable(
+        self,
+        *,
+        pid: str,
+        request_id: str,
+        claimed: dict[str, Any],
+        error: RuntimeError,
+    ) -> None:
+        durable_action = dict(claimed.get("action") or {})
+        self.runtime.audit.record(
+            actor="llm.executor",
+            action="llm.release_resume_payload_unavailable",
+            target=f"human_request:{request_id}",
+            decision={
+                "request_id": request_id,
+                "profile_id": durable_action.get("profile_id"),
+                "payload_sha256": durable_action.get("payload_sha256"),
+                "prepared_request_sha256": durable_action.get(
+                    "prepared_request_sha256"
+                ),
+                "error_type": type(error).__name__,
+                "persist_full_io": self.config.llm.persist_full_io,
+                "replayed": False,
+            },
+        )
+
     def _wait_for_child_action(
         self,
         pid: str,
@@ -735,14 +937,16 @@ class LLMProcessExecutor:
             # to this single tool call, so concurrent tool calls cannot observe
             # another process' human decision.
             try:
-                result = await self.adispatch(
-                    pid,
-                    action,
-                    context_metadata={
-                        "human_resume_request_id": request_id,
-                        "operation_id": pending.get("tool_operation_id"),
-                    },
-                )
+                with self.runtime.data_flow.recovered_source_snapshot_access():
+                    result = await self.adispatch(
+                        pid,
+                        action,
+                        context_metadata={
+                            **self._pending_data_flow_metadata(pending),
+                            "human_resume_request_id": request_id,
+                            "operation_id": pending.get("tool_operation_id"),
+                        },
+                    )
             except HumanApprovalRequired as exc:
                 return self._wait_for_human_action(
                     pid=pid,
@@ -807,6 +1011,143 @@ class LLMProcessExecutor:
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_human=True,
         )
+
+    async def _resume_pending_llm_release_action(self, pid: str) -> dict[str, Any]:
+        pending = self._pending_llm_release_actions[pid]
+        resume_token = self._pending_resume_token(pending)
+        request_id = str(pending["request_id"])
+        request = self.runtime.human.get(request_id)
+        if request.status == HumanRequestStatus.PENDING:
+            durable = self.runtime.store.get_llm_pending_action(pid) or {}
+            try:
+                self._resolve_pending_llm_release_payload(
+                    in_memory_action=dict(pending.get("action") or {}),
+                    durable_action=dict(durable.get("action") or {}),
+                )
+            except RuntimeError as error:
+                claimed = self.runtime.store.claim_llm_pending_action(
+                    pid,
+                    resume_token=resume_token,
+                )
+                if claimed is None:
+                    self._forget_pending_generation(
+                        self._pending_llm_release_actions,
+                        pid,
+                        resume_token,
+                    )
+                    return self._pending_action_resuming_result(pid)
+                self._forget_pending_generation(
+                    self._pending_llm_release_actions,
+                    pid,
+                    resume_token,
+                )
+                self._record_llm_release_payload_unavailable(
+                    pid=pid,
+                    request_id=request_id,
+                    claimed=claimed,
+                    error=error,
+                )
+                raise
+            return {"ok": False, "waiting_human": True, "request_id": request_id}
+
+        claimed = self.runtime.store.claim_llm_pending_action(
+            pid,
+            resume_token=resume_token,
+        )
+        if claimed is None:
+            self._forget_pending_generation(
+                self._pending_llm_release_actions,
+                pid,
+                resume_token,
+            )
+            return self._pending_action_resuming_result(pid)
+        self._forget_pending_generation(
+            self._pending_llm_release_actions,
+            pid,
+            resume_token,
+        )
+
+        if request.status != HumanRequestStatus.APPROVED:
+            durable_action = dict(claimed.get("action") or {})
+            self.runtime.audit.record(
+                actor=pid,
+                action="llm.release_rejected",
+                target=f"human_request:{request_id}",
+                decision={
+                    "request_id": request_id,
+                    "profile_id": durable_action.get("profile_id"),
+                    "payload_sha256": (
+                        durable_action.get("payload_sha256")
+                        or dict(durable_action.get("canonical_args") or {}).get(
+                            "payload_sha256"
+                        )
+                    ),
+                },
+            )
+            self._clear_pending_action(pid, self._pending_resume_token(claimed))
+            # A rejected conditional release is a terminal decision for this
+            # exact model request.  Leaving the process runnable would rebuild
+            # the same prompt on the next quantum and immediately ask for a
+            # replacement release approval.  Pause after persisting the
+            # structured rejection so an explicit Host resume is required to
+            # start a genuinely new model turn.
+            self.runtime.process.pause_for_host_resume(
+                pid,
+                f"LLM data release rejected: {request_id}",
+            )
+            return {
+                "ok": False,
+                "llm_release_rejected": True,
+                "request_id": request_id,
+            }
+
+        try:
+            prepared = self._resolve_pending_llm_release_payload(
+                in_memory_action=dict(pending.get("action") or {}),
+                durable_action=dict(claimed.get("action") or {}),
+            )
+        except RuntimeError as error:
+            self._record_llm_release_payload_unavailable(
+                pid=pid,
+                request_id=request_id,
+                claimed=claimed,
+                error=error,
+            )
+            raise
+
+        try:
+            flow_context = DataFlowContext.from_dict(
+                dict(claimed.get("data_flow_context") or {})
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("durable LLM release has invalid data-flow context") from exc
+        flow_token = self.runtime.data_flow.push(flow_context)
+        try:
+            try:
+                completion, actions, parallel_tool_calls = await self._complete_valid_action(
+                    pid,
+                    list(prepared.get("base_messages") or []),
+                    list(prepared.get("tools") or []),
+                    max_attempts=int(prepared.get("max_attempts") or 0) or None,
+                    response_scope_fingerprint=(
+                        str(prepared["response_scope_fingerprint"])
+                        if prepared.get("response_scope_fingerprint") is not None
+                        else None
+                    ),
+                    _prepared_request=prepared,
+                )
+            except _LLMReleaseApprovalRequired as exc:
+                return self._wait_for_llm_release(pid, exc)
+            self._clear_pending_action(pid, self._pending_resume_token(claimed))
+            return await self._dispatch_completed_llm_action(
+                pid=pid,
+                completion=completion,
+                actions=actions,
+                parallel_tool_calls=parallel_tool_calls,
+                resumed_after_human=True,
+            )
+        finally:
+            self.runtime.data_flow.reset(flow_token)
 
     def _action_name(self, action: dict[str, Any]) -> str:
         return str(action.get("action") or action.get("tool") or action.get("name") or "")
@@ -1012,15 +1353,17 @@ class LLMProcessExecutor:
         action = dict(pending["action"])
         self._forget_pending_generation(self._pending_wait_actions, pid, resume_token)
         try:
-            result = await self.adispatch(
-                pid,
-                action,
-                context_metadata={
-                    "pending_child_resume": True,
-                    "pending_child_pid": child_pid,
-                    "operation_id": pending.get("tool_operation_id"),
-                },
-            )
+            with self.runtime.data_flow.recovered_source_snapshot_access():
+                result = await self.adispatch(
+                    pid,
+                    action,
+                    context_metadata={
+                        **self._pending_data_flow_metadata(pending),
+                        "pending_child_resume": True,
+                        "pending_child_pid": child_pid,
+                        "operation_id": pending.get("tool_operation_id"),
+                    },
+                )
         except ProcessWaitRequired as exc:
             return self._wait_for_child_action(
                 pid=pid,
@@ -1089,11 +1432,15 @@ class LLMProcessExecutor:
         action = dict(pending["action"])
         self._forget_pending_generation(self._pending_message_actions, pid, resume_token)
         try:
-            result = await self.adispatch(
-                pid,
-                action,
-                context_metadata={"operation_id": pending.get("tool_operation_id")},
-            )
+            with self.runtime.data_flow.recovered_source_snapshot_access():
+                result = await self.adispatch(
+                    pid,
+                    action,
+                    context_metadata={
+                        **self._pending_data_flow_metadata(pending),
+                        "operation_id": pending.get("tool_operation_id"),
+                    },
+                )
         except ProcessMessageWaitRequired as exc:
             return self._wait_for_message_action(
                 pid=pid,
@@ -1230,19 +1577,31 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         max_attempts: int | None = None,
         response_scope_fingerprint: str | None = None,
+        _prepared_request: dict[str, Any] | None = None,
     ) -> tuple[Any, list[dict[str, Any]], bool]:
-        attempt_messages = messages
+        attempt_messages = list(
+            (_prepared_request or {}).get("attempt_messages") or messages
+        )
         last_error: Exception | None = None
         selected_max_attempts = max_attempts or self.config.llm.action_repair_attempts
-        for attempt in range(selected_max_attempts):
-            completion, parallel_tool_calls, auto_wait_on_empty_tool_calls, profile_id = await self._complete_action_recorded(
-                pid=pid,
-                messages=attempt_messages,
-                tools=tools,
-                attempt=attempt + 1,
-                max_attempts=selected_max_attempts,
-                response_scope_fingerprint=response_scope_fingerprint,
-            )
+        start_attempt = int((_prepared_request or {}).get("attempt") or 1)
+        prepared_request = _prepared_request
+        for attempt_number in range(start_attempt, selected_max_attempts + 1):
+            try:
+                completion, parallel_tool_calls, auto_wait_on_empty_tool_calls, profile_id = await self._complete_action_recorded(
+                    pid=pid,
+                    messages=attempt_messages,
+                    tools=tools,
+                    attempt=attempt_number,
+                    max_attempts=selected_max_attempts,
+                    response_scope_fingerprint=response_scope_fingerprint,
+                    _prepared_request=prepared_request,
+                )
+            except _LLMReleaseApprovalRequired as exc:
+                exc.prepared_request["base_messages"] = list(messages)
+                exc.prepared_request["attempt_messages"] = list(attempt_messages)
+                raise
+            prepared_request = None
             try:
                 raw_actions, auto_wait_used = self._completion_to_actions(
                     completion.content,
@@ -1256,7 +1615,7 @@ class LLMProcessExecutor:
                         action="llm.empty_tool_calls_auto_wait",
                         target=f"process:{pid}",
                         decision={
-                            "attempt": attempt + 1,
+                            "attempt": attempt_number,
                             "llm_profile_id": profile_id,
                             "action": self._auto_wait_message_action(),
                             "content_preview": completion.content[: self.config.llm.content_preview_chars],
@@ -1279,14 +1638,14 @@ class LLMProcessExecutor:
                     action="llm.action_repair_requested",
                     target=f"process:{pid}",
                     decision={
-                        "attempt": attempt + 1,
+                        "attempt": attempt_number,
                         "error": str(exc),
                         "tool_call_count": len(completion.tool_calls),
                         "tool_calls_preview": self._tool_call_previews(completion.tool_calls),
                         "content_preview": completion.content[: self.config.llm.content_preview_chars],
                     },
                 )
-                if attempt + 1 >= selected_max_attempts:
+                if attempt_number >= selected_max_attempts:
                     break
                 attempt_messages = [
                     *messages,
@@ -1368,75 +1727,354 @@ class LLMProcessExecutor:
         attempt: int,
         max_attempts: int,
         response_scope_fingerprint: str | None = None,
+        _force_stateless: bool = False,
+        _chain_scope_retry: int = 0,
+        _prepared_request: dict[str, Any] | None = None,
     ) -> tuple[Any, bool, bool, str]:
-        call_id = new_id("llmcall")
         process = self.runtime.process.get(pid)
-        created_at = utc_now()
-        profile_id = process.llm_profile_id if process is not None else self.config.llm.default_profile_id
-        request_options = {
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "purpose": "action_selection",
-            "llm_profile_id": profile_id,
-        }
-        request_messages = messages
-        self._preflight_llm_call(pid)
-        try:
-            resolved = self.runtime.llms.resolve(profile_id)
-            client = resolved.client
-            provider_chain_fingerprint = self._openai_provider_chain_fingerprint(client)
-            previous_response_id, previous_tool_outputs = self._previous_response_state_for_state(
-                pid,
-                resolved.profile_id,
-                client,
-                response_scope_fingerprint=response_scope_fingerprint,
-                provider_chain_fingerprint=provider_chain_fingerprint,
+        if _prepared_request is None:
+            call_id = new_id("llmcall")
+            created_at = utc_now()
+            profile_id = (
+                process.llm_profile_id
+                if process is not None
+                else self.config.llm.default_profile_id
             )
-            request_messages = self._messages_with_tool_outputs(messages, previous_tool_outputs)
-            parallel_tool_calls = bool(resolved.parallel_tool_calls)
-            auto_wait_on_empty_tool_calls = bool(resolved.auto_wait_on_empty_tool_calls)
-            request_options.update(
+            request_options = {
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "purpose": "action_selection",
+                "llm_profile_id": profile_id,
+            }
+            request_messages = messages
+            flow_context = self.runtime.data_flow.current_context()
+        else:
+            if (
+                _prepared_request.get("kind") != "llm_release_request"
+                or int(_prepared_request.get("schema_version") or 0) != 1
+                or str(_prepared_request.get("pid") or "") != pid
+            ):
+                raise RuntimeError("invalid durable prepared LLM release request")
+            call_id = str(_prepared_request["call_id"])
+            created_at = str(_prepared_request["created_at"])
+            profile_id = str(_prepared_request["profile_id"])
+            request_options = dict(_prepared_request.get("request_options") or {})
+            request_messages = list(_prepared_request.get("request_messages") or [])
+            tools = list(_prepared_request.get("tools") or [])
+            flow_context = DataFlowContext.from_dict(
+                dict(_prepared_request.get("flow_context") or {})
+            )
+        try:
+            if _prepared_request is None:
+                profile_snapshot = self.runtime.llms.profile_snapshot(profile_id)
+                precheck_sink = DataSink(
+                    f"llm:{profile_id}",
+                    profile_snapshot.identity_sha256,
+                )
+                self.runtime.data_flow.precheck_egress_clearance(
+                    pid=pid,
+                    sink=precheck_sink,
+                    context=flow_context,
+                    payload={"messages": messages, "tools": tools, "profile_id": profile_id},
+                )
+                self._preflight_llm_call(pid)
+                resolved = self.runtime.llms.resolve(profile_id, snapshot=profile_snapshot)
+                client = resolved.client
+                sink = DataSink(f"llm:{resolved.profile_id}", resolved.identity_sha256)
+                if sink != precheck_sink:
+                    raise _LLMProviderChainScopeChanged(
+                        "LLM profile Sink changed after egress precheck"
+                    )
+                data_flow_chain_fingerprint = self._data_flow_provider_chain_fingerprint(
+                    pid=pid,
+                    sink=sink,
+                    context=flow_context,
+                )
+                source_refs_fingerprint = flow_context.source_refs_hash()
+                provider_chain_fingerprint = self._combined_provider_chain_fingerprint(
+                    client,
+                    data_flow_chain_fingerprint,
+                )
+                if _force_stateless:
+                    previous_response_id, previous_tool_outputs = None, []
+                else:
+                    previous_response_id, previous_tool_outputs = self._previous_response_state_for_state(
+                        pid,
+                        resolved.profile_id,
+                        client,
+                        response_scope_fingerprint=response_scope_fingerprint,
+                        provider_chain_fingerprint=provider_chain_fingerprint,
+                    )
+                request_messages = self._messages_with_tool_outputs(messages, previous_tool_outputs)
+                parallel_tool_calls = bool(resolved.parallel_tool_calls)
+                auto_wait_on_empty_tool_calls = bool(resolved.auto_wait_on_empty_tool_calls)
+                temperature = resolved.temperature
+                max_tokens = resolved.max_tokens
+                request_options.update(
+                    {
+                        "llm_profile_id": resolved.profile_id,
+                        "client_class": type(client).__name__,
+                        "real_llm_client": isinstance(client, LLMClient),
+                        "openai_tool_schema": self._tool_schema_observation(tools),
+                        "openai_responses_previous_response_id_enabled": bool(
+                            isinstance(client, LLMClient) and client.responses_previous_response_id
+                        ),
+                        "openai_provider_chain_eligible": bool(
+                            isinstance(client, LLMClient)
+                            and client.responses_previous_response_id
+                            and client.store
+                            and client._use_responses_api()
+                            and client._use_openai_request_options()
+                            and provider_chain_fingerprint is not None
+                        ),
+                        "openai_previous_response_id": previous_response_id,
+                        "openai_previous_response_tool_output_count": len(previous_tool_outputs),
+                        "openai_response_scope_fingerprint": response_scope_fingerprint,
+                        "openai_provider_chain_fingerprint": provider_chain_fingerprint,
+                        "data_flow_provider_chain_fingerprint": data_flow_chain_fingerprint,
+                        "data_flow_provider_source_refs_sha256": source_refs_fingerprint,
+                        "openai_prompt_cache_key_configured": bool(
+                            isinstance(client, LLMClient) and client.prompt_cache_key
+                        ),
+                        "openai_prompt_cache_retention": (
+                            client.prompt_cache_retention if isinstance(client, LLMClient) else None
+                        ),
+                        "openai_safety_identifier_configured": bool(
+                            isinstance(client, LLMClient) and client.safety_identifier
+                        ),
+                        "openai_parallel_tool_calls_enabled": parallel_tool_calls,
+                        "agent_libos_auto_wait_on_empty_tool_calls_enabled": auto_wait_on_empty_tool_calls,
+                    }
+                )
+                egress_payload = {
+                    "messages": request_messages,
+                    "tools": tools,
+                    "profile_id": resolved.profile_id,
+                    "previous_response_id": previous_response_id,
+                    "parallel_tool_calls": parallel_tool_calls,
+                }
+                canonical_args = {
+                    "profile_id": resolved.profile_id,
+                    "sink_identity_sha256": sink.identity_sha256,
+                    "payload_sha256": hashlib.sha256(
+                        dumps(to_jsonable(egress_payload)).encode("utf-8")
+                    ).hexdigest(),
+                    "attempt": attempt,
+                }
+            else:
+                self._preflight_llm_call(pid)
+                resolved = self.runtime.llms.resolve(profile_id)
+                client = resolved.client
+                sink_data = dict(_prepared_request.get("sink") or {})
+                sink = DataSink(
+                    identity=str(sink_data["identity"]),
+                    identity_sha256=sink_data.get("identity_sha256"),
+                    trust_identity=sink_data.get("trust_identity"),
+                    trust_identity_sha256=sink_data.get("trust_identity_sha256"),
+                )
+                current_sink = DataSink(
+                    f"llm:{resolved.profile_id}",
+                    resolved.identity_sha256,
+                )
+                if current_sink != sink:
+                    raise _LLMProviderChainScopeChanged(
+                        "LLM profile Sink changed while data release was pending"
+                    )
+                data_flow_chain_fingerprint = str(
+                    _prepared_request["data_flow_chain_fingerprint"]
+                )
+                source_refs_fingerprint = str(
+                    _prepared_request["source_refs_fingerprint"]
+                )
+                prepared_provider_chain_fingerprint = _prepared_request.get(
+                    "provider_chain_fingerprint"
+                )
+                provider_chain_fingerprint = (
+                    str(prepared_provider_chain_fingerprint)
+                    if prepared_provider_chain_fingerprint is not None
+                    else None
+                )
+                previous_response_id = _prepared_request.get("previous_response_id")
+                parallel_tool_calls = bool(_prepared_request["parallel_tool_calls"])
+                auto_wait_on_empty_tool_calls = bool(
+                    _prepared_request["auto_wait_on_empty_tool_calls"]
+                )
+                temperature = float(_prepared_request["temperature"])
+                max_tokens = int(_prepared_request["max_tokens"])
+                egress_payload = dict(_prepared_request.get("egress_payload") or {})
+                canonical_args = dict(_prepared_request.get("canonical_args") or {})
+            invocation = ProtectedOperationInvocation(
+                pid=pid,
+                actor=pid,
+                target=sink.identity,
+                canonical_args=canonical_args,
+                observation={
+                    **canonical_args,
+                    "message_count": len(request_messages),
+                    "tool_count": len(tools),
+                    "source_count": len(flow_context.source_refs),
+                },
+                data_sink=sink,
+                data_flow_context=flow_context,
+                data_flow_ingress_context=self.runtime.data_flow.unclassified_ingress_context(
+                    flow_context,
+                    origin="external:llm",
+                ),
+                data_flow_payload=egress_payload,
+                data_flow_operation="llm.complete",
+                data_flow_allow_recovered_source_snapshots=(_prepared_request is not None),
+                prepare=lambda: self._assert_llm_provider_chain_scope(
+                    pid=pid,
+                    profile_id=resolved.profile_id,
+                    context=flow_context,
+                    expected_sink=sink,
+                    expected_data_flow_fingerprint=data_flow_chain_fingerprint,
+                    expected_provider_fingerprint=provider_chain_fingerprint,
+                    expected_source_refs_fingerprint=source_refs_fingerprint,
+                ),
+                failure_evidence=lambda error, phase: ProtectedOperationEvidence(
+                    event_type=EventType.EXTERNAL_WRITE,
+                    event_source=pid,
+                    event_target=sink.identity,
+                    event_payload={
+                        "adapter": "llm",
+                        "profile_id": resolved.profile_id,
+                        "outcome": "unknown",
+                        "phase": phase,
+                    },
+                    audit_action="primitive.llm.complete.failed",
+                    audit_actor=pid,
+                    audit_target=sink.identity,
+                    audit_decision={
+                        **canonical_args,
+                        "error_type": type(error).__name__,
+                        "phase": phase,
+                        "effect_outcome": "unknown",
+                    },
+                    input_refs=tuple(item.oid for item in flow_context.source_refs),
+                ),
+            )
+            with self.runtime.protected_operations.start(
+                "primitive.llm.complete",
+                invocation,
+                provider=client,
+            ) as protected:
+                async def dispatch_bound_request() -> Any:
+                    # This runs after the SDK marks the provider phase dispatched
+                    # but before the client can perform DNS or transport I/O. A
+                    # mismatch is certified as not-started by the private
+                    # exception and the request is rebuilt without provider state.
+                    self._assert_llm_provider_chain_scope(
+                        pid=pid,
+                        profile_id=resolved.profile_id,
+                        context=flow_context,
+                        expected_sink=sink,
+                        expected_data_flow_fingerprint=data_flow_chain_fingerprint,
+                        expected_provider_fingerprint=provider_chain_fingerprint,
+                        expected_source_refs_fingerprint=source_refs_fingerprint,
+                    )
+                    return await self._complete_action(
+                        client,
+                        request_messages,
+                        tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        previous_response_id=previous_response_id,
+                        parallel_tool_calls=parallel_tool_calls,
+                    )
+
+                completion = await protected.acall(
+                    ProviderPhase(
+                        "provider_request",
+                        state_mutation=True,
+                        information_flow=True,
+                    ),
+                    dispatch_bound_request,
+                )
+                completion = protected.complete(
+                    completion,
+                    ProtectedOperationEvidence(
+                        event_type=EventType.EXTERNAL_WRITE,
+                        event_source=pid,
+                        event_target=sink.identity,
+                        event_payload={
+                            "adapter": "llm",
+                            "profile_id": resolved.profile_id,
+                            "status": "ok",
+                            "request_id": getattr(completion, "request_id", None),
+                            "response_id": getattr(completion, "response_id", None),
+                        },
+                        audit_action="primitive.llm.complete",
+                        audit_actor=pid,
+                        audit_target=sink.identity,
+                        audit_decision={
+                            **canonical_args,
+                            "status": "ok",
+                            "request_id": getattr(completion, "request_id", None),
+                            "response_id": getattr(completion, "response_id", None),
+                        },
+                        input_refs=tuple(item.oid for item in flow_context.source_refs),
+                        provider_receipt={
+                            "request_id": getattr(completion, "request_id", None),
+                            "response_id": getattr(completion, "response_id", None),
+                        },
+                    ),
+                    classification_override=ExternalEffectClassification(
+                        rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+                        rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+                        state_mutation=True,
+                        information_flow=True,
+                        metadata={"outcome": "provider_completed"},
+                    ),
+                )
+        except HumanApprovalRequired as exc:
+            prepared_request = dict(_prepared_request or {})
+            prepared_request.update(
                 {
-                    "llm_profile_id": resolved.profile_id,
-                    "client_class": type(client).__name__,
-                    "real_llm_client": isinstance(client, LLMClient),
-                    "openai_tool_schema": self._tool_schema_observation(tools),
-                    "openai_responses_previous_response_id_enabled": bool(
-                        isinstance(client, LLMClient) and client.responses_previous_response_id
-                    ),
-                    "openai_provider_chain_eligible": bool(
-                        isinstance(client, LLMClient)
-                        and client.responses_previous_response_id
-                        and client.store
-                        and client._use_responses_api()
-                        and client._use_openai_request_options()
-                        and provider_chain_fingerprint is not None
-                    ),
-                    "openai_previous_response_id": previous_response_id,
-                    "openai_previous_response_tool_output_count": len(previous_tool_outputs),
-                    "openai_response_scope_fingerprint": response_scope_fingerprint,
-                    "openai_provider_chain_fingerprint": provider_chain_fingerprint,
-                    "openai_prompt_cache_key_configured": bool(
-                        isinstance(client, LLMClient) and client.prompt_cache_key
-                    ),
-                    "openai_prompt_cache_retention": (
-                        client.prompt_cache_retention if isinstance(client, LLMClient) else None
-                    ),
-                    "openai_safety_identifier_configured": bool(
-                        isinstance(client, LLMClient) and client.safety_identifier
-                    ),
-                    "openai_parallel_tool_calls_enabled": parallel_tool_calls,
-                    "agent_libos_auto_wait_on_empty_tool_calls_enabled": auto_wait_on_empty_tool_calls,
+                    "kind": "llm_release_request",
+                    "schema_version": 1,
+                    "pid": pid,
+                    "call_id": call_id,
+                    "created_at": created_at,
+                    "profile_id": resolved.profile_id,
+                    "request_messages": list(request_messages),
+                    "tools": list(tools),
+                    "request_options": dict(request_options),
+                    "sink": {
+                        "identity": sink.identity,
+                        "identity_sha256": sink.identity_sha256,
+                        "trust_identity": sink.trust_identity,
+                        "trust_identity_sha256": sink.trust_identity_sha256,
+                    },
+                    "flow_context": flow_context.to_dict(),
+                    "data_flow_chain_fingerprint": data_flow_chain_fingerprint,
+                    "source_refs_fingerprint": source_refs_fingerprint,
+                    "provider_chain_fingerprint": provider_chain_fingerprint,
+                    "previous_response_id": previous_response_id,
+                    "parallel_tool_calls": parallel_tool_calls,
+                    "auto_wait_on_empty_tool_calls": auto_wait_on_empty_tool_calls,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "egress_payload": egress_payload,
+                    "canonical_args": canonical_args,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "response_scope_fingerprint": response_scope_fingerprint,
                 }
             )
-            completion = await self._complete_action(
-                client,
-                request_messages,
-                tools,
-                temperature=resolved.temperature,
-                max_tokens=resolved.max_tokens,
-                previous_response_id=previous_response_id,
-                parallel_tool_calls=parallel_tool_calls,
+            raise _LLMReleaseApprovalRequired(exc, prepared_request) from exc
+        except _LLMProviderChainScopeChanged:
+            if _chain_scope_retry >= 1:
+                raise
+            return await self._complete_action_recorded(
+                pid=pid,
+                messages=messages,
+                tools=tools,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                response_scope_fingerprint=response_scope_fingerprint,
+                _force_stateless=True,
+                _chain_scope_retry=_chain_scope_retry + 1,
             )
         except Exception as exc:
             self._charge_llm_attempt(pid, source="llm.error", context={"error_type": type(exc).__name__})
@@ -1616,23 +2254,92 @@ class LLMProcessExecutor:
             return value
         return None
 
-    def _previous_response_id_for_state(
+    def _data_flow_provider_chain_fingerprint(
         self,
+        *,
+        pid: str,
+        sink: DataSink,
+        context: DataFlowContext,
+    ) -> str:
+        trust = self.runtime.data_flow.resolve_sink_trust(sink)
+        authority_manifest = self.runtime.authority_manifests.get_for_process(pid)
+        material = {
+            "sink": sink.identity,
+            "sink_identity_sha256": sink.identity_sha256,
+            "sink_trust_identity": sink.registry_identity,
+            "sink_trust_identity_sha256": sink.registry_identity_sha256,
+            "registry_generation": self.runtime.store.get_sink_trust_generation(),
+            "trust_id": trust.trust_id if trust is not None else None,
+            "trust_sha256": trust.spec_hash if trust is not None else None,
+            # Provider-side retention is bounded by confidentiality and
+            # identity clearance. Trust, integrity, and origin may be lowered
+            # by a tool result that is then sent explicitly without changing
+            # which data the provider is cleared to retain.
+            "clearance_labels_sha256": hashlib.sha256(
+                dumps(
+                    {
+                        "sensitivity": context.labels.sensitivity.value,
+                        "tenant": context.labels.tenant,
+                        "principal": context.labels.principal,
+                    }
+                ).encode("utf-8")
+            ).hexdigest(),
+            "authority_manifest_hash": (
+                authority_manifest.manifest_hash
+                if authority_manifest is not None
+                else None
+            ),
+        }
+        return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
+
+    def _combined_provider_chain_fingerprint(
+        self,
+        client: Any,
+        data_flow_fingerprint: str,
+    ) -> str | None:
+        provider_fingerprint = self._openai_provider_chain_fingerprint(client)
+        if provider_fingerprint is None:
+            return None
+        material = {
+            "provider": provider_fingerprint,
+            "data_flow": data_flow_fingerprint,
+        }
+        return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
+
+    def _assert_llm_provider_chain_scope(
+        self,
+        *,
         pid: str,
         profile_id: str,
-        client: Any,
-        *,
-        response_scope_fingerprint: str | None = None,
-    ) -> str | None:
-        provider_chain_fingerprint = self._openai_provider_chain_fingerprint(client)
-        response_id, _ = self._previous_response_state_for_state(
-            pid,
-            profile_id,
-            client,
-            response_scope_fingerprint=response_scope_fingerprint,
-            provider_chain_fingerprint=provider_chain_fingerprint,
+        context: DataFlowContext,
+        expected_sink: DataSink,
+        expected_data_flow_fingerprint: str,
+        expected_provider_fingerprint: str | None,
+        expected_source_refs_fingerprint: str,
+    ) -> None:
+        current_resolved = self.runtime.llms.resolve(profile_id)
+        current_sink = DataSink(
+            f"llm:{current_resolved.profile_id}",
+            current_resolved.identity_sha256,
         )
-        return response_id
+        current_data_flow_fingerprint = self._data_flow_provider_chain_fingerprint(
+            pid=pid,
+            sink=current_sink,
+            context=context,
+        )
+        current_provider_fingerprint = self._combined_provider_chain_fingerprint(
+            current_resolved.client,
+            current_data_flow_fingerprint,
+        )
+        if (
+            current_sink != expected_sink
+            or current_data_flow_fingerprint != expected_data_flow_fingerprint
+            or current_provider_fingerprint != expected_provider_fingerprint
+            or context.source_refs_hash() != expected_source_refs_fingerprint
+        ):
+            raise _LLMProviderChainScopeChanged(
+                "LLM provider-side response state scope changed before dispatch"
+            )
 
     def _previous_response_state_for_state(
         self,
@@ -2025,6 +2732,9 @@ class LLMProcessExecutor:
                 "tool_name": tool_name,
                 "filters": dict(filters or {}),
                 "action": dict(action),
+                "data_flow_context": self._serialize_data_flow_context(
+                    self.runtime.data_flow.current_context()
+                ),
                 "content_preview": content_preview,
                 "tool_call_count": tool_call_count,
                 "status": "pending",
@@ -2045,6 +2755,18 @@ class LLMProcessExecutor:
             return candidates[0].operation_id
         return None
 
+    @staticmethod
+    def _serialize_data_flow_context(context: DataFlowContext) -> dict[str, Any]:
+        return {
+            "labels": context.labels.to_dict(),
+            "source_refs": [item.to_dict() for item in context.source_refs],
+            "materialization_id": context.materialization_id,
+        }
+
+    @staticmethod
+    def _pending_data_flow_metadata(pending: dict[str, Any]) -> dict[str, Any]:
+        return {"data_flow_context": dict(pending.get("data_flow_context") or {})}
+
     def _clear_pending_action(self, pid: str, resume_token: str) -> None:
         if not self.runtime.store.complete_llm_pending_action(pid, resume_token=resume_token):
             raise RuntimeError(f"pending LLM action was not claimed before completion: {pid}")
@@ -2057,6 +2779,7 @@ class LLMProcessExecutor:
         resume_token = self._pending_resume_token(pending)
         wait_type = str(pending.get("wait_type") or "")
         selected = {
+            "llm_release": self._pending_llm_release_actions,
             "human": self._pending_human_actions,
             "child": self._pending_wait_actions,
             "message": self._pending_message_actions,
@@ -2065,6 +2788,7 @@ class LLMProcessExecutor:
         other_present = any(
             pid in mapping
             for mapping in (
+                self._pending_llm_release_actions,
                 self._pending_human_actions,
                 self._pending_wait_actions,
                 self._pending_message_actions,
@@ -2083,6 +2807,7 @@ class LLMProcessExecutor:
         return pending
 
     def _clear_in_memory_pending_action(self, pid: str) -> None:
+        self._pending_llm_release_actions.pop(pid, None)
         self._pending_human_actions.pop(pid, None)
         self._pending_wait_actions.pop(pid, None)
         self._pending_message_actions.pop(pid, None)
@@ -2100,7 +2825,14 @@ class LLMProcessExecutor:
             "response_id": str(pending["response_id"]) if pending.get("response_id") else None,
             "tool_call_id": str(pending["tool_call_id"]) if pending.get("tool_call_id") else None,
             "tool_name": str(pending["tool_name"]) if pending.get("tool_name") else None,
+            "data_flow_context": dict(pending.get("data_flow_context") or {}),
         }
+        if wait_type == "llm_release" and pending.get("request_id"):
+            self._pending_llm_release_actions[pid] = {
+                **common,
+                "request_id": str(pending["request_id"]),
+            }
+            return
         if wait_type == "human" and pending.get("request_id"):
             self._pending_human_actions[pid] = {**common, "request_id": str(pending["request_id"])}
             return
@@ -2142,6 +2874,44 @@ class LLMProcessExecutor:
                 },
             )
         for pending in self.runtime.store.list_llm_pending_actions(status="pending"):
+            action = dict(pending.get("action") or {})
+            if (
+                pending.get("wait_type") == "llm_release"
+                and action.get("kind") == "llm_release_request_redacted"
+            ):
+                pid = str(pending["pid"])
+                request_id = str(pending.get("request_id") or "")
+                try:
+                    request = self.runtime.human.get(request_id)
+                except NotFound:
+                    request = None
+                if request is not None and request.status not in {
+                    HumanRequestStatus.PENDING,
+                    HumanRequestStatus.APPROVED,
+                }:
+                    # Rejection/cancellation needs no provider payload and can
+                    # preserve the ordinary durable rejection-resume path.
+                    self._hydrate_pending_action(pending)
+                    continue
+                resume_token = self._pending_resume_token(pending)
+                claimed = self.runtime.store.claim_llm_pending_action(
+                    pid,
+                    resume_token=resume_token,
+                )
+                if claimed is None:
+                    continue
+                error = _LLMReleasePayloadUnavailable(
+                    "prepared LLM release payload is unavailable because full-I/O "
+                    "retention was disabled and the exact in-memory request was lost"
+                )
+                self._record_llm_release_payload_unavailable(
+                    pid=pid,
+                    request_id=request_id,
+                    claimed=claimed,
+                    error=error,
+                )
+                self._fail_interrupted_pending_resume(pid, claimed, error)
+                continue
             self._hydrate_pending_action(pending)
 
     def _restore_pending_compaction_child_goal(self, pending: dict[str, Any]) -> None:

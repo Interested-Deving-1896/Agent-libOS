@@ -23,6 +23,7 @@ from agent_libos.models import (
     ObjectHandle,
     OperationContext,
     DelegationPolicy,
+    DataReleaseBinding,
     ResourcePattern,
     SandboxProfile,
 )
@@ -54,6 +55,7 @@ class CapabilityManager:
     ALLOW_ONCE = "allow_once"
     MISSING = "missing"
     APPROVAL_BINDING_KEY = APPROVAL_BINDING_CONSTRAINT_KEY
+    DATA_RELEASE_BINDING_KEY = "data_release_binding"
     POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
 
     _KNOWN_CONSTRAINT_KEYS = {
@@ -61,6 +63,7 @@ class CapabilityManager:
         "inherited_from",
         AUTHORITY_RULES_KEY,
         APPROVAL_BINDING_KEY,
+        DATA_RELEASE_BINDING_KEY,
     }
 
     def __init__(self, store: RuntimeStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
@@ -705,6 +708,34 @@ class CapabilityManager:
             )
             return replace(decision, consume_capability_id=None)
         return decision
+
+    def reauthorize_decision(
+        self,
+        decision: CapabilityDecision,
+        *,
+        audit: bool = False,
+    ) -> CapabilityDecision:
+        """Re-evaluate a cached decision against the current authority state.
+
+        Protected operations use this immediately before reserving authority
+        and preparing an external-effect intent.  Replaying the exact request
+        context is important: constraints and scoped deny rules must retain
+        the same semantics as the original authorization.
+        """
+
+        current = self.authorize(
+            decision.subject,
+            decision.resource,
+            decision.right,
+            dict(decision.context),
+            audit=audit,
+        )
+        if not current.allowed:
+            raise CapabilityDenied(
+                "capability authority changed before protected dispatch: "
+                f"{current.reason}"
+            )
+        return current
 
     def check(
         self,
@@ -1651,6 +1682,26 @@ class CapabilityManager:
                     "effect_id": binding["effect_id"],
                     "canonical_args_hash": actual_hash,
                     "target_state_version": actual_version,
+                }
+                continue
+            if key == self.DATA_RELEASE_BINDING_KEY:
+                try:
+                    expected = DataReleaseBinding.normalize(value)
+                    actual = DataReleaseBinding.normalize(context.get(key))
+                except (TypeError, ValueError) as exc:
+                    results[key] = {"ok": False, "reason": str(exc)}
+                    continue
+                matched = expected == actual
+                results[key] = {
+                    "ok": matched,
+                    "reason": (
+                        "data release binding matched"
+                        if matched
+                        else "data release Sink, source, payload, policy, or operation changed"
+                    ),
+                    "sink": actual["sink"],
+                    "registry_generation": actual["registry_generation"],
+                    "payload_hash": actual["payload_hash"],
                 }
                 continue
             results[key] = {"ok": True, "value": value}

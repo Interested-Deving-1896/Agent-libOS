@@ -199,7 +199,7 @@ def _run_native_scenario(
                 goal=scenario.title,
                 authority_manifest={
                     "authorized_capabilities": authorized,
-                    "permitted_effects": ["jsonrpc.call"],
+                    "permitted_effects": ["llm.*", "jsonrpc.call"],
                     "metadata": {"benchmark_scenario_id": scenario.scenario_id},
                 },
             )

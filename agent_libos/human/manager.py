@@ -4,7 +4,8 @@ import asyncio
 import builtins
 import hashlib
 import threading
-from typing import TYPE_CHECKING, Any
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
@@ -13,10 +14,26 @@ from agent_libos.models import (
     AuthorityRisk,
     CapabilityEffect,
     CapabilityRight,
+    DataFlowContext,
+    DataFlowOutcome,
+    DataIntegrity,
+    DataLabels,
+    DataSensitivity,
+    DataSink,
+    DataTrustLevel,
     ProcessMessage,
     ProcessMessageKind,
+    SinkTrustLevel,
+    sensitivity_rank,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanResponseRequired, NotFound, ProcessError, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    HumanResponseRequired,
+    NotFound,
+    ProcessError,
+    ValidationError,
+)
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
     EventType,
@@ -41,6 +58,13 @@ if TYPE_CHECKING:
     from agent_libos.runtime.message_manager import ProcessMessageManager
 
 _SENSITIVE_HUMAN_AUDIT_KEYS = frozenset({"answer", "context", "decision", "message", "payload", "question", "reason"})
+_DATA_FLOW_CONTEXT_KEY = "_agent_libos_data_flow_context"
+_DATA_RELEASE_FOR_REQUEST_KEY = "_agent_libos_data_release_for_request_id"
+_DATA_RELEASE_REQUEST_KEY = "_agent_libos_data_release_request_id"
+_DATA_RELEASE_REQUESTS_KEY = "_agent_libos_data_release_request_ids"
+_DATA_RELEASE_PRESENTATION_KEY = "_agent_libos_data_release_presentation"
+_DATA_RELEASE_VISIBLE_KEY = "_agent_libos_data_release_visible"
+_PRESENTATION_RECEIPT_PER_REQUEST_MULTIPLIER = 4
 
 
 def _json_size_bytes(value: Any) -> int:
@@ -54,17 +78,23 @@ def _ensure_json_size(value: Any, limit_bytes: int, label: str) -> int:
     return size
 
 
-def _sanitize_human_observability(value: Any, *, preview_chars: int = 256) -> dict[str, Any]:
+def _sanitize_human_observability(
+    value: Any,
+    *,
+    preview_chars: int = 256,
+    metadata_only: bool = False,
+) -> dict[str, Any]:
     jsonable = to_jsonable(value)
     redacted = _redact_human_value(jsonable)
     encoded = dumps(jsonable).encode("utf-8")
-    preview = dumps(redacted)
+    preview = "<redacted protected payload>" if metadata_only else dumps(redacted)
     return {
         "preview": preview[: max(0, preview_chars)],
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "bytes": len(encoded),
-        "truncated": len(preview) > max(0, preview_chars),
-        "redacted": redacted != jsonable,
+        "truncated": metadata_only or len(preview) > max(0, preview_chars),
+        "redacted": metadata_only or redacted != jsonable,
+        "metadata_only": metadata_only,
     }
 
 
@@ -107,6 +137,24 @@ class HumanObjectManager:
         # transition lock.
         self._terminal_lock = threading.RLock()
         self._terminal_claims: set[str] = set()
+        self._presentation_receipt_lock = threading.RLock()
+        self._presentation_receipts: dict[
+            tuple[str, str, int],
+            tuple[str, Any],
+        ] = {}
+        self._presentation_receipt_limit = max(
+            1,
+            self.config.gui.snapshot_collection_max_items
+            * _PRESENTATION_RECEIPT_PER_REQUEST_MULTIPLIER,
+        )
+        self._data_release_parent_request: ContextVar[str | None] = ContextVar(
+            f"agent_libos_human_release_parent_{id(self)}",
+            default=None,
+        )
+        self._data_release_presentation: ContextVar[str | None] = ContextVar(
+            f"agent_libos_human_release_presentation_{id(self)}",
+            default=None,
+        )
 
     def bind_messages(self, messages: "ProcessMessageManager") -> None:
         self._messages = messages
@@ -117,8 +165,36 @@ class HumanObjectManager:
         human: str,
         request: dict[str, Any],
         blocking: bool = True,
+        *,
+        _trusted_data_release: bool = False,
+        source_oids: Iterable[str] | None = None,
     ) -> str:
+        if request.get("type") == "data_release_approval" and not _trusted_data_release:
+            raise ValidationError(
+                "data release approvals can only be created by the Host data-flow gate"
+            )
+        request = dict(request)
+        if not _trusted_data_release:
+            request.pop(_DATA_RELEASE_FOR_REQUEST_KEY, None)
+            request.pop(_DATA_RELEASE_REQUEST_KEY, None)
+            request.pop(_DATA_RELEASE_REQUESTS_KEY, None)
+            request.pop(_DATA_RELEASE_PRESENTATION_KEY, None)
+            request.pop(_DATA_RELEASE_VISIBLE_KEY, None)
         request = self._bind_external_operation_approval(request)
+        request.pop(_DATA_FLOW_CONTEXT_KEY, None)
+        flow = self._request_source_context(
+            pid,
+            source_oids=source_oids,
+            public_metadata=_trusted_data_release,
+        )
+        request[_DATA_FLOW_CONTEXT_KEY] = flow.to_dict()
+        self._precheck_human_egress(
+            pid=pid,
+            human=human,
+            channel=self.config.runtime.terminal_channel,
+            context=flow,
+            payload=request,
+        )
         _ensure_json_size(request, self.config.tools.human_request_payload_max_bytes, "human request payload")
         now = utc_now()
         human_request = HumanRequest(
@@ -132,6 +208,13 @@ class HumanObjectManager:
             created_at=now,
             updated_at=now,
         )
+        request_observation = _sanitize_human_observability(
+            self.public_request_payload(human_request),
+            metadata_only=(
+                sensitivity_rank(flow.labels.sensitivity)
+                > sensitivity_rank(DataSensitivity.NORMAL)
+            ),
+        )
         # Request persistence, scheduler suspension, and observability are one
         # commit. A caller may therefore safely restore a reserved one-shot
         # capability if this method raises: no pending request was left behind.
@@ -142,6 +225,50 @@ class HumanObjectManager:
                     f"terminal process cannot create human requests: {pid} status={process.status.value}"
                 )
             self.store.insert_human_request(human_request)
+            release_parent_id = request.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+            if _trusted_data_release and isinstance(release_parent_id, str):
+                release_parent = self.store.get_human_request(release_parent_id)
+                if release_parent is None:
+                    raise ValidationError(
+                        f"data release parent Human request not found: {release_parent_id}"
+                    )
+                presentation = request.get(_DATA_RELEASE_PRESENTATION_KEY)
+                presentation_release = isinstance(presentation, str) and bool(presentation)
+                if (
+                    release_parent.pid != pid
+                    or release_parent.human != human
+                    or (
+                        release_parent.status != HumanRequestStatus.PENDING
+                        and not presentation_release
+                    )
+                ):
+                    raise ValidationError(
+                        "data release parent Human request is not eligible for this release"
+                    )
+                release_parent.payload = dict(release_parent.payload)
+                release_parent.payload[_DATA_RELEASE_REQUEST_KEY] = human_request.request_id
+                if isinstance(presentation, str) and presentation:
+                    raw_links = release_parent.payload.get(_DATA_RELEASE_REQUESTS_KEY)
+                    links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
+                    previous_id = links.get(presentation)
+                    if isinstance(previous_id, str) and previous_id != human_request.request_id:
+                        previous = self.store.get_human_request(previous_id)
+                        if previous is not None and previous.status == HumanRequestStatus.PENDING:
+                            previous.status = HumanRequestStatus.CANCELLED
+                            previous.decision = {
+                                "data_release_outcome": "superseded",
+                                "automatic_retry_disabled": True,
+                            }
+                            previous.updated_at = utc_now()
+                            self.store.update_human_request(previous)
+                    links[presentation] = human_request.request_id
+                    release_parent.payload[_DATA_RELEASE_REQUESTS_KEY] = links
+                # A presentation release is internal gate state.  It must not
+                # mutate the public view whose exact hash the release binds,
+                # otherwise creating the release would invalidate itself.
+                if not (isinstance(presentation, str) and presentation):
+                    release_parent.updated_at = utc_now()
+                self.store.update_human_request(release_parent)
             operations = getattr(self.store, "operation_manager", None)
             if operations is not None:
                 operations.expect("approval")
@@ -156,14 +283,26 @@ class HumanObjectManager:
                 # a terminal queue decision moves it back to RUNNABLE.
                 if process is not None:
                     process.status = ProcessStatus.WAITING_HUMAN
-                    process.status_message = f"waiting for human request {human_request.request_id}"
+                    release_parent_id = request.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+                    process.status_message = (
+                        "waiting for human requests "
+                        f"{release_parent_id},{human_request.request_id}"
+                        if _trusted_data_release
+                        and isinstance(release_parent_id, str)
+                        else f"waiting for human request {human_request.request_id}"
+                    )
                     process.updated_at = utc_now()
                     self.store.update_process(process)
             self.events.emit(
                 EventType.HUMAN_QUERY,
                 source=pid,
                 target=f"human:{human}",
-                payload={"request_id": human_request.request_id, "request": request, "blocking": blocking},
+                payload={
+                    "request_id": human_request.request_id,
+                    "request_type": str(request.get("type") or "approval"),
+                    "request": request_observation,
+                    "blocking": blocking,
+                },
             )
             self.audit.record(
                 actor=pid,
@@ -172,10 +311,91 @@ class HumanObjectManager:
                 decision={
                     "request_id": human_request.request_id,
                     "blocking": blocking,
-                    "request": _sanitize_human_observability(request),
+                    "request": request_observation,
                 },
             )
         return human_request.request_id
+
+    def request_data_release(
+        self,
+        *,
+        pid: str,
+        human: str,
+        request: dict[str, Any],
+        blocking: bool = True,
+    ) -> str:
+        """Create the metadata-only Human request owned by DataFlowManager."""
+
+        request = dict(request)
+        request.pop(_DATA_RELEASE_FOR_REQUEST_KEY, None)
+        request.pop(_DATA_RELEASE_REQUEST_KEY, None)
+        request.pop(_DATA_RELEASE_REQUESTS_KEY, None)
+        request.pop(_DATA_RELEASE_PRESENTATION_KEY, None)
+        request.pop(_DATA_RELEASE_VISIBLE_KEY, None)
+        if request.get("type") != "data_release_approval":
+            raise ValidationError("trusted data release request has an invalid type")
+        context = request.get("context")
+        once = request.get("requested_once_capability")
+        if not isinstance(context, dict) or not isinstance(once, dict):
+            raise ValidationError(
+                "trusted data release request requires metadata context and an exact capability"
+            )
+        forbidden = {
+            "content",
+            "content_preview",
+            "payload",
+            "params",
+            "arguments",
+            "question_context",
+        }
+        if any(key in context for key in forbidden):
+            raise ValidationError("data release Human request must not contain payload content")
+        parent_request_id = self._data_release_parent_request.get()
+        presentation = self._data_release_presentation.get()
+        presentation_release = isinstance(presentation, str) and bool(presentation)
+        if parent_request_id is not None:
+            parent = self.store.get_human_request(parent_request_id)
+            if parent is None or (
+                parent.status != HumanRequestStatus.PENDING
+                and not presentation_release
+            ):
+                raise CapabilityDenied(
+                    "data release parent Human request is no longer pending"
+                )
+            raw_links = parent.payload.get(_DATA_RELEASE_REQUESTS_KEY)
+            links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
+            existing_id = (
+                links.get(presentation)
+                if isinstance(presentation, str) and presentation
+                else parent.payload.get(_DATA_RELEASE_REQUEST_KEY)
+            )
+            if isinstance(existing_id, str):
+                existing = self.store.get_human_request(existing_id)
+                if (
+                    existing is not None
+                    and existing.status == HumanRequestStatus.PENDING
+                    and existing.payload.get("type") == "data_release_approval"
+                    and existing.payload.get("requested_once_capability")
+                    == request.get("requested_once_capability")
+                ):
+                    return existing.request_id
+                if existing is not None and existing.status in {
+                    HumanRequestStatus.REJECTED,
+                    HumanRequestStatus.CANCELLED,
+                }:
+                    raise CapabilityDenied(
+                        "data release for this Human request was already denied"
+                    )
+            request[_DATA_RELEASE_FOR_REQUEST_KEY] = parent_request_id
+            if isinstance(presentation, str) and presentation:
+                request[_DATA_RELEASE_PRESENTATION_KEY] = presentation
+        return self.query(
+            pid=pid,
+            human=human,
+            request=request,
+            blocking=blocking and not presentation_release,
+            _trusted_data_release=True,
+        )
 
     def request_permission(
         self,
@@ -185,6 +405,8 @@ class HumanObjectManager:
         rights: list[str],
         reason: str,
         blocking: bool = True,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
         manifests = getattr(self.store, "authority_manifest_manager", None)
@@ -204,6 +426,7 @@ class HumanObjectManager:
                 human=selected_human,
                 request=request,
                 blocking=blocking,
+                source_oids=source_oids,
             )
         except Exception:
             self._restore_one_time_decision(reservation_id)
@@ -395,6 +618,8 @@ class HumanObjectManager:
         human: str | None = None,
         context: dict[str, Any] | None = None,
         blocking: bool = True,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
         resource = f"human:{selected_human}"
@@ -410,6 +635,7 @@ class HumanObjectManager:
                     "context": context or {},
                 },
                 blocking=blocking,
+                source_oids=source_oids,
             )
         except Exception:
             self._restore_one_time_decision(reservation_id)
@@ -431,6 +657,12 @@ class HumanObjectManager:
         decision = request.decision or {}
         if "answer" not in decision:
             raise ValidationError(f"human question {request_id} has no answer")
+        # A resumed tool call may run in a fresh thread or after reopening the
+        # runtime, so its ambient context cannot be trusted to retain the
+        # original question's labels. Rehydrate the Host-persisted request
+        # context and conservatively aggregate the normal/untrusted Human
+        # response before ToolBroker creates the result Object.
+        self._observe_human_response(self._request_data_flow_context(request))
         return str(decision["answer"])
 
     def approve(
@@ -449,6 +681,27 @@ class HumanObjectManager:
             responder or self.config.runtime.default_human_actor,
         )
 
+    def approve_for_presentation(
+        self,
+        request_id: str,
+        *,
+        presentation: str,
+        decision: dict[str, Any] | None = None,
+        responder: str | None = None,
+    ) -> HumanRequest:
+        """Approve only if the request is currently visible on a Host surface."""
+
+        selected_decision: Any = {"approved": True} if decision is None else decision
+        if not isinstance(selected_decision, dict):
+            raise ValidationError("human decision must be a JSON object")
+        return self._decide(
+            request_id,
+            HumanRequestStatus.APPROVED,
+            dict(selected_decision),
+            responder or self.config.runtime.default_human_actor,
+            required_presentation=presentation,
+        )
+
     def reject(
         self,
         request_id: str,
@@ -463,6 +716,27 @@ class HumanObjectManager:
             HumanRequestStatus.REJECTED,
             dict(selected_decision),
             responder or self.config.runtime.default_human_actor,
+        )
+
+    def reject_for_presentation(
+        self,
+        request_id: str,
+        *,
+        presentation: str,
+        decision: dict[str, Any] | None = None,
+        responder: str | None = None,
+    ) -> HumanRequest:
+        """Reject only if the request is currently visible on a Host surface."""
+
+        selected_decision: Any = {"approved": False} if decision is None else decision
+        if not isinstance(selected_decision, dict):
+            raise ValidationError("human decision must be a JSON object")
+        return self._decide(
+            request_id,
+            HumanRequestStatus.REJECTED,
+            dict(selected_decision),
+            responder or self.config.runtime.default_human_actor,
+            required_presentation=presentation,
         )
 
     def interrupt(self, pid: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> str:
@@ -556,6 +830,8 @@ class HumanObjectManager:
         message: str,
         human: str | None = None,
         channel: str | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         selected_human = human or self.config.runtime.default_human
         selected_channel = self._normalize_output_channel(channel)
@@ -565,12 +841,25 @@ class HumanObjectManager:
             )
         resource = f"human:{selected_human}"
         decision = self.capabilities.require(pid, resource, CapabilityRight.WRITE, consume=False)
+        flow = self._request_source_context(pid, source_oids=source_oids)
+        self._precheck_human_egress(
+            pid=pid,
+            human=selected_human,
+            channel=selected_channel,
+            context=flow,
+            payload=message,
+        )
         reservation_id = self._reserve_one_time_decision(decision, used_by="human")
         request = HumanRequest(
             request_id=new_id("hreq"),
             pid=pid,
             human=selected_human,
-            payload={"type": "output", "message": message, "channel": selected_channel},
+            payload={
+                "type": "output",
+                "message": message,
+                "channel": selected_channel,
+                _DATA_FLOW_CONTEXT_KEY: flow.to_dict(),
+            },
             status=HumanRequestStatus.PENDING,
             decision=None,
             blocking=False,
@@ -647,6 +936,642 @@ class HumanObjectManager:
         if request is None:
             raise NotFound(f"human request not found: {request_id}")
         return request
+
+    @staticmethod
+    def public_request_payload(request: HumanRequest) -> dict[str, Any]:
+        """Return the caller-visible request payload without Host provenance."""
+
+        payload = dict(request.payload)
+        payload.pop(_DATA_FLOW_CONTEXT_KEY, None)
+        payload.pop(_DATA_RELEASE_FOR_REQUEST_KEY, None)
+        payload.pop(_DATA_RELEASE_REQUEST_KEY, None)
+        payload.pop(_DATA_RELEASE_REQUESTS_KEY, None)
+        payload.pop(_DATA_RELEASE_PRESENTATION_KEY, None)
+        payload.pop(_DATA_RELEASE_VISIBLE_KEY, None)
+        return payload
+
+    def list_for_presentation(
+        self,
+        *,
+        presentation: str,
+        provider: Any,
+        pid: str | None = None,
+        limit: int | None = None,
+    ) -> builtins.list[dict[str, Any]]:
+        """Project Human requests through one release-aware provider boundary."""
+
+        views, _has_more = self.list_for_presentation_window(
+            presentation=presentation,
+            provider=provider,
+            pid=pid,
+            limit=limit,
+        )
+        return views
+
+    def list_for_presentation_window(
+        self,
+        *,
+        presentation: str,
+        provider: Any,
+        pid: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[builtins.list[dict[str, Any]], bool]:
+        """Return one bounded presentation window and an exact-more signal.
+
+        A newly created metadata release is included in this same result, ahead
+        of its withheld parent, so the first GUI observation is immediately
+        actionable. Pending release links are durable and reused across polling
+        and Runtime reopen. Projection is deliberately lazy: once the final
+        logical window is full, later raw rows are not presented. Therefore a
+        protected operation can never consume a release or mark a parent visible
+        for a row that the caller will crop from this response.
+        """
+
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise ValidationError("Human presentation limit must be a positive integer")
+        selected = self.list(
+            pid=pid,
+            limit=None if limit is None else limit + 1,
+        )
+        views: builtins.list[dict[str, Any]] = []
+        emitted: set[str] = set()
+        has_more = False
+
+        for index, request in enumerate(selected):
+            if request.request_id in emitted:
+                continue
+            if limit is not None and len(views) >= limit:
+                has_more = True
+                break
+            view = self.present_request_view(
+                request,
+                presentation=presentation,
+                provider=provider,
+            )
+            payload = view.get("payload", {})
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("type") != "data_release_approval"
+                and payload.get("release_required") is True
+            ):
+                release_id = view.get("release_request_id")
+                release = (
+                    self.store.get_human_request(release_id)
+                    if isinstance(release_id, str) and release_id
+                    else None
+                )
+                if (
+                    release is not None
+                    and release.request_id not in emitted
+                    and release.status == HumanRequestStatus.PENDING
+                    and (pid is None or release.pid == pid)
+                ):
+                    views.append(self.public_request_view(release))
+                    emitted.add(release.request_id)
+                    if limit is not None and len(views) >= limit:
+                        # Only a still-withheld parent can be displaced by its
+                        # newly created/reused release. No protected payload was
+                        # emitted and no exact release was consumed for it.
+                        has_more = True
+                        break
+
+            views.append(view)
+            emitted.add(request.request_id)
+            if limit is not None and len(views) >= limit:
+                has_more = any(
+                    candidate.request_id not in emitted
+                    for candidate in selected[index + 1 :]
+                )
+                break
+
+        return views, has_more
+
+    def present_request_view(
+        self,
+        request: HumanRequest,
+        *,
+        presentation: str,
+        provider: Any,
+    ) -> dict[str, Any]:
+        """Return one request only after its presentation Sink authorizes it."""
+
+        selected_presentation = str(presentation).strip().lower()
+        if selected_presentation != "gui":
+            raise ValidationError(f"unsupported Human presentation: {presentation}")
+        # Replayed views are not a new Host-to-provider handoff: the exact
+        # bytes were already delivered to this provider session.  Still hold
+        # the Store lock through the final current-policy/source check and the
+        # replay boundary so a concurrent registry/source mutation cannot
+        # slip between the guard and the returned view.  The first delivery
+        # continues through ProtectedOperation below and performs its own
+        # dispatch-time revalidation.
+        with self.store.locked():
+            fresh = self.get(request.request_id)
+            raw = self._raw_public_request_view(fresh)
+            if fresh.payload.get("type") == "data_release_approval":
+                return raw
+
+            context = self._request_data_flow_context(fresh)
+            manager = getattr(self, "data_flow", None)
+            if manager is None:
+                return self.public_request_view(fresh)
+            sink = self._presentation_sink(fresh, selected_presentation)
+            view_sha256 = hashlib.sha256(
+                dumps(to_jsonable(raw)).encode("utf-8")
+            ).hexdigest()
+            outcome = manager.classify_egress_snapshot(
+                sink=sink,
+                context=context,
+                allow_recovered_source_snapshots=True,
+            )
+            release_required = outcome is DataFlowOutcome.RELEASE_REQUIRED
+            if (
+                outcome is DataFlowOutcome.ALLOW
+                and self._presentation_was_delivered(
+                    fresh,
+                    presentation=selected_presentation,
+                    view_sha256=view_sha256,
+                    provider=provider,
+                )
+            ):
+                return raw
+            if release_required:
+                if self._presentation_is_visible(
+                    fresh,
+                    presentation=selected_presentation,
+                    view_sha256=view_sha256,
+                ):
+                    return raw
+
+                release = self._linked_presentation_release(fresh, selected_presentation)
+                if release is not None and release.status in {
+                    HumanRequestStatus.PENDING,
+                    HumanRequestStatus.REJECTED,
+                    HumanRequestStatus.CANCELLED,
+                }:
+                    return self.public_request_view(fresh)
+
+        try:
+            return self._protected_presentation_view(
+                fresh,
+                presentation=selected_presentation,
+                provider=provider,
+                sink=sink,
+                context=context,
+                public_view=raw,
+                view_sha256=view_sha256,
+                release_required=release_required,
+            )
+        except (HumanApprovalRequired, CapabilityDenied):
+            return self._withheld_public_request_view(self.get(fresh.request_id))
+
+    def is_request_withheld_for_presentation(
+        self,
+        request: HumanRequest | str,
+        *,
+        presentation: str,
+    ) -> bool:
+        """Return whether a presentation must refuse a decision for this request.
+
+        This is a read-only check of the same durable exact-release state used
+        by :meth:`present_request_view`. It deliberately never calls a provider
+        or creates a release request, so response endpoints can fail closed
+        without changing the parent request or its process.
+        """
+
+        selected_presentation = str(presentation).strip().lower()
+        if selected_presentation != "gui":
+            raise ValidationError(f"unsupported Human presentation: {presentation}")
+        request_id = request.request_id if isinstance(request, HumanRequest) else request
+        fresh = self.get(request_id)
+        if fresh.payload.get("type") == "data_release_approval":
+            return False
+
+        context = self._request_data_flow_context(fresh)
+        manager = getattr(self, "data_flow", None)
+        if manager is None:
+            return True
+        sink = self._presentation_sink(fresh, selected_presentation)
+        outcome = manager.classify_egress_snapshot(
+            sink=sink,
+            context=context,
+            allow_recovered_source_snapshots=True,
+        )
+        if outcome is DataFlowOutcome.ALLOW:
+            return False
+        if outcome is DataFlowOutcome.DENY:
+            return True
+
+        raw = self._raw_public_request_view(fresh)
+        view_sha256 = hashlib.sha256(
+            dumps(to_jsonable(raw)).encode("utf-8")
+        ).hexdigest()
+        return not self._presentation_is_visible(
+            fresh,
+            presentation=selected_presentation,
+            view_sha256=view_sha256,
+        )
+
+    def _raw_public_request_view(self, request: HumanRequest) -> dict[str, Any]:
+        selected = to_jsonable(request)
+        if not isinstance(selected, dict):
+            raise ValidationError("Human request could not be projected")
+        selected["payload"] = self.public_request_payload(request)
+        parent_id = request.payload.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+        if isinstance(parent_id, str) and parent_id:
+            selected["release_for_request_id"] = parent_id
+        # Release links are gate metadata, not part of the view handed to the
+        # GUI provider.  Withheld projections expose the current release ID so
+        # a client can approve it; the released view is independent of that
+        # internal link and can therefore be bound without a circular hash.
+        return selected
+
+    def _presentation_sink(self, request: HumanRequest, presentation: str) -> DataSink:
+        trust_identity = (
+            f"human:{request.human}:{self.config.runtime.terminal_channel}"
+        )
+        return DataSink(
+            identity=f"human:{request.human}:{presentation}",
+            trust_identity=trust_identity,
+        )
+
+    def _linked_presentation_release_id(
+        self,
+        request: HumanRequest,
+        presentation: str,
+    ) -> str | None:
+        raw_links = request.payload.get(_DATA_RELEASE_REQUESTS_KEY)
+        if not isinstance(raw_links, Mapping):
+            return None
+        selected = raw_links.get(presentation)
+        return selected if isinstance(selected, str) and selected else None
+
+    def _linked_presentation_release(
+        self,
+        request: HumanRequest,
+        presentation: str,
+    ) -> HumanRequest | None:
+        release_id = self._linked_presentation_release_id(request, presentation)
+        return self.store.get_human_request(release_id) if release_id is not None else None
+
+    def _presentation_is_visible(
+        self,
+        request: HumanRequest,
+        *,
+        presentation: str,
+        view_sha256: str,
+    ) -> bool:
+        raw_visible = request.payload.get(_DATA_RELEASE_VISIBLE_KEY)
+        if not isinstance(raw_visible, Mapping):
+            return False
+        state = raw_visible.get(presentation)
+        if not isinstance(state, Mapping):
+            return False
+        release_id = state.get("release_request_id")
+        if (
+            state.get("view_sha256") != view_sha256
+            or not isinstance(release_id, str)
+            or release_id != self._linked_presentation_release_id(request, presentation)
+        ):
+            return False
+        release = self.store.get_human_request(release_id)
+        if release is None or release.status != HumanRequestStatus.APPROVED:
+            return False
+        once = release.payload.get("requested_once_capability")
+        if not isinstance(once, Mapping):
+            return False
+        resource = once.get("resource")
+        constraints = once.get("constraints")
+        manager = getattr(self, "data_flow", None)
+        if (
+            manager is None
+            or not isinstance(resource, str)
+            or not isinstance(constraints, Mapping)
+        ):
+            return False
+        binding = constraints.get(manager.RELEASE_BINDING_KEY)
+        if not manager.is_release_binding_current(
+            pid=request.pid,
+            sink=self._presentation_sink(request, presentation),
+            context=self._request_data_flow_context(request),
+            payload_hash=view_sha256,
+            operation=f"human.{presentation}.present",
+            target_state_version=None,
+            binding=binding,
+            allow_recovered_source_snapshots=True,
+        ):
+            return False
+        return any(
+            capability.resource == resource
+            and capability.constraints == dict(constraints)
+            and capability.uses_remaining == 0
+            for capability in self.store.list_capabilities(subject=request.pid)
+        )
+
+    def _presentation_was_delivered(
+        self,
+        request: HumanRequest,
+        *,
+        presentation: str,
+        view_sha256: str,
+        provider: Any,
+    ) -> bool:
+        """Return whether this exact unrestricted view was already delivered.
+
+        The current Sink is still classified before this check.  The receipt
+        only suppresses a duplicate provider/evidence operation when the
+        current policy remains ALLOW and the public view hash is unchanged.
+        """
+
+        key = (presentation, request.request_id, id(provider))
+        with self._presentation_receipt_lock:
+            receipt = self._presentation_receipts.get(key)
+            delivered = bool(
+                receipt is not None
+                and receipt[0] == view_sha256
+                and receipt[1] is provider
+            )
+            if delivered:
+                self._presentation_receipts[key] = self._presentation_receipts.pop(key)
+            return delivered
+
+    def _mark_presentation_delivered(
+        self,
+        request: HumanRequest,
+        *,
+        presentation: str,
+        view_sha256: str,
+        provider: Any,
+    ) -> None:
+        key = (presentation, request.request_id, id(provider))
+        with self._presentation_receipt_lock:
+            self._presentation_receipts.pop(key, None)
+            # Keep a bounded strong reference so CPython object-id reuse can
+            # never make a new provider/session inherit an old receipt.
+            self._presentation_receipts[key] = (view_sha256, provider)
+            while len(self._presentation_receipts) > self._presentation_receipt_limit:
+                oldest = next(iter(self._presentation_receipts))
+                self._presentation_receipts.pop(oldest, None)
+
+    def _protected_presentation_view(
+        self,
+        request: HumanRequest,
+        *,
+        presentation: str,
+        provider: Any,
+        sink: DataSink,
+        context: DataFlowContext,
+        public_view: dict[str, Any],
+        view_sha256: str,
+        release_required: bool,
+    ) -> dict[str, Any]:
+        release_request_id = (
+            self._linked_presentation_release_id(request, presentation)
+            if release_required
+            else None
+        )
+        public_payload = public_view.get("payload")
+        request_kind = (
+            str(public_payload.get("type") or "approval")
+            if isinstance(public_payload, Mapping)
+            else "approval"
+        )
+        observation = _sanitize_human_observability(public_view, metadata_only=True)
+        presentation_attempt_id = new_id("hpres")
+        effect_context = {
+            "request_id": request.request_id,
+            "request_kind": request_kind,
+            "purpose": f"{presentation}_presentation",
+            "operation": "write",
+            "channel": presentation,
+            "chars": observation["bytes"],
+            "prompt_observation": observation,
+        }
+        invocation = ProtectedOperationInvocation(
+            pid=request.pid,
+            actor=request.pid,
+            target=f"human:{request.human}",
+            canonical_args={
+                "request_id": request.request_id,
+                "presentation": presentation,
+                "view_sha256": view_sha256,
+                "release_request_id": release_request_id,
+                "presentation_attempt_id": presentation_attempt_id,
+            },
+            observation=effect_context,
+            idempotency_key=(
+                f"human:{presentation}:present:{request.request_id}:"
+                f"{release_request_id or 'without-release'}:{view_sha256}:"
+                f"{presentation_attempt_id}"
+            ),
+            data_sink=sink,
+            data_flow_context=context,
+            data_flow_payload=public_view,
+            data_flow_operation=f"human.{presentation}.present",
+            data_flow_allow_recovered_source_snapshots=True,
+            failure_evidence=lambda error, phase: self._protected_terminal_evidence(
+                request,
+                operation="write",
+                resource=f"human:{request.human}",
+                purpose=f"{presentation}_presentation",
+                prompt_observation={"chars": observation["bytes"], **observation},
+                result_observation={"type": type(error).__name__},
+                failed=True,
+                phase=phase,
+            ),
+        )
+
+        def mark_visible() -> None:
+            latest = self.store.get_human_request(request.request_id)
+            if latest is None:
+                raise NotFound(f"human request not found: {request.request_id}")
+            latest_view = self._raw_public_request_view(latest)
+            latest_sha256 = hashlib.sha256(
+                dumps(to_jsonable(latest_view)).encode("utf-8")
+            ).hexdigest()
+            if latest_sha256 != view_sha256:
+                raise CapabilityDenied("Human GUI view changed before presentation")
+            release_id = self._linked_presentation_release_id(latest, presentation)
+            if release_id is None:
+                raise CapabilityDenied("Human GUI release link is missing")
+            raw_visible = latest.payload.get(_DATA_RELEASE_VISIBLE_KEY)
+            visible = dict(raw_visible) if isinstance(raw_visible, Mapping) else {}
+            visible[presentation] = {
+                "release_request_id": release_id,
+                "view_sha256": view_sha256,
+            }
+            latest.payload = dict(latest.payload)
+            latest.payload[_DATA_RELEASE_VISIBLE_KEY] = visible
+            self.store.update_human_request(latest)
+
+        parent_token = self._data_release_parent_request.set(request.request_id)
+        presentation_token = self._data_release_presentation.set(presentation)
+        try:
+            with self._protected().start(
+                "primitive.human.write",
+                invocation,
+                provider=provider,
+            ) as protected:
+                presented = protected.call(
+                    ProviderPhase(
+                        "gui_presentation",
+                        state_mutation=False,
+                        information_flow=True,
+                    ),
+                    provider.present,
+                    public_view,
+                )
+                if not isinstance(presented, dict):
+                    raise ValidationError("Human presentation provider returned an invalid view")
+                if presented != public_view:
+                    raise ValidationError(
+                        "Human GUI presentation provider altered the release-bound view"
+                    )
+                return protected.complete(
+                    presented,
+                    self._protected_terminal_evidence(
+                        request,
+                        operation="write",
+                        resource=f"human:{request.human}",
+                        purpose=f"{presentation}_presentation",
+                        prompt_observation={"chars": observation["bytes"], **observation},
+                        result_observation={"type": "dict", "chars": observation["bytes"]},
+                    ),
+                    classification_context=effect_context,
+                    classification_result={"completed": True, "presentation": presentation},
+                    settle_success=(
+                        mark_visible
+                        if release_required
+                        else lambda: self._mark_presentation_delivered(
+                            request,
+                            presentation=presentation,
+                            view_sha256=view_sha256,
+                            provider=provider,
+                        )
+                    ),
+                )
+        finally:
+            self._data_release_presentation.reset(presentation_token)
+            self._data_release_parent_request.reset(parent_token)
+
+    def public_request_view(self, request: HumanRequest) -> dict[str, Any]:
+        """Return an observer-safe Human request projection.
+
+        Raw request state remains Host-owned and durable. High-sensitivity
+        payloads headed to a conditional Human Sink are replaced with stable,
+        metadata-only evidence until the linked exact release is approved.
+        """
+
+        return self._project_public_request_view(request, force_withhold=False)
+
+    def _withheld_public_request_view(self, request: HumanRequest) -> dict[str, Any]:
+        return self._project_public_request_view(request, force_withhold=True)
+
+    def _project_public_request_view(
+        self,
+        request: HumanRequest,
+        *,
+        force_withhold: bool,
+    ) -> dict[str, Any]:
+
+        selected = to_jsonable(request)
+        if not isinstance(selected, dict):
+            raise ValidationError("Human request could not be projected")
+        payload = self.public_request_payload(request)
+        release_parent_id = request.payload.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+        if isinstance(release_parent_id, str) and release_parent_id:
+            selected["release_for_request_id"] = release_parent_id
+        release_request_id = request.payload.get(_DATA_RELEASE_REQUEST_KEY)
+        if isinstance(release_request_id, str) and release_request_id:
+            selected["release_request_id"] = release_request_id
+        if not force_withhold and not self._withhold_request_payload_from_observers(request):
+            selected["payload"] = payload
+            return selected
+
+        request_type = payload.get("type")
+        selected["payload"] = {
+            "type": request_type if isinstance(request_type, str) else "approval",
+            "question": "Protected Human request awaiting exact data release.",
+            "release_required": True,
+            "release_request_id": (
+                release_request_id
+                if isinstance(release_request_id, str) and release_request_id
+                else None
+            ),
+            "payload_observation": _sanitize_human_observability(
+                payload,
+                metadata_only=True,
+            ),
+        }
+        if request.decision is not None:
+            selected["decision"] = _sanitize_human_observability(request.decision)
+        return selected
+
+    def _withhold_request_payload_from_observers(self, request: HumanRequest) -> bool:
+        context = self._request_data_flow_context(request)
+        if sensitivity_rank(context.labels.sensitivity) <= sensitivity_rank(
+            DataSensitivity.NORMAL
+        ):
+            return False
+        manager = getattr(self, "data_flow", None)
+        if manager is None:
+            return True
+        try:
+            trust = manager.resolve_sink_trust(
+                DataSink(
+                    identity=(
+                        f"human:{request.human}:"
+                        f"{self.config.runtime.terminal_channel}"
+                    )
+                )
+            )
+        except Exception:
+            return True
+        if trust is not None and trust.trust_level is SinkTrustLevel.TRUSTED:
+            return False
+        return not (
+            trust is not None
+            and trust.trust_level is SinkTrustLevel.CONDITIONAL
+            and self._has_completed_linked_release(request)
+        )
+
+    def _has_completed_linked_release(self, request: HumanRequest) -> bool:
+        release_request_id = request.payload.get(_DATA_RELEASE_REQUEST_KEY)
+        if not isinstance(release_request_id, str) or not release_request_id:
+            return False
+        release = self.store.get_human_request(release_request_id)
+        if release is None:
+            return False
+        decision = release.decision or {}
+        linked_and_approved = bool(
+            release.pid == request.pid
+            and release.human == request.human
+            and release.payload.get("type") == "data_release_approval"
+            and release.payload.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+            == request.request_id
+            and release.status == HumanRequestStatus.APPROVED
+            and decision.get("approved") is True
+        )
+        if not linked_and_approved:
+            return False
+        once = release.payload.get("requested_once_capability")
+        if not isinstance(once, dict):
+            return False
+        resource = once.get("resource")
+        constraints = once.get("constraints")
+        if not isinstance(resource, str) or not isinstance(constraints, dict):
+            return False
+        # Approval grants an exact one-shot capability, but approval alone is
+        # not egress. Only unredact after the protected terminal operation has
+        # consumed that exact binding and therefore completed the release.
+        return any(
+            capability.resource == resource
+            and capability.constraints == constraints
+            and capability.uses_remaining == 0
+            for capability in self.store.list_capabilities(subject=request.pid)
+        )
 
     def list(self, pid: str | None = None, *, limit: int | None = None) -> builtins.list[HumanRequest]:
         # Pending decisions are liveness-critical and must never fall behind a
@@ -726,20 +1651,60 @@ class HumanObjectManager:
             pending = self.pending(human=selected_human)
             if not pending:
                 return None
-            # The terminal is the human's message queue. Process requests strictly
-            # in creation order so approvals and answers remain predictable. A
-            # second drain may not skip a claimed head request.
-            request = pending[0]
+            # The terminal is the human's message queue. Host-created,
+            # metadata-only data-release approvals are prerequisites for
+            # delivering an older labeled request, so they must run before the
+            # request whose provider gate created them. All other requests
+            # retain creation order. A second drain may not skip a claimed
+            # selected request.
+            request = next(
+                (
+                    item
+                    for item in pending
+                    if item.payload.get("type") == "data_release_approval"
+                ),
+                pending[0],
+            )
             if request.request_id in self._terminal_claims:
                 return None
             self._terminal_claims.add(request.request_id)
         try:
-            return self._process_claimed_terminal_request(
-                request=request,
-                auto_approve=auto_approve,
-                auto_policy=auto_policy,
-                auto_answer=auto_answer,
-            )
+            try:
+                return self._process_claimed_terminal_request(
+                    request=request,
+                    auto_approve=auto_approve,
+                    auto_policy=auto_policy,
+                    auto_answer=auto_answer,
+                )
+            except HumanApprovalRequired as exc:
+                # A conditional Human Sink discovers the exact provider text
+                # only while formatting the selected request. Process the
+                # metadata-only release request immediately, then let the next
+                # queue iteration retry the original payload with the exact
+                # one-shot release. Never let that implementation detail escape
+                # as an endlessly duplicated queue item.
+                with self._terminal_lock:
+                    release = self.store.get_human_request(exc.request_id)
+                    if (
+                        release is None
+                        or release.human != selected_human
+                        or release.status != HumanRequestStatus.PENDING
+                        or release.payload.get("type") != "data_release_approval"
+                    ):
+                        raise
+                    if release.request_id in self._terminal_claims:
+                        return None
+                    self._terminal_claims.add(release.request_id)
+                try:
+                    return self._process_claimed_terminal_request(
+                        request=release,
+                        auto_approve=auto_approve,
+                        auto_policy=auto_policy,
+                        auto_answer=auto_answer,
+                    )
+                finally:
+                    with self._terminal_lock:
+                        self._terminal_claims.discard(release.request_id)
         finally:
             with self._terminal_lock:
                 self._terminal_claims.discard(request.request_id)
@@ -846,14 +1811,28 @@ class HumanObjectManager:
         status: HumanRequestStatus,
         decision: dict[str, Any],
         responder: str,
+        *,
+        required_presentation: str | None = None,
     ) -> HumanRequest:
         operations = getattr(self.store, "operation_manager", None)
         if operations is not None:
             candidates = operations.operation_for_evidence(("human_request",), request_id)
             if len(candidates) == 1:
                 with operations.attach(candidates[0].operation_id):
-                    return self._decide_impl(request_id, status, decision, responder)
-        return self._decide_impl(request_id, status, decision, responder)
+                    return self._decide_impl(
+                        request_id,
+                        status,
+                        decision,
+                        responder,
+                        required_presentation=required_presentation,
+                    )
+        return self._decide_impl(
+            request_id,
+            status,
+            decision,
+            responder,
+            required_presentation=required_presentation,
+        )
 
     def _decide_impl(
         self,
@@ -861,6 +1840,8 @@ class HumanObjectManager:
         status: HumanRequestStatus,
         decision: dict[str, Any],
         responder: str,
+        *,
+        required_presentation: str | None = None,
     ) -> HumanRequest:
         with self._terminal_lock:
             with self.store.transaction():
@@ -873,6 +1854,19 @@ class HumanObjectManager:
                 if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
                     raise ValidationError(
                         f"terminal process cannot receive a human decision: {request.pid} status={process.status.value}"
+                    )
+                if required_presentation is not None and self.is_request_withheld_for_presentation(
+                    request,
+                    presentation=required_presentation,
+                ):
+                    release_id = self._linked_presentation_release_id(
+                        request,
+                        str(required_presentation).strip().lower(),
+                    )
+                    raise HumanApprovalRequired(
+                        release_id or request.request_id,
+                        "human request payload has not been released for "
+                        f"{required_presentation} presentation",
                     )
                 self._validate_decision_side_effects(request, status, decision)
                 self._apply_decision_side_effects(request, status, decision, responder)
@@ -888,6 +1882,15 @@ class HumanObjectManager:
                 request.decision = decision
                 request.updated_at = utc_now()
                 self.store.update_human_request(request)
+                release_parent = (
+                    self._cancel_linked_request_for_release(
+                        request,
+                        outcome=status.value,
+                        actor=responder,
+                    )
+                    if status != HumanRequestStatus.APPROVED
+                    else None
+                )
                 if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
                     remaining = [
                         pending
@@ -905,35 +1908,85 @@ class HumanObjectManager:
                     else:
                         # Permission denials still wake the process so it can observe
                         # the structured failed operation. Generic rejections pause.
-                        process.status = (
-                            ProcessStatus.RUNNABLE
-                            if status == HumanRequestStatus.APPROVED or permission_related
-                            else ProcessStatus.PAUSED
-                        )
-                        process.status_message = (
-                            None
-                            if status == HumanRequestStatus.APPROVED
-                            else f"human rejected {request_id}"
-                        )
+                        if release_parent is not None:
+                            process.status = ProcessStatus.PAUSED
+                            process.status_message = (
+                                f"data release {status.value} for Human request "
+                                f"{release_parent.request_id}"
+                            )
+                        else:
+                            process.status = (
+                                ProcessStatus.RUNNABLE
+                                if status == HumanRequestStatus.APPROVED or permission_related
+                                else ProcessStatus.PAUSED
+                            )
+                            process.status_message = (
+                                None
+                                if status == HumanRequestStatus.APPROVED
+                                else f"human rejected {request_id}"
+                            )
                     process.updated_at = utc_now()
                     self.store.update_process(process)
+                response_evidence = {
+                    "request_id": request_id,
+                    "status": status.value,
+                    "decision": _sanitize_human_observability(decision),
+                }
+                if release_parent is not None:
+                    response_evidence.update(
+                        {
+                            "linked_request_id": release_parent.request_id,
+                            "linked_request_status": release_parent.status.value,
+                        }
+                    )
                 self.events.emit(
                     EventType.HUMAN_RESPONSE,
                     source=responder,
                     target=request.pid,
-                    payload={
-                        "request_id": request_id,
-                        "status": status.value,
-                        "decision": _sanitize_human_observability(decision),
-                    },
+                    payload=response_evidence,
                 )
                 self.audit.record(
                     actor=responder,
                     action="human.response",
                     target=f"human_request:{request_id}",
-                    decision={"status": status.value, "decision": _sanitize_human_observability(decision)},
+                    decision=response_evidence,
                 )
         return request
+
+    def _cancel_linked_request_for_release(
+        self,
+        release: HumanRequest,
+        *,
+        outcome: str,
+        actor: str,
+    ) -> HumanRequest | None:
+        """Fail closed when an exact Human-Sink release is not approved.
+
+        The caller owns the surrounding store transaction. The internal link
+        is persisted with the release request, so this also works after a
+        runtime reopen and never needs to reconstruct or inspect the sensitive
+        provider payload.
+        """
+
+        if release.payload.get("type") != "data_release_approval":
+            return None
+        parent_id = release.payload.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+        if not isinstance(parent_id, str) or not parent_id:
+            return None
+        parent = self.store.get_human_request(parent_id)
+        if parent is None or parent.status != HumanRequestStatus.PENDING:
+            return None
+        parent.status = HumanRequestStatus.CANCELLED
+        parent.decision = {
+            "data_release_outcome": outcome,
+            "data_release_request_id": release.request_id,
+            "terminated_by": actor,
+            "automatic_retry_disabled": True,
+            "sensitive_payload_delivered": False,
+        }
+        parent.updated_at = utc_now()
+        self.store.update_human_request(parent)
+        return parent
 
     def _validate_decision_side_effects(
         self,
@@ -1159,6 +2212,23 @@ class HumanObjectManager:
     def format_terminal_request(self, request: HumanRequest) -> str:
         return self._terminal_question(request)
 
+    def present_terminal_request(
+        self,
+        request: HumanRequest,
+        *,
+        suffix: str,
+    ) -> None:
+        """Present an interactive request through the protected Human Sink."""
+
+        question = self._terminal_question(request)
+        text = f"\nHuman request {request.request_id}: {question}\n{suffix}"
+        self._terminal_provider_io(
+            request,
+            operation="write",
+            text=text,
+            purpose="interactive_cli_presentation",
+        )
+
     def _terminal_question(self, request: HumanRequest) -> str:
         question = str(request.payload.get("question") or request.payload)
         if request.payload.get("type") == "permission_request":
@@ -1170,6 +2240,32 @@ class HumanObjectManager:
             lines = [question, "Context:"]
             for key in sorted(context):
                 lines.append(f"- {key}: {context[key]!r}")
+            return "\n".join(lines)
+        if request.payload.get("type") == "data_release_approval":
+            context = request.payload.get("context")
+            if not isinstance(context, dict):
+                return question
+            lines = ["Data release details:"]
+            for label, key in [
+                ("sink", "sink"),
+                ("sink identity sha256", "sink_identity_sha256"),
+                ("sensitivity", "sensitivity"),
+                ("tenant", "tenant"),
+                ("principal", "principal"),
+                ("payload bytes", "payload_bytes"),
+                ("payload sha256", "payload_sha256"),
+                ("labels sha256", "labels_sha256"),
+                ("source refs sha256", "source_refs_sha256"),
+                ("source count", "source_count"),
+                ("trust id", "trust_id"),
+                ("trust sha256", "trust_sha256"),
+                ("registry generation", "registry_generation"),
+                ("manifest sha256", "manifest_sha256"),
+                ("operation", "operation"),
+            ]:
+                if context.get(key) is not None:
+                    lines.append(f"- {label}: {context[key]}")
+            lines.append(question)
             return "\n".join(lines)
         if request.payload.get("type") != "external_operation_approval":
             return question
@@ -1333,6 +2429,9 @@ class HumanObjectManager:
         if operation not in {"read", "write"}:
             raise ValidationError(f"unsupported terminal human provider operation: {operation}")
         resource = f"human:{request.human}"
+        channel = self.config.runtime.terminal_channel
+        flow = self._request_data_flow_context(request)
+        sink = DataSink(identity=f"human:{request.human}:{channel}")
         prompt_observation = self._terminal_text_observation(text)
         request_kind = (
             "approval"
@@ -1360,6 +2459,16 @@ class HumanObjectManager:
                 "text": text,
             },
             observation=effect_context,
+            data_sink=sink,
+            data_flow_context=flow,
+            data_flow_ingress_context=(
+                self._human_response_context(flow)
+                if operation == "read"
+                else None
+            ),
+            data_flow_payload=text,
+            data_flow_operation=f"human.{operation}",
+            data_flow_allow_recovered_source_snapshots=True,
             failure_evidence=lambda error, phase: self._protected_terminal_evidence(
                 request,
                 operation=operation,
@@ -1371,39 +2480,168 @@ class HumanObjectManager:
                 phase=phase,
             ),
         )
-        with self._protected().start(
-            f"primitive.human.{operation}", invocation, provider=self.provider
-        ) as protected:
-            result = protected.call(
-                ProviderPhase(
-                    "terminal_io",
-                    state_mutation=operation == "write",
-                    information_flow=True,
-                ),
-                self.provider.read if operation == "read" else self.provider.write,
-                text,
-            )
-            result_observation = (
-                self._terminal_text_observation(result)
-                if isinstance(result, str)
-                else {"type": type(result).__name__}
-            )
-            return protected.complete(
-                result,
-                self._protected_terminal_evidence(
+        provider_attempted = False
+
+        def provider_call() -> str | None:
+            nonlocal provider_attempted
+            provider_attempted = True
+            if operation == "read":
+                return self.provider.read(text)
+            self.provider.write(text)
+            return None
+
+        release_parent_token = self._data_release_parent_request.set(request.request_id)
+        try:
+            with self._protected().start(
+                f"primitive.human.{operation}", invocation, provider=self.provider
+            ) as protected:
+                result = protected.call(
+                    ProviderPhase(
+                        "terminal_io",
+                        state_mutation=operation == "write",
+                        information_flow=True,
+                    ),
+                    provider_call,
+                )
+                result_observation = (
+                    self._terminal_text_observation(result)
+                    if isinstance(result, str)
+                    else {"type": type(result).__name__}
+                )
+                return protected.complete(
+                    result,
+                    self._protected_terminal_evidence(
+                        request,
+                        operation=operation,
+                        resource=resource,
+                        purpose=purpose,
+                        prompt_observation=prompt_observation,
+                        result_observation=result_observation,
+                    ),
+                    classification_context=effect_context,
+                    classification_result={
+                        "completed": True,
+                        "result_observation": result_observation,
+                    },
+                )
+        except ProviderEffectNotStarted:
+            # A provider-certified pre-boundary failure is safe to retry and
+            # therefore intentionally keeps the request pending.
+            raise
+        except BaseException as error:
+            if provider_attempted:
+                self._mark_terminal_provider_outcome_unknown(
                     request,
                     operation=operation,
-                    resource=resource,
                     purpose=purpose,
-                    prompt_observation=prompt_observation,
-                    result_observation=result_observation,
-                ),
-                classification_context=effect_context,
-                classification_result={
-                    "completed": True,
-                    "result_observation": result_observation,
-                },
+                    error=error,
+                )
+            raise
+        finally:
+            self._data_release_parent_request.reset(release_parent_token)
+
+    def _mark_terminal_provider_outcome_unknown(
+        self,
+        request: HumanRequest,
+        *,
+        operation: str,
+        purpose: str,
+        error: BaseException,
+    ) -> None:
+        """Persist a non-retryable terminal request after ambiguous provider I/O."""
+
+        evidence: dict[str, Any] | None = None
+        latest: HumanRequest | None = None
+        with self._terminal_lock:
+            with self.store.transaction():
+                latest = self.store.get_human_request(request.request_id)
+                if latest is None or latest.status != HumanRequestStatus.PENDING:
+                    return
+                latest.status = HumanRequestStatus.CANCELLED
+                latest.decision = {
+                    "provider_outcome": "unknown",
+                    "automatic_retry_disabled": True,
+                    "manual_recovery_required": True,
+                    "operation": operation,
+                    "purpose": purpose,
+                    "error_type": type(error).__name__,
+                }
+                latest.updated_at = utc_now()
+                self.store.update_human_request(latest)
+                release_parent = self._cancel_linked_request_for_release(
+                    latest,
+                    outcome="provider_outcome_unknown",
+                    actor="runtime:human-provider",
+                )
+
+                process = self.store.get_process(latest.pid)
+                if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
+                    remaining = [
+                        pending
+                        for pending in self.store.list_human_requests(
+                            pid=latest.pid,
+                            status=HumanRequestStatus.PENDING,
+                        )
+                        if pending.blocking
+                    ]
+                    if remaining:
+                        process.status_message = "waiting for human requests " + ",".join(
+                            pending.request_id for pending in remaining[:8]
+                        )
+                    else:
+                        process.status = ProcessStatus.PAUSED
+                        if release_parent is not None:
+                            process.status_message = (
+                                "data release provider outcome unknown for Human request "
+                                f"{release_parent.request_id}; manual recovery required"
+                            )
+                        else:
+                            process.status_message = (
+                                f"human provider outcome unknown for request {latest.request_id}; "
+                                "manual recovery required"
+                            )
+                    process.updated_at = utc_now()
+                    self.store.update_process(process)
+
+                evidence = {
+                    "request_id": latest.request_id,
+                    "status": latest.status.value,
+                    "provider_outcome": "unknown",
+                    "automatic_retry_disabled": True,
+                    "operation": operation,
+                    "purpose": purpose,
+                    "error_type": type(error).__name__,
+                }
+                if release_parent is not None:
+                    evidence.update(
+                        {
+                            "linked_request_id": release_parent.request_id,
+                            "linked_request_status": release_parent.status.value,
+                        }
+                    )
+        assert latest is not None and evidence is not None
+        # The non-retryable request transition is the safety boundary. Keep it
+        # committed even if secondary observability is temporarily unavailable;
+        # the protected-operation effect ledger still carries the provider
+        # uncertainty.
+        try:
+            self.events.emit(
+                EventType.HUMAN_RESPONSE,
+                source=f"human:{latest.human}",
+                target=latest.pid,
+                payload=evidence,
             )
+        except Exception:
+            pass
+        try:
+            self.audit.record(
+                actor="runtime:human-provider",
+                action="human.request.provider_outcome_unknown",
+                target=f"human_request:{latest.request_id}",
+                decision=evidence,
+            )
+        except Exception:
+            pass
 
     def _protected(self) -> Any:
         sdk = (
@@ -1615,6 +2853,11 @@ class HumanObjectManager:
                 "message": message,
             },
             observation=effect_context,
+            data_sink=DataSink(identity=f"human:{request.human}:{channel}"),
+            data_flow_context=self._request_data_flow_context(request),
+            data_flow_payload=message,
+            data_flow_operation="human.output",
+            data_flow_allow_recovered_source_snapshots=True,
             prepare=prepare,
             restore_not_started=restore_not_started,
             failure_evidence=lambda error, phase: self._protected_output_evidence(
@@ -1668,6 +2911,75 @@ class HumanObjectManager:
         except Exception:
             pass
         return result
+
+    def _request_source_context(
+        self,
+        pid: str,
+        *,
+        source_oids: Iterable[str] | None = None,
+        public_metadata: bool = False,
+    ) -> DataFlowContext:
+        manager = getattr(self, "data_flow", None)
+        if public_metadata:
+            return DataFlowContext(
+                labels=DataLabels(
+                    sensitivity=DataSensitivity.PUBLIC,
+                    trust_level=DataTrustLevel.VERIFIED,
+                    integrity=DataIntegrity.VERIFIED,
+                    origin="runtime:data-release-metadata",
+                )
+            )
+        if manager is None:
+            return DataFlowContext()
+        return manager.context_from_source_oids(pid, source_oids)
+
+    def _request_data_flow_context(self, request: HumanRequest) -> DataFlowContext:
+        raw = request.payload.get(_DATA_FLOW_CONTEXT_KEY)
+        if raw is None:
+            return DataFlowContext()
+        if not isinstance(raw, Mapping):
+            raise ValidationError("Human request has invalid trusted data-flow context")
+        try:
+            return DataFlowContext.from_dict(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"Human request has invalid trusted data-flow context: {exc}") from exc
+
+    def _precheck_human_egress(
+        self,
+        *,
+        pid: str,
+        human: str,
+        channel: str,
+        context: DataFlowContext,
+        payload: Any,
+    ) -> None:
+        manager = getattr(self, "data_flow", None)
+        if manager is None:
+            return
+        manager.precheck_egress_clearance(
+            pid=pid,
+            sink=DataSink(identity=f"human:{human}:{channel}"),
+            context=context,
+            payload=payload,
+        )
+
+    def _observe_human_response(self, request_context: DataFlowContext) -> None:
+        manager = getattr(self, "data_flow", None)
+        if manager is None:
+            return
+        manager.observe_ingress(self._human_response_context(request_context))
+
+    @staticmethod
+    def _human_response_context(request_context: DataFlowContext) -> DataFlowContext:
+        external = DataFlowContext(
+            labels=DataLabels(
+                sensitivity=DataSensitivity.NORMAL,
+                trust_level=DataTrustLevel.UNTRUSTED,
+                integrity=DataIntegrity.UNTRUSTED,
+                origin="external:human",
+            )
+        )
+        return DataFlowContext.aggregate((request_context, external))
 
     def recover_prepared_output(self, effect: Any) -> None:
         """Undo a durable output claim that never reached the Human provider."""

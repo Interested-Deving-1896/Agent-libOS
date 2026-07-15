@@ -13,6 +13,45 @@ from agent_libos.models.exceptions import CapabilityDenied, NotFound, Validation
 from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.skills import write_skill_package
 
+
+def _identity_manifest(allowed_tenants: list[str]) -> dict[str, object]:
+    return {
+        'data_flow_policy': {
+            'schema_version': 1,
+            'allowed_tenants': allowed_tenants,
+            'allowed_principals': [],
+        }
+    }
+
+
+def _commit_tenant_image(runtime: Runtime) -> str:
+    source = runtime.process.spawn(
+        image='base-agent:v0',
+        goal='capture tenant-a state',
+        authority_manifest=_identity_manifest(['tenant-a']),
+    )
+    runtime.memory.create_object(
+        source,
+        ObjectType.ARTIFACT,
+        {'marker': 'CHECKPOINT_IMAGE_TENANT_A'},
+        metadata=ObjectMetadata(
+            title='tenant-a baked state',
+            sensitivity='secret',
+            tenant='tenant-a',
+        ),
+        name='tenant-a-baked-state',
+        immutable=True,
+    )
+    checkpoint_id = runtime.checkpoint.create(source, 'tenant-a image state', actor=source)
+    runtime.image_registry.grant_register(source, 'tenant-domain-image:v0', issued_by='test')
+    runtime.image_registry.commit_from_checkpoint(
+        actor=source,
+        checkpoint_id=checkpoint_id,
+        image_id='tenant-domain-image:v0',
+        name='tenant-domain-image',
+    )
+    return 'tenant-domain-image:v0'
+
 class TestImageCommit:
 
     def test_commit_settles_checkpoint_read_and_image_write_only_with_image_transaction(
@@ -114,6 +153,80 @@ class TestImageCommit:
             runtime.exec_process(target, 'exec-state:v0', goal='new goal', preserve_capabilities=False)
             assert runtime.memory.get_object_by_name(target, 'role').payload == {'role': 'committed'}
             assert not runtime.capability.check(target, 'shell:python', CapabilityRight.EXECUTE)
+
+    def test_committed_image_spawn_rejects_baked_object_outside_identity_domain(self) -> None:
+        with _runtime() as runtime:
+            image_id = _commit_tenant_image(runtime)
+            processes_before = {process.pid for process in runtime.store.list_processes()}
+
+            with pytest.raises(CapabilityDenied, match='data_flow_policy'):
+                runtime.process.spawn(
+                    image=image_id,
+                    goal='restricted root boot',
+                    authority_manifest=_identity_manifest([]),
+                )
+
+            assert {process.pid for process in runtime.store.list_processes()} == processes_before
+            allowed = runtime.process.spawn(
+                image=image_id,
+                goal='same-domain root boot',
+                authority_manifest=_identity_manifest(['tenant-a']),
+            )
+            assert runtime.memory.get_object_by_name(
+                allowed,
+                'tenant-a-baked-state',
+            ).payload == {'marker': 'CHECKPOINT_IMAGE_TENANT_A'}
+
+    def test_committed_image_exec_rejects_baked_object_outside_identity_domain(self) -> None:
+        with _runtime() as runtime:
+            image_id = _commit_tenant_image(runtime)
+            target = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='restricted exec target',
+                authority_manifest=_identity_manifest([]),
+            )
+            before = runtime.process.get(target)
+            runtime.capability.grant(
+                target,
+                runtime.image_registry.resource_for(image_id),
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+
+            with pytest.raises(CapabilityDenied, match='data_flow_policy'):
+                runtime.exec_process(
+                    target,
+                    image_id,
+                    goal='boot committed image',
+                    preserve_capabilities=False,
+                )
+
+            after = runtime.process.get(target)
+            assert after.image_id == before.image_id == 'base-agent:v0'
+            assert after.goal_oid == before.goal_oid
+            with pytest.raises(NotFound):
+                runtime.memory.get_object_by_name(target, 'tenant-a-baked-state')
+            allowed = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='same-domain exec target',
+                authority_manifest=_identity_manifest(['tenant-a']),
+            )
+            runtime.capability.grant(
+                allowed,
+                runtime.image_registry.resource_for(image_id),
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            runtime.exec_process(
+                allowed,
+                image_id,
+                goal='same-domain committed image',
+                preserve_capabilities=False,
+            )
+            assert runtime.memory.get_object_by_name(
+                allowed,
+                'tenant-a-baked-state',
+            ).payload == {'marker': 'CHECKPOINT_IMAGE_TENANT_A'}
 
     def test_committed_image_boot_requires_image_read_authority(self) -> None:
         with _runtime() as runtime:

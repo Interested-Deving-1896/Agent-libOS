@@ -25,6 +25,9 @@ capabilities:
     write:
       - committed-benchmark:v0
 allowed_effects:
+  - type: external.provider_call
+    provider: llm
+    operation: complete
   - type: image.commit
     image: committed-benchmark:v0
   - type: process.exec

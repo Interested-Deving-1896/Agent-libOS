@@ -304,6 +304,24 @@ queue cannot show the prompt again; the unresolved intent remains pending.
 Human output provider failures likewise persist only `provider_error_type`, not
 the exception message.
 
+## Data release is separate authority
+
+Ordinary Human approval cannot make an external Sink trusted. Data above
+`normal` sent to a `conditional` Host Sink requires a distinct
+`data_release:<canonical-sink>` `approve` capability with
+`uses_remaining=1`. The capability constraint binds the pid, trust id/hash and
+registry generation, Task Authority manifest hash, source Object
+id/version/content hashes, label hash, canonical payload hash, operation, and
+target-state version. Any mismatch makes it unusable.
+
+The release request displays only Sink/label identity, size, and hashes. It
+does not change the Object label and does not replace the normal capability or
+`permitted_effects` check. An `untrusted` Sink cannot be released above
+`normal`; a `trusted` Sink needs no release but still grants no ordinary right.
+Host Sink registry writes separately require `admin` on
+`data_flow_sink_registry:*` and have no model-facing tool. See
+[Data Flow](data_flow.md).
+
 ## Tool, Skill, And JIT Boundary
 
 The process tool table controls LLM-facing tool visibility. Capabilities
@@ -447,6 +465,13 @@ model can produce them.
 Read, write, and delete are separate rights. Granting read over a directory does
 not grant write or delete.
 
+File writes also bind the canonical `filesystem:workspace:<path>` as a data
+Sink. The content/path operation is checked against source labels before
+`state()` or mutation, then revalidated with the exact path-label generation in
+the protected transaction. Success persists a content-hash/source/label path
+binding; later external modification does not silently downgrade it. A trusted
+path still requires normal filesystem write authority.
+
 Process cwd selection is a filesystem read, not ambient process metadata.
 `set_working_directory`, explicit spawn/fork working directories, and explicit
 PTY cwd values require `read` on the selected directory resource. Higher-level
@@ -530,6 +555,17 @@ the local Shell provider rejects budgeted execution that supplies
 `SubprocessLimits` because it cannot enforce that profile; unbudgeted Shell
 execution may still run, while Deno uses its separate Windows supervision and
 budget backend.
+
+Shell argv is an egress payload to `shell:<resolved-executable>`. Clearance
+above `normal` must bind the executable content hash, which is revalidated
+immediately before provider dispatch. Explicit Host trust may allow classified
+argv within clearance, but does not bypass command
+risk policy, execute capability, Human approval, cwd authority, effect ceiling,
+or resource budget. More importantly, trust says the Host accepts that native
+program as a recipient; it does not mediate the program's subsequent direct
+filesystem or network I/O. PTY spawn uses the same content-bound
+resolved-executable model and pins that trust identity for all later session
+input.
 
 Shell command risk is classified by argv-token rules before the provider runs:
 

@@ -27,6 +27,7 @@ Legend:
 | JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
 | MCP client | Tools-only v1 over Streamable HTTP or stdio | Deterministic primitive/provider tests | Real MCP SDK/server integration uses the optional `mcp` extra and `--run-mcp` environment gate; Resources/Prompts are not implemented |
 | Real LLM | OpenAI Responses and OpenAI-compatible Chat profiles | Mock/action-selection paths only | Credentials and token-spending smoke are opt-in with `--run-real-llm`; run one scoped task/profile per release target |
+| Data-label egress enforcement | Host Sink registry and a unified gate cover LLM, Human, JSON-RPC, MCP, filesystem writes, Shell/PTY, and internal process handoff | Deterministic unit/runtime/security/provider/benchmark tests, including pre-provider denial and exact conditional release | The guarantee covers runtime-mediated payloads; trusted modules/providers, native child I/O, Sink re-forwarding, and direct store administration remain operator trust boundaries |
 
 ## GUI and API coverage
 
@@ -43,7 +44,7 @@ Legend:
 
 | Suite | Default evidence | Boundary |
 | --- | --- | --- |
-| `benchmarks/runtime_safety` | Deterministic schema-v1 task×runner matrix, fail-closed metrics, provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof |
+| `benchmarks/runtime_safety` | Deterministic schema-v1 task×runner matrix, including `data_label_exfiltration`, fail-closed metrics, provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof |
 | `benchmarks/practical_agent_workflows` | Separates `native-live`, `native-partial`, `mocked`, and `modeled`; native has no modeled fallback | Checked-in scenarios do not imply a real GitHub/provider integration |
 | Real-model benchmark | One explicitly selected task with real LLM profile | Token/credential gate; results must retain model/profile/environment provenance |
 

@@ -17,6 +17,7 @@ and committed and how provider ambiguity is represented.
 Register contracts during trusted Runtime composition:
 
 ```python
+from agent_libos.models import DataFlowDirection
 from agent_libos.sdk import ProtectedOperationContract, ResourcePolicy
 
 runtime.protected_operations.register_contract(
@@ -27,6 +28,7 @@ runtime.protected_operations.register_contract(
         evidence_roles=("audit", "event", "effect"),
         resource_policy=ResourcePolicy.REQUIRED,
         information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
     )
 )
 ```
@@ -45,6 +47,16 @@ durably settled. Provider failure therefore cannot create an unmetered
 finalized path; a failed effect settlement remains a pending intent for
 reconciliation.
 
+`data_flow_direction` is independently `none`, `ingress`, `egress`, or
+`bidirectional`. Do not infer egress from `information_flow`: filesystem reads,
+DNS, and clocks observe information but do not send the caller's payload.
+Every egress/bidirectional invocation must provide a concrete `DataSink`,
+trusted `DataFlowContext`, canonical payload descriptor, and non-empty
+data-flow operation. Every ingress/bidirectional invocation must additionally
+provide a trusted `data_flow_ingress_context`; `none` and egress-only
+invocations must omit it. A contract with a data-flow direction must also
+declare `information_flow=True`.
+
 If `prepare` changes durable domain state, declare a named
 `prepared_recovery` policy on the contract and register its trusted recovery
 handler during Runtime composition. The effect row persists only the policy
@@ -58,6 +70,10 @@ observation. The SDK hashes canonical arguments for approval/idempotency
 binding but persists only the observation:
 
 ```python
+ingress_context = runtime.data_flow.unclassified_ingress_context(
+    flow_context,
+    origin="external:example",
+)
 invocation = ProtectedOperationInvocation(
     pid=pid,
     actor=pid,
@@ -72,6 +88,11 @@ invocation = ProtectedOperationInvocation(
         source="primitive.example.fetch",
         context={"failure_phase": phase},
     ),
+    data_flow_ingress_context=ingress_context,
+    data_sink=sink,
+    data_flow_context=flow_context,
+    data_flow_payload=provider_request,
+    data_flow_operation="example.fetch",
 )
 ```
 
@@ -82,6 +103,18 @@ not make a provider call or place exception text in persisted context.
 
 Do not put Object payloads, credentials, Human content, raw LLM I/O, provider
 payloads, stdout/stderr, or exception text in observations or evidence.
+
+Before preparing the effect, the SDK reauthorizes the data flow against the
+current Sink-registry generation and exact source Object versions/content
+hashes, checks the payload and release binding, then reserves ordinary and
+release capabilities with the intent in one transaction. It repeats the full
+data-flow recheck immediately before every provider phase; a release consumed by
+an earlier phase is accepted only through the same protected-operation
+reservation. A failed prepare recheck creates no intent, while a failed dispatch
+recheck calls no later provider phase. Effect metadata stores only the
+decision/trust/source/label hashes and ids. Together, the early primitive check,
+transactional prepare, and per-phase dispatch recheck close
+provider-before-policy and mutable-source TOCTOU paths.
 
 ## Synchronous operation
 
@@ -147,6 +180,15 @@ authority is committed. If a later phase raises `ProviderEffectNotStarted`, the
 SDK finalizes the confirmed partial effect; it does not erase the earlier
 information flow or restore authority.
 
+For an ingress/bidirectional contract, the SDK observes the invocation's
+ingress context automatically and at most once after the first actually
+started phase whose `information_flow` flag is true. It observes before
+returning a successful result and before propagating an ordinary exception,
+cancellation, or otherwise uncertain failure. A current phase certified by
+`ProviderEffectNotStarted`, whether raised or returned as the structured marker
+below, does not propagate its ingress context. Any context already observed by
+an earlier completed information-flow phase remains in force.
+
 When a primitive must return a structured domain error instead of propagating
 `ProviderEffectNotStarted`, its provider callable may return
 `ProviderEffectNotStartedResult(error, result, outcome=...)`. The SDK settles
@@ -162,6 +204,10 @@ a not-started mutating phase from becoming a false committed mutation.
 - An ordinary exception or cancellation consumes authority and best-effort
   finalizes `unknown`; if settlement itself fails, the dispatched pending intent
   remains durable for reconciliation.
+- Success, provider error, and finalized-unknown metadata all retain the same
+  payload-free data-flow evidence (decision, Sink/trust generation, source
+  refs and label hashes). Finalizing an intent never replaces that evidence
+  with an error-only envelope.
 - A dispatched required-resource operation settles measured `failure_resource`
   usage, or conservatively settles its preflight usage when no measurement is
   available. Charging remains after effect settlement, so an overage cannot
@@ -179,9 +225,13 @@ unknown evidence, and never invokes the sink again.
 
 ## Prepare, settle, and compensation hooks
 
-`prepare`, `restore_not_started`, and `settle_success` may mutate only local
-transactional state. They must not call a provider. A compensating host action
-is another phase on the same handle:
+`prepare`, `restore_not_started`, `settle_success`, and `failure_settlement`
+may mutate only local transactional state. They must not call a provider.
+`failure_settlement(error, phase)` runs at most once, in its own transaction,
+only after dispatch may have crossed a provider boundary; it is not run for a
+first-phase `ProviderEffectNotStarted`. It lets a primitive preserve local
+conservative state such as a file-path label when the provider outcome is
+unknown. A compensating host action is another phase on the same handle:
 
 ```python
 try:
@@ -209,5 +259,9 @@ called outside a phase, and provider session-handle calls such as
 `session.handle.read()` must be inside a protected callable. The SDK contract
 registry is checked against the Explainable Operations external primitive
 boundary set.
+It also requires every registered data-flow contract to declare an exact
+direction and statically rejects SDK starts whose invocation omits the ingress
+context or, for egress, the Sink, source context, payload descriptor, or
+operation. LLM is included in this provider-boundary inventory.
 The SDK is Host-only infrastructure: it adds no model tool, syscall, CLI, or
 HTTP endpoint.

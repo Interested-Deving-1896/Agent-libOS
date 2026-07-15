@@ -9,6 +9,7 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     CapabilitySpec,
+    DataFlowContext,
     ForkMode,
     HumanRequestStatus,
     MemoryViewSpec,
@@ -20,6 +21,7 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
+    Provenance,
     ResourceUsage,
     ViewMode,
 )
@@ -137,32 +139,48 @@ class LibOSSyscallSession:
         self._human_run_context = runtime.current_human_run_context()
         self._deferred_exit: dict[str, Any] | None = None
         self._deferred_exec: dict[str, Any] | None = None
+        self._deferred_exec_context: DataFlowContext | None = None
+        self._observed_context = runtime.data_flow.current_context()
         self._tracked_wait_states: set[tuple[ProcessStatus, str]] = set()
 
     async def handle(self, name: str, args: dict[str, Any]) -> Any:
         normalized = name.strip()
-        with self.runtime.operations.scope(
-            kind="syscall",
-            name=f"syscall.{normalized or 'invalid'}",
-            actor=self.pid,
-            pid=self.pid,
-            expected_roles=["invocation", "audit"],
-        ) as operation:
-            self.runtime.operations.link_evidence(
-                "syscall_call",
-                operation.operation_id,
-                "invocation",
-                operation_id=operation.operation_id,
-                metadata={"name": normalized},
+        try:
+            with self.runtime.operations.scope(
+                kind="syscall",
+                name=f"syscall.{normalized or 'invalid'}",
+                actor=self.pid,
+                pid=self.pid,
+                expected_roles=["invocation", "audit"],
+            ) as operation:
+                self.runtime.operations.link_evidence(
+                    "syscall_call",
+                    operation.operation_id,
+                    "invocation",
+                    operation_id=operation.operation_id,
+                    metadata={"name": normalized},
+                )
+                result = await self._handle_impl(name, args)
+                self.runtime.operations.link_evidence(
+                    "syscall_call",
+                    operation.operation_id,
+                    "result",
+                    operation_id=operation.operation_id,
+                )
+                return result
+        finally:
+            self._observed_context = DataFlowContext.aggregate(
+                (
+                    self._observed_context,
+                    self.runtime.data_flow.current_context(),
+                )
             )
-            result = await self._handle_impl(name, args)
-            self.runtime.operations.link_evidence(
-                "syscall_call",
-                operation.operation_id,
-                "result",
-                operation_id=operation.operation_id,
-            )
-            return result
+
+    @property
+    def observed_context(self) -> DataFlowContext:
+        """Return the trusted syscall high-water mark across sandbox task boundaries."""
+
+        return self._observed_context
 
     async def _handle_impl(self, name: str, args: dict[str, Any]) -> Any:
         normalized = name.strip()
@@ -218,6 +236,8 @@ class LibOSSyscallSession:
     async def apply_deferred_lifecycle(self, tool_result: ObjectHandle | None = None) -> None:
         if self._deferred_exec is not None:
             exec_args = self._deferred_exec
+            if self._deferred_exec_context is None:
+                raise ProcessError("deferred exec is missing trusted data-flow context")
             self.runtime.exec_process(
                 self.pid,
                 str(exec_args["image"]),
@@ -225,6 +245,12 @@ class LibOSSyscallSession:
                 goal=exec_args.get("goal"),
                 preserve_memory=bool(exec_args.get("preserve_memory", True)),
                 preserve_capabilities=bool(exec_args.get("preserve_capabilities", False)),
+                source_context=DataFlowContext.aggregate(
+                    (
+                        self._deferred_exec_context,
+                        self.runtime.data_flow.current_context(),
+                    )
+                ),
             )
         if self._deferred_exit is not None:
             exit_args = self._deferred_exit
@@ -233,7 +259,7 @@ class LibOSSyscallSession:
                 self.pid,
                 result=result_handle,
                 failed=bool(exit_args.get("failed", False)),
-                message=exit_args.get("message"),
+                message=None if result_handle is not None else exit_args.get("message"),
             )
 
     async def _with_blocking(self, operation: Any) -> Any:
@@ -352,6 +378,11 @@ class LibOSSyscallSession:
             return {"namespace": ns.namespace, "parent_namespace": ns.parent_namespace, "created": True}
         if name == "memory.list_namespace":
             listing = self.runtime.memory.list_namespace(self.pid, args.get("namespace"), limit=args.get("limit"))
+            self.runtime.data_flow.observe_ingress(
+                self.runtime.data_flow.context_from_trusted_source_oids(
+                    [obj.oid for obj in listing["objects"]]
+                )
+            )
             return {
                 "namespace": listing["namespace"],
                 "objects": [
@@ -373,6 +404,9 @@ class LibOSSyscallSession:
             return self._memory_create_object(args)
         if name in {"memory.read_object", "memory.get_object"}:
             obj = self.runtime.memory.get_object_by_name(self.pid, str(args["name"]), namespace=args.get("namespace"))
+            self.runtime.data_flow.observe_ingress(
+                self.runtime.data_flow.context_from_trusted_source_oids([obj.oid])
+            )
             return {
                 "oid": obj.oid,
                 "namespace": obj.namespace,
@@ -480,6 +514,7 @@ class LibOSSyscallSession:
                 subject=str(args.get("subject", "")),
                 body=str(args.get("body", "")),
                 payload=dict(args.get("payload") or {}),
+                source_context=self.runtime.data_flow.current_context(),
             )
             return self._process_message_result(message)
         if name == "process.read_messages":
@@ -488,6 +523,7 @@ class LibOSSyscallSession:
             return self._process_read_messages(args, default_block=True)
         if name == "process.exec":
             self._deferred_exec = dict(args)
+            self._deferred_exec_context = self.runtime.data_flow.current_context()
             return {"deferred": True, "operation": "process.exec", "image": args.get("image")}
         if name == "process.exit":
             self._deferred_exit = dict(args)
@@ -654,26 +690,43 @@ class LibOSSyscallSession:
 
     def _memory_create_object(self, args: dict[str, Any]) -> Any:
         metadata_arg = dict(args.get("metadata") or {})
+        flow = self.runtime.data_flow.current_context()
+        parent_oids, durable_source_refs = (
+            self.runtime.data_flow.provenance_sources(flow)
+        )
         metadata = ObjectMetadata(
             title=metadata_arg.get("title"),
             summary=metadata_arg.get("summary"),
             tags=list(metadata_arg.get("tags", [])),
             mime_type=metadata_arg.get("mime_type"),
+            **flow.labels.to_dict(),
         )
         handle = self.runtime.memory.create_object(
             pid=self.pid,
             object_type=ObjectType(str(args.get("type", ObjectType.OBSERVATION.value))),
             payload=args.get("payload"),
             metadata=metadata,
+            provenance=Provenance(
+                created_from_action="jit.memory.create_object",
+                parent_oids=list(parent_oids),
+                source_refs=list(durable_source_refs),
+            ),
             immutable=bool(args.get("immutable", True)),
             name=args.get("name"),
             namespace=args.get("namespace"),
         )
         self._add_handle_to_view(handle)
         obj = self.runtime.memory.get_object(self.pid, handle)
+        self.runtime.data_flow.observe_ingress(
+            self.runtime.data_flow.context_from_trusted_source_oids([obj.oid])
+        )
         return {"oid": handle.oid, "namespace": obj.namespace, "name": obj.name, "type": obj.type.value}
 
     def _memory_append_object(self, args: dict[str, Any]) -> Any:
+        source_context = self.runtime.data_flow.current_context()
+        parent_oids, durable_source_refs = (
+            self.runtime.data_flow.provenance_sources(source_context)
+        )
         updated, list_field, length = self.runtime.memory.append_object_by_name(
             self.pid,
             str(args["name"]),
@@ -681,6 +734,12 @@ class LibOSSyscallSession:
             str(args.get("list_field", "entries")),
             namespace=args.get("namespace"),
             issued_by="jit.syscall",
+            source_oids=parent_oids,
+            provenance_source_refs=durable_source_refs,
+            source_context=source_context,
+        )
+        self.runtime.data_flow.observe_ingress(
+            self.runtime.data_flow.context_from_trusted_source_oids([updated.oid])
         )
         return {
             "oid": updated.oid,
@@ -811,6 +870,7 @@ class LibOSSyscallSession:
             image=args.get("image"),
             mode=mode,
             working_directory=args.get("working_directory"),
+            source_context=self.runtime.data_flow.current_context(),
         )
         child = self.runtime.process.get(child_pid)
         return {"child_pid": child.pid, "status": child.status.value, "image": child.image_id, "goal_oid": child.goal_oid}
@@ -823,6 +883,7 @@ class LibOSSyscallSession:
             inherit_capabilities=list(args.get("inherit_capabilities") or []),
             resource_budget=args.get("resource_budget"),
             working_directory=args.get("working_directory"),
+            source_context=self.runtime.data_flow.current_context(),
         )
         child = self.runtime.process.get(child_pid)
         return {"child_pid": child.pid, "status": child.status.value, "image": child.image_id, "goal_oid": child.goal_oid}
@@ -859,6 +920,15 @@ class LibOSSyscallSession:
             message_ids=[str(item) for item in args["message_ids"]] if args.get("message_ids") is not None else None,
             limit=int(args["limit"]) if args.get("limit") is not None else None,
         )
+        carrier_oids = self.runtime.messages.observe_labels(self.pid, messages)
+        if carrier_oids:
+            self.runtime.data_flow.observe_ingress(
+                self.runtime.data_flow.context_from_source_oids(
+                    self.pid,
+                    carrier_oids,
+                    include_current=False,
+                )
+            )
         acked = []
         if bool(args.get("ack", True)):
             unread_ids = [message.message_id for message in messages if message.status.value == "unread"]
@@ -922,12 +992,22 @@ class LibOSSyscallSession:
                 optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
                 issued_by="jit.process_exit",
             )
-        if "payload" in args:
+        if "payload" in args or args.get("message") is not None:
+            source_oids = self.runtime.process.flow_source_oids(self.pid)
+            source_context = self.runtime.data_flow.current_context()
             return self.runtime.memory.create_object(
                 pid=self.pid,
                 object_type=ObjectType.SUMMARY,
-                payload=args.get("payload"),
-                metadata=ObjectMetadata(title="Process final result", tags=["final", "jit"]),
+                payload=args.get("payload") if "payload" in args else {"message": args.get("message")},
+                metadata=self.runtime.process.flow_metadata(
+                    source_oids,
+                    source_context=source_context,
+                    base=ObjectMetadata(title="Process final result", tags=["final", "jit"]),
+                ),
+                provenance=Provenance(
+                    created_from_action="jit.process.exit",
+                    parent_oids=source_oids,
+                ),
             )
         if bool(args.get("use_tool_result", False)):
             return tool_result

@@ -3,13 +3,27 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
 from agent_libos.llm.user_profiles import UserLLMProfileStore, default_user_llm_profiles_path
-from agent_libos.models import AgentImage, CapabilityRight, ProcessStatus
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models import (
+    AgentImage,
+    CapabilityRight,
+    DataFlowContext,
+    DataLabels,
+    DataSink,
+    ProcessStatus,
+    SinkTrustLevel,
+    SinkTrustRule,
+)
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.storage import SQLiteStore
 from tests.support.fakes import RecordingActionClient
 
@@ -32,6 +46,346 @@ def _profile_config() -> AgentLibOSConfig:
 
 
 class TestLLMProfiles:
+    @pytest.mark.parametrize(
+        (
+            "env_name",
+            "equivalent_env_value",
+            "env_value",
+            "client_attribute",
+            "expected",
+            "isolated_expected",
+        ),
+        [
+            ("OPENAI_STORE", "0", "1", "store", True, False),
+            (
+                "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
+                "false",
+                "true",
+                "responses_previous_response_id",
+                True,
+                False,
+            ),
+            (
+                "OPENAI_PROMPT_CACHE_RETENTION",
+                "",
+                "24h",
+                "prompt_cache_retention",
+                "24h",
+                None,
+            ),
+        ],
+    )
+    def test_default_profile_identity_tracks_effective_legacy_policy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+        equivalent_env_value: str,
+        env_value: str,
+        client_attribute: str,
+        expected: object,
+        isolated_expected: object,
+    ) -> None:
+        monkeypatch.delenv(env_name, raising=False)
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                default_profile_id="default",
+                profiles={
+                    "default": LLMProfile(),
+                    "isolated": LLMProfile(),
+                },
+            )
+        )
+        runtime = Runtime(SQLiteStore(":memory:"), config=config)
+        try:
+            baseline = runtime.llms.profile_identity_sha256("default")
+            isolated = runtime.llms.profile_identity_sha256("isolated")
+            assert runtime.llms.profile_identity_sha256("default") == baseline
+
+            monkeypatch.setenv(env_name, equivalent_env_value)
+            assert runtime.llms.profile_identity_sha256("default") == baseline
+
+            monkeypatch.setenv(env_name, env_value)
+
+            changed = runtime.llms.profile_identity_sha256("default")
+            assert changed != baseline
+            assert runtime.llms.profile_identity_sha256("default") == changed
+            assert getattr(runtime.llms.resolve("default").client, client_attribute) == expected
+            assert runtime.llms.profile_identity_sha256("isolated") == isolated
+            assert getattr(runtime.llms.resolve("isolated").client, client_attribute) == isolated_expected
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("env_name", "profile_kwargs", "env_value", "client_attribute", "expected"),
+        [
+            ("OPENAI_STORE", {"store": False}, "1", "store", False),
+            (
+                "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
+                {"responses_previous_response_id": False},
+                "true",
+                "responses_previous_response_id",
+                False,
+            ),
+            (
+                "OPENAI_PROMPT_CACHE_RETENTION",
+                {"prompt_cache_retention": "in-memory"},
+                "24h",
+                "prompt_cache_retention",
+                "in-memory",
+            ),
+        ],
+    )
+    def test_explicit_default_profile_policy_precedes_legacy_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+        profile_kwargs: dict[str, object],
+        env_value: str,
+        client_attribute: str,
+        expected: object,
+    ) -> None:
+        monkeypatch.delenv(env_name, raising=False)
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                profiles={"default": LLMProfile(**profile_kwargs)},
+            )
+        )
+        runtime = Runtime(SQLiteStore(":memory:"), config=config)
+        try:
+            baseline = runtime.llms.profile_identity_sha256("default")
+            monkeypatch.setenv(env_name, env_value)
+
+            assert runtime.llms.profile_identity_sha256("default") == baseline
+            assert getattr(runtime.llms.resolve("default").client, client_attribute) == expected
+        finally:
+            runtime.close()
+
+    def test_profile_identity_excludes_api_key_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "first-secret")
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            first = runtime.llms.profile_identity_sha256("default")
+
+            monkeypatch.setenv("OPENAI_API_KEY", "second-secret")
+
+            assert runtime.llms.profile_identity_sha256("default") == first
+        finally:
+            runtime.close()
+
+    def test_cached_default_client_is_rebuilt_for_new_effective_release_policy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_STORE", "1")
+        monkeypatch.setenv("OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID", "true")
+        monkeypatch.setenv("OPENAI_PROMPT_CACHE_RETENTION", "24h")
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            permissive_identity = runtime.llms.profile_identity_sha256("default")
+            permissive_client = runtime.llms.resolve("default").client
+            assert permissive_client.store is True
+            assert permissive_client.responses_previous_response_id is True
+            assert permissive_client.prompt_cache_retention == "24h"
+
+            monkeypatch.setenv("OPENAI_STORE", "0")
+            monkeypatch.setenv("OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID", "false")
+            monkeypatch.setenv("OPENAI_PROMPT_CACHE_RETENTION", "in-memory")
+            strict_identity = runtime.llms.profile_identity_sha256("default")
+            assert strict_identity != permissive_identity
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern="llm:default",
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                    identity_sha256=strict_identity,
+                ),
+                actor="test.host",
+                require_capability=False,
+            )
+            pid = runtime.process.spawn(image="base-agent:v0", goal="strict LLM release")
+            runtime.data_flow.precheck_egress_clearance(
+                pid=pid,
+                sink=DataSink("llm:default", strict_identity),
+                context=DataFlowContext(labels=DataLabels(sensitivity="secret")),
+                payload={"messages": [{"role": "user", "content": "secret"}]},
+            )
+
+            strict_client = runtime.llms.resolve("default").client
+
+            assert strict_client is not permissive_client
+            assert strict_client.store is False
+            assert strict_client.responses_previous_response_id is False
+            assert strict_client.prompt_cache_retention == "in-memory"
+            assert runtime.llms.profile_identity_sha256("default") == strict_identity
+        finally:
+            runtime.close()
+
+    def test_profile_snapshot_binds_identity_and_client_policy_across_environment_change(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_STORE", "1")
+        monkeypatch.setenv("OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID", "true")
+        monkeypatch.setenv("OPENAI_PROMPT_CACHE_RETENTION", "24h")
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            snapshot = runtime.llms.profile_snapshot("default")
+
+            monkeypatch.setenv("OPENAI_STORE", "0")
+            monkeypatch.setenv("OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID", "false")
+            monkeypatch.setenv("OPENAI_PROMPT_CACHE_RETENTION", "in-memory")
+            assert runtime.llms.profile_identity_sha256("default") != snapshot.identity_sha256
+
+            resolved = runtime.llms.resolve("default", snapshot=snapshot)
+
+            assert resolved.identity_sha256 == snapshot.identity_sha256
+            assert resolved.client.store is True
+            assert resolved.client.responses_previous_response_id is True
+            assert resolved.client.prompt_cache_retention == "24h"
+        finally:
+            runtime.close()
+
+    def test_concurrent_policy_cache_invalidation_rebuilds_once_and_closes_stale_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_STORE", "1")
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            stale_client = runtime.llms.resolve("default").client
+            monkeypatch.setenv("OPENAI_STORE", "0")
+            original_create = runtime.llms._create_client
+            original_shutdown = runtime.llms._shutdown_client
+            created = 0
+            closed: list[object] = []
+            observations_lock = threading.Lock()
+
+            def delayed_create(profile_id, profile, *, snapshot):
+                nonlocal created
+                with observations_lock:
+                    created += 1
+                time.sleep(0.02)
+                return original_create(profile_id, profile, snapshot=snapshot)
+
+            def recording_shutdown(client) -> None:
+                with observations_lock:
+                    closed.append(client)
+                original_shutdown(client)
+
+            monkeypatch.setattr(runtime.llms, "_create_client", delayed_create)
+            monkeypatch.setattr(runtime.llms, "_shutdown_client", recording_shutdown)
+            worker_count = 8
+            barrier = threading.Barrier(worker_count)
+
+            def resolve_after_barrier():
+                barrier.wait()
+                return runtime.llms.resolve("default").client
+
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                clients = list(pool.map(lambda _: resolve_after_barrier(), range(worker_count)))
+
+            assert len({id(client) for client in clients}) == 1
+            assert clients[0] is runtime.llms.resolve("default").client
+            assert clients[0] is not stale_client
+            assert clients[0].store is False
+            assert created == 1
+            assert closed == [stale_client]
+        finally:
+            runtime.close()
+
+    def test_policy_change_does_not_close_or_replace_host_test_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_STORE", "1")
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            stale_real_client = runtime.llms.resolve("default").client
+            test_client = CloseCountingClient()
+            runtime.llms.set_test_client("default", test_client)
+            monkeypatch.setenv("OPENAI_STORE", "0")
+            strict_identity = runtime.llms.profile_identity_sha256("default")
+
+            first = runtime.llms.resolve("default")
+            second = runtime.llms.resolve("default")
+
+            assert first.client is test_client
+            assert second.client is test_client
+            assert first.identity_sha256 == strict_identity
+            assert second.identity_sha256 == strict_identity
+            assert test_client.close_calls == 0
+
+            runtime.llms.clear_test_client("default")
+            strict_real_client = runtime.llms.resolve("default").client
+
+            assert test_client.close_calls == 1
+            assert strict_real_client is not stale_real_client
+            assert strict_real_client.store is False
+        finally:
+            runtime.close()
+
+    def test_executor_uses_snapshot_and_resolved_identity_without_rehashing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            client = RecordingActionClient(
+                [{"action": "process_exit", "payload": {"identity": "resolved"}}]
+            )
+            runtime.llms.set_test_client("default", client)
+
+            def unexpected_rehash(_profile_id: str) -> str:
+                raise AssertionError("executor must use the frozen/resolved identity")
+
+            monkeypatch.setattr(
+                runtime.llms,
+                "profile_identity_sha256",
+                unexpected_rehash,
+            )
+            pid = runtime.process.spawn(image="base-agent:v0", goal="resolved identity")
+
+            result = runtime.run_process_once(pid)
+
+            assert result["ok"] is True
+            assert len(client.user_prompts) == 1
+        finally:
+            runtime.close()
+
+    def test_old_profile_trust_is_denied_after_effective_policy_change(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("OPENAI_STORE", raising=False)
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="identity-bound LLM egress")
+            old_identity = runtime.llms.profile_identity_sha256("default")
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern="llm:default",
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                    identity_sha256=old_identity,
+                ),
+                actor="test.host",
+                require_capability=False,
+            )
+
+            monkeypatch.setenv("OPENAI_STORE", "1")
+            changed_identity = runtime.llms.profile_identity_sha256("default")
+
+            assert changed_identity != old_identity
+            with pytest.raises(CapabilityDenied, match="identity hash does not match"):
+                runtime.data_flow.precheck_egress_clearance(
+                    pid=pid,
+                    sink=DataSink("llm:default", changed_identity),
+                    context=DataFlowContext(labels=DataLabels(sensitivity="secret")),
+                    payload={"messages": [{"role": "user", "content": "secret"}]},
+                )
+        finally:
+            runtime.close()
+
     def test_different_processes_use_different_profile_clients(self) -> None:
         runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
         try:
@@ -326,3 +680,11 @@ class AsyncCloseOnlyClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class CloseCountingClient:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1

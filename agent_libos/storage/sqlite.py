@@ -24,12 +24,19 @@ from agent_libos.models import (
     CapabilityStatus,
     Checkpoint,
     ContextMaterializationManifest,
+    DataFlowDecision,
+    DataFlowContext,
+    DataFlowDirection,
+    DataFlowOutcome,
+    DataLabels,
+    DataSourceRef,
     Event,
     EventPriority,
     EventType,
     ExternalEffectRecord,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
+    FileLabelBinding,
     HumanRequest,
     HumanRequestStatus,
     JsonRpcEndpointSpec,
@@ -71,6 +78,9 @@ from agent_libos.models import (
     ResourceBudget,
     ResourceReservation,
     ResourceUsage,
+    SinkTrustLevel,
+    SinkTrustRule,
+    SinkTrustSpec,
     TaskAuthorityManifest,
     ToolCandidate,
     ToolCandidateStatus,
@@ -78,7 +88,17 @@ from agent_libos.models import (
     ToolSpec,
     ViewMode,
 )
+from agent_libos.models.messages import conservative_legacy_process_message_metadata
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, SkillPackage, SkillResource
+from agent_libos.storage.base import (
+    LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS as _LEGACY_PENDING_DATA_FLOW_STATUS,
+    LEGACY_PENDING_DATA_FLOW_RECONCILED_STATUS as _LEGACY_PENDING_DATA_FLOW_RECONCILED_STATUS,
+    LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS as _LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS,
+)
+from agent_libos.storage.gui_visibility import (
+    is_gui_presentation_audit_fields,
+    is_gui_presentation_event_fields,
+)
 from agent_libos.utils.serde import dumps, loads
 
 try:  # pragma: no cover - Windows fallback is exercised only on non-POSIX hosts.
@@ -103,7 +123,50 @@ def _persisted_bool(value: Any, label: str) -> bool:
     return value
 
 
+_REQUIRED_DATA_LABEL_FIELDS = frozenset({"sensitivity", "trust_level", "integrity"})
+
+
+def _conservative_legacy_data_flow_context() -> dict[str, Any]:
+    return DataFlowContext(
+        labels=DataLabels(
+            sensitivity="secret",
+            trust_level="untrusted",
+            integrity="untrusted",
+            origin="legacy",
+        )
+    ).to_dict()
+
+
+def _canonical_pending_data_flow_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        raise ValidationError("pending LLM action requires a trusted data-flow context")
+    labels = value.get("labels")
+    if not isinstance(labels, dict) or not _REQUIRED_DATA_LABEL_FIELDS.issubset(labels):
+        raise ValidationError(
+            "pending LLM action data-flow context requires complete security labels"
+        )
+    try:
+        return DataFlowContext.from_dict(value).to_dict()
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"invalid pending LLM action data-flow context: {exc}") from exc
+
+
+def _canonical_process_message_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError("process message metadata must be an object")
+    selected = dict(value)
+    labels = selected.get("data_labels")
+    if not isinstance(labels, dict) or not _REQUIRED_DATA_LABEL_FIELDS.issubset(labels):
+        return conservative_legacy_process_message_metadata(selected)
+    try:
+        selected["data_labels"] = DataLabels.from_dict(labels).to_dict()
+    except (TypeError, ValueError):
+        return conservative_legacy_process_message_metadata(selected)
+    return selected
+
+
 _MISSING_OBJECT_PAYLOAD = object()
+_LLM_CONTEXT_LABEL_SCHEMA_VERSION = 1
 
 
 class SQLRuntimeStore:
@@ -125,6 +188,10 @@ class SQLRuntimeStore:
             "events",
             "capabilities",
             "capability_use_reservations",
+            "sink_trust_registry",
+            "sink_trust_records",
+            "data_flow_decisions",
+            "file_label_bindings",
             "audit_records",
             "operations",
             "operation_evidence",
@@ -342,7 +409,8 @@ class SQLRuntimeStore:
                   priority TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   correlation_id TEXT,
-                  causality_json TEXT NOT NULL
+                  causality_json TEXT NOT NULL,
+                  gui_snapshot_visible INTEGER NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_events_created
@@ -394,7 +462,8 @@ class SQLRuntimeStore:
                   capability_refs_json TEXT NOT NULL,
                   decision_json TEXT,
                   correlation_id TEXT,
-                  parent_record_id TEXT
+                  parent_record_id TEXT,
+                  gui_snapshot_visible INTEGER NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_audit_records_created
@@ -515,6 +584,7 @@ class SQLRuntimeStore:
                   tool_name TEXT,
                   filters_json TEXT NOT NULL,
                   action_json TEXT NOT NULL,
+                  data_flow_context_json TEXT NOT NULL,
                   content_preview TEXT NOT NULL,
                   tool_call_count INTEGER NOT NULL,
                   status TEXT NOT NULL,
@@ -539,6 +609,8 @@ class SQLRuntimeStore:
                 CREATE TABLE IF NOT EXISTS llm_context_generations (
                   pid TEXT PRIMARY KEY,
                   generation TEXT NOT NULL,
+                  labels_schema_version INTEGER NOT NULL DEFAULT 1,
+                  labels_json TEXT,
                   updated_at TEXT NOT NULL
                 );
 
@@ -553,6 +625,7 @@ class SQLRuntimeStore:
                   subject TEXT NOT NULL,
                   body TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL,
                   status TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL,
@@ -721,13 +794,16 @@ class SQLRuntimeStore:
             self._ensure_authority_manifest_schema()
             self._ensure_resource_reservation_schema()
             self._ensure_capability_schema()
+            self._ensure_data_flow_schema()
             # Prepared protected operations durably link reservations from the
             # external-effect row. Ensure additive effect columns exist before
             # stale-reservation recovery inspects those links.
             self._ensure_external_effect_schema()
             self._abandon_stale_capability_use_reservations()
             self._ensure_audit_schema()
+            self._ensure_gui_snapshot_visibility_schema()
             self._ensure_operation_schema()
+            self._ensure_storage_migration_schema()
             self._ensure_llm_call_schema()
             self._ensure_process_message_schema()
             self._ensure_object_task_schema()
@@ -738,6 +814,7 @@ class SQLRuntimeStore:
             self._ensure_jsonrpc_endpoint_schema()
             self._ensure_mcp_server_schema()
             self._ensure_runtime_module_schema()
+            self._backfill_llm_context_label_history()
             self._release_missing_runtime_object_payloads()
             self.conn.commit()
 
@@ -1391,8 +1468,21 @@ class SQLRuntimeStore:
         table = self.validate_table_identifier(table)
         self._execute(f"DELETE FROM {table} WHERE {where_sql}", params)
 
-    def payload_marker(self, *, present: bool) -> dict[str, Any]:
-        return {"storage": "runtime_memory", "present": present}
+    def payload_marker(
+        self,
+        *,
+        present: bool,
+        recovered_after_reopen: bool = False,
+    ) -> dict[str, Any]:
+        if present and recovered_after_reopen:
+            raise ValueError("a present Object payload cannot be marked as recovered")
+        marker: dict[str, Any] = {
+            "storage": "runtime_memory",
+            "present": present,
+        }
+        if recovered_after_reopen:
+            marker["recovered_after_reopen"] = True
+        return marker
 
     def object_payload(self, oid: str) -> Any:
         self._ensure_healthy()
@@ -1436,6 +1526,26 @@ class SQLRuntimeStore:
         self._object_payloads[oid] = deepcopy(payload)
         return True
 
+    def is_recovered_object_payload(self, oid: str) -> bool:
+        rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
+        if not rows:
+            return False
+        try:
+            marker = loads(rows[0]["payload_json"], {})
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            isinstance(marker, dict)
+            and marker.get("storage") == "runtime_memory"
+            and marker.get("present") is False
+            and marker.get("recovered_after_reopen") is True
+            and set(marker) == {
+                "storage",
+                "present",
+                "recovered_after_reopen",
+            }
+        )
+
     def snapshot_object_payloads(self, oids: Iterable[str]) -> dict[str, Any]:
         payloads: dict[str, Any] = {}
         for oid in oids:
@@ -1444,18 +1554,30 @@ class SQLRuntimeStore:
         return payloads
 
     def insert_event(self, event: Event) -> None:
+        payload_json = dumps(event.payload)
         self._execute(
-            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO events (
+                event_id, type, source, target, payload_json, priority,
+                created_at, correlation_id, causality_json, gui_snapshot_visible
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 event.event_id,
                 event.type.value,
                 event.source,
                 event.target,
-                dumps(event.payload),
+                payload_json,
                 event.priority.value,
                 event.created_at,
                 event.correlation_id,
                 dumps(event.causality),
+                int(
+                    not is_gui_presentation_event_fields(
+                        event.type,
+                        loads(payload_json, {}),
+                    )
+                ),
             ),
         )
 
@@ -1465,11 +1587,15 @@ class SQLRuntimeStore:
         limit: int | None = None,
         before_event_id: str | None = None,
         after_event_id: str | None = None,
+        *,
+        include_gui_presentation: bool = True,
     ) -> list[Event]:
         if before_event_id is not None and after_event_id is not None:
             raise ValueError("event query cannot use before_event_id and after_event_id together")
         clauses: list[str] = []
         params: list[Any] = []
+        if not include_gui_presentation:
+            clauses.append("gui_snapshot_visible = 1")
         if target is not None:
             clauses.append("(target IS NULL OR target = ?)")
             params.append(target)
@@ -1771,9 +1897,436 @@ class SQLRuntimeStore:
             )
         return [self._row_to_capability(row) for row in rows]
 
-    def insert_audit(self, record: AuditRecord) -> None:
+    def register_sink_trust(self, spec: SinkTrustSpec, *, replace: bool = False) -> SinkTrustSpec:
+        if not isinstance(spec, SinkTrustSpec):
+            raise ValidationError("sink trust registration requires a validated SinkTrustSpec")
+        if not spec.active:
+            raise ValidationError("new sink trust record must be active")
+        with self.transaction() as cur:
+            current = self._sink_trust_generation_from_cursor(cur)
+            if spec.generation != current + 1:
+                raise ValidationError(
+                    f"sink trust generation conflict: expected {current + 1}, got {spec.generation}"
+                )
+            cur.execute(
+                "SELECT trust_id FROM sink_trust_records WHERE pattern = ? AND active = 1",
+                (spec.pattern,),
+            )
+            existing = cur.fetchone()
+            if existing is not None and not replace:
+                raise ValidationError(f"active sink trust rule already exists: {spec.pattern}")
+            if existing is not None:
+                cur.execute(
+                    """
+                    UPDATE sink_trust_records
+                       SET active = 0, deactivated_at = ?
+                     WHERE pattern = ? AND active = 1
+                    """,
+                    (spec.created_at, spec.pattern),
+                )
+            cur.execute(
+                """
+                INSERT INTO sink_trust_records (
+                    trust_id, schema_version, pattern, trust_level,
+                    max_sensitivity, tenants_json, principals_json,
+                    identity_sha256, generation, spec_hash, active,
+                    created_by, created_at, deactivated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    spec.trust_id,
+                    spec.schema_version,
+                    spec.pattern,
+                    spec.trust_level.value,
+                    spec.max_sensitivity.value,
+                    dumps(spec.tenants),
+                    dumps(spec.principals),
+                    spec.identity_sha256,
+                    spec.generation,
+                    spec.spec_hash,
+                    1,
+                    spec.created_by,
+                    spec.created_at,
+                    None,
+                ),
+            )
+            cur.execute(
+                "UPDATE sink_trust_registry SET generation = ?, updated_at = ? WHERE registry_key = 'default'",
+                (spec.generation, spec.created_at),
+            )
+            if cur.rowcount != 1:
+                raise ValidationError("sink trust registry metadata is missing")
+        return spec
+
+    def unregister_sink_trust(
+        self,
+        pattern: str,
+        *,
+        generation: int,
+        deactivated_at: str,
+    ) -> bool:
+        try:
+            SinkTrustRule(pattern=pattern)
+        except ValueError as exc:
+            raise ValidationError(f"invalid sink trust pattern: {exc}") from exc
+        if not isinstance(deactivated_at, str) or not deactivated_at.strip():
+            raise ValidationError("sink trust deactivated_at must be a non-empty string")
+        with self.transaction() as cur:
+            current = self._sink_trust_generation_from_cursor(cur)
+            if generation != current + 1:
+                raise ValidationError(
+                    f"sink trust generation conflict: expected {current + 1}, got {generation}"
+                )
+            cur.execute(
+                "SELECT trust_id FROM sink_trust_records WHERE pattern = ? AND active = 1",
+                (pattern,),
+            )
+            if cur.fetchone() is None:
+                return False
+            cur.execute(
+                """
+                UPDATE sink_trust_records
+                   SET active = 0, deactivated_at = ?
+                 WHERE pattern = ? AND active = 1
+                """,
+                (deactivated_at, pattern),
+            )
+            if cur.rowcount != 1:
+                raise ValidationError(f"sink trust rule changed concurrently: {pattern}")
+            cur.execute(
+                "UPDATE sink_trust_registry SET generation = ?, updated_at = ? WHERE registry_key = 'default'",
+                (generation, deactivated_at),
+            )
+            if cur.rowcount != 1:
+                raise ValidationError("sink trust registry metadata is missing")
+        return True
+
+    def get_sink_trust(self, trust_id: str) -> SinkTrustSpec | None:
+        rows = self._query("SELECT * FROM sink_trust_records WHERE trust_id = ?", (trust_id,))
+        return self._row_to_sink_trust(rows[0]) if rows else None
+
+    def inspect_sink_trust(self, pattern: str) -> SinkTrustSpec | None:
+        rows = self._query(
+            "SELECT * FROM sink_trust_records WHERE pattern = ? AND active = 1",
+            (pattern,),
+        )
+        return self._row_to_sink_trust(rows[0]) if rows else None
+
+    def list_sink_trust(
+        self,
+        *,
+        active_only: bool = True,
+        generation: int | None = None,
+        limit: int | None = None,
+    ) -> list[SinkTrustSpec]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if active_only:
+            clauses.append("active = 1")
+        if generation is not None:
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+                raise ValidationError("sink trust generation filter must be a non-negative integer")
+            clauses.append("generation = ?")
+            params.append(generation)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM sink_trust_records{where} ORDER BY generation DESC, pattern, trust_id"
+        if limit is not None:
+            selected_limit = self._data_flow_list_limit(
+                limit,
+                default=self.config.data_flow.registry_list_limit,
+                hard_limit=self.config.data_flow.registry_list_limit,
+                label="sink trust",
+            )
+            sql += " LIMIT ?"
+            params.append(selected_limit)
+        # Enforcement resolution calls this method without a limit and must
+        # see the complete Host registry. Explicit administrative list calls
+        # may opt into the configured bounded window.
+        rows = self._query(sql, params)
+        return [self._row_to_sink_trust(row) for row in rows]
+
+    def get_sink_trust_generation(self) -> int:
+        rows = self._query(
+            "SELECT generation FROM sink_trust_registry WHERE registry_key = 'default'"
+        )
+        if not rows:
+            raise ValidationError("sink trust registry metadata is missing")
+        generation = rows[0]["generation"]
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValidationError("invalid persisted sink trust registry generation")
+        return generation
+
+    def insert_data_flow_decision(self, decision: DataFlowDecision) -> None:
+        if not isinstance(decision, DataFlowDecision):
+            raise ValidationError("data-flow decision insert requires a validated DataFlowDecision")
         self._execute(
-            "INSERT INTO audit_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO data_flow_decisions (
+                decision_id, pid, sink, direction, outcome, reason,
+                labels_json, source_refs_json, payload_hash, trust_id,
+                trust_hash, registry_generation, release_capability_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision.decision_id,
+                decision.pid,
+                decision.sink,
+                decision.direction.value,
+                decision.outcome.value,
+                decision.reason,
+                dumps(decision.labels.to_dict()),
+                dumps([ref.to_dict() for ref in decision.source_refs]),
+                decision.payload_hash,
+                decision.trust_id,
+                decision.trust_hash,
+                decision.registry_generation,
+                decision.release_capability_id,
+                decision.created_at,
+            ),
+        )
+
+    def get_data_flow_decision(self, decision_id: str) -> DataFlowDecision | None:
+        rows = self._query("SELECT * FROM data_flow_decisions WHERE decision_id = ?", (decision_id,))
+        return self._row_to_data_flow_decision(rows[0]) if rows else None
+
+    def list_data_flow_decisions(
+        self,
+        *,
+        pid: str | None = None,
+        sink: str | None = None,
+        outcome: str | None = None,
+        limit: int | None = None,
+    ) -> list[DataFlowDecision]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (("pid", pid), ("sink", sink)):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if outcome is not None:
+            try:
+                selected_outcome = DataFlowOutcome(outcome).value
+            except ValueError as exc:
+                raise ValidationError(f"invalid data-flow outcome filter: {outcome}") from exc
+            clauses.append("outcome = ?")
+            params.append(selected_outcome)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        selected_limit = self._data_flow_list_limit(
+            limit,
+            default=self.config.data_flow.decision_list_limit,
+            hard_limit=self.config.data_flow.decision_list_limit,
+            label="data-flow decision",
+        )
+        rows = self._query(
+            f"SELECT * FROM data_flow_decisions{where} "
+            "ORDER BY created_at DESC, decision_id DESC LIMIT ?",
+            [*params, selected_limit],
+        )
+        return [self._row_to_data_flow_decision(row) for row in rows]
+
+    def upsert_file_label_binding(self, binding: FileLabelBinding) -> FileLabelBinding:
+        if not isinstance(binding, FileLabelBinding):
+            raise ValidationError("file label upsert requires a validated FileLabelBinding")
+        if binding.tombstoned or not binding.active:
+            raise ValidationError("file label upsert requires an active, non-tombstoned binding")
+        with self.transaction() as cur:
+            current_generation = self._file_label_generation_from_cursor(cur, binding.normalized_path)
+            if binding.generation != current_generation + 1:
+                raise ValidationError(
+                    "file label generation conflict for "
+                    f"{binding.normalized_path}: expected {current_generation + 1}, got {binding.generation}"
+                )
+            cur.execute(
+                """
+                UPDATE file_label_bindings
+                   SET active = 0, superseded_at = ?
+                 WHERE normalized_path = ? AND active = 1
+                """,
+                (binding.created_at, binding.normalized_path),
+            )
+            self._insert_file_label_binding(cur, binding)
+        return binding
+
+    def get_file_label_binding(self, normalized_path: str) -> FileLabelBinding | None:
+        rows = self._query(
+            """
+            SELECT * FROM file_label_bindings
+             WHERE normalized_path = ? AND active = 1 AND tombstoned = 0
+            """,
+            (normalized_path,),
+        )
+        return self._row_to_file_label_binding(rows[0]) if rows else None
+
+    def get_file_label_binding_by_id(
+        self,
+        binding_id: str,
+    ) -> FileLabelBinding | None:
+        rows = self._query(
+            """
+            SELECT * FROM file_label_bindings
+             WHERE binding_id = ?
+            """,
+            (binding_id,),
+        )
+        return self._row_to_file_label_binding(rows[0]) if rows else None
+
+    def get_file_label_binding_generation(self, normalized_path: str) -> int:
+        rows = self._query(
+            "SELECT MAX(generation) AS generation FROM file_label_bindings WHERE normalized_path = ?",
+            (normalized_path,),
+        )
+        value = rows[0]["generation"] if rows else None
+        return int(value) if value is not None else 0
+
+    def list_file_label_bindings(
+        self,
+        *,
+        normalized_path: str | None = None,
+        include_history: bool = False,
+        include_tombstones: bool = False,
+        limit: int | None = None,
+    ) -> list[FileLabelBinding]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if normalized_path is not None:
+            clauses.append("normalized_path = ?")
+            params.append(normalized_path)
+        if not include_history:
+            clauses.append("active = 1")
+        if not include_tombstones:
+            clauses.append("tombstoned = 0")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        selected_limit = self._data_flow_list_limit(
+            limit,
+            default=self.config.data_flow.file_binding_list_limit,
+            hard_limit=self.config.data_flow.file_binding_list_limit,
+            label="file label binding",
+        )
+        rows = self._query(
+            f"SELECT * FROM file_label_bindings{where} "
+            "ORDER BY normalized_path, generation DESC, binding_id LIMIT ?",
+            [*params, selected_limit],
+        )
+        return [self._row_to_file_label_binding(row) for row in rows]
+
+    def list_file_label_bindings_for_tree(
+        self,
+        normalized_path: str,
+    ) -> list[FileLabelBinding]:
+        selected = str(normalized_path).rstrip("/")
+        batch_size = self.config.data_flow.file_binding_list_limit
+        found: list[FileLabelBinding] = []
+        last_path: str | None = None
+        while True:
+            params: list[Any] = []
+            clauses = ["active = 1", "tombstoned = 0"]
+            if selected not in {"", "."}:
+                descendant_prefix = f"{selected}/"
+                escaped_prefix = (
+                    descendant_prefix.replace("!", "!!")
+                    .replace("%", "!%")
+                    .replace("_", "!_")
+                )
+                # The outer range drives an index seek; the escaped LIKE keeps
+                # exact subtree semantics for adjacent names such as treehouse.
+                upper_bound = f"{selected}\U0010ffff"
+                clauses.extend(
+                    (
+                        "normalized_path COLLATE BINARY >= ?",
+                        "normalized_path COLLATE BINARY < ?",
+                        "(normalized_path COLLATE BINARY = ? "
+                        "OR normalized_path COLLATE BINARY LIKE ? ESCAPE '!')",
+                    )
+                )
+                params.extend(
+                    (selected, upper_bound, selected, f"{escaped_prefix}%")
+                )
+            if last_path is not None:
+                clauses.append("normalized_path COLLATE BINARY > ?")
+                params.append(last_path)
+            params.append(batch_size)
+            rows = self._query(
+                "SELECT * FROM file_label_bindings "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY normalized_path COLLATE BINARY, generation DESC, binding_id LIMIT ?",
+                params,
+            )
+            found.extend(self._row_to_file_label_binding(row) for row in rows)
+            if len(rows) < batch_size:
+                break
+            last_path = str(rows[-1]["normalized_path"])
+        return found
+
+    def tombstone_file_label_binding(
+        self,
+        normalized_path: str,
+        *,
+        binding_id: str,
+        created_by: str,
+        created_at: str,
+        expected_binding_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> FileLabelBinding | None:
+        if (expected_binding_id is None) != (expected_generation is None):
+            raise ValidationError(
+                "file label tombstone CAS requires both binding ID and generation"
+            )
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                SELECT * FROM file_label_bindings
+                 WHERE normalized_path = ? AND active = 1 AND tombstoned = 0
+                """,
+                (normalized_path,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            previous = self._row_to_file_label_binding(row)
+            if expected_binding_id is not None and (
+                previous.binding_id != expected_binding_id
+                or previous.generation != expected_generation
+            ):
+                return None
+            tombstone = FileLabelBinding(
+                binding_id=binding_id,
+                normalized_path=normalized_path,
+                content_sha256=None,
+                labels=previous.labels,
+                source_refs=previous.source_refs,
+                generation=previous.generation + 1,
+                tombstoned=True,
+                active=True,
+                created_by=created_by,
+                created_at=created_at,
+            )
+            cur.execute(
+                """
+                UPDATE file_label_bindings
+                   SET active = 0, superseded_at = ?
+                 WHERE binding_id = ? AND active = 1
+                """,
+                (created_at, previous.binding_id),
+            )
+            if cur.rowcount != 1:
+                if expected_binding_id is not None:
+                    return None
+                raise ValidationError(f"file label binding changed concurrently: {normalized_path}")
+            self._insert_file_label_binding(cur, tombstone)
+        return tombstone
+
+    def insert_audit(self, record: AuditRecord) -> None:
+        decision_json = (
+            dumps(record.decision) if record.decision is not None else None
+        )
+        self._execute(
+            """
+            INSERT INTO audit_records (
+                record_id, timestamp, actor, action, target, input_refs_json,
+                output_refs_json, capability_refs_json, decision_json,
+                correlation_id, parent_record_id, gui_snapshot_visible
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 record.record_id,
                 record.timestamp,
@@ -1783,9 +2336,16 @@ class SQLRuntimeStore:
                 dumps(record.input_refs),
                 dumps(record.output_refs),
                 dumps(record.capability_refs),
-                dumps(record.decision) if record.decision is not None else None,
+                decision_json,
                 record.correlation_id,
                 record.parent_record_id,
+                int(
+                    not is_gui_presentation_audit_fields(
+                        record.action,
+                        record.target,
+                        loads(decision_json) if decision_json is not None else None,
+                    )
+                ),
             ),
         )
 
@@ -1796,18 +2356,24 @@ class SQLRuntimeStore:
         actor: str | None = None,
         target: str | None = None,
         match_any: bool = False,
+        include_gui_presentation: bool = True,
     ) -> list[AuditRecord]:
         clauses: list[str] = []
         params: list[Any] = []
+        if not include_gui_presentation:
+            clauses.append("gui_snapshot_visible = 1")
+        selectors: list[str] = []
         if actor is not None:
-            clauses.append("actor = ?")
+            selectors.append("actor = ?")
             params.append(actor)
         if target is not None:
-            clauses.append("target = ?")
+            selectors.append("target = ?")
             params.append(target)
-        joiner = " OR " if match_any and len(clauses) > 1 else " AND "
-        where = f" WHERE {joiner.join(clauses)}" if clauses else ""
-        order = "ORDER BY timestamp, rowid"
+        if selectors:
+            joiner = " OR " if match_any and len(selectors) > 1 else " AND "
+            clauses.append(f"({joiner.join(selectors)})")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = "ORDER BY timestamp, record_id"
         if limit is None:
             return [self._row_to_audit(row) for row in self._query(f"SELECT * FROM audit_records{where} {order}", params)]
         selected_limit = int(limit)
@@ -1817,11 +2383,11 @@ class SQLRuntimeStore:
         # newest window first, then return it chronologically so append streams
         # do not lose recent records once the table is larger than the window.
         limited = (
-            f"SELECT audit_records.*, rowid AS _audit_rowid FROM audit_records{where} "
-            "ORDER BY timestamp DESC, rowid DESC LIMIT ?"
+            f"SELECT audit_records.* FROM audit_records{where} "
+            "ORDER BY timestamp DESC, record_id DESC LIMIT ?"
         )
         rows = self._query(
-            f"SELECT * FROM ({limited}) AS limited_audit ORDER BY timestamp, _audit_rowid",
+            f"SELECT * FROM ({limited}) AS limited_audit ORDER BY timestamp, record_id",
             [*params, selected_limit],
         )
         return [self._row_to_audit(row) for row in rows]
@@ -2104,7 +2670,7 @@ class SQLRuntimeStore:
                AND pid = ?
                AND provider = ?
                AND operation = ?
-               AND ((target IS NULL AND ? IS NULL) OR target = ?)
+               AND ((target IS NULL AND CAST(? AS TEXT) IS NULL) OR target = ?)
                AND record_id IS NULL
                AND event_id IS NULL
                AND rollback_class = ?
@@ -2425,18 +2991,89 @@ class SQLRuntimeStore:
             (pid, generation, utc_now()),
         )
 
+    def get_llm_context_label_history(self, pid: str) -> DataLabels | None:
+        rows = self._query(
+            """
+            SELECT labels_schema_version, labels_json
+              FROM llm_context_generations
+             WHERE pid = ?
+            """,
+            (pid,),
+        )
+        if not rows or rows[0]["labels_json"] is None:
+            return None
+        return self._decode_llm_context_label_history(rows[0])
+
+    def merge_llm_context_label_history(
+        self,
+        pid: str,
+        labels: DataLabels,
+    ) -> DataLabels:
+        if not isinstance(labels, DataLabels):
+            raise ValidationError("LLM context label history requires DataLabels")
+        with self.transaction() as cur:
+            row = cur.execute(
+                """
+                SELECT labels_schema_version, labels_json
+                  FROM llm_context_generations
+                 WHERE pid = ?
+                """,
+                (pid,),
+            ).fetchone()
+            current = (
+                self._decode_llm_context_label_history(row)
+                if row is not None and row["labels_json"] is not None
+                else None
+            )
+            merged = DataLabels.aggregate(
+                (labels,) if current is None else (current, labels)
+            )
+            cur.execute(
+                """
+                INSERT INTO llm_context_generations (
+                    pid, generation, labels_schema_version, labels_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(pid) DO UPDATE SET
+                    labels_schema_version = excluded.labels_schema_version,
+                    labels_json = excluded.labels_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    pid,
+                    "initial",
+                    _LLM_CONTEXT_LABEL_SCHEMA_VERSION,
+                    dumps(merged),
+                    utc_now(),
+                ),
+            )
+        return merged
+
+    def _decode_llm_context_label_history(self, row: Any) -> DataLabels:
+        with _persisted_model_decode("LLM context label history"):
+            version = row["labels_schema_version"]
+            if version != _LLM_CONTEXT_LABEL_SCHEMA_VERSION:
+                raise ValueError(
+                    "unsupported schema version "
+                    f"{version!r}; expected {_LLM_CONTEXT_LABEL_SCHEMA_VERSION}"
+                )
+            value = loads(row["labels_json"])
+            return DataLabels.from_dict(value)
+
     def upsert_llm_pending_action(self, pid: str, pending: dict[str, Any]) -> None:
         now = utc_now()
         created_at = str(pending.get("created_at") or now)
         resume_token = str(pending.get("resume_token") or new_id("llmwait"))
+        data_flow_context = _canonical_pending_data_flow_context(
+            pending.get("data_flow_context")
+        )
         self._execute(
             """
             INSERT INTO llm_pending_actions (
                 pid, resume_token, llm_operation_id, tool_operation_id,
                 wait_type, request_id, child_pid, response_id, tool_call_id, tool_name,
-                filters_json, action_json,
+                filters_json, action_json, data_flow_context_json,
                 content_preview, tool_call_count, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pid) DO UPDATE SET
                 resume_token = excluded.resume_token,
                 llm_operation_id = excluded.llm_operation_id,
@@ -2449,6 +3086,7 @@ class SQLRuntimeStore:
                 tool_name = excluded.tool_name,
                 filters_json = excluded.filters_json,
                 action_json = excluded.action_json,
+                data_flow_context_json = excluded.data_flow_context_json,
                 content_preview = excluded.content_preview,
                 tool_call_count = excluded.tool_call_count,
                 status = excluded.status,
@@ -2467,6 +3105,7 @@ class SQLRuntimeStore:
                 pending.get("tool_name"),
                 dumps(pending.get("filters") or {}),
                 dumps(pending.get("action") or {}),
+                dumps(data_flow_context),
                 str(pending.get("content_preview") or ""),
                 int(pending.get("tool_call_count") or 0),
                 str(pending.get("status") or "pending"),
@@ -2514,13 +3153,74 @@ class SQLRuntimeStore:
         )
         return cursor.rowcount == 1
 
+    def list_llm_pending_actions_requiring_terminal_reconciliation(self) -> list[dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT *
+              FROM llm_pending_actions
+             WHERE status IN (?, ?)
+             ORDER BY updated_at, pid
+            """,
+            (
+                _LEGACY_PENDING_DATA_FLOW_STATUS,
+                _LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS,
+            ),
+        )
+        return [self._row_to_llm_pending_action(row) for row in rows]
+
+    def claim_llm_pending_action_terminal_reconciliation(self, pid: str) -> str | None:
+        """Claim a legacy terminal transition or resume its idempotent cleanup."""
+
+        with self._lock:
+            self._ensure_healthy()
+            cursor = self.conn.execute(
+                """
+                UPDATE llm_pending_actions
+                   SET status = ?, updated_at = ?
+                 WHERE pid = ? AND status = ?
+                """,
+                (
+                    _LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS,
+                    utc_now(),
+                    pid,
+                    _LEGACY_PENDING_DATA_FLOW_STATUS,
+                ),
+            )
+            self._commit_if_outermost()
+            if cursor.rowcount == 1:
+                return "claimed"
+            row = self.conn.execute(
+                "SELECT status FROM llm_pending_actions WHERE pid = ?",
+                (pid,),
+            ).fetchone()
+            if row is not None and row["status"] == _LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS:
+                return "resuming"
+            return None
+
+    def complete_llm_pending_action_terminal_reconciliation(self, pid: str) -> bool:
+        cursor = self._execute(
+            """
+            UPDATE llm_pending_actions
+               SET status = ?, updated_at = ?
+             WHERE pid = ? AND status = ?
+            """,
+            (
+                _LEGACY_PENDING_DATA_FLOW_RECONCILED_STATUS,
+                utc_now(),
+                pid,
+                _LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS,
+            ),
+        )
+        return cursor.rowcount == 1
+
     def insert_process_message(self, message: ProcessMessage) -> None:
+        metadata = _canonical_process_message_metadata(message.metadata)
         self._execute(
             """
             INSERT INTO process_messages (
                 message_id, sender, recipient_pid, kind, channel, correlation_id, reply_to,
-                subject, body, payload_json, status, created_at, updated_at, acked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                subject, body, payload_json, metadata_json, status, created_at, updated_at, acked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message.message_id,
@@ -2533,6 +3233,7 @@ class SQLRuntimeStore:
                 message.subject,
                 message.body,
                 dumps(message.payload),
+                dumps(metadata),
                 message.status.value,
                 message.created_at,
                 message.updated_at,
@@ -2541,12 +3242,13 @@ class SQLRuntimeStore:
         )
 
     def update_process_message(self, message: ProcessMessage) -> None:
+        metadata = _canonical_process_message_metadata(message.metadata)
         self._execute(
             """
             UPDATE process_messages
                SET sender = ?, recipient_pid = ?, kind = ?, subject = ?, body = ?,
                    channel = ?, correlation_id = ?, reply_to = ?, payload_json = ?,
-                   status = ?, created_at = ?, updated_at = ?, acked_at = ?
+                   metadata_json = ?, status = ?, created_at = ?, updated_at = ?, acked_at = ?
              WHERE message_id = ?
             """,
             (
@@ -2559,6 +3261,7 @@ class SQLRuntimeStore:
                 message.correlation_id,
                 message.reply_to,
                 dumps(message.payload),
+                dumps(metadata),
                 message.status.value,
                 message.created_at,
                 message.updated_at,
@@ -2566,6 +3269,32 @@ class SQLRuntimeStore:
                 message.message_id,
             ),
         )
+
+    def update_process_message_metadata(
+        self,
+        message_id: str,
+        *,
+        recipient_pid: str,
+        expected_metadata: dict[str, Any],
+        metadata: dict[str, Any],
+        updated_at: str,
+    ) -> bool:
+        selected_metadata = _canonical_process_message_metadata(metadata)
+        cursor = self._execute(
+            """
+            UPDATE process_messages
+               SET metadata_json = ?, updated_at = ?
+             WHERE message_id = ? AND recipient_pid = ? AND metadata_json = ?
+            """,
+            (
+                dumps(selected_metadata),
+                updated_at,
+                message_id,
+                recipient_pid,
+                dumps(expected_metadata),
+            ),
+        )
+        return cursor.rowcount == 1
 
     def get_process_message(self, message_id: str) -> ProcessMessage | None:
         rows = self._query("SELECT * FROM process_messages WHERE message_id = ?", (message_id,))
@@ -3595,6 +4324,227 @@ class SQLRuntimeStore:
             "CREATE INDEX IF NOT EXISTS idx_audit_records_correlation_created ON audit_records(correlation_id, timestamp, record_id)"
         )
 
+    def _ensure_gui_snapshot_visibility_schema(self) -> None:
+        event_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(events)")
+        }
+        if "gui_snapshot_visible" not in event_columns:
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN gui_snapshot_visible INTEGER"
+            )
+        audit_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(audit_records)")
+        }
+        if "gui_snapshot_visible" not in audit_columns:
+            self.conn.execute(
+                "ALTER TABLE audit_records ADD COLUMN gui_snapshot_visible INTEGER"
+            )
+
+        self._backfill_event_gui_snapshot_visibility()
+        self._backfill_audit_gui_snapshot_visibility()
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_gui_snapshot_visible_created "
+            "ON events(gui_snapshot_visible, created_at, event_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_gui_snapshot_visible_created "
+            "ON audit_records(gui_snapshot_visible, timestamp, record_id)"
+        )
+
+    def _backfill_event_gui_snapshot_visibility(self) -> None:
+        batch_size = self.config.gui.snapshot_collection_max_items
+        last_event_id: str | None = None
+        while True:
+            clauses = ["gui_snapshot_visible IS NULL"]
+            params: list[Any] = []
+            if last_event_id is not None:
+                clauses.append("event_id > ?")
+                params.append(last_event_id)
+            params.append(batch_size)
+            rows = list(
+                self.conn.execute(
+                    "SELECT event_id, type, payload_json FROM events "
+                    f"WHERE {' AND '.join(clauses)} "
+                    "ORDER BY event_id LIMIT ?",
+                    params,
+                )
+            )
+            if not rows:
+                return
+            updates: list[tuple[int, str]] = []
+            for row in rows:
+                try:
+                    payload = loads(row["payload_json"], {})
+                except (TypeError, ValueError):
+                    payload = {}
+                updates.append(
+                    (
+                        int(
+                            not is_gui_presentation_event_fields(
+                                row["type"],
+                                payload,
+                            )
+                        ),
+                        str(row["event_id"]),
+                    )
+                )
+            self.conn.executemany(
+                "UPDATE events SET gui_snapshot_visible = ? "
+                "WHERE event_id = ? AND gui_snapshot_visible IS NULL",
+                updates,
+            )
+            if len(rows) < batch_size:
+                return
+            last_event_id = str(rows[-1]["event_id"])
+
+    def _backfill_audit_gui_snapshot_visibility(self) -> None:
+        batch_size = self.config.gui.snapshot_collection_max_items
+        last_record_id: str | None = None
+        while True:
+            clauses = ["gui_snapshot_visible IS NULL"]
+            params: list[Any] = []
+            if last_record_id is not None:
+                clauses.append("record_id > ?")
+                params.append(last_record_id)
+            params.append(batch_size)
+            rows = list(
+                self.conn.execute(
+                    "SELECT record_id, action, target, decision_json "
+                    "FROM audit_records "
+                    f"WHERE {' AND '.join(clauses)} "
+                    "ORDER BY record_id LIMIT ?",
+                    params,
+                )
+            )
+            if not rows:
+                return
+            updates: list[tuple[int, str]] = []
+            for row in rows:
+                try:
+                    decision = (
+                        loads(row["decision_json"])
+                        if row["decision_json"] is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    decision = None
+                updates.append(
+                    (
+                        int(
+                            not is_gui_presentation_audit_fields(
+                                row["action"],
+                                row["target"],
+                                decision,
+                            )
+                        ),
+                        str(row["record_id"]),
+                    )
+                )
+            self.conn.executemany(
+                "UPDATE audit_records SET gui_snapshot_visible = ? "
+                "WHERE record_id = ? AND gui_snapshot_visible IS NULL",
+                updates,
+            )
+            if len(rows) < batch_size:
+                return
+            last_record_id = str(rows[-1]["record_id"])
+
+    def _ensure_data_flow_schema(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sink_trust_registry (
+              registry_key TEXT PRIMARY KEY,
+              generation INTEGER NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            INSERT INTO sink_trust_registry (registry_key, generation, updated_at)
+              VALUES ('default', 0, '')
+              ON CONFLICT(registry_key) DO NOTHING;
+
+            CREATE TABLE IF NOT EXISTS sink_trust_records (
+              trust_id TEXT PRIMARY KEY,
+              schema_version INTEGER NOT NULL,
+              pattern TEXT NOT NULL,
+              trust_level TEXT NOT NULL,
+              max_sensitivity TEXT NOT NULL,
+              tenants_json TEXT NOT NULL,
+              principals_json TEXT NOT NULL,
+              identity_sha256 TEXT,
+              generation INTEGER NOT NULL,
+              spec_hash TEXT NOT NULL,
+              active INTEGER NOT NULL,
+              created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              deactivated_at TEXT,
+              UNIQUE(pattern, generation)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sink_trust_active_pattern
+              ON sink_trust_records(pattern) WHERE active = 1;
+
+            CREATE INDEX IF NOT EXISTS idx_sink_trust_generation
+              ON sink_trust_records(generation, pattern, trust_id);
+
+            CREATE TABLE IF NOT EXISTS data_flow_decisions (
+              decision_id TEXT PRIMARY KEY,
+              pid TEXT NOT NULL,
+              sink TEXT NOT NULL,
+              direction TEXT NOT NULL,
+              outcome TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              labels_json TEXT NOT NULL,
+              source_refs_json TEXT NOT NULL,
+              payload_hash TEXT NOT NULL,
+              trust_id TEXT,
+              trust_hash TEXT,
+              registry_generation INTEGER NOT NULL,
+              release_capability_id TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_data_flow_decisions_created
+              ON data_flow_decisions(created_at, decision_id);
+
+            CREATE INDEX IF NOT EXISTS idx_data_flow_decisions_pid_created
+              ON data_flow_decisions(pid, created_at, decision_id);
+
+            CREATE INDEX IF NOT EXISTS idx_data_flow_decisions_sink_created
+              ON data_flow_decisions(sink, created_at, decision_id);
+
+            CREATE TABLE IF NOT EXISTS file_label_bindings (
+              binding_id TEXT PRIMARY KEY,
+              normalized_path TEXT NOT NULL,
+              content_sha256 TEXT,
+              labels_json TEXT NOT NULL,
+              source_refs_json TEXT NOT NULL,
+              generation INTEGER NOT NULL,
+              tombstoned INTEGER NOT NULL,
+              active INTEGER NOT NULL,
+              created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              superseded_at TEXT,
+              UNIQUE(normalized_path, generation)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_file_label_active_path
+              ON file_label_bindings(normalized_path) WHERE active = 1;
+
+            CREATE INDEX IF NOT EXISTS idx_file_label_path_generation
+              ON file_label_bindings(normalized_path, generation, binding_id);
+
+            CREATE INDEX IF NOT EXISTS idx_file_label_tree_scan
+              ON file_label_bindings(
+                active,
+                tombstoned,
+                normalized_path COLLATE BINARY,
+                generation DESC,
+                binding_id
+              );
+            """
+        )
+
     def _ensure_operation_schema(self) -> None:
         self.conn.executescript(
             """
@@ -3711,6 +4661,7 @@ class SQLRuntimeStore:
               tool_name TEXT,
               filters_json TEXT NOT NULL,
               action_json TEXT NOT NULL,
+              data_flow_context_json TEXT NOT NULL,
               content_preview TEXT NOT NULL,
               tool_call_count INTEGER NOT NULL,
               status TEXT NOT NULL,
@@ -3732,6 +4683,15 @@ class SQLRuntimeStore:
             self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN tool_call_id TEXT")
         if "tool_name" not in pending_columns:
             self.conn.execute("ALTER TABLE llm_pending_actions ADD COLUMN tool_name TEXT")
+        data_flow_context_column_added = "data_flow_context_json" not in pending_columns
+        if data_flow_context_column_added:
+            self.conn.execute(
+                "ALTER TABLE llm_pending_actions "
+                "ADD COLUMN data_flow_context_json TEXT"
+            )
+        self._backfill_llm_pending_action_data_flow_contexts(
+            force=data_flow_context_column_added
+        )
         self.conn.execute(
             """
             UPDATE llm_pending_actions
@@ -3739,6 +4699,7 @@ class SQLRuntimeStore:
              WHERE resume_token IS NULL OR resume_token = ''
             """
         )
+
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS llm_tool_outputs (
@@ -3762,6 +4723,183 @@ class SQLRuntimeStore:
             CREATE TABLE IF NOT EXISTS llm_context_generations (
               pid TEXT PRIMARY KEY,
               generation TEXT NOT NULL,
+              labels_schema_version INTEGER NOT NULL DEFAULT 1,
+              labels_json TEXT,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        context_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(llm_context_generations)")
+        }
+        if "labels_schema_version" not in context_columns:
+            self.conn.execute(
+                "ALTER TABLE llm_context_generations "
+                "ADD COLUMN labels_schema_version INTEGER NOT NULL DEFAULT 1"
+            )
+        if "labels_json" not in context_columns:
+            self.conn.execute(
+                "ALTER TABLE llm_context_generations ADD COLUMN labels_json TEXT"
+            )
+
+    def _backfill_llm_pending_action_data_flow_contexts(
+        self,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Conservatively classify every non-canonical legacy pending carrier.
+
+        Historical schemas can contain absent, partial, malformed, or otherwise
+        invalid JSON. Active rows must be invalidated so the runtime can perform
+        a normal terminal lifecycle after all managers are bound. Completed
+        rows are inert history and only receive the conservative carrier. The
+        durable cursor makes a large legacy history resumable without scanning
+        or decoding it again on every normal runtime open.
+        """
+
+        migration_name = "llm_pending_action_data_flow_context"
+        migration_version = 1
+        now = utc_now()
+        state = self.conn.execute(
+            """
+            SELECT version, cursor_value, completed
+              FROM storage_migrations
+             WHERE migration_name = ?
+            """,
+            (migration_name,),
+        ).fetchone()
+        if state is None:
+            self.conn.execute(
+                """
+                INSERT INTO storage_migrations (
+                    migration_name, version, cursor_value, completed, updated_at
+                ) VALUES (?, ?, NULL, 0, ?)
+                """,
+                (migration_name, migration_version, now),
+            )
+            last_pid: str | None = None
+        elif int(state["version"]) > migration_version:
+            raise ValidationError(
+                f"storage migration {migration_name} version {state['version']} "
+                f"is newer than supported version {migration_version}"
+            )
+        elif force or int(state["version"]) < migration_version:
+            self.conn.execute(
+                """
+                UPDATE storage_migrations
+                   SET version = ?, cursor_value = NULL, completed = 0, updated_at = ?
+                 WHERE migration_name = ?
+                """,
+                (migration_version, now, migration_name),
+            )
+            last_pid = None
+        elif bool(state["completed"]):
+            return
+        else:
+            last_pid = (
+                str(state["cursor_value"])
+                if state["cursor_value"] is not None
+                else None
+            )
+
+        # Initialization may have issued additive DDL just before this
+        # migration. End SQLite's implicit transaction so every data batch and
+        # its cursor advance are committed atomically by transaction().
+        self.conn.commit()
+        conservative_json = dumps(_conservative_legacy_data_flow_context())
+        batch_size = max(1, int(self.config.tools.message_read_limit))
+        while True:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if last_pid is not None:
+                clauses.append("pid > ?")
+                params.append(last_pid)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(batch_size)
+            rows = list(
+                self.conn.execute(
+                    "SELECT pid, status, data_flow_context_json "
+                    "FROM llm_pending_actions"
+                    f"{where} ORDER BY pid LIMIT ?",
+                    params,
+                )
+            )
+            if not rows:
+                break
+            last_pid = str(rows[-1]["pid"])
+            with self.transaction() as cur:
+                for row in rows:
+                    pid = str(row["pid"])
+                    try:
+                        decoded = loads(row["data_flow_context_json"])
+                        canonical = _canonical_pending_data_flow_context(decoded)
+                    except (TypeError, ValueError, ValidationError):
+                        canonical = None
+                    if canonical is not None:
+                        if decoded != canonical:
+                            cur.execute(
+                                """
+                                UPDATE llm_pending_actions
+                                   SET data_flow_context_json = ?
+                                 WHERE pid = ?
+                                """,
+                                (dumps(canonical), pid),
+                            )
+                        continue
+                    status = str(row["status"] or "")
+                    if status in {"pending", "resuming"}:
+                        cur.execute(
+                            """
+                            UPDATE llm_pending_actions
+                               SET data_flow_context_json = ?, status = ?, updated_at = ?
+                             WHERE pid = ? AND status = ?
+                            """,
+                            (
+                                conservative_json,
+                                _LEGACY_PENDING_DATA_FLOW_STATUS,
+                                utc_now(),
+                                pid,
+                                status,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE llm_pending_actions
+                               SET data_flow_context_json = ?
+                             WHERE pid = ?
+                            """,
+                            (conservative_json, pid),
+                        )
+                cur.execute(
+                    """
+                    UPDATE storage_migrations
+                       SET cursor_value = ?, updated_at = ?
+                     WHERE migration_name = ? AND version = ? AND completed = 0
+                    """,
+                    (last_pid, utc_now(), migration_name, migration_version),
+                )
+            if len(rows) < batch_size:
+                break
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE storage_migrations
+                   SET cursor_value = NULL, completed = 1, updated_at = ?
+                 WHERE migration_name = ? AND version = ?
+                """,
+                (utc_now(), migration_name, migration_version),
+            )
+
+    def _ensure_storage_migration_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS storage_migrations (
+              migration_name TEXT PRIMARY KEY,
+              version INTEGER NOT NULL,
+              cursor_value TEXT,
+              completed INTEGER NOT NULL,
               updated_at TEXT NOT NULL
             )
             """
@@ -3775,6 +4913,13 @@ class SQLRuntimeStore:
             self.conn.execute("ALTER TABLE process_messages ADD COLUMN correlation_id TEXT")
         if "reply_to" not in columns:
             self.conn.execute("ALTER TABLE process_messages ADD COLUMN reply_to TEXT")
+        metadata_column_added = "metadata_json" not in columns
+        if metadata_column_added:
+            self.conn.execute(
+                "ALTER TABLE process_messages "
+                "ADD COLUMN metadata_json TEXT"
+            )
+        self._backfill_process_message_metadata(force=metadata_column_added)
         self.conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_process_messages_recipient_status_kind
@@ -3793,6 +4938,210 @@ class SQLRuntimeStore:
               ON process_messages(recipient_pid, correlation_id, status, created_at)
             """
         )
+
+    def _backfill_process_message_metadata(self, *, force: bool = False) -> None:
+        migration_name = "process_message_metadata"
+        migration_version = 1
+        now = utc_now()
+        state = self.conn.execute(
+            """
+            SELECT version, cursor_value, completed
+              FROM storage_migrations
+             WHERE migration_name = ?
+            """,
+            (migration_name,),
+        ).fetchone()
+        if state is None:
+            self.conn.execute(
+                """
+                INSERT INTO storage_migrations (
+                    migration_name, version, cursor_value, completed, updated_at
+                ) VALUES (?, ?, NULL, 0, ?)
+                """,
+                (migration_name, migration_version, now),
+            )
+            last_message_id: str | None = None
+        elif int(state["version"]) > migration_version:
+            raise ValidationError(
+                f"storage migration {migration_name} version {state['version']} "
+                f"is newer than supported version {migration_version}"
+            )
+        elif force or int(state["version"]) < migration_version:
+            self.conn.execute(
+                """
+                UPDATE storage_migrations
+                   SET version = ?, cursor_value = NULL, completed = 0, updated_at = ?
+                 WHERE migration_name = ?
+                """,
+                (migration_version, now, migration_name),
+            )
+            last_message_id = None
+        elif bool(state["completed"]):
+            return
+        else:
+            last_message_id = (
+                str(state["cursor_value"])
+                if state["cursor_value"] is not None
+                else None
+            )
+
+        # Initialization uses direct DDL/DML before this resumable migration.
+        # End that implicit SQLite transaction so each data batch and cursor
+        # advance can commit atomically through the normal transaction helper.
+        self.conn.commit()
+        batch_size = self.config.tools.message_read_limit
+        while True:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if last_message_id is not None:
+                clauses.append("message_id > ?")
+                params.append(last_message_id)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(batch_size)
+            rows = list(
+                self.conn.execute(
+                    "SELECT message_id, metadata_json FROM process_messages"
+                    f"{where} ORDER BY message_id LIMIT ?",
+                    params,
+                )
+            )
+            if not rows:
+                break
+            updates: list[tuple[str, str]] = []
+            for row in rows:
+                try:
+                    raw_metadata = (
+                        loads(row["metadata_json"])
+                        if row["metadata_json"] is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    raw_metadata = None
+                try:
+                    canonical = _canonical_process_message_metadata(raw_metadata)
+                except ValidationError:
+                    canonical = conservative_legacy_process_message_metadata()
+                if raw_metadata != canonical:
+                    updates.append((dumps(canonical), str(row["message_id"])))
+            last_message_id = str(rows[-1]["message_id"])
+            with self.transaction() as cur:
+                if updates:
+                    cur.executemany(
+                        "UPDATE process_messages SET metadata_json = ? "
+                        "WHERE message_id = ?",
+                        updates,
+                    )
+                cur.execute(
+                    """
+                    UPDATE storage_migrations
+                       SET cursor_value = ?, updated_at = ?
+                     WHERE migration_name = ? AND version = ? AND completed = 0
+                    """,
+                    (last_message_id, utc_now(), migration_name, migration_version),
+                )
+            if len(rows) < batch_size:
+                break
+        self.conn.execute(
+            """
+            UPDATE storage_migrations
+               SET cursor_value = NULL, completed = 1, updated_at = ?
+             WHERE migration_name = ? AND version = ?
+            """,
+            (utc_now(), migration_name, migration_version),
+        )
+
+    def _backfill_llm_context_label_history(self) -> None:
+        """Preserve pre-watermark context labels before volatile payload recovery."""
+
+        prefixes = tuple(
+            dict.fromkeys(
+                (
+                    f"{self.config.llm_context.object_name_prefix}:",
+                    f"{DEFAULT_CONFIG.llm_context.object_name_prefix}:",
+                )
+            )
+        )
+        rows = self.conn.execute(
+            """
+            SELECT objects.owner_id, objects.name, objects.metadata_json
+              FROM objects
+              LEFT JOIN llm_context_generations
+                ON llm_context_generations.pid = objects.owner_id
+             WHERE objects.lifecycle_state IN (?, ?)
+               AND objects.type = ?
+               AND (
+                    llm_context_generations.pid IS NULL
+                    OR llm_context_generations.labels_json IS NULL
+               )
+            """,
+            (
+                ObjectLifecycleState.LIVE.value,
+                ObjectLifecycleState.RELEASED.value,
+                ObjectType.PROCESS_STATE.value,
+            ),
+        )
+        recovered: dict[str, list[DataLabels]] = {}
+        for row in rows:
+            name = str(row["name"] or "")
+            owner_pid = str(row["owner_id"] or "").strip()
+            prefix = next(
+                (candidate for candidate in prefixes if name.startswith(candidate)),
+                None,
+            )
+            with _persisted_model_decode(
+                f"LLM context metadata for {owner_pid or name or '<unknown>'}"
+            ):
+                metadata = ObjectMetadata.from_persisted(
+                    loads(row["metadata_json"], {})
+                )
+            tagged_context = all(
+                tag in metadata.tags for tag in ("llm_context", "prompt_cache")
+            )
+            if prefix is None and not tagged_context:
+                continue
+            pid = owner_pid or (
+                name[len(prefix) :].strip() if prefix is not None else ""
+            )
+            if not pid:
+                raise ValidationError(
+                    "persisted LLM context label history has no process owner"
+                )
+            recovered.setdefault(pid, []).append(
+                DataLabels.from_object_metadata(metadata)
+            )
+
+        now = utc_now()
+        for pid, recovered_labels in recovered.items():
+            row = self.conn.execute(
+                """
+                SELECT labels_schema_version, labels_json
+                  FROM llm_context_generations
+                 WHERE pid = ?
+                """,
+                (pid,),
+            ).fetchone()
+            if row is not None and row["labels_json"] is not None:
+                continue
+            merged = DataLabels.aggregate(recovered_labels)
+            self.conn.execute(
+                """
+                INSERT INTO llm_context_generations (
+                    pid, generation, labels_schema_version, labels_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(pid) DO UPDATE SET
+                    labels_schema_version = excluded.labels_schema_version,
+                    labels_json = excluded.labels_json,
+                    updated_at = excluded.updated_at
+                  WHERE llm_context_generations.labels_json IS NULL
+                """,
+                (
+                    pid,
+                    "initial",
+                    _LLM_CONTEXT_LABEL_SCHEMA_VERSION,
+                    dumps(merged),
+                    now,
+                ),
+            )
 
     def _ensure_object_task_schema(self) -> None:
         self.conn.execute(
@@ -4293,8 +5642,12 @@ class SQLRuntimeStore:
         payload = loads(payload_json, {})
         if (
             isinstance(payload, dict)
-            and set(payload) == {"storage", "present"}
+            and {"storage", "present"}.issubset(payload)
+            and set(payload).issubset(
+                {"storage", "present", "recovered_after_reopen"}
+            )
             and payload.get("storage") == "runtime_memory"
+            and isinstance(payload.get("present"), bool)
         ):
             return _MISSING_OBJECT_PAYLOAD
         return payload
@@ -4335,7 +5688,12 @@ class SQLRuntimeStore:
              WHERE oid IN ({placeholders})
             """,
             (
-                dumps(self.payload_marker(present=False)),
+                dumps(
+                    self.payload_marker(
+                        present=False,
+                        recovered_after_reopen=True,
+                    )
+                ),
                 ObjectLifecycleState.RELEASED.value,
                 now,
                 now,
@@ -4434,7 +5792,9 @@ class SQLRuntimeStore:
 
     def _row_to_object(self, row: sqlite3.Row) -> AgentObject:
         with _persisted_model_decode(f"object {row['oid']}"):
-            metadata = ObjectMetadata(**loads(row["metadata_json"], {}))
+            metadata = ObjectMetadata.from_persisted(
+                loads(row["metadata_json"], {})
+            )
             provenance = Provenance(**loads(row["provenance_json"], {}))
             return AgentObject(
                 oid=row["oid"],
@@ -4698,6 +6058,134 @@ class SQLRuntimeStore:
             metadata=loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
         )
 
+    def _row_to_sink_trust(self, row: Any) -> SinkTrustSpec:
+        with _persisted_model_decode(f"sink trust record {row['trust_id']}"):
+            active_raw = row["active"]
+            if active_raw not in {0, 1, False, True}:
+                raise ValueError("active must be stored as 0 or 1")
+            return SinkTrustSpec(
+                trust_id=row["trust_id"],
+                schema_version=int(row["schema_version"]),
+                pattern=row["pattern"],
+                trust_level=SinkTrustLevel(row["trust_level"]),
+                max_sensitivity=row["max_sensitivity"],
+                tenants=tuple(loads(row["tenants_json"], [])),
+                principals=tuple(loads(row["principals_json"], [])),
+                identity_sha256=row["identity_sha256"],
+                generation=int(row["generation"]),
+                spec_hash=row["spec_hash"],
+                active=bool(active_raw),
+                created_by=row["created_by"],
+                created_at=row["created_at"],
+                deactivated_at=row["deactivated_at"],
+            )
+
+    def _row_to_data_flow_decision(self, row: Any) -> DataFlowDecision:
+        with _persisted_model_decode(f"data-flow decision {row['decision_id']}"):
+            raw_refs = loads(row["source_refs_json"], [])
+            if not isinstance(raw_refs, list):
+                raise ValueError("source_refs_json must contain an array")
+            return DataFlowDecision(
+                decision_id=row["decision_id"],
+                pid=row["pid"],
+                sink=row["sink"],
+                direction=DataFlowDirection(row["direction"]),
+                outcome=DataFlowOutcome(row["outcome"]),
+                reason=row["reason"],
+                labels=DataLabels.from_dict(loads(row["labels_json"], {})),
+                source_refs=tuple(DataSourceRef.from_dict(item) for item in raw_refs),
+                payload_hash=row["payload_hash"],
+                trust_id=row["trust_id"],
+                trust_hash=row["trust_hash"],
+                registry_generation=int(row["registry_generation"]),
+                release_capability_id=row["release_capability_id"],
+                created_at=row["created_at"],
+            )
+
+    def _row_to_file_label_binding(self, row: Any) -> FileLabelBinding:
+        with _persisted_model_decode(f"file label binding {row['binding_id']}"):
+            raw_refs = loads(row["source_refs_json"], [])
+            if not isinstance(raw_refs, list):
+                raise ValueError("source_refs_json must contain an array")
+            tombstoned_raw = row["tombstoned"]
+            active_raw = row["active"]
+            if tombstoned_raw not in {0, 1, False, True} or active_raw not in {0, 1, False, True}:
+                raise ValueError("tombstoned and active must be stored as 0 or 1")
+            return FileLabelBinding(
+                binding_id=row["binding_id"],
+                normalized_path=row["normalized_path"],
+                content_sha256=row["content_sha256"],
+                labels=DataLabels.from_dict(loads(row["labels_json"], {})),
+                source_refs=tuple(DataSourceRef.from_dict(item) for item in raw_refs),
+                generation=int(row["generation"]),
+                tombstoned=bool(tombstoned_raw),
+                active=bool(active_raw),
+                created_by=row["created_by"],
+                created_at=row["created_at"],
+                superseded_at=row["superseded_at"],
+            )
+
+    @staticmethod
+    def _sink_trust_generation_from_cursor(cur: Any) -> int:
+        cur.execute("SELECT generation FROM sink_trust_registry WHERE registry_key = 'default'")
+        row = cur.fetchone()
+        if row is None:
+            raise ValidationError("sink trust registry metadata is missing")
+        generation = row["generation"]
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValidationError("invalid persisted sink trust registry generation")
+        return generation
+
+    @staticmethod
+    def _file_label_generation_from_cursor(cur: Any, normalized_path: str) -> int:
+        cur.execute(
+            "SELECT MAX(generation) AS generation FROM file_label_bindings WHERE normalized_path = ?",
+            (normalized_path,),
+        )
+        row = cur.fetchone()
+        value = row["generation"] if row is not None else None
+        return int(value) if value is not None else 0
+
+    @staticmethod
+    def _insert_file_label_binding(cur: Any, binding: FileLabelBinding) -> None:
+        cur.execute(
+            """
+            INSERT INTO file_label_bindings (
+                binding_id, normalized_path, content_sha256, labels_json,
+                source_refs_json, generation, tombstoned, active,
+                created_by, created_at, superseded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                binding.binding_id,
+                binding.normalized_path,
+                binding.content_sha256,
+                dumps(binding.labels.to_dict()),
+                dumps([ref.to_dict() for ref in binding.source_refs]),
+                binding.generation,
+                int(binding.tombstoned),
+                int(binding.active),
+                binding.created_by,
+                binding.created_at,
+                binding.superseded_at,
+            ),
+        )
+
+    @staticmethod
+    def _data_flow_list_limit(
+        limit: int | None,
+        *,
+        default: int,
+        hard_limit: int,
+        label: str,
+    ) -> int:
+        selected = default if limit is None else limit
+        if isinstance(selected, bool) or not isinstance(selected, int) or selected <= 0:
+            raise ValidationError(f"{label} limit must be a positive integer")
+        if selected > hard_limit:
+            raise ValidationError(f"{label} limit exceeds hard cap {hard_limit}")
+        return selected
+
     def _row_to_human_request(self, row: sqlite3.Row) -> HumanRequest:
         with _persisted_model_decode(f"human request {row['request_id']}"):
             return HumanRequest(
@@ -4738,6 +6226,22 @@ class SQLRuntimeStore:
         )
 
     def _row_to_llm_pending_action(self, row: sqlite3.Row) -> dict[str, Any]:
+        raw_data_flow_context = (
+            loads(row["data_flow_context_json"])
+            if "data_flow_context_json" in row.keys()
+            and row["data_flow_context_json"] is not None
+            else None
+        )
+        if raw_data_flow_context is None:
+            if row["status"] != _LEGACY_PENDING_DATA_FLOW_STATUS:
+                raise ValidationError(
+                    f"pending LLM action {row['pid']} has no trusted data-flow context"
+                )
+            data_flow_context = _conservative_legacy_data_flow_context()
+        else:
+            data_flow_context = _canonical_pending_data_flow_context(
+                raw_data_flow_context
+            )
         return {
             "pid": row["pid"],
             "resume_token": row["resume_token"] if "resume_token" in row.keys() else None,
@@ -4751,6 +6255,7 @@ class SQLRuntimeStore:
             "tool_name": row["tool_name"] if "tool_name" in row.keys() else None,
             "filters": loads(row["filters_json"], {}),
             "action": loads(row["action_json"], {}),
+            "data_flow_context": data_flow_context,
             "content_preview": row["content_preview"],
             "tool_call_count": row["tool_call_count"],
             "status": row["status"],
@@ -4809,6 +6314,16 @@ class SQLRuntimeStore:
 
     def _row_to_process_message(self, row: sqlite3.Row) -> ProcessMessage:
         with _persisted_model_decode(f"process message {row['message_id']}"):
+            raw_payload = loads(row["payload_json"], {})
+            raw_metadata = (
+                loads(row["metadata_json"])
+                if "metadata_json" in row.keys() and row["metadata_json"] is not None
+                else None
+            )
+            payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+            metadata = _canonical_process_message_metadata(
+                raw_metadata if raw_metadata is not None else {}
+            )
             return ProcessMessage(
                 message_id=row["message_id"],
                 sender=row["sender"],
@@ -4819,7 +6334,8 @@ class SQLRuntimeStore:
                 reply_to=row["reply_to"] if "reply_to" in row.keys() else None,
                 subject=row["subject"],
                 body=row["body"],
-                payload=loads(row["payload_json"], {}),
+                payload=payload,
+                metadata=metadata,
                 status=ProcessMessageStatus(row["status"]),
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],

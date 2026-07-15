@@ -14,13 +14,14 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
-from agent_libos.models.exceptions import NotFound
+from agent_libos.models.exceptions import HumanApprovalRequired, NotFound
 from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     CapabilitySpec,
     ForkMode,
+    HumanRequestStatus,
     MemoryViewSpec,
     ObjectHandle,
     ObjectMetadata,
@@ -147,7 +148,10 @@ def main(argv: list[str] | None = None) -> None:
     exec_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget when --run is set; omitted runs until idle.")
     exit_parser = sub.add_parser("exit", help="Exit an AgentProcess")
     exit_parser.add_argument("pid")
-    exit_parser.add_argument("--message", help="Optional process status message.")
+    exit_parser.add_argument(
+        "--message",
+        help="Optional final message stored in a label-bearing process-result Object.",
+    )
     exit_parser.add_argument("--payload", help="Optional JSON final-result payload. Non-JSON text is wrapped as content.")
     exit_parser.add_argument("--result-oid", help="Existing object id to use as process result.")
     exit_parser.add_argument("--failed", action="store_true", help="Mark the process as failed instead of exited.")
@@ -1491,7 +1495,12 @@ def _handle_interactive_line(
 ) -> str | None:
     if line is None:
         return "eof"
-    if _handle_interactive_human_response(runtime, line, human):
+    if _handle_interactive_human_response(
+        runtime,
+        line,
+        human,
+        shown_request_id=state.get("shown_request_id"),
+    ):
         return None
     parsed = _parse_interactive_line(line)
     command = parsed.get("command")
@@ -1564,14 +1573,20 @@ def _process_interactive_terminal_outputs(runtime: Runtime, human: str) -> list[
 
 
 def _show_pending_interactive_human_request(runtime: Runtime, human: str, state: dict[str, str]) -> None:
-    request = _first_interactive_input_request(runtime, human)
+    retained_release_id = state.get("pending_release_request_id")
+    request = _interactive_input_request_by_id(
+        runtime,
+        human,
+        retained_release_id,
+    )
+    if request is None:
+        state["pending_release_request_id"] = ""
+        request = _first_interactive_input_request(runtime, human)
     if request is None:
         state["shown_request_id"] = ""
         return
     if state.get("shown_request_id") == request.request_id:
         return
-    state["shown_request_id"] = request.request_id
-    question = runtime.human.format_terminal_request(request)
     request_type = str(request.payload.get("type") or "approval")
     if request_type == "permission_request":
         suffix = "Reply a=always allow, d=always deny, e=ask each time."
@@ -1579,14 +1594,33 @@ def _show_pending_interactive_human_request(runtime: Runtime, human: str, state:
         suffix = "Reply with the answer text."
     else:
         suffix = "Reply y/yes to approve, n/no to reject."
-    print(f"\nHuman request {request.request_id}: {question}\n{suffix}", file=sys.stderr, flush=True)
+    try:
+        runtime.human.present_terminal_request(request, suffix=suffix)
+    except HumanApprovalRequired as exc:
+        # The protected Human Sink created a metadata-only release request.
+        # Retain the exact prerequisite because bounded pending-request windows
+        # are allowed to omit a newly-created release behind older requests.
+        state["pending_release_request_id"] = exc.request_id
+        state["shown_request_id"] = ""
+        return
+    state["shown_request_id"] = request.request_id
 
 
-def _handle_interactive_human_response(runtime: Runtime, line: str, human: str) -> bool:
+def _handle_interactive_human_response(
+    runtime: Runtime,
+    line: str,
+    human: str,
+    *,
+    shown_request_id: str | None,
+) -> bool:
     stripped = line.strip()
     if not stripped or stripped.startswith(("/message", "/m", "/interrupt", "/i", "/pid", "/target", "/help", "/exit", "/quit")):
         return False
-    request = _first_interactive_input_request(runtime, human)
+    request = _interactive_input_request_by_id(
+        runtime,
+        human,
+        shown_request_id,
+    )
     if request is None:
         return False
     response = _interactive_response_text(stripped)
@@ -1666,10 +1700,41 @@ def _interactive_permission_policy(answer: str) -> str:
 
 
 def _first_interactive_input_request(runtime: Runtime, human: str) -> Any | None:
-    for request in runtime.human.pending(human=human):
-        if request.payload.get("type") != "output":
-            return request
-    return None
+    pending = [
+        request
+        for request in runtime.human.pending(human=human)
+        if request.payload.get("type") != "output"
+    ]
+    return next(
+        (
+            request
+            for request in pending
+            if request.payload.get("type") == "data_release_approval"
+        ),
+        pending[0] if pending else None,
+    )
+
+
+def _interactive_input_request_by_id(
+    runtime: Runtime,
+    human: str,
+    request_id: str | None,
+) -> Any | None:
+    """Resolve only the still-pending request that the CLI retained or showed."""
+
+    if not request_id:
+        return None
+    try:
+        request = runtime.human.get(request_id)
+    except NotFound:
+        return None
+    if (
+        request.human != human
+        or request.status is not HumanRequestStatus.PENDING
+        or request.payload.get("type") == "output"
+    ):
+        return None
+    return request
 
 
 def _process_cli_summary(process: Any) -> dict[str, Any]:

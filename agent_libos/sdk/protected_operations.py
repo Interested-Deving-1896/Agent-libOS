@@ -10,6 +10,10 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping, TypeVar
 from agent_libos.models import (
     AuditRecord,
     CapabilityDecision,
+    DataFlowContext,
+    DataFlowDecision,
+    DataFlowDirection,
+    DataSink,
     Event,
     EventPriority,
     EventType,
@@ -59,6 +63,7 @@ class ProtectedOperationContract:
     authority_mode: AuthorityMode = AuthorityMode.CAPABILITY
     state_mutation: bool = False
     information_flow: bool = False
+    data_flow_direction: DataFlowDirection = DataFlowDirection.NONE
     post_provider_failure_mode: PostProviderFailureMode = PostProviderFailureMode.PROPAGATE
     internal_reason: str | None = None
     require_classifier: bool = True
@@ -81,6 +86,18 @@ class ProtectedOperationContract:
             raise ValueError("runtime-internal protected operations require an explicit reason")
         if self.prepared_recovery is not None and not str(self.prepared_recovery).strip():
             raise ValueError("prepared recovery policy names must be non-empty")
+        object.__setattr__(
+            self,
+            "data_flow_direction",
+            DataFlowDirection(self.data_flow_direction),
+        )
+        if (
+            self.data_flow_direction is not DataFlowDirection.NONE
+            and not self.information_flow
+        ):
+            raise ValueError(
+                "data-flow directions require information_flow=True"
+            )
 
 
 @dataclass(frozen=True)
@@ -149,6 +166,11 @@ Hook = Callable[[], None]
 FailureEvidenceFactory = Callable[[BaseException, str], ProtectedOperationEvidence]
 PreparedRecoveryHandler = Callable[[Any], None]
 FailureResourceFactory = Callable[[BaseException, str], ResourceSettlement | None]
+FailureSettlementHandler = Callable[[BaseException, str], None]
+AuthorityRevalidator = Callable[[], Iterable[CapabilityDecision]]
+DataSinkRevalidator = Callable[[], DataSink]
+TargetStateVersionResolver = Callable[[], str | int | None]
+_DATA_FLOW_PAYLOAD_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -164,9 +186,20 @@ class ProtectedOperationInvocation:
     resource_source: str | None = None
     resource_context: Mapping[str, Any] = field(default_factory=dict)
     prepare: Hook | None = None
+    authority_revalidator: AuthorityRevalidator | None = None
     restore_not_started: Hook | None = None
     failure_evidence: FailureEvidenceFactory | None = None
     failure_resource: ResourceSettlement | FailureResourceFactory | None = None
+    failure_settlement: FailureSettlementHandler | None = None
+    data_sink: DataSink | None = None
+    data_sink_revalidator: DataSinkRevalidator | None = None
+    data_flow_context: DataFlowContext | None = None
+    data_flow_ingress_context: DataFlowContext | None = None
+    data_flow_payload: Any = field(default=_DATA_FLOW_PAYLOAD_UNSET, repr=False)
+    data_flow_operation: str | None = None
+    data_flow_target_state_version: str | int | None = None
+    data_flow_target_state_version_resolver: TargetStateVersionResolver | None = None
+    data_flow_allow_recovered_source_snapshots: bool = False
 
 
 class ProtectedOperationProtocolError(ValidationError):
@@ -201,6 +234,7 @@ class ProtectedOperationSDK:
         events: Any,
         resources: Any | None,
         operations: Any,
+        data_flow: Any | None = None,
     ) -> None:
         self.store = store
         self.capabilities = capabilities
@@ -208,6 +242,7 @@ class ProtectedOperationSDK:
         self.events = events
         self.resources = resources
         self.operations = operations
+        self.data_flow = data_flow
         self._contracts: dict[str, ProtectedOperationContract] = {}
         self._prepared_recovery_handlers: dict[str, PreparedRecoveryHandler] = {}
         self._identity = id(self)
@@ -340,10 +375,18 @@ class ProtectedOperation:
         self.provider = provider
         self.effect_id: str | None = None
         self._reservation_ids: list[str] = []
+        self._reservation_ids_by_capability: dict[str, str] = {}
         self._reservations_committed = False
         self._dispatched = False
         self._terminal = False
         self._completed_phases: list[ProviderPhase] = []
+        self._authority_decisions: tuple[CapabilityDecision, ...] = ()
+        self._failure_settlement_run = False
+        self._data_flow_decision: DataFlowDecision | None = None
+        self._data_flow_release_decision: CapabilityDecision | None = None
+        self._data_flow_release_reservation_id: str | None = None
+        self._data_flow_registry_generation: int | None = None
+        self._data_flow_ingress_observed = False
         self._operation_cm: Any | None = None
 
     @property
@@ -434,6 +477,7 @@ class ProtectedOperation:
             self._handle_not_started(error, phase)
             raise
         except BaseException as error:
+            self._observe_data_flow_ingress(phase)
             self._expect_settlement_evidence()
             self._commit_reservations_best_effort()
             self._finalize_unknown(error, phase.name)
@@ -443,6 +487,7 @@ class ProtectedOperation:
         if isinstance(result, ProviderEffectNotStartedResult):
             self._handle_not_started(result.error, phase, outcome=result.outcome)
             return result  # type: ignore[return-value]
+        self._observe_data_flow_ingress(phase)
         self._record_completed_phase(phase)
         self._expect_settlement_evidence()
         self._completed_phases.append(phase)
@@ -471,6 +516,7 @@ class ProtectedOperation:
             self._handle_not_started(error, phase)
             raise
         except BaseException as error:
+            self._observe_data_flow_ingress(phase)
             self._expect_settlement_evidence()
             self._commit_reservations_best_effort()
             self._finalize_unknown(error, phase.name)
@@ -480,6 +526,7 @@ class ProtectedOperation:
         if isinstance(result, ProviderEffectNotStartedResult):
             self._handle_not_started(result.error, phase, outcome=result.outcome)
             return result  # type: ignore[return-value]
+        self._observe_data_flow_ingress(phase)
         self._record_completed_phase(phase)
         self._expect_settlement_evidence()
         self._completed_phases.append(phase)
@@ -545,6 +592,7 @@ class ProtectedOperation:
                     metadata={
                         "context": dict(self.invocation.observation),
                         "provider_phases": self._phase_metadata(),
+                        "data_flow": self._data_flow_evidence(),
                         "result": effect_metadata,
                         **flattened_metadata,
                         "provider_receipt": provider_receipt,
@@ -553,6 +601,11 @@ class ProtectedOperation:
                 )
             self._terminal = True
         except BaseException as error:
+            try:
+                self._run_failure_settlement(error, "completion_settlement")
+            except BaseException as settlement_error:
+                self._terminal = True
+                raise settlement_error from error
             self._terminal = True
             if self.contract.post_provider_failure_mode == PostProviderFailureMode.PRESERVE_RESULT:
                 return result
@@ -562,8 +615,6 @@ class ProtectedOperation:
         return result
 
     def _prepare(self) -> None:
-        if self.contract.require_classifier:
-            require_external_effect_classifier(self.provider, self.contract.operation)
         self._validate_authority()
         manifests = getattr(self.sdk.store, "authority_manifest_manager", None)
         if manifests is not None:
@@ -571,6 +622,9 @@ class ProtectedOperation:
                 self.invocation.pid,
                 f"{self.contract.provider}.{self.contract.operation}",
             )
+        self._preflight_data_flow()
+        if self.contract.require_classifier:
+            require_external_effect_classifier(self.provider, self.contract.operation)
         if self.contract.preflight_classifier:
             # Capability/manifest gates run before inspecting provider-specific
             # operation support. The second classification after completion can
@@ -612,31 +666,38 @@ class ProtectedOperation:
         canonical_args = to_jsonable(dict(self.invocation.canonical_args))
         if not isinstance(observation, dict) or not isinstance(canonical_args, dict):
             raise ValidationError("protected operation contexts must serialize to objects")
-        with self.sdk.store.transaction():
-            self._reserve_decisions()
-            if self.invocation.prepare is not None:
-                self.invocation.prepare()
-            effect = prepare_external_effect_intent(
-                self.sdk.store,
-                pid=self.invocation.pid,
-                provider=self.contract.provider,
-                operation=self.contract.operation,
-                target=self.invocation.target,
-                state_mutation=self.contract.state_mutation,
-                information_flow=self.contract.information_flow,
-                metadata={
-                    "context": observation,
-                    "protected_operation": {
-                        "contract_name": self.contract.name,
-                        "actor": self.invocation.actor,
-                        "reservation_ids": list(self._reservation_ids),
-                        "prepared_recovery": self.contract.prepared_recovery,
+        try:
+            with self.sdk.store.transaction():
+                if self.invocation.prepare is not None:
+                    self.invocation.prepare()
+                self._revalidate_authority()
+                self._revalidate_data_flow()
+                self._reserve_decisions()
+                effect = prepare_external_effect_intent(
+                    self.sdk.store,
+                    pid=self.invocation.pid,
+                    provider=self.contract.provider,
+                    operation=self.contract.operation,
+                    target=self.invocation.target,
+                    state_mutation=self.contract.state_mutation,
+                    information_flow=self.contract.information_flow,
+                    metadata={
+                        "context": observation,
+                        "protected_operation": {
+                            "contract_name": self.contract.name,
+                            "actor": self.invocation.actor,
+                            "reservation_ids": list(self._reservation_ids),
+                            "prepared_recovery": self.contract.prepared_recovery,
+                        },
+                        "data_flow": self._data_flow_evidence(),
                     },
-                },
-                idempotency_key=self.invocation.idempotency_key,
-                canonical_args=canonical_args,
-            )
-            self.effect_id = effect.effect_id
+                    idempotency_key=self.invocation.idempotency_key,
+                    canonical_args=canonical_args,
+                )
+                self.effect_id = effect.effect_id
+        except BaseException as error:
+            self._persist_rolled_back_data_flow_denial(error)
+            raise
 
     def _validate_authority(self) -> None:
         if self.contract.authority_mode == AuthorityMode.RUNTIME_INTERNAL:
@@ -656,45 +717,380 @@ class ProtectedOperation:
                 )
 
     def _reserve_decisions(self) -> None:
-        seen: set[str] = set()
-        for decision in self.invocation.decisions:
+        decisions = [*self._authority_decisions]
+        if self._data_flow_release_decision is not None:
+            decisions.append(self._data_flow_release_decision)
+        for decision in decisions:
             cap_id = decision.consume_capability_id
-            if cap_id is None or str(cap_id) in seen:
+            if cap_id is None:
                 continue
-            seen.add(str(cap_id))
-            reservation_id = self.sdk.capabilities.reserve_decision_use(
-                decision,
-                used_by=self.invocation.actor,
-                reason=f"protected operation reserved authority for {self.contract.name}",
-            )
-            if reservation_id is not None:
+            capability_id = str(cap_id)
+            reservation_id = self._reservation_ids_by_capability.get(capability_id)
+            if reservation_id is None:
+                reservation_id = self.sdk.capabilities.reserve_decision_use(
+                    decision,
+                    used_by=self.invocation.actor,
+                    reason=f"protected operation reserved authority for {self.contract.name}",
+                )
+            if (
+                reservation_id is not None
+                and capability_id not in self._reservation_ids_by_capability
+            ):
+                self._reservation_ids_by_capability[capability_id] = reservation_id
                 self._reservation_ids.append(reservation_id)
+            if decision is self._data_flow_release_decision:
+                self._data_flow_release_reservation_id = reservation_id
+
+    def _revalidate_authority(self) -> None:
+        if self.contract.authority_mode == AuthorityMode.RUNTIME_INTERNAL:
+            self._authority_decisions = ()
+            return
+        if self.invocation.authority_revalidator is None:
+            current = tuple(
+                self.sdk.capabilities.reauthorize_decision(decision)
+                for decision in self.invocation.decisions
+            )
+        else:
+            current = tuple(self.invocation.authority_revalidator())
+        if len(current) != len(self.invocation.decisions):
+            raise CapabilityDenied(
+                "protected operation authority revalidation changed the decision set"
+            )
+        for original, decision in zip(self.invocation.decisions, current, strict=True):
+            self._validate_reauthorized_decision(original, decision)
+        self._authority_decisions = current
+
+    def _revalidate_dispatch_authority(self) -> None:
+        if self.contract.authority_mode == AuthorityMode.RUNTIME_INTERNAL:
+            return
+        current: list[CapabilityDecision] = []
+        for prepared in self._authority_decisions:
+            reserved_capability_id = prepared.consume_capability_id
+            if reserved_capability_id is None:
+                decision = self.sdk.capabilities.reauthorize_decision(prepared)
+                if decision.consume_capability_id is not None:
+                    raise CapabilityDenied(
+                        "protected operation authority changed to unreserved finite use "
+                        "before protected dispatch"
+                    )
+            else:
+                capability_id = str(reserved_capability_id)
+                reservation_id = self._reservation_ids_by_capability.get(capability_id)
+                if reservation_id is None:
+                    raise CapabilityDenied(
+                        "protected operation finite authority reservation disappeared "
+                        "before protected dispatch"
+                    )
+                if not self._reservations_committed:
+                    reservation = self.sdk.store.get_capability_use_reservation(
+                        reservation_id
+                    )
+                    if (
+                        reservation is None
+                        or reservation.get("status") != "reserved"
+                        or str(reservation.get("cap_id") or "") != capability_id
+                        or int(reservation.get("count") or 0) != 1
+                    ):
+                        raise CapabilityDenied(
+                            "protected operation finite authority reservation changed "
+                            "before protected dispatch"
+                        )
+                decision = prepared
+            self._validate_reauthorized_decision(prepared, decision)
+            current.append(decision)
+        self._authority_decisions = tuple(current)
+
+    def _validate_reauthorized_decision(
+        self,
+        original: CapabilityDecision,
+        decision: CapabilityDecision,
+    ) -> None:
+        if (
+            decision.subject,
+            decision.resource,
+            decision.right,
+        ) != (
+            original.subject,
+            original.resource,
+            original.right,
+        ):
+            raise CapabilityDenied(
+                "protected operation authority revalidation changed the requested authority"
+            )
+        if not decision.allowed:
+            raise CapabilityDenied(
+                "protected operation authority changed before dispatch: "
+                f"{decision.reason}"
+            )
+        if decision.subject != self.invocation.pid:
+            raise CapabilityDenied(
+                "protected operation revalidated capability subject does not match the acting process"
+            )
+
+    def _persist_rolled_back_data_flow_denial(self, error: BaseException) -> None:
+        decision = getattr(error, "data_flow_decision", None)
+        sink = getattr(error, "data_flow_sink", None)
+        manager = self.sdk.data_flow
+        if (
+            manager is None
+            or not isinstance(decision, DataFlowDecision)
+            or not isinstance(sink, DataSink)
+        ):
+            return
+        manager.persist_denied_decision(decision=decision, sink=sink)
+
+    def _preflight_data_flow(self) -> None:
+        direction = self.contract.data_flow_direction
+        manager = self.sdk.data_flow
+        has_ingress = direction in {
+            DataFlowDirection.INGRESS,
+            DataFlowDirection.BIDIRECTIONAL,
+        }
+        ingress_context = self.invocation.data_flow_ingress_context
+        if has_ingress:
+            if manager is None:
+                raise ValidationError(
+                    f"ingress protected operation requires DataFlowManager: {self.contract.name}"
+                )
+            if not isinstance(ingress_context, DataFlowContext):
+                raise ValidationError(
+                    "ingress protected operation requires a trusted "
+                    f"DataFlowContext: {self.contract.name}"
+                )
+        elif ingress_context is not None:
+            raise ValidationError(
+                f"non-ingress protected operation declares data-flow ingress state: {self.contract.name}"
+            )
+
+        has_egress = direction in {
+            DataFlowDirection.EGRESS,
+            DataFlowDirection.BIDIRECTIONAL,
+        }
+        if not has_egress:
+            if (
+                self.invocation.data_sink is not None
+                or self.invocation.data_sink_revalidator is not None
+                or self.invocation.data_flow_context is not None
+                or self.invocation.data_flow_payload is not _DATA_FLOW_PAYLOAD_UNSET
+                or self.invocation.data_flow_operation is not None
+                or self.invocation.data_flow_target_state_version is not None
+                or self.invocation.data_flow_target_state_version_resolver is not None
+                or self.invocation.data_flow_allow_recovered_source_snapshots
+            ):
+                raise ValidationError(
+                    f"non-egress protected operation declares data-flow egress state: {self.contract.name}"
+                )
+            return
+        if manager is None:
+            raise ValidationError(
+                f"egress protected operation requires DataFlowManager: {self.contract.name}"
+            )
+        sink = self.invocation.data_sink
+        if not isinstance(sink, DataSink):
+            raise ValidationError(
+                f"egress protected operation requires a concrete DataSink: {self.contract.name}"
+            )
+        context = self.invocation.data_flow_context
+        if not isinstance(context, DataFlowContext):
+            raise ValidationError(
+                f"egress protected operation requires a trusted DataFlowContext: {self.contract.name}"
+            )
+        if self.invocation.data_flow_payload is _DATA_FLOW_PAYLOAD_UNSET:
+            raise ValidationError(
+                f"egress protected operation requires an explicit payload descriptor: {self.contract.name}"
+            )
+        operation = str(self.invocation.data_flow_operation or "").strip()
+        if not operation:
+            raise ValidationError(
+                f"egress protected operation requires an operation descriptor: {self.contract.name}"
+            )
+        payload = self.invocation.data_flow_payload
+        decision, release = manager.authorize_egress(
+            pid=self.invocation.pid,
+            sink=sink,
+            context=context,
+            payload=payload,
+            operation=operation,
+            target_state_version=self.invocation.data_flow_target_state_version,
+            request_release=True,
+            allow_recovered_source_snapshots=(
+                self.invocation.data_flow_allow_recovered_source_snapshots
+            ),
+        )
+        self._data_flow_decision = decision
+        self._data_flow_release_decision = release
+        self._data_flow_registry_generation = decision.registry_generation
+
+    def _observe_data_flow_ingress(self, phase: ProviderPhase) -> None:
+        if self._data_flow_ingress_observed or not phase.information_flow:
+            return
+        if self.contract.data_flow_direction not in {
+            DataFlowDirection.INGRESS,
+            DataFlowDirection.BIDIRECTIONAL,
+        }:
+            return
+        manager = self.sdk.data_flow
+        context = self.invocation.data_flow_ingress_context
+        assert manager is not None and isinstance(context, DataFlowContext)
+        manager.observe_ingress(context)
+        self._data_flow_ingress_observed = True
+
+    def _revalidate_data_sink_identity(self) -> None:
+        resolver = self.invocation.data_sink_revalidator
+        if resolver is None:
+            return
+        expected = self.invocation.data_sink
+        assert isinstance(expected, DataSink)
+        context = self.invocation.data_flow_context
+        assert isinstance(context, DataFlowContext)
+        payload = self.invocation.data_flow_payload
+        assert payload is not _DATA_FLOW_PAYLOAD_UNSET
+        try:
+            current = resolver()
+        except (OSError, ValidationError) as error:
+            manager = self.sdk.data_flow
+            assert manager is not None
+            manager.reject_sink_identity_change(
+                pid=self.invocation.pid,
+                sink=expected,
+                context=context,
+                payload=payload,
+                reason=(
+                    "Sink identity could not be revalidated before provider dispatch "
+                    f"({type(error).__name__})"
+                ),
+            )
+            raise AssertionError("data-flow Sink rejection must raise") from error
+        if not isinstance(current, DataSink):
+            raise ValidationError("data Sink revalidator must return DataSink")
+        if current == expected:
+            return
+        manager = self.sdk.data_flow
+        assert manager is not None
+        manager.reject_sink_identity_change(
+            pid=self.invocation.pid,
+            sink=current,
+            context=context,
+            payload=payload,
+        )
+        raise AssertionError("data-flow Sink rejection must raise")
+
+    def _revalidate_data_flow(self, *, use_reserved_release: bool = False) -> None:
+        direction = self.contract.data_flow_direction
+        if direction not in {DataFlowDirection.EGRESS, DataFlowDirection.BIDIRECTIONAL}:
+            return
+        manager = self.sdk.data_flow
+        sink = self.invocation.data_sink
+        assert manager is not None and sink is not None
+        context = self.invocation.data_flow_context
+        assert isinstance(context, DataFlowContext)
+        payload = self.invocation.data_flow_payload
+        assert payload is not _DATA_FLOW_PAYLOAD_UNSET
+        operation = str(self.invocation.data_flow_operation or "").strip()
+        assert operation
+        authorization: dict[str, Any] = {
+            "pid": self.invocation.pid,
+            "sink": sink,
+            "context": context,
+            "payload": payload,
+            "operation": operation,
+            "target_state_version": self.invocation.data_flow_target_state_version,
+            "request_release": False,
+            "expected_registry_generation": self._data_flow_registry_generation,
+            "allow_recovered_source_snapshots": (
+                self.invocation.data_flow_allow_recovered_source_snapshots
+            ),
+        }
+        resolver = self.invocation.data_flow_target_state_version_resolver
+        if resolver is not None:
+            authorization["current_target_state_version"] = resolver()
+        if use_reserved_release and self._data_flow_release_decision is not None:
+            reservation_id = self._data_flow_release_reservation_id
+            if reservation_id is None:
+                raise CapabilityDenied(
+                    "data release reservation disappeared before protected dispatch"
+                )
+            authorization.update(
+                reserved_release_decision=self._data_flow_release_decision,
+                reserved_release_id=reservation_id,
+            )
+        decision, release = manager.authorize_egress(
+            **authorization,
+        )
+        if (self._data_flow_release_decision is None) != (release is None):
+            raise CapabilityDenied("data release authority changed before protected dispatch")
+        if release is not None and self._data_flow_release_decision is not None:
+            if release.selected_capability_id != self._data_flow_release_decision.selected_capability_id:
+                raise CapabilityDenied("data release capability changed before protected dispatch")
+        self._data_flow_decision = decision
+        self._data_flow_release_decision = release
+
+    def _data_flow_evidence(self) -> dict[str, Any] | None:
+        decision = self._data_flow_decision
+        if decision is None:
+            return None
+        sink = self.invocation.data_sink
+        return {
+            "decision_id": decision.decision_id,
+            "sink": decision.sink,
+            "sink_identity_sha256": sink.identity_sha256 if sink is not None else None,
+            "sink_trust_identity": sink.registry_identity if sink is not None else None,
+            "sink_trust_identity_sha256": (
+                sink.registry_identity_sha256 if sink is not None else None
+            ),
+            "direction": decision.direction.value,
+            "outcome": decision.outcome.value,
+            "reason": decision.reason,
+            "labels": decision.labels.to_dict(),
+            "labels_sha256": decision.labels.labels_hash(),
+            "source_refs": [item.to_dict() for item in decision.source_refs],
+            "source_refs_sha256": DataFlowContext(
+                labels=decision.labels,
+                source_refs=decision.source_refs,
+            ).source_refs_hash(),
+            "payload_sha256": decision.payload_hash,
+            "trust_id": decision.trust_id,
+            "trust_sha256": decision.trust_hash,
+            "registry_generation": decision.registry_generation,
+            "release_capability_id": decision.release_capability_id,
+        }
 
     def _dispatch(self, phase: ProviderPhase) -> None:
         if self.effect_id is None:
             raise ProtectedOperationProtocolError("protected operation has no prepared effect")
-        mark_external_effect_dispatched(self.sdk.store, self.effect_id)
-        current = self.sdk.store.get_external_effect(self.effect_id)
-        if current is None:
-            raise ProtectedOperationProtocolError("protected operation effect disappeared during dispatch")
-        metadata = {
-            **dict(current.provider_metadata),
-            "active_provider_phase": {
-                "name": phase.name,
-                "state_mutation": phase.state_mutation,
-                "information_flow": phase.information_flow,
-            },
-        }
-        if not self.sdk.store.transition_external_effect(
-            self.effect_id,
-            expected_states=("dispatched",),
-            transaction_state="dispatched",
-            provider_metadata=metadata,
-            updated_at=self._now(),
-        ):
-            raise ProtectedOperationProtocolError(
-                f"protected operation phase dispatch cannot be persisted: {self.contract.name}:{phase.name}"
-            )
+        try:
+            with self.sdk.store.transaction():
+                self._revalidate_dispatch_authority()
+                self._revalidate_data_sink_identity()
+                self._revalidate_data_flow(use_reserved_release=True)
+                mark_external_effect_dispatched(self.sdk.store, self.effect_id)
+                current = self.sdk.store.get_external_effect(self.effect_id)
+                if current is None:
+                    raise ProtectedOperationProtocolError(
+                        "protected operation effect disappeared during dispatch"
+                    )
+                metadata = {
+                    **dict(current.provider_metadata),
+                    "active_provider_phase": {
+                        "name": phase.name,
+                        "state_mutation": phase.state_mutation,
+                        "information_flow": phase.information_flow,
+                    },
+                }
+                if not self.sdk.store.transition_external_effect(
+                    self.effect_id,
+                    expected_states=("dispatched",),
+                    transaction_state="dispatched",
+                    provider_metadata=metadata,
+                    updated_at=self._now(),
+                ):
+                    raise ProtectedOperationProtocolError(
+                        "protected operation phase dispatch cannot be persisted: "
+                        f"{self.contract.name}:{phase.name}"
+                    )
+        except BaseException as error:
+            self._persist_rolled_back_data_flow_denial(error)
+            raise
         self._dispatched = True
 
     def _record_completed_phase(self, phase: ProviderPhase) -> None:
@@ -854,6 +1250,11 @@ class ProtectedOperation:
         error: BaseException,
         phase: str,
     ) -> None:
+        settlement_error: BaseException | None = None
+        try:
+            self._run_failure_settlement(error, phase)
+        except BaseException as failure:
+            settlement_error = failure
         settled = False
         try:
             effect_metadata, flattened_metadata = self._safe_effect_metadata(
@@ -874,6 +1275,7 @@ class ProtectedOperation:
                     metadata={
                         "context": dict(self.invocation.observation),
                         "provider_phases": self._phase_metadata(),
+                        "data_flow": self._data_flow_evidence(),
                         "result": effect_metadata,
                         **flattened_metadata,
                         "error_type": classification.metadata.get("error_type"),
@@ -887,6 +1289,16 @@ class ProtectedOperation:
         self._terminal = True
         if settled:
             self._charge_resource(self._failure_resource_settlement(error, phase))
+        if settlement_error is not None:
+            raise settlement_error from error
+
+    def _run_failure_settlement(self, error: BaseException, phase: str) -> None:
+        handler = self.invocation.failure_settlement
+        if handler is None or self._failure_settlement_run or not self._dispatched:
+            return
+        self._failure_settlement_run = True
+        with self.sdk.store.transaction():
+            handler(error, phase)
 
     def _failure_resource_settlement(
         self,

@@ -12,6 +12,9 @@ capabilities:
     execute:
       - read-tool
 allowed_effects:
+  - type: external.provider_call
+    provider: llm
+    operation: complete
   - type: skill.activate
     skill_id: read-tool
 forbidden_effects:

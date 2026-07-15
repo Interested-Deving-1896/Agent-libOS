@@ -22,6 +22,7 @@ from agent_libos.models import (
     ResourceBudget,
 )
 from agent_libos.substrate import (
+    HierarchicalPathLock,
     LocalFilesystemProvider,
     LocalResourceProviderSubstrate,
     ProviderEffectNotStarted,
@@ -296,6 +297,189 @@ class TestFilesystemDirectoryTool:
         assert result.truncated
         assert result.bytes_read == 1
         assert result.content == ''
+
+    def test_unrelated_file_reads_do_not_share_one_global_label_io_lock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        base = f'agent_outputs/parallel_reads_{uuid4().hex}'
+        first_path = self._write_fixture(f'{base}/first.txt', 'first')
+        second_path = self._write_fixture(f'{base}/second.txt', 'second')
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='read unrelated files concurrently',
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            first_path,
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            second_path,
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        provider = self.runtime.filesystem.provider
+        assert isinstance(provider, LocalFilesystemProvider)
+        original_before_path_sink = provider._before_path_sink
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def interleaved_sink(operation: str, target: Path) -> None:
+            if operation != 'read_bytes':
+                return original_before_path_sink(operation, target)
+            relative = target.relative_to(provider.root).as_posix()
+            if relative == first_path:
+                first_entered.set()
+                if not release_first.wait(timeout=5):
+                    raise TimeoutError('first read was not released')
+            elif relative == second_path:
+                second_entered.set()
+            original_before_path_sink(operation, target)
+
+        def read(path: str) -> None:
+            try:
+                self.runtime.filesystem.read_text(pid, path)
+            except BaseException as exc:
+                errors.append(exc)
+
+        monkeypatch.setattr(
+            provider,
+            '_before_path_sink',
+            interleaved_sink,
+        )
+        first = threading.Thread(target=read, args=(first_path,), daemon=True)
+        second = threading.Thread(target=read, args=(second_path,), daemon=True)
+        first.start()
+        assert first_entered.wait(timeout=5)
+        second.start()
+        try:
+            assert second_entered.wait(timeout=1)
+        finally:
+            release_first.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+
+    def test_hierarchical_path_lock_does_not_starve_queued_ancestor(self) -> None:
+        path_lock = HierarchicalPathLock()
+        ancestor_entered = threading.Event()
+        release_ancestor = threading.Event()
+        later_descendant_entered = threading.Event()
+
+        def hold_ancestor() -> None:
+            with path_lock.hold('tree'):
+                ancestor_entered.set()
+                assert release_ancestor.wait(timeout=5)
+
+        def hold_later_descendant() -> None:
+            with path_lock.hold('tree/second'):
+                later_descendant_entered.set()
+
+        ancestor = threading.Thread(target=hold_ancestor, daemon=True)
+        later_descendant = threading.Thread(
+            target=hold_later_descendant,
+            daemon=True,
+        )
+        with path_lock.hold('tree/first'):
+            ancestor.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with path_lock._condition:
+                    if any(parts == ('tree',) for _, parts, _ in path_lock._waiters):
+                        break
+                time.sleep(0.01)
+            else:
+                pytest.fail('ancestor lock did not enter the waiter queue')
+            later_descendant.start()
+            assert not later_descendant_entered.wait(timeout=0.1)
+
+        assert ancestor_entered.wait(timeout=5)
+        assert not later_descendant_entered.wait(timeout=0.1)
+        release_ancestor.set()
+        ancestor.join(timeout=5)
+        later_descendant.join(timeout=5)
+
+        assert not ancestor.is_alive()
+        assert not later_descendant.is_alive()
+        assert later_descendant_entered.is_set()
+
+    def test_hierarchical_path_lock_rejects_widening_upgrade(self) -> None:
+        path_lock = HierarchicalPathLock()
+
+        with path_lock.hold('tree/first'):
+            with pytest.raises(RuntimeError, match='cannot widen'):
+                with path_lock.hold('tree'):
+                    pytest.fail('widening lock upgrade unexpectedly succeeded')
+
+    def test_hierarchical_path_lock_creation_scope_covers_shared_missing_parents(
+        self,
+    ) -> None:
+        path_lock = HierarchicalPathLock()
+        assert path_lock.creation_scope('top-level.txt') == 'top-level.txt'
+        assert path_lock.creation_scope('tree/first/output.txt') == 'tree'
+        sibling_started = threading.Event()
+        sibling_entered = threading.Event()
+
+        def create_sibling() -> None:
+            sibling_started.set()
+            with path_lock.hold(
+                path_lock.creation_scope('tree/second/output.txt')
+            ):
+                sibling_entered.set()
+
+        sibling = threading.Thread(target=create_sibling, daemon=True)
+        with path_lock.hold(path_lock.creation_scope('tree/first/output.txt')):
+            sibling.start()
+            assert sibling_started.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with path_lock._condition:
+                    if path_lock._waiters:
+                        break
+                time.sleep(0.01)
+            else:
+                pytest.fail('sibling creation lock did not enter the waiter queue')
+            assert not sibling_entered.wait(timeout=0.1)
+        sibling.join(timeout=5)
+
+        assert not sibling.is_alive()
+        assert sibling_entered.is_set()
+
+    def test_hierarchical_path_lock_serializes_case_and_unicode_aliases(self) -> None:
+        path_lock = HierarchicalPathLock()
+        alias_started = threading.Event()
+        alias_entered = threading.Event()
+
+        def hold_alias() -> None:
+            alias_started.set()
+            with path_lock.hold('caseprobe/e\u0301.TXT'):
+                alias_entered.set()
+
+        alias = threading.Thread(target=hold_alias, daemon=True)
+        with path_lock.hold('CaseProbe/\u00e9.txt'):
+            alias.start()
+            assert alias_started.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with path_lock._condition:
+                    if path_lock._waiters:
+                        break
+                time.sleep(0.01)
+            else:
+                pytest.fail('alias lock did not enter the waiter queue')
+            assert not alias_entered.wait(timeout=0.1)
+        alias.join(timeout=5)
+
+        assert not alias.is_alive()
+        assert alias_entered.is_set()
 
     def test_read_detects_growth_after_state_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

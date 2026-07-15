@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import inspect
 import os
@@ -13,7 +14,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -26,6 +27,9 @@ from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
+    DataFlowDirection,
+    DataFlowContext,
+    DataLabels,
     EventType,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
@@ -33,9 +37,12 @@ from agent_libos.models import (
     MemoryView,
     MemoryViewSpec,
     ObjectHandle,
+    ObjectMetadata,
     ObjectOwnerKind,
     ProcessStatus,
     ResourceUsage,
+    SinkTrustRule,
+    SinkTrustSpec,
     ToolCandidate,
     ToolCandidateStatus,
     ToolHandle,
@@ -48,6 +55,7 @@ from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.authority_manifest_manager import AuthorityManifestManager
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
+from agent_libos.runtime.data_flow_manager import DataFlowManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.external_effects import reconcile_pending_external_effects
 from agent_libos.runtime.explain_manager import ExplainManager
@@ -141,6 +149,13 @@ class Runtime:
         self.provider_hooks: dict[str, list[Any]] = {}
         self._shutdown_finalizers: list[Any] = []
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
+        self.data_flow = DataFlowManager(
+            store,
+            self.capability,
+            self.audit,
+            self.events,
+            config=self.config,
+        )
         self.protected_operations = ProtectedOperationSDK(
             store=store,
             capabilities=self.capability,
@@ -148,6 +163,7 @@ class Runtime:
             events=self.events,
             resources=self.resources,
             operations=self.operations,
+            data_flow=self.data_flow,
         )
         self.store.protected_operation_sdk = self.protected_operations
         self._register_protected_operation_contracts()
@@ -196,6 +212,7 @@ class Runtime:
             self.capability,
             self.audit,
             self.events,
+            cwd=self.workspace_root,
             human=self.human,
             provider=self.substrate.shell,
             config=self.config,
@@ -234,6 +251,8 @@ class Runtime:
         )
         self.authority_manifests.bind_runtime(self)
         self.store.authority_manifest_manager = self.authority_manifests
+        self.data_flow.bind_runtime(self)
+        self.data_flow.bootstrap_configured_rules()
         self.tools = ToolBroker(
             store,
             self.memory,
@@ -256,7 +275,9 @@ class Runtime:
             resources=self.resources,
             llm_profile_resolver=self._resolve_launch_llm_profile_id,
             authority_manifests=self.authority_manifests,
+            data_flow=self.data_flow,
         )
+        self.messages.bind_process_manager(self.process)
         self.resources.bind_process_kill_finalizer(self.process.finalize_killed_processes)
         self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
         self.object_tasks = ObjectTaskManager(self, config=self.config)
@@ -265,6 +286,17 @@ class Runtime:
         self.messages.bind_object_tasks(self.object_tasks)
         self.process.bind_object_task_terminal_notifier(self._notify_process_terminal)
         self.resources.bind_object_task_terminal_notifier(self._notify_process_terminal)
+        try:
+            self.reconciled_legacy_pending_actions = (
+                self._reconcile_legacy_pending_action_terminals()
+            )
+        except BaseException:
+            # ObjectTaskManager owns a live event-loop thread before durable
+            # terminal reconciliation can run. Constructor failure must unwind
+            # that component before Runtime.open closes the shared store.
+            with contextlib.suppress(Exception):
+                self.object_tasks.shutdown()
+            raise
         self.scheduler = SimpleScheduler(
             store,
             self.audit,
@@ -334,16 +366,32 @@ class Runtime:
 
         contracts = (
             contract("primitive.filesystem.validate_directory", "filesystem", "state", resource_policy=ResourcePolicy.OPTIONAL, information_flow=True),
-            contract("primitive.filesystem.read_text", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True),
-            contract("primitive.filesystem.read_bytes", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True),
-            contract("primitive.filesystem.write_text", "filesystem", "write_text", resource_policy=ResourcePolicy.REQUIRED, state_mutation=True, information_flow=True),
-            contract("primitive.filesystem.read_directory", "filesystem", "list_directory", resource_policy=ResourcePolicy.REQUIRED, information_flow=True),
-            contract("primitive.filesystem.write_directory", "filesystem", "make_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
-            contract("primitive.filesystem.delete_file", "filesystem", "delete_file", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
-            contract("primitive.filesystem.delete_directory", "filesystem", "delete_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.filesystem.read_text", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
+            contract("primitive.filesystem.read_bytes", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
+            contract(
+                "primitive.filesystem.write_text",
+                "filesystem",
+                "write_text",
+                resource_policy=ResourcePolicy.REQUIRED,
+                state_mutation=True,
+                information_flow=True,
+                data_flow_direction=DataFlowDirection.EGRESS,
+            ),
+            contract("primitive.filesystem.read_directory", "filesystem", "list_directory", resource_policy=ResourcePolicy.REQUIRED, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
+            contract("primitive.filesystem.write_directory", "filesystem", "make_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
+            contract("primitive.filesystem.delete_file", "filesystem", "delete_file", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
+            contract("primitive.filesystem.delete_directory", "filesystem", "delete_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
             contract("primitive.clock.now", "clock", "now", resource_policy=ResourcePolicy.NONE, information_flow=True),
             contract("primitive.clock.sleep", "clock", "sleep", resource_policy=ResourcePolicy.NONE, information_flow=True),
-            contract("primitive.shell.run", "shell", "run", resource_policy=ResourcePolicy.OPTIONAL, state_mutation=True, information_flow=True),
+            contract(
+                "primitive.shell.run",
+                "shell",
+                "run",
+                resource_policy=ResourcePolicy.OPTIONAL,
+                state_mutation=True,
+                information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            ),
             contract(
                 "primitive.jsonrpc.call",
                 "jsonrpc",
@@ -351,6 +399,7 @@ class Runtime:
                 resource_policy=ResourcePolicy.REQUIRED,
                 state_mutation=True,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
                 classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
                 classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
                 classifier_failure_label="post_call_failure",
@@ -361,6 +410,7 @@ class Runtime:
                 "list_tools",
                 resource_policy=ResourcePolicy.OPTIONAL,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
                 preflight_classifier=True,
                 classifier_failure_rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
                 classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
@@ -373,6 +423,7 @@ class Runtime:
                 resource_policy=ResourcePolicy.OPTIONAL,
                 authority_mode=AuthorityMode.RUNTIME_INTERNAL,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
                 internal_reason="host registry refresh is an operator-controlled provider operation",
                 preflight_classifier=True,
                 classifier_failure_rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
@@ -386,10 +437,26 @@ class Runtime:
                 resource_policy=ResourcePolicy.REQUIRED,
                 state_mutation=True,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
                 preflight_classifier=True,
                 classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
                 classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
                 classifier_failure_label="post_call_failure",
+            ),
+            contract(
+                "primitive.llm.complete",
+                "llm",
+                "complete",
+                resource_policy=ResourcePolicy.NONE,
+                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+                state_mutation=True,
+                information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+                require_classifier=False,
+                internal_reason=(
+                    "the scheduler owns model selection after process authority and context "
+                    "materialization; DataFlowManager independently gates the provider Sink"
+                ),
             ),
             contract(
                 "primitive.human.read",
@@ -398,6 +465,7 @@ class Runtime:
                 resource_policy=ResourcePolicy.NONE,
                 authority_mode=AuthorityMode.RUNTIME_INTERNAL,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
                 post_provider_failure_mode=PostProviderFailureMode.PRESERVE_RESULT,
                 internal_reason="terminal queue already owns an authorized Human request",
             ),
@@ -409,12 +477,13 @@ class Runtime:
                 authority_mode=AuthorityMode.RUNTIME_INTERNAL,
                 state_mutation=True,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.EGRESS,
                 post_provider_failure_mode=PostProviderFailureMode.PRESERVE_RESULT,
                 internal_reason="terminal queue already owns an authorized Human request",
                 prepared_recovery="human_output_delivery",
             ),
-            contract("primitive.pty.spawn", "pty", "spawn", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
-            contract("primitive.pty.read", "pty", "read", resource_policy=ResourcePolicy.NONE, state_mutation=False, information_flow=True),
+            contract("primitive.pty.spawn", "pty", "spawn", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.BIDIRECTIONAL),
+            contract("primitive.pty.read", "pty", "read", resource_policy=ResourcePolicy.NONE, state_mutation=False, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
             contract(
                 "primitive.pty.ingest",
                 "pty",
@@ -423,14 +492,15 @@ class Runtime:
                 authority_mode=AuthorityMode.RUNTIME_INTERNAL,
                 state_mutation=False,
                 information_flow=True,
+                data_flow_direction=DataFlowDirection.INGRESS,
                 internal_reason=(
                     "runtime continuously drains an already-authorized PTY session so the "
                     "child process cannot block on its output buffer"
                 ),
             ),
-            contract("primitive.pty.write", "pty", "write", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
-            contract("primitive.pty.resize", "pty", "resize", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=False),
-            contract("primitive.pty.close", "pty", "close", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True),
+            contract("primitive.pty.write", "pty", "write", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
+            contract("primitive.pty.resize", "pty", "resize", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
+            contract("primitive.pty.close", "pty", "close", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
             contract(
                 "primitive.pty.close.internal",
                 "pty",
@@ -839,6 +909,34 @@ class Runtime:
             errors.append(f"object_tasks: {type(exc).__name__}: {exc}")
         if errors:
             raise RuntimeError("terminal process notification failed: " + "; ".join(errors))
+
+    def _reconcile_legacy_pending_action_terminals(
+        self,
+        *,
+        pids: set[str] | None = None,
+    ) -> list[str]:
+        """Complete storage/checkpoint legacy migration through manager hooks."""
+
+        reconciled: list[str] = []
+        errors: list[str] = []
+        for pending in self.store.list_llm_pending_actions_requiring_terminal_reconciliation():
+            pid = str(pending.get("pid") or "")
+            if not pid or (pids is not None and pid not in pids):
+                continue
+            try:
+                if self.process.reconcile_legacy_pending_action_terminal(
+                    pid,
+                    reason=CheckpointManager.LEGACY_PENDING_DATA_FLOW_MESSAGE,
+                ):
+                    reconciled.append(pid)
+            except Exception as exc:
+                errors.append(f"{pid}: {type(exc).__name__}: {exc}")
+        if errors:
+            raise RuntimeError(
+                "legacy pending action terminal reconciliation failed: "
+                + "; ".join(errors)
+            )
+        return reconciled
 
     async def _ashutdown_component(self, component: Any) -> bool:
         if component is None:
@@ -1340,6 +1438,45 @@ class Runtime:
             require_capability=False,
         )
 
+    def register_sink_trust(
+        self,
+        spec: SinkTrustRule | dict[str, Any],
+        *,
+        actor: str,
+        replace: bool = False,
+    ) -> SinkTrustSpec:
+        """Host control-plane API; never projected into a model tool table."""
+
+        return self.data_flow.register_sink_trust(
+            spec,
+            actor=actor,
+            replace=replace,
+            require_capability=True,
+        )
+
+    def unregister_sink_trust(self, pattern: str, *, actor: str) -> SinkTrustSpec:
+        """Remove an active Host Sink trust rule under registry authority."""
+
+        return self.data_flow.unregister_sink_trust(
+            pattern,
+            actor=actor,
+            require_capability=True,
+        )
+
+    def inspect_sink_trust(self, pattern: str) -> SinkTrustSpec | None:
+        return self.data_flow.inspect_sink_trust(pattern)
+
+    def list_sink_trust(
+        self,
+        *,
+        active_only: bool = True,
+        generation: int | None = None,
+    ) -> tuple[SinkTrustSpec, ...]:
+        return self.data_flow.list_sink_trust(
+            active_only=active_only,
+            generation=generation,
+        )
+
     def exec_process(
         self,
         pid: str,
@@ -1350,6 +1487,9 @@ class Runtime:
         preserve_memory: bool = True,
         preserve_capabilities: bool = False,
         llm_profile_id: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> Any:
         process = self.process.get(pid)
         selected_image = self._require_image(image)
@@ -1367,6 +1507,9 @@ class Runtime:
                 preserve_memory=preserve_memory,
                 preserve_capabilities=preserve_capabilities,
                 llm_profile_id=llm_profile_id,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
             )
             # Exec swaps the process image and tool table, but deliberately does
             # not apply image required_capabilities. Exec may preserve existing
@@ -1402,6 +1545,9 @@ class Runtime:
         resource_budget: Any | None = None,
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> str:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
@@ -1422,6 +1568,9 @@ class Runtime:
             resource_budget=resource_budget,
             working_directory=selected_cwd,
             llm_profile_id=llm_profile_id,
+            source_oids=source_oids,
+            source_labels=source_labels,
+            source_context=source_context,
         )
 
     def fork_child_process(
@@ -1437,6 +1586,9 @@ class Runtime:
         mode: ForkMode | str = ForkMode.RESTRICTED,
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> str:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
@@ -1460,6 +1612,9 @@ class Runtime:
             mode=mode,
             working_directory=selected_cwd,
             llm_profile_id=llm_profile_id,
+            source_oids=source_oids,
+            source_labels=source_labels,
+            source_context=source_context,
         )
 
     def set_process_working_directory(self, pid: str, path: str) -> Any:
@@ -1773,6 +1928,7 @@ class Runtime:
         artifact = self._load_image_artifact(image, expected_kind="checkpoint_commit")
         self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
         remapped = self._remap_image_artifact_for_process(pid, artifact)
+        self._assert_checkpoint_commit_image_data_flow(pid, remapped)
         self._insert_committed_memory_rows(remapped)
         self._restore_committed_registry_rows(artifact)
         tool_table = self._restore_committed_tool_table(pid, artifact)
@@ -2319,6 +2475,28 @@ class Runtime:
             for table in ["object_links", "capabilities"]:
                 for row in remapped[table]:
                     self.checkpoint._insert_row(cur, table, row)
+
+    def _assert_checkpoint_commit_image_data_flow(
+        self,
+        pid: str,
+        remapped: dict[str, Any],
+    ) -> None:
+        """Admit every restored Object to the target process before publication."""
+
+        for row in remapped["objects"]:
+            oid = str(row.get("oid") or "")
+            try:
+                metadata = ObjectMetadata.from_persisted(
+                    loads(row.get("metadata_json"), {})
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    f"invalid committed image Object metadata for {oid}: {exc}"
+                ) from exc
+            self.authority_manifests.assert_data_flow_labels(
+                pid,
+                DataLabels.from_object_metadata(metadata),
+            )
 
     def _restore_committed_registry_rows(self, artifact: dict[str, Any]) -> None:
         # Loaded Skills are process snapshots carried in ``loaded_skills`` and

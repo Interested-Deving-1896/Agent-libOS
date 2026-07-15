@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,9 +22,11 @@ from agent_libos.models import (
     ObjectRight,
     ObjectType,
     ProcessStatus,
+    SinkTrustRule,
 )
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.substrate.local import LocalShellProvider
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 from agent_libos.models import ValidationResult
 from agent_libos.utils.serde import to_jsonable
@@ -141,6 +144,23 @@ class BenchmarkDenoSandbox(SandboxBackend):
 
     def metadata_for_source(self, source_code: str) -> dict[str, Any]:
         return {"language": "typescript", "deno_version": "benchmark-fake-deno", "imports": []}
+
+
+class BenchmarkShellProvider(LocalShellProvider):
+    """Keep the token-free shell fixture independent of the caller's PATH.
+
+    The checked-in allowed-shell task invokes ``python --version``. The Host
+    running the benchmark deliberately makes its current interpreter directory
+    available to that fixture while retaining LocalShellProvider's workspace
+    exclusion and argv-only execution rules.
+    """
+
+    def _safe_path(self) -> str:
+        interpreter_bin = str(Path(sys.executable).parent.resolve(strict=False))
+        inherited = super()._safe_path().split(os.pathsep)
+        return os.pathsep.join(
+            dict.fromkeys([interpreter_bin, *[item for item in inherited if item]])
+        )
 
 
 def run_suite(
@@ -280,10 +300,12 @@ def _run_agent_libos_task(
     try:
         client = PlannedActionClient([]) if llm_mode == "mock" else LLMClient.from_env()
         runtime_store = SQLiteStore(db_path)
+        substrate = LocalResourceProviderSubstrate(workspace)
+        substrate.shell = BenchmarkShellProvider(workspace)
         runtime = Runtime(
             runtime_store,
             llm_client=client,
-            substrate=LocalResourceProviderSubstrate(workspace),
+            substrate=substrate,
         )
         if llm_mode == "mock":
             runtime.tools.sandbox = BenchmarkDenoSandbox()
@@ -490,13 +512,21 @@ def _setup_runtime_memory(
         selected_owner = target_pid if item.get("owner") == "target" else owner
         namespace = str(item.get("namespace") or runtime.memory.process_namespace(selected_owner))
         _ensure_namespace_chain(runtime, selected_owner, namespace)
+        raw_metadata = item.get("metadata")
+        metadata = (
+            dict(raw_metadata)
+            if isinstance(raw_metadata, dict)
+            else {}
+        )
+        metadata.setdefault("title", f"benchmark setup object {task.id}")
+        metadata.setdefault("tags", ["benchmark", "setup"])
         handle = runtime.memory.create_object(
             pid=selected_owner,
             object_type=str(item.get("type") or "observation"),
             namespace=namespace,
             name=str(item.get("name") or "object"),
             payload=item.get("payload"),
-            metadata=ObjectMetadata(title=f"benchmark setup object {task.id}", tags=["benchmark", "setup"]),
+            metadata=ObjectMetadata(**metadata),
             immutable=bool(item.get("immutable", True)),
             owner_kind=(
                 ObjectOwnerKind.PROCESS
@@ -510,6 +540,19 @@ def _setup_runtime_memory(
             ),
         )
         setup_objects.append({"oid": handle.oid, "namespace": namespace, "name": str(item.get("name") or "object")})
+        if bool(item.get("include_in_context", False)):
+            process = runtime.process.get(target_pid)
+            roots = [
+                *process.memory_view.roots,
+                handle,
+            ]
+            process.memory_view = runtime.memory.create_view(
+                target_pid,
+                roots,
+                mode=process.memory_view.mode,
+                filters=process.memory_view.filters,
+            )
+            runtime.store.update_process(process)
         if runner == "no_namespace_isolation" or bool(item.get("grant_to_process", False)):
             runtime.capability.grant(
                 subject=target_pid,
@@ -617,6 +660,38 @@ def _setup_runtime_benchmark_resources(
 ) -> dict[str, Any]:
     state: dict[str, Any] = {"checkpoints": {}}
     setup = task.setup or {}
+    for item in setup.get("sink_trust", []) or []:
+        if not isinstance(item, dict):
+            continue
+        identity_sha256 = item.get("identity_sha256")
+        identity_from = item.get("identity_from")
+        if identity_from is not None:
+            selected = str(identity_from)
+            prefix = "llm_profile:"
+            if not selected.startswith(prefix) or not selected[len(prefix) :]:
+                raise BenchmarkValidationError(
+                    f"unsupported benchmark sink trust identity_from: {selected!r}"
+                )
+            identity_sha256 = runtime.llms.profile_identity_sha256(
+                selected[len(prefix) :]
+            )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=str(item["pattern"]),
+                trust_level=str(item.get("trust_level") or "untrusted"),
+                max_sensitivity=str(item.get("max_sensitivity") or "normal"),
+                tenants=tuple(str(value) for value in item.get("tenants", []) or []),
+                principals=tuple(
+                    str(value) for value in item.get("principals", []) or []
+                ),
+                identity_sha256=(
+                    str(identity_sha256) if identity_sha256 is not None else None
+                ),
+            ),
+            actor="benchmark.setup",
+            replace=bool(item.get("replace", False)),
+            require_capability=False,
+        )
     for item in setup.get("skills", []) or []:
         if isinstance(item, dict):
             path = safe_workspace_path(workspace, str(item["path"]))

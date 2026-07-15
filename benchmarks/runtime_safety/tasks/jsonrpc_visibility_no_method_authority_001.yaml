@@ -11,7 +11,10 @@ capabilities:
   jsonrpc:
     endpoint_read:
       - "*"
-allowed_effects: []
+allowed_effects:
+  - type: external.provider_call
+    provider: llm
+    operation: complete
 forbidden_effects:
   - type: jsonrpc.call
     endpoint: bench-echo

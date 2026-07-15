@@ -1,0 +1,370 @@
+# Data Labels, Egress Control, and Trusted Sinks
+
+Agent libOS enforces data labels at runtime-mediated payload exits. A visible
+tool, a normal operation capability, or a Human approval is not enough to send
+classified data: the Host-owned Sink registry must also clear the exact Sink,
+the data identity domain must match, and a `conditional` Sink needs an exact
+one-shot release.
+
+This control is independent of ordinary authority. A `trusted` Sink does not
+grant filesystem write, shell execute, Human output, JSON-RPC method, MCP tool,
+process, resource-budget, provider-registration, or Task Authority effect
+permission. All of those checks still apply.
+
+## Labels and derivation
+
+`DataLabels` contains strictly validated fields:
+
+- sensitivity: `public < normal < confidential < restricted < secret`;
+- trust: `untrusted < unknown < user_asserted < verified < trusted`;
+- integrity: `untrusted < unknown < checked < verified`;
+- optional `origin`, `tenant`, `principal`, and
+  `declassification_authority`.
+
+Unknown enum values, malformed identities, unknown fields in a typed flow
+record, and the reserved `mixed` identity outside an aggregate fail closed.
+Derived values take the highest sensitivity, lowest trust and integrity, and
+the union of identity evidence. Combining different non-empty tenants or
+principals produces `mixed`; a mixed value can neither be sent automatically
+nor released. It must first be reclassified by a Host operation.
+
+Explicit object metadata cannot overwrite a parent tenant or principal.
+Lowering sensitivity, removing or replacing identity, raising trust or
+integrity, or changing declassification authority requires an exact
+`declassification:object:<oid>` `admin` capability. Model-facing memory tools
+reject label-bearing metadata, so the model cannot assert trusted labels or a
+declassification authority.
+
+For an LLM-created Object, provenance is the union of explicit `parent_oids`
+and every Object actually included in that LLM materialization. Missing or
+unreadable explicit parents reject the creation. ToolBroker carries the
+materialization id, Object id/version/content hash, and aggregate labels in
+runtime-owned context; model arguments cannot replace that context.
+
+Process `llm_context` objects keep a `label_history` high-water mark across
+append, compaction, checkpoint, fork, exec, reopen, retry, and Human/message
+resume. Provider/tool input is never allowed to reset a previously observed
+higher sensitivity. Unclassified external responses are `normal/untrusted`
+and are aggregated with, rather than substituted for, the request context.
+Synchronous tool workers merge their final runtime-owned context back before
+output-schema validation; schema failures, exceptions, and JIT timeout/error
+paths retain a labeled Tool Result carrier. The async JSON-RPC, MCP, and Shell
+wrappers likewise return worker-thread context on both success and failure,
+instead of relying on one-way `ContextVar` copying.
+
+## Sink trust registry
+
+Unmatched Sinks are `untrusted` with a hard `normal` maximum. Host configuration
+may publish exact or terminal-`*` rules:
+
+```yaml
+data_flow:
+  default_trust_level: untrusted
+  default_max_sensitivity: normal
+  sink_rules:
+    - pattern: "llm:corp-secure"
+      trust_level: trusted
+      max_sensitivity: restricted
+      tenants: ["tenant-a"]
+      principals: ["analyst-a"]
+      identity_sha256: "<profile-identity-sha256>"
+
+    - pattern: "jsonrpc:crm:*"
+      trust_level: conditional
+      max_sensitivity: confidential
+      tenants: ["tenant-a"]
+      principals: ["analyst-a"]
+      identity_sha256: "<endpoint-and-method-identity-sha256>"
+```
+
+Patterns are either exact or a single trailing `*`. Longest match wins;
+duplicate and equal-priority overlapping patterns are rejected. Provider-backed
+LLM, JSON-RPC, MCP, Shell, and PTY clearance above `normal` requires an
+`identity_sha256`. Changing the profile/model/base URL, endpoint/method
+manifest, MCP server/tool/transport or stdio executable, or Shell/PTY executable
+content changes that hash, so the old rule no longer matches.
+
+| Trust level | Automatic send | One-shot release | Hard maximum |
+| --- | --- | --- | --- |
+| `untrusted` | `public`/`normal` | cannot elevate | `normal` |
+| `conditional` | `public`/`normal` | required above `normal` | rule maximum |
+| `trusted` | within rule clearance | not needed | rule maximum |
+
+A labeled tenant or principal must occur in the matched rule's explicit list.
+An unlabeled value does not acquire an identity from the Sink. Identity hash,
+trust level, sensitivity maximum, tenant list, and principal list together form
+clearance; there is no `trusted=true` shortcut.
+
+The registry is versioned and persisted. Each mutation advances the global
+generation and emits an event and audit record. The Host-only API is:
+
+```python
+runtime.register_sink_trust(spec, actor=admin_pid, replace=False)
+runtime.unregister_sink_trust(pattern, actor=admin_pid)
+runtime.inspect_sink_trust(pattern)
+runtime.list_sink_trust(active_only=True)
+```
+
+Writes require `admin` on `data_flow_sink_registry:*` (or the configured
+`data_flow.registry_resource`). The core tool registry exposes no equivalent
+model tool. Runtime bootstrap may load `data_flow.sink_rules` as Host
+configuration before work starts. On reopen, bootstrap-owned rules are
+reconciled with the current configuration: removed patterns are deactivated,
+while rules registered independently through the Host API remain durable.
+Reusable as well as finite registry authority is reauthorized inside the
+registry mutation transaction immediately before the write. Revoking an
+unlimited `admin` grant after the outer check therefore prevents both register
+and unregister from changing the registry.
+
+## Stable Sink identities
+
+| Exit | Sink identity | Additional binding |
+| --- | --- | --- |
+| LLM | `llm:<profile-id>` | profile/model/endpoint/API-mode plus effective store, prompt-cache-retention, and Responses-chaining identity hash |
+| Human | `human:<recipient>:<channel>` | exact recipient and channel |
+| Human GUI projection | `human:<recipient>:gui` | complete gate-independent serialized public view (including status and decision) plus GUI presentation operation; trust aliases the configured Human terminal identity |
+| JSON-RPC | `jsonrpc:<endpoint-id>:<method-id>` | endpoint plus method manifest hash |
+| MCP | `mcp:<server-id>:<tool-id>` | server, transport, and tool manifest hash; stdio also binds the resolved executable path/content |
+| MCP live discovery | `mcp:<server-id>:list_tools` | server and transport manifest hash; stdio also binds the resolved executable path/content |
+| File | `filesystem:workspace:<normalized-path>` | canonical workspace path |
+| Shell | `shell:<resolved-executable>` | resolved path plus executable content hash; mutable workspace executables dispatch from a Host-owned content snapshot |
+| PTY spawn | `pty:spawn:<resolved-executable>` | resolved path/content hash fixed at session creation; mutable workspace executables dispatch from a Host-owned content snapshot |
+| PTY input/control | `pty:session:<session-id>` | aliases the immutable content-bound spawn trust identity |
+| Internal process handoff | `process:<pid>` | identity-domain propagation, not external trust |
+
+MCP metadata-only cached discovery is public. A process-initiated live refresh
+is a bidirectional provider operation: its current flow context is checked as
+outbound request data, and returned metadata or an after-dispatch provider
+error raises the caller's context with `normal/untrusted` external ingress. A
+provider-certified not-started failure adds no ingress. A Host-internal refresh with
+no process actor uses the runtime's public/verified metadata request context.
+Deno/JIT code receives no direct external authority; its syscalls enter the
+same filesystem, shell, Human, JSON-RPC, MCP, and process boundaries.
+
+## Enforcement order
+
+`ProtectedOperationContract.data_flow_direction` is explicitly `none`,
+`ingress`, `egress`, or `bidirectional`. The older `information_flow` flag is
+not interpreted as egress because reads, DNS, and clocks also observe
+information.
+
+For egress, the runtime performs this sequence:
+
+1. Check identifier visibility and non-consuming capability policy needed to
+   avoid registry or endpoint enumeration.
+2. Construct the canonical Sink and resolve its Host trust record and identity
+   hash.
+3. Resolve trusted Object sources into `DataFlowContext` and perform an early
+   clearance/source-version check.
+4. For conditional high-sensitivity flow, create only a metadata-only Human
+   release request.
+5. Complete ordinary capability, Task Authority, policy, approval, and budget
+   checks.
+6. In the protected-operation transaction, revalidate registry generation,
+   Object versions/content hashes, exact payload hash, and release binding.
+7. Atomically reserve ordinary and release capabilities and create the pending
+   external-effect intent.
+8. Immediately before each provider phase, revalidate the registry generation,
+   exact source versions/content hashes, target state, payload, and release
+   binding, then recompute any mutable Host Sink identity (including executable
+   content). A mismatch appends a payload-free denial. A release already
+   reserved or committed by an earlier phase remains valid only through that
+   same protected-operation reservation. For Shell, PTY, and MCP stdio
+   executables in the mutable workspace, create and verify a private Host-owned
+   content snapshot before final dispatch. A bounded, all-or-nothing set of
+   direct sibling resources is linked beside that copy for ordinary relative
+   read compatibility, but remains live provider input rather than part of the
+   pinned executable identity.
+9. Only then enter DNS, provider state, filesystem state, stdio, subprocess, or
+   Human payload delivery. Executable dispatch uses the snapshot rather than
+   reopening the authorized workspace path.
+
+An early denial does not call the provider, DNS, filesystem `state()`, Human
+payload delivery, or spawn; does not consume an ordinary finite-use capability;
+and does not create an external-effect intent. It does append a payload-free
+`DataFlowDecision`, event, audit record, and Explain evidence containing the
+Sink, label/source hashes, trusted source refs, trust record/generation, and
+reason.
+
+Successful effect metadata binds the decision, trust id/hash, registry
+generation, source Object id/version/content hashes, label hash, and release
+capability where applicable. Mutable sources are checked again immediately
+before every provider dispatch. A mutation before the first phase rejects and
+restores both reservations; a mutation between phases prevents the later
+provider call and conservatively finalizes the already-started effect.
+
+Direct Host primitive calls may pass `source_oids`. Those are Object references
+resolved by the runtime; callers cannot submit a `DataLabels` value as payload
+authority. A Host raw payload with no sources starts as `normal` inside the Host
+trust boundary. Model-mediated calls also inherit their ambient materialized
+context, so omitting an explicit source cannot wash a label.
+
+## Exact conditional release
+
+A conditional send above `normal` creates a requested
+`data_release:<sink>` `approve` capability with `uses_remaining=1`. Its binding
+includes:
+
+- pid, Sink identity and identity hash;
+- trust id/hash and current registry generation;
+- Task Authority manifest hash;
+- source Object id/version/content hash and aggregate label hash;
+- canonical payload/argument hash, operation, and target-state version.
+
+The Human sees only Sink, sensitivity, tenant/principal, size, hashes, source
+count, and operation—not the payload. Approval does not change Object labels,
+does not replace ordinary capability, and cannot exceed the Sink maximum or
+identity scope. Replay, cross-Sink reuse, payload change, source mutation,
+manifest change, trust replacement, or generation change fails. `untrusted`
+Sinks cannot be elevated by Human approval; `trusted` Sinks need no release.
+When the binding includes mutable target state, the SDK resolves its current
+version again inside the prepare transaction; a change from the approved
+version denies before capability reservation or provider dispatch.
+
+For Human Sinks, the metadata-only release and protected request are linked in
+durable state. Rejecting/cancelling the release (or an ambiguous release-prompt
+provider outcome) terminates the protected request and prevents automatic
+replay. A provider-certified not-started outcome keeps the exact linked pair
+pending, so reopen does not create duplicate release requests.
+
+Conditional LLM provider releases additionally obey `llm.persist_full_io`
+before approval. In opt-out mode, `llm_pending_actions` stores only the exact
+prepared-request hash, payload hash, and non-sensitive resume identifiers; the
+raw messages, tool schema, and egress payload remain in executor memory. The
+same runtime can consume the approved one-shot release against that hash. If
+the runtime reopens after losing the in-memory request, it claims the durable
+generation and fails the process closed rather than reconstructing a different
+prompt or sending an unbound payload. Rejecting the exact release clears that
+prepared request and pauses the process behind a Host-only resume gate. A
+parent/model `signal_child_process(resume)` cannot turn the rejection into an
+automatic replacement request; an explicit Host resume starts a new model turn
+and, if still required, a new independently bound release.
+
+GUI serialization uses a separate `human:<recipient>:gui` presentation Sink
+with the configured terminal identity as its trust identity. Before release,
+the parent is metadata-only and cannot be answered through the GUI API. Release
+approval must be followed by the protected GUI presentation that consumes the
+exact one-shot capability; only then is the durable parent view interactive.
+The exact binding hashes the complete public view passed to the GUI provider,
+including payload, status, timestamps, and `decision`; internal release links
+and visibility markers are gate state and are not part of that provider view.
+That visible marker is accepted only while the original binding remains current
+for source versions, Sink trust and registry generation, Task Authority
+manifest, labels, public view, and operation. A later answer or any other
+public-view change redacts the parent again and requires a new exact release.
+The freshness check is read-only: it does not record a data-flow decision,
+consume authority, or create a release.
+For GUI responses, that check runs inside the same Human-decision transaction
+as the status change. Presentation lists are built lazily against their final
+logical window, so an exact release is never consumed for an omitted lookahead
+row; a pending metadata release is paired immediately before its still-redacted
+parent without moving completed release history ahead of pending work. An
+unchanged unrestricted view already handed to the same authenticated GUI
+provider session may reuse a bounded in-memory receipt, but only after its exact
+view hash and current source/Sink policy are checked under the Store lock. A
+new provider session cannot inherit the receipt. Presentation evidence remains
+available in the full ledgers while bounded GUI causal windows exclude those
+internally generated rows so polling cannot displace unrelated recent events or
+audits.
+
+For an LLM Sink, the default `llm.persist_full_io=true` policy serializes the
+final messages, tool schemas, profile/Sink identity, request options,
+provider-state scope, flow context, and exact payload binding as one durable
+prepared request before returning `waiting_human`. With
+`persist_full_io=false`, the durable row contains only the prepared-request and
+payload hashes plus non-sensitive resume metadata; the exact request remains
+in executor memory. Approval in that same runtime resumes the hash-bound
+request once. If the in-memory request is lost, the runtime fails closed before
+provider dispatch rather than rematerializing process memory or asking the
+model to recreate the call. A changed profile/Sink identity also fails closed,
+and the same release cannot produce a second provider request.
+
+The protected-operation lifecycle restores an unconsumed ordinary/release use
+only when the provider certifies `ProviderEffectNotStarted` and no earlier
+information flow occurred. Crossing DNS, stdio, provider, or spawn commits the
+uses even if a later phase fails.
+
+## Process domains and persistence
+
+`TaskAuthorityManifest.data_flow_policy` is only the process receive-domain
+ceiling:
+
+```json
+{
+  "schema_version": 1,
+  "allowed_tenants": ["tenant-a"],
+  "allowed_principals": ["analyst-a"]
+}
+```
+
+Child manifests may inherit or narrow these sets, never widen them. Empty sets
+accept only untagged process data. Goals, messages, results, Object Tasks,
+memory merge, fork, and exec carry trusted labels; reading a secret message
+taints later goals and replies. Prompt-visible process events merge their
+runtime-carried labels into the durable LLM context high-water before provider
+dispatch. This policy cannot make an external Sink trusted and cannot reduce a
+Host rule's clearance.
+
+SQLite and PostgreSQL share durable records for the active/versioned Sink
+registry, append-only decisions, exact release constraints, file-path label
+history/tombstones, pending LLM flow context, and provider-chain clearance
+fingerprints. Successful file writes bind the canonical path, content hash,
+labels, and sources. File ingress projects the current active record through an
+opaque, durable reference to its immutable binding ID, generation, and content
+hash; it does not restore runtime-only Object references as live dependencies.
+That exact historical binding remains valid after reopen or later replacement,
+while a missing binding or mismatched generation/content hash fails source
+revalidation before egress. Derived Object provenance keeps these opaque IDs in
+`source_refs` and expands only the binding's stored Object ancestry into
+`parent_oids`, so a file binding is never mistaken for an Object. When a write
+creates missing parent directories, each
+auto-created parent receives the same conservative binding. Recursive directory
+delete obtains labels and its subtree fingerprint from one store snapshot,
+rechecks that fingerprint during protected prepare, and tombstones all
+descendant bindings on success. Non-recursive directory delete similarly
+captures the target binding ID/generation and tombstones it with a storage-level
+compare-and-swap, so a binding created after provider dispatch is preserved.
+Later out-of-band modification does not silently lower the known path label.
+Directory listing snapshots the directory and child bindings before provider
+enumeration, rejects a changed subtree fingerprint, and labels returned
+(including truncation-lookahead) names from the captured snapshot rather than a
+newer lower binding. Runtime file writes and directory creation share the same
+label-publication critical section with listing, so a newly visible child cannot
+be returned before its conservative path binding is durable. That section is a
+fair hierarchical path lock rather than one workspace-global mutex: unrelated
+file reads may proceed concurrently, while ancestor/descendant operations and
+create operations sharing a potentially missing top-level ancestor serialize.
+Lock keys conservatively normalize Unicode and case so Host aliases cannot split
+the label boundary; widening a held child scope to an ancestor is rejected
+instead of risking a lock-upgrade deadlock.
+
+Checkpoint restore does not roll back files, provider state, trust generation,
+or decisions, and it cannot revive a stale release. Fork/reopen revalidates the
+current registry and authority. Runtime-only Object payloads can disappear on
+reopen; a durable pending action may use the Host-written row version and label
+snapshot for domain validation, while materialization still fails and the
+operation must recover or rerun.
+
+LLM Responses chaining is opt-in and is severed when the provider identity,
+Sink/trust generation, clearance sensitivity/identity domain, Task Authority
+manifest, or context epoch changes. Changing mere source versions or
+trust/integrity without changing confidentiality clearance does not retain less
+data at the provider and therefore does not reset an otherwise valid chain.
+
+## Guarantee boundary
+
+The guarantee covers payloads that cross runtime-mediated Sinks. Marking a
+Shell, PTY, or MCP stdio executable trusted means the Host deliberately trusts
+that program to receive the data; it does not give Agent libOS kernel-level
+control over that program's later network or filesystem I/O.
+
+Host administrators, direct database writes, trusted Runtime Modules/provider
+extensions, a Sink's secondary forwarding, and additional I/O initiated by a
+native child after the mediated argv/stdin boundary are outside this guarantee.
+Audit and label rows are append-only through runtime APIs, not tamper-proof
+against a database administrator. Deployments that need that property must add
+external signed/append-only evidence and an OS/container/WASM isolation layer.
+
+The machine-checked invariant is
+`data-labels-constrain-runtime-mediated-egress`; the deterministic benchmark
+attack class is `data_label_exfiltration`.

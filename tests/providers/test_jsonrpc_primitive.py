@@ -24,6 +24,10 @@ from agent_libos.models import (
     JsonRpcTransportResult,
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
+    ObjectMetadata,
+    ObjectType,
+    SinkTrustLevel,
+    SinkTrustRule,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
@@ -31,6 +35,82 @@ from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubs
 from agent_libos.utils.serde import dumps
 
 class TestJsonRpcPrimitive:
+
+    def test_labeled_params_require_matching_trusted_endpoint_identity(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='labeled JSON-RPC egress')
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    'labeled-endpoint',
+                    'https://api.example.test/jsonrpc',
+                    with_header=False,
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'jsonrpc:labeled-endpoint:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'jsonrpc-data-flow-sentinel'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+
+            with pytest.raises(CapabilityDenied, match='data-flow denied egress'):
+                runtime.jsonrpc.call(
+                    pid,
+                    'labeled-endpoint',
+                    'echo',
+                    {'value': 'jsonrpc-data-flow-sentinel'},
+                    source_oids=[source.oid],
+                )
+            assert provider.calls == []
+
+            spec, _metadata = runtime.jsonrpc._load_endpoint('labeled-endpoint')
+            method = spec.method_by_id('echo')
+            assert method is not None
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='jsonrpc:labeled-endpoint:echo',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.jsonrpc._endpoint_identity_sha256(
+                        spec,
+                        method,
+                    ),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            monkeypatch.setattr(
+                runtime.jsonrpc,
+                '_validate_runtime_resolution',
+                lambda _spec: ('93.184.216.34',),
+            )
+
+            result = runtime.jsonrpc.call(
+                pid,
+                'labeled-endpoint',
+                'echo',
+                {'value': 'jsonrpc-data-flow-sentinel'},
+                source_oids=[source.oid],
+            )
+
+            assert result.ok
+            assert len(provider.calls) == 1
+        finally:
+            runtime.close()
 
     @pytest.mark.parametrize('operation', ['inspect', 'unregister', 'register', 'replace'])
     @pytest.mark.parametrize('endpoint_id', ['secret-existing', 'secret-missing'])

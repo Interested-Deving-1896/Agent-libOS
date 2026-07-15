@@ -28,6 +28,47 @@ SAFE_PROVIDER_CALLS = frozenset(
 PROVIDER_HANDLE_METHODS = frozenset(
     {"close", "exit_code", "is_alive", "read", "resize", "write"}
 )
+EGRESS_CONTRACTS = frozenset(
+    {
+        "primitive.filesystem.write_text",
+        "primitive.filesystem.write_directory",
+        "primitive.filesystem.delete_file",
+        "primitive.filesystem.delete_directory",
+        "primitive.shell.run",
+        "primitive.jsonrpc.call",
+        "primitive.mcp.list_tools",
+        "primitive.mcp.list_tools.internal",
+        "primitive.mcp.call",
+        "primitive.llm.complete",
+        "primitive.human.read",
+        "primitive.human.write",
+        "primitive.pty.spawn",
+        "primitive.pty.write",
+        "primitive.pty.resize",
+        "primitive.pty.close",
+    }
+)
+INGRESS_CONTRACTS = frozenset(
+    {
+        "primitive.filesystem.read_text",
+        "primitive.filesystem.read_bytes",
+        "primitive.filesystem.read_directory",
+        "primitive.shell.run",
+        "primitive.jsonrpc.call",
+        "primitive.mcp.list_tools",
+        "primitive.mcp.list_tools.internal",
+        "primitive.mcp.call",
+        "primitive.llm.complete",
+        "primitive.human.read",
+        "primitive.pty.spawn",
+        "primitive.pty.read",
+        "primitive.pty.ingest",
+    }
+)
+DATA_FLOW_DESCRIPTOR_FIELDS = frozenset(
+    {"data_sink", "data_flow_context", "data_flow_payload", "data_flow_operation"}
+)
+INGRESS_DESCRIPTOR_FIELD = "data_flow_ingress_context"
 
 FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
 
@@ -222,6 +263,69 @@ def _provider_handle_names(
     return names
 
 
+def _invocation_descriptor_error(call: ast.Call) -> str | None:
+    fields = {keyword.arg for keyword in call.keywords if keyword.arg is not None}
+    missing = sorted(DATA_FLOW_DESCRIPTOR_FIELDS - fields)
+    if missing:
+        return "missing data-flow descriptor fields: " + ", ".join(missing)
+    return None
+
+
+def _invocation_ingress_descriptor_error(call: ast.Call) -> str | None:
+    fields = {keyword.arg for keyword in call.keywords if keyword.arg is not None}
+    if INGRESS_DESCRIPTOR_FIELD not in fields:
+        return f"missing ingress data-flow descriptor field: {INGRESS_DESCRIPTOR_FIELD}"
+    return None
+
+
+def _literal_contract_names(node: ast.AST) -> frozenset[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return frozenset({node.value})
+    if isinstance(node, ast.IfExp):
+        return _literal_contract_names(node.body) | _literal_contract_names(node.orelse)
+    return frozenset()
+
+
+def _assigned_contract_names(
+    tree: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> dict[tuple[FunctionNode | None, str], frozenset[str]]:
+    assigned: dict[tuple[FunctionNode | None, str], frozenset[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        names = _literal_contract_names(node.value)
+        if not names:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        owner = _nearest_owner(node, parents)
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assigned[(owner, target.id)] = names
+    return assigned
+
+
+def _assigned_invocations(
+    tree: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> dict[tuple[FunctionNode | None, str], ast.Call]:
+    assigned: dict[tuple[FunctionNode | None, str], ast.Call] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call) or _attribute_path(value.func)[-1:] != (
+            "ProtectedOperationInvocation",
+        ):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        owner = _nearest_owner(node, parents)
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assigned[(owner, target.id)] = value
+    return assigned
+
+
 def scan_source(path: Path, *, relative: Path) -> list[str]:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(relative))
@@ -233,6 +337,8 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
         child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
     }
     call_graph = _CallGraph(tree, parents)
+    assigned_invocations = _assigned_invocations(tree, parents)
+    assigned_contract_names = _assigned_contract_names(tree, parents)
     protected_functions = call_graph.protected_functions(tree)
     provider_handle_names = _provider_handle_names(tree, parents)
     direct_provider_functions: set[FunctionNode] = set()
@@ -274,6 +380,58 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
                 errors.append(
                     f"{relative}:{node.lineno}: direct {name} call bypasses agent_libos.sdk"
                 )
+            if _attribute_path(node.func)[-1:] == ("ProtectedOperationInvocation",):
+                fields = {keyword.arg for keyword in node.keywords if keyword.arg is not None}
+                if fields & DATA_FLOW_DESCRIPTOR_FIELDS:
+                    descriptor_error = _invocation_descriptor_error(node)
+                    if descriptor_error is not None:
+                        errors.append(
+                            f"{relative}:{node.lineno}: ProtectedOperationInvocation {descriptor_error}"
+                        )
+            path = _attribute_path(node.func)
+            if path[-1:] == ("start",) and node.args:
+                contract = node.args[0]
+                contract_names = _literal_contract_names(contract)
+                if isinstance(contract, ast.Name):
+                    contract_names = assigned_contract_names.get(
+                        (_nearest_owner(node, parents), contract.id),
+                        frozenset(),
+                    )
+                needs_egress = bool(contract_names & EGRESS_CONTRACTS)
+                needs_ingress = bool(contract_names & INGRESS_CONTRACTS)
+                if needs_egress or needs_ingress:
+                    invocation_node: ast.Call | None = None
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Call):
+                        invocation_node = node.args[1]
+                    elif len(node.args) >= 2 and isinstance(node.args[1], ast.Name):
+                        invocation_node = assigned_invocations.get(
+                            (_nearest_owner(node, parents), node.args[1].id)
+                        )
+                    if invocation_node is None:
+                        errors.append(
+                            f"{relative}:{node.lineno}: data-flow contract "
+                            f"{sorted(contract_names)} "
+                            "does not resolve to a local ProtectedOperationInvocation"
+                        )
+                    else:
+                        if needs_egress:
+                            descriptor_error = _invocation_descriptor_error(invocation_node)
+                            if descriptor_error is not None:
+                                errors.append(
+                                    f"{relative}:{node.lineno}: egress contract "
+                                    f"{sorted(contract_names & EGRESS_CONTRACTS)} "
+                                    f"{descriptor_error}"
+                                )
+                        if needs_ingress:
+                            ingress_error = _invocation_ingress_descriptor_error(
+                                invocation_node
+                            )
+                            if ingress_error is not None:
+                                errors.append(
+                                    f"{relative}:{node.lineno}: ingress contract "
+                                    f"{sorted(contract_names & INGRESS_CONTRACTS)} "
+                                    f"{ingress_error}"
+                                )
             owner = _nearest_owner(node, parents)
             callee = call_graph.resolve(node.func, owner)
             if (

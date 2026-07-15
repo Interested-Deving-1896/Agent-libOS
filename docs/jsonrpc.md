@@ -165,6 +165,24 @@ Tool visibility does not grant remote authority. Default images expose
 `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, and
 `call_jsonrpc_method`, but a call still fails without the method capability.
 
+## Data-flow Sink
+
+`params` is an egress payload to
+`jsonrpc:<endpoint_id>:<method_id>`. After the authority-before-lookup visibility
+gate, the runtime hashes the complete endpoint plus selected method manifest as
+the Sink configuration identity. A Host trust rule above `normal` must bind
+that hash, along with its sensitivity and tenant/principal clearance. Replacing
+the URL, wire method, schema, headers, limits, or effect metadata changes the
+identity and invalidates old trust.
+
+Clearance is checked before ordinary per-use approval, environment resolution,
+DNS, or transport and is revalidated with source Object versions and canonical
+params in the protected-operation transaction. A trusted endpoint still needs
+the exact JSON-RPC method capability, Task Authority effect permission, and
+budget. A conditional high-sensitivity call needs an exact metadata-only
+release; an untrusted endpoint cannot be elevated above `normal`. See
+[Data Flow](data_flow.md).
+
 ## External Effects
 
 The JSON-RPC provider classifies every call from the method spec:
@@ -196,6 +214,10 @@ pending rows in `external_effects_since_checkpoint` and
 Audit and external-effect metadata store bounded, redacted observations of
 `params` with size and hash. Raw params are sent to the registered provider but
 are not persisted in audit or provider-effect context.
+
+Successful effect metadata additionally carries the data-flow decision,
+registry generation, trust id/hash, label/source hashes, and exact source
+Object references, never raw source payloads.
 
 `params_schema`, when present, is validated at registration time and enforced
 before each call. Parameter validation failures do not contact the provider and

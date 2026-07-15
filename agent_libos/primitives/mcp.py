@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import ipaddress
 import math
@@ -8,7 +7,7 @@ import os
 import re
 import socket
 import time
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -23,6 +22,9 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
+    DataFlowContext,
+    DataLabels,
+    DataSink,
     EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -43,7 +45,13 @@ from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequire
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import RuntimeStore
-from agent_libos.substrate import McpProvider, ProviderEffectNotStarted
+from agent_libos.substrate import (
+    ExecutableSnapshot,
+    executable_content_sha256,
+    McpProvider,
+    ProviderEffectNotStarted,
+    snapshot_executable,
+)
 from agent_libos.sdk import (
     ProviderEffectNotStartedResult,
     ProtectedOperationEvidence,
@@ -66,6 +74,7 @@ _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, Capabil
 _ALLOWED_HEADER_PREFIXES = {"", "Bearer ", "Token ", "Basic "}
 _ALLOWED_HEADER_SUFFIXES = {""}
 _TRANSPORTS = {"stdio", "streamable_http"}
+_STDIO_EXECUTABLE_IDENTITY_UNSET = object()
 
 
 class McpPrimitive:
@@ -323,6 +332,26 @@ class McpPrimitive:
                 else "primitive.mcp.list_tools.internal"
             )
             resource_context = {"server_id": server_id, "request_bytes": request_bytes}
+            request_flow = (
+                self._data_flow().current_context()
+                if actor is not None
+                else DataFlowContext(
+                    labels=DataLabels(
+                        sensitivity="public",
+                        trust_level="verified",
+                        integrity="verified",
+                        origin="runtime:mcp-list-tools-metadata",
+                    )
+                )
+            )
+            stdio_executable_identity = self._stdio_executable_identity(spec)
+            list_sink = DataSink(
+                f"mcp:{server_id}:list_tools",
+                self._list_tools_identity_sha256(
+                    spec,
+                    stdio_executable=stdio_executable_identity,
+                ),
+            )
             invocation = ProtectedOperationInvocation(
                 pid=effect_actor,
                 actor=effect_actor,
@@ -337,6 +366,18 @@ class McpPrimitive:
                 ),
                 resource_source="primitive.mcp.list_tools",
                 resource_context=resource_context,
+                data_sink=list_sink,
+                data_sink_revalidator=lambda: DataSink(
+                    f"mcp:{server_id}:list_tools",
+                    self._list_tools_identity_sha256(spec),
+                ),
+                data_flow_context=request_flow,
+                data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                    request_flow,
+                    origin="external:mcp",
+                ),
+                data_flow_payload={"method": "tools/list", "server_id": server_id},
+                data_flow_operation="mcp.list_tools",
                 failure_evidence=lambda error, phase: self._protected_list_failure_evidence(
                     effect_actor, spec, effect_context, error, phase
                 ),
@@ -355,22 +396,40 @@ class McpPrimitive:
                     )
                 started = time.monotonic()
 
+                executable_snapshot = self._stdio_snapshot_for_dispatch(
+                    pid=effect_actor,
+                    spec=spec,
+                    expected_identity=stdio_executable_identity,
+                    sink=list_sink,
+                    context=request_flow,
+                    payload={"method": "tools/list", "server_id": server_id},
+                )
+
                 def invoke_list_tools():
                     try:
+                        provider_kwargs: dict[str, Any] = {
+                            "timeout_s": spec.timeout_s,
+                            "max_response_bytes": spec.max_response_bytes,
+                        }
+                        if executable_snapshot is not None:
+                            provider_kwargs["executable_snapshot"] = executable_snapshot
                         return self.provider.list_tools(
                             spec,
-                            timeout_s=spec.timeout_s,
-                            max_response_bytes=spec.max_response_bytes,
+                            **provider_kwargs,
                         ), None
                     except ProviderEffectNotStarted:
                         raise
                     except Exception as error:
                         return None, error
 
-                result, provider_error = protected.call(
-                    ProviderPhase("provider_not_started_after_dns", information_flow=True),
-                    invoke_list_tools,
-                )
+                try:
+                    result, provider_error = protected.call(
+                        ProviderPhase("provider_not_started_after_dns", information_flow=True),
+                        invoke_list_tools,
+                    )
+                finally:
+                    if executable_snapshot is not None:
+                        executable_snapshot.close()
                 if provider_error is not None:
                     result_payload = self._list_tools_failure_payload(
                         provider_error,
@@ -465,20 +524,56 @@ class McpPrimitive:
             self._commit_registry_authority(reservations, actor=actor, operation="unregister")
         return {"server_id": server_id, "deleted": True}
 
-    def call_tool(self, pid: str, server_id: str, tool_id: str, arguments: Any = None) -> McpCallResult:
+    def call_tool(
+        self,
+        pid: str,
+        server_id: str,
+        tool_id: str,
+        arguments: Any = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> McpCallResult:
         resource = self.tool_resource(server_id, tool_id)
         selected_args = {} if arguments is None else arguments
         if not isinstance(selected_args, dict):
             raise ValidationError("MCP tool arguments must be a JSON object or null")
         self._validate_json_value(selected_args, "arguments")
         visibility_context = self._visibility_operation_context(pid, server_id, tool_id, selected_args)
-        self._authorize_call_visibility(pid, resource, visibility_context)
+        self._authorize_call_visibility(
+            pid,
+            resource,
+            visibility_context,
+            source_oids=source_oids,
+        )
         spec, _metadata = self._load_server(server_id)
         tool = spec.tool_by_id(tool_id)
         if tool is None:
             raise NotFound(f"MCP tool not found: {server_id}/{tool_id}")
         operation_context = self._operation_context(pid, spec, tool, selected_args)
-        decision = self._authorize_call(pid, resource, tool.right, operation_context)
+        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        stdio_executable_identity = self._stdio_executable_identity(spec)
+        sink = DataSink(
+            f"mcp:{server_id}:{tool_id}",
+            self._server_identity_sha256(
+                spec,
+                tool,
+                stdio_executable=stdio_executable_identity,
+            ),
+        )
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=selected_args,
+            operation="mcp.call_tool",
+        )
+        decision = self._authorize_call(
+            pid,
+            resource,
+            tool.right,
+            operation_context,
+            source_oids=source_oids,
+        )
         auxiliary_decisions = self._require_stdio_process_spawn(pid, spec, consume=False)
         self._validate_arguments_against_schema(tool, selected_args)
         profile = self.capabilities.profiles.mcp(
@@ -505,7 +600,6 @@ class McpPrimitive:
                 "sandbox_profile": self._profile_json(profile),
             }
         )
-        self._require_runtime_environment(spec)
         request_bytes = len(dumps({"name": tool.mcp_name, "arguments": selected_args}).encode("utf-8"))
         if request_bytes > spec.max_request_bytes:
             raise ValidationError(f"MCP request exceeds max_request_bytes={spec.max_request_bytes}")
@@ -524,8 +618,21 @@ class McpPrimitive:
             failure_evidence=lambda error, phase: self._protected_call_failure_evidence(
                 pid, resource, tool, operation_context, error, phase
             ),
+            data_sink=sink,
+            data_sink_revalidator=lambda: DataSink(
+                f"mcp:{server_id}:{tool_id}",
+                self._server_identity_sha256(spec, tool),
+            ),
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                flow_context,
+                origin="external:mcp",
+            ),
+            data_flow_payload=selected_args,
+            data_flow_operation="mcp.call_tool",
         )
         with self._protected().start("primitive.mcp.call", invocation, provider=self.provider) as protected:
+            self._require_runtime_environment(spec)
             if spec.transport == "streamable_http":
                 observes_host = self._runtime_resolution_observes_host(spec)
                 protected.call(
@@ -542,17 +649,33 @@ class McpPrimitive:
 
             def validate_live_tool() -> Exception | None:
                 try:
-                    self._validate_live_tool(spec, tool)
+                    self._validate_live_tool(
+                        spec,
+                        tool,
+                        executable_snapshot=live_executable_snapshot,
+                    )
                 except ProviderEffectNotStarted:
                     raise
                 except Exception as error:
                     return error
                 return None
 
-            validation_error = protected.call(
-                ProviderPhase("live_validation_not_started_after_dns", information_flow=True),
-                validate_live_tool,
+            live_executable_snapshot = self._stdio_snapshot_for_dispatch(
+                pid=pid,
+                spec=spec,
+                expected_identity=stdio_executable_identity,
+                sink=sink,
+                context=flow_context,
+                payload=selected_args,
             )
+            try:
+                validation_error = protected.call(
+                    ProviderPhase("live_validation_not_started_after_dns", information_flow=True),
+                    validate_live_tool,
+                )
+            finally:
+                if live_executable_snapshot is not None:
+                    live_executable_snapshot.close()
             if validation_error is not None:
                 result = self._failure(
                     spec,
@@ -580,13 +703,18 @@ class McpPrimitive:
                 | ProviderEffectNotStartedResult
             ):
                 try:
+                    provider_kwargs: dict[str, Any] = {
+                        "timeout_s": spec.timeout_s,
+                        "max_response_bytes": spec.max_response_bytes,
+                    }
+                    if executable_snapshot is not None:
+                        provider_kwargs["executable_snapshot"] = executable_snapshot
                     return (
                         self.provider.call_tool(
                             spec,
                             tool,
                             selected_args,
-                            timeout_s=spec.timeout_s,
-                            max_response_bytes=spec.max_response_bytes,
+                            **provider_kwargs,
                         ),
                         None,
                     )
@@ -618,19 +746,32 @@ class McpPrimitive:
                         ),
                     )
 
-            provider_outcome = protected.call(
-                ProviderPhase(
-                    "provider_call",
-                    state_mutation=tool.state_mutation,
-                    information_flow=True,
-                ),
-                invoke_tool,
+            executable_snapshot = self._stdio_snapshot_for_dispatch(
+                pid=pid,
+                spec=spec,
+                expected_identity=stdio_executable_identity,
+                sink=sink,
+                context=flow_context,
+                payload=selected_args,
             )
+            try:
+                provider_outcome = protected.call(
+                    ProviderPhase(
+                        "provider_call",
+                        state_mutation=tool.state_mutation,
+                        information_flow=True,
+                    ),
+                    invoke_tool,
+                )
+            finally:
+                if executable_snapshot is not None:
+                    executable_snapshot.close()
             if isinstance(provider_outcome, ProviderEffectNotStartedResult):
-                return self._call_result_from_provider(spec, tool, provider_outcome.result)
+                result = self._call_result_from_provider(spec, tool, provider_outcome.result)
+                return result
             provider_result, classification_override = provider_outcome
             result = self._call_result_from_provider(spec, tool, provider_result)
-            return protected.complete(
+            completed = protected.complete(
                 result,
                 self._protected_call_evidence(pid, resource, result, tool, operation_context),
                 classification_context=effect_context,
@@ -640,9 +781,25 @@ class McpPrimitive:
                     request_bytes, result, server_id=server_id, tool_id=tool_id
                 ),
             )
+            return completed
 
-    async def acall_tool(self, pid: str, server_id: str, tool_id: str, arguments: Any = None) -> McpCallResult:
-        return await asyncio.to_thread(self.call_tool, pid, server_id, tool_id, arguments)
+    async def acall_tool(
+        self,
+        pid: str,
+        server_id: str,
+        tool_id: str,
+        arguments: Any = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> McpCallResult:
+        return await self._data_flow().run_sync_in_worker(
+            self.call_tool,
+            pid,
+            server_id,
+            tool_id,
+            arguments,
+            source_oids=source_oids,
+        )
 
     def grant_tool(
         self,
@@ -662,7 +819,15 @@ class McpPrimitive:
             delegable=delegable,
         )
 
-    def _authorize_call(self, pid: str, resource: str, right: str, context: dict[str, Any]) -> Any:
+    def _authorize_call(
+        self,
+        pid: str,
+        resource: str,
+        right: str,
+        context: dict[str, Any],
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> Any:
         decision = self.capabilities.authorize(pid, resource, right, context, audit=True)
         if decision.allowed:
             return decision
@@ -691,6 +856,7 @@ class McpPrimitive:
                     "context": approval_context,
                 },
                 blocking=True,
+                source_oids=source_oids,
             )
             raise HumanApprovalRequired(
                 request_id=request_id,
@@ -698,16 +864,37 @@ class McpPrimitive:
             )
         raise CapabilityDenied(decision.reason)
 
-    def _authorize_call_visibility(self, pid: str, resource: str, context: dict[str, Any]) -> None:
+    def _authorize_call_visibility(
+        self,
+        pid: str,
+        resource: str,
+        context: dict[str, Any],
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         for right in (CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.EXECUTE):
             decision = self.capabilities.authorize(pid, resource, right, {**context, "right": str(right)})
             if decision.allowed:
                 return
             if decision.policy == CapabilityManager.ASK_EACH_TIME:
-                self._request_visibility_approval(pid, resource, str(right), context)
+                self._request_visibility_approval(
+                    pid,
+                    resource,
+                    str(right),
+                    context,
+                    source_oids=source_oids,
+                )
         raise CapabilityDenied(f"{pid} lacks MCP call authority on {resource}")
 
-    def _request_visibility_approval(self, pid: str, resource: str, right: str, context: dict[str, Any]) -> None:
+    def _request_visibility_approval(
+        self,
+        pid: str,
+        resource: str,
+        right: str,
+        context: dict[str, Any],
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for MCP call on {resource}")
         profile = self.capabilities.profiles.mcp(
@@ -732,17 +919,29 @@ class McpPrimitive:
                 "context": approval_context,
             },
             blocking=True,
+            source_oids=source_oids,
         )
         raise HumanApprovalRequired(
             request_id=request_id,
             message=f"{pid} is waiting for per-use human approval to call {resource}",
         )
 
-    def _validate_live_tool(self, server: McpServerSpec, tool: McpToolSpec) -> None:
+    def _validate_live_tool(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        *,
+        executable_snapshot: ExecutableSnapshot | None = None,
+    ) -> None:
+        provider_kwargs: dict[str, Any] = {
+            "timeout_s": server.timeout_s,
+            "max_response_bytes": server.max_response_bytes,
+        }
+        if executable_snapshot is not None:
+            provider_kwargs["executable_snapshot"] = executable_snapshot
         result = self.provider.list_tools(
             server,
-            timeout_s=server.timeout_s,
-            max_response_bytes=server.max_response_bytes,
+            **provider_kwargs,
         )
         live = next((item for item in result.tools if item.name == tool.mcp_name), None)
         if live is None:
@@ -893,6 +1092,138 @@ class McpPrimitive:
         if sdk is None:
             raise ValidationError("MCP protected-operation SDK is not attached")
         return sdk
+
+    def _data_flow(self) -> Any:
+        manager = getattr(self, "data_flow", None) or getattr(
+            self._protected(),
+            "data_flow",
+            None,
+        )
+        if manager is None:
+            raise ValidationError("MCP data-flow manager is not attached")
+        return manager
+
+    def _server_identity_sha256(
+        self,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        *,
+        stdio_executable: dict[str, str] | None | object = (
+            _STDIO_EXECUTABLE_IDENTITY_UNSET
+        ),
+    ) -> str | None:
+        if stdio_executable is _STDIO_EXECUTABLE_IDENTITY_UNSET:
+            stdio_executable = self._stdio_executable_identity(spec)
+        if spec.transport == "stdio" and stdio_executable is None:
+            # A stdio provider that cannot resolve the exact executable may
+            # still handle normal data, but it cannot match Host clearance for
+            # data above normal sensitivity.
+            return None
+        return hashlib.sha256(
+            dumps(
+                to_jsonable(
+                    {
+                        "schema_version": 1,
+                        "server": spec,
+                        "tool": tool,
+                        "stdio_executable": stdio_executable,
+                    }
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _list_tools_identity_sha256(
+        self,
+        spec: McpServerSpec,
+        *,
+        stdio_executable: dict[str, str] | None | object = (
+            _STDIO_EXECUTABLE_IDENTITY_UNSET
+        ),
+    ) -> str | None:
+        if stdio_executable is _STDIO_EXECUTABLE_IDENTITY_UNSET:
+            stdio_executable = self._stdio_executable_identity(spec)
+        if spec.transport == "stdio" and stdio_executable is None:
+            return None
+        return hashlib.sha256(
+            dumps(
+                to_jsonable(
+                    {
+                        "schema_version": 1,
+                        "server": spec,
+                        "operation": "tools/list",
+                        "stdio_executable": stdio_executable,
+                    }
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _stdio_executable_identity(self, spec: McpServerSpec) -> dict[str, str] | None:
+        if spec.transport != "stdio" or spec.stdio is None:
+            return None
+        resolver = getattr(self.provider, "resolve_stdio_executable", None)
+        if not callable(resolver):
+            return None
+        try:
+            resolved = Path(resolver(spec)).resolve(strict=True)
+            return {
+                "path": resolved.as_posix(),
+                "content_sha256": executable_content_sha256(resolved),
+            }
+        except (OSError, ValidationError):
+            # Preserve normal-sensitivity compatibility, but leave the Sink
+            # unidentified so any Host rule above normal fails closed.
+            return None
+
+    def _stdio_snapshot_for_dispatch(
+        self,
+        *,
+        pid: str,
+        spec: McpServerSpec,
+        expected_identity: dict[str, str] | None,
+        sink: DataSink,
+        context: DataFlowContext,
+        payload: Any,
+    ) -> ExecutableSnapshot | None:
+        if spec.transport != "stdio" or spec.stdio is None:
+            return None
+        resolver = getattr(self.provider, "resolve_stdio_executable", None)
+        checker = getattr(self.provider, "executable_snapshot_required", None)
+        if not callable(resolver) or not callable(checker):
+            return None
+        resolved = str(resolver(spec))
+        if not bool(checker(spec, resolved)):
+            return None
+        if not bool(getattr(self.provider, "supports_executable_snapshots", False)):
+            self._data_flow().reject_sink_identity_change(
+                pid=pid,
+                sink=sink,
+                context=context,
+                payload=payload,
+                reason="MCP provider cannot pin a mutable stdio executable",
+            )
+            raise AssertionError("data-flow Sink rejection must raise")
+        snapshot = snapshot_executable(
+            resolved,
+            sibling_limit=self.config.tools.executable_snapshot_sibling_limit,
+        )
+        actual = {
+            "path": snapshot.source_path.as_posix(),
+            "content_sha256": snapshot.content_sha256,
+        }
+        if expected_identity is None or actual != expected_identity:
+            snapshot.close()
+            self._data_flow().reject_sink_identity_change(
+                pid=pid,
+                sink=sink,
+                context=context,
+                payload=payload,
+                reason=(
+                    "MCP stdio Sink identity changed before immutable "
+                    "executable dispatch snapshot"
+                ),
+            )
+            raise AssertionError("data-flow Sink rejection must raise")
+        return snapshot
 
     def _protected_list_evidence(
         self,

@@ -4,6 +4,15 @@ from contextlib import AbstractContextManager
 from typing import Any, Iterable, Protocol
 
 
+LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS = "legacy_data_flow_invalidated"
+LEGACY_PENDING_DATA_FLOW_RECONCILING_STATUS = "legacy_data_flow_reconciling"
+LEGACY_PENDING_DATA_FLOW_RECONCILED_STATUS = "legacy_data_flow_reconciled"
+LEGACY_PENDING_DATA_FLOW_MESSAGE = (
+    "legacy pending LLM action has no trusted data-flow context; "
+    "automatic resume is disabled"
+)
+
+
 class StoreTransaction(Protocol):
     """Backend-neutral SQL cursor surface used by scoped store helpers."""
 
@@ -40,7 +49,12 @@ class RuntimeStore(Protocol):
     def validate_column_identifier(self, table: str, column: str) -> str:
         ...
 
-    def payload_marker(self, *, present: bool) -> dict[str, Any]:
+    def payload_marker(
+        self,
+        *,
+        present: bool,
+        recovered_after_reopen: bool = False,
+    ) -> dict[str, Any]:
         ...
 
     def object_payload(self, oid: str) -> Any:
@@ -53,6 +67,9 @@ class RuntimeStore(Protocol):
         ...
 
     def has_object_payload(self, oid: str) -> bool:
+        ...
+
+    def is_recovered_object_payload(self, oid: str) -> bool:
         ...
 
     def snapshot_object_payloads(self, oids: Iterable[str]) -> dict[str, Any]:
@@ -202,6 +219,8 @@ class RuntimeStore(Protocol):
         limit: int | None = None,
         before_event_id: str | None = None,
         after_event_id: str | None = None,
+        *,
+        include_gui_presentation: bool = True,
     ) -> list[Any]:
         ...
 
@@ -244,10 +263,101 @@ class RuntimeStore(Protocol):
     def list_capabilities(self, subject: str | None = None) -> list[Any]:
         ...
 
+    def register_sink_trust(self, spec: Any, *, replace: bool = False) -> Any:
+        ...
+
+    def unregister_sink_trust(
+        self,
+        pattern: str,
+        *,
+        generation: int,
+        deactivated_at: str,
+    ) -> bool:
+        ...
+
+    def get_sink_trust(self, trust_id: str) -> Any | None:
+        ...
+
+    def inspect_sink_trust(self, pattern: str) -> Any | None:
+        ...
+
+    def list_sink_trust(
+        self,
+        *,
+        active_only: bool = True,
+        generation: int | None = None,
+        limit: int | None = None,
+    ) -> list[Any]:
+        ...
+
+    def get_sink_trust_generation(self) -> int:
+        ...
+
+    def insert_data_flow_decision(self, decision: Any) -> None:
+        ...
+
+    def get_data_flow_decision(self, decision_id: str) -> Any | None:
+        ...
+
+    def list_data_flow_decisions(
+        self,
+        *,
+        pid: str | None = None,
+        sink: str | None = None,
+        outcome: str | None = None,
+        limit: int | None = None,
+    ) -> list[Any]:
+        ...
+
+    def upsert_file_label_binding(self, binding: Any) -> Any:
+        ...
+
+    def get_file_label_binding(self, normalized_path: str) -> Any | None:
+        ...
+
+    def get_file_label_binding_by_id(self, binding_id: str) -> Any | None:
+        ...
+
+    def get_file_label_binding_generation(self, normalized_path: str) -> int:
+        ...
+
+    def list_file_label_bindings(
+        self,
+        *,
+        normalized_path: str | None = None,
+        include_history: bool = False,
+        include_tombstones: bool = False,
+        limit: int | None = None,
+    ) -> list[Any]:
+        ...
+
+    def list_file_label_bindings_for_tree(self, normalized_path: str) -> list[Any]:
+        ...
+
+    def tombstone_file_label_binding(
+        self,
+        normalized_path: str,
+        *,
+        binding_id: str,
+        created_by: str,
+        created_at: str,
+        expected_binding_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> Any | None:
+        ...
+
     def insert_audit(self, record: Any) -> None:
         ...
 
-    def list_audit(self, **filters: Any) -> list[Any]:
+    def list_audit(
+        self,
+        limit: int | None = None,
+        *,
+        actor: str | None = None,
+        target: str | None = None,
+        match_any: bool = False,
+        include_gui_presentation: bool = True,
+    ) -> list[Any]:
         ...
 
     def get_audit(self, record_id: str) -> Any | None:
@@ -351,6 +461,12 @@ class RuntimeStore(Protocol):
     def set_llm_context_generation(self, pid: str, generation: str) -> None:
         ...
 
+    def get_llm_context_label_history(self, pid: str) -> Any | None:
+        ...
+
+    def merge_llm_context_label_history(self, pid: str, labels: Any) -> Any:
+        ...
+
     def upsert_llm_pending_action(self, pid: str, pending: dict[str, Any]) -> None:
         ...
 
@@ -366,10 +482,33 @@ class RuntimeStore(Protocol):
     def complete_llm_pending_action(self, pid: str, *, resume_token: str) -> bool:
         ...
 
+    def list_llm_pending_actions_requiring_terminal_reconciliation(self) -> list[dict[str, Any]]:
+        ...
+
+    def claim_llm_pending_action_terminal_reconciliation(self, pid: str) -> str | None:
+        ...
+
+    def complete_llm_pending_action_terminal_reconciliation(self, pid: str) -> bool:
+        ...
+
     def insert_process_message(self, message: Any) -> None:
         ...
 
     def update_process_message(self, message: Any) -> None:
+        ...
+
+    def update_process_message_metadata(
+        self,
+        message_id: str,
+        *,
+        recipient_pid: str,
+        expected_metadata: dict[str, Any],
+        metadata: dict[str, Any],
+        updated_at: str,
+    ) -> bool:
+        ...
+
+    def get_process_message(self, message_id: str) -> Any | None:
         ...
 
     def list_process_messages(self, pid: str, **filters: Any) -> list[Any]:

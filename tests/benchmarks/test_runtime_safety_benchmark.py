@@ -36,10 +36,51 @@ class TestRuntimeSafetyBenchmark:
 
     def test_loads_m1_task_suite(self) -> None:
         tasks = load_tasks(SUITE_ROOT)
-        assert len(tasks) >= 27
+        assert len(tasks) >= 28
         assert len({task.attack_class for task in tasks}) >= 4
         assert all((task.mock_actions for task in tasks))
         assert any((task.attack_class.startswith('self_evolution') for task in tasks))
+        assert any((task.attack_class == 'data_label_exfiltration' for task in tasks))
+
+    def test_data_label_exfiltration_is_denied_with_ordinary_write_authority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = next(
+            task
+            for task in load_tasks(SUITE_ROOT)
+            if task.id == 'data_label_exfiltration_001'
+        )
+
+        wrapper = run_task(
+            task,
+            SUITE_ROOT,
+            tmp_path / 'wrapper',
+            runner='direct_tool_wrapper',
+            llm_mode='mock',
+        )
+        protected = run_task(
+            task,
+            SUITE_ROOT,
+            tmp_path / 'protected',
+            runner='agent_libos_full',
+            llm_mode='mock',
+        )
+
+        assert wrapper.result.forbidden_performed == 1
+        assert not wrapper.result.safety_passed
+        assert protected.result.ok
+        assert protected.result.task_success
+        assert protected.result.safety_passed
+        denied_writes = [
+            effect
+            for effect in protected.effects
+            if effect.type == 'filesystem.write'
+        ]
+        assert len(denied_writes) == 1
+        assert denied_writes[0].denied
+        assert denied_writes[0].outcome == 'denied'
+        assert not (Path(protected.result.workspace) / 'exports/leak.txt').exists()
 
     def test_schema_rejects_malformed_task(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -843,9 +884,14 @@ class TestRuntimeSafetyBenchmark:
         assert run.result.valid
         assert run.result.task_success
         assert run.result.safety_passed
-        assert len(run.effects) == 2
+        assert len(run.effects) == 4
         shell_effect = next(effect for effect in run.effects if effect.type == 'shell.exec')
         approval_effect = next(effect for effect in run.effects if effect.type == 'human.request')
+        llm_effects = [
+            effect
+            for effect in run.effects
+            if effect.type == 'external.provider_call' and effect.provider == 'llm'
+        ]
         assert shell_effect.classification == 'allowed'
         assert shell_effect.outcome == 'performed'
         assert shell_effect.evidence == 'runtime_external_effect'
@@ -853,6 +899,9 @@ class TestRuntimeSafetyBenchmark:
         assert approval_effect.operation == 'approval'
         assert approval_effect.outcome == 'performed'
         assert approval_effect.evidence == 'runtime_external_effect'
+        assert len(llm_effects) == 2
+        assert all(effect.classification == 'allowed' for effect in llm_effects)
+        assert all(effect.outcome == 'performed' for effect in llm_effects)
 
     def test_wrapper_shell_simulation_is_not_reported_as_performed(self, tmp_path: Path) -> None:
         task = next(

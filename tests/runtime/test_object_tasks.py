@@ -28,7 +28,7 @@ from agent_libos.models import (
     ProcessStatus,
     RelationType,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ProcessMessageWaitRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 
@@ -209,6 +209,10 @@ class TestObjectTasks:
             assert unread[-1].sender == f"object_task:{task.task_id}"
             assert unread[-1].channel == runtime.config.object_tasks.notification_channel
             assert unread[-1].payload["status"] == ObjectTaskStatus.SUCCEEDED.value
+            assert set(unread[-1].metadata["source_oids"]) == {owner.oid, completed.result_oid}
+            assert {
+                ref["oid"] for ref in unread[-1].metadata["data_flow_context"]["source_refs"]
+            } == {owner.oid, completed.result_oid}
             lifecycle = [
                 event.type
                 for event in runtime.events.list(target=owner.oid)
@@ -224,6 +228,129 @@ class TestObjectTasks:
                 EventType.OBJECT_TASK_RUNNING,
                 EventType.OBJECT_TASK_COMPLETED,
             ]
+        finally:
+            runtime.close()
+
+    def test_object_task_notification_respects_recipient_identity_domain(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="parent",
+                authority_manifest={
+                    "data_flow_policy": {
+                        "schema_version": 1,
+                        "allowed_tenants": ["tenant-a"],
+                        "allowed_principals": [],
+                    }
+                },
+            )
+            _grant_process_spawn(runtime, parent)
+            recipient = runtime.process.spawn_child(
+                parent,
+                "restricted notification recipient",
+                authority_manifest={
+                    "data_flow_policy": {
+                        "schema_version": 1,
+                        "allowed_tenants": [],
+                        "allowed_principals": [],
+                    }
+                },
+            )
+            owner = runtime.memory.create_object(
+                parent,
+                ObjectType.ARTIFACT,
+                {"name": "tenant owner"},
+                metadata=ObjectMetadata(
+                    title="tenant owner",
+                    sensitivity="secret",
+                    tenant="tenant-a",
+                ),
+                immutable=False,
+            )
+            grant_cap = runtime.capability.issue_trusted(
+                subject=parent,
+                resource="object:*",
+                rights=[ObjectRight.GRANT.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+
+            task = runtime.object_tasks.start(
+                parent,
+                owner,
+                "get_working_directory",
+                {},
+                notify_pid=recipient,
+                grant_result_to_notify=True,
+            )
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=parent, timeout=2)
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.result_oid is not None
+            assert completed.notification.status == ObjectTaskNotificationStatus.FAILED
+            assert "data_flow_policy" in (completed.notification.error or "")
+            assert runtime.messages.unread(recipient) == []
+            with pytest.raises(CapabilityDenied):
+                runtime.memory.handle_for_oid(
+                    recipient,
+                    completed.result_oid,
+                    required_rights={ObjectRight.READ.value},
+                )
+            assert runtime.store.get_capability(grant_cap.cap_id).uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_object_task_notify_result_rolls_back_grant_when_notification_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            _grant_process_spawn(runtime, parent)
+            recipient = runtime.spawn_child_process(parent, "notify recipient")
+            owner = _owner(runtime, parent)
+            grant_cap = runtime.capability.issue_trusted(
+                subject=parent,
+                resource="object:*",
+                rights=[ObjectRight.GRANT.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+
+            def fail_notification(*_args: object, **_kwargs: object) -> object:
+                raise ProcessError("injected object task notification failure")
+
+            monkeypatch.setattr(runtime.messages, "post", fail_notification)
+            task = runtime.object_tasks.start(
+                parent,
+                owner,
+                "get_working_directory",
+                {},
+                notify_pid=recipient,
+                grant_result_to_notify=True,
+            )
+
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=parent,
+                timeout=2,
+            )
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.result_oid is not None
+            assert completed.notification.status == ObjectTaskNotificationStatus.FAILED
+            assert "injected object task notification failure" in (
+                completed.notification.error or ""
+            )
+            with pytest.raises(CapabilityDenied):
+                runtime.memory.handle_for_oid(
+                    recipient,
+                    completed.result_oid,
+                    required_rights={ObjectRight.READ.value},
+                )
+            assert runtime.store.get_capability(grant_cap.cap_id).uses_remaining == 1
         finally:
             runtime.close()
 
@@ -1010,6 +1137,10 @@ class TestObjectTasks:
             assert message["payload"]["owner_oid"] == owner.oid
             assert message["payload"]["version"] == 2
             assert "payload" not in message["payload"]
+            assert message["metadata"]["source_oids"] == [owner.oid]
+            assert [
+                ref["oid"] for ref in message["metadata"]["data_flow_context"]["source_refs"]
+            ] == [owner.oid]
             assert any(record.action == "object_task.owner_watch.resume" for record in runtime.audit.trace())
         finally:
             runtime.close()
@@ -1287,7 +1418,10 @@ class TestObjectTasks:
             refreshed = runtime.object_tasks.get(task.task_id, actor_pid=pid)
 
             assert refreshed.status == ObjectTaskStatus.CANCELLED
-            assert refreshed.error == "external kill"
+            assert refreshed.error is not None and refreshed.error.startswith("result_oid:")
+            reason = runtime.store.get_object(refreshed.error.split(":", 1)[1])
+            assert reason is not None
+            assert reason.payload == {"reason": "external kill"}
         finally:
             runtime.close()
 

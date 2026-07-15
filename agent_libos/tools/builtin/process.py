@@ -6,17 +6,17 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.memory.data_labels import flow_context_parts, flow_context_value
 from agent_libos.models.exceptions import NotFound
 from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
+    DataFlowContext,
     ForkMode,
     MemoryViewSpec,
     MergePolicy,
     ObjectHandle,
-    ObjectMetadata,
     ObjectRight,
-    ObjectType,
     ProcessSignal,
     ResourceBudget,
     ViewMode,
@@ -29,7 +29,10 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 class ProcessExitArgs(BaseModel):
     payload: dict[str, Any] | None = Field(default=None, description="Optional structured final result.")
     result_oid: str | None = Field(default=None, description="Existing object id to use as process result.")
-    message: str | None = Field(default=None, description="Optional status message.")
+    message: str | None = Field(
+        default=None,
+        description="Optional final message stored in a label-bearing result Object.",
+    )
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -225,7 +228,10 @@ class ListChildProcessesOutput(BaseModel):
 class SignalChildProcessArgs(BaseModel):
     child_pid: str = Field(description="Direct child process id to signal.")
     signal: str = Field(description="Signal to send: pause, resume, cancel, or terminate.")
-    reason: str | None = Field(default=None, description="Optional reason stored in the child status message.")
+    reason: str | None = Field(
+        default=None,
+        description="Optional reason stored in a label-bearing Object referenced by child status.",
+    )
 
 
 class SignalChildProcessOutput(BaseModel):
@@ -265,6 +271,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        source_oids, source_labels, source_context = _flow_sources(ctx)
         result_handle: ObjectHandle | None = None
         if args.result_oid:
             result_handle = runtime.memory.handle_for_oid(
@@ -274,14 +281,21 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
                 optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
                 issued_by="process_exit_tool",
             )
-        elif args.payload is not None:
-            result_handle = runtime.memory.create_object(
-                pid=ctx.pid,
-                object_type=ObjectType.SUMMARY,
-                payload=args.payload,
-                metadata=ObjectMetadata(title="Process final result", tags=["final"]),
-            )
-        runtime.process.exit(ctx.pid, result=result_handle, message=args.message)
+        generated_payload = (
+            args.payload
+            if args.payload is not None
+            else {"message": args.message}
+            if args.message is not None
+            else None
+        )
+        result_handle = runtime.process.exit(
+            ctx.pid,
+            result=result_handle,
+            payload=generated_payload if result_handle is None else None,
+            source_oids=source_oids,
+            source_labels=source_labels,
+            source_context=source_context,
+        )
         result_oid = result_handle.oid if result_handle is not None else None
         return ProcessExitOutput(status="exited", result_oid=result_oid)
 
@@ -345,6 +359,7 @@ class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         old_image = runtime.process.get(ctx.pid).image_id
+        source_oids, source_labels, source_context = _flow_sources(ctx)
         try:
             process = runtime.exec_process(
                 ctx.pid,
@@ -353,6 +368,9 @@ class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
                 goal=args.goal,
                 preserve_memory=args.preserve_memory,
                 preserve_capabilities=args.preserve_capabilities,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
             )
         except NotFound as exc:
             raise ToolExecutionError(
@@ -393,6 +411,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         parent = runtime.process.get(ctx.pid)
+        source_oids, source_labels, source_context = _flow_sources(ctx)
         image = args.image or parent.image_id
         try:
             fork_mode = ForkMode(args.mode)
@@ -419,6 +438,9 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
                 image=image,
                 mode=fork_mode,
                 working_directory=args.working_directory,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
             )
         except NotFound as exc:
             raise ToolExecutionError(
@@ -502,6 +524,7 @@ class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        source_oids, source_labels, source_context = _flow_sources(ctx)
         inherit_specs = self._inheritance_specs(runtime, args, cwd=runtime.process.working_directory(ctx.pid))
         child_pid = runtime.spawn_child_process(
             parent=ctx.pid,
@@ -510,6 +533,9 @@ class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
             inherit_capabilities=inherit_specs,
             resource_budget=_resource_budget_from_spec(args.resource_budget),
             working_directory=args.working_directory,
+            source_oids=source_oids,
+            source_labels=source_labels,
+            source_context=source_context,
         )
         child = runtime.process.get(child_pid)
         return SpawnChildProcessOutput(
@@ -637,7 +663,16 @@ class SignalChildProcessTool(SyncAgentTool[SignalChildProcessArgs]):
                 code=ToolErrorCode.PERMISSION_DENIED,
                 details={"signal": signal.value},
             )
-        child = runtime.process.signal_child(ctx.pid, args.child_pid, signal, reason=args.reason)
+        source_oids, source_labels, source_context = _flow_sources(ctx)
+        child = runtime.process.signal_child(
+            ctx.pid,
+            args.child_pid,
+            signal,
+            reason=args.reason,
+            source_oids=source_oids,
+            source_labels=source_labels,
+            source_context=source_context,
+        )
         return SignalChildProcessOutput(child_pid=child.pid, signal=signal.value, status=child.status.value)
 
 
@@ -668,6 +703,17 @@ class MergeChildMemoryTool(SyncAgentTool[MergeChildMemoryArgs]):
             merged_oids=result.merged_oids,
             skipped_oids=result.skipped_oids,
         )
+
+
+def _flow_sources(ctx: ToolContext) -> tuple[list[str] | None, Any | None, DataFlowContext | None]:
+    try:
+        source_oids, labels = flow_context_parts(ctx.metadata)
+        return source_oids, labels, flow_context_value(ctx.metadata)
+    except ValueError as exc:
+        raise ToolExecutionError(
+            str(exc),
+            code=ToolErrorCode.EXECUTION_ERROR,
+        ) from exc
 
 
 def _view_mode_for_fork(mode: ForkMode) -> ViewMode:

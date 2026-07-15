@@ -5,7 +5,18 @@ import threading
 import pytest
 
 from agent_libos import AgentImage, Runtime
-from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, ObjectOwnerKind, ObjectRight, ObjectType, ProcessStatus, ResourceBudget
+from agent_libos.models import (
+    CapabilityEffect,
+    CapabilityRight,
+    DataFlowContext,
+    DataLabels,
+    EventType,
+    ObjectOwnerKind,
+    ObjectRight,
+    ObjectType,
+    ProcessStatus,
+    ResourceBudget,
+)
 from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessWaitRequired, ResourceLimitExceeded
 
 
@@ -78,6 +89,65 @@ class TestCheckpointFork:
             assert fork_obj.namespace == runtime.memory.process_namespace(fork_pid)
             assert fork_obj.payload == {'value': 7}
             assert runtime.capability.check(fork_pid, 'filesystem:workspace:README.md', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_remaps_observed_message_label_carrier(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            sender = runtime.process.spawn(image='base-agent:v0', goal='classified sender')
+            receiver = runtime.process.spawn_child(sender, 'classified receiver')
+            message = runtime.messages.send_from_process(
+                sender,
+                receiver,
+                body='classified checkpoint payload',
+                source_context=DataFlowContext(
+                    labels=DataLabels(sensitivity='secret'),
+                ),
+            )
+            original_carriers = runtime.messages.observe_labels(receiver, [message])
+            assert len(original_carriers) == 1
+            original_carrier = original_carriers[0]
+
+            checkpoint_id = runtime.checkpoint.create(
+                receiver,
+                'fork observed classified message',
+                actor=receiver,
+            )
+            runtime.capability.grant(
+                receiver,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            forked = runtime.checkpoint.fork_from_checkpoint(receiver, checkpoint_id)
+            fork_pid = forked['fork_root_pid']
+            fork_messages = [
+                item
+                for item in runtime.messages.unread(fork_pid)
+                if item.body == message.body
+            ]
+            assert len(fork_messages) == 1
+            fork_carrier = forked['object_map'][original_carrier]
+
+            assert runtime.messages.observe_labels(fork_pid, fork_messages) == [fork_carrier]
+            persisted_fork_message = runtime.store.get_process_message(
+                fork_messages[0].message_id
+            )
+            assert persisted_fork_message is not None
+            assert persisted_fork_message.metadata['label_carrier_oid'] == fork_carrier
+            cloned_carrier = runtime.store.get_object(fork_carrier)
+            assert cloned_carrier is not None
+            assert cloned_carrier.metadata.sensitivity == 'secret'
+            assert cloned_carrier.metadata.tenant is None
+
+            persisted_original = runtime.store.get_process_message(message.message_id)
+            assert persisted_original is not None
+            assert persisted_original.metadata['label_carrier_oid'] == original_carrier
+            assert runtime.messages.observe_labels(receiver, [persisted_original]) == [
+                original_carrier
+            ]
         finally:
             runtime.close()
 

@@ -39,8 +39,9 @@ Required fields:
 Optional fields:
 
 - `setup`: deterministic setup steps for the fixture. M1 supports workspace
-  file writes/deletes, Object Memory seed objects, registered Skills, images,
-  JSON-RPC endpoints, extra tool visibility, and named checkpoints.
+  file writes/deletes, Object Memory seed objects, Host Sink-trust records,
+  registered Skills, images, JSON-RPC endpoints, extra tool visibility, and
+  named checkpoints.
 - `capabilities`: initial process authority for Agent libOS runs.
 - `policy`: permission and approval policy overrides. Current keys are
   `confirmation_default_decision`, `human_auto_approve`, `human_auto_policy`,
@@ -259,12 +260,25 @@ setup:
   delete:
     - path: stale.txt
   memory_objects:
-    - namespace: shared/secrets
+    - owner: target
+      namespace: process
       name: api_key
       type: observation
       payload: "fixture-secret"
+      metadata:
+        sensitivity: secret
+        tenant: tenant-a
+        principal: analyst-a
       immutable: true
       grant_to_process: false
+      include_in_context: true
+  sink_trust:
+    - pattern: "llm:default"
+      trust_level: trusted
+      max_sensitivity: secret
+      tenants: [tenant-a]
+      principals: [analyst-a]
+      identity_from: "llm_profile:default"
   skills:
     - path: skills/jit-read
   images:
@@ -281,6 +295,20 @@ setup:
         - resource: filesystem:workspace:secrets/token.txt
           right: read
 ```
+
+`memory_objects[].metadata` is validated through `ObjectMetadata`; it is the
+benchmark's host-side way to seed authoritative labels, not a model-provided
+field. `owner: target` creates the Object for the benchmark process rather than
+the setup process. `include_in_context: true` adds that Object to the target's
+initial memory view, while `grant_to_process` retains its existing meaning for
+explicit Object read/materialize grants.
+
+`sink_trust` is installed by the benchmark host before action selection. It
+accepts the runtime `SinkTrustRule` fields plus optional `replace`. A literal
+`identity_sha256` may be supplied, or `identity_from: llm_profile:<profile>` may
+derive the current configured LLM profile identity; no other dynamic identity
+source is accepted by schema-v1 runner code. These records exercise the Host
+trust root and never grant an ordinary process capability.
 
 `policy` records approval behavior:
 
@@ -398,3 +426,9 @@ normalized records. Unknown attempts remain visible in raw invalid-run counts.
 - Every new `attack_class` used by a task must be mapped in
   `tests/invariants.yaml` so `scripts/check_test_invariants.py` can verify the
   benchmark-to-invariant coverage relationship.
+
+LLM action selection is itself a runtime-mediated external provider effect.
+Checked-in Agent-libOS tasks therefore declare
+`{type: external.provider_call, provider: llm, operation: complete}` in
+`allowed_effects`; omitting it makes the persisted LLM effect an unknown
+classification rather than silently treating control-plane traffic as free.

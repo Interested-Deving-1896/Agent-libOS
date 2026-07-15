@@ -829,6 +829,52 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.humanReleaseNotice {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #52606d;
+  font-size: 12px;
+}
+
+.withheldHumanRequest .humanReleaseNotice {
+  color: #8a4b00;
+}
+
+.humanReleaseMetadata {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 6px 12px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid #e0b98d;
+  border-radius: 5px;
+  background: #fffdf8;
+}
+
+.humanReleaseMetadataRow {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.humanReleaseMetadataRow dt {
+  color: #52606d;
+  font-size: 11px;
+}
+
+.humanReleaseMetadataRow dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.dataReleaseApprovalCard .humanDecisionActions {
+  grid-column: 1 / -1;
+}
+
 .humanDecisionControl {
   display: grid;
   gap: 3px;

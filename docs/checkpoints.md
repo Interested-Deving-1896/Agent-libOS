@@ -21,6 +21,9 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
   applied to the current global Skill registry by restore/fork),
 - loaded Skill records,
 - mailbox delivery state,
+- durable `llm_pending_actions`, including conditional provider-release
+  prepared state according to the active `llm.persist_full_io` retention
+  policy,
 - image definitions needed by the subtree,
 - checkpoint-derived image artifacts needed by those image definitions,
 - loaded startup Runtime Module ids and source hashes.
@@ -56,6 +59,8 @@ Restore never deletes:
 - LLM call records,
 - checkpoint records,
 - human interaction history.
+- Sink trust registry generations/history, data-flow decisions, and file label
+  binding/tombstone history.
 
 Restore itself appends new audit and event records.
 
@@ -76,6 +81,14 @@ image rows so the restored subtree can run against its snapshotted image
 definitions; it does not copy image-package source directories or provider-side
 state.
 
+Sink trust is Host-global external policy, not reconstructable subtree state.
+Checkpoint restore neither replaces it nor lowers its active generation. Any
+restored pending LLM action, provider chain, or conditional release is checked
+against the current registry, current Task Authority manifest, and exact source
+versions before use; an old trust record or release cannot authorize a new
+dispatch. File path bindings also remain current because restore cannot rewind
+the external file.
+
 Providers classify their successful effects as:
 
 - `irreversible`,
@@ -94,7 +107,7 @@ marks the effect as information flow. Timeout, cancellation, resource-limit,
 ordinary provider exception, and post-effect classifier failure otherwise
 cannot prove non-execution, so the use stays consumed and an `unknown` effect
 remains visible in checkpoint reports. A tool/provider error therefore does not
-imply that no outside-world effect occurred. Filesystem/clock/shell, human
+imply that no outside-world effect occurred. LLM, filesystem/clock/shell, human
 output, PTY spawn/write/resize/close, and live JSON-RPC/MCP calls persist this
 uncertainty before the provider boundary as a pending external-effect intent,
 then conditionally finalize the same id. If any post-provider sink fails,
@@ -228,6 +241,21 @@ reconciliation/event/audit phase and error. Each recordable failure appends a
 `checkpoint.restore.post_commit_failure` audit record. Callers must not retry a
 `restored_with_warnings` result as though the main restore had rolled back.
 
+Legacy flow carriers are normalized while snapshot rows are prepared. A valid
+minimal pending/message label object is written back in canonical form so later
+message-observation CAS uses the exact persisted bytes. An incomplete or
+malformed active pending action is restored with conservative
+secret/untrusted labels and a durable reconciliation marker; completed pending
+history is relabeled conservatively without failing its process. After the
+registry, ownership, and Store lifecycle locks are released, the same startup
+terminal reconciler commits a non-terminal process's FAILED transition,
+reservation release, and parent wakeup, then cancels Human/ObjectTask work and
+runs normal Object/Host terminal finalization. An already-terminal row preserves
+its status/result and completes only missing cleanup. Result Objects and
+mergeable child memory remain available until parent cleanup. A cleanup failure
+is a post-commit warning and leaves a retryable marker; it does not roll the
+restored rows back or replay a provider.
+
 All post-checkpoint pending human requests for restored processes are cancelled.
 Post-checkpoint mailbox entries are kept in history but marked as superseded by
 restore so they are not delivered as unread by default.
@@ -263,6 +291,11 @@ LLM context generation inside the main transaction. Provider-side Responses
 history is append-only and is not rolled back, so this generation change forces
 the next LLM request to reset stateless instead of chaining to a response made
 from post-checkpoint local state.
+
+When `llm.persist_full_io=false`, a conditional LLM release row contains only
+hash-bound resume metadata. It can resume only while the matching prepared
+request is still held by the current executor; a reopen, or a restore that
+discards that in-memory generation, fails closed before provider dispatch.
 
 Scoped Object Memory rows removed by restore run registered release finalizers
 after the main state commit. A finalizer failure is surfaced through the

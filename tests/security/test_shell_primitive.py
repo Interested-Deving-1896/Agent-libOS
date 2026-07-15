@@ -1,5 +1,9 @@
 from __future__ import annotations
+import asyncio
 import agent_libos.substrate.local as local_substrate
+import agent_libos.sdk.protected_operations as protected_operations
+from dataclasses import replace
+import hashlib
 import os
 import pytest
 import subprocess
@@ -8,8 +12,8 @@ from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.config import AgentLibOSConfig, ShellCommandRule, ShellDefaults
-from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellDefaults
+from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ValidationError
 from agent_libos.substrate import (
     CommandMetrics,
@@ -42,6 +46,573 @@ class TestShellPrimitive:
             assert result.stdout == 'ok\n'
             assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, 2.0)]
             assert 'primitive.shell.run' in self._audit_actions(runtime)
+        finally:
+            runtime.close()
+
+    def test_shell_revalidates_composite_policy_before_provider_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = ResolvingShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='revalidate shell policy')
+            capability = runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            original_start = runtime.protected_operations.start
+
+            def start(contract, invocation, *, provider):
+                original_prepare = invocation.prepare
+
+                def revoke_during_prepare() -> None:
+                    if original_prepare is not None:
+                        original_prepare()
+                    runtime.capability.revoke(
+                        capability.cap_id,
+                        revoked_by='test',
+                        reason='shell dispatch race regression',
+                        require_authority=False,
+                    )
+
+                return original_start(
+                    contract,
+                    replace(invocation, prepare=revoke_during_prepare),
+                    provider=provider,
+                )
+
+            monkeypatch.setattr(runtime.protected_operations, 'start', start)
+
+            with pytest.raises(CapabilityDenied, match='lacks shell execute policy'):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert provider.resolver_calls == []
+            assert provider.calls == []
+            assert runtime.store.list_external_effects(pid=pid) == []
+        finally:
+            runtime.close()
+
+    def test_secret_argv_requires_host_sink_clearance_even_with_shell_policy(self) -> None:
+        provider = ResolvingShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='labeled shell egress')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.allowlist_auto_else_ask_level,
+                issued_by='test',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'shell-data-flow-sentinel'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+
+            with pytest.raises(CapabilityDenied, match='data-flow denied egress'):
+                runtime.shell.run(
+                    pid,
+                    ['git', 'status', '--short'],
+                    source_oids=[source.oid],
+                )
+            assert provider.resolver_calls == []
+            assert provider.calls == []
+
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='shell:*',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.shell._executable_data_sink(
+                        'shell', 'git', cwd='.'
+                    ).identity_sha256,
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            result = runtime.shell.run(
+                pid,
+                ['git', 'status', '--short'],
+                source_oids=[source.oid],
+            )
+
+            assert result.stdout == 'ok\n'
+            assert provider.resolver_calls == [_HARDENED_GIT_STATUS_SHORT]
+            assert provider.calls == [
+                (_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)
+            ]
+        finally:
+            runtime.close()
+
+    def test_shell_arun_forwards_explicit_source_oids(self) -> None:
+        provider = ResolvingShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='async labeled shell egress')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.allowlist_auto_else_ask_level,
+                issued_by='test',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'async-shell-data-flow-sentinel'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+
+            with pytest.raises(CapabilityDenied, match='data-flow denied egress'):
+                asyncio.run(
+                    runtime.shell.arun(
+                        pid,
+                        ['git', 'status', '--short'],
+                        source_oids=[source.oid],
+                    )
+                )
+            assert provider.resolver_calls == []
+            assert provider.calls == []
+
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='shell:*',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=runtime.shell._executable_data_sink(
+                        'shell', 'git', cwd='.'
+                    ).identity_sha256,
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            result = asyncio.run(
+                runtime.shell.arun(
+                    pid,
+                    ['git', 'status', '--short'],
+                    source_oids=[source.oid],
+                )
+            )
+
+            assert result.stdout == 'ok\n'
+            assert provider.resolver_calls == [_HARDENED_GIT_STATUS_SHORT]
+            assert provider.calls == [
+                (_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)
+            ]
+        finally:
+            runtime.close()
+
+    def test_secret_egress_uses_the_provider_resolved_executable_identity(self, tmp_path: Path) -> None:
+        root = tmp_path / 'workspace'
+        commands = root / 'commands'
+        commands.mkdir(parents=True)
+        executable = commands / 'trusted-tool'
+        marker = commands / 'ran.txt'
+        executable.write_text(
+            '#!/bin/sh\nprintf ran > ran.txt\nprintf "actual\\n"\n',
+            encoding='utf-8',
+        )
+        executable.chmod(0o755)
+        runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='resolved executable Sink')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'resolved-executable-sentinel'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            old_process_cwd_identity = (Path.cwd() / 'trusted-tool').resolve().as_posix()
+            actual_identity = executable.resolve().as_posix()
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=f'shell:{old_process_cwd_identity}',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+
+            with pytest.raises(CapabilityDenied, match='data-flow denied egress'):
+                runtime.shell.run(
+                    pid,
+                    ['./trusted-tool'],
+                    cwd='commands',
+                    source_oids=[source.oid],
+                )
+            assert not marker.exists()
+            assert runtime.store.list_external_effects(pid=pid) == []
+            denied = runtime.store.list_data_flow_decisions(pid=pid, outcome='deny')
+            assert len(denied) == 1
+            assert denied[0].sink == f'shell:{actual_identity}'
+            assert any(
+                record.action == 'data_flow.egress'
+                and record.target == f'shell:{actual_identity}'
+                and record.decision.get('outcome') == 'deny'
+                for record in runtime.audit.trace()
+            )
+            assert any(
+                event.type == EventType.DATA_FLOW_DECISION
+                and event.payload.get('outcome') == 'deny'
+                for event in runtime.events.list(
+                    target=f'data_flow_sink:shell:{actual_identity}'
+                )
+            )
+
+            runtime.data_flow.unregister_sink_trust(
+                f'shell:{old_process_cwd_identity}',
+                actor='test.host',
+                require_capability=False,
+            )
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=f'shell:{actual_identity}',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            result = runtime.shell.run(
+                pid,
+                ['./trusted-tool'],
+                cwd='commands',
+                source_oids=[source.oid],
+            )
+
+            assert result.stdout == 'actual\n'
+            assert marker.read_text(encoding='utf-8') == 'ran'
+        finally:
+            runtime.close()
+
+    def test_workspace_executable_snapshot_preserves_sibling_resource_access(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / 'workspace'
+        commands = root / 'commands'
+        commands.mkdir(parents=True)
+        executable = commands / 'read-sibling'
+        (commands / 'asset.txt').write_text('sibling payload', encoding='utf-8')
+        executable.write_text(
+            '#!/bin/sh\ncat "$(dirname "$0")/asset.txt"\n',
+            encoding='utf-8',
+        )
+        executable.chmod(0o755)
+        runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+        try:
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='run a workspace script with a sibling asset',
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+
+            result = runtime.shell.run(pid, ['./read-sibling'], cwd='commands')
+
+            assert result.returncode == 0
+            assert result.stdout == 'sibling payload'
+            assert result.stderr == ''
+        finally:
+            runtime.close()
+
+    def test_workspace_executable_snapshot_rejects_unbounded_sibling_set(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / 'workspace'
+        commands = root / 'commands'
+        commands.mkdir(parents=True)
+        executable = commands / 'bounded-tool'
+        executable.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        executable.chmod(0o755)
+        (commands / 'asset-one.txt').write_text('one', encoding='utf-8')
+        (commands / 'asset-two.txt').write_text('two', encoding='utf-8')
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                executable_snapshot_sibling_limit=1,
+            ),
+        )
+        runtime = Runtime.open(
+            'local',
+            config=config,
+            substrate=LocalResourceProviderSubstrate(root),
+        )
+        provider_called = False
+        try:
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='reject an unbounded sibling mirror',
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            original_run = runtime.shell.provider.run
+
+            def tracked_run(*args: Any, **kwargs: Any) -> CommandResult:
+                nonlocal provider_called
+                provider_called = True
+                return original_run(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.shell.provider, 'run', tracked_run)
+
+            with pytest.raises(ValidationError, match='sibling count exceeds'):
+                runtime.shell.run(pid, ['./bounded-tool'], cwd='commands')
+
+            assert provider_called is False
+        finally:
+            runtime.close()
+
+    def test_workspace_executable_snapshot_fails_closed_on_missing_sibling_link(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / 'workspace'
+        commands = root / 'commands'
+        commands.mkdir(parents=True)
+        executable = commands / 'all-or-nothing-tool'
+        executable.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        executable.chmod(0o755)
+        (commands / 'required-config.txt').write_text('required', encoding='utf-8')
+        runtime = Runtime.open(
+            'local',
+            substrate=LocalResourceProviderSubstrate(root),
+        )
+        provider_called = False
+        try:
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='fail before running without a required sibling',
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            original_run = runtime.shell.provider.run
+
+            def tracked_run(*args: Any, **kwargs: Any) -> CommandResult:
+                nonlocal provider_called
+                provider_called = True
+                return original_run(*args, **kwargs)
+
+            def reject_symlink(*_args: Any, **_kwargs: Any) -> None:
+                raise OSError('injected sibling-link failure')
+
+            def reject_hardlink(*_args: Any, **_kwargs: Any) -> None:
+                raise OSError('injected sibling-hardlink failure')
+
+            monkeypatch.setattr(runtime.shell.provider, 'run', tracked_run)
+            monkeypatch.setattr(Path, 'symlink_to', reject_symlink)
+            monkeypatch.setattr(os, 'link', reject_hardlink)
+
+            with pytest.raises(ValidationError, match='cannot expose sibling resource'):
+                runtime.shell.run(pid, ['./all-or-nothing-tool'], cwd='commands')
+
+            assert provider_called is False
+        finally:
+            runtime.close()
+
+    def test_replaced_executable_loses_secret_sink_trust_before_dispatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / 'workspace'
+        commands = root / 'commands'
+        commands.mkdir(parents=True)
+        executable = commands / 'trusted-tool'
+        stolen = commands / 'stolen.txt'
+        executable.write_text(
+            '#!/bin/sh\nprintf "trusted\\n"\n',
+            encoding='utf-8',
+        )
+        executable.chmod(0o755)
+        runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='executable replacement PoC')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'EXECUTABLE_REPLACEMENT_SECRET'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            executable_identity = executable.resolve().as_posix()
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=f'shell:{executable_identity}',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            original_resolve = runtime.shell.provider.resolve_argv
+
+            def replace_after_resolve(argv: list[str], *, cwd: str | None = None) -> list[str]:
+                resolved = original_resolve(argv, cwd=cwd)
+                executable.write_text(
+                    '#!/bin/sh\nprintf "%s" "$1" > stolen.txt\nprintf "replacement\\n"\n',
+                    encoding='utf-8',
+                )
+                return resolved
+
+            monkeypatch.setattr(runtime.shell.provider, 'resolve_argv', replace_after_resolve)
+
+            with pytest.raises(CapabilityDenied, match='Sink identity changed'):
+                runtime.shell.run(
+                    pid,
+                    ['./trusted-tool', 'EXECUTABLE_REPLACEMENT_SECRET'],
+                    cwd='commands',
+                    source_oids=[source.oid],
+                )
+
+            assert not stolen.exists()
+            denied = runtime.store.list_data_flow_decisions(pid=pid, outcome='deny')
+            assert len(denied) == 1
+            assert denied[0].sink == f"shell:{executable_identity}"
+            assert denied[0].reason == "Sink identity changed before provider dispatch"
+            assert len(denied[0].payload_hash) == 64
+        finally:
+            runtime.close()
+
+    def test_final_dispatch_race_executes_authorized_shell_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / 'workspace'
+        commands = root / 'commands'
+        commands.mkdir(parents=True)
+        executable = commands / 'trusted-tool'
+        trusted = commands / 'trusted.txt'
+        stolen = commands / 'stolen.txt'
+        executable.write_text(
+            '#!/bin/sh\nprintf trusted > trusted.txt\nprintf "trusted\\n"\n',
+            encoding='utf-8',
+        )
+        executable.chmod(0o755)
+        runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+        try:
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='close executable dispatch TOCTOU',
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'FINAL_DISPATCH_SHELL_SECRET'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            executable_identity = executable.resolve().as_posix()
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=f'shell:{executable_identity}',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            original_mark_dispatched = protected_operations.mark_external_effect_dispatched
+            dispatch_count = 0
+
+            def replace_after_final_validation(store: Any, effect_id: str) -> Any:
+                nonlocal dispatch_count
+                result = original_mark_dispatched(store, effect_id)
+                dispatch_count += 1
+                if dispatch_count == 2:
+                    executable.write_text(
+                        '#!/bin/sh\nprintf "%s" "$1" > stolen.txt\nprintf "replacement\\n"\n',
+                        encoding='utf-8',
+                    )
+                    executable.chmod(0o755)
+                return result
+
+            monkeypatch.setattr(
+                protected_operations,
+                'mark_external_effect_dispatched',
+                replace_after_final_validation,
+            )
+
+            result = runtime.shell.run(
+                pid,
+                ['./trusted-tool', 'FINAL_DISPATCH_SHELL_SECRET'],
+                cwd='commands',
+                source_oids=[source.oid],
+            )
+
+            assert dispatch_count == 2
+            assert result.stdout == 'trusted\n'
+            assert trusted.read_text(encoding='utf-8') == 'trusted'
+            assert not stolen.exists()
+        finally:
+            runtime.close()
+
+    def test_provider_resolver_cannot_switch_authorized_executable_sink(self) -> None:
+        provider = SwitchingShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='reject resolver Sink switch',
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.allowlist_auto_else_ask_level,
+                issued_by='test',
+            )
+
+            with pytest.raises(
+                ValidationError,
+                match='provider executable resolver changed the authorized Sink identity',
+            ):
+                runtime.shell.run(pid, ['git', 'status', '--short'])
+
+            assert provider.resolver_calls == [_HARDENED_GIT_STATUS_SHORT]
+            assert provider.calls == []
+            effects = runtime.store.list_external_effects(pid=pid)
+            assert len(effects) == 1
+            assert effects[0].operation == 'run'
+            assert effects[0].transaction_state == 'unknown'
+            assert effects[0].information_flow is True
+            assert effects[0].provider_metadata['outcome'] == 'unknown_after_provider_success'
+            assert effects[0].provider_metadata['provider_phases'] == [
+                {
+                    'name': 'resolve_argv',
+                    'state_mutation': False,
+                    'information_flow': True,
+                }
+            ]
         finally:
             runtime.close()
 
@@ -119,6 +690,8 @@ class TestShellPrimitive:
             runtime.close()
 
     def test_shell_subprocess_home_points_to_workspace(self) -> None:
+        if os.name == 'nt':
+            pytest.skip('the env utility assertion is POSIX-specific')
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
             try:
@@ -127,10 +700,16 @@ class TestShellPrimitive:
 
                 result = runtime.shell.run(
                     pid,
-                    ['python', '-c', 'import os; print(os.environ.get("HOME")); print(os.environ.get("USERPROFILE"))'],
+                    ['env'],
                 )
 
-                assert result.stdout.splitlines() == [str(Path(temp_dir).resolve()), str(Path(temp_dir).resolve())]
+                environment = dict(
+                    line.split('=', 1)
+                    for line in result.stdout.splitlines()
+                    if '=' in line
+                )
+                assert environment['HOME'] == str(Path(temp_dir).resolve())
+                assert environment['USERPROFILE'] == str(Path(temp_dir).resolve())
             finally:
                 runtime.close()
 
@@ -957,6 +1536,16 @@ class FakeShellProvider:
         return ExternalEffectClassification(rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE, rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED, state_mutation=True, information_flow=True, metadata={'operation': operation})
 
 
+class ResolvingShellProvider(FakeShellProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.resolver_calls: list[list[str]] = []
+
+    def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
+        self.resolver_calls.append(list(argv))
+        return list(argv)
+
+
 class TimeoutShellProvider(FakeShellProvider):
     def run(
         self,
@@ -973,6 +1562,12 @@ class TimeoutShellProvider(FakeShellProvider):
             'provider timed out after execution began',
             metrics=CommandMetrics(wall_seconds=timeout, killed=True, limit_kind='wall_time'),
         )
+
+
+class SwitchingShellProvider(ResolvingShellProvider):
+    def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
+        self.resolver_calls.append(list(argv))
+        return [str(Path(tempfile.gettempdir()) / 'switched-shell-executable'), *argv[1:]]
 
 
 class ClassifierFailureShellProvider(FakeShellProvider):

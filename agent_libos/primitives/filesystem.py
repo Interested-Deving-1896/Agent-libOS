@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import quote
@@ -17,6 +18,8 @@ from agent_libos.models import (
     CapabilityDecision,
     CapabilityEffect,
     CapabilityRight,
+    DataFlowContext,
+    DataSink,
     EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -27,7 +30,9 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.substrate import (
     FilesystemProvider,
+    HierarchicalPathLock,
     LocalFilesystemProvider,
+    ProviderEffectNotStarted,
     ResolvedPath,
 )
 from agent_libos.sdk import (
@@ -41,6 +46,8 @@ _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _RESOURCE_SEGMENT_SAFE = "-._~"
 _DIRECTORY_STATE_OBSERVATION_BYTES = 512
+
+_FileLabelPathLocks = HierarchicalPathLock
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,7 @@ class FilesystemAdapter:
         self.namespace = provider.namespace
         self.human = human
         self.resources = resources
+        self._file_label_io_lock = _FileLabelPathLocks()
 
     def validate_directory(
         self,
@@ -241,21 +249,27 @@ class FilesystemAdapter:
             pid, resource, CapabilityRight.READ, authority_context, consume=False
         )
         effect_context = {"path": relative, "resource": resource, "encoding": encoding, "max_bytes": max_bytes}
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=resource,
-            decisions=(decision,),
-            canonical_args=authority_context,
-            observation=effect_context,
-            preflight_usage=ResourceUsage(external_read_bytes=max_bytes),
-            resource_source="primitive.filesystem.read_text",
-            resource_context=effect_context,
-            failure_evidence=lambda error, phase: self._protected_failure_evidence(
-                pid, resource, "primitive.filesystem.read_text.failed", effect_context, error, phase
-            ),
-        )
-        with self._protected().start("primitive.filesystem.read_text", invocation, provider=self.provider) as protected:
+        with ExitStack() as stack:
+            stack.enter_context(self._file_label_io_lock.hold(relative))
+            read_context, read_binding_state = self._data_flow().file_snapshot(relative)
+            invocation = ProtectedOperationInvocation(
+                pid=pid,
+                actor=pid,
+                target=resource,
+                decisions=(decision,),
+                canonical_args=authority_context,
+                observation=effect_context,
+                preflight_usage=ResourceUsage(external_read_bytes=max_bytes),
+                resource_source="primitive.filesystem.read_text",
+                resource_context=effect_context,
+                data_flow_ingress_context=read_context,
+                failure_evidence=lambda error, phase: self._protected_failure_evidence(
+                    pid, resource, "primitive.filesystem.read_text.failed", effect_context, error, phase
+                ),
+            )
+            protected = stack.enter_context(self._protected().start(
+                "primitive.filesystem.read_text", invocation, provider=self.provider
+            ))
             target_state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
@@ -290,6 +304,14 @@ class FilesystemAdapter:
                 target,
                 max_bytes=read_limit,
             )
+            current_binding_state = self._data_flow().file_state_version(relative)
+            if current_binding_state != read_binding_state:
+                self._data_flow().observe_ingress(
+                    DataFlowContext.aggregate(
+                        (read_context, self._data_flow().file_context(relative))
+                    )
+                )
+                raise CapabilityDenied("filesystem label binding changed during read")
             truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
             selected = raw[:max_bytes]
             content = self._decode_text_prefix(selected, encoding, truncated=truncated)
@@ -297,7 +319,7 @@ class FilesystemAdapter:
                 path=relative, content=content, bytes_read=len(selected), truncated=truncated
             )
             result_payload = {"bytes_read": len(selected), "truncated": truncated}
-            return protected.complete(
+            completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
                     pid,
@@ -316,6 +338,7 @@ class FilesystemAdapter:
                     context=effect_context,
                 ),
             )
+            return completed
 
     def read_bytes(
         self,
@@ -344,21 +367,27 @@ class FilesystemAdapter:
             pid, resource, CapabilityRight.READ, authority_context, consume=False
         )
         effect_context = {"path": relative, "resource": resource, "max_bytes": max_bytes}
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=resource,
-            decisions=(decision,),
-            canonical_args=authority_context,
-            observation=effect_context,
-            preflight_usage=ResourceUsage(external_read_bytes=max_bytes),
-            resource_source="primitive.filesystem.read_bytes",
-            resource_context=effect_context,
-            failure_evidence=lambda error, phase: self._protected_failure_evidence(
-                pid, resource, "primitive.filesystem.read_bytes.failed", effect_context, error, phase
-            ),
-        )
-        with self._protected().start("primitive.filesystem.read_bytes", invocation, provider=self.provider) as protected:
+        with ExitStack() as stack:
+            stack.enter_context(self._file_label_io_lock.hold(relative))
+            read_context, read_binding_state = self._data_flow().file_snapshot(relative)
+            invocation = ProtectedOperationInvocation(
+                pid=pid,
+                actor=pid,
+                target=resource,
+                decisions=(decision,),
+                canonical_args=authority_context,
+                observation=effect_context,
+                preflight_usage=ResourceUsage(external_read_bytes=max_bytes),
+                resource_source="primitive.filesystem.read_bytes",
+                resource_context=effect_context,
+                data_flow_ingress_context=read_context,
+                failure_evidence=lambda error, phase: self._protected_failure_evidence(
+                    pid, resource, "primitive.filesystem.read_bytes.failed", effect_context, error, phase
+                ),
+            )
+            protected = stack.enter_context(self._protected().start(
+                "primitive.filesystem.read_bytes", invocation, provider=self.provider
+            ))
             target_state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
@@ -392,13 +421,21 @@ class FilesystemAdapter:
                 target,
                 max_bytes=self._read_limit_for_state(target_state.size_bytes, max_bytes),
             )
+            current_binding_state = self._data_flow().file_state_version(relative)
+            if current_binding_state != read_binding_state:
+                self._data_flow().observe_ingress(
+                    DataFlowContext.aggregate(
+                        (read_context, self._data_flow().file_context(relative))
+                    )
+                )
+                raise CapabilityDenied("filesystem label binding changed during read")
             truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
             selected = raw[:max_bytes]
             result = FileBytesReadResult(
                 path=relative, content=selected, bytes_read=len(selected), truncated=truncated
             )
             result_payload = {"bytes_read": len(selected), "truncated": truncated}
-            return protected.complete(
+            completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
                     pid,
@@ -417,6 +454,7 @@ class FilesystemAdapter:
                     context=effect_context,
                 ),
             )
+            return completed
 
     def write_text(
         self,
@@ -426,6 +464,8 @@ class FilesystemAdapter:
         encoding: str = _TOOL_DEFAULTS.default_text_encoding,
         overwrite: bool = True,
         cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> FileWriteResult:
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
@@ -443,6 +483,25 @@ class FilesystemAdapter:
                 extra={"encoding": encoding, "overwrite": overwrite},
             ),
         )
+        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        sink = DataSink(resource)
+        data_flow_payload = {
+            "path": relative,
+            "text": text,
+            "encoding": encoding,
+            "overwrite": overwrite,
+        }
+        target_label_generation = self._data_flow().store.get_file_label_binding_generation(
+            relative
+        )
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=data_flow_payload,
+            operation="filesystem.write_text",
+            target_state_version=target_label_generation,
+        )
         decision, authority_context = self._require_write(
             pid=pid,
             resource=resource,
@@ -451,6 +510,7 @@ class FilesystemAdapter:
             text=text,
             encoding=encoding,
             overwrite=overwrite,
+            source_oids=source_oids,
         )
         bytes_to_write = len(text.encode(encoding))
         effect_context = {
@@ -461,6 +521,8 @@ class FilesystemAdapter:
             "created": None,
         }
         intent: dict[str, Any] = {}
+        mutation_attempted = False
+        missing_parent_paths: list[str] = []
 
         def prepare() -> None:
             intent["record"] = self._record_mutation_intent(
@@ -468,6 +530,31 @@ class FilesystemAdapter:
                 action="primitive.filesystem.write_text.intent",
                 target=resource,
                 decision={"path": relative, "bytes_to_write": bytes_to_write},
+            )
+
+        def write_provider() -> None:
+            nonlocal mutation_attempted
+            mutation_attempted = True
+            self.provider.write_text(
+                target,
+                text,
+                encoding=encoding,
+                newline="\n",
+                overwrite=overwrite,
+            )
+
+        def settle_ambiguous_write(error: BaseException, _phase: str) -> None:
+            if not mutation_attempted or isinstance(error, ProviderEffectNotStarted):
+                return
+            # A generic provider or post-provider settlement failure cannot
+            # prove whether bytes reached the workspace.  Persist the intended
+            # labels conservatively so a later read cannot wash the source.
+            self._bind_written_path_set(
+                pid=pid,
+                context=flow_context,
+                parent_paths=missing_parent_paths,
+                final_path=relative,
+                final_content=text.encode(encoding),
             )
 
         invocation = ProtectedOperationInvocation(
@@ -490,13 +577,37 @@ class FilesystemAdapter:
                 phase,
                 intent.get("record"),
             ),
+            failure_settlement=settle_ambiguous_write,
+            data_sink=sink,
+            data_flow_context=flow_context,
+            data_flow_payload=data_flow_payload,
+            data_flow_operation="filesystem.write_text",
+            data_flow_target_state_version=target_label_generation,
+            data_flow_target_state_version_resolver=lambda: (
+                self._data_flow().store.get_file_label_binding_generation(relative)
+            ),
         )
-        with self._protected().start("primitive.filesystem.write_text", invocation, provider=self.provider) as protected:
+        with (
+            self._file_label_io_lock.hold(
+                HierarchicalPathLock.creation_scope(relative)
+            ),
+            self._protected().start(
+                "primitive.filesystem.write_text", invocation, provider=self.provider
+            ) as protected,
+        ):
             target_state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
             created = not target_state.exists
             effect_context.update({"created": created, "state_observed": True})
+            if created:
+                missing_parent_paths.extend(
+                    protected.call(
+                        ProviderPhase("parent_state", information_flow=True),
+                        self._missing_parent_paths,
+                        relative,
+                    )
+                )
             if target_state.exists and target_state.kind != "file":
                 error = CapabilityDenied(f"path is not a file: {relative}")
                 self._complete_state_rejection(
@@ -525,16 +636,11 @@ class FilesystemAdapter:
                 raise error
             protected.call(
                 ProviderPhase("write", state_mutation=True, information_flow=True),
-                self.provider.write_text,
-                target,
-                text,
-                encoding=encoding,
-                newline="\n",
-                overwrite=overwrite,
+                write_provider,
             )
             result = FileWriteResult(path=relative, bytes_written=bytes_to_write, created=created)
             result_payload = {"bytes_written": bytes_to_write, "created": created}
-            return protected.complete(
+            completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
                     pid,
@@ -548,12 +654,21 @@ class FilesystemAdapter:
                 ),
                 classification_context=effect_context,
                 classification_result=result_payload,
+                settle_success=lambda: self._bind_written_path_set(
+                    pid=pid,
+                    context=flow_context,
+                    parent_paths=missing_parent_paths,
+                    final_path=relative,
+                    final_content=text.encode(encoding),
+                ),
                 resource=ResourceSettlement(
                     usage=ResourceUsage(external_write_bytes=bytes_to_write),
                     source="primitive.filesystem.write_text",
                     context=effect_context,
                 ),
             )
+            self._data_flow().observe_ingress(self._data_flow().file_context(relative))
+            return completed
 
     def read_directory(
         self,
@@ -583,21 +698,31 @@ class FilesystemAdapter:
         )
         effect_context = {"path": relative, "resource": resource, "limit": limit}
         estimated_metadata_bytes = self._directory_metadata_preflight_bytes(limit)
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=resource,
-            decisions=(decision,),
-            canonical_args=authority_context,
-            observation=effect_context,
-            preflight_usage=ResourceUsage(external_read_bytes=estimated_metadata_bytes),
-            resource_source="primitive.filesystem.read_directory",
-            resource_context={**effect_context, "estimated_metadata_bytes": estimated_metadata_bytes},
-            failure_evidence=lambda error, phase: self._protected_failure_evidence(
-                pid, resource, "primitive.filesystem.read_directory.failed", effect_context, error, phase
-            ),
-        )
-        with self._protected().start("primitive.filesystem.read_directory", invocation, provider=self.provider) as protected:
+        with ExitStack() as stack:
+            stack.enter_context(self._file_label_io_lock.hold(relative))
+            label_snapshot, label_state_version = (
+                self._data_flow().directory_label_snapshot(relative)
+            )
+            external_context = self._data_flow().external_file_context()
+            directory_base_context = label_snapshot.get(relative, external_context)
+            invocation = ProtectedOperationInvocation(
+                pid=pid,
+                actor=pid,
+                target=resource,
+                decisions=(decision,),
+                canonical_args=authority_context,
+                observation=effect_context,
+                preflight_usage=ResourceUsage(external_read_bytes=estimated_metadata_bytes),
+                resource_source="primitive.filesystem.read_directory",
+                resource_context={**effect_context, "estimated_metadata_bytes": estimated_metadata_bytes},
+                data_flow_ingress_context=directory_base_context,
+                failure_evidence=lambda error, phase: self._protected_failure_evidence(
+                    pid, resource, "primitive.filesystem.read_directory.failed", effect_context, error, phase
+                ),
+            )
+            protected = stack.enter_context(self._protected().start(
+                "primitive.filesystem.read_directory", invocation, provider=self.provider
+            ))
             target_state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
@@ -629,6 +754,30 @@ class FilesystemAdapter:
                 ProviderPhase("list", information_flow=True),
                 lambda: list(self.provider.list_directory(target, limit=limit + 1)),
             )
+            directory_context = DataFlowContext.aggregate(
+                [
+                    directory_base_context,
+                    *(
+                        label_snapshot.get(child.path, external_context)
+                        for child in children
+                    ),
+                ]
+            )
+            if (
+                self._data_flow().directory_label_state_version(relative)
+                != label_state_version
+            ):
+                self._data_flow().observe_ingress(
+                    DataFlowContext.aggregate(
+                        (
+                            directory_context,
+                            self._data_flow().file_context(relative),
+                        )
+                    )
+                )
+                raise CapabilityDenied(
+                    "filesystem directory-child label bindings changed during listing"
+                )
             selected = children[:limit]
             entries = [DirectoryEntry(**entry.__dict__) for entry in selected]
             truncated = len(children) > len(selected)
@@ -637,7 +786,7 @@ class FilesystemAdapter:
                 path=relative, entries=entries, count=len(entries), truncated=truncated
             )
             result_payload = {"count": len(entries), "truncated": truncated}
-            return protected.complete(
+            completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
                     pid,
@@ -656,6 +805,8 @@ class FilesystemAdapter:
                     context={**effect_context, "metadata_bytes": metadata_bytes, "listed_entries": len(children)},
                 ),
             )
+            self._data_flow().observe_ingress(directory_context)
+            return completed
 
     def write_directory(
         self,
@@ -664,6 +815,8 @@ class FilesystemAdapter:
         parents: bool = True,
         exist_ok: bool = True,
         cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> DirectoryWriteResult:
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
@@ -681,6 +834,20 @@ class FilesystemAdapter:
                 extra={"parents": parents, "exist_ok": exist_ok},
             ),
         )
+        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        sink = DataSink(self.resource_for(relative))
+        data_flow_payload = {"path": relative, "parents": parents, "exist_ok": exist_ok}
+        target_label_generation = self._data_flow().store.get_file_label_binding_generation(
+            relative
+        )
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=data_flow_payload,
+            operation="filesystem.write_directory",
+            target_state_version=target_label_generation,
+        )
         decision, authority_context = self._require_write_operation(
             pid=pid,
             resource=resource,
@@ -690,6 +857,7 @@ class FilesystemAdapter:
             primitive="runtime.filesystem.write_directory",
             question=f"Allow this process to create or update directory {relative}?",
             extra_context={"parents": parents, "exist_ok": exist_ok},
+            source_oids=source_oids,
         )
         effect_context = {
             "path": relative,
@@ -699,6 +867,8 @@ class FilesystemAdapter:
             "created": None,
         }
         intent: dict[str, Any] = {}
+        mutation_attempted = False
+        missing_parent_paths: list[str] = []
 
         def prepare() -> None:
             intent["record"] = self._record_mutation_intent(
@@ -708,6 +878,26 @@ class FilesystemAdapter:
                 decision={"path": relative, "parents": parents, "exist_ok": exist_ok},
             )
 
+        def make_directory_provider() -> None:
+            nonlocal mutation_attempted
+            mutation_attempted = True
+            self.provider.make_directory(
+                target,
+                parents=parents,
+                exist_ok=exist_ok,
+            )
+
+        def settle_ambiguous_directory(error: BaseException, _phase: str) -> None:
+            if not mutation_attempted or isinstance(error, ProviderEffectNotStarted):
+                return
+            self._bind_written_path_set(
+                pid=pid,
+                context=flow_context,
+                parent_paths=missing_parent_paths,
+                final_path=relative,
+                final_content=b"<agent-libos-directory>",
+            )
+
         invocation = ProtectedOperationInvocation(
             pid=pid,
             actor=pid,
@@ -715,6 +905,14 @@ class FilesystemAdapter:
             decisions=(decision,),
             canonical_args=authority_context,
             observation=effect_context,
+            data_sink=sink,
+            data_flow_context=flow_context,
+            data_flow_payload=data_flow_payload,
+            data_flow_operation="filesystem.write_directory",
+            data_flow_target_state_version=target_label_generation,
+            data_flow_target_state_version_resolver=lambda: (
+                self._data_flow().store.get_file_label_binding_generation(relative)
+            ),
             prepare=prepare,
             failure_evidence=lambda error, phase: self._protected_failure_evidence(
                 pid,
@@ -725,15 +923,29 @@ class FilesystemAdapter:
                 phase,
                 intent.get("record"),
             ),
+            failure_settlement=settle_ambiguous_directory,
         )
-        with self._protected().start(
-            "primitive.filesystem.write_directory", invocation, provider=self.provider
-        ) as protected:
+        with (
+            self._file_label_io_lock.hold(
+                HierarchicalPathLock.creation_scope(relative)
+            ),
+            self._protected().start(
+                "primitive.filesystem.write_directory", invocation, provider=self.provider
+            ) as protected,
+        ):
             target_state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
             created = not target_state.exists
             effect_context.update({"created": created, "state_observed": True})
+            if created and parents:
+                missing_parent_paths.extend(
+                    protected.call(
+                        ProviderPhase("parent_state", information_flow=True),
+                        self._missing_parent_paths,
+                        relative,
+                    )
+                )
             if target_state.exists and target_state.kind != "directory":
                 error = CapabilityDenied(f"path is not a directory: {relative}")
                 self._complete_state_rejection(
@@ -760,10 +972,7 @@ class FilesystemAdapter:
                 raise error
             protected.call(
                 ProviderPhase("make_directory", state_mutation=True, information_flow=True),
-                self.provider.make_directory,
-                target,
-                parents=parents,
-                exist_ok=exist_ok,
+                make_directory_provider,
             )
             result = DirectoryWriteResult(path=relative, created=created)
             result_payload = {"created": created}
@@ -781,6 +990,13 @@ class FilesystemAdapter:
                 ),
                 classification_context=effect_context,
                 classification_result=result_payload,
+                settle_success=lambda: self._bind_written_path_set(
+                    pid=pid,
+                    context=flow_context,
+                    parent_paths=missing_parent_paths,
+                    final_path=relative,
+                    final_content=b"<agent-libos-directory>",
+                ),
             )
 
     def delete_file(
@@ -789,6 +1005,27 @@ class FilesystemAdapter:
         path: str | os.PathLike[str],
         missing_ok: bool = False,
         cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
+    ) -> DeleteResult:
+        _target, relative = self._resolve(path, cwd=cwd)
+        with self._file_label_io_lock.hold(relative):
+            return self._delete_file_serialized(
+                pid,
+                path,
+                missing_ok,
+                cwd,
+                source_oids=source_oids,
+            )
+
+    def _delete_file_serialized(
+        self,
+        pid: str,
+        path: str | os.PathLike[str],
+        missing_ok: bool = False,
+        cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> DeleteResult:
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
@@ -806,6 +1043,26 @@ class FilesystemAdapter:
                 extra={"missing_ok": missing_ok},
             ),
         )
+        (
+            target_context,
+            target_label_state_version,
+            target_binding_snapshot,
+        ) = self._data_flow().file_deletion_snapshot(relative)
+        flow_context = DataFlowContext.aggregate(
+            (
+                self._data_flow().context_from_source_oids(pid, source_oids),
+                target_context,
+            )
+        )
+        data_flow_payload = {"path": relative, "missing_ok": missing_ok}
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=DataSink(resource),
+            context=flow_context,
+            payload=data_flow_payload,
+            operation="filesystem.delete_file",
+            target_state_version=target_label_state_version,
+        )
         decision, authority_context = self._require_delete(
             pid=pid,
             resource=resource,
@@ -814,6 +1071,7 @@ class FilesystemAdapter:
             operation="delete_file",
             recursive=False,
             missing_ok=missing_ok,
+            source_oids=source_oids,
         )
         effect_context = {"path": relative, "resource": resource, "missing_ok": missing_ok}
         intent: dict[str, Any] = {}
@@ -833,12 +1091,22 @@ class FilesystemAdapter:
             decisions=(decision,),
             canonical_args=authority_context,
             observation=effect_context,
+            data_sink=DataSink(resource),
+            data_flow_context=flow_context,
+            data_flow_payload=data_flow_payload,
+            data_flow_operation="filesystem.delete_file",
+            data_flow_target_state_version=target_label_state_version,
+            data_flow_target_state_version_resolver=lambda: (
+                self._data_flow().file_state_version(relative)
+            ),
             prepare=prepare,
             failure_evidence=lambda error, phase: self._protected_failure_evidence(
                 pid, resource, "primitive.filesystem.delete_file.failed", effect_context, error, phase, intent.get("record")
             ),
         )
-        with self._protected().start("primitive.filesystem.delete_file", invocation, provider=self.provider) as protected:
+        with self._protected().start(
+            "primitive.filesystem.delete_file", invocation, provider=self.provider
+        ) as protected:
             target_state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
@@ -895,6 +1163,10 @@ class FilesystemAdapter:
                 ),
                 classification_context=effect_context,
                 classification_result={"deleted": True},
+                settle_success=lambda: self._data_flow().tombstone_path_tree(
+                    pid=pid,
+                    expected_bindings=target_binding_snapshot,
+                ),
             )
 
     def delete_directory(
@@ -904,6 +1176,29 @@ class FilesystemAdapter:
         recursive: bool = False,
         missing_ok: bool = False,
         cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
+    ) -> DeleteResult:
+        _target, relative = self._resolve(path, cwd=cwd)
+        with self._file_label_io_lock.hold(relative):
+            return self._delete_directory_serialized(
+                pid,
+                path,
+                recursive,
+                missing_ok,
+                cwd,
+                source_oids=source_oids,
+            )
+
+    def _delete_directory_serialized(
+        self,
+        pid: str,
+        path: str | os.PathLike[str],
+        recursive: bool = False,
+        missing_ok: bool = False,
+        cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
     ) -> DeleteResult:
         target, relative = self._resolve(path, cwd=cwd)
         if target.is_root:
@@ -923,6 +1218,39 @@ class FilesystemAdapter:
                 extra={"recursive": recursive, "missing_ok": missing_ok},
             ),
         )
+        target_binding_snapshot: dict[str, tuple[str, int]] = {}
+        if recursive:
+            (
+                target_context,
+                target_label_generation,
+                target_binding_snapshot,
+            ) = self._data_flow().file_tree_deletion_snapshot(relative)
+        else:
+            (
+                target_context,
+                target_label_generation,
+                target_binding_snapshot,
+            ) = self._data_flow().file_deletion_snapshot(relative)
+        flow_context = DataFlowContext.aggregate(
+            (
+                self._data_flow().context_from_source_oids(pid, source_oids),
+                target_context,
+            )
+        )
+        sink = DataSink(self.resource_for(relative))
+        data_flow_payload = {
+            "path": relative,
+            "recursive": recursive,
+            "missing_ok": missing_ok,
+        }
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=data_flow_payload,
+            operation="filesystem.delete_directory",
+            target_state_version=target_label_generation,
+        )
         decision, authority_context = self._require_delete(
             pid=pid,
             resource=resource,
@@ -931,6 +1259,7 @@ class FilesystemAdapter:
             operation="delete_directory",
             recursive=recursive,
             missing_ok=missing_ok,
+            source_oids=source_oids,
         )
         effect_context = {
             "path": relative,
@@ -955,6 +1284,16 @@ class FilesystemAdapter:
             decisions=(decision,),
             canonical_args=authority_context,
             observation=effect_context,
+            data_sink=sink,
+            data_flow_context=flow_context,
+            data_flow_payload=data_flow_payload,
+            data_flow_operation="filesystem.delete_directory",
+            data_flow_target_state_version=target_label_generation,
+            data_flow_target_state_version_resolver=lambda: (
+                self._data_flow().file_tree_state_version(relative)
+                if recursive
+                else self._data_flow().file_state_version(relative)
+            ),
             prepare=prepare,
             failure_evidence=lambda error, phase: self._protected_failure_evidence(
                 pid, resource, "primitive.filesystem.delete_directory.failed", effect_context, error, phase, intent.get("record")
@@ -1029,6 +1368,10 @@ class FilesystemAdapter:
                 ),
                 classification_context=effect_context,
                 classification_result=result_payload,
+                settle_success=lambda: self._data_flow().tombstone_path_tree(
+                    pid=pid,
+                    expected_bindings=target_binding_snapshot,
+                ),
             )
 
     def grant_workspace(
@@ -1152,6 +1495,16 @@ class FilesystemAdapter:
         if sdk is None:
             raise ValidationError("filesystem protected-operation SDK is not attached")
         return sdk
+
+    def _data_flow(self) -> Any:
+        manager = getattr(self, "data_flow", None) or getattr(
+            self._protected(),
+            "data_flow",
+            None,
+        )
+        if manager is None:
+            raise ValidationError("filesystem data-flow manager is not attached")
+        return manager
 
     @staticmethod
     def _state_only_classification(
@@ -1300,6 +1653,40 @@ class FilesystemAdapter:
         # information-flow budgets fail closed before metadata is observed.
         return max(1, (limit + 1) * 512)
 
+    def _missing_parent_paths(self, normalized_path: str) -> list[str]:
+        parts = [part for part in str(normalized_path).split("/") if part]
+        parents = ["/".join(parts[:index]) for index in range(1, len(parts))]
+        missing: list[str] = []
+        for parent in parents:
+            target = self.provider.resolve(parent)
+            if not self.provider.state(target).exists:
+                missing.append(target.relative)
+        return missing
+
+    def _bind_written_path_set(
+        self,
+        *,
+        pid: str,
+        context: DataFlowContext,
+        parent_paths: Iterable[str],
+        final_path: str,
+        final_content: bytes,
+    ) -> None:
+        with self._data_flow().store.transaction():
+            for parent in dict.fromkeys(parent_paths):
+                self._data_flow().bind_written_file(
+                    pid=pid,
+                    normalized_path=parent,
+                    content=b"<agent-libos-directory>",
+                    context=context,
+                )
+            self._data_flow().bind_written_file(
+                pid=pid,
+                normalized_path=final_path,
+                content=final_content,
+                context=context,
+            )
+
     def _record_mutation_intent(
         self,
         *,
@@ -1354,6 +1741,7 @@ class FilesystemAdapter:
         text: str,
         encoding: str,
         overwrite: bool,
+        source_oids: Iterable[str] | None = None,
     ) -> tuple[CapabilityDecision, dict[str, Any]]:
         return self._require_write_operation(
             pid=pid,
@@ -1368,6 +1756,7 @@ class FilesystemAdapter:
                 "overwrite": overwrite,
                 **self._content_context(text, encoding),
             },
+            source_oids=source_oids,
         )
 
     def _reject_definite_permission_denial(
@@ -1394,6 +1783,7 @@ class FilesystemAdapter:
         primitive: str,
         question: str,
         extra_context: dict[str, Any] | None = None,
+        source_oids: Iterable[str] | None = None,
     ) -> tuple[CapabilityDecision, dict[str, Any]]:
         operation_context = self._operation_context(
             pid=pid,
@@ -1434,6 +1824,7 @@ class FilesystemAdapter:
                     },
                 },
                 blocking=True,
+                source_oids=source_oids,
             )
             raise HumanApprovalRequired(
                 request_id=request_id,
@@ -1450,6 +1841,7 @@ class FilesystemAdapter:
         operation: str,
         recursive: bool,
         missing_ok: bool,
+        source_oids: Iterable[str] | None = None,
     ) -> tuple[CapabilityDecision, dict[str, Any]]:
         operation_context = self._operation_context(
             pid=pid,
@@ -1484,6 +1876,7 @@ class FilesystemAdapter:
                     "context": operation_context,
                 },
                 blocking=True,
+                source_oids=source_oids,
             )
             raise HumanApprovalRequired(
                 request_id=request_id,

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, MemoryViewID, NamespaceID, OID, PID, SnapshotID, StrEnum
+from agent_libos.models.data_flow import DataIntegrity, DataSensitivity, DataTrustLevel
 
 
 class _UnsetPayload:
@@ -105,6 +106,99 @@ class ObjectMetadata:
     tenant: str | None = None
     principal: str | None = None
     declassification_authority: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_object_label(
+            "sensitivity",
+            self.sensitivity,
+            {item.value for item in DataSensitivity},
+        )
+        _validate_object_label(
+            "trust_level",
+            self.trust_level,
+            {item.value for item in DataTrustLevel},
+        )
+        _validate_object_label(
+            "integrity",
+            self.integrity,
+            {item.value for item in DataIntegrity},
+        )
+        for field_name in ("origin", "tenant", "principal", "declassification_authority"):
+            _validate_optional_identity(field_name, getattr(self, field_name))
+
+    @classmethod
+    def from_persisted(cls, value: Mapping[str, Any]) -> ObjectMetadata:
+        """Decode metadata written before data-label enums were enforced.
+
+        New writes remain strict through ``__post_init__``. Historical stores,
+        however, accepted arbitrary strings. Unknown confidentiality labels are
+        therefore raised to the most restrictive value, while unknown
+        integrity/trust and identities are reduced conservatively.
+        """
+
+        if not isinstance(value, Mapping):
+            raise ValueError("persisted object metadata must be an object")
+        selected = dict(value)
+        _normalize_persisted_ordered_label(
+            selected,
+            "sensitivity",
+            {item.value for item in DataSensitivity},
+            fallback=DataSensitivity.SECRET.value,
+        )
+        _normalize_persisted_ordered_label(
+            selected,
+            "trust_level",
+            {item.value for item in DataTrustLevel},
+            fallback=DataTrustLevel.UNTRUSTED.value,
+        )
+        _normalize_persisted_ordered_label(
+            selected,
+            "integrity",
+            {item.value for item in DataIntegrity},
+            fallback=DataIntegrity.UNTRUSTED.value,
+        )
+        for field_name, fallback in (
+            ("origin", "derived"),
+            ("tenant", "mixed"),
+            ("principal", "mixed"),
+            ("declassification_authority", None),
+        ):
+            if field_name not in selected:
+                continue
+            try:
+                _validate_optional_identity(field_name, selected[field_name])
+            except ValueError:
+                selected[field_name] = fallback
+        return cls(**selected)
+
+
+def _validate_object_label(name: str, value: str, allowed: set[str]) -> None:
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"invalid object data label {name}: {value!r}")
+
+
+def _validate_optional_identity(name: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"invalid object data label {name}: {value!r}")
+    if value == "mixed" and name not in {"tenant", "principal"}:
+        raise ValueError(f"invalid object data label {name}: {value!r}")
+    if len(value) > 256 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"invalid object data label {name}: {value!r}")
+
+
+def _normalize_persisted_ordered_label(
+    selected: dict[str, Any],
+    name: str,
+    allowed: set[str],
+    *,
+    fallback: str,
+) -> None:
+    if name in selected and (
+        not isinstance(selected[name], str) or selected[name] not in allowed
+    ):
+        selected[name] = fallback
 
 
 @dataclass

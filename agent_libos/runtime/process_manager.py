@@ -3,17 +3,22 @@ from __future__ import annotations
 import builtins
 import contextlib
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
-from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.memory.data_labels import metadata_from_labels, propagate_object_labels
 from agent_libos.memory.object_memory import ObjectMemoryManager
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired, ValidationError
+from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.serde import loads
 from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
+    DataFlowContext,
+    DataLabels,
     EventType,
     ForkMode,
     MemoryView,
@@ -22,7 +27,10 @@ from agent_libos.models import (
     MergeResult,
     ObjectHandle,
     ObjectMetadata,
+    ObjectOwnerKind,
     ObjectType,
+    Provenance,
+    ProcessMessage,
     ProcessResult,
     ProcessSignal,
     ProcessStatus,
@@ -34,10 +42,12 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import RuntimeStore
 
+
 class ProcessManager:
     """Process lifecycle primitive."""
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+    HOST_RESUME_REQUIRED_PREFIX = "host_resume_required:"
 
     def __init__(
         self,
@@ -50,6 +60,7 @@ class ProcessManager:
         resources: Any | None = None,
         llm_profile_resolver: Callable[[str, str | None], str] | None = None,
         authority_manifests: Any | None = None,
+        data_flow: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -60,6 +71,7 @@ class ProcessManager:
         self.resources = resources
         self._llm_profile_resolver = llm_profile_resolver
         self.authority_manifests = authority_manifests
+        self.data_flow = data_flow
         self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
         self._object_task_terminal_notifier: Callable[[str], None] | None = None
 
@@ -129,6 +141,7 @@ class ProcessManager:
                     process.resource_budget = ResourceBudget(**manifest.resource_budget)
                     process.updated_at = utc_now()
                     self.store.update_process(process)
+                self._assert_goal_data_flow(pid, goal_handle)
                 self.authority_manifests.compile_root_capabilities(manifest)
             else:
                 self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
@@ -174,6 +187,9 @@ class ProcessManager:
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
         authority_manifest: Any | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> str:
         parent_proc = self._get(parent)
         fork_mode = ForkMode(mode)
@@ -210,21 +226,13 @@ class ProcessManager:
             )
             self.store.insert_process(child)
             self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
-            goal_handle = self._ensure_goal(child_pid, goal)
-            source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
-            if isinstance(memory_view, MemoryView):
-                source_view = memory_view
-                spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
-            else:
-                spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
-            # Forking attenuates memory handles by default. The child can see only
-            # roots selected by the parent and only the rights granted into its view.
-            child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
-            child_view.roots.append(goal_handle)
-            child.goal_oid = goal_handle.oid
-            child.memory_view = child_view
-            child.updated_at = utc_now()
-            self.store.update_process(child)
+            goal_handle = self._ensure_goal(
+                child_pid,
+                goal,
+                source_oids=self.flow_source_oids(parent, source_oids),
+                source_labels=source_labels,
+                source_context=source_context,
+            )
             requested_specs = [*(capabilities or []), *inherit_specs]
             manifest = None
             if self.authority_manifests is not None:
@@ -238,6 +246,24 @@ class ProcessManager:
                     parent_pid=parent,
                     issued_by=f"process.fork:{parent}",
                 )
+                self._assert_goal_data_flow(child_pid, goal_handle)
+            source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
+            if isinstance(memory_view, MemoryView):
+                source_view = memory_view
+                spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
+            else:
+                spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
+            # Forking attenuates memory handles by default. The child can see only
+            # roots selected by the parent and only the rights granted into its view.
+            with self.memory.ownership_locked(), self.store.locked():
+                child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
+                for root in child_view.roots:
+                    self._assert_object_data_flow(child_pid, root.oid)
+                child_view.roots.append(goal_handle)
+                child.goal_oid = goal_handle.oid
+                child.memory_view = child_view
+                child.updated_at = utc_now()
+                self.store.update_process(child)
             self._compile_child_authority(
                 parent_pid=parent,
                 child_pid=child_pid,
@@ -295,6 +321,9 @@ class ProcessManager:
         initial_status: ProcessStatus | str = ProcessStatus.RUNNABLE,
         llm_profile_id: str | None = None,
         authority_manifest: Any | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> str:
         parent_proc = self._get(parent)
         if parent_proc.status in self.TERMINAL_STATUSES:
@@ -333,7 +362,13 @@ class ProcessManager:
             )
             self.store.insert_process(child)
             self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
-            goal_handle = self._ensure_goal(child_pid, goal)
+            goal_handle = self._ensure_goal(
+                child_pid,
+                goal,
+                source_oids=self.flow_source_oids(parent, source_oids),
+                source_labels=source_labels,
+                source_context=source_context,
+            )
             # Unlike fork(), spawn_child() starts from a fresh address-space-like
             # Object Memory view rooted only at the child goal.
             child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
@@ -353,6 +388,7 @@ class ProcessManager:
                     parent_pid=parent,
                     issued_by=f"process.spawn_child:{parent}",
                 )
+                self._assert_goal_data_flow(child_pid, goal_handle)
             self._compile_child_authority(
                 parent_pid=parent,
                 child_pid=child_pid,
@@ -408,6 +444,9 @@ class ProcessManager:
         preserve_memory: bool = True,
         preserve_capabilities: bool = False,
         llm_profile_id: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> None:
         with self.store.transaction(include_object_payloads=True):
             self._exec_uncommitted(
@@ -418,6 +457,9 @@ class ProcessManager:
                 preserve_memory=preserve_memory,
                 preserve_capabilities=preserve_capabilities,
                 llm_profile_id=llm_profile_id,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
             )
 
     def _exec_uncommitted(
@@ -429,12 +471,25 @@ class ProcessManager:
         preserve_memory: bool = True,
         preserve_capabilities: bool = False,
         llm_profile_id: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> None:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot exec terminated process: {pid}")
         old_image = process.image_id
-        goal_handle = self._ensure_goal(pid, goal) if goal is not None else None
+        goal_handle = (
+            self._ensure_goal(
+                pid,
+                goal,
+                source_oids=self.flow_source_oids(pid, source_oids),
+                source_labels=source_labels,
+                source_context=source_context,
+            )
+            if goal is not None
+            else None
+        )
         process = self._get(pid)
         if not preserve_capabilities:
             kept: builtins.list[str] = []
@@ -516,21 +571,28 @@ class ProcessManager:
                 parent.updated_at = utc_now()
                 self.store.update_process(parent)
         result_handle = None
-        if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
-            oid = child_proc.status_message.split(":", 1)[1]
-            self.memory.preserve_process_owned(child, {oid})
-            result_handle = self.capabilities.handle_for_object(
-                pid,
-                oid,
-                {"read", "materialize", "link", "diff"},
-                issued_by=f"process.wait:{child}",
-            )
-            self._add_handle_to_process_view(parent, result_handle)
-        if parent.status == ProcessStatus.WAITING_EVENT and parent.status_message == f"waiting for {child}":
-            parent.status = ProcessStatus.RUNNABLE
-            parent.status_message = None
-            parent.updated_at = utc_now()
-            self.store.update_process(parent)
+        # Keep the receiver-domain check, source ownership transfer, and
+        # handle publication under one lock domain so a mutable result cannot
+        # change labels between validation and delivery.
+        with self.memory.ownership_locked(), self.store.locked():
+            parent = self._get(pid)
+            child_proc = self._require_child(parent.pid, child)
+            if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
+                oid = child_proc.status_message.split(":", 1)[1]
+                self._assert_object_data_flow(pid, oid)
+                self.memory.preserve_process_owned(child, {oid})
+                result_handle = self.capabilities.handle_for_object(
+                    pid,
+                    oid,
+                    {"read", "materialize", "link", "diff"},
+                    issued_by=f"process.wait:{child}",
+                )
+                self._add_handle_to_process_view(parent, result_handle)
+            if parent.status == ProcessStatus.WAITING_EVENT and parent.status_message == f"waiting for {child}":
+                parent.status = ProcessStatus.RUNNABLE
+                parent.status_message = None
+                parent.updated_at = utc_now()
+                self.store.update_process(parent)
         self.audit.record(
             actor=pid,
             action="process.wait",
@@ -577,16 +639,42 @@ class ProcessManager:
         child: str,
         signal: ProcessSignal | str,
         reason: str | None = None,
+        *,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> AgentProcess:
         child_proc = self._require_child(pid, child)
         sig = ProcessSignal(signal)
-        updated = self._apply_signal(
-            child_proc,
-            sig,
-            payload={"reason": reason} if reason else {},
-            actor=pid,
-            action="process.signal_child",
-        )
+        self._require_signal_applicable(child_proc, sig)
+        payload: dict[str, Any] = {}
+        # The labeled reason carrier is part of the signal transition, not a
+        # preparatory side effect.  Keep its Object payload, capability, child
+        # MemoryView root, process state, event, and audit in one rollback scope.
+        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
+            if reason is not None:
+                reason_handle = self._create_flow_text_carrier(
+                    recipient_pid=child,
+                    text=reason,
+                    payload_field="reason",
+                    object_type=ObjectType.MESSAGE,
+                    title="Process signal reason",
+                    tags=["process_signal", "reason"],
+                    created_from_action="process.signal_child.reason",
+                    source_pid=pid,
+                    source_oids=source_oids,
+                    source_labels=source_labels,
+                    source_context=source_context,
+                )
+                payload["reason_oid"] = reason_handle.oid
+            updated = self._apply_signal(
+                child_proc,
+                sig,
+                payload=payload,
+                actor=pid,
+                action="process.signal_child",
+                allow_host_resume=False,
+            )
         if updated.status in self.TERMINAL_STATUSES:
             self._complete_terminal_signal(updated, actor=pid, signal=sig)
         return updated
@@ -597,37 +685,155 @@ class ProcessManager:
         child: str,
         policy: MergePolicy | None = None,
     ) -> MergeResult:
-        child_proc = self._require_child(pid, child)
-        if child_proc.status not in self.TERMINAL_STATUSES:
-            raise ProcessError(f"cannot merge running child process: {child}")
-        if child_proc.memory_view is None:
-            return MergeResult(merged_oids=[], skipped_oids=[])
-        result = self.memory.merge_view(pid, child_proc.memory_view, policy=policy)
-        parent = self._get(pid)
-        for handle in result.merged_handles:
-            self._add_handle_to_process_view(parent, handle)
-        adopted = self.memory.adopt_process_owned(child, pid, result.merged_oids)
-        released = self.memory.release_process_owned(child)
-        self.audit.record(
-            actor=pid,
-            action="process.merge_child_memory",
-            target=f"process:{child}",
-            output_refs=result.merged_oids,
-            decision={
-                "merged": len(result.merged_oids),
-                "skipped": result.skipped_oids,
-                "adopted": adopted,
-                "released_child_owned": released,
-            },
-        )
-        return result
+        selected_policy = policy or MergePolicy()
+        with self.memory.ownership_locked(), self.store.locked():
+            child_proc = self._require_child(pid, child)
+            if child_proc.status not in self.TERMINAL_STATUSES:
+                raise ProcessError(f"cannot merge running child process: {child}")
+            if child_proc.memory_view is None:
+                return MergeResult(merged_oids=[], skipped_oids=[])
+            candidate_oids = {handle.oid for handle in child_proc.memory_view.roots}
+            if selected_policy.include_child_created:
+                candidate_oids.update(
+                    obj.oid
+                    for obj in self.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, child)
+                )
+            for oid in sorted(candidate_oids):
+                if self.store.get_object(oid) is not None:
+                    self._assert_object_data_flow(pid, oid)
+            result = self.memory.merge_view(pid, child_proc.memory_view, policy=selected_policy)
+            parent = self._get(pid)
+            for handle in result.merged_handles:
+                self._add_handle_to_process_view(parent, handle)
+            adopted = self.memory.adopt_process_owned(child, pid, result.merged_oids)
+            released = self.memory.release_process_owned(child)
+            self.audit.record(
+                actor=pid,
+                action="process.merge_child_memory",
+                target=f"process:{child}",
+                output_refs=result.merged_oids,
+                decision={
+                    "merged": len(result.merged_oids),
+                    "skipped": result.skipped_oids,
+                    "adopted": adopted,
+                    "released_child_owned": released,
+                },
+            )
+            return result
 
-    def signal(self, target: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> None:
+    def signal(
+        self,
+        target: str,
+        signal: ProcessSignal | str,
+        payload: dict[str, Any] | None = None,
+        *,
+        _require_host_resume: bool = False,
+    ) -> None:
         proc = self._get(target)
         sig = ProcessSignal(signal)
-        updated = self._apply_signal(proc, sig, payload=payload or {}, actor="runtime", action="process.signal")
+        selected_payload = dict(payload or {})
+        reason = selected_payload.pop("reason", None)
+        self._require_signal_applicable(proc, sig)
+        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
+            if reason is not None:
+                reason_handle = self._create_flow_text_carrier(
+                    recipient_pid=target,
+                    text=str(reason),
+                    payload_field="reason",
+                    object_type=ObjectType.MESSAGE,
+                    title="Process signal reason",
+                    tags=["process_signal", "reason"],
+                    created_from_action="process.signal.reason",
+                    source_pid=target,
+                )
+                selected_payload["reason_oid"] = reason_handle.oid
+            updated = self._apply_signal(
+                proc,
+                sig,
+                payload=selected_payload,
+                actor="runtime",
+                action="process.signal",
+                allow_host_resume=True,
+                require_host_resume=_require_host_resume,
+            )
         if updated.status in self.TERMINAL_STATUSES:
             self._complete_terminal_signal(updated, actor="runtime", signal=sig)
+
+    def _require_signal_applicable(self, proc: AgentProcess, sig: ProcessSignal) -> None:
+        if proc.status in self.TERMINAL_STATUSES:
+            raise ProcessError(f"cannot signal terminal process: {proc.pid} status={proc.status.value}")
+        if sig == ProcessSignal.INTERRUPT:
+            raise ProcessError(
+                "process interrupt signals are not state transitions; "
+                "send a durable interrupt process message instead"
+            )
+        if sig == ProcessSignal.PAUSE and proc.status in {
+            ProcessStatus.WAITING_EVENT,
+            ProcessStatus.WAITING_TOOL,
+            ProcessStatus.WAITING_HUMAN,
+        }:
+            raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
+        if sig == ProcessSignal.RESUME and proc.status in {
+            ProcessStatus.WAITING_EVENT,
+            ProcessStatus.WAITING_TOOL,
+            ProcessStatus.WAITING_HUMAN,
+        }:
+            raise ProcessError(f"cannot resume waiting process: {proc.pid} status={proc.status.value}")
+
+    def _create_flow_text_carrier(
+        self,
+        *,
+        recipient_pid: str,
+        text: str,
+        payload_field: str,
+        object_type: ObjectType,
+        title: str,
+        tags: list[str],
+        created_from_action: str,
+        source_pid: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
+    ) -> ObjectHandle:
+        selected_sources = (
+            self.flow_source_oids(source_pid, source_oids)
+            if source_pid is not None
+            else self._normalize_source_oids(source_oids)
+        )
+        selected_context = source_context
+        if selected_context is None and self.data_flow is not None:
+            selected_context = self.data_flow.current_context()
+        metadata = self.flow_metadata(
+            selected_sources,
+            source_labels,
+            selected_context,
+            base=ObjectMetadata(title=title, tags=tags),
+        )
+        # A process deriving its own result and a Host management-plane
+        # injection are not cross-process ingress.  Enforce the recipient
+        # identity domain only for an actual process-to-process handoff.
+        if (
+            self.authority_manifests is not None
+            and source_pid is not None
+            and source_pid != recipient_pid
+        ):
+            self.authority_manifests.assert_data_flow_labels(
+                recipient_pid,
+                DataLabels.from_object_metadata(metadata),
+            )
+        handle = self.memory.create_object(
+            pid=recipient_pid,
+            object_type=object_type,
+            payload={payload_field: text},
+            metadata=metadata,
+            immutable=True,
+            provenance=Provenance(
+                created_from_action=created_from_action,
+                parent_oids=selected_sources,
+            ),
+        )
+        self._add_handle_to_process_view(self._get(recipient_pid), handle)
+        return handle
 
     def _apply_signal(
         self,
@@ -636,6 +842,9 @@ class ProcessManager:
         payload: dict[str, Any],
         actor: str,
         action: str,
+        *,
+        allow_host_resume: bool,
+        require_host_resume: bool = False,
     ) -> AgentProcess:
         # Persist the process state, reservation release, parent wakeup, event,
         # and audit as one lifecycle transition.  Object/Host cleanup and
@@ -643,13 +852,13 @@ class ProcessManager:
         # cannot be rolled back with the SQL transaction.
         with self.store.transaction():
             proc = self._get(proc.pid)
-            if proc.status in self.TERMINAL_STATUSES:
-                raise ProcessError(f"cannot signal terminal process: {proc.pid} status={proc.status.value}")
-            if sig == ProcessSignal.INTERRUPT:
-                raise ProcessError(
-                    "process interrupt signals are not state transitions; "
-                    "send a durable interrupt process message instead"
-                )
+            self._require_signal_applicable(proc, sig)
+            host_resume_required = bool(
+                proc.status_message
+                and proc.status_message.startswith(self.HOST_RESUME_REQUIRED_PREFIX)
+            )
+            if sig == ProcessSignal.RESUME and host_resume_required and not allow_host_resume:
+                raise ProcessError(f"process requires explicit Host resume: {proc.pid}")
             if sig == ProcessSignal.PAUSE:
                 if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
                     raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
@@ -661,7 +870,15 @@ class ProcessManager:
                     proc.status = ProcessStatus.RUNNABLE
             elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
                 proc.status = ProcessStatus.KILLED
-            proc.status_message = payload.get("reason")
+            reason_oid = str(payload.get("reason_oid") or "").strip()
+            if sig == ProcessSignal.PAUSE and require_host_resume:
+                proc.status_message = f"{self.HOST_RESUME_REQUIRED_PREFIX}{reason_oid}"
+            elif sig == ProcessSignal.PAUSE and host_resume_required:
+                # Ordinary child signaling must not erase an existing Host-only
+                # resume gate by pausing the process again with a new reason.
+                pass
+            else:
+                proc.status_message = f"result_oid:{reason_oid}" if reason_oid else None
             proc.updated_at = utc_now()
             self.store.update_process(proc)
             if proc.status in self.TERMINAL_STATUSES:
@@ -683,13 +900,103 @@ class ProcessManager:
         return proc
 
     def _complete_terminal_signal(self, process: AgentProcess, *, actor: str, signal: ProcessSignal) -> None:
+        preserve_oids: set[str] = set()
+        if process.status_message and process.status_message.startswith("result_oid:"):
+            preserve_oids.add(process.status_message.split(":", 1)[1])
         self._complete_terminal_cleanup(
             process,
             actor=actor,
             audit_action="process.signal_finalize_failed",
-            preserve_oids=set(),
+            preserve_oids=preserve_oids,
             context={"signal": signal.value},
         )
+
+    def reconcile_legacy_pending_action_terminal(
+        self,
+        pid: str,
+        *,
+        reason: str,
+        actor: str = "runtime.legacy_pending_migration",
+    ) -> bool:
+        """Finish a fail-closed legacy migration through normal terminal hooks.
+
+        Claiming the migration marker, publishing the terminal transition,
+        releasing resource reservations, and waking the parent commit together.
+        Human/ObjectTask notification and process-memory finalization are then
+        idempotently retried while the durable marker remains ``reconciling``.
+        """
+
+        process: AgentProcess
+        with self.store.transaction():
+            claim = self.store.claim_llm_pending_action_terminal_reconciliation(pid)
+            if claim is None:
+                return False
+            process = self._get(pid)
+            historical_terminal = (
+                process.status in self.TERMINAL_STATUSES
+                and process.status_message != reason
+            )
+            if claim == "claimed" and historical_terminal:
+                self._release_child_budget(pid)
+            elif claim == "claimed":
+                if process.status not in self.TERMINAL_STATUSES:
+                    process.status = ProcessStatus.FAILED
+                    process.status_message = reason
+                    process.updated_at = utc_now()
+                    self.store.update_process(process)
+                elif process.status != ProcessStatus.FAILED:
+                    raise ValidationError(
+                        "legacy pending action terminal marker conflicts with "
+                        f"process {pid} status {process.status.value}"
+                    )
+                self._release_child_budget(pid)
+                self.events.emit(
+                    EventType.PROCESS_EXITED,
+                    source=actor,
+                    target=process.parent_pid,
+                    payload={
+                        "pid": pid,
+                        "status": ProcessStatus.FAILED.value,
+                        "result_oid": None,
+                        "reason": reason,
+                        "legacy_pending_action_reconciled": True,
+                    },
+                )
+                self.audit.record(
+                    actor=actor,
+                    action="process.legacy_pending_action_terminal",
+                    target=f"process:{pid}",
+                    decision={"status": ProcessStatus.FAILED.value, "reason": reason},
+                )
+                self._wake_parent_waiting_on_child(process)
+            elif claim == "resuming":
+                if process.status not in self.TERMINAL_STATUSES:
+                    raise ValidationError(
+                        "legacy pending action reconciliation marker has no matching "
+                        f"terminal process transition: {pid}"
+                    )
+            else:  # pragma: no cover - store implementations own the finite claim modes.
+                raise RuntimeError(f"unknown legacy pending action reconciliation mode: {claim}")
+
+        preserve_oids: set[str] = set()
+        if process.status_message and process.status_message.startswith("result_oid:"):
+            preserve_oids.add(process.status_message.split(":", 1)[1])
+        cleanup_errors = self._complete_terminal_cleanup(
+            process,
+            actor=actor,
+            audit_action="process.legacy_pending_action_finalize_failed",
+            preserve_oids=preserve_oids,
+            context={"reason": reason},
+        )
+        if cleanup_errors:
+            raise RuntimeError(
+                f"legacy pending action terminal cleanup failed for {pid}: {cleanup_errors}"
+            )
+        if not self.store.complete_llm_pending_action_terminal_reconciliation(pid):
+            raise RuntimeError(
+                f"legacy pending action reconciliation completion raced for process {pid}"
+            )
+        return True
 
     def _complete_terminal_cleanup(
         self,
@@ -699,7 +1006,7 @@ class ProcessManager:
         audit_action: str,
         preserve_oids: set[str],
         context: dict[str, Any],
-    ) -> None:
+    ) -> list[dict[str, str]]:
         errors: list[dict[str, str]] = []
         try:
             self._notify_object_task_process_terminal(process.pid)
@@ -710,7 +1017,7 @@ class ProcessManager:
         except Exception as exc:
             errors.append({"phase": "process_finalize", "error": f"{type(exc).__name__}: {exc}"})
         if not errors:
-            return
+            return []
         try:
             self.audit.record(
                 actor=actor,
@@ -723,9 +1030,18 @@ class ProcessManager:
             # sink failure must not turn a committed signal into a retryable
             # API error or skip the remaining cleanup phase.
             pass
+        return errors
 
     def pause(self, pid: str, reason: str) -> None:
         self.signal(pid, ProcessSignal.PAUSE, {"reason": reason})
+
+    def pause_for_host_resume(self, pid: str, reason: str) -> None:
+        self.signal(
+            pid,
+            ProcessSignal.PAUSE,
+            {"reason": reason},
+            _require_host_resume=True,
+        )
 
     def resume(self, pid: str) -> None:
         self.signal(pid, ProcessSignal.RESUME, {})
@@ -733,21 +1049,69 @@ class ProcessManager:
     def cancel(self, pid: str, reason: str) -> None:
         self.signal(pid, ProcessSignal.CANCEL, {"reason": reason})
 
-    def exit(self, pid: str, result: ObjectHandle | None = None, failed: bool = False, message: str | None = None) -> None:
+    def exit(
+        self,
+        pid: str,
+        result: ObjectHandle | None = None,
+        failed: bool = False,
+        message: str | None = None,
+        *,
+        payload: dict[str, Any] | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
+    ) -> ObjectHandle | None:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
             self._release_rejected_exit_result(pid, result)
             raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
+        message_present = message is not None
         # Terminal state, child-budget release, evidence, and parent wakeup are
-        # one durable lifecycle transition.  Host/object finalizers remain
-        # post-commit because provider cleanup cannot be rolled back safely.
+        # one durable lifecycle transition, including any generated result.
+        # Host/object finalizers remain post-commit because provider cleanup
+        # cannot be rolled back safely.
         with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
             process = self._get(pid)
             if process.status in self.TERMINAL_STATUSES:
                 self._release_rejected_exit_result(pid, result)
                 raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
+            if result is None and payload is not None:
+                selected_sources = self.flow_source_oids(pid, source_oids)
+                result = self.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.SUMMARY,
+                    payload=payload,
+                    metadata=self.flow_metadata(
+                        selected_sources,
+                        source_labels,
+                        source_context,
+                        base=ObjectMetadata(title="Process final result", tags=["final"]),
+                    ),
+                    provenance=Provenance(
+                        created_from_action="process.exit",
+                        parent_oids=selected_sources,
+                    ),
+                )
+            elif result is None and message is not None:
+                result = self._create_flow_text_carrier(
+                    recipient_pid=pid,
+                    text=message,
+                    payload_field="message",
+                    object_type=ObjectType.SUMMARY,
+                    title="Process final result",
+                    tags=["final", "process_exit"],
+                    created_from_action="process.exit.message",
+                    source_pid=pid,
+                    source_oids=source_oids,
+                    source_labels=source_labels,
+                    source_context=source_context,
+                )
+            # Result construction may update the process MemoryView. Reload the
+            # row before applying the terminal transition so neither write wins
+            # over the other.
+            process = self._get(pid)
             process.status = ProcessStatus.FAILED if failed else ProcessStatus.EXITED
-            process.status_message = f"result_oid:{result.oid}" if result is not None else message
+            process.status_message = f"result_oid:{result.oid}" if result is not None else None
             process.updated_at = utc_now()
             self.store.update_process(process)
             self._release_child_budget(pid)
@@ -762,7 +1126,7 @@ class ProcessManager:
                 action="process.exit",
                 target=f"process:{pid}",
                 output_refs=[result.oid] if result else [],
-                decision={"status": process.status.value, "message": message},
+                decision={"status": process.status.value, "message_present": message_present},
             )
             self._wake_parent_waiting_on_child(process)
         self._complete_terminal_cleanup(
@@ -772,6 +1136,7 @@ class ProcessManager:
             preserve_oids={result.oid} if result is not None else set(),
             context={"status": process.status.value, "result_oid": result.oid if result is not None else None},
         )
+        return result
 
     def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:
         errors: list[str] = []
@@ -992,18 +1357,305 @@ class ProcessManager:
             return None
         return float(value) / divisor
 
-    def _ensure_goal(self, pid: str, goal: dict[str, Any] | str | ObjectHandle | None) -> ObjectHandle:
+    def flow_source_oids(self, pid: str, source_oids: Iterable[str] | None = None) -> list[str]:
+        """Return trusted ambient Object sources for a process-originated value.
+
+        Explicit sources come from runtime-owned ToolContext metadata.  The
+        current goal and MemoryView roots are included conservatively so a
+        process cannot wash a label merely by copying observed content into a
+        raw child goal or process message.
+        """
+
+        process = self._get(pid)
+        explicit = self._normalize_source_oids(source_oids)
+        candidates = [*explicit]
+        if process.goal_oid:
+            candidates.append(process.goal_oid)
+        if process.memory_view is not None:
+            candidates.extend(handle.oid for handle in process.memory_view.roots)
+        selected: list[str] = []
+        seen: set[str] = set()
+        for oid in candidates:
+            if oid in seen:
+                continue
+            obj = self.store.get_object(oid)
+            if obj is None:
+                if oid in explicit:
+                    raise NotFound(f"data-flow source object not found: {oid}")
+                continue
+            seen.add(oid)
+            selected.append(oid)
+        return selected
+
+    def flow_metadata(
+        self,
+        source_oids: Iterable[str],
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
+        *,
+        base: ObjectMetadata | None = None,
+    ) -> ObjectMetadata:
+        labels: list[DataLabels] = []
+        for oid in self._normalize_source_oids(source_oids):
+            obj = self.store.get_object(oid)
+            if obj is None:
+                raise NotFound(f"data-flow source object not found: {oid}")
+            labels.append(DataLabels.from_object_metadata(obj.metadata))
+        if source_context is not None:
+            if not isinstance(source_context, DataFlowContext):
+                raise ProcessError("trusted source_context must use DataFlowContext")
+            labels.append(source_context.labels)
+        supplied = metadata_from_labels(source_labels)
+        if supplied is not None:
+            labels.append(DataLabels.from_object_metadata(supplied))
+        aggregate = metadata_from_labels(DataLabels.aggregate(labels))
+        return propagate_object_labels(
+            base or ObjectMetadata(),
+            [aggregate] if aggregate is not None else [],
+        )
+
+    def flow_context(
+        self,
+        pid: str,
+        source_oids: Iterable[str],
+        *,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
+    ) -> DataFlowContext:
+        selected_oids = self._normalize_source_oids(source_oids)
+        contexts: list[DataFlowContext] = []
+        if selected_oids and self.data_flow is not None:
+            contexts.append(
+                self.data_flow.context_from_source_oids(
+                    pid,
+                    selected_oids,
+                    include_current=False,
+                )
+            )
+        elif selected_oids:
+            metadata: list[ObjectMetadata] = []
+            for oid in selected_oids:
+                obj = self.store.get_object(oid)
+                if obj is None:
+                    raise NotFound(f"data-flow source object not found: {oid}")
+                metadata.append(obj.metadata)
+            contexts.append(
+                DataFlowContext(
+                    labels=DataLabels.aggregate(
+                        DataLabels.from_object_metadata(item) for item in metadata
+                    )
+                )
+            )
+        if source_context is not None:
+            if not isinstance(source_context, DataFlowContext):
+                raise ProcessError("trusted source_context must use DataFlowContext")
+            contexts.append(source_context)
+        aggregate = metadata_from_labels(source_labels)
+        if aggregate is not None:
+            contexts.append(
+                DataFlowContext(labels=DataLabels.from_object_metadata(aggregate))
+            )
+        return DataFlowContext.aggregate(contexts)
+
+    def observe_message_labels(self, pid: str, messages: Iterable[ProcessMessage]) -> list[str]:
+        """Persist received-message labels as metadata-only process roots.
+
+        Message text already remains in the mailbox.  The carrier contains
+        only its id, keeping payload duplication out of Object Memory while
+        making later goal/message derivations inherit the received labels.
+        """
+
+        selected_messages = list(messages)
+        observed: list[str] = []
+        refreshed_metadata: list[tuple[ProcessMessage, dict[str, Any]]] = []
+        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
+            process = self._get(pid)
+            if process.status in self.TERMINAL_STATUSES:
+                raise ProcessError(
+                    f"cannot observe messages for terminal process: {pid} "
+                    f"status={process.status.value}"
+                )
+            for supplied_message in selected_messages:
+                message = self.store.get_process_message(supplied_message.message_id)
+                if message is None:
+                    raise ProcessError(
+                        f"cannot observe missing process message: {supplied_message.message_id}"
+                    )
+                if message.recipient_pid != pid:
+                    raise ProcessError(
+                        f"process message {message.message_id} belongs to "
+                        f"{message.recipient_pid}, not {pid}"
+                    )
+                labels = metadata_from_labels(message.metadata)
+                if labels is None:
+                    refreshed_metadata.append((supplied_message, dict(message.metadata)))
+                    continue
+                existing_oid = str(message.metadata.get("label_carrier_oid") or "").strip()
+                existing = self.store.get_object(existing_oid) if existing_oid else None
+                if existing is not None:
+                    handle = self.memory.handle_for_oid(
+                        pid,
+                        existing.oid,
+                        required_rights={"read"},
+                        optional_rights={"materialize", "link", "diff"},
+                        issued_by="process.message.observe",
+                    )
+                else:
+                    source_oids = [
+                        oid
+                        for oid in self._normalize_source_oids(message.metadata.get("source_oids"))
+                        if self.store.get_object(oid) is not None
+                    ]
+                    metadata = self.flow_metadata(
+                        source_oids,
+                        labels,
+                        base=ObjectMetadata(
+                            title="Observed process message labels",
+                            tags=["process_message", "label_carrier"],
+                        ),
+                    )
+                    handle = self.memory.create_object(
+                        pid=pid,
+                        object_type=ObjectType.MESSAGE,
+                        payload={"message_id": message.message_id},
+                        metadata=metadata,
+                        immutable=True,
+                        provenance=Provenance(
+                            source_refs=[f"process_message:{message.message_id}"],
+                            created_from_action="process.message.observe",
+                            parent_oids=source_oids,
+                        ),
+                    )
+                    expected_metadata = dict(message.metadata)
+                    message.metadata["label_carrier_oid"] = handle.oid
+                    message.updated_at = utc_now()
+                    if not self.store.update_process_message_metadata(
+                        message.message_id,
+                        recipient_pid=pid,
+                        expected_metadata=expected_metadata,
+                        metadata=message.metadata,
+                        updated_at=message.updated_at,
+                    ):
+                        raise ProcessError(
+                            f"process message metadata changed while observing: {message.message_id}"
+                        )
+                self._add_handle_to_process_view(process, handle)
+                process = self._get(pid)
+                observed.append(handle.oid)
+                refreshed_metadata.append((supplied_message, dict(message.metadata)))
+        # Keep caller-held message snapshots useful without ever copying their
+        # stale status or ACK timestamps back into durable storage.
+        for supplied_message, metadata in refreshed_metadata:
+            supplied_message.metadata.clear()
+            supplied_message.metadata.update(metadata)
+        return observed
+
+    def _ensure_goal(
+        self,
+        pid: str,
+        goal: dict[str, Any] | str | ObjectHandle | None,
+        *,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
+    ) -> ObjectHandle:
         if isinstance(goal, ObjectHandle):
-            return goal
-        default_goal = self.config.process.default_goal_text
-        payload = {"text": goal or default_goal} if isinstance(goal, str) or goal is None else goal
+            selected_sources = self._normalize_source_oids(source_oids)
+            has_additional_flow = bool(selected_sources) or source_labels is not None or source_context is not None
+            if not has_additional_flow:
+                if (
+                    self.authority_manifests is not None
+                    and self.authority_manifests.get_for_process(pid) is not None
+                ):
+                    self._assert_goal_data_flow(pid, goal)
+                return goal
+            source_goal = self.store.get_object(goal.oid)
+            if source_goal is None:
+                raise NotFound(f"process goal object not found: {goal.oid}")
+            if goal.oid not in selected_sources:
+                selected_sources.append(goal.oid)
+            payload = deepcopy(source_goal.payload)
+        else:
+            default_goal = self.config.process.default_goal_text
+            payload = {"text": goal or default_goal} if isinstance(goal, str) or goal is None else goal
+            selected_sources = self._normalize_source_oids(source_oids)
+        metadata = self.flow_metadata(
+            selected_sources,
+            source_labels,
+            source_context,
+            base=ObjectMetadata(title="Process goal", tags=["goal"]),
+        )
+        if (
+            self.authority_manifests is not None
+            and self.authority_manifests.get_for_process(pid) is not None
+        ):
+            self.authority_manifests.assert_data_flow_labels(
+                pid,
+                DataLabels.from_object_metadata(metadata),
+            )
         return self.memory.create_object(
             pid=pid,
             object_type=ObjectType.GOAL,
             payload=payload,
-            metadata=ObjectMetadata(title="Process goal", tags=["goal"]),
+            metadata=metadata,
             immutable=True,
+            provenance=Provenance(
+                created_from_action="process.goal",
+                parent_oids=selected_sources,
+            ),
         )
+
+    def _assert_goal_data_flow(self, pid: str, goal: ObjectHandle) -> None:
+        self._assert_object_data_flow(pid, goal.oid)
+
+    def _assert_object_data_flow(self, pid: str, oid: str) -> None:
+        if self.authority_manifests is None:
+            return
+        obj = self.store.get_object(oid)
+        if obj is not None:
+            labels = DataLabels.from_object_metadata(obj.metadata)
+        else:
+            # Object payloads are runtime-local and may be released on reopen,
+            # while process-result metadata remains durable. The receiver
+            # domain check must therefore use that Host-written label record
+            # before handing the caller a handle whose materialization will
+            # still fail. Direct database tampering is outside this boundary.
+            rows = self.store.select_table_rows(
+                "objects",
+                "oid = ? AND lifecycle_state IN (?, ?)",
+                (oid, "live", "released"),
+            )
+            if not rows:
+                raise NotFound(f"data-flow source object not found: {oid}")
+            try:
+                metadata = ObjectMetadata.from_persisted(
+                    loads(rows[0].get("metadata_json"), {})
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    f"invalid persisted metadata for released object {oid}: {exc}"
+                ) from exc
+            labels = DataLabels.from_object_metadata(metadata)
+        self.authority_manifests.assert_data_flow_labels(
+            pid,
+            labels,
+        )
+
+    def _normalize_source_oids(self, source_oids: Iterable[str] | None) -> list[str]:
+        if source_oids is None:
+            return []
+        if isinstance(source_oids, (str, bytes)):
+            raise ProcessError("data-flow source_oids must be a collection of Object ids")
+        selected: list[str] = []
+        seen: set[str] = set()
+        for value in source_oids:
+            oid = str(value or "").strip()
+            if not oid:
+                raise ProcessError("data-flow source_oids cannot contain empty Object ids")
+            if oid not in seen:
+                selected.append(oid)
+                seen.add(oid)
+        return selected
 
     def _grant_specs(self, pid: str, specs: Iterable[dict[str, Any]], issued_by: str) -> None:
         for spec in specs:

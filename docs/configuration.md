@@ -58,10 +58,11 @@ same change.
 | `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode` |
 | `gui` | `event_buffer_limit`, `request_body_max_bytes`, `scheduler_shutdown_join_timeout_s`, `http_shutdown_delay_s`, `object_task_wait_default_timeout_s`, `object_task_wait_max_timeout_s`, `snapshot_event_limit`, `snapshot_audit_limit`, `snapshot_llm_call_limit`, `snapshot_process_message_limit`, `snapshot_process_llm_call_limit`, `snapshot_object_task_limit`, `snapshot_collection_max_items`, `snapshot_string_max_chars`, `sse_payload_max_bytes`, `agent_rating_comment_max_chars` |
 | `capability` | `default_delegation_depth`, `max_rights_per_capability`, `max_constraints_bytes`, `list_limit`, `decision_explain_preview_chars` |
+| `data_flow` | `default_trust_level`, `default_max_sensitivity`, `sink_rules`, `registry_resource`, `registry_list_limit`, `decision_list_limit`, `file_binding_list_limit` |
 | `scheduler` | `max_quanta`, `poll_interval_s`, `max_workers`, `drain_window_s`, `shutdown_join_timeout_s` |
 | `process` | `max_tool_calls`, `max_child_processes`, `max_runtime_seconds`, `max_context_materialization_tokens`, `max_context_materialization_total_tokens`, `max_llm_calls`, `max_llm_total_tokens`, `max_subprocess_wall_seconds`, `max_subprocess_cpu_seconds`, `max_subprocess_memory_bytes`, `max_external_read_bytes`, `max_external_write_bytes`, `max_jsonrpc_bytes`, `max_mcp_bytes`, `max_deno_syscalls`, `default_goal_text`, `default_working_directory`, `fork_budget_divisor`, `fork_min_tool_calls`, `fork_min_child_processes` |
 | `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `compatibility_retry_attempts`, `action_repair_attempts`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
-| `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s` |
+| `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `executable_snapshot_sibling_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s` |
 | `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
 | `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
 | `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
@@ -93,12 +94,30 @@ Modules may also own module-local settings that are not fields of
   in registry rows, audit metadata, benchmark provenance, or GUI responses.
 - `llm.persist_full_io` defaults to true. Set it to false when the deployment's
   user agreement does not authorize retention of full prompts, tool schemas,
-  reasoning, outputs, and raw provider payloads.
+  reasoning, outputs, and raw provider payloads. The opt-out also redacts
+  conditional LLM release resume rows before approval; exact same-runtime
+  approval remains supported, while reopen fails that unrecoverable release
+  closed instead of rebuilding or dispatching it.
 - Provider-side Responses storage and chaining remain opt-in through
   `llm.store` and `llm.responses_previous_response_id`.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
   requirements as declarations, not grants. The legacy mode is a compatibility
   choice and must not be inferred from an image.
+- `data_flow.default_trust_level` is fixed to `untrusted`, and
+  `default_max_sensitivity` cannot exceed `normal`. Higher clearance is valid
+  only in a Host-owned `sink_rules` record. Rules accept exact or terminal-`*`
+  patterns; provider-backed LLM, JSON-RPC, MCP, Shell, and PTY rules above
+  `normal` require an `identity_sha256`. Duplicate or equal-priority overlapping
+  patterns fail configuration loading. See [Data Flow](data_flow.md).
+- `data_flow.registry_resource` is the `admin` capability resource for runtime
+  registry mutations. `registry_list_limit`, `decision_list_limit`, and
+  `file_binding_list_limit` bound active control-plane reads; they do not
+  truncate append-only decision or binding history in storage.
+- `tools.executable_snapshot_sibling_limit` bounds the direct sibling entries
+  linked beside a mutable workspace executable snapshot before Shell, MCP
+  stdio, or PTY dispatch. Exceeding the limit, failing enumeration, or failing
+  to link any required sibling aborts the dispatch instead of exposing a
+  partial snapshot.
 
 ## Bounded windows
 

@@ -20,16 +20,24 @@ from agent_libos.api.gui.server import (
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
 from agent_libos.models import (
+    AuditRecord,
     CapabilityRight,
+    Event,
+    EventPriority,
     EventType,
     HumanRequest,
     HumanRequestStatus,
     ObjectMetadata,
+    ObjectPatch,
     ObjectType,
     ProcessSignal,
     ProcessStatus,
+    SinkTrustLevel,
+    SinkTrustRule,
 )
+from agent_libos.models.exceptions import HumanApprovalRequired
 from agent_libos.utils.ids import utc_now
+from agent_libos.utils.serde import to_jsonable
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
 
@@ -227,6 +235,1361 @@ class TestGuiServer:
 
         assert status == 200
         assert pending_id in {request['request_id'] for request in snapshot['human_requests']}
+
+    def test_repeated_snapshot_reuses_unchanged_human_presentation_evidence(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='reuse an unchanged GUI presentation',
+        )
+        request_id = runtime.human.query(
+            pid,
+            runtime.config.runtime.default_human,
+            {'type': 'question', 'question': 'UNCHANGED_GUI_PRESENTATION'},
+            blocking=False,
+        )
+
+        first = self.server.service.snapshot()
+        effects_after_first = runtime.store.list_external_effects(pid=pid)
+        events_after_first = len(runtime.events.list())
+        audit_after_first = len(runtime.audit.trace())
+        decisions_after_first = len(runtime.store.list_data_flow_decisions(pid=pid))
+
+        second = self.server.service.snapshot()
+
+        assert next(
+            item for item in first['human_requests'] if item['request_id'] == request_id
+        ) == next(
+            item for item in second['human_requests'] if item['request_id'] == request_id
+        )
+        presentation_effects = [
+            effect
+            for effect in effects_after_first
+            if effect.provider == 'human'
+            and effect.provider_metadata.get('context', {}).get('purpose')
+            == 'gui_presentation'
+        ]
+        assert len(presentation_effects) == 1
+        assert runtime.store.list_external_effects(pid=pid) == effects_after_first
+        assert len(runtime.events.list()) == events_after_first
+        assert len(runtime.audit.trace()) == audit_after_first
+        assert len(runtime.store.list_data_flow_decisions(pid=pid)) == decisions_after_first
+
+    def test_new_gui_presentation_session_does_not_reuse_an_old_receipt(self) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='bind GUI presentation receipts to one service session',
+        )
+        request_id = runtime.human.query(
+            pid,
+            runtime.config.runtime.default_human,
+            {'type': 'question', 'question': 'SESSION_BOUND_GUI_PRESENTATION'},
+            blocking=False,
+        )
+
+        service.snapshot()
+        first_effects = [
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider == 'human'
+            and effect.provider_metadata.get('context', {}).get('purpose')
+            == 'gui_presentation'
+        ]
+        old_provider = service._human_presentation_provider
+        new_provider = type(old_provider)()
+        old_key = ('gui', request_id, id(old_provider))
+        old_receipt = runtime.human._presentation_receipts[old_key]
+        # Deterministically simulate a recycled object-id key.  Receipt
+        # identity, not just the integer key, must bind the old session.
+        runtime.human._presentation_receipts[
+            ('gui', request_id, id(new_provider))
+        ] = old_receipt
+        service._human_presentation_provider = new_provider
+
+        service.snapshot()
+        second_effects = [
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider == 'human'
+            and effect.provider_metadata.get('context', {}).get('purpose')
+            == 'gui_presentation'
+        ]
+
+        assert len(first_effects) == 1
+        assert len(second_effects) == 2
+
+    def test_cached_gui_projection_linearizes_with_sink_policy_changes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='linearize cached GUI presentation policy',
+        )
+        sentinel = 'GUI_CACHED_POLICY_LINEARIZATION_SENTINEL'
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': sentinel},
+            metadata=ObjectMetadata(sensitivity='normal'),
+        )
+        human = runtime.config.runtime.default_human
+        pattern = f'human:{human}:{runtime.config.runtime.terminal_channel}'
+
+        def register(max_sensitivity: str) -> None:
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=pattern,
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity=max_sensitivity,
+                ),
+                actor='test.host',
+                replace=True,
+                require_capability=False,
+            )
+
+        register('normal')
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': sentinel},
+            source_oids=[source.oid],
+            blocking=False,
+        )
+        assert sentinel in json.dumps(service.snapshot(), sort_keys=True)
+
+        original_receipt_check = runtime.human._presentation_was_delivered
+        receipt_checked = threading.Event()
+        allow_cached_return = threading.Event()
+        blocked_once = False
+
+        def checked_receipt(*args: object, **kwargs: object) -> bool:
+            nonlocal blocked_once
+            delivered = original_receipt_check(*args, **kwargs)
+            selected = args[0] if args else None
+            if (
+                isinstance(selected, HumanRequest)
+                and selected.request_id == request_id
+                and not blocked_once
+            ):
+                blocked_once = True
+                receipt_checked.set()
+                assert allow_cached_return.wait(timeout=5)
+            return delivered
+
+        monkeypatch.setattr(
+            runtime.human,
+            '_presentation_was_delivered',
+            checked_receipt,
+        )
+        snapshot_box: list[dict[str, Any]] = []
+        snapshot_thread = threading.Thread(
+            target=lambda: snapshot_box.append(service.snapshot()),
+            daemon=True,
+        )
+        snapshot_thread.start()
+        assert receipt_checked.wait(timeout=5)
+
+        mutation_started = threading.Event()
+        mutation_done = threading.Event()
+
+        def downgrade_sink() -> None:
+            mutation_started.set()
+            register('public')
+            mutation_done.set()
+
+        mutation_thread = threading.Thread(target=downgrade_sink, daemon=True)
+        mutation_thread.start()
+        assert mutation_started.wait(timeout=5)
+        assert mutation_done.wait(timeout=0.1) is False
+
+        allow_cached_return.set()
+        snapshot_thread.join(timeout=5)
+        mutation_thread.join(timeout=5)
+
+        assert snapshot_thread.is_alive() is False
+        assert mutation_thread.is_alive() is False
+        assert sentinel in json.dumps(snapshot_box[0], sort_keys=True)
+        assert sentinel not in json.dumps(service.snapshot(), sort_keys=True)
+
+    def test_human_presentation_evidence_does_not_starve_snapshot_causal_windows(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='preserve causal snapshot markers',
+        )
+        marker_event = runtime.events.emit(
+            EventType.PROCESS_CREATED,
+            source=pid,
+            target=pid,
+            payload={'marker': 'before-gui-presentation-burst'},
+        )
+        marker_audit = runtime.audit.record(
+            actor=pid,
+            action='test.gui.causal_marker',
+            target=f'process:{pid}',
+            decision={'marker': 'before-gui-presentation-burst'},
+        )
+        old_event_window = (
+            runtime.config.gui.snapshot_event_limit
+            + runtime.config.gui.snapshot_collection_max_items * 8
+        )
+        old_audit_window = (
+            runtime.config.gui.snapshot_audit_limit
+            + runtime.config.gui.snapshot_collection_max_items * 8
+        )
+        burst_size = max(old_event_window, old_audit_window) * 2 + 1
+        burst_timestamp = '9999-12-31T23:59:59+00:00'
+        for index in range(burst_size):
+            runtime.store.insert_event(
+                Event(
+                    event_id=f'evt_gui_presentation_burst_{index:05d}',
+                    type=EventType.HUMAN_OUTPUT,
+                    source='human:owner',
+                    target=pid,
+                    payload={'purpose': 'gui_presentation'},
+                    priority=EventPriority.NORMAL,
+                    created_at=burst_timestamp,
+                )
+            )
+            runtime.store.insert_audit(
+                AuditRecord(
+                    record_id=f'audit_gui_presentation_burst_{index:05d}',
+                    timestamp=burst_timestamp,
+                    actor='human:owner',
+                    action='human.output',
+                    target=f'human:{runtime.config.runtime.default_human}:terminal',
+                    input_refs=[],
+                    output_refs=[],
+                    capability_refs=[],
+                    decision={'purpose': 'gui_presentation'},
+                    correlation_id=None,
+                )
+            )
+
+        event_queries: list[dict[str, Any]] = []
+        audit_queries: list[dict[str, Any]] = []
+        original_list_events = runtime.store.list_events
+        original_list_audit = runtime.store.list_audit
+
+        def tracked_events(*args: Any, **kwargs: Any) -> list[Event]:
+            event_queries.append(dict(kwargs))
+            return original_list_events(*args, **kwargs)
+
+        def tracked_audit(*args: Any, **kwargs: Any) -> list[AuditRecord]:
+            audit_queries.append(dict(kwargs))
+            return original_list_audit(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.store, 'list_events', tracked_events)
+        monkeypatch.setattr(runtime.store, 'list_audit', tracked_audit)
+        snapshot = self.server.service.snapshot()
+
+        assert marker_event.event_id in {item['event_id'] for item in snapshot['events']}
+        assert marker_audit.record_id in {item['record_id'] for item in snapshot['audit']}
+        assert event_queries == [
+            {
+                'target': None,
+                'limit': runtime.config.gui.snapshot_event_limit,
+                'before_event_id': None,
+                'after_event_id': None,
+                'include_gui_presentation': False,
+            }
+        ]
+        assert audit_queries == [
+            {
+                'limit': runtime.config.gui.snapshot_audit_limit,
+                'actor': None,
+                'target': None,
+                'match_any': False,
+                'include_gui_presentation': False,
+            }
+        ]
+
+    def test_snapshot_completed_release_history_cannot_crowd_out_withheld_parent(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='pending Human release pair must stay visible',
+        )
+        human = runtime.config.runtime.default_human
+        now = utc_now()
+        limit = runtime.config.gui.snapshot_collection_max_items
+        for index in range(limit + 2):
+            runtime.store.insert_human_request(
+                HumanRequest(
+                    request_id=f'hreq_completed_release_{index:04d}',
+                    pid=pid,
+                    human=human,
+                    payload={
+                        'type': 'data_release_approval',
+                        'question': f'completed release {index}',
+                    },
+                    status=HumanRequestStatus.APPROVED,
+                    decision={'approved': True},
+                    blocking=False,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_PENDING_PAIR_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=(
+                    f'human:{human}:'
+                    f'{runtime.config.runtime.terminal_channel}'
+                ),
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        parent_id = runtime.human.query(
+            pid,
+            human,
+            {
+                'type': 'question',
+                'question': 'GUI_PENDING_PAIR_SECRET_SENTINEL',
+            },
+            source_oids=[source.oid],
+        )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        requests = snapshot['human_requests']
+        assert len(requests) == limit
+        assert 'GUI_PENDING_PAIR_SECRET_SENTINEL' not in json.dumps(
+            requests,
+            sort_keys=True,
+        )
+        parent = next(item for item in requests if item['request_id'] == parent_id)
+        release = next(
+            item
+            for item in requests
+            if item.get('release_for_request_id') == parent_id
+            and item['status'] == HumanRequestStatus.PENDING.value
+        )
+        assert parent['payload']['release_required'] is True
+        assert requests.index(release) < requests.index(parent)
+
+    def test_presentation_window_does_not_release_a_cropped_approved_parent(self) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='cropped GUI parent must remain withheld',
+        )
+        human = runtime.config.runtime.default_human
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=(
+                    f'human:{human}:'
+                    f'{runtime.config.runtime.terminal_channel}'
+                ),
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        first_source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_FIRST_WINDOW_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        cropped_source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_CROPPED_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': 'GUI_FIRST_WINDOW_SECRET_SENTINEL'},
+            source_oids=[first_source.oid],
+        )
+        cropped_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': 'GUI_CROPPED_SECRET_SENTINEL'},
+            source_oids=[cropped_source.oid],
+        )
+        cropped_view = service.human_request_view(runtime.human.get(cropped_id))
+        assert cropped_view['payload']['release_required'] is True
+        cropped_release_id = cropped_view['release_request_id']
+        cropped_release = runtime.human.approve(
+            cropped_release_id,
+            {'approved': True, 'source': 'test.gui'},
+        )
+        release_resource = cropped_release.payload['requested_once_capability']['resource']
+        release_capability = next(
+            capability
+            for capability in runtime.store.list_capabilities(subject=pid)
+            if capability.resource == release_resource
+        )
+        assert release_capability.uses_remaining == 1
+        cropped_effects_before = [
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider_metadata.get('context', {}).get('request_id') == cropped_id
+        ]
+
+        views, has_more = runtime.human.list_for_presentation_window(
+            presentation='gui',
+            provider=service._human_presentation_provider,
+            limit=2,
+        )
+
+        assert has_more is True
+        assert cropped_id not in {
+            request['request_id'] for request in views
+        }
+        assert len(views) == 2
+        assert views[0].get('release_for_request_id') == views[1]['request_id']
+        assert views[1]['payload']['release_required'] is True
+        release_capability_after = next(
+            capability
+            for capability in runtime.store.list_capabilities(subject=pid)
+            if capability.cap_id == release_capability.cap_id
+        )
+        assert release_capability_after.uses_remaining == 1
+        assert [
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider_metadata.get('context', {}).get('request_id') == cropped_id
+        ] == cropped_effects_before
+        assert runtime.human.is_request_withheld_for_presentation(
+            cropped_id,
+            presentation='gui',
+        ) is True
+
+        parent_before_denial = to_jsonable(runtime.human.get(cropped_id))
+        process_before_denial = to_jsonable(runtime.process.get(pid))
+        denied_status, denied = self.request(
+            'POST',
+            f'/api/human-requests/{cropped_id}/respond',
+            {'approved': True, 'answer': 'not presented', 'auto_run': False},
+        )
+        assert denied_status == 409
+        assert 'not been released' in denied['error']['message']
+        assert to_jsonable(runtime.human.get(cropped_id)) == parent_before_denial
+        assert to_jsonable(runtime.process.get(pid)) == process_before_denial
+
+    def test_presentation_window_reports_pair_expansion_without_raw_lookahead(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='logical Human presentation expansion',
+        )
+        human = runtime.config.runtime.default_human
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=(
+                    f'human:{human}:'
+                    f'{runtime.config.runtime.terminal_channel}'
+                ),
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_EXPANSION_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        first_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': 'GUI_EXPANSION_SECRET_SENTINEL'},
+            source_oids=[source.oid],
+        )
+        second_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': 'ordinary second parent'},
+        )
+
+        views, has_more = runtime.human.list_for_presentation_window(
+            presentation='gui',
+            provider=self.server.service._human_presentation_provider,
+            limit=2,
+        )
+
+        assert has_more is True
+        assert [view.get('release_for_request_id') for view in views] == [first_id, None]
+        assert views[1]['request_id'] == first_id
+        assert second_id not in {view['request_id'] for view in views}
+
+    def test_human_request_views_redact_conditional_payload_before_exact_release(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image='base-agent:v0', goal='redact conditional Human request')
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI DATA_FLOW_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        human = runtime.config.runtime.default_human
+        channel = runtime.config.runtime.terminal_channel
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=f'human:{human}:{channel}',
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {
+                'type': 'question',
+                'question': 'GUI DATA_FLOW_SECRET_SENTINEL',
+                'note': 'GUI_NOTE_SECRET_SENTINEL',
+                'custom': {
+                    'arbitrary_leaf': 'GUI_NESTED_SECRET_SENTINEL',
+                },
+            },
+            source_oids=[source.oid],
+        )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+        list_status, listed = self.request('GET', '/api/human-requests')
+        process_status, process_list = self.request(
+            'GET',
+            f'/api/processes/{pid}/human-requests',
+        )
+
+        assert status == list_status == process_status == 200
+        snapshot_encoded = json.dumps(snapshot, sort_keys=True)
+        assert 'GUI DATA_FLOW_SECRET_SENTINEL' not in snapshot_encoded
+        assert 'GUI_NOTE_SECRET_SENTINEL' not in snapshot_encoded
+        assert 'GUI_NESTED_SECRET_SENTINEL' not in snapshot_encoded
+        for projection in (snapshot['human_requests'], listed, process_list):
+            encoded = json.dumps(projection, sort_keys=True)
+            assert 'GUI DATA_FLOW_SECRET_SENTINEL' not in encoded
+            assert 'GUI_NOTE_SECRET_SENTINEL' not in encoded
+            assert 'GUI_NESTED_SECRET_SENTINEL' not in encoded
+            parent = next(item for item in projection if item['request_id'] == request_id)
+            assert parent['payload']['release_required'] is True
+            assert parent['payload']['payload_observation']['redacted'] is True
+            assert parent['payload']['payload_observation']['metadata_only'] is True
+            release = next(
+                item
+                for item in projection
+                if item['payload'].get('type') == 'data_release_approval'
+            )
+            assert release['payload']['context']['payload_sha256']
+            assert release['release_for_request_id'] == request_id
+
+        releases = [
+            item
+            for item in runtime.human.list()
+            if item.payload.get('type') == 'data_release_approval'
+        ]
+        assert len(releases) == 1
+        release = releases[0]
+        assert release.payload['context']['sink'] == f'human:{human}:gui'
+        assert release.payload['context']['operation'] == 'human.gui.present'
+
+        parent_before_denial = to_jsonable(runtime.human.get(request_id))
+        process_before_denial = to_jsonable(runtime.process.get(pid))
+        requests_before_denial = to_jsonable(runtime.human.list(pid=pid))
+        capabilities_before_denial = to_jsonable(
+            runtime.store.list_capabilities(subject=pid)
+        )
+        decisions_before_denial = to_jsonable(
+            runtime.store.list_data_flow_decisions(pid=pid)
+        )
+        withheld_status, withheld = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'too early', 'auto_run': False},
+        )
+        assert withheld_status == 409
+        assert 'not been released' in withheld['error']['message']
+        assert to_jsonable(runtime.human.get(request_id)) == parent_before_denial
+        assert to_jsonable(runtime.process.get(pid)) == process_before_denial
+        assert to_jsonable(runtime.human.list(pid=pid)) == requests_before_denial
+        assert to_jsonable(runtime.store.list_capabilities(subject=pid)) == capabilities_before_denial
+        assert to_jsonable(runtime.store.list_data_flow_decisions(pid=pid)) == decisions_before_denial
+
+        response_status, _response = self.request(
+            'POST',
+            f'/api/human-requests/{release.request_id}/respond',
+            {'approved': True, 'auto_run': False},
+        )
+        assert response_status == 200
+
+        released_status, released_snapshot = self.request('GET', '/api/snapshot')
+        repeated_status, repeated_snapshot = self.request('GET', '/api/snapshot')
+        assert released_status == repeated_status == 200
+        for projection in (released_snapshot['human_requests'], repeated_snapshot['human_requests']):
+            parent = next(item for item in projection if item['request_id'] == request_id)
+            assert parent['payload']['question'] == 'GUI DATA_FLOW_SECRET_SENTINEL'
+            assert parent['payload']['note'] == 'GUI_NOTE_SECRET_SENTINEL'
+            assert parent['payload']['custom']['arbitrary_leaf'] == 'GUI_NESTED_SECRET_SENTINEL'
+        assert len([
+            item
+            for item in runtime.human.list()
+            if item.payload.get('type') == 'data_release_approval'
+        ]) == 1
+        release_caps = [
+            capability
+            for capability in runtime.store.list_capabilities(subject=pid)
+            if capability.resource == release.payload['requested_once_capability']['resource']
+        ]
+        assert len(release_caps) == 1
+        assert release_caps[0].uses_remaining == 0
+        presentation_effects = [
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider == 'human'
+            and effect.provider_metadata.get('context', {}).get('purpose') == 'gui_presentation'
+        ]
+        assert len(presentation_effects) == 1
+        presentation_flow = presentation_effects[0].provider_metadata['data_flow']
+        assert presentation_flow['sink'] == f'human:{human}:gui'
+        assert presentation_flow['release_capability_id'] == release_caps[0].cap_id
+
+        answered_status, answered = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'released answer', 'auto_run': False},
+        )
+        assert answered_status == 200
+        assert answered['request']['status'] == 'approved'
+        assert 'answer' not in answered['request']['decision']
+        assert answered['request']['payload']['release_required'] is True
+        decision_release = next(
+            item
+            for item in runtime.human.list(pid=pid)
+            if item.payload.get('type') == 'data_release_approval'
+            and item.request_id != release.request_id
+        )
+        assert decision_release.status == HumanRequestStatus.PENDING
+        runtime.human.approve(
+            decision_release.request_id,
+            {'approved': True, 'source': 'test.gui'},
+        )
+        decision_status, decision_snapshot = self.request('GET', '/api/snapshot')
+        assert decision_status == 200
+        decision_parent = next(
+            item
+            for item in decision_snapshot['human_requests']
+            if item['request_id'] == request_id
+        )
+        assert decision_parent['decision']['answer'] == 'released answer'
+        assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+    def test_gui_presentation_release_does_not_suspend_runnable_process(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='keep runnable during GUI presentation release',
+        )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_PRESENTATION_RELEASE_SECRET'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        human = runtime.config.runtime.default_human
+        channel = runtime.config.runtime.terminal_channel
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=f'human:{human}:{channel}',
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {
+                'type': 'question',
+                'question': 'GUI_PRESENTATION_RELEASE_SECRET',
+            },
+            blocking=False,
+            source_oids=[source.oid],
+        )
+        assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        parent = next(
+            item for item in snapshot['human_requests']
+            if item['request_id'] == request_id
+        )
+        assert parent['payload']['release_required'] is True
+        release = next(
+            item for item in runtime.human.list(pid=pid)
+            if item.payload.get('type') == 'data_release_approval'
+        )
+        assert release.payload['_agent_libos_data_release_presentation'] == 'gui'
+        assert release.blocking is False
+        assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+    def test_gui_conditional_release_survives_reopen_without_duplicate(self) -> None:
+        db_path = Path(self.temp_dir.name) / 'gui-human-release.sqlite'
+        runtime = Runtime.open(str(db_path))
+        service = GuiRuntimeService(
+            runtime=runtime,
+            token='reopen-one',
+            auto_run=False,
+        )
+        pid = runtime.process.spawn(image='base-agent:v0', goal='reopen GUI release')
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_REOPEN_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        human = runtime.config.runtime.default_human
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=f'human:{human}:{runtime.config.runtime.terminal_channel}',
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {
+                'type': 'question',
+                'question': 'GUI_REOPEN_SECRET_SENTINEL',
+            },
+            source_oids=[source.oid],
+        )
+        first = service.snapshot()
+        first_encoded = json.dumps(first['human_requests'], sort_keys=True)
+        assert 'GUI_REOPEN_SECRET_SENTINEL' not in first_encoded
+        release_ids = [
+            item.request_id
+            for item in runtime.human.list()
+            if item.payload.get('type') == 'data_release_approval'
+        ]
+        assert len(release_ids) == 1
+        release_id = release_ids[0]
+        service.close()
+        runtime.close()
+
+        reopened = Runtime.open(str(db_path))
+        reopened_server = create_gui_http_server(
+            runtime=reopened,
+            port=0,
+            token='reopen-two',
+            auto_run=False,
+        )
+        reopened_thread = threading.Thread(
+            target=reopened_server.serve_forever,
+            daemon=True,
+        )
+        reopened_thread.start()
+        reopened_host, reopened_port = reopened_server.server_address
+
+        def reopened_request(
+            method: str,
+            path: str,
+            body: dict[str, Any] | None = None,
+        ) -> tuple[int, Any]:
+            conn = http.client.HTTPConnection(reopened_host, reopened_port, timeout=10)
+            headers = {'Authorization': 'Bearer reopen-two'}
+            payload = None
+            if body is not None:
+                payload = json.dumps(body).encode('utf-8')
+                headers['Content-Type'] = 'application/json'
+            conn.request(method, path, body=payload, headers=headers)
+            response = conn.getresponse()
+            data = response.read()
+            conn.close()
+            decoded = json.loads(data.decode('utf-8')) if data else None
+            return response.status, decoded
+
+        try:
+            reopened_status, reopened_snapshot = reopened_request('GET', '/api/snapshot')
+            assert reopened_status == 200
+            assert 'GUI_REOPEN_SECRET_SENTINEL' not in json.dumps(
+                reopened_snapshot['human_requests'],
+                sort_keys=True,
+            )
+            reopened_release_ids = [
+                item.request_id
+                for item in reopened.human.list()
+                if item.payload.get('type') == 'data_release_approval'
+            ]
+            assert reopened_release_ids == [release_id]
+
+            parent_before_denial = to_jsonable(reopened.human.get(request_id))
+            process_before_denial = to_jsonable(reopened.process.get(pid))
+            requests_before_denial = to_jsonable(reopened.human.list(pid=pid))
+            capabilities_before_denial = to_jsonable(
+                reopened.store.list_capabilities(subject=pid)
+            )
+            decisions_before_denial = to_jsonable(
+                reopened.store.list_data_flow_decisions(pid=pid)
+            )
+            withheld_status, withheld = reopened_request(
+                'POST',
+                f'/api/human-requests/{request_id}/respond',
+                {'approved': True, 'answer': 'too early', 'auto_run': False},
+            )
+            assert withheld_status == 409
+            assert 'not been released' in withheld['error']['message']
+            assert to_jsonable(reopened.human.get(request_id)) == parent_before_denial
+            assert to_jsonable(reopened.process.get(pid)) == process_before_denial
+            assert to_jsonable(reopened.human.list(pid=pid)) == requests_before_denial
+            assert to_jsonable(reopened.store.list_capabilities(subject=pid)) == capabilities_before_denial
+            assert to_jsonable(reopened.store.list_data_flow_decisions(pid=pid)) == decisions_before_denial
+
+            reopened.human.approve(
+                release_id,
+                {'approved': True, 'source': 'test.gui'},
+            )
+
+            parent_before_consumption = to_jsonable(reopened.human.get(request_id))
+            process_before_consumption = to_jsonable(reopened.process.get(pid))
+            requests_before_consumption = to_jsonable(reopened.human.list(pid=pid))
+            capabilities_before_consumption = to_jsonable(
+                reopened.store.list_capabilities(subject=pid)
+            )
+            decisions_before_consumption = to_jsonable(
+                reopened.store.list_data_flow_decisions(pid=pid)
+            )
+            unconsumed_status, unconsumed = reopened_request(
+                'POST',
+                f'/api/human-requests/{request_id}/respond',
+                {'approved': True, 'answer': 'still too early', 'auto_run': False},
+            )
+            assert unconsumed_status == 409
+            assert 'not been released' in unconsumed['error']['message']
+            assert to_jsonable(reopened.human.get(request_id)) == parent_before_consumption
+            assert to_jsonable(reopened.process.get(pid)) == process_before_consumption
+            assert to_jsonable(reopened.human.list(pid=pid)) == requests_before_consumption
+            assert to_jsonable(reopened.store.list_capabilities(subject=pid)) == capabilities_before_consumption
+            assert to_jsonable(reopened.store.list_data_flow_decisions(pid=pid)) == decisions_before_consumption
+
+            released_status, released = reopened_request('GET', '/api/snapshot')
+            assert released_status == 200
+            parent = next(
+                item
+                for item in released['human_requests']
+                if item['request_id'] == request_id
+            )
+            assert parent['payload']['question'] == 'GUI_REOPEN_SECRET_SENTINEL'
+            assert [
+                item.request_id
+                for item in reopened.human.list()
+                if item.payload.get('type') == 'data_release_approval'
+            ] == [release_id]
+
+            answered_status, answered = reopened_request(
+                'POST',
+                f'/api/human-requests/{request_id}/respond',
+                {'approved': True, 'answer': 'after reopen', 'auto_run': False},
+            )
+            assert answered_status == 200
+            assert answered['request']['status'] == 'approved'
+            assert 'answer' not in answered['request']['decision']
+            assert answered['request']['payload']['release_required'] is True
+            decision_release = next(
+                item
+                for item in reopened.human.list(pid=pid)
+                if item.payload.get('type') == 'data_release_approval'
+                and item.request_id != release_id
+            )
+            assert decision_release.status == HumanRequestStatus.PENDING
+            reopened.human.approve(
+                decision_release.request_id,
+                {'approved': True, 'source': 'test.gui'},
+            )
+            decision_status, decision_snapshot = reopened_request(
+                'GET',
+                '/api/snapshot',
+            )
+            assert decision_status == 200
+            decision_parent = next(
+                item
+                for item in decision_snapshot['human_requests']
+                if item['request_id'] == request_id
+            )
+            assert decision_parent['decision']['answer'] == 'after reopen'
+            assert reopened.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            reopened_server.shutdown()
+            reopened_thread.join(timeout=5)
+            reopened_server.service.shutdown()
+            reopened_server.server_close()
+            reopened.close()
+
+    def test_gui_visible_release_is_invalidated_by_sink_registry_generation(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='invalidate stale GUI release',
+        )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_STALE_RELEASE_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+            immutable=False,
+        )
+        human = runtime.config.runtime.default_human
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=f'human:{human}:{runtime.config.runtime.terminal_channel}',
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {
+                'type': 'question',
+                'question': 'GUI_STALE_RELEASE_SECRET_SENTINEL',
+            },
+            source_oids=[source.oid],
+        )
+
+        initial_status, initial = self.request('GET', '/api/snapshot')
+        assert initial_status == 200
+        assert 'GUI_STALE_RELEASE_SECRET_SENTINEL' not in json.dumps(initial, sort_keys=True)
+        first_release = next(
+            item
+            for item in runtime.human.list()
+            if item.payload.get('type') == 'data_release_approval'
+        )
+        approval_status, _ = self.request(
+            'POST',
+            f'/api/human-requests/{first_release.request_id}/respond',
+            {'approved': True, 'auto_run': False},
+        )
+        assert approval_status == 200
+        visible_status, visible = self.request('GET', '/api/snapshot')
+        assert visible_status == 200
+        visible_parent = next(
+            item for item in visible['human_requests'] if item['request_id'] == request_id
+        )
+        assert visible_parent['payload']['question'] == 'GUI_STALE_RELEASE_SECRET_SENTINEL'
+
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern='human:gui-release-generation-bump:terminal',
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        parent_before_denial = to_jsonable(runtime.human.get(request_id))
+        process_before_denial = to_jsonable(runtime.process.get(pid))
+        requests_before_denial = to_jsonable(runtime.human.list(pid=pid))
+        capabilities_before_denial = to_jsonable(
+            runtime.store.list_capabilities(subject=pid)
+        )
+        decisions_before_denial = to_jsonable(
+            runtime.store.list_data_flow_decisions(pid=pid)
+        )
+        stale_status, stale = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'stale release', 'auto_run': False},
+        )
+        assert stale_status == 409
+        assert 'not been released' in stale['error']['message']
+        assert to_jsonable(runtime.human.get(request_id)) == parent_before_denial
+        assert to_jsonable(runtime.process.get(pid)) == process_before_denial
+        assert to_jsonable(runtime.human.list(pid=pid)) == requests_before_denial
+        assert to_jsonable(runtime.store.list_capabilities(subject=pid)) == capabilities_before_denial
+        assert to_jsonable(runtime.store.list_data_flow_decisions(pid=pid)) == decisions_before_denial
+
+        redacted_status, redacted = self.request('GET', '/api/snapshot')
+        assert redacted_status == 200
+        assert 'GUI_STALE_RELEASE_SECRET_SENTINEL' not in json.dumps(redacted, sort_keys=True)
+        redacted_parent = next(
+            item for item in redacted['human_requests'] if item['request_id'] == request_id
+        )
+        assert redacted_parent['payload']['release_required'] is True
+        second_release = next(
+            item
+            for item in runtime.human.list()
+            if item.payload.get('type') == 'data_release_approval'
+            and item.request_id != first_release.request_id
+        )
+        assert second_release.status == HumanRequestStatus.PENDING
+
+        renewed_status, renewed = self.request(
+            'POST',
+            f'/api/human-requests/{second_release.request_id}/respond',
+            {'approved': True, 'auto_run': False},
+        )
+        assert renewed_status == 200, renewed
+        renewed_snapshot_status, renewed_snapshot = self.request('GET', '/api/snapshot')
+        assert renewed_snapshot_status == 200
+        renewed_parent = next(
+            item
+            for item in renewed_snapshot['human_requests']
+            if item['request_id'] == request_id
+        )
+        assert renewed_parent['payload']['question'] == 'GUI_STALE_RELEASE_SECRET_SENTINEL'
+
+        runtime.memory.update_object(
+            pid,
+            source,
+            ObjectPatch(payload={'value': 'source changed after GUI release'}),
+        )
+        parent_before_source_denial = to_jsonable(runtime.human.get(request_id))
+        process_before_source_denial = to_jsonable(runtime.process.get(pid))
+        source_stale_status, source_stale = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {'approved': True, 'answer': 'source is stale', 'auto_run': False},
+        )
+        assert source_stale_status == 409
+        assert 'not been released' in source_stale['error']['message']
+        assert to_jsonable(runtime.human.get(request_id)) == parent_before_source_denial
+        assert to_jsonable(runtime.process.get(pid)) == process_before_source_denial
+
+        source_redacted_status, source_redacted = self.request('GET', '/api/snapshot')
+        assert source_redacted_status == 200
+        assert 'GUI_STALE_RELEASE_SECRET_SENTINEL' not in json.dumps(
+            source_redacted,
+            sort_keys=True,
+        )
+        source_redacted_parent = next(
+            item
+            for item in source_redacted['human_requests']
+            if item['request_id'] == request_id
+        )
+        assert source_redacted_parent['payload']['release_required'] is True
+
+    @pytest.mark.parametrize(
+        ('sensitivity', 'initial_max', 'downgraded_max'),
+        [
+            ('secret', 'secret', 'normal'),
+            ('normal', 'normal', 'public'),
+        ],
+    )
+    def test_gui_projection_revalidates_trusted_sink_clearance(
+        self,
+        sensitivity: str,
+        initial_max: str,
+        downgraded_max: str,
+    ) -> None:
+        runtime = self.server.service.runtime
+        sentinel = f'GUI_TRUSTED_DOWNGRADE_{sensitivity.upper()}_SENTINEL'
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='revalidate trusted GUI projection clearance',
+        )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': sentinel},
+            metadata=ObjectMetadata(sensitivity=sensitivity),
+        )
+        human = runtime.config.runtime.default_human
+        pattern = f'human:{human}:{runtime.config.runtime.terminal_channel}'
+
+        def register(max_sensitivity: str) -> None:
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=pattern,
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity=max_sensitivity,
+                ),
+                actor='test.host',
+                replace=True,
+                require_capability=False,
+            )
+
+        register(initial_max)
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': sentinel},
+            source_oids=[source.oid],
+        )
+
+        initial_status, initial = self.request('GET', '/api/snapshot')
+        assert initial_status == 200
+        initial_parent = next(
+            item for item in initial['human_requests'] if item['request_id'] == request_id
+        )
+        assert initial_parent['payload']['question'] == sentinel
+
+        register(downgraded_max)
+        decisions_before = {
+            item.decision_id for item in runtime.store.list_data_flow_decisions(pid=pid)
+        }
+        downgraded_status, downgraded = self.request('GET', '/api/snapshot')
+
+        assert downgraded_status == 200
+        assert sentinel not in json.dumps(downgraded, sort_keys=True)
+        downgraded_parent = next(
+            item
+            for item in downgraded['human_requests']
+            if item['request_id'] == request_id
+        )
+        assert downgraded_parent['payload']['release_required'] is True
+        denials = [
+            item
+            for item in runtime.store.list_data_flow_decisions(pid=pid, outcome='deny')
+            if item.decision_id not in decisions_before
+            and item.sink == f'human:{human}:gui'
+        ]
+        assert len(denials) == 1
+        denial = denials[0]
+        assert denial.labels.sensitivity.value == sensitivity
+        assert f'exceeds Sink maximum {downgraded_max}' in denial.reason
+        assert any(
+            record.action == 'data_flow.egress'
+            and record.target == f'human:{human}:gui'
+            and record.decision.get('decision_id') == denial.decision_id
+            and record.decision.get('outcome') == 'deny'
+            for record in runtime.audit.trace()
+        )
+        assert any(
+            event.type == EventType.DATA_FLOW_DECISION
+            and event.payload.get('decision_id') == denial.decision_id
+            and event.payload.get('outcome') == 'deny'
+            for event in runtime.events.list(target=f'data_flow_sink:human:{human}:gui')
+        )
+
+        register(initial_max)
+        restored_status, restored = self.request('GET', '/api/snapshot')
+        assert restored_status == 200, restored
+        restored_parent = next(
+            item for item in restored['human_requests'] if item['request_id'] == request_id
+        )
+        assert restored_parent['payload']['question'] == sentinel
+        repeated_status, repeated = self.request('GET', '/api/snapshot')
+        assert repeated_status == 200, repeated
+        repeated_parent = next(
+            item for item in repeated['human_requests'] if item['request_id'] == request_id
+        )
+        assert repeated_parent['payload']['question'] == sentinel
+
+    def test_gui_response_guard_and_decision_share_binding_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='serialize GUI presentation guard with Human decision',
+        )
+        human = runtime.config.runtime.default_human
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_ATOMIC_GUARD_SECRET_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=(
+                    f'human:{human}:'
+                    f'{runtime.config.runtime.terminal_channel}'
+                ),
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': 'GUI_ATOMIC_GUARD_SECRET_SENTINEL'},
+            source_oids=[source.oid],
+        )
+        withheld = self.server.service.human_request_view(runtime.human.get(request_id))
+        release_id = withheld['release_request_id']
+        runtime.human.approve(release_id, {'approved': True, 'source': 'test.gui'})
+        visible = self.server.service.human_request_view(runtime.human.get(request_id))
+        assert visible['payload']['question'] == 'GUI_ATOMIC_GUARD_SECRET_SENTINEL'
+
+        original_guard = runtime.human.is_request_withheld_for_presentation
+        guard_checked = threading.Event()
+        allow_decision = threading.Event()
+        blocked_once = False
+
+        def guarded(request: HumanRequest | str, *, presentation: str) -> bool:
+            nonlocal blocked_once
+            result = original_guard(request, presentation=presentation)
+            selected_id = request.request_id if isinstance(request, HumanRequest) else request
+            if selected_id == request_id and not blocked_once:
+                blocked_once = True
+                guard_checked.set()
+                assert allow_decision.wait(timeout=5)
+            return result
+
+        monkeypatch.setattr(runtime.human, 'is_request_withheld_for_presentation', guarded)
+        response_box: list[tuple[int, Any]] = []
+        response_thread = threading.Thread(
+            target=lambda: response_box.append(
+                self.request(
+                    'POST',
+                    f'/api/human-requests/{request_id}/respond',
+                    {'approved': True, 'answer': 'atomic answer', 'auto_run': False},
+                )
+            ),
+            daemon=True,
+        )
+        response_thread.start()
+        assert guard_checked.wait(timeout=5)
+
+        mutation_started = threading.Event()
+        mutation_done = threading.Event()
+        status_seen_after_mutation: list[HumanRequestStatus] = []
+
+        def mutate_registry() -> None:
+            mutation_started.set()
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='human:gui-atomic-generation-bump:terminal',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            status_seen_after_mutation.append(runtime.human.get(request_id).status)
+            mutation_done.set()
+
+        mutation_thread = threading.Thread(target=mutate_registry, daemon=True)
+        mutation_thread.start()
+        assert mutation_started.wait(timeout=5)
+        assert mutation_done.wait(timeout=0.1) is False
+
+        allow_decision.set()
+        response_thread.join(timeout=5)
+        mutation_thread.join(timeout=5)
+
+        assert response_thread.is_alive() is False
+        assert mutation_thread.is_alive() is False
+        assert response_box[0][0] == 200
+        assert status_seen_after_mutation == [HumanRequestStatus.APPROVED]
+        assert runtime.human.get(request_id).decision['answer'] == 'atomic answer'
+
+    def test_gui_release_binds_the_returned_decision_view(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='bind GUI release to the complete returned view',
+        )
+        human = runtime.config.runtime.default_human
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_COMPLETE_VIEW_SECRET'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=(
+                    f'human:{human}:'
+                    f'{runtime.config.runtime.terminal_channel}'
+                ),
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            require_capability=False,
+        )
+        request_id = runtime.human.query(
+            pid,
+            human,
+            {'type': 'question', 'question': 'GUI_COMPLETE_VIEW_SECRET'},
+            source_oids=[source.oid],
+        )
+
+        initial_status, _initial = self.request('GET', '/api/snapshot')
+        assert initial_status == 200
+        first_release = next(
+            item
+            for item in runtime.human.list(pid=pid)
+            if item.payload.get('type') == 'data_release_approval'
+        )
+        runtime.human.approve(
+            first_release.request_id,
+            {'approved': True, 'source': 'test.gui'},
+        )
+        visible_status, visible = self.request('GET', '/api/snapshot')
+        assert visible_status == 200
+        visible_parent = next(
+            item for item in visible['human_requests'] if item['request_id'] == request_id
+        )
+        assert visible_parent['payload']['question'] == 'GUI_COMPLETE_VIEW_SECRET'
+        decisions_before_response = len(
+            runtime.store.list_data_flow_decisions(pid=pid)
+        )
+
+        answered_status, answered = self.request(
+            'POST',
+            f'/api/human-requests/{request_id}/respond',
+            {
+                'approved': True,
+                'answer': 'GUI_DECISION_SECRET_SENTINEL',
+                'auto_run': False,
+            },
+        )
+
+        assert answered_status == 200
+        assert 'GUI_DECISION_SECRET_SENTINEL' not in json.dumps(
+            answered['request'],
+            sort_keys=True,
+        )
+        assert answered['request']['payload']['release_required'] is True
+        assert len(runtime.store.list_data_flow_decisions(pid=pid)) > decisions_before_response
+        second_release = next(
+            item
+            for item in runtime.human.list(pid=pid)
+            if item.payload.get('type') == 'data_release_approval'
+            and item.request_id != first_release.request_id
+        )
+        assert second_release.status == HumanRequestStatus.PENDING
+
+        runtime.human.approve(
+            second_release.request_id,
+            {'approved': True, 'source': 'test.gui'},
+        )
+        released_status, released = self.request('GET', '/api/snapshot')
+        assert released_status == 200
+        released_parent = next(
+            item for item in released['human_requests'] if item['request_id'] == request_id
+        )
+        assert released_parent['decision']['answer'] == 'GUI_DECISION_SECRET_SENTINEL'
 
     def test_snapshot_source_bounds_process_and_registry_reads(self, monkeypatch: pytest.MonkeyPatch) -> None:
         service = self.server.service

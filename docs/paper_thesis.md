@@ -15,10 +15,11 @@ use remote resources, ask humans, and resume across long executions. Those
 behaviors are useful, but they make prompt-only control, wrapper-level tool
 lists, and host isolation insufficient as the primary authority boundary.
 
-Agent libOS argues for an agent-native boundary:
+Agent libOS argues for two coupled, Host-enforced boundaries:
 
 ```text
-process identity + capability + primitive + audit
+authority:        process identity + capability + primitive + audit
+information flow: trusted data labels + Host Sink trust + exact release
 ```
 
 A process may see a model-facing tool, Skill, JIT tool, image definition,
@@ -26,6 +27,12 @@ child-process handle, checkpoint, or remote endpoint. Resource access is still
 decided only when a libOS primitive runs under that process id. Capability
 checks, policy, human approval, provider containment, external-effect
 classification, events, and audit all happen at that primitive boundary.
+Trusted source labels propagate through runtime Objects, messages, Tool/JIT
+results, Human answers, and provider ingress. Before runtime-mediated egress,
+the Host resolves a canonical Sink identity and clearance from its durable
+registry; a model cannot declare a Sink trusted. Conditional high-sensitivity
+egress requires an exact one-shot Human release bound to the Sink, payload,
+source versions, labels, manifest, and registry generation.
 
 The contribution is not a larger tool catalog. The contribution is a runtime
 substrate for capability-controlled self-evolution.
@@ -46,10 +53,14 @@ substrate for capability-controlled self-evolution.
    image registry/exec/commit primitives, standard `SKILL.md` packages, JSON-RPC over
    HTTP client endpoints, MCP client tools over registered servers, and
    Deno/TypeScript JIT tools that can reach libOS only through syscall RPC.
+   The same implementation carries trusted data-flow labels, enforces
+   Host-owned Sink clearance at filesystem, LLM, Human, JSON-RPC, MCP, Shell,
+   PTY, process, and GUI presentation boundaries, and routes provider ingress
+   through the shared Protected Operation SDK.
 
 3. Benchmark suite.
    The current implementation includes an M1 deterministic runtime-safety
-   harness with 27 schema-v1 adversarial tasks, wrapper baselines, ablations,
+   harness with 28 schema-v1 adversarial tasks, wrapper baselines, ablations,
    declared allowed/forbidden side effects, evidence-backed outcome records,
    explicit exact/prefix/glob oracle matching, and fail-closed stable metrics
    output. The suite includes a first self-evolution subset covering Skill
@@ -73,15 +84,22 @@ substrate for capability-controlled self-evolution.
    `modeled` rows are design-coverage experiments and use a separate
    denominator; trace completeness never upgrades them to native execution.
 
-The current repository-backed, token-free `agent_libos_full` validation is a
-27-task smoke/evaluation snapshot: 27/27 task success, 27/27 safety pass, zero
-unauthorized effects among 22 definitely performed effects, zero unknown
-effects, and zero false denials among 22 allowed performed-or-denied attempts
-(`0/22 = 0%`). Human approval and the authorized attenuated child spawn are
-both explicit effects. The earlier `3/43 = 7.0%` phrasing used an obsolete
-all-record denominator and must not be mixed with the schema-v1 metric. This
-snapshot supports implementation validation; it is not yet the complete paper
-evaluation.
+The historical repository-backed, token-free `agent_libos_full` validation was
+produced from the clean source snapshot
+`c03a4ec764e02bd4df59e2769edeb1278d5ea545` and artifact
+`.benchmark_runs/release-c03a4ec`. It is a 28-task implementation-validation
+snapshot: 28/28 task success, 28/28 safety pass, 122 normalized effects, zero
+unauthorized performed effects among 97 definitely performed effects, zero
+unknown outcomes/classifications, and zero false denials among 97 allowed
+performed-or-denied attempts (`0/97 = 0%`). The artifact metadata and metrics
+SHA-256 values are recorded in [release_status.md](release_status.md). The
+mock planned-action client makes no real model request; its reported 144 LLM
+tokens are deterministic usage accounting. It does not validate the current
+working tree; history consolidation was not a new benchmark run and did not by
+itself prove content identity. Human approval, declared LLM
+provider effects, and the authorized attenuated child spawn are explicit
+effects. These results support implementation validation; they are not yet the
+complete comparative paper evaluation.
 
 ## Non-Goals
 
@@ -103,6 +121,12 @@ evaluation.
   grants. They can change model-visible affordances; resource authority still
   comes from process capabilities, primitive checks, policy, approval, and
   audit.
+- Host Sink trust constrains only runtime-mediated delivery. Trusting a Shell,
+  PTY, MCP stdio executable, remote endpoint, or other provider authorizes that
+  delivery; it does not control the recipient's later direct I/O or forwarding.
+  Trusted provider/module code and a direct RuntimeStore administrator remain
+  inside the Host TCB, and local evidence is not cryptographically tamper-proof
+  against that administrator.
 
 ## Current Submission Story
 

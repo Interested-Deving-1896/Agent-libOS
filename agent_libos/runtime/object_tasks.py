@@ -5,13 +5,14 @@ import math
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING, Iterable
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     CapabilityRight,
     CapabilitySpec,
+    DataLabels,
     EventPriority,
     EventType,
     HumanRequestStatus,
@@ -61,6 +62,18 @@ _TERMINAL_STATUSES = {
 _OWNER_WATCH_EVENTS = {"updated", "linked"}
 _MESSAGE_REPLAY_SAFE_TOOLS = {"receive_process_messages"}
 _PROCESS_REPLAY_SAFE_TOOLS = {"wait_child_process"}
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingNotifyResultGrant:
+    recipient_pid: str
+    result_oid: str
+    reservation_id: str | None
+    used_by: str
+
+
+class _NotifyResultGrantPublicationFailed(RuntimeError):
+    pass
 
 
 class ObjectTaskManager:
@@ -559,6 +572,7 @@ class ObjectTaskManager:
     async def _execute_task(self, task_id: str) -> None:
         task = self._get(task_id)
         result_oid: str | None = None
+        pending_notify_grant: _PendingNotifyResultGrant | None = None
         with self._lock:
             args = dict(self._pending_args.get(task_id, {}))
         context_metadata = self._context_metadata_for_resume(task)
@@ -608,19 +622,33 @@ class ObjectTaskManager:
                         metadata={"task_id": task_id, "tool": task.tool},
                         reason="object_task_result",
                     )
-                    self._grant_notify_result_if_requested(task, result_oid)
+                    pending_notify_grant = self._prepare_notify_result_grant(
+                        task,
+                        result_oid,
+                    )
                 # Serialize the final active-state check with cancellation and
                 # terminal task transitions. A cancellation that won while the
                 # result was being wired must discard, not publish, that result.
                 with self._lock:
                     latest_task = self.runtime.store.get_object_task(task_id)
                     if latest_task is None or latest_task.status in _TERMINAL_STATUSES:
+                        self._restore_notify_result_grant(
+                            pending_notify_grant,
+                            reason="object task completed after cancellation",
+                        )
+                        pending_notify_grant = None
                         self._discard_failed_result(str(task.runner_pid), task_id, result_oid)
                         return
                     latest_process = self.runtime.process.get(str(task.runner_pid))
                     if latest_process.status not in self.runtime.process.TERMINAL_STATUSES:
                         self.runtime.process.exit(str(task.runner_pid), result=result.result_handle)
-                    self._mark_succeeded(task_id, result, result_oid)
+                    self._mark_succeeded(
+                        task_id,
+                        result,
+                        result_oid,
+                        pending_notify_grant=pending_notify_grant,
+                    )
+                    pending_notify_grant = None
                 return
             if latest_process.status not in self.runtime.process.TERMINAL_STATUSES:
                 self.runtime.process.exit(str(task.runner_pid), failed=True, message=result.error or "object task failed")
@@ -650,6 +678,11 @@ class ObjectTaskManager:
             self._terminalize_runner(str(task.runner_pid), reason=f"object task failed: {exc}")
             self._discard_failed_result(str(task.runner_pid), task_id, result_oid)
             self._mark_failed(task_id, str(exc))
+        finally:
+            self._restore_notify_result_grant(
+                pending_notify_grant,
+                reason="object task notify-result publication did not settle",
+            )
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -739,6 +772,9 @@ class ObjectTaskManager:
         }
         subject = f"Object owner {payload['event']}: {task.owner_oid}"
         sender = f"object_task_owner_watch:{task.task_id}"
+        source_oids = [task.owner_oid]
+        if payload["dst_oid"]:
+            source_oids.append(str(payload["dst_oid"]))
         try:
             message = self.runtime.messages.post(
                 sender=sender,
@@ -748,6 +784,7 @@ class ObjectTaskManager:
                 correlation_id=task.task_id,
                 subject=subject,
                 payload=payload,
+                source_oids=source_oids,
             )
         except Exception as exc:
             self.runtime.events.emit(
@@ -994,7 +1031,70 @@ class ObjectTaskManager:
         )
         return updated
 
-    def _mark_succeeded(self, task_id: str, result: Any, result_oid: str | None) -> ObjectTask:
+    def _mark_succeeded(
+        self,
+        task_id: str,
+        result: Any,
+        result_oid: str | None,
+        *,
+        pending_notify_grant: _PendingNotifyResultGrant | None = None,
+    ) -> ObjectTask:
+        if pending_notify_grant is None:
+            return self._persist_succeeded(task_id, result, result_oid)
+        try:
+            with self.runtime.memory.ownership_locked(), self.runtime.store.transaction():
+                result_object = self.runtime.store.get_object(
+                    pending_notify_grant.result_oid
+                )
+                if result_object is None:
+                    raise NotFound(
+                        f"object task result not found: {pending_notify_grant.result_oid}"
+                    )
+                self.runtime.authority_manifests.assert_data_flow_labels(
+                    pending_notify_grant.recipient_pid,
+                    DataLabels.from_object_metadata(result_object.metadata),
+                )
+                self.runtime.capability.handle_for_object(
+                    pending_notify_grant.recipient_pid,
+                    pending_notify_grant.result_oid,
+                    {
+                        ObjectRight.READ.value,
+                        ObjectRight.MATERIALIZE.value,
+                        ObjectRight.LINK.value,
+                    },
+                    issued_by=pending_notify_grant.used_by,
+                )
+                notified = self._persist_succeeded(task_id, result, result_oid)
+                if (
+                    notified.notification.status
+                    != ObjectTaskNotificationStatus.DELIVERED
+                ):
+                    raise _NotifyResultGrantPublicationFailed(
+                        "object task result notification was not delivered"
+                    )
+                committed = self.runtime.capability.commit_reserved_use(
+                    pending_notify_grant.reservation_id,
+                    committed_by=pending_notify_grant.used_by,
+                    reason="one-time object task notify-result grant committed",
+                )
+                if pending_notify_grant.reservation_id is not None and not committed:
+                    raise RuntimeError(
+                        "object task notify-result grant reservation could not be committed"
+                    )
+            return notified
+        except _NotifyResultGrantPublicationFailed:
+            self._restore_notify_result_grant(
+                pending_notify_grant,
+                reason="object task result notification was not delivered",
+            )
+            return self._persist_succeeded(task_id, result, result_oid)
+
+    def _persist_succeeded(
+        self,
+        task_id: str,
+        result: Any,
+        result_oid: str | None,
+    ) -> ObjectTask:
         now = utc_now()
         with self._lock:
             task = self._get(task_id)
@@ -1136,6 +1236,9 @@ class ObjectTaskManager:
         }
         subject = notification.subject or f"Object task {task.status.value}: {task.tool}"
         body = task.error or ""
+        source_oids = [task.owner_oid]
+        if task.result_oid is not None:
+            source_oids.append(task.result_oid)
         try:
             message = self.runtime.messages.post(
                 sender=f"object_task:{task.task_id}",
@@ -1146,6 +1249,7 @@ class ObjectTaskManager:
                 subject=subject,
                 body=body,
                 payload=payload,
+                source_oids=source_oids,
             )
             updated_notification = replace(
                 notification,
@@ -1153,7 +1257,7 @@ class ObjectTaskManager:
                 status=ObjectTaskNotificationStatus.DELIVERED,
                 error=None,
             )
-        except ProcessError as exc:
+        except (CapabilityDenied, ProcessError) as exc:
             recipient = self.runtime.store.get_process(notification.recipient_pid)
             status = (
                 ObjectTaskNotificationStatus.UNDELIVERED_TERMINAL
@@ -1172,12 +1276,28 @@ class ObjectTaskManager:
         self.runtime.store.update_object_task(updated)
         return updated
 
-    def _grant_notify_result_if_requested(self, task: ObjectTask, result_oid: str) -> None:
+    def _prepare_notify_result_grant(
+        self,
+        task: ObjectTask,
+        result_oid: str,
+    ) -> _PendingNotifyResultGrant | None:
         if not self._grant_result_to_notify.get(task.task_id):
-            return
+            return None
         recipient = task.notification.recipient_pid
         if recipient is None or recipient == task.creator_pid:
-            return
+            return None
+        result_object = self.runtime.store.get_object(result_oid)
+        if result_object is None:
+            raise NotFound(f"object task result not found: {result_oid}")
+        try:
+            self.runtime.authority_manifests.assert_data_flow_labels(
+                recipient,
+                DataLabels.from_object_metadata(result_object.metadata),
+            )
+        except CapabilityDenied:
+            # The normal notification path records the recipient-domain error.
+            # Do not reserve GRANT authority or publish a provisional handle.
+            return None
         decision = self.runtime.capability.authorize(task.creator_pid, f"object:{result_oid}", ObjectRight.GRANT)
         if not decision.allowed:
             raise CapabilityDenied(f"{task.creator_pid} cannot grant object task result: {result_oid}")
@@ -1187,24 +1307,25 @@ class ObjectTaskManager:
             used_by=used_by,
             reason="one-time object task notify-result grant reserved",
         )
-        try:
-            self.runtime.capability.handle_for_object(
-                recipient,
-                result_oid,
-                {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value},
-                issued_by=used_by,
-            )
-        except Exception:
-            self.runtime.capability.restore_reserved_use(
-                reservation_id,
-                restored_by=used_by,
-                reason="object task notify-result handle issuance failed",
-            )
-            raise
-        self.runtime.capability.commit_reserved_use(
-            reservation_id,
-            committed_by=used_by,
-            reason="one-time object task notify-result grant committed",
+        return _PendingNotifyResultGrant(
+            recipient_pid=recipient,
+            result_oid=result_oid,
+            reservation_id=reservation_id,
+            used_by=used_by,
+        )
+
+    def _restore_notify_result_grant(
+        self,
+        pending: _PendingNotifyResultGrant | None,
+        *,
+        reason: str,
+    ) -> None:
+        if pending is None:
+            return
+        self.runtime.capability.restore_reserved_use(
+            pending.reservation_id,
+            restored_by=pending.used_by,
+            reason=reason,
         )
 
     def _set_runner_status(self, runner_pid: str, status: ProcessStatus, message: str | None = None) -> None:

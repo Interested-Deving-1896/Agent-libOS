@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.models import ObjectMetadata, ObjectType
+from agent_libos.models import ObjectMetadata, ObjectType, Provenance
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 from agent_libos.tools.observability import ensure_json_size, json_size_bytes
 from agent_libos.utils.ids import estimate_tokens
@@ -108,6 +108,9 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
             "truncated": result.truncated,
         }
         payload = self._fit_payload_to_memory_limit(payload, args.allow_truncated, runtime.config.tools.memory_payload_hard_limit_bytes)
+        flow = runtime.data_flow.current_context()
+        labels = flow.labels
+        parent_oids, durable_source_refs = runtime.data_flow.provenance_sources(flow)
         handle = runtime.memory.create_object(
             pid=ctx.pid,
             object_type=ObjectType(args.object_type),
@@ -117,6 +120,18 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
                 tags=["file_object", "workspace_file"],
                 mime_type="text/plain",
                 token_estimate=estimate_tokens(payload),
+                sensitivity=labels.sensitivity.value,
+                trust_level=labels.trust_level.value,
+                integrity=labels.integrity.value,
+                origin=labels.origin,
+                tenant=labels.tenant,
+                principal=labels.principal,
+                declassification_authority=labels.declassification_authority,
+            ),
+            provenance=Provenance(
+                created_from_action="tool.create_object_from_file",
+                parent_oids=list(parent_oids),
+                source_refs=list(durable_source_refs),
             ),
             immutable=True,
             name=args.name,
@@ -212,6 +227,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
                 encoding=args.encoding,
                 overwrite=args.overwrite,
                 cwd=runtime.process.working_directory(ctx.pid),
+                source_oids=[obj.oid],
             )
         except FileExistsError as exc:
             raise ToolExecutionError(

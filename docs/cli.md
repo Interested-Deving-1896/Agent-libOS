@@ -668,6 +668,12 @@ Registry commands accept `--actor-pid <pid>` to enforce that process's
 `mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
 audited admin registry operations.
 
+Sink trust is intentionally not an MCP, model-tool, or process CLI registry.
+Administrators configure it under `data_flow.sink_rules` or use the Host-only
+`Runtime.register_sink_trust()` / `unregister_sink_trust()` interfaces. See
+[data_flow.md](data_flow.md); registering trust does not grant the process
+capabilities shown above.
+
 `mcp call` always runs as the target process pid and requires that pid to hold
 the tool capability, such as `mcp:demo-mcp:forecast read`. For a stdio server,
 the pid additionally needs `process:spawn write` and `execute` on the exact

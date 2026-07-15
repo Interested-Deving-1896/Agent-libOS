@@ -5,8 +5,16 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import ProcessMessage, ProcessMessageKind
-from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.memory.data_labels import flow_context_parts, flow_context_value
+from agent_libos.models import DataFlowContext, ProcessMessage, ProcessMessageKind
+from agent_libos.tools.base import (
+    SyncAgentTool,
+    ToolContext,
+    ToolErrorCode,
+    ToolExecutionError,
+    ToolPolicy,
+    ToolResult,
+)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -22,6 +30,7 @@ class ProcessMessageInfo(BaseModel):
     subject: str
     body: str
     payload: dict[str, Any]
+    metadata: dict[str, Any] = Field(default_factory=dict)
     status: str
     created_at: str
     acked_at: str | None = None
@@ -95,6 +104,7 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        source_oids, source_labels, source_context = _flow_sources(ctx)
         try:
             message = runtime.messages.send_from_process(
                 ctx.pid,
@@ -106,6 +116,9 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
                 subject=args.subject,
                 body=args.body,
                 payload=args.payload,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
             )
         except ValueError as exc:
             raise ToolExecutionError(
@@ -137,7 +150,7 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
     )
     tags = ["process", "message", "inspect"]
 
-    def run(self, args: ReadProcessMessagesArgs, ctx: ToolContext) -> ReadProcessMessagesOutput:
+    def run(self, args: ReadProcessMessagesArgs, ctx: ToolContext) -> ToolResult:
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
@@ -160,6 +173,7 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
             message_ids=args.message_ids,
             limit=args.limit,
         )
+        carrier_oids = runtime.messages.observe_labels(ctx.pid, messages)
         acked: list[ProcessMessage] = []
         if args.ack:
             unread_ids = [message.message_id for message in messages if message.status.value == "unread"]
@@ -167,11 +181,12 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
                 acked = runtime.messages.ack(ctx.pid, unread_ids)
                 acked_by_id = {message.message_id: message for message in acked}
                 messages = [acked_by_id.get(message.message_id, message) for message in messages]
-        return ReadProcessMessagesOutput(
+        output = ReadProcessMessagesOutput(
             ready=True,
             messages=[_message_info(message) for message in messages],
             acked_message_ids=[message.message_id for message in acked],
         )
+        return _flow_labeled_result(runtime, ctx.pid, carrier_oids, output)
 
 
 class ReceiveProcessMessagesArgs(ReadProcessMessagesArgs):
@@ -194,7 +209,7 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
     )
     tags = ["process", "message", "ipc", "receive"]
 
-    def run(self, args: ReceiveProcessMessagesArgs, ctx: ToolContext) -> ReadProcessMessagesOutput:
+    def run(self, args: ReceiveProcessMessagesArgs, ctx: ToolContext) -> ToolResult:
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
@@ -218,6 +233,7 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
             message_ids=args.message_ids,
             limit=args.limit,
         )
+        carrier_oids = runtime.messages.observe_labels(ctx.pid, messages)
         acked: list[ProcessMessage] = []
         if args.ack:
             unread_ids = [message.message_id for message in messages if message.status.value == "unread"]
@@ -225,11 +241,12 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
                 acked = runtime.messages.ack(ctx.pid, unread_ids)
                 acked_by_id = {message.message_id: message for message in acked}
                 messages = [acked_by_id.get(message.message_id, message) for message in messages]
-        return ReadProcessMessagesOutput(
+        output = ReadProcessMessagesOutput(
             ready=bool(messages),
             messages=[_message_info(message) for message in messages],
             acked_message_ids=[message.message_id for message in acked],
         )
+        return _flow_labeled_result(runtime, ctx.pid, carrier_oids, output)
 
 
 def _message_info(message: ProcessMessage) -> ProcessMessageInfo:
@@ -244,7 +261,46 @@ def _message_info(message: ProcessMessage) -> ProcessMessageInfo:
         subject=message.subject,
         body=message.body,
         payload=message.payload,
+        metadata={
+            key: value
+            for key, value in message.metadata.items()
+            if key in {"source_oids", "source_refs", "data_labels", "data_flow_context"}
+        },
         status=message.status.value,
         created_at=message.created_at,
         acked_at=message.acked_at,
+    )
+
+
+def _flow_sources(ctx: ToolContext) -> tuple[list[str] | None, Any | None, DataFlowContext | None]:
+    try:
+        source_oids, labels = flow_context_parts(ctx.metadata)
+        return source_oids, labels, flow_context_value(ctx.metadata)
+    except ValueError as exc:
+        raise ToolExecutionError(
+            str(exc),
+            code=ToolErrorCode.EXECUTION_ERROR,
+        ) from exc
+
+
+def _flow_labeled_result(
+    runtime: Any,
+    pid: str,
+    carrier_oids: list[str],
+    output: ReadProcessMessagesOutput,
+) -> ToolResult:
+    context = runtime.data_flow.context_from_source_oids(
+        pid,
+        carrier_oids,
+        include_current=True,
+    )
+    return ToolResult.success(
+        data=output.model_dump(),
+        metadata={
+            "data_flow_context": {
+                "labels": context.labels.to_dict(),
+                "source_refs": [ref.to_dict() for ref in context.source_refs],
+                "materialization_id": context.materialization_id,
+            }
+        },
     )

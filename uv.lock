@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-libos"
-version = "0.1.5"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },

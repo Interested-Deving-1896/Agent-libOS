@@ -29,6 +29,10 @@ Modules are part of the host trusted computing base:
 - Module source files are hashed with a configured per-file size limit
   (`AgentLibOSConfig.modules.source_max_bytes`) before import. Multi-file
   package hashes also respect `package_max_bytes` and `max_package_files`.
+- A module that performs direct Python/OS I/O is outside the runtime-mediated
+  data-flow guarantee. Module syscalls and providers that handle process data
+  must declare a protected-operation direction and use the common SDK gate;
+  Host trust in the module is not a substitute for Sink clearance.
 
 Use Skills when the model needs workflow instructions, tool visibility, or JIT
 tool candidates at runtime. Use Runtime Modules when the system owner wants to
@@ -162,6 +166,14 @@ Spawn, read, write, resize, close, automatic exit cleanup, and compensating
 close phases use the same [Protected Operation SDK](protected_operation_sdk.md)
 contracts as core providers; the module does not manage effect intents or
 finite-use reservations through a private lifecycle.
+PTY spawn and write additionally use the common data-flow gate. The session
+pins the resolved executable identity and Sink trust snapshot established at
+spawn; a later write cannot switch the session to another trusted executable.
+Every successful write raises the session's data-flow high-water mark and the
+published session Object labels. A write that crossed the provider boundary
+but returned an ambiguous error raises the same high-water mark
+conservatively. Later clean-looking PTY output/read results therefore retain
+all sensitivity and source references ever written to that session.
 The continuous reader is one runtime-internal `pty.ingest` child operation for
 the lifetime of the session. It drains and probes the provider handle only
 inside that SDK phase, records one information-flow effect when it stops, and

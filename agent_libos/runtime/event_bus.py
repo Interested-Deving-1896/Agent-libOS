@@ -51,14 +51,19 @@ class EventBus:
         limit: int | None = None,
         before_event_id: str | None = None,
         after_event_id: str | None = None,
+        *,
+        include_gui_presentation: bool = True,
     ) -> builtins.list[Event]:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
             raise ValidationError("event list limit must be a positive integer")
         if before_event_id is not None and after_event_id is not None:
             raise ValidationError("event query cannot use before_event_id and after_event_id together")
-        return self.store.list_events(
-            target=target,
-            limit=limit,
-            before_event_id=before_event_id,
-            after_event_id=after_event_id,
-        )
+        filters = {
+            "target": target,
+            "limit": limit,
+            "before_event_id": before_event_id,
+            "after_event_id": after_event_id,
+        }
+        if not include_gui_presentation:
+            filters["include_gui_presentation"] = False
+        return self.store.list_events(**filters)

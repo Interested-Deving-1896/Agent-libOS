@@ -268,10 +268,20 @@ An update that lowers sensitivity or raises trust/integrity requires explicit
 `admin` authority on `declassification:object:<oid>`. Context Materialization
 Manifests and Explain expose labels alongside ids/hashes without copying Object
 payloads. Finite declassification authority is consumed atomically with the
-Object update, so a one-shot downgrade grant cannot be reused. External
-information-flow intents may record an observe-only label
-summary and manifest policy. Version 1 does not yet enforce source-to-sink
-policy at Human, JSON-RPC, MCP, network, or file-write sinks.
+Object update, so a one-shot downgrade grant cannot be reused. Removing or
+replacing tenant/principal, changing declassification authority, or raising
+integrity/trust is the same privileged transition. Model-facing Object tools
+do not accept these trusted fields.
+
+For an LLM-derived Object, explicit `parent_oids` supplement rather than replace
+all Objects included in the active context materialization. Every parent must
+exist and be readable. The runtime resolves their exact versions and hashes;
+a benign explicit parent cannot wash labels from other observed context.
+
+These labels now constrain runtime-mediated egress. ToolBroker carries the
+trusted `DataFlowContext` internally, and LLM, Human, JSON-RPC, MCP,
+filesystem-write, Shell, and PTY primitives check Host Sink clearance and
+revalidate source versions before dispatch. See [Data Flow](data_flow.md).
 
 ## Context Materialization
 
@@ -281,6 +291,11 @@ Each process also has a mutable context object named `llm_context:<pid>`.
 
 The runtime appends new process facts and summaries to the end of that object so
 repeated prompt prefixes remain stable for prompt caching.
+
+The context payload also keeps a conservative `label_history`. Appending tool
+results, retry/repair, parallel batches, Human/message resume, compaction,
+checkpoint, fork, exec, and reopen cannot reset a previously observed higher
+sensitivity or narrower identity evidence to defaults.
 
 The `compact_process_context` tool is the explicit exception to the append-only
 shape: after validation it atomically replaces older entries with one
@@ -323,6 +338,20 @@ is released fail-closed instead of treating the marker as user payload.
 Scoped checkpoint snapshots and image artifacts can explicitly capture object
 payloads needed to reconstruct a process subtree, subject to configured
 snapshot limits.
+
+Successful file writes store a separate canonical path binding with content
+hash, labels, exact source refs, and generation. If a provider may have written
+bytes but returns an ambiguous error, the runtime also stores the intended
+binding conservatively; a certified `ProviderEffectNotStarted` does not create
+that binding. Missing parent directories automatically created by a file or
+directory write receive the same binding. Recursive directory deletion reads
+the complete active descendant binding set and approval fingerprint atomically,
+rechecks the fingerprint before dispatch, then tombstones that set after
+success. `create_object_from_file`
+inherits that binding (or `normal/untrusted` for an unclassified external
+file), and `write_object_to_file` supplies the source Object to the filesystem
+egress gate. Out-of-band file changes do not automatically downgrade a known
+high-sensitivity path; delete creates a tombstone/history record.
 
 Root process-owned memory is released on process exit unless retained as the
 final process result. Non-root terminal process memory is held only until the

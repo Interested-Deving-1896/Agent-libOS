@@ -25,6 +25,7 @@ Agent personality / application
      - Skill manager
      - HumanObject manager
      - primitive managers
+     - data-flow manager and Host Sink trust registry
      - capability manager
      - event bus
      - checkpoint manager
@@ -76,8 +77,11 @@ the runtime trusted computing base and are gated by manifest hash trust rather
 than by process capabilities.
 
 The runtime owns agent-level semantics: process identity, capability checks,
-approval, event emission, audit, process wakeups, checkpointing, and durable
-metadata.
+source labels, Host Sink clearance, approval, event emission, audit, process
+wakeups, checkpointing, and durable metadata. `DataFlowManager` resolves
+runtime-owned Object source references, performs early egress clearance, issues
+exact conditional releases through metadata-only Human requests, and appends
+payload-free decisions. See [Data Flow](data_flow.md).
 
 Explainable Operations overlays these managers without replacing their source
 records. A `ContextVar` carries the active causal operation through async calls
@@ -94,12 +98,16 @@ not change tool schemas or skip primitive authorization. The concrete provider
 inventory, containment guarantees, extension checklist, and environment
 limitations are documented in [Providers](providers.md).
 
-Filesystem, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
+LLM, filesystem, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
 the public [`agent_libos.sdk`](protected_operation_sdk.md) contract. The SDK is
 the only provider-facing lifecycle for finite capability reservation, effect
 prepare/dispatch/finalize, classification fallback, event/audit evidence, and
-resource settlement. Low-level effect-ledger functions remain Runtime-internal
-for the SDK and startup reconciliation.
+resource settlement. Egress/bidirectional contracts must also declare a
+concrete `DataSink`, trusted `DataFlowContext`, canonical payload descriptor,
+and operation. The SDK revalidates those descriptors in the same transaction
+that reserves ordinary/release capabilities and prepares the effect intent.
+Low-level effect-ledger functions remain Runtime-internal for the SDK and
+startup reconciliation.
 
 Providers are also the source of truth for successful external-effect rollback
 classification. Effectful provider calls must expose a classifier to the
@@ -173,6 +181,10 @@ post-provider sink failure leaves the pending row visible.
 - `RuntimeModuleRegistry` loads the internal core module and configured trusted
   startup modules before processes, tools, or LLM execution can run.
 - `CapabilityManager` grants, checks, revokes, and consumes one-shot authority.
+- `DataFlowManager` owns the versioned Host Sink registry, source/version
+  validation, conditional releases, file label bindings, and append-only flow
+  decisions. Registry writes require configured `data_flow_sink_registry:*`
+  admin authority and are never projected as model tools.
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
 - `HumanObjectManager` owns questions, approvals, terminal queue processing,
   and human output.
@@ -189,7 +201,9 @@ post-provider sink failure leaves the pending row visible.
   state; checkpoint-derived image commit reuses that internal snapshot boundary.
 - `LLMProcessExecutor` materializes prompt context, resolves the process
   `llm_profile_id` through the host profile registry, calls that LLM client,
-  and dispatches selected tool calls.
+  and dispatches selected tool calls. LLM requests are formal protected
+  bidirectional provider operations; provider-chain reuse is bound to provider,
+  Sink/trust generation, clearance domain, manifest, and context epoch.
 
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
@@ -290,7 +304,10 @@ The runtime store keeps durable metadata and append-only records:
   persistence is enabled by default for self-evolution training and
   fine-tuning pipelines; this may include sensitive prompt, tool, reasoning,
   and provider payload fields. Set `llm.persist_full_io: false` to opt out and
-  store only previews plus hashes for those fields.
+  store only previews plus hashes for those fields. Conditional LLM release
+  rows apply the same policy before Human approval: the exact pending request
+  stays in memory, while SQL receives only hashes and non-sensitive resume
+  metadata.
 
 Object payloads are not ordinary durable object rows. They live in runtime
 memory, while SQL object rows store only a runtime-memory marker. Rows whose

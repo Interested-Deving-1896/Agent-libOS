@@ -110,7 +110,7 @@ async def amain(args: argparse.Namespace) -> None:
                         }
                     ]
                 },
-                "permitted_effects": ["filesystem.*", "human.*"],
+                "permitted_effects": ["llm.*", "filesystem.*", "human.*"],
                 "metadata": {"provided_by": "llm_summarize_document"},
             },
         )

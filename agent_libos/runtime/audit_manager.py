@@ -73,5 +73,14 @@ class AuditManager:
         actor: str | None = None,
         target: str | None = None,
         match_any: bool = False,
+        include_gui_presentation: bool = True,
     ) -> list[AuditRecord]:
-        return self.store.list_audit(limit=limit, actor=actor, target=target, match_any=match_any)
+        filters = {
+            "limit": limit,
+            "actor": actor,
+            "target": target,
+            "match_any": match_any,
+        }
+        if not include_gui_presentation:
+            filters["include_gui_presentation"] = False
+        return self.store.list_audit(**filters)

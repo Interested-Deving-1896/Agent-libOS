@@ -13,18 +13,1147 @@ from typing import Any
 
 import pytest
 import psutil
+import agent_libos.sdk.protected_operations as protected_operations
 
 from agent_libos import Runtime
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import AgentImage, CapabilityRight, ExternalEffectClassification
+from agent_libos.models import (
+    AgentImage,
+    CapabilityRight,
+    DataFlowContext,
+    DataSink,
+    EventType,
+    ExternalEffectClassification,
+    ObjectMetadata,
+    SinkTrustLevel,
+    SinkTrustRule,
+)
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
-from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate, ProviderEffectNotStarted, SubprocessLimits
 from modules.pty.pty_module import LocalPtyProvider, _PtyRuntimeSession
 
 
 class TestPtyModule:
+    def test_secret_pty_spawn_and_write_require_trusted_spawn_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = ResolvingPtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="labeled PTY egress")
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-data-flow-sentinel"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                adapter = _pty_adapter(runtime)
+
+                with pytest.raises(CapabilityDenied, match="data-flow denied egress"):
+                    adapter.create(
+                        pid,
+                        ["git", "status"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                        source_oids=[source.oid],
+                    )
+                assert provider.resolver_calls == []
+                assert provider.spawned == []
+
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern="pty:spawn:*",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=adapter.shell._executable_data_sink(
+                            "pty:spawn",
+                            "git",
+                            cwd=".",
+                        ).identity_sha256,
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                    source_oids=[source.oid],
+                )
+                written = adapter.write(
+                    pid,
+                    created.session_oid,
+                    "pty-data-flow-sentinel\n",
+                )
+
+                assert len(provider.spawned) == 1
+                assert provider.resolver_calls == [["git", "status"]]
+                assert written.bytes_written == len("pty-data-flow-sentinel\n".encode())
+                assert provider.sessions[0].writes == ["pty-data-flow-sentinel\n"]
+            finally:
+                runtime.close()
+
+    def test_secret_pty_resize_and_close_deny_before_session_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="gate labeled PTY control operations",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-control-data-flow-sentinel"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                secret_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [source.oid],
+                )
+                session = adapter._sessions[created.session_oid]
+
+                with runtime.data_flow.activate(secret_context):
+                    with pytest.raises(CapabilityDenied, match="data-flow denied egress"):
+                        adapter.resize(
+                            pid,
+                            created.session_oid,
+                            cols=111,
+                            rows=37,
+                        )
+                    with pytest.raises(CapabilityDenied, match="data-flow denied egress"):
+                        adapter.close(pid, created.session_oid)
+
+                assert provider.sessions[0].size == (80, 24)
+                assert not provider.sessions[0].closed
+                assert not session.stop_event.is_set()
+                assert created.session_oid in adapter._sessions
+                assert runtime.store.get_object(created.session_oid) is not None
+                sink_identity = f"pty:session:{session.session_id}"
+                denied = runtime.store.list_data_flow_decisions(
+                    pid=pid,
+                    outcome="deny",
+                )
+                assert len(denied) == 2
+                assert all(item.sink == sink_identity for item in denied)
+                assert all(
+                    item.labels.sensitivity.value == "secret"
+                    for item in denied
+                )
+                assert len([
+                    record
+                    for record in runtime.audit.trace()
+                    if record.action == "data_flow.egress"
+                    and record.target == sink_identity
+                    and record.decision.get("outcome") == "deny"
+                ]) == 2
+                assert len([
+                    event
+                    for event in runtime.events.list(
+                        target=f"data_flow_sink:{sink_identity}",
+                    )
+                    if event.type == EventType.DATA_FLOW_DECISION
+                    and event.payload.get("outcome") == "deny"
+                ]) == 2
+
+                resized = adapter.resize(
+                    pid,
+                    created.session_oid,
+                    cols=100,
+                    rows=30,
+                )
+                closed = adapter.close(pid, created.session_oid)
+
+                assert (resized.cols, resized.rows) == (100, 30)
+                assert closed.closed
+                assert provider.sessions[0].size == (100, 30)
+                assert provider.sessions[0].closed
+            finally:
+                runtime.close()
+
+    def test_pty_close_prepare_denial_keeps_background_reader_alive(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="keep PTY alive after rejected close",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                session = adapter._sessions[created.session_oid]
+                assert session.reader_thread is not None
+                assert session.reader_thread.is_alive()
+                original_authorize = runtime.data_flow.authorize_egress
+
+                def reject_prepare_revalidation(**kwargs: Any) -> Any:
+                    if kwargs.get("expected_registry_generation") is not None:
+                        raise CapabilityDenied("sink changed before dispatch")
+                    return original_authorize(**kwargs)
+
+                monkeypatch.setattr(
+                    runtime.data_flow,
+                    "authorize_egress",
+                    reject_prepare_revalidation,
+                )
+
+                with pytest.raises(CapabilityDenied, match="sink changed before dispatch"):
+                    adapter.close(pid, created.session_oid)
+
+                assert created.session_oid in adapter._sessions
+                assert runtime.store.get_object(created.session_oid) is not None
+                assert provider.sessions[0].closed is False
+                assert session.closed is False
+                assert session.closing is False
+                assert session.close_complete.is_set()
+                assert session.stop_event.is_set() is False
+                assert session.reader_thread.is_alive()
+
+                provider.sessions[0].outputs.append("reader-still-live\n")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    with session.lock:
+                        if "reader-still-live\n" in "".join(session.buffer):
+                            break
+                    time.sleep(0.01)
+                with session.lock:
+                    assert "reader-still-live\n" in "".join(session.buffer)
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("write_outcome", ["success", "ambiguous"])
+    def test_pty_write_raises_session_data_flow_high_water(
+        self,
+        write_outcome: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal=f"PTY {write_outcome} write high-water",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-write-data-flow-sentinel"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern="pty:spawn:*",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=adapter._sessions[
+                            created.session_oid
+                        ].data_sink.identity_sha256,
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                if write_outcome == "ambiguous":
+                    original_write = provider.sessions[0].write
+
+                    def write_then_lose_outcome(text: str) -> int:
+                        original_write(text)
+                        raise TimeoutError("PTY write outcome is unknown")
+
+                    monkeypatch.setattr(
+                        provider.sessions[0],
+                        "write",
+                        write_then_lose_outcome,
+                    )
+                secret_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [source.oid],
+                )
+
+                with runtime.data_flow.activate(secret_context):
+                    if write_outcome == "ambiguous":
+                        with pytest.raises(TimeoutError, match="outcome is unknown"):
+                            adapter.write(
+                                pid,
+                                created.session_oid,
+                                "pty-write-data-flow-sentinel\n",
+                            )
+                    else:
+                        adapter.write(
+                            pid,
+                            created.session_oid,
+                            "pty-write-data-flow-sentinel\n",
+                        )
+
+                session = adapter._sessions[created.session_oid]
+                assert session.data_flow_context.labels.sensitivity.value == "secret"
+                assert source.oid in {
+                    item.oid for item in session.data_flow_context.source_refs
+                }
+                stored_session = runtime.store.get_object(created.session_oid)
+                assert stored_session is not None
+                assert stored_session.metadata.sensitivity == "secret"
+
+                with runtime.data_flow.activate(DataFlowContext()):
+                    adapter.read(
+                        pid,
+                        created.session_oid,
+                        timeout_s=0.2,
+                    )
+                    returned = runtime.data_flow.current_context()
+                    assert returned.labels.sensitivity.value == "secret"
+                    assert source.oid in {item.oid for item in returned.source_refs}
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("resize_outcome", ["success", "ambiguous"])
+    def test_pty_resize_raises_session_data_flow_high_water(
+        self,
+        resize_outcome: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal=f"PTY {resize_outcome} resize high-water",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-resize-data-flow-sentinel"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern="pty:spawn:*",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=adapter._sessions[
+                            created.session_oid
+                        ].data_sink.identity_sha256,
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                if resize_outcome == "ambiguous":
+                    original_resize = provider.sessions[0].resize
+
+                    def resize_then_lose_outcome(cols: int, rows: int) -> None:
+                        original_resize(cols, rows)
+                        raise TimeoutError("PTY resize outcome is unknown")
+
+                    monkeypatch.setattr(
+                        provider.sessions[0],
+                        "resize",
+                        resize_then_lose_outcome,
+                    )
+                secret_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [source.oid],
+                )
+
+                with runtime.data_flow.activate(secret_context):
+                    if resize_outcome == "ambiguous":
+                        with pytest.raises(TimeoutError, match="outcome is unknown"):
+                            adapter.resize(
+                                pid,
+                                created.session_oid,
+                                cols=100,
+                                rows=30,
+                            )
+                    else:
+                        adapter.resize(
+                            pid,
+                            created.session_oid,
+                            cols=100,
+                            rows=30,
+                        )
+
+                session = adapter._sessions[created.session_oid]
+                assert provider.sessions[0].size == (100, 30)
+                assert session.data_flow_context.labels.sensitivity.value == "secret"
+                assert source.oid in {
+                    item.oid for item in session.data_flow_context.source_refs
+                }
+                stored_session = runtime.store.get_object(created.session_oid)
+                assert stored_session is not None
+                assert stored_session.metadata.sensitivity == "secret"
+            finally:
+                runtime.close()
+
+    def test_pty_ambiguous_close_raises_session_data_flow_high_water(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="PTY ambiguous close high-water",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-close-data-flow-sentinel"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern="pty:spawn:*",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=adapter._sessions[
+                            created.session_oid
+                        ].data_sink.identity_sha256,
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                original_close = provider.sessions[0].close
+
+                def close_then_lose_outcome(
+                    *,
+                    force: bool = True,
+                    timeout_s: float = 2.0,
+                ) -> int | None:
+                    original_close(force=force, timeout_s=timeout_s)
+                    raise TimeoutError("PTY close outcome is unknown")
+
+                monkeypatch.setattr(
+                    provider.sessions[0],
+                    "close",
+                    close_then_lose_outcome,
+                )
+                secret_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [source.oid],
+                )
+
+                with runtime.data_flow.activate(secret_context):
+                    with pytest.raises(TimeoutError, match="outcome is unknown"):
+                        adapter.close(pid, created.session_oid)
+
+                session = adapter._sessions[created.session_oid]
+                assert session.close_outcome_unknown
+                assert session.data_flow_context.labels.sensitivity.value == "secret"
+                assert source.oid in {
+                    item.oid for item in session.data_flow_context.source_refs
+                }
+                stored_session = runtime.store.get_object(created.session_oid)
+                assert stored_session is not None
+                assert stored_session.metadata.sensitivity == "secret"
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("second_operation", ["write", "resize", "close"])
+    def test_pty_control_waits_for_session_high_water_publication(
+        self,
+        second_operation: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            first_release = threading.Event()
+            first_thread: threading.Thread | None = None
+            second_thread: threading.Thread | None = None
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal=f"serialize PTY high-water before {second_operation}",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                session = adapter._sessions[created.session_oid]
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-serialized-high-water"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                secret_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [source.oid],
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern="pty:spawn:*",
+                        trust_level=SinkTrustLevel.CONDITIONAL,
+                        max_sensitivity="secret",
+                        identity_sha256=session.data_sink.identity_sha256,
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                secret_text = "PTY_SERIALIZED_SECRET\n"
+                with runtime.data_flow.activate(secret_context):
+                    with pytest.raises(HumanApprovalRequired):
+                        adapter.write(pid, created.session_oid, secret_text)
+                runtime.human.drain_terminal_queue(auto_approve=True)
+
+                first_provider_return_pending = threading.Event()
+                second_provider_called = threading.Event()
+                original_write = provider.sessions[0].write
+                original_resize = provider.sessions[0].resize
+                original_close = provider.sessions[0].close
+
+                def coordinated_write(text: str) -> int:
+                    if text == secret_text:
+                        result = original_write(text)
+                        first_provider_return_pending.set()
+                        if not first_release.wait(timeout=10):
+                            raise TimeoutError("secret PTY write was not released")
+                        return result
+                    second_provider_called.set()
+                    return original_write(text)
+
+                def tracked_resize(cols: int, rows: int) -> None:
+                    second_provider_called.set()
+                    original_resize(cols, rows)
+
+                def tracked_close(
+                    *,
+                    force: bool = True,
+                    timeout_s: float = 2.0,
+                ) -> int | None:
+                    second_provider_called.set()
+                    return original_close(force=force, timeout_s=timeout_s)
+
+                monkeypatch.setattr(provider.sessions[0], "write", coordinated_write)
+                if second_operation == "resize":
+                    monkeypatch.setattr(provider.sessions[0], "resize", tracked_resize)
+                elif second_operation == "close":
+                    monkeypatch.setattr(provider.sessions[0], "close", tracked_close)
+
+                first_errors: list[BaseException] = []
+                second_errors: list[BaseException] = []
+                second_started = threading.Event()
+
+                def run_secret_write() -> None:
+                    try:
+                        with runtime.data_flow.activate(secret_context):
+                            adapter.write(pid, created.session_oid, secret_text)
+                    except BaseException as exc:
+                        first_errors.append(exc)
+
+                def run_second_control() -> None:
+                    second_started.set()
+                    try:
+                        if second_operation == "write":
+                            adapter.write(pid, created.session_oid, "normal\n")
+                        elif second_operation == "resize":
+                            adapter.resize(
+                                pid,
+                                created.session_oid,
+                                cols=100,
+                                rows=30,
+                            )
+                        else:
+                            adapter.close(pid, created.session_oid)
+                    except BaseException as exc:
+                        second_errors.append(exc)
+
+                first_thread = threading.Thread(target=run_secret_write, daemon=True)
+                second_thread = threading.Thread(target=run_second_control, daemon=True)
+                first_thread.start()
+                assert first_provider_return_pending.wait(timeout=10)
+                second_thread.start()
+                assert second_started.wait(timeout=10)
+                try:
+                    assert not second_provider_called.wait(timeout=0.1)
+                finally:
+                    first_release.set()
+                    first_thread.join(timeout=10)
+                    second_thread.join(timeout=10)
+
+                assert not first_thread.is_alive()
+                assert not second_thread.is_alive()
+                assert first_errors == []
+                assert len(second_errors) == 1
+                assert isinstance(second_errors[0], HumanApprovalRequired)
+                assert not second_provider_called.is_set()
+                assert session.data_flow_context.labels.sensitivity.value == "secret"
+                assert source.oid in {
+                    item.oid for item in session.data_flow_context.source_refs
+                }
+                assert created.session_oid in adapter._sessions
+                assert provider.sessions[0].closed is False
+            finally:
+                first_release.set()
+                if first_thread is not None and first_thread.is_alive():
+                    first_thread.join(timeout=2)
+                if second_thread is not None and second_thread.is_alive():
+                    second_thread.join(timeout=2)
+                runtime.close()
+
+    def test_pty_read_waits_for_secret_write_high_water_publication(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            write_release = threading.Event()
+            write_thread: threading.Thread | None = None
+            read_thread: threading.Thread | None = None
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="serialize PTY read with secret write high-water",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                session = adapter._sessions[created.session_oid]
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "pty-read-write-high-water"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                secret_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [source.oid],
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern="pty:spawn:*",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=session.data_sink.identity_sha256,
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+
+                secret_text = "PTY_READ_WRITE_SECRET\n"
+                write_output_produced = threading.Event()
+                original_write = provider.sessions[0].write
+
+                def coordinated_write(text: str) -> int:
+                    result = original_write(text)
+                    write_output_produced.set()
+                    if not write_release.wait(timeout=10):
+                        raise TimeoutError("secret PTY write was not released")
+                    return result
+
+                monkeypatch.setattr(provider.sessions[0], "write", coordinated_write)
+                write_errors: list[BaseException] = []
+
+                def run_secret_write() -> None:
+                    try:
+                        with runtime.data_flow.activate(secret_context):
+                            adapter.write(pid, created.session_oid, secret_text)
+                    except BaseException as exc:
+                        write_errors.append(exc)
+
+                write_thread = threading.Thread(target=run_secret_write, daemon=True)
+                write_thread.start()
+                assert write_output_produced.wait(timeout=10)
+
+                expected_output = f"echo:{secret_text}"
+                deadline = time.monotonic() + 5
+                buffered_output = ""
+                while time.monotonic() < deadline:
+                    with session.lock:
+                        buffered_output = "".join(session.buffer)
+                    if expected_output in buffered_output:
+                        break
+                    time.sleep(0.01)
+                assert expected_output in buffered_output
+
+                read_polled = threading.Event()
+                original_buffer_is_empty = adapter._buffer_is_empty
+
+                def tracked_buffer_is_empty(selected_session: _PtyRuntimeSession) -> bool:
+                    result = original_buffer_is_empty(selected_session)
+                    if selected_session is session:
+                        read_polled.set()
+                    return result
+
+                monkeypatch.setattr(adapter, "_buffer_is_empty", tracked_buffer_is_empty)
+                read_done = threading.Event()
+                read_errors: list[BaseException] = []
+                read_results: list[Any] = []
+                read_contexts: list[DataFlowContext] = []
+
+                def read_output() -> None:
+                    try:
+                        with runtime.data_flow.activate(DataFlowContext()):
+                            read_results.append(
+                                adapter.read(
+                                    pid,
+                                    created.session_oid,
+                                    timeout_s=0.5,
+                                )
+                            )
+                            read_contexts.append(runtime.data_flow.current_context())
+                    except BaseException as exc:
+                        read_errors.append(exc)
+                    finally:
+                        read_done.set()
+
+                read_thread = threading.Thread(target=read_output, daemon=True)
+                read_thread.start()
+                assert read_polled.wait(timeout=10)
+                try:
+                    # The output is already buffered, but its secret write has
+                    # not published the session high-water yet. A read must
+                    # wait for that publication before returning the bytes.
+                    assert not read_done.wait(timeout=0.1)
+                finally:
+                    write_release.set()
+                    write_thread.join(timeout=10)
+                    read_thread.join(timeout=10)
+
+                assert not write_thread.is_alive()
+                assert not read_thread.is_alive()
+                assert write_errors == []
+                assert read_errors == []
+                assert len(read_results) == 1
+                assert expected_output in read_results[0].output
+                assert len(read_contexts) == 1
+                assert read_contexts[0].labels.sensitivity.value == "secret"
+                assert source.oid in {ref.oid for ref in read_contexts[0].source_refs}
+                assert session.data_flow_context.labels.sensitivity.value == "secret"
+            finally:
+                write_release.set()
+                if write_thread is not None and write_thread.is_alive():
+                    write_thread.join(timeout=2)
+                if read_thread is not None and read_thread.is_alive():
+                    read_thread.join(timeout=2)
+                runtime.close()
+
+    def test_secret_pty_spawn_uses_provider_resolved_executable_identity(self) -> None:
+        if os.name == "nt":
+            pytest.skip("relative executable PTY identity uses POSIX test script")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands"
+            commands.mkdir()
+            executable = commands / "trusted-tool"
+            marker = commands / "ran.txt"
+            executable.write_text(
+                "#!/bin/sh\nprintf ran > ran.txt\nprintf 'ready\\n'\nsleep 2\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            runtime = _open_pty_runtime(temp_dir, LocalPtyProvider(root))
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="resolved PTY executable Sink")
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "resolved-pty-executable-sentinel"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                adapter = _pty_adapter(runtime)
+                # This test covers executable Sink identity, not the independent
+                # psutil-backed resource monitor. Disable that monitor so a
+                # restricted macOS worker cannot close the PTY before the test
+                # script records that dispatch occurred.
+                adapter.resources = None
+                old_process_cwd_identity = (Path.cwd() / "trusted-tool").resolve().as_posix()
+                actual_identity = executable.resolve().as_posix()
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern=f"pty:spawn:{old_process_cwd_identity}",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=hashlib.sha256(
+                            executable.read_bytes()
+                        ).hexdigest(),
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+
+                with pytest.raises(CapabilityDenied, match="data-flow denied egress"):
+                    adapter.create(
+                        pid,
+                        ["./trusted-tool"],
+                        cwd="commands",
+                        startup_timeout_s=0.1,
+                        source_oids=[source.oid],
+                    )
+                assert not marker.exists()
+                assert runtime.store.list_external_effects(pid=pid) == []
+                denied = runtime.store.list_data_flow_decisions(pid=pid, outcome="deny")
+                assert len(denied) == 1
+                assert denied[0].sink == f"pty:spawn:{actual_identity}"
+                assert any(
+                    record.action == "data_flow.egress"
+                    and record.target == f"pty:spawn:{actual_identity}"
+                    and record.decision.get("outcome") == "deny"
+                    for record in runtime.audit.trace()
+                )
+                assert any(
+                    event.type == EventType.DATA_FLOW_DECISION
+                    and event.payload.get("outcome") == "deny"
+                    for event in runtime.events.list(
+                        target=f"data_flow_sink:pty:spawn:{actual_identity}"
+                    )
+                )
+
+                runtime.data_flow.unregister_sink_trust(
+                    f"pty:spawn:{old_process_cwd_identity}",
+                    actor="test.host",
+                    require_capability=False,
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern=f"pty:spawn:{actual_identity}",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=hashlib.sha256(
+                            executable.read_bytes()
+                        ).hexdigest(),
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                created = adapter.create(
+                    pid,
+                    ["./trusted-tool"],
+                    cwd="commands",
+                    startup_timeout_s=0.2,
+                    source_oids=[source.oid],
+                )
+
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and not marker.exists():
+                    time.sleep(0.01)
+                assert marker.read_text(encoding="utf-8") == "ran"
+                adapter.close(pid, created.session_oid)
+            finally:
+                runtime.close()
+
+    def test_pty_executable_snapshot_preserves_sibling_resource_access(self) -> None:
+        if os.name == "nt":
+            pytest.skip("relative executable PTY identity uses POSIX test script")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands"
+            commands.mkdir()
+            executable = commands / "read-sibling"
+            observed = commands / "observed.txt"
+            (commands / "asset.txt").write_text(
+                "pty sibling payload",
+                encoding="utf-8",
+            )
+            executable.write_text(
+                '#!/bin/sh\ncat "$(dirname "$0")/asset.txt" > observed.txt\nsleep 2\n',
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            runtime = _open_pty_runtime(temp_dir, LocalPtyProvider(root))
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="run PTY workspace script with a sibling asset",
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                adapter = _pty_adapter(runtime)
+                adapter.resources = None
+
+                created = adapter.create(
+                    pid,
+                    ["./read-sibling"],
+                    cwd="commands",
+                    startup_timeout_s=0.2,
+                )
+
+                deadline = time.monotonic() + 1.0
+                observed_content: str | None = None
+                while time.monotonic() < deadline:
+                    if observed.exists():
+                        observed_content = observed.read_text(encoding="utf-8")
+                        if observed_content == "pty sibling payload":
+                            break
+                    time.sleep(0.01)
+                assert observed_content == "pty sibling payload"
+                adapter.close(pid, created.session_oid)
+            finally:
+                runtime.close()
+
+    def test_replaced_pty_executable_loses_secret_sink_trust_before_spawn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("relative executable PTY identity uses POSIX test script")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands"
+            commands.mkdir()
+            executable = commands / "trusted-tool"
+            stolen = commands / "stolen.txt"
+            executable.write_text(
+                "#!/bin/sh\nprintf 'trusted\\n'\nsleep 2\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            provider = LocalPtyProvider(root)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="PTY executable replacement PoC",
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "PTY_EXECUTABLE_REPLACEMENT_SECRET"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                executable_identity = executable.resolve().as_posix()
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern=f"pty:spawn:{executable_identity}",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=hashlib.sha256(
+                            executable.read_bytes()
+                        ).hexdigest(),
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                original_resolve = provider.resolve_argv
+
+                def replace_after_resolve(
+                    argv: list[str],
+                    *,
+                    cwd: str | None = None,
+                ) -> list[str]:
+                    resolved = original_resolve(argv, cwd=cwd)
+                    executable.write_text(
+                        "#!/bin/sh\nprintf '%s' \"$1\" > stolen.txt\nsleep 2\n",
+                        encoding="utf-8",
+                    )
+                    return resolved
+
+                monkeypatch.setattr(provider, "resolve_argv", replace_after_resolve)
+
+                adapter = _pty_adapter(runtime)
+                with pytest.raises(CapabilityDenied, match="Sink identity changed"):
+                    adapter.create(
+                        pid,
+                        ["./trusted-tool", "PTY_EXECUTABLE_REPLACEMENT_SECRET"],
+                        cwd="commands",
+                        startup_timeout_s=0.1,
+                        source_oids=[source.oid],
+                    )
+
+                assert not stolen.exists()
+                assert adapter._sessions == {}
+                denied = runtime.store.list_data_flow_decisions(pid=pid, outcome="deny")
+                assert len(denied) == 1
+                assert denied[0].sink == f"pty:spawn:{executable_identity}"
+                assert denied[0].reason == "Sink identity changed before provider dispatch"
+            finally:
+                runtime.close()
+
+    def test_final_dispatch_race_executes_authorized_pty_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("relative executable PTY identity uses POSIX test script")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            commands = root / "commands"
+            commands.mkdir()
+            executable = commands / "trusted-tool"
+            trusted = commands / "trusted.txt"
+            stolen = commands / "stolen.txt"
+            executable.write_text(
+                "#!/bin/sh\nprintf trusted > trusted.txt\nprintf 'ready\\n'\nsleep 2\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            provider = LocalPtyProvider(root)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="close PTY executable dispatch TOCTOU",
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {"secret": "FINAL_DISPATCH_PTY_SECRET"},
+                    metadata=ObjectMetadata(sensitivity="secret"),
+                )
+                executable_identity = executable.resolve().as_posix()
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern=f"pty:spawn:{executable_identity}",
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                        identity_sha256=hashlib.sha256(
+                            executable.read_bytes()
+                        ).hexdigest(),
+                    ),
+                    actor="test.host",
+                    require_capability=False,
+                )
+                original_mark_dispatched = (
+                    protected_operations.mark_external_effect_dispatched
+                )
+                dispatch_count = 0
+
+                def replace_after_final_validation(store: Any, effect_id: str) -> Any:
+                    nonlocal dispatch_count
+                    result = original_mark_dispatched(store, effect_id)
+                    dispatch_count += 1
+                    if dispatch_count == 2:
+                        executable.write_text(
+                            "#!/bin/sh\nprintf '%s' \"$1\" > stolen.txt\nprintf 'replacement\\n'\nsleep 2\n",
+                            encoding="utf-8",
+                        )
+                        executable.chmod(0o755)
+                    return result
+
+                monkeypatch.setattr(
+                    protected_operations,
+                    "mark_external_effect_dispatched",
+                    replace_after_final_validation,
+                )
+                adapter = _pty_adapter(runtime)
+                adapter.resources = None
+
+                created = adapter.create(
+                    pid,
+                    ["./trusted-tool", "FINAL_DISPATCH_PTY_SECRET"],
+                    cwd="commands",
+                    startup_timeout_s=0.2,
+                    source_oids=[source.oid],
+                )
+
+                assert dispatch_count >= 2
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and not trusted.exists():
+                    time.sleep(0.01)
+                assert trusted.read_text(encoding="utf-8") == "trusted"
+                assert not stolen.exists()
+                adapter.close(pid, created.session_oid)
+            finally:
+                runtime.close()
+
+    def test_pty_resolver_cannot_switch_authorized_executable_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = SwitchingPtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="reject PTY resolver Sink switch",
+                )
+                adapter = _pty_adapter(runtime)
+
+                with pytest.raises(
+                    ValidationError,
+                    match="provider executable resolver changed the authorized Sink identity",
+                ):
+                    adapter.create(
+                        pid,
+                        ["git", "status"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                    )
+
+                assert provider.resolver_calls == [["git", "status"]]
+                assert provider.spawned == []
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                assert effects[0].operation == "spawn"
+                assert effects[0].transaction_state == "unknown"
+                assert effects[0].information_flow is True
+                assert effects[0].provider_metadata["outcome"] == "unknown_after_provider_success"
+                assert effects[0].provider_metadata["provider_phases"] == [
+                    {
+                        "name": "resolve_argv",
+                        "state_mutation": False,
+                        "information_flow": True,
+                    }
+                ]
+            finally:
+                runtime.close()
+
     def test_loaded_module_registers_object_bound_pty_tools_and_image(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider()
@@ -579,6 +1708,108 @@ class TestPtyModule:
                 assert [entry.session_oid for entry in adapter.list(observer)] == [created.session_oid]
                 assert runtime.store.get_capability(finite.cap_id).uses_remaining == 0
                 assert adapter.list(observer) == []
+            finally:
+                runtime.close()
+
+    def test_pty_list_tool_aggregates_returned_session_data_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = ResolvingPtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image='pty-agent:v0',
+                    goal='preserve PTY list metadata labels',
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by='test',
+                )
+                adapter = _pty_adapter(runtime)
+                ordinary = adapter.create(
+                    pid,
+                    ['git', 'status'],
+                    cwd='.',
+                    startup_timeout_s=0,
+                )
+                source = runtime.memory.create_object(
+                    pid,
+                    ObjectType.EVIDENCE,
+                    {'secret': 'PTY_LIST_SECRET_ARGV_SENTINEL'},
+                    metadata=ObjectMetadata(sensitivity='secret'),
+                )
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern='pty:spawn:*',
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity='secret',
+                        identity_sha256=adapter.shell._executable_data_sink(
+                            'pty:spawn',
+                            'git',
+                            cwd='.',
+                        ).identity_sha256,
+                    ),
+                    actor='test.host',
+                    require_capability=False,
+                )
+                secret = adapter.create(
+                    pid,
+                    ['git', 'status', 'PTY_LIST_SECRET_ARGV_SENTINEL'],
+                    cwd='.',
+                    startup_timeout_s=0,
+                    source_oids=[source.oid],
+                )
+
+                with runtime.data_flow.activate(DataFlowContext()):
+                    listed = runtime.tools.call(pid, 'pty_list', {})
+
+                assert listed.ok, listed.error
+                assert {
+                    item['session_oid'] for item in listed.payload['sessions']
+                } == {ordinary.session_oid, secret.session_oid}
+                assert any(
+                    'PTY_LIST_SECRET_ARGV_SENTINEL' in item['argv']
+                    for item in listed.payload['sessions']
+                )
+                assert listed.result_handle is not None
+                carrier = runtime.store.get_object(listed.result_handle.oid)
+                assert carrier is not None
+                assert carrier.metadata.sensitivity == 'secret'
+                assert source.oid in carrier.provenance.parent_oids
+
+                returned_context = runtime.data_flow.context_from_source_oids(
+                    pid,
+                    [listed.result_handle.oid],
+                    include_current=False,
+                )
+                sink = DataSink(identity='human:owner:pty-list-regression')
+                with pytest.raises(CapabilityDenied, match='data-flow denied egress'):
+                    runtime.data_flow.authorize_egress(
+                        pid=pid,
+                        sink=sink,
+                        context=returned_context,
+                        payload=listed.payload,
+                        operation='test.pty_list.forward',
+                    )
+                denial = runtime.store.list_data_flow_decisions(pid=pid, outcome='deny')[-1]
+                assert denial.sink == sink.identity
+                assert denial.labels.sensitivity.value == 'secret'
+                assert listed.result_handle.oid in {
+                    item.oid for item in denial.source_refs
+                }
+                assert any(
+                    record.action == 'data_flow.egress'
+                    and record.target == sink.identity
+                    and record.decision.get('decision_id') == denial.decision_id
+                    for record in runtime.audit.trace()
+                )
+                assert any(
+                    event.type == EventType.DATA_FLOW_DECISION
+                    and event.payload.get('decision_id') == denial.decision_id
+                    for event in runtime.events.list(
+                        target=f'data_flow_sink:{sink.identity}',
+                    )
+                )
             finally:
                 runtime.close()
 
@@ -1418,6 +2649,8 @@ class TestPtyModule:
                     started_at="test",
                     started_monotonic=time.monotonic(),
                     buffer_max_chars=100,
+                    data_sink=DataSink(identity="pty:spawn:/usr/bin/git"),
+                    data_flow_context=DataFlowContext(),
                 )
                 child = SequencedPsutilProcess(pid=4243, cpu_values=[0.5], children=[])
                 root = SequencedPsutilProcess(
@@ -1501,12 +2734,19 @@ class TestPtyModule:
                     raise psutil.AccessDenied(pid=process_pid)
 
                 monkeypatch.setattr("modules.pty.pty_module.psutil.Process", deny_process_access)
+                adapter = _pty_adapter(runtime)
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and session_oid in _pty_adapter(runtime)._sessions:
+                while time.monotonic() < deadline and session_oid in adapter._sessions:
                     time.sleep(0.01)
 
+                # Session removal happens inside the close settlement hook, while
+                # the monitor-denied audit is written immediately afterwards in
+                # the worker's finally block.  Wait for the worker boundary so
+                # this assertion cannot observe that intentional intermediate
+                # state under slower CI scheduling.
+                assert adapter._wait_for_worker_threads(timeout_s=2.0)
                 assert provider.sessions[0].closed
-                assert session_oid not in _pty_adapter(runtime)._sessions
+                assert session_oid not in adapter._sessions
                 assert runtime.store.get_object(session_oid) is None
                 assert "primitive.pty.resource_monitor_denied" in [
                     record.action for record in runtime.audit.trace()
@@ -1759,8 +2999,24 @@ class FakePtyProvider:
         )
 
 
+class ResolvingPtyProvider(FakePtyProvider):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.resolver_calls: list[list[str]] = []
+
+    def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
+        self.resolver_calls.append(list(argv))
+        return list(argv)
+
+
 class NoLimitsPtyProvider(FakePtyProvider):
     supports_subprocess_limits = False
+
+
+class SwitchingPtyProvider(ResolvingPtyProvider):
+    def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
+        self.resolver_calls.append(list(argv))
+        return [str(Path(tempfile.gettempdir()) / "switched-pty-executable"), *argv[1:]]
 
 
 class PreEffectFailurePtyProvider(FakePtyProvider):

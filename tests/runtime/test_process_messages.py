@@ -8,7 +8,13 @@ import time
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, ProcessMessageKind, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    ProcessMessage,
+    ProcessMessageKind,
+    ProcessMessageStatus,
+    ProcessStatus,
+)
 from agent_libos.models.exceptions import ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
@@ -18,6 +24,31 @@ def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
 
 
 class TestProcessMessage:
+
+    def test_process_message_preserves_legacy_positional_status_arguments(self) -> None:
+        message = ProcessMessage(
+            'legacy-message',
+            'sender',
+            'recipient',
+            ProcessMessageKind.NORMAL,
+            'subject',
+            'body',
+            'default',
+            None,
+            None,
+            {'legacy': True},
+            ProcessMessageStatus.ACKED,
+            'created',
+            'updated',
+            'acked',
+        )
+
+        assert message.payload == {'legacy': True}
+        assert message.status == ProcessMessageStatus.ACKED
+        assert message.created_at == 'created'
+        assert message.updated_at == 'updated'
+        assert message.acked_at == 'acked'
+        assert message.metadata == {}
 
     def test_post_event_failure_rolls_back_message_and_waiter_wakeup(
         self,
@@ -326,6 +357,200 @@ class TestProcessMessage:
         finally:
             if poster is not None:
                 poster.join(timeout=5)
+            runtime.close()
+
+    def test_observe_labels_racing_ack_preserves_acked_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        carrier_created = threading.Event()
+        ack_started = threading.Event()
+        ack_finished = threading.Event()
+        ack_errors: list[BaseException] = []
+        ack_thread: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='observe labels while acking')
+            message = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='labeled message',
+            )
+            stale_messages = runtime.messages.list(pid)
+            original_create_object = runtime.memory.create_object
+
+            def coordinated_create_object(*args, **kwargs):
+                handle = original_create_object(*args, **kwargs)
+                metadata = kwargs.get('metadata')
+                if metadata is not None and 'label_carrier' in metadata.tags:
+                    carrier_created.set()
+                    assert ack_started.wait(timeout=5)
+                    # The unfixed path releases the store lock after carrier
+                    # creation, allowing ACK to commit before its stale
+                    # full-row message update. The fixed path keeps ACK
+                    # blocked until observation commits.
+                    ack_finished.wait(timeout=0.1)
+                return handle
+
+            monkeypatch.setattr(runtime.memory, 'create_object', coordinated_create_object)
+
+            def ack_message() -> None:
+                try:
+                    assert carrier_created.wait(timeout=5)
+                    ack_started.set()
+                    runtime.messages.ack(pid, [message.message_id])
+                except BaseException as exc:
+                    ack_errors.append(exc)
+                finally:
+                    ack_finished.set()
+
+            ack_thread = threading.Thread(target=ack_message, daemon=True)
+            ack_thread.start()
+            observed = runtime.messages.observe_labels(pid, stale_messages)
+            ack_thread.join(timeout=5)
+
+            assert not ack_thread.is_alive()
+            assert ack_errors == []
+            assert len(observed) == 1
+            stored = runtime.store.get_process_message(message.message_id)
+            assert stored is not None
+            assert stored.status == ProcessMessageStatus.ACKED
+            assert stored.acked_at is not None
+            assert stored.metadata['label_carrier_oid'] == observed[0]
+            assert runtime.messages.unread(pid) == []
+        finally:
+            if ack_thread is not None:
+                ack_thread.join(timeout=5)
+            runtime.close()
+
+    def test_observe_labels_racing_exit_cannot_revive_terminal_process(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        carrier_created = threading.Event()
+        exit_started = threading.Event()
+        exit_finished = threading.Event()
+        exit_errors: list[BaseException] = []
+        exit_thread: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='observe labels while exiting')
+            runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='labeled message',
+            )
+            stale_messages = runtime.messages.list(pid)
+            original_create_object = runtime.memory.create_object
+
+            def coordinated_create_object(*args, **kwargs):
+                handle = original_create_object(*args, **kwargs)
+                metadata = kwargs.get('metadata')
+                if metadata is not None and 'label_carrier' in metadata.tags:
+                    carrier_created.set()
+                    assert exit_started.wait(timeout=5)
+                    exit_finished.wait(timeout=0.1)
+                return handle
+
+            monkeypatch.setattr(runtime.memory, 'create_object', coordinated_create_object)
+
+            def exit_process() -> None:
+                try:
+                    assert carrier_created.wait(timeout=5)
+                    exit_started.set()
+                    runtime.process.exit(pid)
+                except BaseException as exc:
+                    exit_errors.append(exc)
+                finally:
+                    exit_finished.set()
+
+            exit_thread = threading.Thread(target=exit_process, daemon=True)
+            exit_thread.start()
+            runtime.messages.observe_labels(pid, stale_messages)
+            exit_thread.join(timeout=5)
+
+            assert not exit_thread.is_alive()
+            assert exit_errors == []
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            assert runtime.store.claim_runnable_process(pid) is None
+            with pytest.raises(ProcessError, match='terminal process'):
+                runtime.messages.observe_labels(pid, stale_messages)
+        finally:
+            if exit_thread is not None:
+                exit_thread.join(timeout=5)
+            runtime.close()
+
+    def test_double_observe_labels_reuses_one_carrier(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        first_carrier_created = threading.Event()
+        second_carrier_created = threading.Event()
+        start = threading.Barrier(3)
+        creation_lock = threading.Lock()
+        creation_oids: list[str] = []
+        observer_threads: list[threading.Thread] = []
+        observer_errors: list[BaseException] = []
+        observer_results: list[list[str]] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='observe labels twice')
+            runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='labeled message',
+            )
+            stale_copies = [runtime.messages.list(pid), runtime.messages.list(pid)]
+            original_create_object = runtime.memory.create_object
+
+            def coordinated_create_object(*args, **kwargs):
+                handle = original_create_object(*args, **kwargs)
+                metadata = kwargs.get('metadata')
+                if metadata is not None and 'label_carrier' in metadata.tags:
+                    with creation_lock:
+                        creation_oids.append(handle.oid)
+                        ordinal = len(creation_oids)
+                    if ordinal == 1:
+                        first_carrier_created.set()
+                        # On the unfixed path the second observer also sees
+                        # stale metadata and creates a second carrier. Under
+                        # the fixed transaction it cannot enter this window.
+                        second_carrier_created.wait(timeout=0.2)
+                    else:
+                        second_carrier_created.set()
+                return handle
+
+            monkeypatch.setattr(runtime.memory, 'create_object', coordinated_create_object)
+
+            def observe(messages: list[ProcessMessage]) -> None:
+                try:
+                    start.wait(timeout=5)
+                    observer_results.append(runtime.messages.observe_labels(pid, messages))
+                except BaseException as exc:
+                    observer_errors.append(exc)
+
+            observer_threads = [
+                threading.Thread(target=observe, args=(messages,), daemon=True)
+                for messages in stale_copies
+            ]
+            for thread in observer_threads:
+                thread.start()
+            start.wait(timeout=5)
+            for thread in observer_threads:
+                thread.join(timeout=5)
+
+            assert all(not thread.is_alive() for thread in observer_threads)
+            assert observer_errors == []
+            assert first_carrier_created.is_set()
+            assert len(creation_oids) == 1
+            assert len(observer_results) == 2
+            assert observer_results[0] == observer_results[1]
+            stored = runtime.store.get_process_message(stale_copies[0][0].message_id)
+            assert stored is not None
+            assert stored.metadata['label_carrier_oid'] == observer_results[0][0]
+        finally:
+            for thread in observer_threads:
+                thread.join(timeout=5)
             runtime.close()
 
     def test_receive_process_messages_blocks_until_matching_message_then_resumes(self) -> None:

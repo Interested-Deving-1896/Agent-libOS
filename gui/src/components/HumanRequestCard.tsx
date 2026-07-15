@@ -1,5 +1,11 @@
 import { useReducer, useRef } from "react";
-import type { HumanPermissionPolicy, HumanRequest, HumanResponseInput } from "../api/types";
+import type {
+  DataReleaseApprovalContext,
+  HumanPermissionPolicy,
+  HumanRequest,
+  HumanRequestPayload,
+  HumanResponseInput
+} from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 
 export type HumanDecisionDraft = {
@@ -10,7 +16,8 @@ export type HumanDecisionDraft = {
 export type HumanResponseValidationError =
   | "question_answer_required"
   | "permission_approve_deny"
-  | "permission_reject_allow";
+  | "permission_reject_allow"
+  | "release_required";
 
 type HumanResponseBuildResult =
   | { response: HumanResponseInput }
@@ -51,6 +58,9 @@ export function buildHumanResponse(
   approved: boolean,
   draft: HumanDecisionDraft
 ): HumanResponseBuildResult {
+  if (request.payload.release_required === true) {
+    return { error: "release_required" };
+  }
   const requestType = request.payload?.type;
   if (requestType === "permission_request") {
     if (approved) {
@@ -74,6 +84,11 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
   const requestType = request.payload?.type;
   const isPermission = requestType === "permission_request";
   const isQuestion = requestType === "question";
+  const isDataReleaseApproval = requestType === "data_release_approval";
+  const releaseRequired = request.payload.release_required === true;
+  const releaseContext = isDataReleaseApproval
+    ? parseDataReleaseApprovalContext(request.payload)
+    : null;
   const [state, dispatch] = useReducer(humanDecisionReducer, {
     answer: "",
     policy: "ask_each_time",
@@ -101,13 +116,39 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
     }
   }
 
-  const approveDisabled = state.submitting || (isQuestion && !state.answer.trim()) || (isPermission && state.policy === "always_deny");
+  const approveDisabled = state.submitting
+    || (isQuestion && !state.answer.trim())
+    || (isPermission && state.policy === "always_deny")
+    || (isDataReleaseApproval && releaseContext === null);
   const rejectDisabled = state.submitting || (isPermission && state.policy === "always_allow");
   const prompt = String(request.payload?.question ?? request.payload?.reason ?? request.payload?.type ?? t("operator.humanRequestFallback"));
+  const releaseRequestId = request.release_request_id
+    ?? (typeof request.payload.release_request_id === "string" ? request.payload.release_request_id : null);
+
+  if (releaseRequired) {
+    return (
+      <div className={`${className} typedHumanRequest withheldHumanRequest`}>
+        <strong className="humanRequestPrompt">{t("human.releaseRequiredTitle")}</strong>
+        <p className="humanReleaseNotice" role="status">
+          {releaseRequestId
+            ? t("human.releaseRequiredMessage", { requestId: releaseRequestId })
+            : t("human.releaseRequiredMessageNoId")}
+        </p>
+      </div>
+    );
+  }
 
   return (
-    <div className={`${className} typedHumanRequest`} aria-busy={state.submitting || undefined}>
-      <strong className="humanRequestPrompt">{prompt}</strong>
+    <div
+      className={`${className} typedHumanRequest${isDataReleaseApproval ? " dataReleaseApprovalCard" : ""}`}
+      aria-busy={state.submitting || undefined}
+    >
+      <strong className="humanRequestPrompt">
+        {isDataReleaseApproval ? t("human.releaseApprovalTitle") : prompt}
+      </strong>
+      {isDataReleaseApproval ? (
+        <p className="humanReleaseNotice">{t("human.releaseApprovalHint")}</p>
+      ) : null}
       {isPermission ? (
         <label className="humanDecisionControl">
           <span>{t("human.permissionPolicy")}</span>
@@ -143,6 +184,14 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
           />
         </label>
       ) : null}
+      {isDataReleaseApproval && releaseContext ? (
+        <DataReleaseMetadata context={releaseContext} />
+      ) : null}
+      {isDataReleaseApproval && !releaseContext ? (
+        <span className="humanDecisionError" role="alert">
+          {t("human.releaseMetadataInvalid")}
+        </span>
+      ) : null}
       <div className="humanDecisionActions">
         <button disabled={approveDisabled} onClick={() => void submit(true)}>
           {isQuestion ? t("human.submitAnswer") : t("human.approve")}
@@ -159,5 +208,84 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
 function validationErrorKey(error: HumanResponseValidationError): TranslationKey {
   if (error === "question_answer_required") return "human.answerRequired";
   if (error === "permission_approve_deny") return "human.approveDenyInvalid";
+  if (error === "release_required") return "human.releaseRequiredMessageNoId";
   return "human.rejectAllowInvalid";
+}
+
+export function parseDataReleaseApprovalContext(
+  payload: HumanRequestPayload
+): DataReleaseApprovalContext | null {
+  if (payload.type !== "data_release_approval" || !isRecord(payload.context)) return null;
+  const context = payload.context;
+  if (
+    !isNonEmptyString(context.sink)
+    || !isNonEmptyString(context.sensitivity)
+    || !isNonNegativeInteger(context.payload_bytes)
+    || !isSha256(context.payload_sha256)
+    || !isNonNegativeInteger(context.source_count)
+    || !isNonEmptyString(context.operation)
+    || !isNullableString(context.tenant)
+    || !isNullableString(context.principal)
+  ) {
+    return null;
+  }
+  return {
+    sink: context.sink,
+    sensitivity: context.sensitivity,
+    tenant: normalizeOptionalString(context.tenant),
+    principal: normalizeOptionalString(context.principal),
+    payload_bytes: context.payload_bytes,
+    payload_sha256: context.payload_sha256,
+    source_count: context.source_count,
+    operation: context.operation
+  };
+}
+
+function DataReleaseMetadata({ context }: { context: DataReleaseApprovalContext }) {
+  const { t } = useI18n();
+  const rows: Array<{ key: TranslationKey; value: string; code?: boolean }> = [
+    { key: "human.releaseSink", value: context.sink, code: true },
+    { key: "human.releaseSensitivity", value: context.sensitivity },
+    ...(context.tenant ? [{ key: "human.releaseTenant" as const, value: context.tenant, code: true }] : []),
+    ...(context.principal ? [{ key: "human.releasePrincipal" as const, value: context.principal, code: true }] : []),
+    { key: "human.releasePayloadBytes", value: String(context.payload_bytes) },
+    { key: "human.releasePayloadSha256", value: context.payload_sha256, code: true },
+    { key: "human.releaseSourceCount", value: String(context.source_count) },
+    { key: "human.releaseOperation", value: context.operation, code: true }
+  ];
+
+  return (
+    <dl className="humanReleaseMetadata" aria-label={t("human.releaseMetadataLabel")}>
+      {rows.map((row) => (
+        <div className="humanReleaseMetadataRow" key={row.key}>
+          <dt>{t(row.key)}</dt>
+          <dd>{row.code ? <code>{row.value}</code> : row.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+}
+
+function isNullableString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+function normalizeOptionalString(value: string | null | undefined): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
 }

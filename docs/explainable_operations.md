@@ -55,6 +55,13 @@ failure.
 - context manifest;
 - event and audit.
 
+Data-flow decisions are append-only evidence as well. Their linked audit/event
+records carry the decision id, Sink/trust hashes, registry generation, source
+references, label summary, and release id without copying the payload. A
+pre-provider data-flow denial therefore remains explainable even though no
+external-effect intent exists and no ordinary finite-use capability was
+consumed.
+
 Audit and event managers attach every record emitted inside an active operation.
 Capability, Human, external-effect, ToolBroker, LLM, ObjectTask, and context
 code additionally link their own durable identifiers. A uniqueness constraint

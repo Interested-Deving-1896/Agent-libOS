@@ -134,7 +134,7 @@ async def run_chat(
                         "rights": ["write"],
                     }
                 ],
-                "permitted_effects": ["human.*"],
+                "permitted_effects": ["llm.*", "human.*"],
                 "metadata": {"provided_by": "human_llm_chat"},
             },
         )

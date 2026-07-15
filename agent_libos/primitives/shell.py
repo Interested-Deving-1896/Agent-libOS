@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-import asyncio
 import hashlib
 import inspect
 import math
 import subprocess
+import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -21,6 +21,7 @@ from agent_libos.models import (
     CapabilityDecision,
     CapabilityEffect,
     CapabilityRight,
+    DataSink,
     EventType,
     ResourceUsage,
     SandboxProfile,
@@ -31,8 +32,12 @@ from agent_libos.runtime.event_bus import EventBus
 from agent_libos.substrate import (
     CommandMetrics,
     CommandResult,
+    ExecutableSnapshot,
+    executable_content_sha256,
     LocalShellProvider,
+    resolve_runtime_python_alias,
     ShellProvider,
+    snapshot_executable,
     SubprocessLimitExceeded,
     SubprocessLimits,
     SubprocessTimeoutExpired,
@@ -71,6 +76,7 @@ class ShellPolicyDecision:
     rule_id: str | None = None
     rule_effect: CapabilityEffect = CapabilityEffect.ASK
     sandbox_profile: SandboxProfile | None = None
+    authority_decision: CapabilityDecision | None = None
 
 
 class ShellAdapter:
@@ -99,6 +105,8 @@ class ShellAdapter:
         self.human = human
         self.resources = resources
         self.provider = provider or LocalShellProvider(cwd or ".")
+        provider_cwd = getattr(self.provider, "cwd", None)
+        self.cwd = Path(cwd if cwd is not None else provider_cwd or ".").resolve()
         self.rule_engine = ShellRuleEngine(self._configured_rules())
 
     def run(
@@ -107,6 +115,8 @@ class ShellAdapter:
         argv: list[str],
         timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
         cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> CommandResult:
         checked = self._validate_argv(argv)
         selected_timeout = self._validate_timeout(timeout)
@@ -114,14 +124,39 @@ class ShellAdapter:
         selected_cwd = os.fspath(cwd) if cwd is not None else "."
         self._enforce_workspace_argv_scope(checked, cwd=selected_cwd)
         decision = self._authorize(pid, checked, resource, timeout=selected_timeout, cwd=selected_cwd)
+        if not decision.allowed and not decision.ask_human:
+            raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
+        dispatch_argv = self._harden_read_only_git_argv(checked)
+        sink = self._executable_data_sink("shell", dispatch_argv[0], cwd=cwd)
+        executable_identity = sink.identity.split(":", 1)[1]
+        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        data_flow_payload = {
+            "argv": [executable_identity, *dispatch_argv[1:]],
+            "cwd": os.fspath(cwd) if cwd is not None else None,
+        }
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=data_flow_payload,
+            operation="shell.run",
+        )
         if decision.ask_human:
-            self._request_human_approval(pid, checked, resource, decision, timeout=selected_timeout, cwd=cwd)
+            self._request_human_approval(
+                pid,
+                checked,
+                resource,
+                decision,
+                timeout=selected_timeout,
+                cwd=cwd,
+                source_oids=source_oids,
+            )
         if not decision.allowed:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
-        provider_argv = self._harden_read_only_git_argv(checked)
+        provider_argv = list(dispatch_argv)
         effect_context = {
             "argv": list(checked),
-            "provider_argv": list(provider_argv),
+            "provider_argv": list(data_flow_payload["argv"]),
             "resource": resource,
             "timeout_s": selected_timeout,
             "cwd": os.fspath(cwd) if cwd is not None else None,
@@ -143,17 +178,30 @@ class ShellAdapter:
             cwd=cwd,
         )
         correlation_id = intent_record.record_id
-        capability_decision = CapabilityDecision(
-            subject=pid,
-            resource=resource,
-            right=CapabilityRight.EXECUTE.value,
-            allowed=True,
-            effect=CapabilityEffect.ALLOW,
-            reason=decision.reason,
-            selected_capability_id=decision.consume_capability_id,
-            consume_capability_id=decision.consume_capability_id,
-            context=effect_context,
-        )
+        capability_decision = decision.authority_decision
+        if capability_decision is None or not capability_decision.allowed:
+            raise CapabilityDenied(
+                "allowed shell policy decision is missing its capability authority"
+            )
+
+        def revalidate_shell_authority() -> tuple[CapabilityDecision, ...]:
+            current = self._authorize(
+                pid,
+                checked,
+                resource,
+                timeout=selected_timeout,
+                cwd=selected_cwd,
+            )
+            authority = current.authority_decision
+            if not current.allowed or current.ask_human or authority is None:
+                raise CapabilityDenied(
+                    f"{pid} shell authority changed before provider dispatch: {current.reason}"
+                )
+            return (authority,)
+
+        def revalidate_shell_sink() -> DataSink:
+            return self._executable_data_sink("shell", provider_argv[0], cwd=cwd)
+
         invocation = ProtectedOperationInvocation(
             pid=pid,
             actor=pid,
@@ -172,6 +220,7 @@ class ShellAdapter:
                 "argv": list(checked),
                 "provider_argv": list(provider_argv),
             },
+            authority_revalidator=revalidate_shell_authority,
             restore_not_started=lambda: self.audit.record(
                 actor=pid,
                 action="primitive.shell.failed",
@@ -189,15 +238,56 @@ class ShellAdapter:
                 error,
                 phase,
             ),
+            data_sink=sink,
+            data_sink_revalidator=revalidate_shell_sink,
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                flow_context,
+                origin="external:shell",
+            ),
+            data_flow_payload=data_flow_payload,
+            data_flow_operation="shell.run",
         )
         with self._protected().start("primitive.shell.run", invocation, provider=self.provider) as operation:
-            try:
-                proc = operation.call(
-                    ProviderPhase("run", state_mutation=True, information_flow=True),
-                    self.provider.run,
-                    provider_argv,
-                    **provider_kwargs,
+            resolver = getattr(self.provider, "resolve_argv", None)
+            if callable(resolver):
+                provider_argv = operation.call(
+                    ProviderPhase("resolve_argv", information_flow=True),
+                    self._resolve_provider_argv,
+                    dispatch_argv,
+                    cwd=cwd,
                 )
+            self._require_provider_executable_identity(
+                provider_argv[0],
+                expected=executable_identity,
+                cwd=cwd,
+            )
+            effect_context["provider_argv"] = list(provider_argv)
+            executable_snapshot = self._snapshot_executable_for_dispatch(
+                pid=pid,
+                provider=self.provider,
+                requested_argv0=dispatch_argv[0],
+                provider_argv0=provider_argv[0],
+                cwd=cwd,
+                expected_sink=sink,
+                expected_executable_identity=executable_identity,
+                flow_context=flow_context,
+                data_flow_payload=data_flow_payload,
+            )
+            dispatch_kwargs = dict(provider_kwargs)
+            if executable_snapshot is not None:
+                dispatch_kwargs["executable_snapshot"] = executable_snapshot
+            try:
+                try:
+                    proc = operation.call(
+                        ProviderPhase("run", state_mutation=True, information_flow=True),
+                        self.provider.run,
+                        provider_argv,
+                        **dispatch_kwargs,
+                    )
+                finally:
+                    if executable_snapshot is not None:
+                        executable_snapshot.close()
                 proc = replace(self._bounded_result(proc), argv=list(checked))
             except SubprocessTimeoutExpired as exc:
                 self._charge_subprocess_metrics(pid, exc.metrics, resource=resource, argv=checked, cwd=cwd, allow_overage=True)
@@ -273,13 +363,14 @@ class ShellAdapter:
                         "metrics": self._metrics_json(proc.metrics),
                     },
                 )
-            return operation.complete(
+            completed = operation.complete(
                 proc,
                 evidence,
                 classification_context=effect_context,
                 classification_result=result_observation,
                 resource=resource_settlement,
             )
+            return completed
 
     def _harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
         """Harden the exact built-in Git read allowlist before provider use."""
@@ -303,6 +394,177 @@ class ShellAdapter:
         if sdk is None:
             raise ValidationError("ShellAdapter requires ProtectedOperationSDK")
         return sdk
+
+    def _data_flow(self) -> Any:
+        manager = getattr(self, "data_flow", None) or getattr(
+            self._protected(),
+            "data_flow",
+            None,
+        )
+        if manager is None:
+            raise ValidationError("shell data-flow manager is not attached")
+        return manager
+
+    def _resolve_provider_argv(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | os.PathLike[str] | None,
+        provider: Any | None = None,
+    ) -> list[str]:
+        selected_provider = self.provider if provider is None else provider
+        resolver = getattr(selected_provider, "resolve_argv", None)
+        if not callable(resolver):
+            return list(argv)
+        resolved = resolver(
+            list(argv),
+            cwd=os.fspath(cwd) if cwd is not None else None,
+        )
+        if isinstance(resolved, (str, bytes)):
+            raise ValidationError("provider executable resolver must return argv")
+        try:
+            selected = list(resolved)
+        except TypeError as exc:
+            raise ValidationError("provider executable resolver must return argv") from exc
+        if (
+            len(selected) != len(argv)
+            or not selected
+            or not isinstance(selected[0], str)
+            or not selected[0].strip()
+            or selected[1:] != argv[1:]
+        ):
+            raise ValidationError(
+                "provider executable resolver may canonicalize only argv[0]"
+            )
+        return selected
+
+    def _resolved_executable_identity(
+        self,
+        argv0: str,
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> str:
+        """Resolve the Sink identity from Host-owned argv[0] state only."""
+
+        root = self._provider_workspace_root() or self.cwd
+        selected_cwd = self._resolve_workspace_cwd(
+            root,
+            os.fspath(cwd) if cwd is not None else ".",
+        )
+        if self._argv0_has_path(argv0):
+            raw = Path(argv0).expanduser()
+            selected = raw if raw.is_absolute() else selected_cwd / raw
+        else:
+            selected = shutil.which(argv0, path=self._host_executable_path(root))
+            if selected is None:
+                selected = resolve_runtime_python_alias(
+                    argv0,
+                    workspace_root=root,
+                )
+            if selected is None:
+                selected = selected_cwd / argv0
+        return Path(selected).resolve(strict=False).as_posix()
+
+    def _executable_data_sink(
+        self,
+        namespace: str,
+        argv0: str,
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> DataSink:
+        executable_identity = self._resolved_executable_identity(argv0, cwd=cwd)
+        try:
+            identity_sha256 = executable_content_sha256(executable_identity)
+        except FileNotFoundError:
+            # Abstract/fake providers may implement a non-local executable. Such
+            # a Sink remains usable for normal data, but cannot match a
+            # content-bound clearance above normal.
+            identity_sha256 = None
+        return DataSink(
+            identity=f"{namespace}:{executable_identity}",
+            identity_sha256=identity_sha256,
+        )
+
+    def _host_executable_path(self, root: Path) -> str:
+        entries: list[str] = []
+        for item in os.environ.get("PATH", "").split(os.pathsep):
+            if not item:
+                continue
+            raw = Path(item).expanduser()
+            if not raw.is_absolute():
+                continue
+            resolved = raw.resolve(strict=False)
+            if root in resolved.parents or resolved == root:
+                continue
+            entries.append(str(resolved))
+        return os.pathsep.join(entries)
+
+    def _require_provider_executable_identity(
+        self,
+        argv0: str,
+        *,
+        expected: str,
+        cwd: str | os.PathLike[str] | None,
+    ) -> None:
+        actual = self._resolved_executable_identity(argv0, cwd=cwd)
+        if actual != expected:
+            raise ValidationError(
+                "provider executable resolver changed the authorized Sink identity: "
+                f"expected {expected}, found {actual}"
+            )
+
+    def _snapshot_executable_for_dispatch(
+        self,
+        *,
+        pid: str,
+        provider: Any,
+        requested_argv0: str,
+        provider_argv0: str,
+        cwd: str | os.PathLike[str] | None,
+        expected_sink: DataSink,
+        expected_executable_identity: str,
+        flow_context: Any,
+        data_flow_payload: Any,
+    ) -> ExecutableSnapshot | None:
+        checker = getattr(provider, "executable_snapshot_required", None)
+        if not callable(checker):
+            return None
+        required = bool(
+            checker(
+                provider_argv0,
+                requested_argv0=requested_argv0,
+                cwd=os.fspath(cwd) if cwd is not None else None,
+            )
+        )
+        if not required:
+            return None
+        if not bool(getattr(provider, "supports_executable_snapshots", False)):
+            self._data_flow().reject_sink_identity_change(
+                pid=pid,
+                sink=expected_sink,
+                context=flow_context,
+                payload=data_flow_payload,
+                reason="provider cannot pin a mutable executable before dispatch",
+            )
+            raise AssertionError("data-flow Sink rejection must raise")
+        snapshot = snapshot_executable(
+            provider_argv0,
+            sibling_limit=self.config.tools.executable_snapshot_sibling_limit,
+        )
+        if (
+            snapshot.source_path.as_posix() != expected_executable_identity
+            or snapshot.content_sha256 != expected_sink.identity_sha256
+        ):
+            snapshot.close()
+            self._data_flow().reject_sink_identity_change(
+                pid=pid,
+                sink=expected_sink,
+                context=flow_context,
+                payload=data_flow_payload,
+                reason="Sink identity changed before provider dispatch",
+            )
+            raise AssertionError("data-flow Sink rejection must raise")
+        return snapshot
 
     def _protected_failure_evidence(
         self,
@@ -354,8 +616,17 @@ class ShellAdapter:
         argv: list[str],
         timeout: float = _TOOL_DEFAULTS.shell_timeout_s,
         cwd: str | os.PathLike[str] | None = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> CommandResult:
-        return await asyncio.to_thread(self.run, pid, argv, timeout=timeout, cwd=cwd)
+        return await self._data_flow().run_sync_in_worker(
+            self.run,
+            pid,
+            argv,
+            timeout=timeout,
+            cwd=cwd,
+            source_oids=source_oids,
+        )
 
     def grant_policy(
         self,
@@ -510,6 +781,7 @@ class ShellAdapter:
                 rule_id=rule.rule_id,
                 rule_effect=rule.effect,
                 sandbox_profile=profile,
+                authority_decision=explicit_decision,
             )
         if explicit_policy in {CapabilityManager.ALWAYS_ALLOW, CapabilityManager.ALLOW_ONCE}:
             return ShellPolicyDecision(
@@ -525,6 +797,7 @@ class ShellAdapter:
                 rule_id=rule.rule_id,
                 rule_effect=rule.effect,
                 sandbox_profile=profile,
+                authority_decision=explicit_decision,
             )
 
         if not policy_caps:
@@ -550,6 +823,7 @@ class ShellAdapter:
                 rule_id=rule.rule_id,
                 rule_effect=rule.effect,
                 sandbox_profile=profile,
+                authority_decision=policy_decision,
             )
         if not policy_decision.allowed:
             return ShellPolicyDecision(
@@ -580,6 +854,7 @@ class ShellAdapter:
                     rule_id=rule.rule_id,
                     rule_effect=rule.effect,
                     sandbox_profile=profile,
+                    authority_decision=policy_decision,
                 )
             return ShellPolicyDecision(
                 allowed=False,
@@ -592,6 +867,7 @@ class ShellAdapter:
                 rule_id=rule.rule_id,
                 rule_effect=rule.effect,
                 sandbox_profile=profile,
+                authority_decision=policy_decision,
             )
         if level == self.config.shell.always_allow_level:
             return ShellPolicyDecision(
@@ -607,6 +883,7 @@ class ShellAdapter:
                 rule_id=rule.rule_id,
                 rule_effect=rule.effect,
                 sandbox_profile=profile,
+                authority_decision=policy_decision,
             )
         return ShellPolicyDecision(
             False,
@@ -630,6 +907,7 @@ class ShellAdapter:
         *,
         timeout: float,
         cwd: str | os.PathLike[str] | None,
+        source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for shell execute on {resource}")
@@ -668,6 +946,7 @@ class ShellAdapter:
                 "context": approval_context,
             },
             blocking=True,
+            source_oids=source_oids,
         )
         raise HumanApprovalRequired(
             request_id=request_id,

@@ -28,7 +28,21 @@ from agent_libos.llm.user_profiles import (
     normalize_user_llm_profile_id,
     summarize_llm_profile,
 )
-from agent_libos.models import CapabilityRight, CapabilitySpec, ObjectRight, ProcessMessageKind, ProcessSignal, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    CapabilitySpec,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+    ObjectRight,
+    ProcessMessageKind,
+    ProcessSignal,
+    ProcessStatus,
+)
+from agent_libos.storage.gui_visibility import (
+    is_gui_presentation_audit,
+    is_gui_presentation_event,
+)
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -70,6 +84,34 @@ _GUI_NULLABLE_BOOL_FIELDS = {
     "responses_previous_response_id",
     "store",
 }
+
+
+class _GuiHumanPresentationProvider:
+    """The protected handoff from Host-owned state to GUI response JSON."""
+
+    @staticmethod
+    def present(view: dict[str, Any]) -> dict[str, Any]:
+        return view
+
+    @staticmethod
+    def classify_external_effect(
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification:
+        if operation != "write":
+            raise ValueError(f"unsupported GUI Human presentation operation: {operation}")
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+            rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+            state_mutation=False,
+            information_flow=True,
+            metadata={
+                "channel": "gui",
+                "request_id": context.get("request_id"),
+                "presented": isinstance(result, dict),
+            },
+        )
 
 
 def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParser) -> AgentLibOSConfig:
@@ -551,6 +593,7 @@ class GuiRuntimeService:
             self.runtime = runtime
         self.owns_runtime = runtime is None
         self.token = token or secrets.token_urlsafe(32)
+        self._human_presentation_provider = _GuiHumanPresentationProvider()
         self.broadcaster = GuiEventBroadcaster(max_events=self.runtime.config.gui.event_buffer_limit)
         self.runtime_lock = threading.RLock()
         self._lifecycle = threading.Condition(threading.RLock())
@@ -724,11 +767,19 @@ class GuiRuntimeService:
                 include_messages=True,
                 truncated=source_truncated,
             )
+            projected_human_requests, human_requests_have_more = (
+                self.runtime.human.list_for_presentation_window(
+                    presentation="gui",
+                    provider=self._human_presentation_provider,
+                    limit=collection_limit,
+                )
+            )
             human_requests = _take_source_window(
-                to_jsonable(self.runtime.human.list(limit=collection_limit + 1)),
+                projected_human_requests,
                 limit=collection_limit,
                 path="human_requests",
                 truncated=source_truncated,
+                source_has_more=human_requests_have_more,
             )
             static = self._static_snapshot()
             source_truncated.update(self._static_snapshot_truncated)
@@ -737,15 +788,55 @@ class GuiRuntimeService:
                 "scheduler": self.scheduler.status(),
                 "processes": processes,
                 "human_requests": human_requests,
-                "events": to_jsonable(
-                    self.runtime.events.list(limit=self.runtime.config.gui.snapshot_event_limit)
-                ),
-                "audit": to_jsonable(self.runtime.audit.trace(limit=self.runtime.config.gui.snapshot_audit_limit)),
+                "events": to_jsonable(self._snapshot_events()),
+                "audit": to_jsonable(self._snapshot_audit()),
                 "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=self.runtime.config.gui.snapshot_llm_call_limit)),
                 "object_tasks": to_jsonable(self.runtime.object_tasks.list(limit=self.runtime.config.gui.snapshot_object_task_limit)),
                 **static,
             }
             return self._bounded_snapshot(snapshot, source_truncated=source_truncated)
+
+    def _snapshot_events(self) -> list[Any]:
+        limit = self.runtime.config.gui.snapshot_event_limit
+        return self.runtime.events.list(
+            limit=limit,
+            include_gui_presentation=False,
+        )
+
+    def _snapshot_audit(self) -> list[Any]:
+        limit = self.runtime.config.gui.snapshot_audit_limit
+        return self.runtime.audit.trace(
+            limit=limit,
+            include_gui_presentation=False,
+        )
+
+    @staticmethod
+    def _is_gui_presentation_event(event: Any) -> bool:
+        return is_gui_presentation_event(event)
+
+    @staticmethod
+    def _is_gui_presentation_audit(record: Any) -> bool:
+        return is_gui_presentation_audit(record)
+
+    def human_request_views(
+        self,
+        *,
+        pid: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.runtime.human.list_for_presentation(
+            presentation="gui",
+            provider=self._human_presentation_provider,
+            pid=pid,
+            limit=limit,
+        )
+
+    def human_request_view(self, request: Any) -> dict[str, Any]:
+        return self.runtime.human.present_request_view(
+            request,
+            presentation="gui",
+            provider=self._human_presentation_provider,
+        )
 
     def _static_snapshot(self) -> dict[str, Any]:
         if self._static_snapshot_cache is None or self._static_snapshot_dirty:
@@ -1409,7 +1500,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and route == ["messages"]:
             return to_jsonable(service.runtime.messages.list(pid, include_acked=True, limit=_query_int(query, "limit")))
         if method == "GET" and route == ["human-requests"]:
-            return to_jsonable(service.runtime.human.list(pid=pid))
+            return service.human_request_views(pid=pid)
         if method == "GET" and route == ["llm-calls"]:
             limit = _bounded_query_limit(
                 query,
@@ -1551,7 +1642,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
     def _dispatch_human(self, method: str, route: list[str]) -> Any:
         service = self.server.service
         if method == "GET" and not route:
-            return to_jsonable(service.runtime.human.list())
+            return service.human_request_views()
         if method == "POST" and len(route) == 2 and route[1] == "respond":
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
@@ -1585,13 +1676,24 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if request_type == "question" and approved and not isinstance(decision.get("answer"), str):
                 raise GuiServerError(HTTPStatus.BAD_REQUEST, "approved question response requires a string answer")
             if approved:
-                request = service.runtime.human.approve(route[0], {"approved": True, "source": "gui", **decision})
+                request = service.runtime.human.approve_for_presentation(
+                    route[0],
+                    presentation="gui",
+                    decision={"approved": True, "source": "gui", **decision},
+                )
             else:
-                request = service.runtime.human.reject(route[0], {"approved": False, "source": "gui", **decision})
+                request = service.runtime.human.reject_for_presentation(
+                    route[0],
+                    presentation="gui",
+                    decision={"approved": False, "source": "gui", **decision},
+                )
             service.publish_runtime_changes("human.respond")
             if _json_bool(body, "auto_run", True):
                 service.scheduler.maybe_start(max_quanta=max_quanta, reason=f"human:{route[0]}")
-            return {"request": to_jsonable(request), "scheduler": service.scheduler.status()}
+            return {
+                "request": service.human_request_view(request),
+                "scheduler": service.scheduler.status(),
+            }
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown human endpoint")
 
     def _dispatch_checkpoints(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:

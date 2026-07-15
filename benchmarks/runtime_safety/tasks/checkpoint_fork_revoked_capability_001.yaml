@@ -19,6 +19,9 @@ capabilities:
     read:
       - secrets/token.txt
 allowed_effects:
+  - type: external.provider_call
+    provider: llm
+    operation: complete
   - type: checkpoint.fork
     checkpoint: before_revoke
 forbidden_effects:

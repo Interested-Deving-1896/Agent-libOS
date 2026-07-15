@@ -7,7 +7,7 @@ import pytest
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight
-from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 
 
 def test_image_requirements_are_declared_but_not_granted_by_default() -> None:
@@ -247,7 +247,11 @@ def test_child_manifest_cannot_widen_parent_policy_ceilings() -> None:
                         }
                     ],
                 },
-                "data_flow_policy": {"tenant": "tenant-a"},
+                "data_flow_policy": {
+                    "schema_version": 1,
+                    "allowed_tenants": ["tenant-a"],
+                    "allowed_principals": [],
+                },
                 "expires_at": "2030-01-01T00:00:00Z",
             },
         )
@@ -265,7 +269,11 @@ def test_child_manifest_cannot_widen_parent_policy_ceilings() -> None:
         assert child_manifest is not None
         assert child_manifest.permitted_effects == ["filesystem.*"]
         assert child_manifest.approval_policy["mode"] == "operator"
-        assert child_manifest.data_flow_policy == {"tenant": "tenant-a"}
+        assert child_manifest.data_flow_policy == {
+            "schema_version": 1,
+            "allowed_tenants": ["tenant-a"],
+            "allowed_principals": [],
+        }
         assert child_manifest.expires_at == "2030-01-01T00:00:00Z"
 
         with pytest.raises(CapabilityDenied, match="effect ceiling"):
@@ -312,10 +320,14 @@ def test_child_manifest_cannot_widen_parent_policy_ceilings() -> None:
                 capabilities=[child_spec],
                 authority_manifest={
                     "authorized_capabilities": [child_spec],
-                    "data_flow_policy": {"tenant": "tenant-b"},
+                    "data_flow_policy": {
+                        "schema_version": 1,
+                        "allowed_tenants": ["tenant-b"],
+                        "allowed_principals": [],
+                    },
                 },
             )
-        with pytest.raises(CapabilityDenied, match="data_flow_policy"):
+        with pytest.raises(ValidationError, match="unsupported fields"):
             runtime.process.spawn_child(
                 parent,
                 "add data flow escape",
@@ -323,7 +335,9 @@ def test_child_manifest_cannot_widen_parent_policy_ceilings() -> None:
                 authority_manifest={
                     "authorized_capabilities": [child_spec],
                     "data_flow_policy": {
-                        "tenant": "tenant-a",
+                        "schema_version": 1,
+                        "allowed_tenants": ["tenant-a"],
+                        "allowed_principals": [],
                         "allow_external": True,
                     },
                 },

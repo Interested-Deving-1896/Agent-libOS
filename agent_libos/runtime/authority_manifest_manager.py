@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import CapabilityRight, ResourceBudget, TaskAuthorityManifest
+from agent_libos.models import CapabilityRight, DataLabels, ResourceBudget, TaskAuthorityManifest
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.storage import RuntimeStore
 from agent_libos.utils.ids import new_id, utc_now
@@ -97,12 +97,16 @@ class AuthorityManifestManager:
             if "permitted_effects" in payload
             else (parent.permitted_effects if parent is not None else [])
         )
-        parent_data_flow_policy = dict(parent.data_flow_policy) if parent is not None else {}
-        supplied_data_flow_policy = self._mapping(
-            payload.get("data_flow_policy"),
-            "data_flow_policy",
+        parent_data_flow_policy = (
+            self._normalize_data_flow_policy(parent.data_flow_policy)
+            if parent is not None
+            else self._normalize_data_flow_policy({})
         )
-        data_flow_policy = {**parent_data_flow_policy, **supplied_data_flow_policy}
+        data_flow_policy = (
+            self._normalize_data_flow_policy(payload.get("data_flow_policy"))
+            if "data_flow_policy" in payload
+            else parent_data_flow_policy
+        )
         expires_at = self._optional_string(
             payload["expires_at"]
             if "expires_at" in payload
@@ -118,10 +122,10 @@ class AuthorityManifestManager:
                 label="approval_policy",
                 ignored_keys={"requestable_capabilities"},
             )
-            self._require_policy_mapping_attenuated(
-                parent.data_flow_policy,
+        if parent is not None:
+            self._require_data_flow_policy_attenuated(
+                parent_data_flow_policy,
                 data_flow_policy,
-                label="data_flow_policy",
             )
             self._require_expiry_attenuated(parent.expires_at, expires_at)
         manifest = TaskAuthorityManifest(
@@ -318,6 +322,32 @@ class AuthorityManifestManager:
             f"task authority manifest {manifest.manifest_id} does not permit effect class {selected}"
         )
 
+    def assert_data_flow_labels(self, pid: str, labels: DataLabels | Any) -> None:
+        """Enforce the process's inbound tenant/principal domain.
+
+        This policy is deliberately independent from external Sink trust.  It
+        can only constrain which labeled internal handoffs a process receives;
+        it cannot make any external Sink trusted or reduce a Host clearance.
+        """
+
+        selected = labels if isinstance(labels, DataLabels) else DataLabels.from_object_metadata(labels)
+        if selected.is_mixed_identity:
+            raise CapabilityDenied(
+                f"process {pid} cannot receive mixed tenant/principal data without Host reclassification"
+            )
+        manifest = self.get_for_process(pid)
+        policy = self._normalize_data_flow_policy(
+            manifest.data_flow_policy if manifest is not None else {}
+        )
+        for field, value in (
+            ("allowed_tenants", selected.tenant),
+            ("allowed_principals", selected.principal),
+        ):
+            if value is not None and value not in set(policy[field]):
+                raise CapabilityDenied(
+                    f"process {pid} data_flow_policy does not allow {field[:-1]} {value!r}"
+                )
+
     def summary_for_process(self, pid: str) -> dict[str, Any] | None:
         manifest = self.get_for_process(pid)
         if manifest is None:
@@ -352,6 +382,67 @@ class AuthorityManifestManager:
         if not isinstance(values, (list, tuple)):
             raise ValidationError("authority manifest capability collections must be lists")
         return [self._normalize_spec(value) for value in values]
+
+    def _normalize_data_flow_policy(self, value: Any) -> dict[str, Any]:
+        selected = self._mapping(value, "data_flow_policy")
+        unknown = set(selected) - {
+            "schema_version",
+            "allowed_tenants",
+            "allowed_principals",
+        }
+        if unknown:
+            raise ValidationError(
+                f"data_flow_policy contains unsupported fields: {sorted(unknown)}"
+            )
+        schema_version = selected.get("schema_version", 1)
+        if schema_version != 1:
+            raise ValidationError(
+                f"unsupported data_flow_policy schema_version: {schema_version}"
+            )
+        return {
+            "schema_version": 1,
+            "allowed_tenants": self._data_flow_identities(
+                selected.get("allowed_tenants", []),
+                "allowed_tenants",
+            ),
+            "allowed_principals": self._data_flow_identities(
+                selected.get("allowed_principals", []),
+                "allowed_principals",
+            ),
+        }
+
+    @staticmethod
+    def _data_flow_identities(value: Any, label: str) -> list[str]:
+        if not isinstance(value, (list, tuple)):
+            raise ValidationError(f"data_flow_policy.{label} must be a list")
+        selected: set[str] = set()
+        for raw in value:
+            if not isinstance(raw, str) or not raw or raw != raw.strip():
+                raise ValidationError(
+                    f"data_flow_policy.{label} entries must be non-empty canonical strings"
+                )
+            if raw in {"*", "mixed"} or len(raw) > 256 or "\x00" in raw:
+                raise ValidationError(
+                    f"data_flow_policy.{label} cannot contain {raw!r}"
+                )
+            selected.add(raw)
+        return sorted(selected)
+
+    @staticmethod
+    def _require_data_flow_policy_attenuated(
+        parent: dict[str, Any],
+        child: dict[str, Any],
+    ) -> None:
+        if child.get("schema_version") != parent.get("schema_version"):
+            raise CapabilityDenied("child data_flow_policy cannot change schema_version")
+        for field in ("allowed_tenants", "allowed_principals"):
+            parent_values = set(parent.get(field) or ())
+            child_values = set(child.get(field) or ())
+            if not child_values.issubset(parent_values):
+                raise CapabilityDenied(
+                    f"child data_flow_policy cannot widen {field}: "
+                    f"parent={sorted(parent_values)} child={sorted(child_values)}"
+                )
 
     @staticmethod
     def _dedupe_specs(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

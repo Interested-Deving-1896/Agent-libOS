@@ -11,6 +11,9 @@ capabilities:
   process:
     spawn: true
 allowed_effects:
+  - type: external.provider_call
+    provider: llm
+    operation: complete
   - type: process.spawn
 forbidden_effects: []
 success_oracle:

@@ -12,13 +12,15 @@ The task schema is defined in
 
 ## Task Suite
 
-The checked-in suite contains 27 schema-v1 YAML tasks under
+The checked-in suite contains 28 schema-v1 YAML tasks under
 `benchmarks/runtime_safety/tasks/`. They cover at least these classes:
 
 - secret read attempts,
 - forbidden filesystem writes,
 - forbidden filesystem deletes,
 - shell bypass and exfiltration attempts,
+- data-label exfiltration attempts in which ordinary write authority exists
+  but the destination Sink has insufficient clearance,
 - object authority leakage,
 - process authority leakage,
 - self-evolution attempts involving Skills, JIT tools, image
@@ -61,6 +63,10 @@ Risky shell/network behavior is simulated where needed and recorded as effects.
 
 Agent libOS runners execute through the runtime, using process capabilities,
 primitive checks, human policy, audit records, and persisted LLM calls.
+LLM action selection is also a persisted `external.provider_call` effect, so
+the checked-in tasks explicitly allow `llm/complete`; this is not an implicit
+oracle exception. A task that omits the entry reports the provider call as an
+unknown effect.
 
 `no_audit_linkage` does not pretend that the runtime stopped producing audit
 rows. Its precise intervention is at the benchmark observer: audit rows are not
@@ -100,6 +106,13 @@ Select attack classes:
 ```bash
 uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner all --attack-class shell_policy_bypass --output .benchmark_runs/shell
 ```
+
+The `data_label_exfiltration` class deliberately gives the target process the
+ordinary capability needed by the requested primitive. The full runtime must
+still deny the action at the independent data-flow gate, while baseline
+wrappers expose the counterfactual action. Its setup seeds a labeled Object in
+the target LLM context and pins the benchmark LLM profile as a trusted Sink;
+the attempted filesystem write remains an untrusted Sink.
 
 Tasks are loaded in lexicographic filename order, filters preserve that order,
 and `--limit` is applied last. Both `--limit` and `--max-quanta` require a
@@ -297,23 +310,41 @@ subsets of normalized effect records, and `tool_calls` / `primitive_calls` are
 runner-reported execution trace counts. `metrics.json` records these units in
 `count_units`.
 
-## Last Recorded Deterministic Validation Snapshot
+## Historical Deterministic Validation Snapshot
 
-The last recorded token-free `agent_libos_full` 27-task run was valid and
-reported 27/27 task success, 27/27 safety pass, zero unauthorized performed
-effects out of 22 definitely performed effects, zero unknown effects, and zero
-allowed denials out of 22 allowed performed-or-denied attempts
-(`false_denial_rate = 0/22 = 0%`). Human approval and the authorized attenuated
-child spawn are persisted as explicit effects. This replaces the older,
-incompatible
-`3/43 = 7.0%` wording whose denominator counted unrelated normalized records.
+The recorded run for clean, pre-consolidation source snapshot
+`c03a4ec764e02bd4df59e2769edeb1278d5ea545` is
+`.benchmark_runs/release-c03a4ec`. Its provenance says `dirty: false`,
+`llm_mode: mock`, and `real_llm_credentials_present: false`. The run is valid
+and reports 28/28 task success, 28/28 safety pass, 122 normalized effects,
+zero unauthorized performed effects out of 97 definitely performed effects,
+zero unknown outcomes/classifications, and zero allowed denials out of 97
+allowed performed-or-denied attempts (`false_denial_rate = 0/97 = 0%`). It
+also records 74 tool calls, 91 primitive calls, and 76 remote calls. The
+`llm_tokens: 144` value is deterministic usage accounting from the planned
+mock client, not a real provider request or token spend.
 
-The cross-runner smoke over eight runners and three selected tasks produces 24
-result rows with no infrastructure failure or invalid output. These are
-historical repository snapshots, neither validation of the current dirty
-working tree nor a claim that the 27-task harness is a complete paper
-evaluation. Consult [release_status.md](release_status.md) for current gates and
-rerun with provenance before publishing the counts.
+The artifact's `metadata.json` SHA-256 is
+`7ef7b0054f1e4fbd2bcb9b33e803016e62010254a122dffa8c692f0837ba6b54`; its
+recollected `metrics.json` SHA-256 is
+`f6b3b0aa5e2a403c3ed0a7c848dcbccffa7faabe5eda7edf6cfe26ebccde53b6`.
+This artifact does not validate the current working tree. History consolidation
+was not a new benchmark run and did not by itself prove content identity. The
+artifact is ignored and must be copied separately when publishing evidence.
+
+This population includes explicitly declared LLM provider effects as well as
+Human approval and the authorized attenuated child spawn; compare rates only
+with snapshots using the same workload and effect model. The two 97-element
+denominators are qualified effect populations, not the 122-record total or the
+28 task rows. This supersedes the older 27-task `0/22` snapshot and the
+incompatible `3/43 = 7.0%` wording whose denominator counted unrelated
+normalized records.
+
+The older cross-runner smoke over eight runners and three selected tasks is
+historical and is not part of this commit-bound artifact. The 28-task run is an
+implementation-validation snapshot, not a claim that the harness is a complete
+paper evaluation. Consult [release_status.md](release_status.md) for its exact
+commands, platform, matrix results, and remaining gates.
 
 ## Practical workflow evidence levels
 

@@ -234,6 +234,18 @@ await libos.syscall(name, args)
 The `libos` object does not expose Python objects, `Runtime`, or
 `runtime.tools`.
 
+JIT code cannot declare authoritative labels or Sink trust. Syscalls that carry
+data out of the runtime inherit the caller's materialized source context and
+pass through the same SDK data-flow gate as their Python primitive. Deno itself
+still has no direct network, filesystem, environment, or subprocess authority;
+marking a Sink trusted changes only the mediated payload decision.
+
+Object and file reads append their trusted labels and any versioned Object
+source refs to the active JIT call. Later JIT syscalls, created or appended
+Objects, and the final tool-result Object inherit the full aggregate even when
+a Host-classified file has no Object source ref, so a read-then-write sequence
+cannot reset sensitivity to the default.
+
 ## RPC Protocol
 
 Python starts a Deno subprocess and writes one NDJSON run frame:
@@ -353,9 +365,16 @@ JIT validation errors, validation logs, and input/output schema failure details
 are persisted through the same bounded/redacted envelope; the direct tool call
 result can still return the original error to the caller.
 
-Full tool results are stored only as Tool Result Object Memory objects and are
-subject to a hard serialized payload limit. Larger content should be passed by
-file or object reference rather than returned inline from a tool.
+Full successful tool results are stored only as Tool Result Object Memory
+objects and are subject to a hard serialized payload limit. A failed tool
+result is also stored as a Tool Result Object whenever its trusted data-flow
+context differs from the default context; this labeled carrier prevents error
+text derived from Object reads from becoming an untracked input to the next
+LLM action. Sync worker threads and timeout-managed async tasks return their
+post-call data-flow context to ToolBroker on both success and failure. If a
+labeled failure is too large, the carrier keeps its labels and source refs but
+omits the error body. Larger content should be passed by file or object
+reference rather than returned inline from a tool.
 
 ## Deferred Lifecycle
 

@@ -41,6 +41,21 @@ const en = {
     "human.approveDenyInvalid": "Always deny cannot be submitted as an approval.",
     "human.rejectAllowInvalid": "Always allow cannot be submitted as a rejection.",
     "human.submitFailed": "The response was not accepted. Your selection and input have been kept.",
+    "human.releaseRequiredTitle": "Data release required",
+    "human.releaseRequiredMessage": "Respond to release request {requestId} before answering this protected request.",
+    "human.releaseRequiredMessageNoId": "Respond to the pending data release request before answering this protected request.",
+    "human.releaseApprovalTitle": "Data release approval",
+    "human.releaseApprovalHint": "Review the bound metadata below. The payload content is not shown.",
+    "human.releaseMetadataInvalid": "Release metadata is incomplete. Approval is disabled; reject this request to fail closed.",
+    "human.releaseMetadataLabel": "Bound data release metadata",
+    "human.releaseSink": "Destination sink",
+    "human.releaseSensitivity": "Sensitivity",
+    "human.releaseTenant": "Tenant",
+    "human.releasePrincipal": "Principal",
+    "human.releasePayloadBytes": "Payload bytes",
+    "human.releasePayloadSha256": "Payload SHA-256",
+    "human.releaseSourceCount": "Source count",
+    "human.releaseOperation": "Operation",
     "user.openDb": "Open DB",
     "user.openDbTitle": "Open database",
     "user.refreshTitle": "Refresh",
@@ -270,6 +285,21 @@ const zhCN: Record<TranslationKey, string> = {
     "human.approveDenyInvalid": "“始终拒绝”不能作为批准决定提交。",
     "human.rejectAllowInvalid": "“始终允许”不能作为拒绝决定提交。",
     "human.submitFailed": "响应未被接受；已保留当前选择和输入。",
+    "human.releaseRequiredTitle": "需要先处理数据释放",
+    "human.releaseRequiredMessage": "请先响应数据释放请求 {requestId}，再回答此受保护请求。",
+    "human.releaseRequiredMessageNoId": "请先响应待处理的数据释放请求，再回答此受保护请求。",
+    "human.releaseApprovalTitle": "数据释放审批",
+    "human.releaseApprovalHint": "请只审核下方绑定元数据；界面不会显示原始 payload 内容。",
+    "human.releaseMetadataInvalid": "数据释放元数据不完整，已禁用批准；请拒绝此请求以安全失败。",
+    "human.releaseMetadataLabel": "绑定的数据释放元数据",
+    "human.releaseSink": "目标 sink",
+    "human.releaseSensitivity": "敏感级别",
+    "human.releaseTenant": "租户",
+    "human.releasePrincipal": "主体",
+    "human.releasePayloadBytes": "Payload 字节数",
+    "human.releasePayloadSha256": "Payload SHA-256",
+    "human.releaseSourceCount": "来源数量",
+    "human.releaseOperation": "操作",
     "user.openDb": "打开 DB",
     "user.openDbTitle": "打开数据库",
     "user.refreshTitle": "刷新",
@@ -471,8 +501,16 @@ type I18nContextValue = {
 
 const I18nContext = createContext<I18nContextValue | null>(null);
 
-export function I18nProvider({ children }: { children: ReactNode }) {
-  const [language, setLanguageState] = useState<Language>(() => resolveInitialLanguage());
+export function I18nProvider({
+  children,
+  initialLanguage
+}: {
+  children: ReactNode;
+  initialLanguage?: Language;
+}) {
+  const [language, setLanguageState] = useState<Language>(
+    () => initialLanguage ?? resolveInitialLanguage()
+  );
 
   function setLanguage(next: Language) {
     setLanguageState(next);

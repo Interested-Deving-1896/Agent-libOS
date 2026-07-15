@@ -450,6 +450,13 @@ class TestConfigDefaults:
             AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, object_task_wait_default_timeout_s=5, object_task_wait_max_timeout_s=4))
         with pytest.raises(PydanticValidationError, match='agent_rating_comment_max_chars'):
             AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, agent_rating_comment_max_chars=0))
+        with pytest.raises(PydanticValidationError, match='executable_snapshot_sibling_limit'):
+            AgentLibOSConfig(
+                tools=replace(
+                    DEFAULT_CONFIG.tools,
+                    executable_snapshot_sibling_limit=0,
+                )
+            )
 
     def test_sqlite_store_llm_call_limits_use_runtime_config(self) -> None:
         config = AgentLibOSConfig(llm=LLMDefaults(call_record_list_limit=1, call_record_hard_limit=2))

@@ -21,11 +21,14 @@ from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, Proce
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.memory.object_memory import ObjectMemoryManager
+from agent_libos.memory.data_labels import propagate_object_labels
 from agent_libos.models import (
+    DataFlowContext,
     EventType,
     JIT_MULTIPLEXER_TOOL_NAME,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     OPENAI_TOOL_NAME_MAX_CHARS,
+    ObjectHandle,
     ObjectMetadata,
     ObjectOwnerKind,
     ObjectType,
@@ -45,7 +48,13 @@ from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import CommandMetrics, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
-from agent_libos.tools.base import BaseAgentTool, SyncAgentTool, ToolContext
+from agent_libos.tools.base import (
+    BaseAgentTool,
+    SyncAgentTool,
+    ToolContext,
+    attach_wait_data_flow_context,
+    wait_data_flow_context,
+)
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult
 from agent_libos.utils.serde import dumps
@@ -650,6 +659,45 @@ class ToolBroker:
         context_metadata: dict[str, Any] | None = None,
     ) -> ToolCallResult:
         runtime = getattr(self, "runtime", None)
+        manager = getattr(runtime, "data_flow", None)
+        if manager is None:
+            return await self._acall_with_operation(
+                pid,
+                tool,
+                args,
+                context_metadata=context_metadata,
+            )
+        context = self._trusted_data_flow_context(context_metadata, manager.current_context())
+        token = manager.push(context)
+        try:
+            result = await self._acall_with_operation(
+                pid,
+                tool,
+                args,
+                context_metadata=context_metadata,
+            )
+        except (HumanApprovalRequired, ProcessWaitRequired, ProcessMessageWaitRequired) as exc:
+            carried = wait_data_flow_context(exc)
+            manager.reset(token)
+            if carried is not None:
+                manager.observe_ingress(carried)
+            raise
+        except BaseException:
+            manager.reset(token)
+            raise
+        else:
+            manager.reset(token)
+            return result
+
+    async def _acall_with_operation(
+        self,
+        pid: str,
+        tool: ToolHandle | str,
+        args: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> ToolCallResult:
+        runtime = getattr(self, "runtime", None)
         operations = getattr(runtime, "operations", None)
         if operations is None:
             return await self._acall_impl(pid, tool, args, context_metadata=context_metadata)
@@ -873,8 +921,30 @@ class ToolBroker:
                     args,
                     self._context(pid, handle, call_id, metadata=context_metadata),
                 )
+                runtime = getattr(self, "runtime", None)
+                manager = getattr(runtime, "data_flow", None)
+                tool_metadata = dict(tool_result.metadata)
+                inbound = tool_metadata.get("data_flow_context")
+                if inbound is not None and manager is not None:
+                    returned_context = self._trusted_data_flow_context(
+                        {"data_flow_context": inbound},
+                        manager.current_context(),
+                    )
+                    combined_context = DataFlowContext.aggregate(
+                        (manager.current_context(), returned_context)
+                    )
+                    manager.observe_ingress(combined_context)
+                    tool_metadata["data_flow_context"] = combined_context.to_dict()
+                tool_result.metadata = tool_metadata
                 if not tool_result.ok:
                     error_message = tool_result.error.message if tool_result.error else tool_result.content
+                    failure_payload = tool_result.model_dump(mode="json")
+                    result_handle = self._persist_labeled_tool_failure(
+                        pid=pid,
+                        resource=resource,
+                        handle=handle,
+                        payload=failure_payload,
+                    )
                     self.events.emit(
                         EventType.TOOL_FAILED,
                         source=resource,
@@ -882,26 +952,28 @@ class ToolBroker:
                         payload={
                             "call_id": call_id,
                             "error": error_message,
-                            "tool_result": sanitize_for_observability(tool_result.model_dump(mode="json")),
+                            "result_oid": result_handle.oid if result_handle else None,
+                            "tool_result": sanitize_for_observability(failure_payload),
                         },
                     )
                     self.audit.record(
                         actor=pid,
                         action="tool.call",
                         target=resource,
+                        output_refs=[result_handle.oid] if result_handle else [],
                         decision={
                             "ok": False,
                             "tool": handle.name,
                             "policy_decision": "allow",
-                            "tool_result": sanitize_for_observability(tool_result.model_dump(mode="json")),
+                            "tool_result": sanitize_for_observability(failure_payload),
                             "tool_wall_seconds": self._elapsed(started_at),
                         },
                     )
                     return ToolCallResult(
                         call_id=call_id,
                         tool_id=handle.tool_id,
-                        result_handle=None,
-                        payload=tool_result.model_dump(mode="json"),
+                        result_handle=result_handle,
+                        payload=failure_payload,
                         ok=False,
                         error=error_message,
                     )
@@ -912,7 +984,7 @@ class ToolBroker:
                     "result": payload,
                     "content": tool_result.content,
                     "artifacts": [artifact.model_dump(mode="json") for artifact in tool_result.artifacts],
-                    "metadata": tool_result.metadata,
+                    "metadata": tool_metadata,
                 }
             elif handle.tool_id in self._jit_sources:
                 runtime = getattr(self, "runtime", None)
@@ -920,12 +992,15 @@ class ToolBroker:
                     raise RuntimeError("Runtime is unavailable for Deno JIT syscall execution.")
                 self._validate_jit_arguments(handle, args)
                 jit_session = LibOSSyscallSession(runtime, pid, config=self.config)
-                deno_result = await self._run_sandbox_source(
-                    self._jit_sources[handle.tool_id],
-                    args,
-                    pid=pid,
-                    syscall_handler=jit_session.handle,
-                )
+                try:
+                    deno_result = await self._run_sandbox_source(
+                        self._jit_sources[handle.tool_id],
+                        args,
+                        pid=pid,
+                        syscall_handler=jit_session.handle,
+                    )
+                finally:
+                    runtime.data_flow.observe_ingress(jit_session.observed_context)
                 if isinstance(deno_result, SandboxExecutionResult):
                     payload = deno_result.value
                     self._charge_subprocess_metrics(
@@ -942,20 +1017,35 @@ class ToolBroker:
                 raise NotFound(f"tool implementation not loaded: {handle.tool_id}")
         except SubprocessLimitExceeded as exc:
             self._handle_subprocess_limit(pid, handle, resource, call_id, exc)
+            result_handle = self._persist_exception_tool_failure(
+                pid=pid,
+                resource=resource,
+                handle=handle,
+                error=exc,
+                policy_decision="resource_limit",
+            )
             return ToolCallResult(
                 call_id=call_id,
                 tool_id=handle.tool_id,
-                result_handle=None,
+                result_handle=result_handle,
                 payload=None,
                 ok=False,
                 error=str(exc),
             )
         except SubprocessTimeoutExpired as exc:
             error = self._handle_subprocess_timeout(pid, handle, resource, call_id, exc)
+            result_handle = self._persist_exception_tool_failure(
+                pid=pid,
+                resource=resource,
+                handle=handle,
+                error=exc,
+                policy_decision="timeout",
+                message=error,
+            )
             return ToolCallResult(
                 call_id=call_id,
                 tool_id=handle.tool_id,
-                result_handle=None,
+                result_handle=result_handle,
                 payload=None,
                 ok=False,
                 error=error,
@@ -963,6 +1053,7 @@ class ToolBroker:
         except HumanApprovalRequired as exc:
             # Do not convert this into a ToolCallResult: the LLM quantum has not
             # completed and must be resumed after the human decision.
+            self._preserve_wait_data_flow_context(exc)
             self.audit.record(
                 actor=pid,
                 action="tool.call_waiting_human",
@@ -977,6 +1068,7 @@ class ToolBroker:
             )
             raise
         except ProcessWaitRequired as exc:
+            self._preserve_wait_data_flow_context(exc)
             self.audit.record(
                 actor=pid,
                 action="tool.call_waiting_process",
@@ -991,6 +1083,7 @@ class ToolBroker:
             )
             raise
         except ProcessMessageWaitRequired as exc:
+            self._preserve_wait_data_flow_context(exc)
             self.audit.record(
                 actor=pid,
                 action="tool.call_waiting_message",
@@ -1008,16 +1101,29 @@ class ToolBroker:
         except ValueError as exc:
             error = str(exc)
             observed_error = self._error_observation(error)
+            result_handle = self._persist_exception_tool_failure(
+                pid=pid,
+                resource=resource,
+                handle=handle,
+                error=exc,
+                policy_decision="validation_error",
+            )
             self.events.emit(
                 EventType.TOOL_FAILED,
                 source=resource,
                 target=pid,
-                payload={"call_id": call_id, "error": observed_error, "policy_decision": "validation_error"},
+                payload={
+                    "call_id": call_id,
+                    "error": observed_error,
+                    "policy_decision": "validation_error",
+                    "result_oid": result_handle.oid if result_handle else None,
+                },
             )
             self.audit.record(
                 actor=pid,
                 action="tool.call",
                 target=resource,
+                output_refs=[result_handle.oid] if result_handle else [],
                 decision={
                     "ok": False,
                     "tool": handle.name,
@@ -1026,18 +1132,30 @@ class ToolBroker:
                     "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
-            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=result_handle, payload=None, ok=False, error=error)
         except Exception as exc:
+            result_handle = self._persist_exception_tool_failure(
+                pid=pid,
+                resource=resource,
+                handle=handle,
+                error=exc,
+                policy_decision="allow",
+            )
             self.events.emit(
                 EventType.TOOL_FAILED,
                 source=resource,
                 target=pid,
-                payload={"call_id": call_id, "error": sanitize_for_observability(str(exc))},
+                payload={
+                    "call_id": call_id,
+                    "error": sanitize_for_observability(str(exc)),
+                    "result_oid": result_handle.oid if result_handle else None,
+                },
             )
             self.audit.record(
                 actor=pid,
                 action="tool.call",
                 target=resource,
+                output_refs=[result_handle.oid] if result_handle else [],
                 decision={
                     "ok": False,
                     "tool": handle.name,
@@ -1046,7 +1164,7 @@ class ToolBroker:
                     "tool_wall_seconds": self._elapsed(started_at),
                 },
             )
-            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=str(exc))
+            return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=result_handle, payload=None, ok=False, error=str(exc))
 
         try:
             ensure_json_size(
@@ -1100,53 +1218,93 @@ class ToolBroker:
                 )
                 return ToolCallResult(call_id=call_id, tool_id=handle.tool_id, result_handle=None, payload=None, ok=False, error=error)
 
+        lifecycle_error: Exception | None = None
         with self.memory.lifetime_scope(
             actor=resource,
             owner_kind=ObjectOwnerKind.PROCESS,
             owner_id=pid,
             reason="tool_result",
         ) as result_scope:
+            runtime = getattr(self, "runtime", None)
+            flow = (
+                runtime.data_flow.current_context()
+                if runtime is not None and getattr(runtime, "data_flow", None) is not None
+                else DataFlowContext()
+            )
+            parent_oids, durable_source_refs = (
+                runtime.data_flow.provenance_sources(flow)
+                if runtime is not None and getattr(runtime, "data_flow", None) is not None
+                else ((), ())
+            )
             result_handle = result_scope.create_object(
                 pid=pid,
                 object_type=ObjectType.TOOL_RESULT,
                 payload=result_payload,
                 metadata=self._tool_result_metadata(handle),
-                provenance=Provenance(created_from_action=f"tool.{handle.name}"),
+                provenance=Provenance(
+                    created_from_action=f"tool.{handle.name}",
+                    parent_oids=list(parent_oids),
+                    source_refs=list(durable_source_refs),
+                ),
                 immutable=True,
             )
             if jit_session is not None:
                 try:
                     await jit_session.apply_deferred_lifecycle(result_handle)
                 except Exception as exc:
-                    error = str(exc)
-                    observed_error = self._error_observation(error)
-                    self.events.emit(
-                        EventType.TOOL_FAILED,
-                        source=resource,
-                        target=pid,
-                        payload={"call_id": call_id, "error": observed_error, "policy_decision": "lifecycle_error"},
-                    )
-                    self.audit.record(
-                        actor=pid,
-                        action="tool.call",
-                        target=resource,
-                        decision={
-                            "ok": False,
-                            "tool": handle.name,
-                            "policy_decision": "lifecycle_error",
-                            "error": observed_error,
-                            "tool_wall_seconds": self._elapsed(started_at),
-                        },
-                    )
-                    return ToolCallResult(
-                        call_id=call_id,
-                        tool_id=handle.tool_id,
-                        result_handle=None,
-                        payload=None,
-                        ok=False,
-                        error=error,
-                    )
-            result_scope.commit()
+                    lifecycle_error = exc
+            if lifecycle_error is None:
+                result_scope.commit()
+        if lifecycle_error is not None:
+            outward_error = "JIT tool failed while applying deferred lifecycle."
+            failure_payload = {
+                "ok": False,
+                "error": {
+                    "type": type(lifecycle_error).__name__,
+                    "message": outward_error,
+                },
+                "policy_decision": "lifecycle_error",
+            }
+            result_handle = self._persist_exception_tool_failure(
+                pid=pid,
+                resource=resource,
+                handle=handle,
+                error=lifecycle_error,
+                policy_decision="lifecycle_error",
+            )
+            observed_error = self._error_observation(outward_error)
+            self.events.emit(
+                EventType.TOOL_FAILED,
+                source=resource,
+                target=pid,
+                payload={
+                    "call_id": call_id,
+                    "error": observed_error,
+                    "policy_decision": "lifecycle_error",
+                    "result_oid": result_handle.oid if result_handle else None,
+                },
+            )
+            self.audit.record(
+                actor=pid,
+                action="tool.call",
+                target=resource,
+                output_refs=[result_handle.oid] if result_handle else [],
+                decision={
+                    "ok": False,
+                    "tool": handle.name,
+                    "policy_decision": "lifecycle_error",
+                    "error": observed_error,
+                    "tool_wall_seconds": self._elapsed(started_at),
+                },
+            )
+            return ToolCallResult(
+                call_id=call_id,
+                tool_id=handle.tool_id,
+                result_handle=result_handle,
+                payload=failure_payload,
+                ok=False,
+                error=outward_error,
+            )
         self.events.emit(
             EventType.TOOL_COMPLETED,
             source=resource,
@@ -1201,12 +1359,123 @@ class ToolBroker:
         spec = implementation.spec(config=self.config) if implementation is not None else self.store.get_tool_spec(handle.tool_id)
         tags = set(spec.tags if spec is not None else [])
         externally_sourced = bool(tags & {"remote", "provider", "jsonrpc", "mcp", "network", "shell"})
-        return ObjectMetadata(
+        base = ObjectMetadata(
             title=f"Tool result: {handle.name}",
             tags=["tool_result", handle.name],
             origin=f"tool:{handle.name}",
             trust_level="untrusted" if externally_sourced else "unknown",
             integrity="unknown",
+        )
+        runtime = getattr(self, "runtime", None)
+        manager = getattr(runtime, "data_flow", None)
+        if manager is None:
+            return base
+        labels = manager.current_context().labels
+        inherited = ObjectMetadata(**labels.to_dict())
+        return propagate_object_labels(base, [inherited])
+
+    def _preserve_wait_data_flow_context(self, exc: BaseException) -> None:
+        runtime = getattr(self, "runtime", None)
+        manager = getattr(runtime, "data_flow", None)
+        if manager is None:
+            return
+        carried = wait_data_flow_context(exc)
+        contexts = [manager.current_context()]
+        if carried is not None:
+            contexts.append(carried)
+        attach_wait_data_flow_context(exc, DataFlowContext.aggregate(contexts))
+
+    def _persist_labeled_tool_failure(
+        self,
+        *,
+        pid: str,
+        resource: str,
+        handle: ToolHandle,
+        payload: dict[str, Any],
+    ) -> ObjectHandle | None:
+        runtime = getattr(self, "runtime", None)
+        manager = getattr(runtime, "data_flow", None)
+        if manager is None:
+            return None
+        flow = manager.current_context()
+        if flow == DataFlowContext():
+            return None
+
+        carrier_payload: dict[str, Any] = {
+            "tool_id": handle.tool_id,
+            "tool_name": handle.name,
+            "ok": False,
+            "failure": payload,
+        }
+        try:
+            ensure_json_size(
+                carrier_payload,
+                self._tool_result_persistence_limit(),
+                "tool failure result payload",
+            )
+        except ValidationError as exc:
+            # The label carrier is security-critical; retain it even when the
+            # provider/tool error itself is too large for Object Memory.
+            carrier_payload = {
+                "tool_id": handle.tool_id,
+                "tool_name": handle.name,
+                "ok": False,
+                "failure_omitted": True,
+                "reason": str(exc),
+                "metadata": {
+                    "data_flow_context": flow.to_dict(),
+                },
+            }
+
+        with self.memory.lifetime_scope(
+            actor=resource,
+            owner_kind=ObjectOwnerKind.PROCESS,
+            owner_id=pid,
+            reason="tool_failure_result",
+        ) as result_scope:
+            runtime = getattr(self, "runtime", None)
+            parent_oids, durable_source_refs = (
+                runtime.data_flow.provenance_sources(flow)
+                if runtime is not None and getattr(runtime, "data_flow", None) is not None
+                else ((), ())
+            )
+            result_handle = result_scope.create_object(
+                pid=pid,
+                object_type=ObjectType.TOOL_RESULT,
+                payload=carrier_payload,
+                metadata=self._tool_result_metadata(handle),
+                provenance=Provenance(
+                    created_from_action=f"tool.{handle.name}.failure",
+                    parent_oids=list(parent_oids),
+                    source_refs=list(durable_source_refs),
+                ),
+                immutable=True,
+            )
+            result_scope.commit()
+        return result_handle
+
+    def _persist_exception_tool_failure(
+        self,
+        *,
+        pid: str,
+        resource: str,
+        handle: ToolHandle,
+        error: BaseException,
+        policy_decision: str,
+        message: str | None = None,
+    ) -> ObjectHandle | None:
+        return self._persist_labeled_tool_failure(
+            pid=pid,
+            resource=resource,
+            handle=handle,
+            payload={
+                "ok": False,
+                "error": {
+                    "type": type(error).__name__,
+                    "message": message if message is not None else str(error),
+                },
+                "policy_decision": policy_decision,
+            },
         )
 
     def _tool_result_persistence_limit(self) -> int:
@@ -1943,6 +2212,8 @@ class ToolBroker:
             "tool_name": handle.name,
         }
         selected_metadata.update(dict(metadata or {}))
+        if runtime is not None and getattr(runtime, "data_flow", None) is not None:
+            selected_metadata["data_flow_context"] = runtime.data_flow.current_context()
         return ToolContext(
             trace_id=call_id,
             call_id=call_id,
@@ -1951,6 +2222,23 @@ class ToolBroker:
             runtime=runtime,
             metadata=selected_metadata,
         )
+
+    @staticmethod
+    def _trusted_data_flow_context(
+        metadata: dict[str, Any] | None,
+        fallback: DataFlowContext,
+    ) -> DataFlowContext:
+        selected = (metadata or {}).get("data_flow_context")
+        if selected is None:
+            return fallback
+        if isinstance(selected, DataFlowContext):
+            return selected
+        if not isinstance(selected, dict):
+            raise ValidationError("trusted data_flow_context must be an object")
+        try:
+            return DataFlowContext.from_dict(selected)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"invalid trusted data_flow_context: {exc}") from exc
 
     def _get_candidate(self, candidate_id: str) -> ToolCandidate:
         candidate = self.store.get_tool_candidate(candidate_id)

@@ -9,6 +9,12 @@ from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
+from agent_libos.models.data_flow import (
+    DataSensitivity,
+    SinkTrustLevel,
+    SinkTrustRule,
+    sensitivity_rank,
+)
 
 _PYDANTIC_CONFIG = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -93,6 +99,23 @@ class CapabilityDefaults:
     max_constraints_bytes: int = 16_384
     list_limit: int = 100
     decision_explain_preview_chars: int = 2_000
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class DataFlowDefaults:
+    """Host-owned defaults for runtime-mediated data egress.
+
+    Unmatched sinks are intentionally fixed to untrusted/normal. Additional
+    clearance must be attached to a concrete or trailing-wildcard sink rule.
+    """
+
+    default_trust_level: SinkTrustLevel = SinkTrustLevel.UNTRUSTED
+    default_max_sensitivity: DataSensitivity = DataSensitivity.NORMAL
+    sink_rules: tuple[SinkTrustRule, ...] = ()
+    registry_resource: str = "data_flow_sink_registry:*"
+    registry_list_limit: int = 100
+    decision_list_limit: int = 1_000
+    file_binding_list_limit: int = 1_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -194,6 +217,7 @@ class ToolDefaults:
     filesystem_read_hard_limit_bytes: int = 1_048_576
     directory_entry_limit: int = 1_024
     directory_entry_hard_limit: int = 10_000
+    executable_snapshot_sibling_limit: int = 1_024
     memory_payload_chars: int = 12_000
     memory_payload_hard_limit_chars: int = 200_000
     memory_payload_hard_limit_bytes: int = 200_000
@@ -542,6 +566,7 @@ class AgentLibOSConfig:
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
     gui: GuiDefaults = field(default_factory=GuiDefaults)
     capability: CapabilityDefaults = field(default_factory=CapabilityDefaults)
+    data_flow: DataFlowDefaults = field(default_factory=DataFlowDefaults)
     scheduler: SchedulerDefaults = field(default_factory=SchedulerDefaults)
     process: ProcessDefaults = field(default_factory=ProcessDefaults)
     llm: LLMDefaults = field(default_factory=LLMDefaults)
@@ -605,6 +630,33 @@ def _validate_config(config: AgentLibOSConfig) -> None:
             )
     _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
+
+    data_flow = config.data_flow
+    if data_flow.default_trust_level is not SinkTrustLevel.UNTRUSTED:
+        raise ValueError("data_flow.default_trust_level must remain untrusted")
+    if sensitivity_rank(data_flow.default_max_sensitivity) > sensitivity_rank(DataSensitivity.NORMAL):
+        raise ValueError("data_flow.default_max_sensitivity must not exceed normal")
+    _require_non_empty("data_flow.registry_resource", data_flow.registry_resource)
+    _positive("data_flow.registry_list_limit", data_flow.registry_list_limit)
+    _positive("data_flow.decision_list_limit", data_flow.decision_list_limit)
+    _positive("data_flow.file_binding_list_limit", data_flow.file_binding_list_limit)
+    patterns: set[str] = set()
+    priorities: dict[tuple[str, int], str] = {}
+    for index, rule in enumerate(data_flow.sink_rules):
+        if not isinstance(rule, SinkTrustRule):
+            raise ValueError(f"data_flow.sink_rules[{index}] must be a SinkTrustRule")
+        if rule.pattern in patterns:
+            raise ValueError(f"data_flow.sink_rules contains duplicate pattern: {rule.pattern}")
+        patterns.add(rule.pattern)
+        base = rule.pattern[:-1] if rule.pattern.endswith("*") else rule.pattern
+        priority = (base, len(base))
+        conflict = priorities.get(priority)
+        if conflict is not None:
+            raise ValueError(
+                "data_flow.sink_rules contains equal-priority overlapping patterns: "
+                f"{conflict!r} and {rule.pattern!r}"
+            )
+        priorities[priority] = rule.pattern
 
     gui = config.gui
     for name in (
@@ -744,6 +796,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "filesystem_read_hard_limit_bytes",
         "directory_entry_limit",
         "directory_entry_hard_limit",
+        "executable_snapshot_sibling_limit",
         "memory_payload_chars",
         "memory_payload_hard_limit_chars",
         "memory_payload_hard_limit_bytes",

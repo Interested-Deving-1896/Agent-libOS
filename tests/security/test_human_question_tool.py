@@ -121,7 +121,7 @@ class TestHumanQuestionTool:
         assert effects[0].provider_metadata['classification_fallback'] == 'post_effect_failure'
 
     @pytest.mark.parametrize('certified_not_started', [False, True])
-    def test_terminal_read_failure_preserves_pending_request_and_effect_semantics(
+    def test_terminal_read_failure_is_retryable_only_when_provider_certifies_not_started(
         self,
         certified_not_started: bool,
     ) -> None:
@@ -133,7 +133,11 @@ class TestHumanQuestionTool:
             blocking=True,
         )
 
+        provider_calls = 0
+
         def fail_read(_prompt: str) -> str:
+            nonlocal provider_calls
+            provider_calls += 1
             if certified_not_started:
                 raise ProviderEffectNotStarted('read did not start')
             raise RuntimeError('ambiguous terminal read failure')
@@ -143,17 +147,74 @@ class TestHumanQuestionTool:
         with pytest.raises(expected):
             self.runtime.human.process_next_terminal()
 
-        assert self.runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        request = self.runtime.human.get(request_id)
+        assert request.status == (
+            HumanRequestStatus.PENDING
+            if certified_not_started
+            else HumanRequestStatus.CANCELLED
+        )
+        assert provider_calls == 1
         effects = [effect for effect in self.runtime.store.list_external_effects(pid=pid) if effect.provider == 'human']
         if certified_not_started:
             assert effects == []
         else:
+            assert request.decision == {
+                'provider_outcome': 'unknown',
+                'automatic_retry_disabled': True,
+                'manual_recovery_required': True,
+                'operation': 'read',
+                'purpose': 'text_answer',
+                'error_type': 'RuntimeError',
+            }
+            assert self.runtime.process.get(pid).status == ProcessStatus.PAUSED
+            assert self.runtime.human.process_next_terminal() is None
+            assert provider_calls == 1
             assert len(effects) == 1
             assert effects[0].effect_state == 'finalized'
             assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
             metadata = json.dumps(effects[0].provider_metadata, sort_keys=True)
             assert 'Do not persist this prompt' not in metadata
             assert 'ambiguous terminal read failure' not in metadata
+
+    @pytest.mark.parametrize('certified_not_started', [False, True])
+    def test_terminal_write_failure_is_retryable_only_when_provider_certifies_not_started(
+        self,
+        certified_not_started: bool,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='terminal write failure')
+        request_id = self.runtime.human.query(
+            pid,
+            'owner',
+            {'type': 'question', 'question': 'Display this question once'},
+            blocking=True,
+        )
+        provider_calls = 0
+
+        def fail_write(_prompt: str) -> None:
+            nonlocal provider_calls
+            provider_calls += 1
+            if certified_not_started:
+                raise ProviderEffectNotStarted('write did not start')
+            raise RuntimeError('ambiguous terminal write failure')
+
+        self.runtime.substrate.human.output_sink = fail_write
+        expected = ProviderEffectNotStarted if certified_not_started else RuntimeError
+        with pytest.raises(expected):
+            self.runtime.human.process_next_terminal(auto_answer='yes')
+
+        request = self.runtime.human.get(request_id)
+        assert request.status == (
+            HumanRequestStatus.PENDING
+            if certified_not_started
+            else HumanRequestStatus.CANCELLED
+        )
+        assert provider_calls == 1
+        if not certified_not_started:
+            assert request.decision is not None
+            assert request.decision['provider_outcome'] == 'unknown'
+            assert request.decision['automatic_retry_disabled'] is True
+            assert self.runtime.human.process_next_terminal(auto_answer='yes') is None
+            assert provider_calls == 1
 
     def test_human_output_not_started_abandons_effect_and_restores_one_time_authority(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='output did not start')
@@ -207,11 +268,13 @@ class TestHumanQuestionTool:
             authority_manifest=_human_manifest(),
         )
         results = asyncio.run(self.runtime.arun_until_idle(max_quanta=4, human_auto_answer='Sunday 02:00 UTC'))
-        assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
+        process = self.runtime.process.get(pid)
+        assert process.status == ProcessStatus.EXITED, (process.status_message, results)
         assert self.runtime.llm.client.calls == 2
         assert results[0]['waiting_human']
         assert 'action' not in results[0]
         ask_result = next((result for result in results if _action_name(result) == 'ask_human'))
+        assert 'answer' in ask_result['result']['payload'], ask_result
         assert ask_result['result']['payload']['answer'] == 'Sunday 02:00 UTC'
         assert self.runtime.human.list(pid)[0].decision['answer'] == 'Sunday 02:00 UTC'
 
@@ -501,12 +564,31 @@ class TestHumanQuestionTool:
                 waiting = runtime.run_next_process_once()
                 request_id = waiting['request_id']
                 assert waiting['waiting_human']
+                persisted_context = runtime.human.get(request_id).payload[
+                    '_agent_libos_data_flow_context'
+                ]
+                source_oids = [
+                    item['oid'] for item in persisted_context['source_refs']
+                ]
+                assert all(runtime.store.get_object(oid) is not None for oid in source_oids)
             finally:
                 runtime.close()
 
             runtime = Runtime.open(db_path)
             try:
                 runtime.llm.client = ExplodingClient()
+                source_rows = {
+                    oid: runtime.store.select_table_rows('objects', 'oid = ?', (oid,))
+                    for oid in source_oids
+                }
+                assert all(source_rows.values()), source_rows
+                assert all(
+                    rows[0]['lifecycle_state'] in {'live', 'released'}
+                    for rows in source_rows.values()
+                ), {
+                    oid: rows[0]['lifecycle_state']
+                    for oid, rows in source_rows.items()
+                }
                 runtime.human.drain_terminal_queue(auto_answer='yes')
 
                 resumed = runtime.run_next_process_once()
@@ -557,7 +639,7 @@ def _human_manifest() -> dict[str, object]:
                 'rights': [CapabilityRight.WRITE.value],
             }
         ],
-        'permitted_effects': ['human.*'],
+        'permitted_effects': ['human.*', 'llm.*'],
     }
 
 

@@ -9,6 +9,7 @@ import http.client
 import heapq
 import ipaddress
 import os
+import re
 import signal
 import shutil
 import socket
@@ -19,7 +20,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
@@ -48,8 +49,12 @@ from agent_libos.substrate.base import (
     CommandMetrics,
     CommandResult,
     DirectoryEntrySnapshot,
+    ExecutableSnapshot,
+    HierarchicalPathLock,
     PathState,
     ResolvedPath,
+    resolve_runtime_python_alias,
+    snapshot_executable,
     SubprocessLimitExceeded,
     SubprocessLimits,
     SubprocessTimeoutExpired,
@@ -251,7 +256,7 @@ class LocalFilesystemProvider:
         self.root = Path(root).resolve()
         self.namespace = namespace
         self.root_display = str(self.root)
-        self._path_lock = threading.RLock()
+        self._path_lock = HierarchicalPathLock()
 
     def resolve(self, path: Any) -> ResolvedPath:
         raw = Path(path)
@@ -271,7 +276,7 @@ class LocalFilesystemProvider:
         return ResolvedPath(relative=relative, display=str(target), is_root=target == self.root)
 
     def state(self, path: ResolvedPath) -> PathState:
-        with self._path_lock:
+        with self._path_lock.hold(path.relative):
             target = self._target(path)
             if not target.exists():
                 return PathState(exists=False, kind="missing")
@@ -285,7 +290,7 @@ class LocalFilesystemProvider:
             )
 
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
-        with self._path_lock:
+        with self._path_lock.hold(path.relative):
             target = self._target(path)
             self._before_path_sink("read_bytes", target)
             target = self._target(path)
@@ -303,7 +308,7 @@ class LocalFilesystemProvider:
         *,
         overwrite: bool = True,
     ) -> None:
-        with self._path_lock:
+        with self._path_lock.hold(HierarchicalPathLock.creation_scope(path.relative)):
             target = self._target(path)
             self._before_path_sink_checked("write_parent", target.parent)
             self._ensure_parent_dirs_under_root(target)
@@ -315,26 +320,26 @@ class LocalFilesystemProvider:
             self._target(path)
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None:
-        with self._path_lock:
+        with self._path_lock.hold(HierarchicalPathLock.creation_scope(path.relative)):
             target = self._target(path)
             self._before_path_sink_checked("make_directory", target)
             self._make_directory_under_root(target, parents=parents, exist_ok=exist_ok)
             self._target(path)
 
     def list_directory(self, path: ResolvedPath, *, limit: int | None = None) -> list[DirectoryEntrySnapshot]:
-        with self._path_lock:
+        with self._path_lock.hold(path.relative):
             target = self._target(path)
             self._before_path_sink_checked("list_directory", target)
             return self._list_directory_under_root(target, limit=limit)
 
     def delete_file(self, path: ResolvedPath) -> None:
-        with self._path_lock:
+        with self._path_lock.hold(path.relative):
             target = self._target(path)
             self._delete_file_under_root(path, target)
             self._target(path)
 
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None:
-        with self._path_lock:
+        with self._path_lock.hold(path.relative):
             target = self._target(path)
             self._delete_directory_under_root(path, target, recursive=recursive)
             self._target(path)
@@ -871,9 +876,13 @@ class LocalShellProvider:
     """Subprocess-backed shell provider scoped to a configured working directory."""
 
     supports_subprocess_limits = os.name != "nt"
+    supports_executable_snapshots = True
 
     def __init__(self, cwd: str | Path):
         self.cwd = Path(cwd).resolve()
+
+    def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
+        return self._resolve_argv0(argv, self._resolve_cwd(cwd))
 
     def run(
         self,
@@ -884,19 +893,45 @@ class LocalShellProvider:
         limits: SubprocessLimits | None = None,
         stdout_limit_chars: int | None = None,
         stderr_limit_chars: int | None = None,
+        executable_snapshot: ExecutableSnapshot | None = None,
     ) -> CommandResult:
         if limits is not None and not self.supports_subprocess_limits:
             raise ValidationError("shell provider cannot enforce SubprocessLimits on this platform")
         selected_cwd = self._resolve_cwd(cwd)
         stdout_limit = _SHELL_DEFAULTS.stdout_hard_limit_chars if stdout_limit_chars is None else max(0, int(stdout_limit_chars))
         stderr_limit = _SHELL_DEFAULTS.stderr_hard_limit_chars if stderr_limit_chars is None else max(0, int(stderr_limit_chars))
+        requested_argv0 = argv[0] if argv else None
         checked_argv = self._resolve_argv0(argv, selected_cwd)
+        popen_executable: str | None = None
+        if executable_snapshot is not None:
+            executable_snapshot.verify()
+            if executable_snapshot.source_path != Path(checked_argv[0]).resolve(
+                strict=False
+            ):
+                raise ValidationError(
+                    "shell executable snapshot does not match resolved argv[0]"
+                )
+            if os.name == "nt":
+                checked_argv = [
+                    str(executable_snapshot.executable_path),
+                    *checked_argv[1:],
+                ]
+            else:
+                # The executable parameter selects the pinned bytes, while
+                # argv[0] retains the caller's invocation spelling. Launchers
+                # such as .venv/bin/python use that spelling to locate
+                # pyvenv.cfg; replacing it with the symlink-resolved base
+                # interpreter silently drops the virtual environment.
+                popen_executable = str(executable_snapshot.executable_path)
+                if requested_argv0 is not None:
+                    checked_argv = [requested_argv0, *checked_argv[1:]]
         started_at = time.monotonic()
         with tempfile.TemporaryFile("w+b") as stdout_file, tempfile.TemporaryFile("w+b") as stderr_file:
             job = self._windows_job_for_run(limits)
             try:
                 proc = subprocess.Popen(
                     checked_argv,
+                    executable=popen_executable,
                     cwd=selected_cwd,
                     env=self._safe_env(),
                     shell=False,
@@ -1033,6 +1068,27 @@ class LocalShellProvider:
                 )
             return result
 
+    def executable_snapshot_required(
+        self,
+        executable: str,
+        *,
+        requested_argv0: str | None = None,
+        cwd: str | None = None,
+    ) -> bool:
+        selected_cwd = self._resolve_cwd(cwd)
+
+        def is_workspace_path(path: Path) -> bool:
+            return path == self.cwd or self.cwd in path.parents
+
+        if is_workspace_path(Path(executable).resolve(strict=False)):
+            return True
+        if requested_argv0 and self._argv0_has_path(requested_argv0):
+            raw = Path(requested_argv0).expanduser()
+            candidate = raw if raw.is_absolute() else selected_cwd / raw
+            lexical = Path(os.path.abspath(candidate))
+            return is_workspace_path(lexical)
+        return False
+
     def classify_external_effect(
         self,
         operation: str,
@@ -1066,9 +1122,18 @@ class LocalShellProvider:
         return env
 
     def _resolve_argv0(self, argv: list[str], selected_cwd: Path) -> list[str]:
-        if not argv or self._argv0_has_path(argv[0]):
+        if not argv:
             return argv
+        if self._argv0_has_path(argv[0]):
+            raw = Path(argv[0])
+            target = raw if raw.is_absolute() else selected_cwd / raw
+            return [str(target.resolve(strict=False)), *argv[1:]]
         resolved = shutil.which(argv[0], path=self._safe_path())
+        if resolved is None:
+            resolved = resolve_runtime_python_alias(
+                argv[0],
+                workspace_root=self.cwd,
+            )
         if resolved is None:
             raise FileNotFoundError(f"shell executable not found on safe PATH: {argv[0]}")
         target = Path(resolved).resolve()
@@ -1481,6 +1546,8 @@ class HttpJsonRpcProvider:
 class SdkMcpProvider:
     """MCP client provider backed by the optional official Python SDK."""
 
+    supports_executable_snapshots = True
+
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self.workspace_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
 
@@ -1490,12 +1557,24 @@ class SdkMcpProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
     ) -> McpToolListResult:
-        try:
-            return _run_mcp_async(self._alist_tools(server, timeout_s=timeout_s, max_response_bytes=max_response_bytes))
-        except BaseExceptionGroup as exc:
-            self._raise_mcp_transport_limit_error(exc)
-            raise
+        with self._stdio_dispatch_snapshot(
+            server,
+            executable_snapshot,
+        ) as selected_snapshot:
+            try:
+                return _run_mcp_async(
+                    self._alist_tools(
+                        server,
+                        timeout_s=timeout_s,
+                        max_response_bytes=max_response_bytes,
+                        executable_snapshot=selected_snapshot,
+                    )
+                )
+            except BaseExceptionGroup as exc:
+                self._raise_mcp_transport_limit_error(exc)
+                raise
 
     def call_tool(
         self,
@@ -1505,20 +1584,91 @@ class SdkMcpProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
     ) -> McpProviderCallResult:
-        try:
-            return _run_mcp_async(
-                self._acall_tool(
-                    server,
-                    tool,
-                    arguments,
-                    timeout_s=timeout_s,
-                    max_response_bytes=max_response_bytes,
+        with self._stdio_dispatch_snapshot(
+            server,
+            executable_snapshot,
+        ) as selected_snapshot:
+            try:
+                return _run_mcp_async(
+                    self._acall_tool(
+                        server,
+                        tool,
+                        arguments,
+                        timeout_s=timeout_s,
+                        max_response_bytes=max_response_bytes,
+                        executable_snapshot=selected_snapshot,
+                    )
                 )
+            except BaseExceptionGroup as exc:
+                self._raise_mcp_transport_limit_error(exc)
+                raise
+
+    def resolve_stdio_executable(self, server: McpServerSpec) -> str:
+        """Resolve the exact stdio executable used by the local MCP transport."""
+
+        if server.transport != "stdio" or server.stdio is None:
+            raise ValidationError("MCP stdio executable resolution requires stdio configuration")
+        candidate = self._stdio_command_candidate(server)
+        resolved_candidate = candidate.resolve(strict=True)
+        if not resolved_candidate.is_file():
+            raise ValidationError(
+                f"MCP stdio executable is not a regular file: {resolved_candidate}"
             )
-        except BaseExceptionGroup as exc:
-            self._raise_mcp_transport_limit_error(exc)
-            raise
+        return str(resolved_candidate)
+
+    def _stdio_command_candidate(self, server: McpServerSpec) -> Path:
+        if server.transport != "stdio" or server.stdio is None:
+            raise ValidationError("MCP stdio executable resolution requires stdio configuration")
+        command = server.stdio.command
+        selected_cwd = Path(self._resolved_stdio_cwd(server))
+        raw = Path(command).expanduser()
+        if raw.is_absolute() or "/" in command or "\\" in command:
+            candidate = raw if raw.is_absolute() else selected_cwd / raw
+        else:
+            child_env = self._resolved_stdio_env(server)
+            resolved = shutil.which(command, path=child_env.get("PATH", os.defpath))
+            if resolved is None:
+                raise FileNotFoundError(f"MCP stdio executable not found: {command}")
+            candidate = Path(resolved)
+        return Path(os.path.abspath(candidate))
+
+    def executable_snapshot_required(
+        self,
+        server: McpServerSpec,
+        resolved_executable: str,
+    ) -> bool:
+        if server.transport != "stdio" or server.stdio is None:
+            return False
+
+        def is_workspace_path(path: Path) -> bool:
+            return path == self.workspace_root or self.workspace_root in path.parents
+
+        if is_workspace_path(Path(resolved_executable).resolve(strict=False)):
+            return True
+        candidate = self._stdio_command_candidate(server)
+        return is_workspace_path(candidate)
+
+    @contextlib.contextmanager
+    def _stdio_dispatch_snapshot(
+        self,
+        server: McpServerSpec,
+        executable_snapshot: ExecutableSnapshot | None,
+    ) -> Iterator[ExecutableSnapshot | None]:
+        if executable_snapshot is not None:
+            executable_snapshot.verify()
+            yield executable_snapshot
+            return
+        if server.transport != "stdio" or server.stdio is None:
+            yield None
+            return
+        resolved = self.resolve_stdio_executable(server)
+        if not self.executable_snapshot_required(server, resolved):
+            yield None
+            return
+        with snapshot_executable(resolved) as owned_snapshot:
+            yield owned_snapshot
 
     @staticmethod
     def _raise_mcp_transport_limit_error(error: BaseException) -> None:
@@ -1552,12 +1702,14 @@ class SdkMcpProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
     ) -> McpToolListResult:
         started = time.monotonic()
         async with self._session(
             server,
             timeout_s=timeout_s,
             max_response_bytes=max_response_bytes,
+            executable_snapshot=executable_snapshot,
         ) as session:
             result = await asyncio.wait_for(session.list_tools(), timeout=timeout_s)
         tools = [
@@ -1587,12 +1739,14 @@ class SdkMcpProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
     ) -> McpProviderCallResult:
         started = time.monotonic()
         async with self._session(
             server,
             timeout_s=timeout_s,
             max_response_bytes=max_response_bytes,
+            executable_snapshot=executable_snapshot,
         ) as session:
             result = await asyncio.wait_for(session.call_tool(tool.mcp_name, arguments), timeout=timeout_s)
         content = _jsonable_mcp_value(getattr(result, "content", None))
@@ -1620,6 +1774,7 @@ class SdkMcpProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
     ):
         try:
             from mcp import ClientSession
@@ -1632,10 +1787,30 @@ class SdkMcpProvider:
         if server.transport == "stdio":
             if server.stdio is None:
                 raise RuntimeError("MCP stdio transport is missing stdio configuration")
+            if executable_snapshot is not None:
+                executable_snapshot.verify()
+                command = str(executable_snapshot.executable_path)
+            else:
+                resolved_executable = Path(self.resolve_stdio_executable(server))
+                command_candidate = self._stdio_command_candidate(server)
+                try:
+                    dispatch_target = command_candidate.resolve(strict=True)
+                except OSError as exc:
+                    raise ValidationError(
+                        "MCP stdio executable is no longer available"
+                    ) from exc
+                if dispatch_target != resolved_executable:
+                    raise ValidationError(
+                        "MCP stdio executable changed before dispatch"
+                    )
+                # Preserve a virtual-environment launcher's lexical path so
+                # Python can discover its pyvenv.cfg. The resolved target above
+                # remains the identity that was validated by the primitive.
+                command = str(command_candidate)
             params = StdioServerParameters(
-                command=server.stdio.command,
+                command=command,
                 args=list(server.stdio.args),
-                env=self._resolved_stdio_env(server),
+                env=self._stdio_dispatch_env(server, executable_snapshot),
                 cwd=self._resolved_stdio_cwd(server),
             )
             async with _strict_stdio_client(
@@ -1719,6 +1894,59 @@ class SdkMcpProvider:
             if value is None:
                 raise RuntimeError(f"missing environment variable for MCP stdio env {child_name}: {host_name}")
             env[child_name] = value
+        return env
+
+    def _stdio_dispatch_env(
+        self,
+        server: McpServerSpec,
+        executable_snapshot: ExecutableSnapshot | None,
+    ) -> dict[str, str]:
+        env = self._resolved_stdio_env(server)
+        if executable_snapshot is None:
+            return env
+        candidate = self._stdio_command_candidate(server)
+        name = candidate.name.lower()
+        if re.fullmatch(r"python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?", name) is None:
+            return env
+        venv_root = candidate.parent.parent
+        if not (venv_root / "pyvenv.cfg").is_file():
+            return env
+        try:
+            selected_target = candidate.resolve(strict=True)
+            snapshot_target = executable_snapshot.source_path.resolve(strict=True)
+        except OSError as exc:
+            raise ValidationError(
+                "MCP stdio Python virtual environment launcher is no longer available"
+            ) from exc
+        if selected_target != snapshot_target:
+            raise ValidationError(
+                "MCP stdio Python virtual environment launcher changed after executable snapshot"
+            )
+
+        env["VIRTUAL_ENV"] = str(venv_root)
+        env["PATH"] = os.pathsep.join(
+            (str(candidate.parent), env.get("PATH", os.defpath))
+        )
+        site_packages = sorted(
+            path
+            for path in (
+                *tuple((venv_root / "lib").glob("python*/site-packages")),
+                venv_root / "Lib" / "site-packages",
+            )
+            if path.is_dir()
+        )
+        if site_packages:
+            python_paths = [str(path) for path in site_packages]
+            if env.get("PYTHONPATH"):
+                python_paths.append(env["PYTHONPATH"])
+            env["PYTHONPATH"] = os.pathsep.join(python_paths)
+        env["PYTHONNOUSERSITE"] = "1"
+        if sys.platform == "darwin":
+            # A copied macOS CPython launcher otherwise derives an invalid
+            # prefix from the private snapshot directory and cannot find even
+            # the standard library. Preserve the selected virtual environment
+            # while the executable bytes remain pinned by the snapshot.
+            env["__PYVENV_LAUNCHER__"] = str(candidate)
         return env
 
     def _resolved_stdio_cwd(self, server: McpServerSpec) -> str:

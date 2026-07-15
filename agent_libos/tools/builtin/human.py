@@ -148,7 +148,7 @@ class AskHumanTool(SyncAgentTool[AskHumanArgs]):
             "question": args.question,
             "context": args.context,
         }
-        if request.payload != expected_payload:
+        if runtime.human.public_request_payload(request) != expected_payload:
             raise ToolExecutionError(
                 "Human resume request payload does not match this ask_human call.",
                 code=ToolErrorCode.PERMISSION_DENIED,

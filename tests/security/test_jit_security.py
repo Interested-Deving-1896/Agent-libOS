@@ -670,7 +670,8 @@ class TestJitSecurity:
 
         assert not result.ok
         assert result.result_handle is None
-        assert 'agent image not found' in (result.error or '')
+        assert result.error == 'JIT tool failed while applying deferred lifecycle.'
+        assert result.payload['policy_decision'] == 'lifecycle_error'
         assert [obj for obj in self.runtime.store.list_objects() if obj.type.value == 'tool_result'] == []
         tool_audits = [
             record

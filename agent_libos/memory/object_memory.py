@@ -12,6 +12,7 @@ from typing import Any, Iterable
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.memory.data_labels import (
+    is_conservative_label_propagation,
     is_label_downgrade,
     labels_for_explain,
     propagate_object_labels,
@@ -20,6 +21,7 @@ from agent_libos.models.exceptions import CapabilityDenied, NotFound, Validation
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
     CapabilityRight,
+    DataFlowContext,
     EventType,
     MaterializedContext,
     MemoryView,
@@ -209,19 +211,25 @@ class ObjectMemoryManager:
             operation_id = operations.current_id() if operations is not None else None
             if operation_id is not None and operation_id not in selected_provenance.source_operation_ids:
                 selected_provenance.source_operation_ids.append(operation_id)
-            if (
-                operation_id is not None
-                and not selected_provenance.parent_oids
-                and str(selected_provenance.created_from_action or "").startswith("llm.")
-            ):
-                selected_provenance.parent_oids.extend(
-                    self._included_context_oids_for_operation(operation_id)
+            llm_derived = str(selected_provenance.created_from_action or "").startswith("llm.")
+            if operation_id is not None and llm_derived:
+                # Explicit parents supplement the materialized prompt context;
+                # they must never suppress it.  Otherwise a model could name a
+                # benign parent to wash labels from every object it actually
+                # observed while producing this value.
+                selected_provenance.parent_oids = list(
+                    dict.fromkeys(
+                        [
+                            *selected_provenance.parent_oids,
+                            *self._included_context_oids_for_operation(operation_id),
+                        ]
+                    )
                 )
-            parent_objects = [
-                parent
-                for parent_oid in selected_provenance.parent_oids
-                if (parent := self.store.get_object(parent_oid)) is not None
-            ]
+            parent_objects, parent_read_decisions = self._resolve_parent_objects(
+                pid,
+                selected_provenance.parent_oids,
+                require_read=llm_derived,
+            )
             meta = propagate_object_labels(
                 self._metadata_for_payload(payload, metadata),
                 [parent.metadata for parent in parent_objects],
@@ -255,7 +263,7 @@ class ObjectMemoryManager:
             }
             if not immutable:
                 rights.add(ObjectRight.WRITE.value)
-            self._consume_one_time_decision(namespace_decision)
+            self._consume_one_time_decisions([namespace_decision, *parent_read_decisions])
             self.store.insert_object(obj)
             handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory")
             self.events.emit(
@@ -268,6 +276,7 @@ class ObjectMemoryManager:
                     "name": obj.name,
                     "qualified_name": self.qualified_name(obj),
                     "type": obj.type.value,
+                    "data_labels": labels_for_explain(obj.metadata),
                 },
             )
             self.audit.record(
@@ -562,6 +571,7 @@ class ObjectMemoryManager:
         patch: ObjectPatch,
         *,
         expected_version: int | None = None,
+        _trusted_label_propagation: bool = False,
     ) -> ObjectHandle:
         with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             write_decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.WRITE)
@@ -617,7 +627,10 @@ class ObjectMemoryManager:
                 next_metadata,
                 [parent.metadata for parent in parent_objects],
             )
-            if is_label_downgrade(current.metadata, next_metadata):
+            if is_label_downgrade(current.metadata, next_metadata) and not (
+                _trusted_label_propagation
+                and is_conservative_label_propagation(current.metadata, next_metadata)
+            ):
                 self.capabilities.require(
                     pid,
                     f"declassification:object:{current.oid}",
@@ -671,6 +684,7 @@ class ObjectMemoryManager:
                     "name": updated.name,
                     "qualified_name": self.qualified_name(updated),
                     "version": updated.version,
+                    "data_labels": labels_for_explain(updated.metadata),
                 },
             )
             self.audit.record(
@@ -703,6 +717,9 @@ class ObjectMemoryManager:
         namespace: str | None = None,
         *,
         issued_by: str = "memory.append",
+        source_oids: Iterable[str] | None = None,
+        provenance_source_refs: Iterable[str] | None = None,
+        source_context: DataFlowContext | None = None,
     ) -> tuple[AgentObject, str | None, int]:
         with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             object_namespace = self.resolve_namespace(pid, namespace)
@@ -736,14 +753,55 @@ class ObjectMemoryManager:
             else:
                 raise ValidationError("target object payload is not appendable")
             self._validate_payload_size(payload, "memory payload")
+            if source_context is not None and not isinstance(source_context, DataFlowContext):
+                raise ValidationError("trusted append source_context must use DataFlowContext")
+            selected_source_oids = list(
+                dict.fromkeys(
+                    str(oid)
+                    for oid in tuple(source_oids or ())
+                    if str(oid) != obj.oid
+                )
+            )
+            if source_context is None:
+                source_objects, source_read_decisions = self._resolve_parent_objects(
+                    pid,
+                    selected_source_oids,
+                    require_read=True,
+                )
+                inherited_metadata = [source.metadata for source in source_objects]
+            else:
+                source_read_decisions = []
+                inherited_metadata = [ObjectMetadata(**source_context.labels.to_dict())]
+            provenance = deepcopy(obj.provenance)
+            provenance.parent_oids = list(
+                dict.fromkeys([*provenance.parent_oids, *selected_source_oids])
+            )
+            provenance.source_refs = list(
+                dict.fromkeys(
+                    [
+                        *provenance.source_refs,
+                        *(str(ref) for ref in tuple(provenance_source_refs or ())),
+                    ]
+                )
+            )
             updated = replace(
                 obj,
                 payload=payload,
-                metadata=self._metadata_for_payload(payload, obj.metadata, force_token_estimate=True),
+                metadata=propagate_object_labels(
+                    self._metadata_for_payload(
+                        payload,
+                        obj.metadata,
+                        force_token_estimate=True,
+                    ),
+                    inherited_metadata,
+                ),
+                provenance=provenance,
                 version=obj.version + 1,
                 updated_at=utc_now(),
             )
-            self._consume_one_time_decisions([*decisions, namespace_decision])
+            self._consume_one_time_decisions(
+                [*decisions, namespace_decision, *source_read_decisions]
+            )
             if not self.store.update_object(
                 updated,
                 expected_version=obj.version,
@@ -768,6 +826,7 @@ class ObjectMemoryManager:
                     "name": updated.name,
                     "qualified_name": self.qualified_name(updated),
                     "version": updated.version,
+                    "data_labels": labels_for_explain(updated.metadata),
                 },
             )
             self.audit.record(
@@ -2002,3 +2061,41 @@ class ObjectMemoryManager:
             operation = self.store.get_operation(selected_id)
             selected_id = operation.parent_operation_id if operation is not None else None
         return []
+
+    def _resolve_parent_objects(
+        self,
+        pid: str,
+        parent_oids: Iterable[str],
+        *,
+        require_read: bool,
+    ) -> tuple[list[AgentObject], list[Any]]:
+        """Resolve provenance parents, failing closed for LLM-derived values.
+
+        Non-LLM callers retain the legacy best-effort behavior because some
+        trusted import paths use provenance as an external reference.  An LLM
+        result is different: its parents are security evidence, so a missing
+        or no-longer-readable source cannot be silently dropped from label
+        aggregation.
+        """
+
+        parents: list[AgentObject] = []
+        read_decisions: list[Any] = []
+        for raw_oid in dict.fromkeys(parent_oids):
+            if not isinstance(raw_oid, str) or not raw_oid:
+                if require_read:
+                    raise ValidationError(f"invalid LLM-derived object parent oid: {raw_oid!r}")
+                continue
+            parent = self.store.get_object(raw_oid)
+            if parent is None:
+                if require_read:
+                    raise ValidationError(f"LLM-derived object parent not found: {raw_oid}")
+                continue
+            if require_read:
+                decision = self.capabilities.authorize(pid, f"object:{raw_oid}", ObjectRight.READ)
+                if not decision.allowed:
+                    raise CapabilityDenied(
+                        f"LLM-derived object parent is not readable by {pid}: {raw_oid}"
+                    )
+                read_decisions.append(decision)
+            parents.append(parent)
+        return parents, read_decisions
