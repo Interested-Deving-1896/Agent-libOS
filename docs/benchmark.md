@@ -343,8 +343,9 @@ normalized records.
 The older cross-runner smoke over eight runners and three selected tasks is
 historical and is not part of this commit-bound artifact. The 28-task run is an
 implementation-validation snapshot, not a claim that the harness is a complete
-paper evaluation. Consult [release_status.md](release_status.md) for its exact
-commands, platform, matrix results, and remaining gates.
+paper evaluation. Consult [release_status.md](release_status.md) for current
+readiness and [support_matrix.md](support_matrix.md) for environment gates;
+historical snapshot provenance remains in this document.
 
 ## Practical workflow evidence levels
 

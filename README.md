@@ -126,8 +126,8 @@ The implementation currently includes:
 
 Start here, then read the deeper references as needed:
 
-- [docs/release_status.md](docs/release_status.md): living, commit/dirty-state
-  validation ledger for the current release candidate or development snapshot.
+- [docs/release_status.md](docs/release_status.md): current-version readiness,
+  validation outcomes, and remaining environment boundaries.
 - [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
   historical, commit-bound 2026-07-10 subsystem review and validation snapshot;
   it is not the current release-status source.
@@ -200,6 +200,24 @@ Install dependencies:
 uv sync --frozen --all-groups
 ```
 
+### Distribution artifacts
+
+The Python wheel contains the core `agent_libos` package and the
+`agent-libos` and `agent-libos-gui-server` console entrypoints. Repository-level
+assets such as the optional PTY Runtime Module, bundled example Skill and
+Image, benchmarks, tests, and documentation are distributed with the Python
+source archive and source checkout, not installed into the core wheel. The
+Electron sources are repository-checkout assets and are validated by their
+separate GUI lane. A wheel installation may load separately supplied modules,
+Skills, Images, and configuration through their normal explicit paths.
+
+Build and validate both release artifacts with:
+
+```bash
+uv build --out-dir dist
+uv run python scripts/check_release_artifacts.py dist
+```
+
 Run tests:
 
 ```bash
@@ -264,11 +282,11 @@ allowed denials `0/97`, and zero unknown outcomes/classifications. Its
 `f6b3b0aa5e2a403c3ed0a7c848dcbccffa7faabe5eda7edf6cfe26ebccde53b6`.
 That artifact is not evidence for the current tree: its counts do not carry
 over across history consolidation or later runtime changes unless content
-identity is proved and the release ledger explicitly records that proof.
+identity is proved and a new validation artifact records that proof.
 The two rate denominators are qualified effect populations, not task counts,
 and missing/unknown evidence invalidates rates instead of being inferred from
 `result.ok`. The ignored artifact must be packaged separately. See the
-[living release ledger](docs/release_status.md) and
+[current release status](docs/release_status.md) and
 [benchmark contract](docs/benchmark.md).
 
 Run the practical workflow evidence suite separately:

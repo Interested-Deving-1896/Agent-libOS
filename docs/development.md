@@ -103,6 +103,25 @@ uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 
 `.benchmark_runs/` is ignored and should not be committed.
 
+## Release Artifacts
+
+The core Python wheel contains only the `agent_libos` package and its two
+console entrypoints. The source distribution additionally contains the
+repository-level PTY module, example Skill and Image packages, benchmarks,
+tests, and documentation. Electron sources remain repository-checkout assets
+validated by the separate GUI lane. Validate that contract before a release:
+
+```bash
+uv build --out-dir dist
+uv run python scripts/check_release_artifacts.py dist
+```
+
+The artifact checker requires the Python package, project metadata, and
+lockfile versions to agree; when GUI sources are present, both GUI package
+versions must agree as well. CI installs the built wheel into a fresh
+environment, runs both entrypoint help commands from outside the source tree,
+and executes the deterministic demo against an in-memory store.
+
 The deterministic matrix is not the full platform release matrix. See
 [support_matrix.md](support_matrix.md) before claiming Windows/macOS, packaged
 Electron, real MCP, or real LLM coverage.

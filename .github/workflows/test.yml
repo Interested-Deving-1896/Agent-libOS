@@ -36,6 +36,45 @@ jobs:
       - name: Check invariant manifest and pytest collection
         run: uv run python scripts/check_test_invariants.py
 
+  release-artifacts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2.0.4
+        with:
+          deno-version: lts
+
+      - name: Build and validate distributions
+        run: |
+          uv build --out-dir dist
+          python scripts/check_release_artifacts.py dist
+
+      - name: Clean-install wheel and run entrypoint smoke
+        run: |
+          uv venv --python 3.11 .release-venv
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          uv pip install --python .release-venv/bin/python "$wheel"
+          smoke_root="$(mktemp -d)"
+          cd "$smoke_root"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; assert agent_libos.__version__ == importlib.metadata.version('agent-libos')"
+          "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --help
+          "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-gui-server" --help
+          "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --db local demo > demo.json
+
   python:
     needs: static
     runs-on: ubuntu-latest

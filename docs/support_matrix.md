@@ -19,6 +19,7 @@ Legend:
 | Surface | Declared/current implementation | Per-change CI | Remaining boundary |
 | --- | --- | --- | --- |
 | Python | Package declares 3.11–3.14 | Ubuntu on 3.11 and 3.14 for Python lanes | 3.12/3.13 are inside the declared range but are not separate per-change jobs |
+| Python release artifacts | Core-package wheel plus Python source distribution | CI builds both artifacts, validates their contents, and clean-installs the wheel for CLI and deterministic-demo smoke | Repository-level PTY/Skill/Image assets are source-distribution assets; Electron sources remain repository-checkout assets |
 | SQLite RuntimeStore | Default local backend, file and in-memory targets | Ubuntu deterministic lanes | macOS/Windows filesystem ACL and locking behavior need native release-gate runs |
 | PostgreSQL RuntimeStore | Optional `postgres` extra | PostgreSQL 17 service on Ubuntu/Python 3.11 | Other supported server versions and deployment TLS/auth topology are operator gates |
 | Core process/shell containment | POSIX process groups plus platform-specific fallbacks | Ubuntu security/runtime/provider lanes | macOS and Windows native process-tree/resource behavior are not CI-covered |
@@ -51,12 +52,13 @@ Legend:
 ## Release-gate policy
 
 The deterministic `scripts/test_matrix.py --lane all`, invariant checker, GUI
-lane, PostgreSQL CI job, and runtime-safety smoke are necessary but not
-sufficient for a cross-platform release. Before advertising a platform or
-provider configuration as release-validated, record a fresh native run for the
-corresponding environment-gate cells above. Do not copy counts or “remaining
-gates” from `docs/prelaunch_hardening_report.md`; that file is bound to its
-historical commit.
+lane, release-artifact build and clean-install smoke, PostgreSQL CI job, and
+runtime-safety smoke are necessary but not sufficient for a cross-platform
+release. Before advertising a platform or provider configuration as
+release-validated, record a fresh native run for the corresponding
+environment-gate cells above. Do not copy counts or “remaining gates” from
+`docs/prelaunch_hardening_report.md`; that file is bound to its historical
+commit.
 
 When a new environment becomes CI-covered, update this matrix and
 `docs/invariants.md` Known Test Gaps in the same change.

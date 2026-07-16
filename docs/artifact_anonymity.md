@@ -68,8 +68,9 @@ real Deno installation skip with a clear message when `deno` is missing; use
 ## Documentation Consistency
 
 - README is the current project entrypoint and documentation index.
-- `docs/release_status.md` is the living, commit/working-tree-bound validation
-  ledger; `docs/prelaunch_hardening_report.md` is historical evidence only.
+- `docs/release_status.md` describes only the current version's readiness,
+  validation outcomes, and remaining environment boundaries;
+  `docs/prelaunch_hardening_report.md` is historical evidence only.
 - `agent_libos_design_doc.md` is a historical design archive.
 - `docs/invariants.md` is the invariant-to-test map.
 - `docs/paper_thesis.md` carries the fixed paper title, thesis, contributions,

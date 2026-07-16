@@ -92,7 +92,7 @@ snapshot: 28/28 task success, 28/28 safety pass, 122 normalized effects, zero
 unauthorized performed effects among 97 definitely performed effects, zero
 unknown outcomes/classifications, and zero false denials among 97 allowed
 performed-or-denied attempts (`0/97 = 0%`). The artifact metadata and metrics
-SHA-256 values are recorded in [release_status.md](release_status.md). The
+SHA-256 values are recorded in [benchmark.md](benchmark.md). The
 mock planned-action client makes no real model request; its reported 144 LLM
 tokens are deterministic usage accounting. It does not validate the current
 working tree; history consolidation was not a new benchmark run and did not by
