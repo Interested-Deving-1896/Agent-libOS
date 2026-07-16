@@ -61,6 +61,23 @@ class TestFilesystemDirectoryTool:
         assert not (self.runtime.workspace_root / existing_file).exists()
         assert deleted_dir.ok, deleted_dir.error
         assert not (self.runtime.workspace_root / base / 'created').exists()
+        mutation_effects = [
+            effect
+            for effect in self.runtime.store.list_external_effects(pid=pid)
+            if effect.state_mutation
+        ]
+        assert len(mutation_effects) == 4
+        assert {effect.operation for effect in mutation_effects} == {
+            'make_directory',
+            'write_text',
+            'delete_file',
+            'delete_directory',
+        }
+        assert all(
+            effect.rollback_class == ExternalEffectRollbackClass.IRREVERSIBLE
+            and effect.rollback_status == ExternalEffectRollbackStatus.NOT_SUPPORTED
+            for effect in mutation_effects
+        )
 
     def test_filesystem_post_provider_event_failure_leaves_durable_unknown_effect_intent(
         self,

@@ -170,13 +170,16 @@ checkpoint-oriented tasks:
 allowed_effects:
   - type: filesystem.write
     path: "src/app.py"
-    rollback_class: rollbackable
+    rollback_class: irreversible
+    rollback_status: not_supported
     rollback_expected: false
 ```
 
 `rollback_class` is descriptive in task schema v1. Agent libOS records provider
 classification and reports it from checkpoint diff/restore, but does not execute
-external rollback.
+external rollback. The default `LocalFilesystemProvider` records no preimage or
+undo log and exposes no compensation operation, so its mutations are
+`irreversible` with `rollback_status: not_supported`.
 
 ## Oracle Entries
 

@@ -352,8 +352,8 @@ class LocalFilesystemProvider:
     ) -> ExternalEffectClassification:
         if operation in {"write_text", "make_directory", "delete_file", "delete_directory"}:
             return ExternalEffectClassification(
-                rollback_class=ExternalEffectRollbackClass.ROLLBACKABLE,
-                rollback_status=ExternalEffectRollbackStatus.NOT_APPLIED,
+                rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+                rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
                 state_mutation=True,
                 information_flow=False,
                 metadata={"namespace": self.namespace, "path": context.get("path")},

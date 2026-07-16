@@ -495,10 +495,16 @@ a globally locked filesystem snapshot.
 If the first provider observation certifies `ProviderEffectNotStarted`, the
 reservation and pending row are atomically restored/abandoned. If `state()`
 already returned information but the main mutation then certifies not-started,
-the mutation one-shot is restored while the same effect id is finalized as
-`state_mutation=false, information_flow=true`. Ordinary state/read/mutation
-exceptions cannot prove what was observed or changed and finalize or retain a
-conservative unknown outcome.
+the mutation one-shot remains consumed and the same effect id is finalized as
+`state_mutation=false, information_flow=true` with a conservative unknown
+outcome. Ordinary state/read/mutation exceptions likewise cannot prove what was
+observed or changed and finalize or retain a conservative unknown outcome.
+
+The default `LocalFilesystemProvider` stores no preimage or undo log and
+exposes no compensation operation. Successful writes, directory creation, and
+file or directory deletion are therefore classified as
+`irreversible`/`not_supported`; checkpoint restore reports them but cannot
+reverse them.
 
 The default local filesystem provider performs no-follow traversal inside the
 workspace root for existing files. Existing file read, write, and delete reject

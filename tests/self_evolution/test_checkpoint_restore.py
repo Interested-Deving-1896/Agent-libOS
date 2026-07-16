@@ -851,9 +851,13 @@ class TestCheckpointRestore:
                 assert (Path(temp_dir) / 'out.txt').exists()
                 assert result['external_effects_since_checkpoint']
                 assert result['restore_external_policy'] == 'report_only'
-                assert result['external_effect_summary']['by_rollback_class']['rollbackable'] == 1
-                assert result['external_effects_since_checkpoint'][0]['provider'] == 'filesystem'
-                assert result['external_effects_since_checkpoint'][0]['rollback_class'] == 'rollbackable'
+                summary = result['external_effect_summary']['by_rollback_class']
+                assert summary['irreversible'] == 1
+                assert 'rollbackable' not in summary
+                filesystem_effect = result['external_effects_since_checkpoint'][0]
+                assert filesystem_effect['provider'] == 'filesystem'
+                assert filesystem_effect['rollback_class'] == 'irreversible'
+                assert filesystem_effect['rollback_status'] == 'not_supported'
                 assert 'checkpoint.restore' in [record.action for record in runtime.audit.trace()]
             finally:
                 runtime.close()
@@ -878,10 +882,12 @@ class TestCheckpointRestore:
                 effects = result['external_effects_since_checkpoint']
                 assert result['status'] == 'restored'
                 assert result['restore_external_policy'] == 'report_only'
-                assert summary['rollbackable'] == 1
-                assert summary['irreversible'] == 1
+                assert 'rollbackable' not in summary
+                assert summary['irreversible'] == 2
                 assert summary['no_rollback_required'] == 1
-                assert {(effect['provider'], effect['rollback_class']) for effect in effects} == {('filesystem', 'rollbackable'), ('shell', 'irreversible'), ('human', 'no_rollback_required')}
+                assert {(effect['provider'], effect['rollback_class']) for effect in effects} == {('filesystem', 'irreversible'), ('shell', 'irreversible'), ('human', 'no_rollback_required')}
+                filesystem_effect = next(effect for effect in effects if effect['provider'] == 'filesystem')
+                assert filesystem_effect['rollback_status'] == 'not_supported'
             finally:
                 runtime.close()
 

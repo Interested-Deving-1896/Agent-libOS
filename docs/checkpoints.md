@@ -96,6 +96,13 @@ Providers classify their successful effects as:
 - `no_rollback_required`,
 - `unknown` for an outcome whose external state cannot be proven.
 
+The default `LocalFilesystemProvider` classifies successful writes, directory
+creation, and file or directory deletion as `irreversible` with
+`rollback_status=not_supported`. It stores no preimage or undo log and exposes
+no compensation operation. The generic `rollbackable` class remains available
+for providers that can support a real compensation layer, but checkpoint
+restore itself still only reports those effects.
+
 Filesystem mutations, clock operations, shell execution, and PTY spawn reserve
 finite-use authority before entering their provider boundary.
 `ProviderEffectNotStarted` restores that exact reservation only when it

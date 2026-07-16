@@ -1,6 +1,6 @@
-# Agent libOS 0.2.0 Status
+# Agent libOS 0.2.1 Status
 
-Agent libOS 0.2.0 is ready for release within its documented core Python wheel
+Agent libOS 0.2.1 is ready for release within its documented core Python wheel
 and Python source-distribution scope.
 
 ## Current status
