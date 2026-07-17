@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-libos"
-version = "0.2.1"
+version = "0.3.0"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,7 +46,7 @@ dev = [
 ]
 
 [project.scripts]
-agent-libos = "agent_libos.api.cli:main"
+agent-libos = "agent_libos.api.cli:cli"
 agent-libos-gui-server = "agent_libos.api.gui.server:main"
 
 [tool.hatch.build.targets.wheel]

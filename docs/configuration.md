@@ -10,7 +10,7 @@ operators do not have to infer those rules from example YAML.
 
 Product entrypoints use this order:
 
-1. Start from a fresh `DEFAULT_CONFIG` value.
+1. Start from the deeply immutable `DEFAULT_CONFIG` baseline.
 2. If `--config <path>` is present, recursively merge that YAML mapping.
 3. Otherwise load the repository/project-root `config.yaml` when it exists.
    The loader does not search the caller's current working directory.
@@ -18,9 +18,10 @@ Product entrypoints use this order:
    merge mapping fields such as `llm.profiles`.
 5. For CLI and GUI-server entrypoints, an explicit `--db` store target overrides
    the selected runtime store target.
-6. Construct and validate a new frozen `AgentLibOSConfig`. Unknown fields and
-   unsafe, inverted, non-finite, or incorrectly typed bounds fail before the
-   Runtime opens.
+6. When an overlay is present, construct and validate a new frozen
+   `AgentLibOSConfig`; without an overlay, the shared immutable baseline is
+   safe to reuse. Unknown fields and unsafe, inverted, non-finite, or
+   incorrectly typed bounds fail before the Runtime opens.
 
 There is no runtime hot reload. Change the host configuration and open a new
 Runtime. Library callers should pass an explicit config object when they need a
@@ -31,6 +32,11 @@ from agent_libos import Runtime
 from agent_libos.config import load_config_file
 
 runtime = Runtime.open(config=load_config_file("agent-config.yaml"))
+try:
+    # Use the Runtime.
+    ...
+finally:
+    runtime.shutdown(actor="library", reason="library.complete")
 ```
 
 The checked-in repository `config.yaml` selects `.agent_libos.sqlite` and loads
@@ -71,7 +77,7 @@ same change.
 | `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix` |
 | `object_tasks` | `max_running_global`, `max_running_per_object`, `notification_channel`, `owner_watch_channel`, `owner_watch_events`, `shutdown_join_timeout_s` |
 | `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit` |
-| `checkpoint` | `snapshot_version`, `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
+| `checkpoint` | `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
 | `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities` |
 | `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
@@ -82,6 +88,9 @@ The table is checked against the dataclass fields by
 remain authoritative in the live dump and typed source. Optional Runtime
 Modules may also own module-local settings that are not fields of
 `AgentLibOSConfig`.
+
+Checkpoint snapshot format versions are owned by the runtime codec and are not
+configurable. A runtime release emits only the snapshot version it can decode.
 
 ## Security-sensitive settings
 
@@ -101,8 +110,7 @@ Modules may also own module-local settings that are not fields of
 - Provider-side Responses storage and chaining remain opt-in through
   `llm.store` and `llm.responses_previous_response_id`.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
-  requirements as declarations, not grants. The legacy mode is a compatibility
-  choice and must not be inferred from an image.
+  requirements as declarations, not grants; this value is fixed in 0.3.
 - `data_flow.default_trust_level` is fixed to `untrusted`, and
   `default_max_sensitivity` cannot exceed `normal`. Higher clearance is valid
   only in a Host-owned `sink_rules` record. Rules accept exact or terminal-`*`

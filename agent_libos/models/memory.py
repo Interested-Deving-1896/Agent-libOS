@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, MemoryViewID, NamespaceID, OID, PID, SnapshotID, StrEnum
 from agent_libos.models.data_flow import DataIntegrity, DataSensitivity, DataTrustLevel
 
@@ -98,8 +97,8 @@ class ObjectMetadata:
     token_estimate: int | None = None
     embedding_refs: list[str] = field(default_factory=list)
     indexes: list[str] = field(default_factory=list)
-    sensitivity: str = field(default_factory=lambda: DEFAULT_CONFIG.memory.metadata_sensitivity)
-    retention_policy: str = field(default_factory=lambda: DEFAULT_CONFIG.memory.metadata_retention_policy)
+    sensitivity: str = DataSensitivity.NORMAL.value
+    retention_policy: str = "default"
     trust_level: str = "unknown"
     integrity: str = "unknown"
     origin: str | None = "local"
@@ -260,7 +259,7 @@ class ObjectQuery:
     type: ObjectType | str | None = None
     tags: list[str] = field(default_factory=list)
     text: str | None = None
-    limit: int = field(default_factory=lambda: DEFAULT_CONFIG.memory.query_limit)
+    limit: int | None = None
     name: str | None = None
     namespace: NamespaceID | None = None
 

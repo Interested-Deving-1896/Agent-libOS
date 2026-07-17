@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from agent_libos.capability.effect_binding import APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY
+from agent_libos.capability.evaluator import (
+    DATA_RELEASE_BINDING_KEY as DATA_RELEASE_BINDING_CONSTRAINT_KEY,
+    KNOWN_CONSTRAINT_KEYS,
+    CapabilityEvaluator,
+)
+from agent_libos.capability.lease import CapabilityLeaseService
+from agent_libos.capability.mutation import CapabilityDraft, CapabilityMutationService
 from agent_libos.capability.profiles import SandboxProfileBuilder
 from agent_libos.capability.resources import ResourceAuthority
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY, AuthorityRuleCodec
@@ -18,25 +25,15 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     CapabilitySpec,
-    CapabilityStatus,
-    EventType,
     ObjectHandle,
     OperationContext,
     DelegationPolicy,
-    DataReleaseBinding,
     ResourcePattern,
     SandboxProfile,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.effect_binding import (
-    APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY,
-    canonical_effect_hash,
-    normalize_approval_binding,
-)
-from agent_libos.storage import RuntimeStore
-from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.ports import AuditPort, CapabilityStorePort, EventPort, OperationPort
+from agent_libos.utils.ids import utc_now
 
 
 @dataclass(frozen=True)
@@ -55,25 +52,31 @@ class CapabilityManager:
     ALLOW_ONCE = "allow_once"
     MISSING = "missing"
     APPROVAL_BINDING_KEY = APPROVAL_BINDING_CONSTRAINT_KEY
-    DATA_RELEASE_BINDING_KEY = "data_release_binding"
+    DATA_RELEASE_BINDING_KEY = DATA_RELEASE_BINDING_CONSTRAINT_KEY
     POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
 
-    _KNOWN_CONSTRAINT_KEYS = {
-        "shell_policy_level",
-        "inherited_from",
-        AUTHORITY_RULES_KEY,
-        APPROVAL_BINDING_KEY,
-        DATA_RELEASE_BINDING_KEY,
-    }
+    _KNOWN_CONSTRAINT_KEYS = KNOWN_CONSTRAINT_KEYS
 
-    def __init__(self, store: RuntimeStore, audit: AuditManager, events: EventBus, config: AgentLibOSConfig | None = None):
+    def __init__(
+        self,
+        store: CapabilityStorePort,
+        audit: AuditPort,
+        events: EventPort,
+        config: AgentLibOSConfig | None = None,
+        *,
+        operations: OperationPort,
+    ) -> None:
         self.config = config or DEFAULT_CONFIG
         self.store = store
         self.audit = audit
         self.events = events
+        self.operations = operations
         self.resources = ResourceAuthority()
         self.rule_codec = AuthorityRuleCodec()
         self.profiles = SandboxProfileBuilder()
+        self.evaluator = CapabilityEvaluator(self.rule_codec)
+        self.leases = CapabilityLeaseService(store, audit, events, self.operations)
+        self.mutations = CapabilityMutationService(store, audit, events, self.leases)
 
     def issue(
         self,
@@ -104,52 +107,29 @@ class CapabilityManager:
         expires_at = selected.expires_at
         if transfer_parent is not None and expires_at is None:
             expires_at = transfer_parent.expires_at
-        # The issued row, process attachment, evidence, and finite-use issuer
-        # mutation are one authority transition.  If any sink fails, callers
-        # must not observe a granted capability while also receiving an error,
-        # and a consumed one-shot grant must not be restored independently of
-        # the inserted row.
-        with self.store.transaction():
-            authority_reservation = self.reserve_decision_use(
-                issue_authority.mutation_decision,
-                used_by=actor,
-                reason="one-time issue authority reserved",
-            )
-            cap = self._insert_capability(
-                subject=subject,
-                resource=selected.resource,
-                rights=selected.rights,
-                effect=selected.effect,
-                constraints=selected.constraints,
-                metadata=selected.metadata,
-                issued_by=actor,
-                issuer_cap_id=issuer_cap_id,
-                parent_cap_id=transfer_parent.cap_id if transfer_parent is not None else None,
-                delegation_depth=delegation_depth,
-                max_delegation_depth=max_delegation_depth,
-                expires_at=expires_at,
-                uses_remaining=selected.uses_remaining,
-                delegable=selected.delegable,
-                revocable=selected.revocable,
-            )
-            self.commit_reserved_use(
-                authority_reservation,
-                committed_by=actor,
-                reason="one-time issue authority committed",
-            )
-            self.audit.record(
-                actor=actor,
-                action="capability.issue",
-                target=f"{subject}:{cap.resource}",
-                capability_refs=[cap.cap_id] + ([issuer_cap_id] if issuer_cap_id else []),
-                decision={
-                    "effect": cap.effect.value,
-                    "rights": sorted(cap.rights),
-                    "uses_remaining": cap.uses_remaining,
-                    "delegable": cap.delegable,
-                },
-            )
-        return cap
+        draft = self._capability_draft(
+            subject=subject,
+            resource=selected.resource,
+            rights=selected.rights,
+            effect=selected.effect,
+            constraints=selected.constraints,
+            metadata=selected.metadata,
+            issued_by=actor,
+            issuer_cap_id=issuer_cap_id,
+            parent_cap_id=transfer_parent.cap_id if transfer_parent is not None else None,
+            delegation_depth=delegation_depth,
+            max_delegation_depth=max_delegation_depth,
+            expires_at=expires_at,
+            uses_remaining=selected.uses_remaining,
+            delegable=selected.delegable,
+            revocable=selected.revocable,
+        )
+        return self.mutations.issue(
+            draft,
+            actor=actor,
+            authority_decision=issue_authority.mutation_decision,
+            attach_to_process=self._attach_to_process,
+        )
 
     def issue_trusted(
         self,
@@ -268,12 +248,12 @@ class CapabilityManager:
             delegable=selected.delegable,
             revocable=selected.revocable,
         )
-        self.audit.record(
+        self.mutations.record_delegation(
+            cap,
+            parent_cap=parent_cap,
+            parent_subject=parent,
+            child_subject=child,
             actor=actor or parent,
-            action="capability.delegate",
-            target=f"{parent}->{child}:{cap.resource}",
-            capability_refs=[parent_cap.cap_id, cap.cap_id],
-            decision={"rights": sorted(cap.rights), "effect": cap.effect.value},
         )
         return cap
 
@@ -528,7 +508,8 @@ class CapabilityManager:
         matches = [
             cap
             for cap in capabilities
-            if cap.active
+            if cap.subject == subject
+            and cap.active
             and not self._is_expired(cap)
             and self._parent_chain_active(cap)
             and self._resource_matches(cap.resource, resource)
@@ -554,130 +535,41 @@ class CapabilityManager:
         selected_context: dict[str, Any],
         audit: bool,
     ) -> CapabilityDecision:
-        matched_ids = [cap.cap_id for cap in matches]
-        failed_constraints: list[tuple[Capability, dict[str, Any]]] = []
-        for cap in matches:
-            constraint_results = self._evaluate_constraints(cap, selected_context)
-            constraint_effect = self._constraint_effect(constraint_results)
-            if constraint_effect == CapabilityEffect.DENY:
-                decision = CapabilityDecision(
-                    subject=subject,
-                    resource=resource,
-                    right=requested_right,
-                    allowed=False,
-                    effect=CapabilityEffect.DENY,
-                    reason=f"capability constraints denied {requested_right} on {resource}",
-                    matched_capability_ids=matched_ids,
-                    selected_capability_id=cap.cap_id,
-                    issuer_chain=self._issuer_chain(cap),
-                    constraint_results=constraint_results,
-                    context=selected_context,
-                )
-                return self._record_decision(decision, audit=audit)
-            if not all(bool(item.get("ok")) for item in constraint_results.values()):
-                restrictive_constraint_failed = (
-                    cap.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}
-                    and not self._constraint_failure_is_scoped_miss(constraint_results)
-                )
-                if restrictive_constraint_failed:
-                    # Restrictive policy records must fail closed. The one
-                    # exception is an AuthorityRule deny/ask whose rule simply
-                    # does not match this operation; that is a scoped miss, not
-                    # a malformed restriction.
-                    decision = CapabilityDecision(
-                        subject=subject,
-                        resource=resource,
-                        right=requested_right,
-                        allowed=False,
-                        effect=CapabilityEffect.DENY,
-                        reason=f"capability constraints denied {requested_right} on {resource}",
-                        matched_capability_ids=matched_ids,
-                        selected_capability_id=cap.cap_id,
-                        issuer_chain=self._issuer_chain(cap),
-                        constraint_results=constraint_results,
-                        context=selected_context,
-                    )
-                    return self._record_decision(decision, audit=audit)
-                failed_constraints.append((cap, constraint_results))
-                continue
-            if cap.effect == CapabilityEffect.DENY:
-                # Unconstrained deny still dominates all matching grants. A
-                # deny carrying AuthorityRule constraints is scoped: it only
-                # dominates when those rules match the current operation
-                # context, which lets policy express "deny git push" without
-                # denying every `shell:git` operation.
-                decision = CapabilityDecision(
-                    subject=subject,
-                    resource=resource,
-                    right=requested_right,
-                    allowed=False,
-                    effect=CapabilityEffect.DENY,
-                    reason=f"{subject} denied {requested_right} on {resource}",
-                    matched_capability_ids=matched_ids,
-                    selected_capability_id=cap.cap_id,
-                    issuer_chain=self._issuer_chain(cap),
-                    constraint_results=constraint_results,
-                    context=selected_context,
-                )
-                return self._record_decision(decision, audit=audit)
-            if cap.effect == CapabilityEffect.ASK or constraint_effect == CapabilityEffect.ASK:
-                decision = CapabilityDecision(
-                    subject=subject,
-                    resource=resource,
-                    right=requested_right,
-                    allowed=False,
-                    effect=CapabilityEffect.ASK,
-                    reason=f"{subject} requires human approval for {requested_right} on {resource}",
-                    matched_capability_ids=matched_ids,
-                    selected_capability_id=cap.cap_id,
-                    issuer_chain=self._issuer_chain(cap),
-                    constraint_results=constraint_results,
-                    context=selected_context,
-                )
-                return self._record_decision(decision, audit=audit)
-            if cap.effect == CapabilityEffect.ALLOW:
-                decision = CapabilityDecision(
-                    subject=subject,
-                    resource=resource,
-                    right=requested_right,
-                    allowed=True,
-                    effect=CapabilityEffect.ALLOW,
-                    reason="capability allowed operation",
-                    matched_capability_ids=matched_ids,
-                    selected_capability_id=cap.cap_id,
-                    consume_capability_id=cap.cap_id if cap.uses_remaining is not None else None,
-                    issuer_chain=self._issuer_chain(cap),
-                    constraint_results=constraint_results,
-                    context=selected_context,
-                )
-                return self._record_decision(decision, audit=audit)
-        if failed_constraints:
-            cap, constraint_results = failed_constraints[0]
-            decision = CapabilityDecision(
-                subject=subject,
-                resource=resource,
-                right=requested_right,
-                allowed=False,
-                effect=None,
-                reason=f"capability constraints rejected {requested_right} on {resource}",
-                matched_capability_ids=matched_ids,
-                selected_capability_id=cap.cap_id,
-                issuer_chain=self._issuer_chain(cap),
-                constraint_results=constraint_results,
-                context=selected_context,
-            )
-            return self._record_decision(decision, audit=audit)
-        decision = CapabilityDecision(
+        decision = self.evaluator.decide(
             subject=subject,
             resource=resource,
-            right=requested_right,
-            allowed=False,
-            effect=None,
-            reason=f"{subject} lacks {requested_right} on {resource}",
-            matched_capability_ids=matched_ids,
+            requested_right=requested_right,
+            matches=matches,
             context=selected_context,
         )
+        selected = next(
+            (cap for cap in matches if cap.cap_id == decision.selected_capability_id),
+            None,
+        )
+        if selected is not None:
+            decision = replace(decision, issuer_chain=self._issuer_chain(selected))
         return self._record_decision(decision, audit=audit)
+
+    def decision_from_matches(
+        self,
+        *,
+        subject: str,
+        resource: str,
+        requested_right: str,
+        matches: list[Capability],
+        selected_context: dict[str, Any],
+        audit: bool,
+    ) -> CapabilityDecision:
+        """Evaluate preselected grants through the public capability façade."""
+
+        return self._decision_from_matches(
+            subject=subject,
+            resource=resource,
+            requested_right=requested_right,
+            matches=matches,
+            selected_context=selected_context,
+            audit=audit,
+        )
 
     def require(
         self,
@@ -767,23 +659,24 @@ class CapabilityManager:
         if policy not in self.POLICY_VALUES:
             raise ValueError(f"unknown permission policy: {policy}")
         effect, uses_remaining = self._effect_from_policy(policy)
-        cap = self.issue_trusted(
-            subject=subject,
-            resource=resource,
-            rights=rights,
-            issued_by=issued_by or self.config.runtime.default_human_actor,
-            effect=effect,
-            constraints=dict(constraints or {}),
-            uses_remaining=uses_remaining,
-        )
-        self.audit.record(
-            actor=issued_by or self.config.runtime.default_human_actor,
-            action="capability.permission_policy",
-            target=f"{subject}:{resource}",
-            capability_refs=[cap.cap_id],
-            decision={"policy": policy, "effect": effect.value, "rights": sorted(cap.rights)},
-        )
-        return cap
+        with self.store.transaction():
+            cap = self.issue_trusted(
+                subject=subject,
+                resource=resource,
+                rights=rights,
+                issued_by=issued_by or self.config.runtime.default_human_actor,
+                effect=effect,
+                constraints=dict(constraints or {}),
+                uses_remaining=uses_remaining,
+            )
+            self.audit.record(
+                actor=issued_by or self.config.runtime.default_human_actor,
+                action="capability.permission_policy",
+                target=f"{subject}:{resource}",
+                capability_refs=[cap.cap_id],
+                decision={"policy": policy, "effect": effect.value, "rights": sorted(cap.rights)},
+            )
+            return cap
 
     def grant_once(
         self,
@@ -804,31 +697,7 @@ class CapabilityManager:
         )
 
     def consume_use(self, cap_id: str, *, used_by: str, reason: str = "capability use consumed", count: int = 1) -> Capability:
-        if count < 1:
-            raise ValidationError("capability consume count must be >= 1")
-        cap = self.store.get_capability(cap_id)
-        if cap is None:
-            raise NotFound(f"capability not found: {cap_id}")
-        if cap.uses_remaining is None:
-            return cap
-        updated = self.store.consume_capability_uses(cap_id, count)
-        if updated is None:
-            raise CapabilityDenied(f"capability use exhausted: {cap_id}")
-        self.audit.record(
-            actor=used_by,
-            action="capability.consume",
-            target=cap.resource,
-            capability_refs=[cap_id],
-            decision={"uses_remaining": updated.uses_remaining, "count": count, "reason": reason},
-        )
-        if updated.revoked:
-            self.events.emit(
-                EventType.CAPABILITY_REVOKED,
-                source=used_by,
-                target=cap.subject,
-                payload={"capability_id": cap_id, "reason": reason},
-            )
-        return updated
+        return self.leases.consume(cap_id, used_by=used_by, reason=reason, count=count)
 
     def reserve_use(
         self,
@@ -845,78 +714,18 @@ class CapabilityManager:
         late failure cleanup cannot reactivate authority that was revoked while
         the provider call was in flight.
         """
-        if count < 1:
-            raise ValidationError("capability reservation count must be >= 1")
-        cap = self.store.get_capability(cap_id)
-        if cap is None:
-            raise NotFound(f"capability not found: {cap_id}")
-        if cap.uses_remaining is None:
-            raise ValidationError(f"capability is not finite-use: {cap_id}")
-        reservation_id = new_id("capres")
-        updated = self.store.reserve_capability_uses(
+        return self.leases.reserve(
             cap_id,
-            reservation_id,
-            count=count,
             reserved_by=reserved_by,
             reason=reason,
-            created_at=utc_now(),
+            count=count,
         )
-        if updated is None:
-            raise CapabilityDenied(f"capability use exhausted: {cap_id}")
-        self.audit.record(
-            actor=reserved_by,
-            action="capability.reserve_use",
-            target=cap.resource,
-            capability_refs=[cap_id],
-            decision={
-                "reservation_id": reservation_id,
-                "uses_remaining": updated.uses_remaining,
-                "count": count,
-                "reason": reason,
-            },
-        )
-        operations = getattr(self.store, "operation_manager", None)
-        if operations is not None:
-            operations.expect("reservation")
-            operations.link_evidence(
-                "capability_reservation",
-                reservation_id,
-                "reservation",
-                metadata={"capability_id": cap_id, "status": "reserved", "count": count},
-            )
-        if updated.revoked:
-            self.events.emit(
-                EventType.CAPABILITY_REVOKED,
-                source=reserved_by,
-                target=cap.subject,
-                payload={"capability_id": cap_id, "reason": reason, "reservation_id": reservation_id},
-            )
-        return reservation_id
 
     def reserve_decision_use(self, decision: CapabilityDecision | None, *, used_by: str, reason: str) -> str | None:
-        if decision is None or decision.consume_capability_id is None:
-            return None
-        return self.reserve_use(str(decision.consume_capability_id), reserved_by=used_by, reason=reason)
+        return self.leases.reserve_decision(decision, used_by=used_by, reason=reason)
 
     def commit_reserved_use(self, reservation_id: str | None, *, committed_by: str, reason: str) -> bool:
-        if reservation_id is None:
-            return False
-        committed = self.store.commit_capability_use_reservation(reservation_id, updated_at=utc_now())
-        self.audit.record(
-            actor=committed_by,
-            action="capability.commit_reserved_use",
-            target=f"capability_reservation:{reservation_id}",
-            decision={"committed": committed, "reason": reason},
-        )
-        operations = getattr(self.store, "operation_manager", None)
-        if operations is not None:
-            operations.link_evidence(
-                "capability_reservation",
-                reservation_id,
-                "result",
-                metadata={"status": "committed" if committed else "commit_skipped"},
-            )
-        return committed
+        return self.leases.commit(reservation_id, committed_by=committed_by, reason=reason)
 
     def restore_reserved_use(
         self,
@@ -926,56 +735,11 @@ class CapabilityManager:
         reason: str = "reserved capability use restored",
     ) -> Capability | None:
         """Restore only the exact still-live reservation created for this effect."""
-        if reservation_id is None:
-            return None
-        updated = self.store.restore_capability_use_reservation(reservation_id, updated_at=utc_now())
-        if updated is None:
-            self.audit.record(
-                actor=restored_by,
-                action="capability.restore_reserved_use_skipped",
-                target=f"capability_reservation:{reservation_id}",
-                decision={"restored": False, "reason": reason},
-            )
-            operations = getattr(self.store, "operation_manager", None)
-            if operations is not None:
-                operations.link_evidence(
-                    "capability_reservation",
-                    reservation_id,
-                    "result",
-                    metadata={"status": "restore_skipped"},
-                )
-            return None
-        self.audit.record(
-            actor=restored_by,
-            action="capability.restore_reserved_use",
-            target=updated.resource,
-            capability_refs=[updated.cap_id],
-            decision={
-                "reservation_id": reservation_id,
-                "uses_remaining": updated.uses_remaining,
-                "reason": reason,
-            },
+        return self.leases.restore(
+            reservation_id,
+            restored_by=restored_by,
+            reason=reason,
         )
-        self.events.emit(
-            EventType.CAPABILITY_GRANTED,
-            source=restored_by,
-            target=updated.subject,
-            payload={
-                "capability_id": updated.cap_id,
-                "reason": reason,
-                "reservation_id": reservation_id,
-                "uses_remaining": updated.uses_remaining,
-            },
-        )
-        operations = getattr(self.store, "operation_manager", None)
-        if operations is not None:
-            operations.link_evidence(
-                "capability_reservation",
-                reservation_id,
-                "result",
-                metadata={"status": "restored", "capability_id": updated.cap_id},
-            )
-        return updated
 
     def consume_allow_once(self, subject: str, resource: str, right: str | CapabilityRight, used_by: str) -> None:
         decision = self.authorize(subject, resource, right)
@@ -999,41 +763,12 @@ class CapabilityManager:
             authority_decision = self._require_revoke_authority(revoked_by, cap)
         else:
             authority_decision = None
-        # The target mutation, finite authority settlement, event, and audit
-        # are one authority transition. A sink failure must not leave either a
-        # revoked target or a consumed one-shot revoke grant behind.
-        with self.store.transaction():
-            current = self.store.get_capability(cap_id)
-            if current is None:
-                raise NotFound(f"capability not found: {cap_id}")
-            if not current.revocable:
-                raise CapabilityDenied(f"capability is not revocable: {cap_id}")
-            authority_reservation = self.reserve_decision_use(
-                authority_decision,
-                used_by=revoked_by,
-                reason="one-time revoke authority reserved",
-            )
-            revoked = replace(current, status=CapabilityStatus.REVOKED)
-            self.store.update_capability(revoked)
-            self.commit_reserved_use(
-                authority_reservation,
-                committed_by=revoked_by,
-                reason="one-time revoke authority committed",
-            )
-            self.events.emit(
-                EventType.CAPABILITY_REVOKED,
-                source=revoked_by,
-                target=current.subject,
-                payload={"capability_id": cap_id, "reason": reason},
-            )
-            self.audit.record(
-                actor=revoked_by,
-                action="capability.revoke",
-                target=current.resource,
-                capability_refs=[cap_id],
-                decision={"revoked": True, "reason": reason, "subject": current.subject},
-            )
-        return revoked
+        return self.mutations.revoke(
+            cap_id,
+            revoked_by=revoked_by,
+            reason=reason,
+            authority_decision=authority_decision,
+        )
 
     def disable_subject_capability(
         self,
@@ -1042,19 +777,7 @@ class CapabilityManager:
         actor: str,
         reason: str | None = None,
     ) -> Capability:
-        cap = self.store.get_capability(cap_id)
-        if cap is None:
-            raise NotFound(f"capability not found: {cap_id}")
-        updated = replace(cap, status=CapabilityStatus.DISABLED)
-        self.store.update_capability(updated)
-        self.audit.record(
-            actor=actor,
-            action="capability.disable",
-            target=cap.resource,
-            capability_refs=[cap_id],
-            decision={"reason": reason, "subject": cap.subject},
-        )
-        return updated
+        return self.mutations.disable(cap_id, actor=actor, reason=reason)
 
     def revoke_resource_trusted(
         self,
@@ -1063,28 +786,11 @@ class CapabilityManager:
         revoked_by: str,
         reason: str | None = None,
     ) -> list[Capability]:
-        revoked: list[Capability] = []
-        for cap in self.store.list_capabilities():
-            if cap.resource != resource or not cap.active:
-                continue
-            updated = replace(cap, status=CapabilityStatus.REVOKED)
-            self.store.update_capability(updated)
-            revoked.append(updated)
-            self.events.emit(
-                EventType.CAPABILITY_REVOKED,
-                source=revoked_by,
-                target=cap.subject,
-                payload={"capability_id": cap.cap_id, "reason": reason},
-            )
-        if revoked:
-            self.audit.record(
-                actor=revoked_by,
-                action="capability.revoke_resource",
-                target=resource,
-                capability_refs=[cap.cap_id for cap in revoked],
-                decision={"revoked": len(revoked), "reason": reason},
-            )
-        return revoked
+        return self.mutations.revoke_resource(
+            resource,
+            revoked_by=revoked_by,
+            reason=reason,
+        )
 
     def authorize_handle(self, subject: str, handle: ObjectHandle, right: str | CapabilityRight) -> CapabilityDecision:
         requested = str(right)
@@ -1255,6 +961,44 @@ class CapabilityManager:
         delegable: bool,
         revocable: bool,
     ) -> Capability:
+        draft = self._capability_draft(
+            subject=subject,
+            resource=resource,
+            rights=rights,
+            effect=effect,
+            constraints=constraints,
+            metadata=metadata,
+            issued_by=issued_by,
+            issuer_cap_id=issuer_cap_id,
+            parent_cap_id=parent_cap_id,
+            delegation_depth=delegation_depth,
+            max_delegation_depth=max_delegation_depth,
+            expires_at=expires_at,
+            uses_remaining=uses_remaining,
+            delegable=delegable,
+            revocable=revocable,
+        )
+        return self.mutations.publish(draft, attach_to_process=self._attach_to_process)
+
+    def _capability_draft(
+        self,
+        *,
+        subject: str,
+        resource: str,
+        rights: set[str],
+        effect: CapabilityEffect,
+        constraints: dict[str, Any],
+        metadata: dict[str, Any],
+        issued_by: str,
+        issuer_cap_id: str | None,
+        parent_cap_id: str | None,
+        delegation_depth: int,
+        max_delegation_depth: int | None,
+        expires_at: str | None,
+        uses_remaining: int | None,
+        delegable: bool,
+        revocable: bool,
+    ) -> CapabilityDraft:
         if not subject:
             raise ValidationError("capability subject must be non-empty")
         self.parse_resource_pattern(resource)
@@ -1265,14 +1009,12 @@ class CapabilityManager:
         if max_delegation_depth is not None and max_delegation_depth < delegation_depth:
             raise ValidationError("max_delegation_depth cannot be less than delegation_depth")
         normalized_expires_at = self._normalize_expires_at(expires_at)
-        cap = Capability(
-            cap_id=new_id("cap"),
+        return CapabilityDraft(
             subject=subject,
             resource=self._canonical_resource(resource),
             rights=normalized_rights,
             constraints=dict(constraints),
             issued_by=issued_by,
-            issued_at=utc_now(),
             expires_at=normalized_expires_at,
             delegable=delegable,
             revocable=revocable,
@@ -1282,24 +1024,8 @@ class CapabilityManager:
             delegation_depth=delegation_depth,
             max_delegation_depth=max_delegation_depth,
             uses_remaining=uses_remaining,
-            status=CapabilityStatus.ACTIVE,
             metadata=dict(metadata),
         )
-        self.store.insert_capability(cap)
-        self._attach_to_process(subject, cap.cap_id)
-        self.events.emit(
-            EventType.CAPABILITY_GRANTED,
-            source=issued_by,
-            target=subject,
-            payload={
-                "capability_id": cap.cap_id,
-                "resource": cap.resource,
-                "rights": sorted(cap.rights),
-                "effect": cap.effect.value,
-                "uses_remaining": cap.uses_remaining,
-            },
-        )
-        return cap
 
     def claim_decision_use(self, decision: CapabilityDecision, *, used_by: str, reason: str) -> None:
         if decision.consume_capability_id is None:
@@ -1496,12 +1222,7 @@ class CapabilityManager:
         return self._sort_matching_capabilities(matches)
 
     def _sort_matching_capabilities(self, capabilities: Iterable[Capability]) -> list[Capability]:
-        matches = list(capabilities)
-        matches.sort(key=lambda cap: cap.cap_id)
-        matches.sort(key=lambda cap: cap.issued_at, reverse=True)
-        matches.sort(key=lambda cap: len(cap.resource), reverse=True)
-        matches.sort(key=lambda cap: 0 if cap.effect == CapabilityEffect.DENY else 1)
-        return matches
+        return self.evaluator.sort_matching_capabilities(capabilities)
 
     def _resource_matches(self, granted: str, requested: str) -> bool:
         return self.resources.matches(granted, requested)
@@ -1647,327 +1368,32 @@ class CapabilityManager:
             self.rule_codec.coerce_many(constraints[AUTHORITY_RULES_KEY])
 
     def _evaluate_constraints(self, cap: Capability, context: dict[str, Any]) -> dict[str, Any]:
-        results: dict[str, Any] = {}
-        for key, value in cap.constraints.items():
-            if key not in self._KNOWN_CONSTRAINT_KEYS:
-                results[key] = {"ok": False, "reason": "unknown constraint key"}
-                continue
-            if key == AUTHORITY_RULES_KEY:
-                try:
-                    rules = self.rule_codec.coerce_many(value)
-                except ValidationError as exc:
-                    results[key] = {"ok": False, "reason": str(exc)}
-                    continue
-                results[key] = self._evaluate_authority_rules(rules, context)
-                continue
-            if key == self.APPROVAL_BINDING_KEY:
-                try:
-                    binding = normalize_approval_binding(value)
-                except ValidationError as exc:
-                    results[key] = {"ok": False, "reason": str(exc)}
-                    continue
-                expected_hash = binding["canonical_args_hash"]
-                actual_hash = canonical_effect_hash(context)
-                expected_version = binding.get("target_state_version")
-                actual_version = context.get("target_state_version")
-                hash_ok = bool(expected_hash) and expected_hash == actual_hash
-                version_ok = expected_version is None or expected_version == actual_version
-                results[key] = {
-                    "ok": hash_ok and version_ok,
-                    "reason": (
-                        "approved effect arguments or target state changed"
-                        if not hash_ok or not version_ok
-                        else "approval binding matched"
-                    ),
-                    "effect_id": binding["effect_id"],
-                    "canonical_args_hash": actual_hash,
-                    "target_state_version": actual_version,
-                }
-                continue
-            if key == self.DATA_RELEASE_BINDING_KEY:
-                try:
-                    expected = DataReleaseBinding.normalize(value)
-                    actual = DataReleaseBinding.normalize(context.get(key))
-                except (TypeError, ValueError) as exc:
-                    results[key] = {"ok": False, "reason": str(exc)}
-                    continue
-                matched = expected == actual
-                results[key] = {
-                    "ok": matched,
-                    "reason": (
-                        "data release binding matched"
-                        if matched
-                        else "data release Sink, source, payload, policy, or operation changed"
-                    ),
-                    "sink": actual["sink"],
-                    "registry_generation": actual["registry_generation"],
-                    "payload_hash": actual["payload_hash"],
-                }
-                continue
-            results[key] = {"ok": True, "value": value}
-        return results
+        return self.evaluator.evaluate_constraints(cap, context)
 
     def _constraint_effect(self, constraint_results: dict[str, Any]) -> CapabilityEffect | None:
-        effects = {
-            str(result.get("effect"))
-            for result in constraint_results.values()
-            if result.get("effect") is not None
-        }
-        if CapabilityEffect.DENY.value in effects:
-            return CapabilityEffect.DENY
-        if CapabilityEffect.ASK.value in effects:
-            return CapabilityEffect.ASK
-        if CapabilityEffect.ALLOW.value in effects:
-            return CapabilityEffect.ALLOW
-        return None
+        return self.evaluator.constraint_effect(constraint_results)
 
     def _constraint_failure_is_scoped_miss(self, constraint_results: dict[str, Any]) -> bool:
-        failed = {
-            key: result
-            for key, result in constraint_results.items()
-            if not bool(result.get("ok"))
-        }
-        return (
-            set(failed) == {AUTHORITY_RULES_KEY}
-            and failed[AUTHORITY_RULES_KEY].get("reason") == "no authority rule matched operation context"
-        )
+        return self.evaluator.constraint_failure_is_scoped_miss(constraint_results)
 
     def _evaluate_authority_rules(self, rules: list[Any], context: dict[str, Any]) -> dict[str, Any]:
-        operation = str(context.get("authority_operation") or context.get("operation") or "")
-        if not operation:
-            return {"ok": False, "reason": "authority rule requires operation context"}
-        operation_rules = [rule for rule in rules if rule.operation == operation]
-        matched = []
-        for rule in operation_rules:
-            unknown_conditions = self._unknown_authority_rule_conditions(rule)
-            malformed_conditions = self._malformed_authority_rule_conditions(rule)
-            if unknown_conditions:
-                return {
-                    "ok": False,
-                    "effect": CapabilityEffect.DENY.value,
-                    "reason": "malformed authority rule condition",
-                    "operation": operation,
-                    "rule_id": rule.rule_id,
-                    "unknown_conditions": unknown_conditions,
-                }
-            if malformed_conditions:
-                return {
-                    "ok": False,
-                    "effect": CapabilityEffect.DENY.value,
-                    "reason": "malformed authority rule condition",
-                    "operation": operation,
-                    "rule_id": rule.rule_id,
-                    "malformed_conditions": malformed_conditions,
-                }
-            if self._authority_rule_matches(rule, context):
-                matched.append(rule)
-        if not matched:
-            return {
-                "ok": False,
-                "reason": "no authority rule matched operation context",
-                "operation": operation,
-                "rule_ids": [rule.rule_id for rule in rules],
-            }
-        deny = next((rule for rule in matched if rule.effect == CapabilityEffect.DENY), None)
-        if deny is not None:
-            return {
-                "ok": False,
-                "effect": CapabilityEffect.DENY.value,
-                "rule_id": deny.rule_id,
-                "risk": deny.risk.value,
-                "operation": operation,
-                "reason": "authority rule denied operation",
-            }
-        ask = next((rule for rule in matched if rule.effect == CapabilityEffect.ASK), None)
-        if ask is not None:
-            return {
-                "ok": True,
-                "effect": CapabilityEffect.ASK.value,
-                "rule_id": ask.rule_id,
-                "risk": ask.risk.value,
-                "operation": operation,
-            }
-        allow = matched[0]
-        return {
-            "ok": True,
-            "effect": CapabilityEffect.ALLOW.value,
-            "rule_id": allow.rule_id,
-            "risk": allow.risk.value,
-            "operation": operation,
-        }
+        return self.evaluator.evaluate_authority_rules(rules, context)
 
     def _unknown_authority_rule_conditions(self, rule: Any) -> list[str]:
-        conditions = dict(rule.conditions or {})
-        allowed_conditions = {
-            "argv",
-            "argv_sha256",
-            "match",
-            "regex_token",
-            "cwd",
-            "path",
-            "resource",
-            "right",
-            "endpoint_id",
-            "method_id",
-            "rpc_method",
-            "params_sha256",
-            "server_id",
-            "transport",
-            "tool_id",
-            "mcp_name",
-            "arguments_sha256",
-            "content_sha256",
-            "timeout_s",
-            "timeout_max_s",
-            "network",
-            "filesystem_intent",
-            "continuous_session",
-            "operation",
-            "authority_operation",
-            "recursive",
-            "missing_ok",
-            "overwrite",
-            "parents",
-            "exist_ok",
-        }
-        return sorted(key for key in conditions if key not in allowed_conditions)
+        return self.evaluator.unknown_authority_rule_conditions(rule)
 
     def _malformed_authority_rule_conditions(self, rule: Any) -> list[str]:
-        conditions = dict(rule.conditions or {})
-        malformed: list[str] = []
-        string_conditions = {
-            "operation",
-            "authority_operation",
-            "argv_sha256",
-            "cwd",
-            "path",
-            "resource",
-            "right",
-            "endpoint_id",
-            "method_id",
-            "rpc_method",
-            "params_sha256",
-            "server_id",
-            "transport",
-            "tool_id",
-            "mcp_name",
-            "arguments_sha256",
-            "content_sha256",
-            "network",
-            "filesystem_intent",
-        }
-        bool_conditions = {"continuous_session", "recursive", "missing_ok", "overwrite", "parents", "exist_ok"}
-        for key in string_conditions:
-            if key in conditions and not isinstance(conditions[key], str):
-                malformed.append(key)
-        for key in bool_conditions:
-            if key in conditions and not isinstance(conditions[key], bool):
-                malformed.append(key)
-        if "argv" in conditions and (
-            not isinstance(conditions["argv"], list) or not all(isinstance(item, str) for item in conditions["argv"])
-        ):
-            malformed.append("argv")
-        if "match" in conditions and conditions["match"] not in {"exact", "prefix"}:
-            malformed.append("match")
-        if "regex_token" in conditions:
-            import re
-
-            regex = conditions["regex_token"]
-            if not isinstance(regex, str):
-                malformed.append("regex_token")
-            else:
-                try:
-                    re.compile(regex)
-                except re.error:
-                    malformed.append("regex_token")
-        for key in ("timeout_s", "timeout_max_s"):
-            if key in conditions and self._finite_nonnegative_timeout(conditions[key]) is None:
-                malformed.append(key)
-        return sorted(set(malformed))
+        return self.evaluator.malformed_authority_rule_conditions(rule)
 
     def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
-        conditions = dict(rule.conditions or {})
-        if "operation" in conditions and str(context.get("operation")) != str(conditions["operation"]):
-            return False
-        if "authority_operation" in conditions and str(context.get("authority_operation")) != str(conditions["authority_operation"]):
-            return False
-        if "argv" in conditions and not self._argv_condition_matches(conditions, context):
-            return False
-        regex = conditions.get("regex_token")
-        if isinstance(regex, str):
-            import re
-
-            try:
-                pattern = re.compile(regex)
-            except re.error:
-                return False
-            argv = context.get("argv")
-            if not isinstance(argv, list) or not any(pattern.fullmatch(str(token)) for token in argv):
-                return False
-        for key in [
-            "argv_sha256",
-            "cwd",
-            "path",
-            "resource",
-            "right",
-            "endpoint_id",
-            "method_id",
-            "rpc_method",
-            "params_sha256",
-            "server_id",
-            "transport",
-            "tool_id",
-            "mcp_name",
-            "arguments_sha256",
-            "content_sha256",
-            "network",
-            "filesystem_intent",
-            "continuous_session",
-            "recursive",
-            "missing_ok",
-            "overwrite",
-            "parents",
-            "exist_ok",
-        ]:
-            if key in conditions and context.get(key) != conditions[key]:
-                return False
-        if "timeout_s" in conditions:
-            actual_timeout = self._finite_nonnegative_timeout(context.get("timeout_s"))
-            expected_timeout = self._finite_nonnegative_timeout(conditions["timeout_s"])
-            if actual_timeout is None or expected_timeout is None or actual_timeout != expected_timeout:
-                return False
-        if "timeout_max_s" in conditions:
-            actual_timeout = self._finite_nonnegative_timeout(context.get("timeout_s"))
-            maximum_timeout = self._finite_nonnegative_timeout(conditions["timeout_max_s"])
-            if actual_timeout is None or maximum_timeout is None or actual_timeout > maximum_timeout:
-                return False
-        return True
+        return self.evaluator.authority_rule_matches(rule, context)
 
     @staticmethod
     def _finite_nonnegative_timeout(value: Any) -> float | None:
-        if isinstance(value, bool):
-            return None
-        try:
-            selected = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(selected) or selected < 0:
-            return None
-        return selected
+        return CapabilityEvaluator.finite_nonnegative_timeout(value)
 
     def _argv_condition_matches(self, conditions: dict[str, Any], context: dict[str, Any]) -> bool:
-        expected = conditions.get("argv")
-        actual = context.get("argv")
-        if not isinstance(expected, list) or not all(isinstance(item, str) for item in expected):
-            return False
-        if not isinstance(actual, list) or not all(isinstance(item, str) for item in actual):
-            return False
-        match = str(conditions.get("match", "exact"))
-        if match == "exact":
-            return actual == expected
-        if match == "prefix":
-            return len(actual) >= len(expected) and actual[: len(expected)] == expected
-        return False
+        return self.evaluator.argv_condition_matches(conditions, context)
 
     def _require_constraint_attenuation(self, parent_cap: Capability, spec: CapabilitySpec) -> None:
         for key, value in parent_cap.constraints.items():
@@ -1982,23 +1408,10 @@ class CapabilityManager:
                 raise CapabilityDenied(f"delegated constraint is not covered by parent: {key}")
 
     def _context_dict(self, context: OperationContext | dict[str, Any] | None) -> dict[str, Any]:
-        if context is None:
-            return {}
-        if isinstance(context, OperationContext):
-            return {
-                "primitive": context.primitive,
-                "operation": context.operation,
-                **context.metadata,
-            }
-        return dict(context)
+        return self.evaluator.context_dict(context)
 
     def _is_expired(self, cap: Capability) -> bool:
-        if cap.expires_at is None:
-            return False
-        try:
-            return self._expires_at_datetime(cap.expires_at) <= datetime.now(timezone.utc)
-        except ValidationError:
-            return True
+        return self.evaluator.is_expired(cap)
 
     def _parent_chain_active(self, cap: Capability) -> bool:
         parent_id = cap.parent_cap_id
@@ -2020,21 +1433,7 @@ class CapabilityManager:
         return dt.astimezone(timezone.utc).isoformat()
 
     def _expires_at_datetime(self, value: Any) -> datetime:
-        if isinstance(value, datetime):
-            dt = value
-        elif isinstance(value, str):
-            raw = value.strip()
-            if not raw:
-                raise ValidationError("capability expires_at must be a non-empty ISO timestamp")
-            try:
-                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError as exc:
-                raise ValidationError("capability expires_at must be an ISO timestamp") from exc
-        else:
-            raise ValidationError("capability expires_at must be an ISO timestamp")
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        return self.evaluator.expires_at_datetime(value)
 
     def _issuer_chain(self, cap: Capability) -> list[str]:
         chain: list[str] = []
@@ -2049,9 +1448,7 @@ class CapabilityManager:
 
     def _record_decision(self, decision: CapabilityDecision, *, audit: bool) -> CapabilityDecision:
         if audit:
-            operations = getattr(self.store, "operation_manager", None)
-            if operations is not None:
-                operations.expect("decision")
+            self.operations.expect("decision")
             self.audit.record(
                 actor=decision.subject,
                 action="capability.authorize",
@@ -2123,7 +1520,4 @@ class CapabilityManager:
         process = self.store.get_process(subject)
         if process is None:
             return
-        if cap_id not in process.capabilities:
-            process.capabilities.append(cap_id)
-            process.updated_at = utc_now()
-            self.store.update_process(process)
+        self.store.append_process_capability_ids(subject, [cap_id])

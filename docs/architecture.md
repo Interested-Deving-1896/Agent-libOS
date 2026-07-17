@@ -169,9 +169,48 @@ Object is containment, not evidence that spawn never occurred; classifier
 absence or failure after a PTY operation finalizes an `unknown` fallback, while
 post-provider sink failure leaves the pending row visible.
 
-## Composition Root
+## Composition Root And Internal Dependencies
 
-`agent_libos.runtime.runtime.Runtime` wires the runtime together:
+`agent_libos.runtime.builder.RuntimeBuilder` is the composition root. It opens
+the store, constructs all acyclic dependencies in dependency order, and uses
+named late bindings only for explicit construction cycles: Data Flow/Human,
+Resource/Process and Object Task notifications, lifecycle participants, and
+the checkpoint module-catalog/image-registry pair. Protected-operation recovery
+and Process/Image Boot use their named recovery/hook registries for the same
+reason. The builder then loads trusted extensions and cleans up a partially
+assembled host on failure.
+`agent_libos.runtime.runtime.Runtime` is the stable host facade over that
+assembled graph. Its component fields are declared explicitly for static
+tooling, and the architecture check rejects composition-root assignments that
+are absent from that declaration. Subsystem services do not retain it as a
+service locator.
+
+The internal dependency rules are:
+
+- services receive repositories, ports, registries, or callbacks explicitly at
+  construction time unless an identified two-way construction dependency
+  requires a narrow named binding;
+- lower layers do not import concrete API or Runtime implementations;
+- one component does not call or read another component's private members;
+- identified cycles use named, narrow binding methods rather than a generic
+  `bind_runtime` escape hatch;
+- Runtime-facade traversal is confined to boundary adapters:
+  `GuiRuntimeService`, `LibOSSyscallSession`, and the ephemeral `ToolContext`
+  given to model-facing tool wrappers. Stateful subsystem services use explicit
+  dependencies instead.
+
+`scripts/check_architecture.py` enforces these rules across both the core
+`agent_libos` package and repository-level Runtime Modules, including Runtime
+aliases, and ratchets long-function and branch-complexity ceilings. The
+checked-in allowlist contains current ceilings, not permanent exemptions:
+the check rejects stale ceilings after debt shrinks, so the same change must
+remove or lower the entry and the improvement cannot later regress within an
+obsolete budget. Underscore-prefixed collaborator fields do not bypass private
+access detection; literal `getattr` access and local aliases are normalized to
+the same dependency path. The checked-in set of named composition-cycle
+bindings is itself ratcheted so new late bindings cannot accumulate unnoticed.
+
+The assembled graph includes:
 
 - `RuntimeStore` persists metadata and append-only records through a backend
   abstraction. SQLite is the default backend; PostgreSQL is available through
@@ -179,8 +218,11 @@ post-provider sink failure leaves the pending row visible.
   repository contract while backend classes own connection setup and dialect
   behavior.
 - `RuntimeModuleRegistry` loads the internal core module and configured trusted
-  startup modules before processes, tools, or LLM execution can run.
-- `CapabilityManager` grants, checks, revokes, and consumes one-shot authority.
+  startup modules before processes, tools, or LLM execution can run. Hook code
+  receives an explicit `ModuleHookServices` snapshot and journaled registration
+  methods, never the concrete Runtime.
+- `CapabilityManager` coordinates separate evaluation, finite-use lease, and
+  mutation services.
 - `DataFlowManager` owns the versioned Host Sink registry, source/version
   validation, conditional releases, file label bindings, and append-only flow
   decisions. Registry writes require configured `data_flow_sink_registry:*`
@@ -190,20 +232,28 @@ post-provider sink failure leaves the pending row visible.
   and human output.
 - `FilesystemAdapter`, `ShellAdapter`, `ClockPrimitive`, `JsonRpcPrimitive`,
   and `McpPrimitive` expose protected primitive operations over provider
-  backends.
-- `ToolBroker` registers static tools and process-local JIT tools.
+  backends. `ShellExecutionPolicy` is the public protocol implemented directly
+  by `ShellAdapter` for one-shot Shell and interactive PTY execution; Runtime
+  Modules do not call `ShellAdapter` private methods or depend on a forwarding
+  wrapper.
+- `ToolBroker` is the public tool boundary; `ToolRegistry`,
+  `ToolExecutionService`, and `JITToolService` own registration, dispatch, and
+  JIT lifecycle respectively.
 - `SkillManager` registers standard Skill packages and activates them into
   process tool tables and prompt context without granting resource authority.
-- `ProcessManager` owns lifecycle, working directories, child relationships,
-  and image transitions.
+- `ProcessManager` owns process lifecycle, working directories, and child
+  relationships; `ProcessLaunchService` owns launch/exec transitions.
 - `SimpleScheduler` runs runnable processes and wakes waiting work.
-- `CheckpointManager` snapshots and restores reconstructable process-subtree
-  state; checkpoint-derived image commit reuses that internal snapshot boundary.
-- `LLMProcessExecutor` materializes prompt context, resolves the process
-  `llm_profile_id` through the host profile registry, calls that LLM client,
-  and dispatches selected tool calls. LLM requests are formal protected
-  bidirectional provider operations; provider-chain reuse is bound to provider,
-  Sink/trust generation, clearance domain, manifest, and context epoch.
+- `ObjectTaskManager` coordinates execution while dedicated state and
+  notification services own durable transitions and wake/message publication.
+- `CheckpointManager` coordinates restore/fork transactions over typed snapshot
+  codecs and remappers. Image artifact loading, image-package installation,
+  checkpoint image creation, and image boot are separate services.
+- `LLMProcessExecutor` coordinates one process quantum using explicit process,
+  repository, provider, pending-action, context-memory, and action-dispatch
+  dependencies. LLM requests remain formal protected bidirectional provider
+  operations; provider-chain reuse is bound to provider, Sink/trust generation,
+  clearance domain, manifest, and context epoch.
 
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
@@ -211,7 +261,8 @@ workspace unless another substrate is injected.
 The internal core module registers the built-in tool set and default images
 through the same module registration path exposed to trusted external modules.
 This keeps future providers, syscalls, and images from accumulating ad hoc
-startup code in the composition root.
+startup code in the composition root while the module registration journal
+keeps rollback ownership explicit.
 
 Host-facing control surfaces live under `agent_libos.api`. The CLI entrypoint
 and the local GUI HTTP/SSE server are different presentations over the same

@@ -4,16 +4,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import BaseAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 from agent_libos.utils.serde import to_jsonable
 
-_JSONRPC_DEFAULTS = DEFAULT_CONFIG.jsonrpc
-
-
 class ListJsonRpcEndpointsArgs(BaseModel):
     text: str | None = Field(default=None, description="Optional endpoint search text.")
-    limit: int | None = Field(default=None, ge=1, le=_JSONRPC_DEFAULTS.list_limit)
+    limit: int | None = Field(default=None, ge=1)
 
 
 class ListJsonRpcEndpointsOutput(BaseModel):

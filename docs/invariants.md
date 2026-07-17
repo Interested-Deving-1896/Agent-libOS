@@ -142,14 +142,11 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   owner-only; PostgreSQL keys advisory leases by database/schema.
 - `storage-transactions-recover-or-fail-closed`: commit/savepoint finalization
   failure restores SQL and opted-in Object payload state; rollback failure
-  poisons/closes the store, and interrupted Object schema rebuilds recover
-  atomically or fail closed.
-- `legacy-persisted-data-flow-state-migrates-conservatively`: valid minimal
-  pending/message/context state is canonicalized, incomplete state becomes
-  conservative before delivery, and bounded cursor migrations reject future
-  versions. Invalid active waits complete terminal budget, parent, Human,
-  ObjectTask, and Object/Host cleanup through a retryable state machine without
-  replaying providers or destroying historical results.
+  poisons/closes the store.
+- `v3-persisted-state-is-strict-and-versioned`: a 0.3 store accepts only the
+  complete version-3 schema and canonical security carriers. Older,
+  incomplete, or malformed state is rejected before mutation; active wait
+  cleanup and provider-effect recovery operate only on valid 0.3 state.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, reserve and consume one-shot grants exactly once, are decided exactly
   once from pending state, and route through primitives. Concurrent terminal
@@ -207,7 +204,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   visible process; GUI-level omissions detected by lookahead remain explicit in
   `_truncated`, while stricter subsystem list maxima remain authoritative.
   Persisted indexed visibility flags exclude internal presentation evidence
-  before `LIMIT`, and legacy null flags backfill in resumable batches.
+  before `LIMIT`; missing or malformed required 0.3 visibility state fails
+  closed instead of being repaired during open.
 - `tool-observability-redacts-sensitive-payloads`: tool audit/event
   observability stores bounded preview, hash, size, and truncation metadata
   instead of raw sensitive args or results.
@@ -306,9 +304,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   transactional; failed activation cannot leave a visible JIT alias, and
   reactivation or unload retires the exact superseded process-local JIT rows.
   Loaded-Skill provenance preserves a base/shared alias until its last actual
-  source is unloaded; legacy persisted rows backfill image/manual static base
-  bindings before unload. Discovery rejects non-positive, boolean, and
-  above-config limits.
+  source is unloaded; noncanonical persisted provenance is rejected before
+  unload. Discovery rejects non-positive, boolean, and above-config limits.
 - `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
   trust to the current source hash, reject ambiguous manifests and duplicate
   module ids, resolve import strings without executing untrusted package code,

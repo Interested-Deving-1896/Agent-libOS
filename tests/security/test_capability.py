@@ -76,6 +76,62 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_matching_capability_candidates_cannot_cross_subject_boundary(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            requester = runtime.process.spawn(image='base-agent:v0', goal='requester')
+            other = runtime.process.spawn(image='base-agent:v0', goal='other subject')
+            borrowed = runtime.capability.grant(
+                other,
+                'shell:git',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            decision = runtime.capability.authorize_matching_capabilities(
+                requester,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                [borrowed],
+            )
+
+            assert not decision.allowed
+            assert decision.selected_capability_id is None
+        finally:
+            runtime.close()
+
+    def test_human_capability_decision_rejects_cross_subject_override(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            requester = runtime.process.spawn(image='base-agent:v0', goal='request grant')
+            victim = runtime.process.spawn(image='base-agent:v0', goal='unrelated victim')
+            request_id = runtime.human.query(
+                requester,
+                'owner',
+                {
+                    'type': 'approval',
+                    'question': 'grant requested authority',
+                    'requested_capability': {
+                        'subject': victim,
+                        'resource': 'object:cross-subject',
+                        'rights': ['read'],
+                    },
+                },
+                blocking=False,
+            )
+
+            with pytest.raises(ValidationError, match='subject must match request process'):
+                runtime.human.approve(request_id)
+
+            assert not runtime.capability.check(
+                victim,
+                'object:cross-subject',
+                CapabilityRight.READ,
+            )
+            assert runtime.human.get(request_id).status.value == 'pending'
+        finally:
+            runtime.close()
+
     def test_trusted_actor_names_do_not_bypass_issue_or_revoke_authority(self) -> None:
         runtime = Runtime.open('local')
         try:

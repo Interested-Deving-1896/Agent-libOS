@@ -3,18 +3,20 @@ from __future__ import annotations
 import builtins
 from typing import Any
 
+from agent_libos.ports import OperationPort
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import Event, EventPriority, EventType
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import EvidenceRepository
 
 
 class EventBus:
-    def __init__(self, store: RuntimeStore):
+    def __init__(
+        self,
+        store: EvidenceRepository,
+        operations: OperationPort | None = None,
+    ) -> None:
         self.store = store
-        self.operations: Any | None = None
-
-    def bind_operations(self, operations: Any) -> None:
         self.operations = operations
 
     def emit(
@@ -38,11 +40,12 @@ class EventBus:
             correlation_id=correlation_id,
             causality=causality or {},
         )
-        self.store.insert_event(event)
-        if self.operations is not None:
-            self.operations.link_evidence("event", event.event_id, "event")
-            if event.type == EventType.RESOURCE_CHARGED:
-                self.operations.link_evidence("event", event.event_id, "resource_charge")
+        with self.store.transaction():
+            self.store.insert_event(event)
+            if self.operations is not None:
+                self.operations.link_evidence("event", event.event_id, "event")
+                if event.type == EventType.RESOURCE_CHARGED:
+                    self.operations.link_evidence("event", event.event_id, "resource_charge")
         return event
 
     def list(

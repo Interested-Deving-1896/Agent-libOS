@@ -1,5 +1,4 @@
-from agent_libos.api.cli import main
+from agent_libos.api.cli import cli
 
 if __name__ == "__main__":
-    main()
-
+    cli()

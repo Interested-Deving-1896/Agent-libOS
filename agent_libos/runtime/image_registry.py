@@ -12,7 +12,7 @@ from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
 from jsonschema.validators import validator_for as jsonschema_validator_for
@@ -38,10 +38,15 @@ from agent_libos.models import (
     is_openai_tool_name,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.ports import (
+    ImageCheckpointPort,
+    ImageFilesystemPort,
+    ImageToolPort,
+)
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.skills.schema import JitToolSpec
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import ExtensionRepository
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
@@ -123,8 +128,12 @@ class ImageRegistryPrimitive:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
-        tool_exists: Any,
-        store: RuntimeStore | None = None,
+        tools: ImageToolPort,
+        checkpoint: ImageCheckpointPort,
+        filesystem: ImageFilesystemPort,
+        process_working_directory: Callable[[str], Path],
+        lifecycle_lock: Any,
+        store: ExtensionRepository | None = None,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
@@ -133,28 +142,28 @@ class ImageRegistryPrimitive:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
-        self.tool_exists = tool_exists
-        self.runtime: Any | None = None
+        self.tools = tools
+        self.checkpoint = checkpoint
+        self.filesystem = filesystem
+        self.process_working_directory = process_working_directory
+        self.lifecycle_lock = lifecycle_lock
         self._registration_lock = threading.RLock()
-
-    def bind_runtime(self, runtime: Any) -> None:
-        self.runtime = runtime
 
     @contextmanager
     def _atomic_image_registration(self, image_id: str) -> Iterator[None]:
         """Keep the durable registry, audit/event rows, and cache in lockstep."""
 
-        with self._atomic_image_registrations((image_id,)):
+        with self.atomic_image_registrations((image_id,)):
             yield
 
     @contextmanager
-    def _atomic_image_registrations(self, image_ids: Iterable[str]) -> Iterator[None]:
+    def atomic_image_registrations(self, image_ids: Iterable[str]) -> Iterator[None]:
+        """Publish a batch of image cache/store mutations atomically."""
         """Atomically update one or more durable image rows and cache entries."""
 
         transaction_store = self.store or self.audit.store
-        lifecycle_lock = getattr(self.runtime, "_registry_lifecycle_lock", self._registration_lock)
         selected_ids = tuple(dict.fromkeys(str(image_id) for image_id in image_ids))
-        with lifecycle_lock, self._registration_lock:
+        with self.lifecycle_lock, self._registration_lock:
             previous = {
                 image_id: self.images[image_id]
                 for image_id in selected_ids
@@ -493,10 +502,9 @@ class ImageRegistryPrimitive:
             return handle.read()
 
     def _read_workspace_package(self, pid: str, path: str) -> tuple[dict[str, bytes], str]:
-        runtime = self._runtime()
-        cwd = runtime.process.working_directory(pid)
+        cwd = self.process_working_directory(pid)
         package_root, manifest_path = self._workspace_package_paths(path)
-        manifest = runtime.filesystem.read_bytes(
+        manifest = self.filesystem.read_bytes(
             pid,
             manifest_path,
             max_bytes=self.config.image.package_manifest_max_bytes,
@@ -506,7 +514,10 @@ class ImageRegistryPrimitive:
             raise ValidationError(
                 f"image package manifest exceeds package_manifest_max_bytes={self.config.image.package_manifest_max_bytes}"
             )
-        _target, workspace_package_root = runtime.filesystem.resolve_path(package_root, cwd=cwd)
+        _target, workspace_package_root = self.filesystem.resolve_path(
+            package_root,
+            cwd=cwd,
+        )
         files: dict[str, bytes] = {self.config.image.package_manifest_name: manifest.content}
         self._read_workspace_package_tree(pid, workspace_package_root, files)
         self._validate_package_size(files)
@@ -529,7 +540,6 @@ class ImageRegistryPrimitive:
         workspace_package_root: str,
         files: dict[str, bytes],
     ) -> None:
-        runtime = self._runtime()
         visited_dirs: set[str] = set()
 
         def visit(directory: str) -> None:
@@ -537,7 +547,7 @@ class ImageRegistryPrimitive:
             if normalized_dir in visited_dirs:
                 return
             visited_dirs.add(normalized_dir)
-            listing = runtime.filesystem.read_directory(
+            listing = self.filesystem.read_directory(
                 pid,
                 normalized_dir or ".",
                 limit=self.config.image.package_max_files,
@@ -559,7 +569,7 @@ class ImageRegistryPrimitive:
                 self._validate_package_relative_path(relative)
                 if relative in files:
                     continue
-                read = runtime.filesystem.read_bytes(
+                read = self.filesystem.read_bytes(
                     pid,
                     entry.path,
                     max_bytes=self.config.image.package_file_max_bytes,
@@ -795,12 +805,10 @@ class ImageRegistryPrimitive:
         return result
 
     def _validate_package_jit_name_available(self, name: str) -> None:
-        runtime = self.runtime
-        tools = getattr(runtime, "tools", None)
-        if tools is not None and tools._name_collides_with_static_tool(name):
+        if self.tools.name_collides_with_static_tool(name):
             raise ValidationError(f"image package JIT tool conflicts with static tool: {name}")
         try:
-            self.tool_exists(name)
+            self.tools.resolve(name)
         except NotFound:
             return
         raise ValidationError(f"image package JIT tool conflicts with existing tool: {name}")
@@ -842,12 +850,7 @@ class ImageRegistryPrimitive:
         )
 
     def _static_check_package_jit_source(self, source: str, name: str) -> None:
-        runtime = self.runtime
-        sandbox = getattr(getattr(runtime, "tools", None), "sandbox", None)
-        static_check = getattr(sandbox, "static_check", None)
-        if not callable(static_check):
-            return
-        result = static_check(source)
+        result = self.tools.static_check_jit_source(source)
         if not result.ok:
             raise ValidationError(f"image package JIT tool {name} failed static validation: {'; '.join(result.errors)}")
 
@@ -1042,11 +1045,6 @@ class ImageRegistryPrimitive:
         normalized_root = self._normalize_package_reference(root)
         return normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}/")
 
-    def _runtime(self) -> Any:
-        if self.runtime is None:
-            raise ValidationError("image package operation requires a bound Runtime")
-        return self.runtime
-
     def load_persisted_images(self) -> None:
         if self.store is None:
             return
@@ -1129,12 +1127,9 @@ class ImageRegistryPrimitive:
         metadata: dict[str, Any] | None = None,
         require_capability: bool = True,
     ) -> ImageRegistrationResult:
-        if self.runtime is None or self.store is None:
-            raise ValidationError("checkpoint image commit requires a bound Runtime and runtime store")
-        found = self.store.get_checkpoint_snapshot(checkpoint_id)
-        if found is None:
-            raise NotFound(f"checkpoint not found: {checkpoint_id}")
-        checkpoint, snapshot = found
+        if self.store is None:
+            raise ValidationError("checkpoint image commit requires a runtime store")
+        checkpoint, snapshot = self.checkpoint.load_checkpoint_artifact(checkpoint_id)
         authority_decision = self._authorize_registry_mutation(
             actor,
             image_id,
@@ -1142,7 +1137,7 @@ class ImageRegistryPrimitive:
             require_capability=require_capability,
         )
         checkpoint_scope = (
-            self.runtime.checkpoint._checkpoint_or_process_read_scope(
+            self.checkpoint.checkpoint_or_process_read_scope(
                 actor,
                 checkpoint,
                 purpose="checkpoint image commit read",
@@ -1178,6 +1173,11 @@ class ImageRegistryPrimitive:
             )
             return result
 
+    def preflight_checkpoint_commit(self, checkpoint_id: str) -> None:
+        """Reject an incompatible source checkpoint before operation evidence."""
+
+        self.checkpoint.preflight_checkpoint(checkpoint_id)
+
     def _commit_from_checkpoint_locked(
         self,
         *,
@@ -1191,7 +1191,7 @@ class ImageRegistryPrimitive:
         replace: bool,
         metadata: dict[str, Any] | None,
     ) -> ImageRegistrationResult:
-        self.runtime.checkpoint._require_snapshot_modules(snapshot)
+        self.checkpoint.require_snapshot_modules(snapshot)
         self._validate_identifier(image_id, "image_id", self.config.image.id_max_chars)
         self._validate_string_length(name, "name", self.config.image.name_max_chars)
         self._validate_string_length(version, "version", self.config.image.version_max_chars)
@@ -1393,7 +1393,14 @@ class ImageRegistryPrimitive:
             boot=self._boot_mapping(image.get("boot")),
         )
 
-    def _validate_image(self, image: AgentImage, *, validate_tools: bool = True) -> None:
+    def _validate_image(
+        self,
+        image: AgentImage,
+        *,
+        validate_tools: bool = True,
+        additional_tool_names: Iterable[str] = (),
+    ) -> None:
+        additional_tools = frozenset(additional_tool_names)
         self._validate_identifier(image.image_id, "image_id", self.config.image.id_max_chars)
         self._validate_string_length(image.name, "name", self.config.image.name_max_chars)
         self._validate_string_length(image.version, "version", self.config.image.version_max_chars)
@@ -1436,16 +1443,31 @@ class ImageRegistryPrimitive:
             self._validate_identifier(skill_id, "default_skills[]", self.config.skills.id_max_chars)
         for tool_name in image.default_tools:
             self._validate_identifier(tool_name, "default_tools[]", self.config.image.id_max_chars)
-            if not validate_tools:
+            if not validate_tools or tool_name in additional_tools:
                 continue
             try:
-                self.tool_exists(tool_name)
+                self.tools.resolve(tool_name)
             except Exception as exc:
                 raise ValidationError(f"unknown tool in AgentImage default_tools: {tool_name}") from exc
         for spec in image.required_capabilities:
             self._validate_capability_spec(spec)
         self._validate_module_specs(image.required_modules)
         self._validate_boot(image.boot)
+
+    def validate_image(
+        self,
+        image: AgentImage,
+        *,
+        validate_tools: bool = True,
+        additional_tool_names: Iterable[str] = (),
+    ) -> None:
+        """Validate an image supplied by another runtime service."""
+
+        self._validate_image(
+            image,
+            validate_tools=validate_tools,
+            additional_tool_names=additional_tool_names,
+        )
 
     def _validate_identifier(self, value: str, field: str, max_chars: int) -> None:
         self._validate_string_length(value, field, max_chars)
@@ -1767,16 +1789,11 @@ class ImageRegistryPrimitive:
 
     def _static_tool_names_for_commit(self, tool_table: dict[str, str]) -> list[str]:
         static: list[str] = []
-        runtime = self.runtime
-        tools = getattr(runtime, "tools", None)
-        if tools is None:
-            return static
-        jit_sources = getattr(tools, "_jit_sources", {})
         for name, tool_id in sorted(tool_table.items()):
-            if tool_id in jit_sources:
+            if self.tools.is_jit_tool_id(tool_id):
                 continue
             try:
-                tools.resolve(name)
+                self.tools.resolve(name)
             except Exception as exc:
                 raise ValidationError(f"committed image references unavailable static tool: {name}") from exc
             static.append(name)

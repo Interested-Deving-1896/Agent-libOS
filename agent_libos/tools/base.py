@@ -460,7 +460,10 @@ class SyncAgentTool(BaseAgentTool[InputT], ABC):
     async def execute(self, args: InputT, ctx: ToolContext) -> Any:
         runtime = ctx.runtime
         manager = getattr(runtime, "data_flow", None) if runtime is not None else None
+        blocking_work = getattr(runtime, "blocking_work", None) if runtime is not None else None
         if manager is None:
+            if blocking_work is not None:
+                return await blocking_work.run(self.run, args, ctx)
             return await asyncio.to_thread(self.run, args, ctx)
 
         # ``asyncio.to_thread`` copies ContextVars into the worker but does not
@@ -477,7 +480,10 @@ class SyncAgentTool(BaseAgentTool[InputT], ABC):
                 # unlabeled model-visible result.
                 return False, exc, manager.current_context()
 
-        succeeded, raw_result, returned_context = await asyncio.to_thread(run_with_flow)
+        if blocking_work is not None:
+            succeeded, raw_result, returned_context = await blocking_work.run(run_with_flow)
+        else:
+            succeeded, raw_result, returned_context = await asyncio.to_thread(run_with_flow)
         returned_context = _merge_result_data_flow_context(
             raw_result,
             returned_context,
@@ -573,6 +579,18 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
         _set_property_default(properties, "channel", runtime.terminal_channel)
     elif name == "request_permission":
         _set_property_default(properties, "human", runtime.default_human)
+    elif name == "list_jsonrpc_endpoints":
+        _set_number_bounds(
+            properties,
+            "limit",
+            maximum=config.jsonrpc.list_limit,
+        )
+    elif name == "list_mcp_servers":
+        _set_number_bounds(
+            properties,
+            "limit",
+            maximum=config.mcp.list_limit,
+        )
 
 
 def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLibOSConfig) -> dict[str, Any]:

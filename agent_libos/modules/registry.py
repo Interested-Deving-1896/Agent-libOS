@@ -1,34 +1,56 @@
 from __future__ import annotations
 
 import inspect
-import threading
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, get_project_root
 from agent_libos.models import EventType
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.context import ModuleContext, ModuleRuntimeView, StartupHook
+from agent_libos.modules.host import ModuleHookContext, ModuleHookServices
+from agent_libos.modules.journal import RegistrationJournal
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource
+from agent_libos.ports import AuditPort, EventPort
+from agent_libos.storage import ExtensionRepository
 from agent_libos.utils.ids import utc_now
 
-if TYPE_CHECKING:
-    from agent_libos.runtime.runtime import Runtime
-
-
 class RuntimeModuleRegistry:
-    """Startup module registry bound to one Runtime instance."""
+    """Transactional startup module registration and rollback coordinator."""
 
-    def __init__(self, runtime: "Runtime", *, config: AgentLibOSConfig | None = None) -> None:
-        self.runtime = runtime
+    def __init__(
+        self,
+        extensions: ExtensionRepository,
+        tools: Any,
+        images: dict[str, Any],
+        image_registry: Any,
+        syscalls: Any,
+        provider_hooks: dict[str, list[Any]],
+        audit: AuditPort,
+        events: EventPort,
+        hook_services: ModuleHookServices,
+        lifecycle_lock: Any,
+        *,
+        config: AgentLibOSConfig | None = None,
+    ) -> None:
+        self._extensions = extensions
+        self._tools = tools
+        self._images = images
+        self._image_registry = image_registry
+        self._syscalls = syscalls
+        self._provider_hooks_by_kind = provider_hooks
+        self._audit = audit
+        self._events = events
+        self._hook_services = hook_services
         self.config = config or DEFAULT_CONFIG
-        self._lifecycle_lock = getattr(runtime, "_registry_lifecycle_lock", threading.RLock())
+        self._lifecycle_lock = lifecycle_lock
         self._provider_hooks: list[tuple[str, str, StartupHook]] = []
         self._startup_hooks: list[tuple[str, str, StartupHook]] = []
         self._loaded_modules: dict[str, dict[str, Any]] = {}
         self._applied_contexts: dict[str, ModuleContext] = {}
         self._applied_sources: dict[str, ModuleSource] = {}
+        self._registration_journals: dict[str, RegistrationJournal] = {}
         self._module_import_cleanups: dict[str, tuple[str, Any]] = {}
         self._startup_hooks_ran = False
 
@@ -168,7 +190,7 @@ class RuntimeModuleRegistry:
     def list_modules(self, limit: int | None = None) -> list[dict[str, Any]]:
         with self._lifecycle_lock:
             selected_limit = self._bounded_discover_limit(limit)
-            return self.runtime.store.list_runtime_modules(limit=selected_limit)
+            return self._extensions.list_runtime_modules(limit=selected_limit)
 
     def _bounded_discover_limit(self, limit: int | None) -> int:
         selected = self.config.modules.discover_limit if limit is None else limit
@@ -184,7 +206,7 @@ class RuntimeModuleRegistry:
 
     def inspect_module(self, module_id: str) -> dict[str, Any]:
         with self._lifecycle_lock:
-            found = self.runtime.store.get_runtime_module(module_id)
+            found = self._extensions.get_runtime_module(module_id)
             if found is None:
                 raise NotFound(f"runtime module not found: {module_id}")
             return found
@@ -212,10 +234,9 @@ class RuntimeModuleRegistry:
     def _run_startup_hooks_locked(self) -> None:
         if self._startup_hooks_ran:
             return
-        surface_snapshot = self._snapshot_runtime_surfaces()
         failed_hook: tuple[str, str] | None = None
         try:
-            with self.runtime.store.transaction(include_object_payloads=True):
+            with self._extensions.transaction(include_object_payloads=True):
                 for module_id, hook_name, hook in list(self._provider_hooks):
                     failed_hook = (module_id, hook_name)
                     self._run_module_hook(module_id, hook_name, hook, kind="provider")
@@ -223,7 +244,6 @@ class RuntimeModuleRegistry:
                     failed_hook = (module_id, hook_name)
                     self._run_module_hook(module_id, hook_name, hook, kind="startup")
         except Exception as exc:
-            self._restore_runtime_surfaces(surface_snapshot)
             if failed_hook is not None:
                 module_id, hook_name = failed_hook
                 self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
@@ -259,18 +279,20 @@ class RuntimeModuleRegistry:
         enforce_provides: bool,
         import_cleanup: tuple[str, Any] | None = None,
     ) -> dict[str, Any]:
-        ctx = ModuleContext(ModuleRuntimeView(config=self.runtime.config), source.manifest, enforce_provides=enforce_provides)
-        surface_snapshot = self._snapshot_runtime_surfaces()
+        self._retry_pending_rollback(source.manifest.module_id)
+        ctx = ModuleContext(ModuleRuntimeView(config=self.config), source.manifest, enforce_provides=enforce_provides)
+        journal = RegistrationJournal(source.manifest.module_id)
+        self._registration_journals[source.manifest.module_id] = journal
         try:
-            with self.runtime.store.transaction(include_object_payloads=True):
+            with self._extensions.transaction(include_object_payloads=True):
                 result = entrypoint(ctx)
                 if inspect.isawaitable(result):
                     raise ValidationError(f"module entrypoint must be synchronous: {source.manifest.module_id}")
                 self._preflight_context(ctx)
-                self._apply_context(ctx)
+                self._apply_context(ctx, journal)
                 now = utc_now()
                 summary = ctx.registered_summary()
-                self.runtime.store.upsert_runtime_module(
+                self._extensions.upsert_runtime_module(
                     module_id=source.manifest.module_id,
                     name=source.manifest.name,
                     version=source.manifest.version,
@@ -309,13 +331,13 @@ class RuntimeModuleRegistry:
                 self._applied_sources[source.manifest.module_id] = source
                 if import_cleanup is not None:
                     self._module_import_cleanups[source.manifest.module_id] = import_cleanup
-                self.runtime.events.emit(
+                self._events.emit(
                     EventType.MODULE_LOADED,
                     source="runtime",
                     target=f"module:{source.manifest.module_id}",
                     payload={"module_id": source.manifest.module_id, "registered": summary},
                 )
-                self.runtime.audit.record(
+                self._audit.record(
                     actor="runtime",
                     action="module.load",
                     target=f"module:{source.manifest.module_id}",
@@ -330,12 +352,32 @@ class RuntimeModuleRegistry:
                 )
                 if self._startup_hooks_ran and not self._is_internal_module(source.manifest.module_id):
                     self._run_context_hooks(ctx)
-                loaded = self.runtime.store.get_runtime_module(source.manifest.module_id) or {}
+                loaded = self._extensions.get_runtime_module(source.manifest.module_id) or {}
             return loaded
-        except Exception:
-            self._restore_runtime_surfaces(surface_snapshot)
+        except BaseException as exc:
+            rollback_error: BaseException | None = None
+            try:
+                journal.rollback()
+            except BaseException as rollback_exc:
+                rollback_error = rollback_exc
+            if rollback_error is None:
+                self._registration_journals.pop(source.manifest.module_id, None)
+            self._loaded_modules.pop(source.manifest.module_id, None)
+            self._applied_contexts.pop(source.manifest.module_id, None)
+            self._applied_sources.pop(source.manifest.module_id, None)
             self._cleanup_module_import(source.manifest.module_id, fallback=import_cleanup)
+            if rollback_error is not None:
+                raise rollback_error from exc
             raise
+
+    def _retry_pending_rollback(self, module_id: str) -> None:
+        journal = self._registration_journals.get(module_id)
+        if journal is None:
+            return
+        if module_id in self._loaded_modules:
+            raise ValidationError(f"startup module already loaded: {module_id}")
+        journal.rollback()
+        self._registration_journals.pop(module_id, None)
 
     def _require_module_id_available(self, module_id: str, source_sha256: str) -> None:
         loaded = self._loaded_modules.get(module_id)
@@ -353,70 +395,99 @@ class RuntimeModuleRegistry:
         pending_tools = {tool.spec().name for tool in ctx.tools}
         for tool_name in pending_tools:
             try:
-                self.runtime.tools.resolve(tool_name)
+                self._tools.resolve(tool_name)
             except NotFound:
                 pass
             else:
                 raise ValidationError(f"module tool already exists: {tool_name}")
         for image in ctx.images:
-            if image.image_id in self.runtime.images:
+            if image.image_id in self._images:
                 raise ValidationError(f"module image already exists: {image.image_id}")
-            original_tool_exists = self.runtime.image_registry.tool_exists
-            self.runtime.image_registry.tool_exists = lambda tool_name: (
-                self.runtime.tools.resolve(tool_name) if tool_name not in pending_tools else tool_name
+            self._image_registry.validate_image(
+                image,
+                additional_tool_names=pending_tools,
             )
-            try:
-                self.runtime.image_registry._validate_image(image)
-            finally:
-                self.runtime.image_registry.tool_exists = original_tool_exists
             for tool_name in image.default_tools:
                 if tool_name in pending_tools:
                     continue
                 try:
-                    self.runtime.tools.resolve(tool_name)
+                    self._tools.resolve(tool_name)
                 except NotFound as exc:
                     raise ValidationError(f"module image references unknown tool: {tool_name}") from exc
         for syscall in ctx.syscalls:
-            if self.runtime.syscalls.get(syscall) is not None or syscall in self.runtime.syscalls.reserved_names:
+            if self._syscalls.get(syscall) is not None or syscall in self._syscalls.reserved_names:
                 raise ValidationError(f"module syscall already exists or is built-in: {syscall}")
 
-    def _apply_context(self, ctx: ModuleContext) -> None:
+    def _apply_context(self, ctx: ModuleContext, journal: RegistrationJournal) -> None:
         for tool in ctx.tools:
-            handle = self.runtime.tools.register_tool(tool, registered_by=ctx.actor, scope=f"module:{ctx.module_id}")
-            self.runtime.audit.record(
+            handle = self._tools.register_tool(tool, registered_by=ctx.actor, scope=f"module:{ctx.module_id}")
+            journal.record(
+                kind="tool",
+                target=handle.name,
+                undo=lambda handle=handle: self._unregister_tool(handle, actor=ctx.actor),
+            )
+            self._audit.record(
                 actor=ctx.actor,
                 action="module.register_tool",
                 target=f"tool:{handle.tool_id}",
                 decision={"module_id": ctx.module_id, "tool": handle.name},
             )
         for image in ctx.images:
-            result = self.runtime.image_registry.register(image, actor=ctx.actor, replace=False, require_capability=False)
-            self.runtime.audit.record(
+            result = self._image_registry.register(image, actor=ctx.actor, replace=False, require_capability=False)
+            journal.record(
+                kind="image",
+                target=result.image.image_id,
+                undo=lambda image=result.image: self._unregister_image(image, actor=ctx.actor),
+            )
+            self._audit.record(
                 actor=ctx.actor,
                 action="module.register_image",
                 target=f"image:{result.image.image_id}",
                 decision={"module_id": ctx.module_id, "image_id": result.image.image_id},
             )
         for name, handler in ctx.syscalls.items():
-            self.runtime.syscalls.register(name, handler, registered_by=ctx.actor)
-            self.runtime.audit.record(
+            registered = self._syscalls.register(name, handler, registered_by=ctx.actor)
+            journal.record(
+                kind="syscall",
+                target=registered.name,
+                undo=lambda name=registered.name: self._syscalls.unregister(name, registered_by=ctx.actor),
+            )
+            self._audit.record(
                 actor=ctx.actor,
                 action="module.register_syscall",
                 target=f"syscall:{name}",
                 decision={"module_id": ctx.module_id, "syscall": name},
             )
         for kind, hooks in ctx.provider_hooks.items():
-            self.runtime.provider_hooks.setdefault(kind, []).extend(hooks)
+            runtime_hooks = self._provider_hooks_by_kind.setdefault(kind, [])
             for index, hook in enumerate(hooks):
-                self._provider_hooks.append((ctx.module_id, f"{kind}:{index}", hook))
-            self.runtime.audit.record(
+                runtime_hooks.append(hook)
+                routed_hook = (ctx.module_id, f"{kind}:{index}", hook)
+                self._provider_hooks.append(routed_hook)
+                journal.record(
+                    kind="provider_hook",
+                    target=f"{kind}:{index}",
+                    undo=lambda kind=kind, runtime_hooks=runtime_hooks, hook=hook, routed_hook=routed_hook: self._unregister_context_provider_hook(
+                        kind,
+                        runtime_hooks,
+                        hook,
+                        routed_hook,
+                    ),
+                )
+            self._audit.record(
                 actor=ctx.actor,
                 action="module.register_provider_hook",
                 target=f"provider_hook:{kind}",
                 decision={"module_id": ctx.module_id, "kind": kind, "count": len(hooks)},
             )
         for name, hook in ctx.startup_hooks.items():
-            self._startup_hooks.append((ctx.module_id, name, hook))
+            routed_hook = (ctx.module_id, name, hook)
+            self._startup_hooks.append(routed_hook)
+            journal.record(
+                kind="startup_hook",
+                target=name,
+                undo=lambda routed_hook=routed_hook: self._remove_identity(self._startup_hooks, routed_hook),
+            )
 
     def _run_context_hooks(self, ctx: ModuleContext) -> None:
         for kind, hooks in ctx.provider_hooks.items():
@@ -426,79 +497,25 @@ class RuntimeModuleRegistry:
             self._run_module_hook(ctx.module_id, name, hook, kind="startup")
 
     def _run_module_hook(self, module_id: str, hook_name: str, hook: StartupHook, *, kind: str) -> None:
-        result = hook(self.runtime)
+        journal = self._registration_journals.get(module_id)
+        if journal is None:
+            raise ValidationError(f"Runtime Module has no registration journal: {module_id}")
+        host = ModuleHookContext(self._hook_services, module_id, journal)
+        try:
+            result = hook(host)
+        finally:
+            host.deactivate()
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if callable(close):
                 close()
             raise ValidationError(f"{kind} hook must be synchronous: {module_id}:{hook_name}")
-        self.runtime.audit.record(
+        self._audit.record(
             actor=f"module:{module_id}",
             action=f"module.{kind}_hook",
             target=f"module:{module_id}:{hook_name}",
             decision={"hook": hook_name},
         )
-
-    def _snapshot_runtime_surfaces(self) -> dict[str, Any]:
-        """Capture registries that a trusted module can mutate synchronously."""
-
-        substrate = self.runtime.substrate
-        return {
-            "runtime_attrs": dict(self.runtime.__dict__),
-            "shutdown_finalizers": list(self.runtime._shutdown_finalizers),
-            "object_release_finalizers": list(self.runtime.memory._object_release_finalizers),
-            "substrate": substrate,
-            "substrate_attrs": dict(getattr(substrate, "__dict__", {})),
-            "tool_implementations": dict(self.runtime.tools._tools),
-            "tool_ids_by_name": dict(self.runtime.tools._tool_ids_by_name),
-            "tool_handles": dict(self.runtime.tools._handles),
-            "jit_sources": dict(self.runtime.tools._jit_sources),
-            "images": dict(self.runtime.images),
-            "syscalls": dict(self.runtime.syscalls._handlers),
-            "runtime_provider_hooks": {
-                kind: list(hooks)
-                for kind, hooks in self.runtime.provider_hooks.items()
-            },
-            "provider_hooks": list(self._provider_hooks),
-            "startup_hooks": list(self._startup_hooks),
-            "loaded_modules": dict(self._loaded_modules),
-            "applied_contexts": dict(self._applied_contexts),
-            "applied_sources": dict(self._applied_sources),
-            "module_import_cleanups": dict(self._module_import_cleanups),
-        }
-
-    def _restore_runtime_surfaces(self, snapshot: dict[str, Any]) -> None:
-        runtime_attrs = snapshot["runtime_attrs"]
-        for name in set(self.runtime.__dict__) - set(runtime_attrs):
-            del self.runtime.__dict__[name]
-        self.runtime.__dict__.update(runtime_attrs)
-        substrate = snapshot["substrate"]
-        substrate_attrs = getattr(substrate, "__dict__", None)
-        if substrate_attrs is not None:
-            substrate_attrs.clear()
-            substrate_attrs.update(snapshot["substrate_attrs"])
-        self.runtime._shutdown_finalizers[:] = snapshot["shutdown_finalizers"]
-        self.runtime.memory._object_release_finalizers[:] = snapshot["object_release_finalizers"]
-        for target, key in [
-            (self.runtime.tools._tools, "tool_implementations"),
-            (self.runtime.tools._tool_ids_by_name, "tool_ids_by_name"),
-            (self.runtime.tools._handles, "tool_handles"),
-            (self.runtime.tools._jit_sources, "jit_sources"),
-            (self.runtime.images, "images"),
-            (self.runtime.syscalls._handlers, "syscalls"),
-            (self._loaded_modules, "loaded_modules"),
-            (self._applied_contexts, "applied_contexts"),
-            (self._applied_sources, "applied_sources"),
-            (self._module_import_cleanups, "module_import_cleanups"),
-        ]:
-            target.clear()
-            target.update(snapshot[key])
-        self.runtime.provider_hooks.clear()
-        self.runtime.provider_hooks.update(
-            {kind: list(hooks) for kind, hooks in snapshot["runtime_provider_hooks"].items()}
-        )
-        self._provider_hooks[:] = snapshot["provider_hooks"]
-        self._startup_hooks[:] = snapshot["startup_hooks"]
 
     def _rollback_external_modules_after_hook_failure(self, failed_module_id: str, exc: Exception, *, hook_name: str) -> None:
         module_ids = [
@@ -523,18 +540,91 @@ class RuntimeModuleRegistry:
 
     def _rollback_module(self, module_id: str) -> None:
         ctx = self._applied_contexts.get(module_id)
-        surface_snapshot = self._snapshot_runtime_surfaces()
+        journal = self._registration_journals.get(module_id)
         try:
-            with self.runtime.store.transaction(include_object_payloads=True):
+            with self._extensions.transaction(include_object_payloads=True):
+                if journal is not None:
+                    journal.rollback()
                 if ctx is not None:
-                    self._rollback_context(ctx)
-        except Exception:
-            self._restore_runtime_surfaces(surface_snapshot)
-            raise
+                    self._audit.record(
+                        actor="runtime",
+                        action="module.rollback",
+                        target=f"module:{ctx.module_id}",
+                        decision={"registered": ctx.registered_summary()},
+                    )
+        except BaseException as rollback_exc:
+            try:
+                self._recover_durable_module_rollback(module_id, rollback_exc)
+            except BaseException as recovery_exc:
+                raise recovery_exc from rollback_exc
+            if journal is None or not journal.rolled_back:
+                raise
         self._cleanup_module_import(module_id)
         self._loaded_modules.pop(module_id, None)
         self._applied_contexts.pop(module_id, None)
         self._applied_sources.pop(module_id, None)
+        self._registration_journals.pop(module_id, None)
+
+    def _recover_durable_module_rollback(
+        self,
+        module_id: str,
+        rollback_exc: BaseException,
+    ) -> None:
+        """Fail closed when the journal ran but its enclosing transaction failed."""
+
+        actor = f"module:{module_id}"
+        source = self._applied_sources.get(module_id)
+        ctx = self._applied_contexts.get(module_id)
+        registered = ctx.registered_summary() if ctx is not None else {}
+        with self._extensions.transaction(include_object_payloads=True):
+            for row in self._extensions.list_tools():
+                if row.get("registered_by") == actor:
+                    self._extensions.delete_tool(
+                        str(row["tool_id"]),
+                        registered_by=actor,
+                    )
+            for image, metadata in self._extensions.list_images():
+                if metadata.get("registered_by") == actor:
+                    self._extensions.delete_image(
+                        image.image_id,
+                        registered_by=actor,
+                    )
+            if source is not None:
+                self._extensions.upsert_runtime_module(
+                    module_id=source.manifest.module_id,
+                    name=source.manifest.name,
+                    version=source.manifest.version,
+                    entrypoint=source.manifest.entrypoint,
+                    manifest_path=source.manifest_path,
+                    manifest_sha256=source.manifest_sha256,
+                    source_path=source.source_path,
+                    source_sha256=source.source_sha256,
+                    status="failed",
+                    loaded_at=None,
+                    registered=registered,
+                    error=(
+                        "durable rollback recovery after "
+                        f"{type(rollback_exc).__name__}: {rollback_exc}"
+                    ),
+                    metadata=source.manifest.metadata,
+                )
+
+        # The original failure may be the audit sink itself. Durable cleanup
+        # must not depend on a second audit write, so recovery evidence is best
+        # effort after the fail-closed state has committed.
+        try:
+            self._audit.record(
+                actor="runtime",
+                action="module.rollback_recovered",
+                target=f"module:{module_id}",
+                decision={
+                    "error": str(rollback_exc),
+                    "error_type": type(rollback_exc).__name__,
+                    "registered": registered,
+                },
+            )
+        except Exception:
+            pass
 
     def _cleanup_all_module_imports(self) -> None:
         for module_id in reversed(list(self._module_import_cleanups)):
@@ -544,32 +634,41 @@ class RuntimeModuleRegistry:
         cleanup = self._module_import_cleanups.pop(module_id, None) or fallback
         ModuleLoader.cleanup_imported_package(cleanup)
 
-    def _rollback_context(self, ctx: ModuleContext) -> None:
-        self._provider_hooks = [item for item in self._provider_hooks if item[0] != ctx.module_id]
-        self._startup_hooks = [item for item in self._startup_hooks if item[0] != ctx.module_id]
-        for kind, hooks in list(ctx.provider_hooks.items()):
-            hook_ids = {id(hook) for hook in hooks}
-            remaining = [hook for hook in self.runtime.provider_hooks.get(kind, []) if id(hook) not in hook_ids]
-            if remaining:
-                self.runtime.provider_hooks[kind] = remaining
-            else:
-                self.runtime.provider_hooks.pop(kind, None)
-        for name in reversed(list(ctx.syscalls)):
-            self.runtime.syscalls.unregister(name, registered_by=ctx.actor)
-        for image in reversed(ctx.images):
-            stored = self.runtime.store.get_image(image.image_id)
-            registered_by = stored[1].get("registered_by") if stored is not None else None
-            if registered_by == ctx.actor or (stored is None and self.runtime.images.get(image.image_id) == image):
-                self.runtime.images.pop(image.image_id, None)
-                self.runtime.store.delete_image(image.image_id, registered_by=ctx.actor)
-        for tool in reversed(ctx.tools):
-            self.runtime.tools.unregister_tool(tool.spec().name, registered_by=ctx.actor)
-        self.runtime.audit.record(
-            actor="runtime",
-            action="module.rollback",
-            target=f"module:{ctx.module_id}",
-            decision={"registered": ctx.registered_summary()},
-        )
+    def _unregister_tool(self, handle: Any, *, actor: str) -> None:
+        try:
+            self._tools.unregister_tool(handle, registered_by=actor)
+        finally:
+            self._tools.discard_tool_registration(handle)
+
+    def _unregister_image(self, image: Any, *, actor: str) -> None:
+        if self._images.get(image.image_id) == image:
+            self._images.pop(image.image_id, None)
+        stored = self._extensions.get_image(image.image_id)
+        registered_by = stored[1].get("registered_by") if stored is not None else None
+        if registered_by == actor:
+            self._extensions.delete_image(image.image_id, registered_by=actor)
+
+    def _unregister_context_provider_hook(
+        self,
+        kind: str,
+        runtime_hooks: list[Any],
+        hook: StartupHook,
+        routed_hook: tuple[str, str, StartupHook],
+    ) -> None:
+        self._remove_identity(self._provider_hooks, routed_hook)
+        if self._provider_hooks_by_kind.get(kind) is not runtime_hooks:
+            return
+        self._remove_identity(runtime_hooks, hook)
+        if not runtime_hooks:
+            self._provider_hooks_by_kind.pop(kind, None)
+
+    @staticmethod
+    def _remove_identity(items: list[Any], value: Any) -> bool:
+        for index in range(len(items) - 1, -1, -1):
+            if items[index] is value:
+                del items[index]
+                return True
+        return False
 
     def _is_internal_module(self, module_id: str) -> bool:
         return module_id == "agent-libos-core:v0"
@@ -596,7 +695,7 @@ class RuntimeModuleRegistry:
             source_sha256 = ""
             metadata = {}
         if module_id in self._loaded_modules:
-            self.runtime.audit.record(
+            self._audit.record(
                 actor="runtime",
                 action="module.load_failed",
                 target=f"module:{module_id}",
@@ -608,7 +707,7 @@ class RuntimeModuleRegistry:
                 },
             )
             return
-        self.runtime.store.upsert_runtime_module(
+        self._extensions.upsert_runtime_module(
             module_id=module_id,
             name=name,
             version=version,
@@ -623,7 +722,7 @@ class RuntimeModuleRegistry:
             error=str(exc),
             metadata=metadata,
         )
-        self.runtime.audit.record(
+        self._audit.record(
             actor="runtime",
             action="module.load_failed",
             target=f"module:{module_id}",
@@ -637,7 +736,7 @@ class RuntimeModuleRegistry:
         *,
         registered: dict[str, Any] | None = None,
     ) -> None:
-        self.runtime.store.upsert_runtime_module(
+        self._extensions.upsert_runtime_module(
             module_id=source.manifest.module_id,
             name=source.manifest.name,
             version=source.manifest.version,
@@ -652,7 +751,7 @@ class RuntimeModuleRegistry:
             error=str(exc),
             metadata=source.manifest.metadata,
         )
-        self.runtime.audit.record(
+        self._audit.record(
             actor="runtime",
             action="module.load_failed",
             target=f"module:{source.manifest.module_id}",

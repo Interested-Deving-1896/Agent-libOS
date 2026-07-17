@@ -2,17 +2,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_libos.ports import OperationPort
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import AuditRecord
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import EvidenceRepository
 
 
 class AuditManager:
-    def __init__(self, store: RuntimeStore):
+    def __init__(
+        self,
+        store: EvidenceRepository,
+        operations: OperationPort | None = None,
+    ) -> None:
         self.store = store
-        self.operations: Any | None = None
-
-    def bind_operations(self, operations: Any) -> None:
         self.operations = operations
 
     def record(
@@ -40,12 +42,13 @@ class AuditManager:
             correlation_id=correlation_id,
             parent_record_id=parent_record_id,
         )
-        self.store.insert_audit(record)
-        if self.operations is not None:
-            self.operations.link_evidence("audit", record.record_id, "audit")
-            semantic_role = self._semantic_role(action)
-            if semantic_role is not None:
-                self.operations.link_evidence("audit", record.record_id, semantic_role)
+        with self.store.transaction():
+            self.store.insert_audit(record)
+            if self.operations is not None:
+                self.operations.link_evidence("audit", record.record_id, "audit")
+                semantic_role = self._semantic_role(action)
+                if semantic_role is not None:
+                    self.operations.link_evidence("audit", record.record_id, semantic_role)
         return record
 
     @staticmethod

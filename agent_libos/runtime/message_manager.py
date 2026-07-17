@@ -19,7 +19,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import NotFound, ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import ProcessRepository
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 
@@ -35,23 +35,24 @@ class ProcessMessageManager:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        store: ProcessRepository,
         audit: AuditManager,
         events: EventBus,
+        authority_policy: Any,
+        *,
+        process_manager: ProcessManager,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = store
         self.audit = audit
         self.events = events
+        self.authority_policy = authority_policy
         self._object_tasks: Any | None = None
-        self._process_manager: ProcessManager | None = None
+        self._process_manager = process_manager
 
     def bind_object_tasks(self, object_tasks: Any) -> None:
         self._object_tasks = object_tasks
-
-    def bind_process_manager(self, process_manager: ProcessManager) -> None:
-        self._process_manager = process_manager
 
     def post(
         self,
@@ -78,14 +79,12 @@ class ProcessMessageManager:
         body_text = str(body or "")
         payload_dict = dict(payload or {})
         message_metadata = self._message_metadata(sender, metadata, source_oids=source_oids)
-        manifests = getattr(self.store, "authority_manifest_manager", None)
-        if manifests is not None:
-            labels = metadata_from_labels(message_metadata)
-            if labels is not None:
-                manifests.assert_data_flow_labels(
-                    recipient_pid,
-                    DataLabels.from_object_metadata(labels),
-                )
+        labels = metadata_from_labels(message_metadata)
+        if labels is not None:
+            self.authority_policy.assert_data_flow_labels(
+                recipient_pid,
+                DataLabels.from_object_metadata(labels),
+            )
         self._validate_text_limit(subject_text, self.config.tools.message_subject_max_chars, "process message subject")
         self._validate_text_limit(body_text, self.config.tools.message_body_max_chars, "process message body")
         selected_correlation_id = self._normalize_optional_identifier(correlation_id, "process message correlation_id")
@@ -174,24 +173,22 @@ class ProcessMessageManager:
         source_context: DataFlowContext | None = None,
     ) -> ProcessMessage:
         self._require_related_process(sender_pid, recipient_pid)
-        metadata: dict[str, Any] | None = None
-        if self._process_manager is not None:
-            selected_sources = self._process_manager.flow_source_oids(sender_pid, source_oids)
-            context = self._process_manager.flow_context(
-                sender_pid,
-                selected_sources,
-                source_labels=source_labels,
-                source_context=source_context,
-            )
-            metadata = {
-                "source_oids": selected_sources,
-                "data_labels": context.labels.to_dict(),
-                "data_flow_context": {
-                    "labels": context.labels.to_dict(),
-                    "source_refs": [ref.to_dict() for ref in context.source_refs],
-                    "materialization_id": context.materialization_id,
-                },
-            }
+        selected_sources = self._process_manager.flow_source_oids(sender_pid, source_oids)
+        context = self._process_manager.flow_context(
+            sender_pid,
+            selected_sources,
+            source_labels=source_labels,
+            source_context=source_context,
+        )
+        metadata: dict[str, Any] = {
+            "source_oids": selected_sources,
+            "data_labels": context.labels.to_dict(),
+            "data_flow_context": {
+                "labels": context.labels.to_dict(),
+                "source_refs": [ref.to_dict() for ref in context.source_refs],
+                "materialization_id": context.materialization_id,
+            },
+        }
         return self.post(
             sender=sender_pid,
             recipient_pid=recipient_pid,
@@ -206,8 +203,6 @@ class ProcessMessageManager:
         )
 
     def observe_labels(self, pid: str, messages: Iterable[ProcessMessage]) -> list[str]:
-        if self._process_manager is None:
-            return []
         return self._process_manager.observe_message_labels(pid, messages)
 
     def unread(
@@ -325,7 +320,12 @@ class ProcessMessageManager:
             process.status = ProcessStatus.WAITING_EVENT
             process.status_message = self._wait_status_message(filters)
             process.updated_at = utc_now()
-            self.store.update_process(process)
+            self.store.transition_process(
+                pid,
+                ProcessStatus.WAITING_EVENT,
+                expected_revision=process.revision,
+                status_message=process.status_message,
+            )
             self.audit.record(
                 actor=pid,
                 action="process.message.wait",
@@ -454,7 +454,13 @@ class ProcessMessageManager:
         process.status = ProcessStatus.RUNNABLE
         process.status_message = None
         process.updated_at = utc_now()
-        self.store.update_process(process)
+        self.store.transition_process(
+            process.pid,
+            ProcessStatus.RUNNABLE,
+            expected_revision=process.revision,
+            expected_status=ProcessStatus.WAITING_EVENT,
+            status_message=None,
+        )
         self.audit.record(
             actor="process.message",
             action="process.message.wait_wake",
@@ -521,6 +527,28 @@ class ProcessMessageManager:
             return None
         return decoded if isinstance(decoded, dict) else None
 
+    def has_matching_unread_wait(
+        self,
+        pid: str,
+        status_message: str | None,
+    ) -> bool:
+        """Return whether a persisted message wait already has an unread match."""
+
+        filters = self._filters_from_wait_status(status_message)
+        if filters is None:
+            return False
+        return bool(
+            self.unread(
+                pid,
+                kind=filters.get("kind"),
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+            )
+        )
+
     def _normalize_channel(self, channel: str | None) -> str:
         selected = (channel or "default").strip()
         if not selected:
@@ -543,8 +571,6 @@ class ProcessMessageManager:
             selected_oids = list(dict.fromkeys(str(oid or "").strip() for oid in source_oids))
             if any(not oid for oid in selected_oids):
                 raise ValidationError("process message source_oids cannot contain empty Object ids")
-            if self._process_manager is None:
-                raise ProcessError("process message Object sources require a bound ProcessManager")
             if self._process_manager.data_flow is not None:
                 context = self._process_manager.data_flow.context_from_trusted_source_oids(selected_oids)
             else:

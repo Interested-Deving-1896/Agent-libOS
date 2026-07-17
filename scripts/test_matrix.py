@@ -21,7 +21,11 @@ LANE_PATHS = {
     "benchmark": ("tests/benchmarks",),
 }
 PYTHON_LANES = tuple(LANE_PATHS)
-DEFAULT_MAX_LANE_SECONDS = 300.0
+# The deterministic security lane alone is close to five minutes on the
+# supported development baseline, and the combined four-worker matrix is
+# longer than that. Keep a bounded process-tree deadline while leaving enough
+# headroom for normal collection and worker teardown variance.
+DEFAULT_MAX_LANE_SECONDS = 600.0
 DEFAULT_WORKERS = "1"
 DEFAULT_PARALLEL_WORKER_CAP = 4
 PROCESS_TIMEOUT_EXIT_CODE = 124

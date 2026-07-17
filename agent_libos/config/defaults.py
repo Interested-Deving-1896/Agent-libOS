@@ -26,6 +26,29 @@ ShellPolicyLevel = Literal[
 ]
 
 
+class _ImmutableDict(dict):
+    """Small immutable dict used by frozen configuration value objects."""
+
+    @staticmethod
+    def _reject_mutation(*args: object, **kwargs: object) -> None:
+        raise TypeError("configuration mappings are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __copy__(self) -> "_ImmutableDict":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_ImmutableDict":
+        return self
+
+
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ShellCommandRule:
     argv: tuple[str, ...]
@@ -54,7 +77,7 @@ class RuntimeDefaults:
     terminal_channel: str = "terminal"
     run_until_idle_max_quanta: int | None = None
     launcher_max_quanta: int = 40
-    launch_authority_mode: Literal["manifest_required", "legacy_image_grants"] = "manifest_required"
+    launch_authority_mode: Literal["manifest_required"] = "manifest_required"
 
     @property
     def default_human_resource(self) -> str:
@@ -201,6 +224,9 @@ class LLMDefaults:
     persist_full_io: bool = True
     json_instruction: str = "You must respond with a valid JSON object."
     fallback_status_codes: tuple[int, ...] = (404, 405)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "profiles", _ImmutableDict(self.profiles))
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -424,7 +450,7 @@ class ImageDefaults:
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ImageCommitDefaults:
-    artifact_version: int = 1
+    artifact_version: int = 2
     artifact_hard_limit_bytes: int = 16_777_216
     payload_capture_limit_bytes: int = 1_048_576
     max_required_capabilities: int = 128
@@ -464,7 +490,6 @@ class LLMContextDefaults:
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class CheckpointDefaults:
-    snapshot_version: int = 1
     list_limit: int = 100
     payload_capture_limit_bytes: int = 1_048_576
     snapshot_hard_limit_bytes: int = 16_777_216
@@ -952,7 +977,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         _require_non_empty(f"llm_context.{name}", getattr(llm_context, name))
 
     checkpoint = config.checkpoint
-    for name in ("snapshot_version", "list_limit", "payload_capture_limit_bytes", "snapshot_hard_limit_bytes", "diff_preview_items"):
+    for name in ("list_limit", "payload_capture_limit_bytes", "snapshot_hard_limit_bytes", "diff_preview_items"):
         _positive(f"checkpoint.{name}", getattr(checkpoint, name))
     _require_at_least("checkpoint.snapshot_hard_limit_bytes", checkpoint.snapshot_hard_limit_bytes, "checkpoint.payload_capture_limit_bytes", checkpoint.payload_capture_limit_bytes)
 

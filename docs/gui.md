@@ -301,9 +301,10 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 `_truncated` and is not serialized.
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
-GUI-presentation evidence from displacing causal runtime rows. Upgrades fill
-legacy null flags in bounded, resumable batches; the full event/audit ledgers
-remain unchanged and can still include presentation evidence when requested.
+GUI-presentation evidence from displacing causal runtime rows. The flag is
+required by the 0.3 schema; missing or malformed persisted visibility state is
+rejected rather than repaired during open. The full event/audit histories can
+still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
 updated terminal history, so a full snapshot does not hide current work behind
 old completed rows. If the bounded window contains a child but not its parent,

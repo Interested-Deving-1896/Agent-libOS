@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,43 +33,5 @@ class ProcessMessage:
     created_at: str = ""
     updated_at: str = ""
     acked_at: str | None = None
-    # Keep new envelope metadata after every legacy field. ProcessMessage is a
-    # public dataclass and older callers may still pass status/timestamps by
-    # position.
+    # Keep envelope metadata after the stable public positional fields.
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-def conservative_legacy_process_message_metadata(
-    value: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Classify messages whose historical flow carrier is unavailable.
-
-    Pre-data-flow stores and checkpoints persisted no trusted message labels.
-    Treating that absence as NORMAL would let unread legacy payloads enter a
-    process without taint, so migration uses the most restrictive labels.
-    """
-
-    labels: dict[str, str | None] = {
-        "sensitivity": "secret",
-        "trust_level": "untrusted",
-        "integrity": "untrusted",
-        "origin": "legacy",
-        "tenant": None,
-        "principal": None,
-        "declassification_authority": None,
-    }
-    selected = dict(value or {})
-    # A carrier created under incomplete historical labels is not trusted to
-    # represent the conservative migration result. Observation must create a
-    # fresh carrier from the labels below.
-    selected.pop("label_carrier_oid", None)
-    selected.update({
-        "source_oids": [],
-        "data_labels": dict(labels),
-        "data_flow_context": {
-            "labels": dict(labels),
-            "source_refs": [],
-            "materialization_id": None,
-        },
-    })
-    return selected

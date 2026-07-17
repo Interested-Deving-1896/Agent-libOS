@@ -90,6 +90,13 @@ class McpProviderCallResult:
     response_bytes: int = 0
     duration_s: float = 0.0
     too_large: bool = False
+    error_type: str | None = None
+    correlation_id: str | None = None
+    list_request_bytes: int = 0
+    list_response_bytes: int = 0
+    call_request_bytes: int = 0
+    call_response_bytes: int = 0
+    call_started: bool = False
 
 
 @dataclass(frozen=True)

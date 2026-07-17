@@ -9,7 +9,7 @@ from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, Valid
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.storage import RuntimeStore
-from agent_libos.utils.ids import utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import to_jsonable
 
 
@@ -77,6 +77,105 @@ class ResourceManager:
         with self.store.locked():
             self._preflight_locked(pid, usage, source=source, context=context)
 
+    def reserve_usage(
+        self,
+        pid: str,
+        usage: ResourceUsage | dict[str, Any],
+        *,
+        source: str,
+        context: dict[str, Any] | None = None,
+        reservation_id: str | None = None,
+        reserved_by: str | None = None,
+    ) -> str:
+        """Atomically reserve a maximum usage envelope before provider dispatch."""
+
+        selected = self._coerce_usage(usage)
+        if self._is_zero(selected):
+            raise ValidationError("resource usage reservation must be non-zero")
+        selected_id = reservation_id or new_id("usage_reservation")
+        now = utc_now()
+        with self.store.transaction():
+            self._preflight_locked(pid, selected, source=source, context=context)
+            self.store.insert_resource_usage_reservation(
+                reservation_id=selected_id,
+                pid=pid,
+                usage=selected,
+                reserved_by=reserved_by or source,
+                reason=source,
+                created_at=now,
+            )
+        return selected_id
+
+    def settle_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        actual_usage: ResourceUsage | dict[str, Any] | None = None,
+        charge_maximum: bool = False,
+        release: bool = False,
+        source: str,
+        context: dict[str, Any] | None = None,
+    ) -> ResourceUsage:
+        """Settle exactly once; unknown provider outcomes charge the full envelope."""
+
+        if charge_maximum and release:
+            raise ValidationError("resource reservation cannot both release and charge maximum")
+        with self.store.transaction():
+            reservation = self.store.get_resource_usage_reservation(reservation_id)
+            if reservation is None:
+                raise ValidationError(f"resource usage reservation not found: {reservation_id}")
+            if reservation["status"] != "active":
+                settled = reservation.get("settled_usage")
+                return settled if isinstance(settled, ResourceUsage) else ResourceUsage()
+            maximum = reservation["usage"]
+            if release:
+                selected = ResourceUsage()
+                status = "released"
+            elif charge_maximum:
+                selected = maximum
+                status = "charged_maximum"
+            else:
+                selected = self._coerce_usage(actual_usage or ResourceUsage())
+                self._assert_usage_within_reservation(selected, maximum)
+                status = "settled"
+            if not self.store.settle_resource_usage_reservation(
+                reservation_id,
+                status=status,
+                settled_usage=selected,
+                updated_at=utc_now(),
+            ):
+                raise ValidationError(
+                    f"resource usage reservation changed concurrently: {reservation_id}"
+                )
+            if not self._is_zero(selected):
+                self.charge(
+                    reservation["pid"],
+                    selected,
+                    source=source,
+                    context={**(context or {}), "reservation_id": reservation_id, "settlement": status},
+                )
+            return selected
+
+    def recover_usage_reservations(self) -> list[str]:
+        """Release certified pre-dispatch rows and charge ambiguous rows maximally."""
+
+        recovered: list[str] = []
+        for reservation in self.store.list_resource_usage_reservations(status="active"):
+            effect = self.store.get_external_effect(reservation["reserved_by"])
+            release = effect is None or effect.transaction_state == "prepared"
+            self.settle_usage_reservation(
+                reservation["reservation_id"],
+                release=release,
+                charge_maximum=not release,
+                source="resource.recovery",
+                context={
+                    "effect_id": reservation["reserved_by"],
+                    "outcome": "not_started" if release else "unknown_after_dispatch",
+                },
+            )
+            recovered.append(reservation["reservation_id"])
+        return recovered
+
     def charge(
         self,
         pid: str,
@@ -103,7 +202,14 @@ class ResourceManager:
                 latest = self._get(process.pid)
                 latest.resource_usage = self._merge_usage(latest.resource_usage, delta)
                 latest.updated_at = utc_now()
-                self.store.update_process(latest)
+                latest = self.store.patch_process(
+                    latest.pid,
+                    {
+                        "resource_usage": latest.resource_usage,
+                        "updated_at": latest.updated_at,
+                    },
+                    expected_revision=latest.revision,
+                )
                 if index > 0:
                     self._consume_reservation_locked(latest.pid, chain[index - 1].pid, delta, relevant_fields)
                 exceeded = self._first_exceeded_effective(
@@ -160,7 +266,12 @@ class ResourceManager:
                 process.status = ProcessStatus.KILLED
                 process.status_message = reason
                 process.updated_at = utc_now()
-                self.store.update_process(process)
+                self.store.transition_process(
+                    process.pid,
+                    ProcessStatus.KILLED,
+                    expected_revision=process.revision,
+                    status_message=reason,
+                )
                 self.store.delete_resource_reservations_for_process(process.pid)
                 killed.append(process.pid)
             self.events.emit(
@@ -226,7 +337,13 @@ class ResourceManager:
             parent.status = ProcessStatus.RUNNABLE
             parent.status_message = None
             parent.updated_at = utc_now()
-            self.store.update_process(parent)
+            self.store.transition_process(
+                parent.pid,
+                ProcessStatus.RUNNABLE,
+                expected_revision=parent.revision,
+                expected_status=ProcessStatus.WAITING_EVENT,
+                status_message=None,
+            )
             self.audit.record(
                 actor="resource_manager",
                 action="process.wait_wake",
@@ -373,6 +490,7 @@ class ResourceManager:
                         used = sum(float(getattr(process.resource_usage, field)) for field in usage_fields)
                         if budget_field not in _NON_RESERVABLE_BUDGET_FIELDS:
                             used += reserved_by_parent.get(process.pid, {}).get(budget_field, 0.0)
+                            used += self._reserved_usage_value_locked(process.pid, budget_field)
                         process_remaining = max(0.0, float(limit) - used)
                         remaining = process_remaining if remaining is None else min(remaining, process_remaining)
                     values[budget_field] = (
@@ -499,6 +617,7 @@ class ResourceManager:
             value = sum(float(getattr(usage, usage_field)) for usage_field in usage_fields)
             if budget_field not in _NON_RESERVABLE_BUDGET_FIELDS:
                 value += self._reserved_budget_value_locked(process.pid, budget_field)
+                value += self._reserved_usage_value_locked(process.pid, budget_field)
             process_remaining = max(0.0, float(limit) - value)
             remaining = process_remaining if remaining is None else min(remaining, process_remaining)
         return remaining
@@ -595,6 +714,25 @@ class ResourceManager:
             total += value
         return total
 
+    def _reserved_usage_value_locked(
+        self,
+        owner_pid: str,
+        budget_field: str,
+    ) -> float:
+        usage_fields = _BUDGET_USAGE_MAP[budget_field]
+        total = 0.0
+        for reservation in self.store.list_resource_usage_reservations(status="active"):
+            try:
+                chain_pids = {process.pid for process in self._process_chain(reservation["pid"])}
+            except NotFound:
+                # A durable reservation whose process vanished is uncertain.
+                # Keep it visible to the root budget instead of silently freeing it.
+                chain_pids = {reservation["pid"]}
+            if owner_pid not in chain_pids:
+                continue
+            total += self._usage_value(reservation["usage"], budget_field, usage_fields)
+        return total
+
     def _usage_value(
         self,
         usage: ResourceUsage,
@@ -676,6 +814,7 @@ class ResourceManager:
                     consuming_child_pid=consuming_child_pid,
                     consuming_usage=consuming_usage,
                 )
+                value += self._reserved_usage_value_locked(process.pid, budget_field)
             if float(value) > float(limit):
                 return {"budget": budget_field, "usage": list(usage_fields), "value": value, "limit": limit}
         return None
@@ -691,6 +830,22 @@ class ResourceManager:
             usage.validate()
         except ValueError as exc:
             raise ValidationError(f"resource usage {exc}") from exc
+
+    def _assert_usage_within_reservation(
+        self,
+        actual: ResourceUsage,
+        maximum: ResourceUsage,
+    ) -> None:
+        exceeded = [
+            name
+            for name in _USAGE_FIELD_NAMES
+            if float(getattr(actual, name)) > float(getattr(maximum, name))
+        ]
+        if exceeded:
+            raise ResourceLimitExceeded(
+                "resource settlement exceeded reserved maximum for fields: "
+                + ", ".join(sorted(exceeded))
+            )
 
     def _limit_message(self, pid: str, exceeded: dict[str, Any]) -> str:
         if exceeded["budget"] == "max_child_processes":

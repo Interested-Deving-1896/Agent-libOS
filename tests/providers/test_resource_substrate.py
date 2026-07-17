@@ -121,7 +121,12 @@ class TestResourceProviderSubstrate:
     def test_shell_adapter_uses_injected_provider(self) -> None:
         runtime = Runtime.open('local')
         provider = FakeShellProvider()
-        shell = ShellAdapter(runtime.capability, runtime.audit, provider=provider)
+        shell = ShellAdapter(
+            runtime.capability,
+            runtime.audit,
+            protected_operations=runtime.protected_operations,
+            provider=provider,
+        )
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='run shell through substrate')
             runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
@@ -565,7 +570,12 @@ class TestResourceProviderSubstrate:
     def test_effectful_provider_without_classification_fails_closed(self) -> None:
         runtime = Runtime.open('local')
         provider = NoClassificationShellProvider()
-        shell = ShellAdapter(runtime.capability, runtime.audit, provider=provider)
+        shell = ShellAdapter(
+            runtime.capability,
+            runtime.audit,
+            protected_operations=runtime.protected_operations,
+            provider=provider,
+        )
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='missing effect classifier')
             runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')

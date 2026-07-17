@@ -1,7 +1,7 @@
-"""Runtime-internal external-effect ledger helpers.
+"""Evidence-layer helpers for atomic protected external-effect settlement.
 
-Provider-facing subsystems must use :mod:`agent_libos.sdk`; direct lifecycle
-calls from extension code bypass authority and exception settlement guarantees.
+Provider-facing subsystems use :mod:`agent_libos.sdk`; this module is the
+narrow ledger implementation behind that boundary.
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
 )
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.storage import RuntimeStore
+from agent_libos.ports import EffectAuthorityPort, OperationPort, ProtectedEffectPort
 from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.runtime.effect_binding import (
+from agent_libos.capability.effect_binding import (
     canonical_effect_hash,
     current_approval_effect_binding,
 )
@@ -57,7 +57,7 @@ def classify_external_effect(
 
 
 def record_external_effect(
-    store: RuntimeStore,
+    store: ProtectedEffectPort,
     *,
     pid: str,
     provider: str,
@@ -68,6 +68,7 @@ def record_external_effect(
     event: Event | None,
     metadata: dict[str, Any] | None = None,
     intent_effect_id: str | None = None,
+    operations: OperationPort | None = None,
 ) -> ExternalEffectRecord:
     provider_metadata = {
         **dict(classification.metadata),
@@ -112,7 +113,6 @@ def record_external_effect(
         raise ValidationError(
             "external effect intent was missing, already finalized, or did not match its provider boundary"
         )
-    operations = getattr(store, "operation_manager", None)
     if operations is not None:
         operations.link_evidence(
             "external_effect",
@@ -124,7 +124,7 @@ def record_external_effect(
 
 
 def prepare_external_effect_intent(
-    store: RuntimeStore,
+    store: ProtectedEffectPort,
     *,
     pid: str,
     provider: str,
@@ -135,6 +135,8 @@ def prepare_external_effect_intent(
     metadata: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
     canonical_args: dict[str, Any] | None = None,
+    operations: OperationPort | None = None,
+    authority_policy: EffectAuthorityPort | None = None,
 ) -> ExternalEffectRecord:
     """Persist conservative evidence before a provider boundary.
 
@@ -144,72 +146,22 @@ def prepare_external_effect_intent(
     pre-provider abort from a process crash at the provider boundary.
     """
 
-    manifests = getattr(store, "authority_manifest_manager", None)
-    manifest = None
-    if manifests is not None:
-        manifests.assert_effect(pid, f"{provider}.{operation}")
-        manifest = manifests.get_for_process(pid)
+    manifest = _effect_manifest(authority_policy, pid, provider, operation)
     context = dict((metadata or {}).get("context") or metadata or {})
     binding_context = dict(canonical_args) if canonical_args is not None else context
-    approval_binding = current_approval_effect_binding(store)
-    effect_id = approval_binding["effect_id"] if approval_binding is not None else new_id("effintent")
-    computed_args_hash = canonical_effect_hash(binding_context)
-    if (
-        approval_binding is not None
-        and canonical_args is not None
-        and approval_binding["canonical_args_hash"] != computed_args_hash
-    ):
-        raise ValidationError("protected operation arguments do not match the approved external effect")
-    args_hash = approval_binding["canonical_args_hash"] if approval_binding is not None else computed_args_hash
-    operations = getattr(store, "operation_manager", None)
     operation_id = operations.current_id() if operations is not None else None
-    selected_idempotency_key = idempotency_key or hashlib.sha256(
-        dumps(
-            {
-                "operation_id": operation_id or effect_id,
-                "provider": provider,
-                "operation": operation,
-                "target": target,
-                "canonical_args_hash": args_hash,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
-    existing = next(
-        (
-            item
-            for item in store.list_external_effects(pid=pid)
-            if item.idempotency_key == selected_idempotency_key
-        ),
-        None,
+    effect_id, args_hash, selected_idempotency_key = _effect_identity(
+        store=store,
+        pid=pid,
+        provider=provider,
+        operation=operation,
+        target=target,
+        binding_context=binding_context,
+        canonical_args_supplied=canonical_args is not None,
+        operation_id=operation_id,
+        idempotency_key=idempotency_key,
     )
-    if existing is not None:
-        raise ValidationError(
-            "duplicate external effect dispatch blocked by idempotency key: "
-            f"{selected_idempotency_key} existing_effect={existing.effect_id} "
-            f"state={existing.transaction_state}"
-        )
     now = utc_now()
-    selected_metadata = dict(metadata or {})
-    if information_flow:
-        raw_labels = selected_metadata.get("data_labels")
-        labels = {
-            str(key): value
-            for key, value in dict(raw_labels or {}).items()
-            if str(key)
-            in {
-                "sensitivity",
-                "trust_level",
-                "integrity",
-                "origin",
-                "tenant",
-                "principal",
-            }
-        }
-        selected_metadata["information_flow_evidence"] = {
-            "mode": "observe_only",
-            "labels": labels,
-            "manifest_policy": dict(manifest.data_flow_policy) if manifest is not None else {},
-        }
     record = ExternalEffectRecord(
         effect_id=effect_id,
         record_id=None,
@@ -223,7 +175,7 @@ def prepare_external_effect_intent(
         state_mutation=state_mutation,
         information_flow=information_flow,
         provider_metadata={
-            **selected_metadata,
+            **_effect_metadata(metadata, information_flow, manifest),
             "effect_state": "pending",
             "outcome": "unknown_after_provider_boundary",
         },
@@ -234,39 +186,174 @@ def prepare_external_effect_intent(
         idempotency_key=selected_idempotency_key,
         updated_at=now,
     )
+    _insert_effect_intent(store, record)
+    if operations is not None:
+        _link_pending_effect(operations, record)
+    return record
+
+
+def _effect_manifest(
+    authority_policy: EffectAuthorityPort | None,
+    pid: str,
+    provider: str,
+    operation: str,
+) -> Any | None:
+    if authority_policy is None:
+        return None
+    authority_policy.assert_effect(pid, f"{provider}.{operation}")
+    return authority_policy.get_for_process(pid)
+
+
+def _effect_identity(
+    *,
+    store: ProtectedEffectPort,
+    pid: str,
+    provider: str,
+    operation: str,
+    target: str | None,
+    binding_context: dict[str, Any],
+    canonical_args_supplied: bool,
+    operation_id: str | None,
+    idempotency_key: str | None,
+) -> tuple[str, str, str]:
+    approval = current_approval_effect_binding(store, operation_id)
+    effect_id = approval["effect_id"] if approval is not None else new_id("effintent")
+    computed_hash = canonical_effect_hash(binding_context)
+    if (
+        approval is not None
+        and canonical_args_supplied
+        and approval["canonical_args_hash"] != computed_hash
+    ):
+        raise ValidationError(
+            "protected operation arguments do not match the approved external effect"
+        )
+    args_hash = approval["canonical_args_hash"] if approval is not None else computed_hash
+    selected_key = idempotency_key or _default_idempotency_key(
+        operation_id=operation_id,
+        effect_id=effect_id,
+        provider=provider,
+        operation=operation,
+        target=target,
+        args_hash=args_hash,
+    )
+    existing = _effect_with_idempotency_key(store, pid, selected_key)
+    if existing is not None:
+        raise ValidationError(
+            "duplicate external effect dispatch blocked by idempotency key: "
+            f"{selected_key} existing_effect={existing.effect_id} "
+            f"state={existing.transaction_state}"
+        )
+    return effect_id, args_hash, selected_key
+
+
+def _default_idempotency_key(
+    *,
+    operation_id: str | None,
+    effect_id: str,
+    provider: str,
+    operation: str,
+    target: str | None,
+    args_hash: str,
+) -> str:
+    return hashlib.sha256(
+        dumps(
+            {
+                "operation_id": operation_id or effect_id,
+                "provider": provider,
+                "operation": operation,
+                "target": target,
+                "canonical_args_hash": args_hash,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _effect_with_idempotency_key(
+    store: ProtectedEffectPort,
+    pid: str,
+    idempotency_key: str,
+) -> ExternalEffectRecord | None:
+    return next(
+        (
+            item
+            for item in store.list_external_effects(pid=pid)
+            if item.idempotency_key == idempotency_key
+        ),
+        None,
+    )
+
+
+def _effect_metadata(
+    metadata: dict[str, Any] | None,
+    information_flow: bool,
+    manifest: Any | None,
+) -> dict[str, Any]:
+    selected = dict(metadata or {})
+    if not information_flow:
+        return selected
+    raw_labels = selected.get("data_labels")
+    label_fields = {
+        "sensitivity",
+        "trust_level",
+        "integrity",
+        "origin",
+        "tenant",
+        "principal",
+    }
+    selected["information_flow_evidence"] = {
+        "mode": "observe_only",
+        "labels": {
+            str(key): value
+            for key, value in dict(raw_labels or {}).items()
+            if str(key) in label_fields
+        },
+        "manifest_policy": (
+            dict(manifest.data_flow_policy) if manifest is not None else {}
+        ),
+    }
+    return selected
+
+
+def _insert_effect_intent(
+    store: ProtectedEffectPort,
+    record: ExternalEffectRecord,
+) -> None:
     try:
         store.insert_external_effect(record)
     except Exception as exc:
-        raced = next(
-            (
-                item
-                for item in store.list_external_effects(pid=pid)
-                if item.idempotency_key == selected_idempotency_key
-            ),
-            None,
+        raced = _effect_with_idempotency_key(
+            store,
+            record.pid,
+            str(record.idempotency_key),
         )
         if raced is not None:
             raise ValidationError(
                 "duplicate external effect dispatch blocked by concurrent idempotency claim: "
-                f"{selected_idempotency_key} existing_effect={raced.effect_id}"
+                f"{record.idempotency_key} existing_effect={raced.effect_id}"
             ) from exc
         raise
-    operations = getattr(store, "operation_manager", None)
-    if operations is not None:
-        # Event/audit roles become required only after the provider has
-        # actually returned or become ambiguous. A pre-dispatch abort or a
-        # first-phase ProviderEffectNotStarted must not report false gaps.
-        operations.expect("effect")
-        operations.link_evidence(
-            "external_effect",
-            record.effect_id,
-            "effect",
-            metadata={"effect_state": "pending", "provider": provider, "operation": operation},
-        )
-    return record
 
 
-def mark_external_effect_dispatched(store: RuntimeStore, effect_id: str) -> ExternalEffectRecord:
+def _link_pending_effect(
+    operations: OperationPort,
+    record: ExternalEffectRecord,
+) -> None:
+    # Event/audit roles become required only after a provider returned or
+    # became ambiguous. Pre-dispatch aborts must not report false gaps.
+    operations.expect("effect")
+    operations.link_evidence(
+        "external_effect",
+        record.effect_id,
+        "effect",
+        metadata={
+            "effect_state": "pending",
+            "provider": record.provider,
+            "operation": record.operation,
+        },
+    )
+
+
+def mark_external_effect_dispatched(store: ProtectedEffectPort, effect_id: str) -> ExternalEffectRecord:
     current = store.get_external_effect(effect_id)
     if current is None:
         raise ValidationError(f"external effect intent not found: {effect_id}")
@@ -285,7 +372,7 @@ def mark_external_effect_dispatched(store: RuntimeStore, effect_id: str) -> Exte
 
 
 def mark_external_effect_unknown(
-    store: RuntimeStore,
+    store: ProtectedEffectPort,
     effect_id: str,
     *,
     reason: str,
@@ -312,7 +399,7 @@ def mark_external_effect_unknown(
     return store.get_external_effect(effect_id) or current
 
 
-def reconcile_pending_external_effects(store: RuntimeStore, substrate: Any) -> list[ExternalEffectRecord]:
+def reconcile_pending_external_effects(store: ProtectedEffectPort, substrate: Any) -> list[ExternalEffectRecord]:
     """Reconcile without replay; unsupported providers remain explicitly unknown."""
 
     reconciled: list[ExternalEffectRecord] = []
@@ -387,13 +474,17 @@ def reconcile_pending_external_effects(store: RuntimeStore, substrate: Any) -> l
     return reconciled
 
 
-def abandon_external_effect_intent(store: RuntimeStore, intent_effect_id: str | None) -> None:
+def abandon_external_effect_intent(
+    store: ProtectedEffectPort,
+    intent_effect_id: str | None,
+    *,
+    operations: OperationPort | None = None,
+) -> None:
     """Remove an intent only when the provider certifies the effect never started."""
 
     if intent_effect_id is not None:
         if not store.abandon_external_effect_intent(intent_effect_id):
             raise ValidationError("external effect intent was missing or already finalized")
-        operations = getattr(store, "operation_manager", None)
         if operations is not None:
             operations.link_evidence(
                 "external_effect",

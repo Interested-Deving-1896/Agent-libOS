@@ -107,21 +107,21 @@ module registered only declared resources, checks name collisions, then applies
 the registrations before the runtime is returned to the caller. Registration,
 module metadata, audit/event rows, and the in-memory tool/image/syscall/hook
 registries commit as one lifecycle transaction. Startup hooks run under the
-same registry snapshot discipline: if a hook registers a runtime tool, image,
-syscall, or provider hook directly and then fails, those registrations are
-removed before the module row is recorded as failed. The snapshot also restores
-runtime/substrate provider bindings, module-owned runtime attributes, shutdown
-finalizers, and Object release finalizers, which covers adapters such as the PTY
-module's host binding. Hook code may still perform arbitrary external trusted
-host-side effects that the runtime cannot compensate, so hooks should be kept
-small and idempotent and should not treat a registry rollback as an
-external-effect rollback.
+same registration-journal discipline: if a hook registers a runtime tool,
+image, syscall, provider hook, module-owned runtime/substrate attribute,
+shutdown finalizer, or Object release finalizer and then fails, its journal
+undoes those owned changes in reverse order before the module row is recorded
+as failed. A hook receives an explicit `ModuleHookServices`-backed surface, not
+the concrete Runtime or another manager's private registry. Hook code may still
+perform arbitrary external trusted host-side effects that the runtime cannot
+compensate, so hooks should be kept small and idempotent and should not treat a
+registration rollback as an external-effect rollback.
 
 The runtime serializes module resolution, import, buffered application, hook
 execution, rollback, failed-record publication, and shutdown cleanup with the
 same re-entrant registry lifecycle lock used by ToolBroker and ImageRegistry.
-A failed module snapshot restore therefore cannot erase a successful module or
-registry publication that raced with it. Module list limits must be positive
+A failed module rollback therefore cannot erase a successful module or registry
+publication that raced with it. Module list limits must be positive
 integers no larger than `ModuleDefaults.discover_limit`.
 
 `Runtime.open()` runs all configured startup hooks before returning. If host code
@@ -162,6 +162,10 @@ terminal sessions. When loaded and trusted, it registers the tools
 `pty_list`, plus the `pty-agent:v0` image. The adapter, local PTY provider,
 reader thread, buffer limits, and timeout/window defaults live inside this
 module, not in the core Runtime or default Resource Provider Substrate.
+The adapter receives the explicit module host services it uses and shares
+Shell launch authorization only through the public `ShellExecutionPolicy`
+surface; it does not retain the concrete Runtime or call `ShellAdapter` private
+methods.
 Spawn, read, write, resize, close, automatic exit cleanup, and compensating
 close phases use the same [Protected Operation SDK](protected_operation_sdk.md)
 contracts as core providers; the module does not manage effect intents or

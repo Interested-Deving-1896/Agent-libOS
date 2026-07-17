@@ -147,6 +147,6 @@ payload-like fields, credentials, Human content, LLM raw I/O, Object payloads,
 raw command arguments and environments, stdout/stderr, and provider metadata.
 The original append-only audit/effect records remain unchanged.
 
-Old unlinked rows are not backfilled or heuristically reconstructed. Opening an
-older store creates the additive tables, but only newly recorded explicit links
-can be reported as complete explanations.
+Unlinked rows are not backfilled or heuristically reconstructed. The 0.3
+schema requires the explanation tables and explicit links; an older or
+incomplete store is rejected before mutation.

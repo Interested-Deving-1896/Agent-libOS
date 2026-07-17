@@ -4,16 +4,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import BaseAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 from agent_libos.utils.serde import to_jsonable
 
-_MCP_DEFAULTS = DEFAULT_CONFIG.mcp
-
-
 class ListMcpServersArgs(BaseModel):
     text: str | None = Field(default=None, description="Optional MCP server search text.")
-    limit: int | None = Field(default=None, ge=1, le=_MCP_DEFAULTS.list_limit)
+    limit: int | None = Field(default=None, ge=1)
 
 
 class ListMcpServersOutput(BaseModel):
@@ -106,7 +102,11 @@ class ListMcpToolsTool(BaseAgentTool[ListMcpToolsArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        result = runtime.mcp.list_tools(args.server_id, actor=ctx.pid, refresh=args.refresh)
+        result = await runtime.mcp.alist_tools(
+            args.server_id,
+            actor=ctx.pid,
+            refresh=args.refresh,
+        )
         return ListMcpToolsOutput(**result)
 
 

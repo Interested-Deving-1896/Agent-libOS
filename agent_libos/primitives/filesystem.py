@@ -26,8 +26,7 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     ResourceUsage,
 )
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
+from agent_libos.ports import AuditPort, EventPort
 from agent_libos.substrate import (
     FilesystemProvider,
     HierarchicalPathLock,
@@ -38,6 +37,7 @@ from agent_libos.substrate import (
 from agent_libos.sdk import (
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
+    ProtectedOperationSDK,
     ProviderPhase,
     ResourceSettlement,
 )
@@ -110,8 +110,10 @@ class FilesystemAdapter:
     def __init__(
         self,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus,
+        audit: AuditPort,
+        events: EventPort,
+        *,
+        protected_operations: ProtectedOperationSDK,
         root: str | os.PathLike[str] | None = None,
         namespace: str = _RUNTIME_DEFAULTS.workspace_namespace,
         human: Any | None = None,
@@ -123,6 +125,7 @@ class FilesystemAdapter:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.protected_operations = protected_operations
         if provider is None:
             if root is None:
                 raise ValueError("FilesystemAdapter requires either root or provider")
@@ -1487,14 +1490,7 @@ class FilesystemAdapter:
         return self._resolve(path, cwd=cwd)
 
     def _protected(self) -> Any:
-        sdk = (
-            getattr(self, "protected_operations", None)
-            or getattr(self, "protected_operation_sdk", None)
-            or getattr(self.audit.store, "protected_operation_sdk", None)
-        )
-        if sdk is None:
-            raise ValidationError("filesystem protected-operation SDK is not attached")
-        return sdk
+        return self.protected_operations
 
     def _data_flow(self) -> Any:
         manager = getattr(self, "data_flow", None) or getattr(

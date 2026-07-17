@@ -16,6 +16,11 @@ store.
 uv run agent-libos --db .agent_libos.sqlite <command>
 ```
 
+Runtime domain errors are printed as a stable JSON object with
+`schema_version`, `error.type`, and `error.message`, and exit with status 1;
+the installed command does not expose a Python traceback for ordinary user
+errors.
+
 ## Configuration File
 
 `agent-libos` and `agent-libos-gui-server` read `config.yaml` from the project

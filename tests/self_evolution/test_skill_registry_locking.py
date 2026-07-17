@@ -56,9 +56,15 @@ def test_skill_activation_acquires_registry_lifecycle_before_store(
         pid = runtime.process.spawn(image="base-agent:v0", goal="verify registry lock ordering")
         runtime.skills.register_skill_from_path(skill_dir, actor="test", require_capability=False)
 
-        runtime._registry_lifecycle_lock = _ObservedLifecycleLock(
+        observed_lifecycle_lock = _ObservedLifecycleLock(
             runtime._registry_lifecycle_lock,
             activation_attempted_lifecycle,
+        )
+        runtime._registry_lifecycle_lock = observed_lifecycle_lock
+        monkeypatch.setattr(
+            runtime.tools,
+            "_registry_lifecycle_lock_value",
+            observed_lifecycle_lock,
         )
         original_register_locked = runtime.tools._register_tool_locked
         original_transaction = runtime.store.transaction

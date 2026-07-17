@@ -21,12 +21,63 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import NotFound
 from tests.support.fakes import RecordingActionClient
 from tests.support.runtime import temporary_runtime, workspace_runtime
-from agent_libos.runtime.external_effects import (
+from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     record_external_effect,
 )
 from agent_libos.runtime.runtime import Runtime
 from tests.support.external_effects import begin_external_effect_intent
+
+
+@pytest.mark.parametrize('evidence_kind', ['audit', 'event'])
+def test_primary_evidence_and_operation_link_commit_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_kind: str,
+) -> None:
+    with temporary_runtime() as runtime:
+        original_insert = runtime.operations.store.insert_operation_evidence
+
+        def fail_selected_link(link: object) -> object:
+            if getattr(link, 'evidence_type', None) == evidence_kind:
+                raise RuntimeError(f'injected {evidence_kind} link failure')
+            return original_insert(link)
+
+        monkeypatch.setattr(
+            runtime.operations.store,
+            'insert_operation_evidence',
+            fail_selected_link,
+        )
+        with runtime.operations.scope(
+            kind='runtime',
+            name=f'test.atomic-{evidence_kind}',
+            actor='test',
+            pid=None,
+        ):
+            with pytest.raises(RuntimeError, match=f'injected {evidence_kind} link failure'):
+                if evidence_kind == 'audit':
+                    runtime.audit.record(
+                        actor='test',
+                        action='test.atomic_evidence',
+                        target='test:target',
+                    )
+                else:
+                    runtime.events.emit(
+                        EventType.OBJECT_UPDATED,
+                        source='test',
+                        target='test:target',
+                        payload={'atomic': True},
+                    )
+
+        if evidence_kind == 'audit':
+            assert not any(
+                record.action == 'test.atomic_evidence'
+                for record in runtime.audit.trace()
+            )
+        else:
+            assert not any(
+                event.payload.get('atomic') is True
+                for event in runtime.events.list()
+            )
 
 
 def test_direct_protected_operation_is_persisted_and_explainable() -> None:
@@ -215,7 +266,7 @@ def test_certified_pre_boundary_failure_is_not_started_not_unknown() -> None:
             auto_finish=False,
         ) as operation:
             intent = begin_external_effect_intent(
-                runtime.store,
+                runtime,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -230,7 +281,11 @@ def test_certified_pre_boundary_failure_is_not_started_not_unknown() -> None:
                 target="resource:test",
                 decision={"provider_started": False},
             )
-            abandon_external_effect_intent(runtime.store, intent.effect_id)
+            abandon_external_effect_intent(
+                runtime.uow.protected_effects,
+                intent.effect_id,
+                operations=runtime.operations,
+            )
             runtime.operations.finish("failed", operation_id=operation.operation_id)
 
         explanation = runtime.explain.explain_operation(operation.operation_id)
@@ -263,7 +318,7 @@ def test_finalized_unknown_effect_marks_operation_unknown() -> None:
             ) as operation:
                 operation_id = operation.operation_id
                 intent = begin_external_effect_intent(
-                    runtime.store,
+                    runtime,
                     pid=pid,
                     provider="test",
                     operation="write",
@@ -272,7 +327,7 @@ def test_finalized_unknown_effect_marks_operation_unknown() -> None:
                     information_flow=False,
                 )
                 record_external_effect(
-                    runtime.store,
+                    runtime.uow.protected_effects,
                     pid=pid,
                     provider="test",
                     operation="write",
@@ -287,6 +342,7 @@ def test_finalized_unknown_effect_marks_operation_unknown() -> None:
                     audit_record=None,
                     event=None,
                     intent_effect_id=intent.effect_id,
+                    operations=runtime.operations,
                 )
                 raise RuntimeError("provider failed after dispatch")
 
@@ -307,7 +363,7 @@ def test_successful_return_cannot_hide_finalized_unknown_effect() -> None:
             pid=pid,
         ) as operation:
             intent = begin_external_effect_intent(
-                runtime.store,
+                runtime,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -316,7 +372,7 @@ def test_successful_return_cannot_hide_finalized_unknown_effect() -> None:
                 information_flow=False,
             )
             record_external_effect(
-                runtime.store,
+                runtime.uow.protected_effects,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -331,6 +387,7 @@ def test_successful_return_cannot_hide_finalized_unknown_effect() -> None:
                 audit_record=None,
                 event=None,
                 intent_effect_id=intent.effect_id,
+                operations=runtime.operations,
             )
 
         stored = runtime.store.get_operation(operation.operation_id)
@@ -350,7 +407,7 @@ def test_unknown_rollback_status_does_not_hide_known_committed_outcome() -> None
             pid=pid,
         ) as operation:
             intent = begin_external_effect_intent(
-                runtime.store,
+                runtime,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -359,7 +416,7 @@ def test_unknown_rollback_status_does_not_hide_known_committed_outcome() -> None
                 information_flow=False,
             )
             effect = record_external_effect(
-                runtime.store,
+                runtime.uow.protected_effects,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -374,6 +431,7 @@ def test_unknown_rollback_status_does_not_hide_known_committed_outcome() -> None
                 audit_record=None,
                 event=None,
                 intent_effect_id=intent.effect_id,
+                operations=runtime.operations,
             )
 
         stored = runtime.store.get_operation(operation.operation_id)
@@ -566,7 +624,7 @@ def test_running_operation_with_pending_provider_effect_recovers_as_unknown(tmp_
     operation = runtime.operations.start(kind="primitive", name="test.provider", actor="host", pid=None)
     with runtime.operations.attach(operation.operation_id):
         begin_external_effect_intent(
-            runtime.store,
+            runtime,
             pid="host",
             provider="test",
             operation="write",

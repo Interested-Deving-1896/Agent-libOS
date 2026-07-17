@@ -24,7 +24,7 @@ from agent_libos.models.exceptions import (
     ProcessWaitRequired,
     ResourceLimitExceeded,
 )
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import EvidenceRepository
 from agent_libos.utils.ids import new_id, utc_now
 
 
@@ -45,7 +45,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 class OperationManager:
     """Durable causal scopes for protected Agent libOS operations."""
 
-    def __init__(self, store: RuntimeStore):
+    def __init__(self, store: EvidenceRepository):
         self.store = store
         self._identity = id(self)
 

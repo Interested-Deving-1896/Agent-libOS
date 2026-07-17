@@ -95,6 +95,52 @@ class TestExternalBoundary:
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.DELIVERED
         assert 'human.output' in self._audit_actions()
 
+    @pytest.mark.parametrize('failed_sink', ['reservation_audit', 'request_evidence'])
+    def test_human_output_initial_commit_is_atomic_with_one_time_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failed_sink: str,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='atomic output intent')
+        cap = self.runtime.capability.grant_once(
+            pid,
+            'human:owner',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        if failed_sink == 'reservation_audit':
+            original_record = self.runtime.audit.record
+
+            def fail_reservation_audit(*args: object, **kwargs: object) -> object:
+                if kwargs.get('action') == 'capability.reserve_use':
+                    raise RuntimeError('injected reservation audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(self.runtime.audit, 'record', fail_reservation_audit)
+        else:
+            original_link = self.runtime.operations.link_evidence
+
+            def fail_request_evidence(evidence_type: str, *args: object, **kwargs: object) -> object:
+                if evidence_type == 'human_request':
+                    raise RuntimeError('injected request evidence failure')
+                return original_link(evidence_type, *args, **kwargs)
+
+            monkeypatch.setattr(self.runtime.operations, 'link_evidence', fail_request_evidence)
+
+        with pytest.raises(RuntimeError, match='injected'):
+            self.runtime.human.output(pid, 'must not become pending')
+
+        persisted = self.runtime.store.get_capability(cap.cap_id)
+        assert persisted is not None and persisted.active
+        assert persisted.uses_remaining == 1
+        assert self.runtime.human.list(pid) == []
+        assert self.runtime.store.select_table_rows(
+            'capability_use_reservations',
+            'cap_id = ?',
+            (cap.cap_id,),
+        ) == []
+        assert self.human_output == []
+
     def test_terminal_drain_cannot_double_deliver_new_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='single output delivery')
         self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')

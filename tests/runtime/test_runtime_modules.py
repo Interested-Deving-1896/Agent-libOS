@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import types
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from agent_libos import Runtime
@@ -17,11 +18,139 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models import AgentImage
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.modules.host import ModuleHookContext, ModuleHookServices
+from agent_libos.modules.journal import RegistrationJournal, RegistrationRollbackError
 from agent_libos.modules.loader import ModuleLoader
+from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 class TestRuntimeModule:
+
+    def test_registration_journal_rolls_back_in_reverse_order_once(self) -> None:
+        order: list[str] = []
+        journal = RegistrationJournal('journal-test:v0')
+        journal.record(kind='tool', target='one', undo=lambda: order.append('tool'))
+        journal.record(kind='image', target='two', undo=lambda: order.append('image'))
+        journal.record(kind='startup_hook', target='three', undo=lambda: order.append('startup_hook'))
+
+        journal.rollback()
+        journal.rollback()
+
+        assert order == ['startup_hook', 'image', 'tool']
+        assert journal.rolled_back
+
+    def test_registration_journal_retains_failed_inverse_for_retry(self) -> None:
+        order: list[str] = []
+        attempts = 0
+        journal = RegistrationJournal('journal-retry:v0')
+
+        def transient_failure() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError('transient inverse failure')
+            order.append('retry_succeeded')
+
+        journal.record(kind='tool', target='older', undo=lambda: order.append('older'))
+        journal.record(kind='tool', target='retry', undo=transient_failure)
+
+        with pytest.raises(RegistrationRollbackError, match='transient inverse failure'):
+            journal.rollback()
+
+        assert order == ['older']
+        assert journal.size == 1
+        assert not journal.rolled_back
+        with pytest.raises(RuntimeError, match='rollback has started'):
+            journal.record(kind='tool', target='late', undo=lambda: None)
+
+        journal.rollback()
+        journal.rollback()
+
+        assert attempts == 2
+        assert order == ['older', 'retry_succeeded']
+        assert journal.size == 0
+        assert journal.rolled_back
+
+    def test_tool_rollback_quarantine_is_identity_bound(self) -> None:
+        runtime = Runtime.open()
+        try:
+            handle = runtime.tools.loaded_tool_handles()[0]
+            equal_but_distinct = deepcopy(handle)
+
+            assert equal_but_distinct == handle
+            assert equal_but_distinct is not handle
+            assert not runtime.tools.discard_tool_registration(equal_but_distinct)
+            assert runtime.tools.resolve(handle.name) is handle
+        finally:
+            runtime.close()
+
+    def test_module_registry_does_not_expose_surface_snapshot_rollback(self) -> None:
+        runtime = Runtime.open()
+        try:
+            assert not hasattr(runtime.modules, '_snapshot_runtime_surfaces')
+            assert not hasattr(runtime.modules, '_restore_runtime_surfaces')
+            assert runtime.modules._registration_journals['agent-libos-core:v0'].size > 0
+        finally:
+            runtime.close()
+
+    def test_module_hook_host_has_only_explicit_journaled_runtime_state(self) -> None:
+        runtime = Runtime.open()
+        journal = RegistrationJournal('host-contract:v0')
+        host = ModuleHookContext(ModuleHookServices.from_host(runtime), 'host-contract:v0', journal)
+        try:
+            assert host.audit is runtime.audit
+            assert not hasattr(host, 'llm')
+            with pytest.raises(ValidationError, match='explicit journaled'):
+                host.unregistered_state = object()  # type: ignore[attr-defined]
+            with pytest.raises(ValidationError, match='prefix'):
+                host.set_runtime_attribute('unscoped_state', object())
+
+            state = object()
+            host.set_runtime_attribute('_agent_libos_host_contract', state)
+            assert host.get_runtime_attribute('_agent_libos_host_contract') is state
+            journal.rollback()
+            assert host.get_runtime_attribute('_agent_libos_host_contract') is None
+        finally:
+            runtime.close()
+
+    def test_module_hook_memory_finalizer_registration_is_journaled(self) -> None:
+        runtime = Runtime.open()
+        journal = RegistrationJournal('memory-view-contract:v0')
+        host = ModuleHookContext(ModuleHookServices.from_host(runtime), 'memory-view-contract:v0', journal)
+        finalizer = lambda _obj, _actor, _reason: None
+        try:
+            before = list(runtime.memory._object_release_finalizers)
+
+            host.memory.bind_object_release_finalizer(finalizer)
+
+            assert runtime.memory._object_release_finalizers == [*before, finalizer]
+            journal.rollback()
+            assert runtime.memory._object_release_finalizers == before
+        finally:
+            host.deactivate()
+            journal.rollback()
+            runtime.close()
+
+    def test_module_hook_image_view_cannot_mutate_live_images(self) -> None:
+        runtime = Runtime.open()
+        journal = RegistrationJournal('image-view-contract:v0')
+        host = ModuleHookContext(ModuleHookServices.from_host(runtime), 'image-view-contract:v0', journal)
+        try:
+            image_id = runtime.config.runtime.default_image_id
+            original = runtime.images[image_id]
+            exposed = host.images[image_id]
+
+            exposed.boot['kind'] = 'mutated-by-module'
+            exposed.metadata['nested'] = {'mutated': True}
+
+            assert runtime.images[image_id] == original
+            assert runtime.images[image_id].boot.get('kind') != 'mutated-by-module'
+            assert 'nested' not in runtime.images[image_id].metadata
+        finally:
+            host.deactivate()
+            journal.rollback()
+            runtime.close()
 
     def test_module_discovery_rejects_unbounded_limits(self) -> None:
         runtime = Runtime.open()
@@ -760,6 +889,97 @@ sha256: {package_sha}
             finally:
                 runtime.close()
 
+    def test_startup_hook_rollback_audit_failure_recovers_persistent_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / 'runtime.sqlite'
+        manifest, source_sha = _write_module(tmp_path, failing_startup_hook=True)
+        trust = _module_trust_key('test-module:v0', manifest, source_sha)
+        original_record = AuditManager.record
+
+        def fail_rollback_audit(self, *args, **kwargs):
+            action = kwargs.get('action')
+            if action is None and len(args) > 1:
+                action = args[1]
+            if action == 'module.rollback':
+                raise RuntimeError('rollback audit sink failed')
+            return original_record(self, *args, **kwargs)
+
+        monkeypatch.setattr(AuditManager, 'record', fail_rollback_audit)
+
+        with pytest.raises(RuntimeError, match='startup hook failed'):
+            Runtime.open(
+                db,
+                module_manifests=(str(manifest),),
+                trusted_modules=(trust,),
+            )
+
+        runtime = Runtime.open(db)
+        try:
+            failed = runtime.modules.inspect_module('test-module:v0')
+            assert failed['status'] == 'failed'
+            assert 'startup hook failed' in failed['error']
+            assert 'module-agent:v0' not in runtime.images
+            assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
+            assert any(
+                record.action == 'module.rollback_recovered'
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_module_rollback_commit_failure_recovers_persistent_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / 'runtime.sqlite'
+        manifest, source_sha = _write_module(tmp_path)
+        trust = _module_trust_key('test-module:v0', manifest, source_sha)
+        runtime = Runtime.open(
+            db,
+            module_manifests=(str(manifest),),
+            trusted_modules=(trust,),
+        )
+        original_transaction = runtime.modules._extensions.transaction
+        fail_commit = True
+
+        @contextlib.contextmanager
+        def fail_first_commit(*, include_object_payloads: bool = False):
+            nonlocal fail_commit
+            with original_transaction(
+                include_object_payloads=include_object_payloads,
+            ):
+                yield
+                if fail_commit:
+                    fail_commit = False
+                    raise RuntimeError('simulated rollback commit failure')
+
+        monkeypatch.setattr(
+            runtime.modules._extensions,
+            'transaction',
+            fail_first_commit,
+        )
+        try:
+            runtime.modules._rollback_module('test-module:v0')
+
+            assert not runtime.modules.is_loaded('test-module:v0')
+            assert 'module-agent:v0' not in runtime.images
+            assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
+            assert runtime.modules.inspect_module('test-module:v0')['status'] == 'failed'
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(db)
+        try:
+            assert reopened.modules.inspect_module('test-module:v0')['status'] == 'failed'
+            assert 'module-agent:v0' not in reopened.images
+            assert all(row['name'] != 'module_echo' for row in reopened.store.list_tools())
+        finally:
+            reopened.close()
+
     def test_failing_startup_hook_cannot_leave_direct_runtime_registrations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -793,9 +1013,9 @@ sha256: {package_sha}
                     kind: list(hooks)
                     for kind, hooks in runtime.provider_hooks.items()
                 }
-                before_shutdown_finalizers = list(runtime._shutdown_finalizers)
+                before_shutdown_finalizers = runtime.lifecycle.finalizers_snapshot()
                 before_release_finalizers = list(runtime.memory._object_release_finalizers)
-                assert not hasattr(runtime, '_agent_libos_pty_adapter')
+                assert runtime.module_state.get('_agent_libos_pty_adapter') is None
                 assert not hasattr(runtime.substrate, 'hook_direct_provider')
                 with pytest.raises(RuntimeError, match='mutating startup hook failed'):
                     runtime.modules.load_module_manifest(manifest, trusted_modules=(trust,))
@@ -805,11 +1025,88 @@ sha256: {package_sha}
                 assert runtime.store.get_image('hook-direct-image:v0') is None
                 assert runtime.syscalls.get('hook.direct') is None
                 assert runtime.provider_hooks == before_provider_hooks
-                assert runtime._shutdown_finalizers == before_shutdown_finalizers
+                assert runtime.lifecycle.finalizers_snapshot() == before_shutdown_finalizers
                 assert runtime.memory._object_release_finalizers == before_release_finalizers
-                assert not hasattr(runtime, '_agent_libos_pty_adapter')
+                assert runtime.module_state.get('_agent_libos_pty_adapter') is None
                 assert not hasattr(runtime.substrate, 'hook_direct_provider')
                 assert runtime.modules.inspect_module('mutating-hook-module:v0')['status'] == 'failed'
+            finally:
+                runtime.close()
+
+    def test_failed_module_rollback_quarantines_tool_and_retries_cleanup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, source_sha = _write_mutating_hook_module(tmp_path)
+        trust = _module_trust_key('mutating-hook-module:v0', manifest, source_sha)
+        runtime = Runtime.open()
+        original_unregister = runtime.tools.unregister_tool
+        attempts = 0
+
+        def transient_unregister_failure(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError('transient tool unregister failure')
+            return original_unregister(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.tools, 'unregister_tool', transient_unregister_failure)
+        try:
+            with pytest.raises(RegistrationRollbackError, match='transient tool unregister failure'):
+                runtime.modules.load_module_manifest(manifest, trusted_modules=(trust,))
+
+            with pytest.raises(NotFound):
+                runtime.tools.resolve('hook_direct_tool')
+            assert all(
+                handle.name != 'hook_direct_tool'
+                for handle in runtime.tools.loaded_tool_handles()
+            )
+            assert all(row['name'] != 'hook_direct_tool' for row in runtime.store.list_tools())
+            assert runtime.modules.inspect_module('mutating-hook-module:v0')['status'] == 'failed'
+            assert any(
+                record.action == 'module.load_failed'
+                and record.target == 'module:mutating-hook-module:v0'
+                for record in runtime.audit.trace()
+            )
+            pending = runtime.modules._registration_journals['mutating-hook-module:v0']
+            assert pending.size == 1
+            assert not pending.rolled_back
+
+            with pytest.raises(RuntimeError, match='mutating startup hook failed'):
+                runtime.modules.load_module_manifest(manifest, trusted_modules=(trust,))
+
+            assert attempts == 3
+            assert 'mutating-hook-module:v0' not in runtime.modules._registration_journals
+            with pytest.raises(NotFound):
+                runtime.tools.resolve('hook_direct_tool')
+        finally:
+            runtime.close()
+
+    def test_runtime_loaded_failing_hook_preserves_previously_loaded_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            successful_root = root / 'successful'
+            failing_root = root / 'failing'
+            successful_root.mkdir()
+            failing_root.mkdir()
+            successful_manifest, successful_sha = _write_module(successful_root)
+            failing_manifest, failing_sha = _write_mutating_hook_module(failing_root)
+            runtime = Runtime.open(
+                module_manifests=(str(successful_manifest),),
+                trusted_modules=(_module_trust_key('test-module:v0', successful_manifest, successful_sha),),
+            )
+            try:
+                with pytest.raises(RuntimeError, match='mutating startup hook failed'):
+                    runtime.modules.load_module_manifest(
+                        failing_manifest,
+                        trusted_modules=(_module_trust_key('mutating-hook-module:v0', failing_manifest, failing_sha),),
+                    )
+
+                assert runtime.modules.inspect_module('test-module:v0')['status'] == 'loaded'
+                assert runtime.tools.resolve('module_echo').name == 'module_echo'
+                assert 'module-agent:v0' in runtime.images
+                assert runtime.syscalls.get('module.ping') is not None
             finally:
                 runtime.close()
 
@@ -1058,26 +1355,14 @@ def hook_syscall(session, args):
 
 
 def mutating_hook(runtime):
-    runtime.tools.register_tool(
-        HookDirectTool(),
-        registered_by="module:mutating-hook-module:v0",
-        scope="module:mutating-hook-module:v0",
-    )
-    runtime.image_registry.register(
-        AgentImage(image_id="hook-direct-image:v0", name="hook-direct-image"),
-        actor="module:mutating-hook-module:v0",
-        require_capability=False,
-    )
-    runtime.syscalls.register(
-        "hook.direct",
-        hook_syscall,
-        registered_by="module:mutating-hook-module:v0",
-    )
-    runtime.provider_hooks.setdefault("hook-direct", []).append(lambda _runtime: None)
+    runtime.register_tool(HookDirectTool())
+    runtime.register_image(AgentImage(image_id="hook-direct-image:v0", name="hook-direct-image"))
+    runtime.register_syscall("hook.direct", hook_syscall)
+    runtime.register_provider_hook("hook-direct", lambda _runtime: None)
     runtime.bind_shutdown_finalizer(lambda: True)
     runtime.memory.bind_object_release_finalizer(lambda _obj, _actor, _reason: None)
-    runtime._agent_libos_pty_adapter = object()
-    runtime.substrate.hook_direct_provider = object()
+    runtime.set_runtime_attribute("_agent_libos_pty_adapter", object())
+    runtime.set_substrate_attribute("hook_direct_provider", object())
     raise RuntimeError("mutating startup hook failed")
 
 

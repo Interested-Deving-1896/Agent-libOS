@@ -191,7 +191,7 @@ def _install_mocked_jit_runner(
         return sandbox.static_check(source_code)
 
     monkeypatch.setattr(sandbox, "run_tests", validate_statically)
-    monkeypatch.setattr(runtime.tools, "_run_sandbox_source", runner)
+    monkeypatch.setattr(sandbox, "arun_source", runner)
 
 
 def _bind_ambient_secret_file(

@@ -11,12 +11,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "0.2.1"
+    assert validate_version_alignment(ROOT) == "0.3.0"
 
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 0.2.1 Status\n")
+    assert text.startswith("# Agent libOS 0.3.0 Status\n")
     forbidden = {
         "commit id": r"\bcommit\b",
         "dirty state": r"\bdirty\b",
@@ -51,3 +51,11 @@ def test_python_wheel_scope_is_the_core_package() -> None:
     assert pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["agent_libos"]
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "The Python wheel contains the core `agent_libos` package" in readme
+
+
+def test_console_entrypoint_uses_the_domain_error_boundary() -> None:
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["scripts"] == {
+        "agent-libos": "agent_libos.api.cli:cli",
+        "agent-libos-gui-server": "agent_libos.api.gui.server:main",
+    }

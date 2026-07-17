@@ -54,8 +54,8 @@ class TestSkillIntegration:
                 assert new_tool_id != old_tool_id
                 assert runtime.process.get(pid).tool_table['replace_count'] == new_tool_id
                 assert old_tool_id not in {str(row['tool_id']) for row in runtime.store.list_tools()}
-                assert old_tool_id not in runtime.tools._handles
-                assert old_tool_id not in runtime.tools._jit_sources
+                assert runtime.tools.loaded_tool_handle(old_tool_id) is None
+                assert not runtime.tools.is_jit_tool_id(old_tool_id)
                 assert not runtime.store.select_table_rows(
                     'tool_candidates',
                     'registered_tool_id = ?',
@@ -65,8 +65,8 @@ class TestSkillIntegration:
                 runtime.skills.unload_skill(pid, 'replace-jit-skill', actor=pid)
                 assert 'replace_count' not in runtime.process.get(pid).tool_table
                 assert new_tool_id not in {str(row['tool_id']) for row in runtime.store.list_tools()}
-                assert new_tool_id not in runtime.tools._handles
-                assert new_tool_id not in runtime.tools._jit_sources
+                assert runtime.tools.loaded_tool_handle(new_tool_id) is None
+                assert not runtime.tools.is_jit_tool_id(new_tool_id)
                 assert not runtime.store.select_table_rows(
                     'tool_candidates',
                     'registered_tool_id = ?',
@@ -119,7 +119,11 @@ class TestSkillIntegration:
                     isinstance(obj.payload, dict) and obj.payload.get('candidate_id')
                     for obj in runtime.store.list_objects()
                 )
-                assert not [handle for handle in runtime.tools._handles.values() if handle.name == 'atomic_count']
+                assert not [
+                    handle
+                    for handle in runtime.tools.loaded_tool_handles()
+                    if handle.name == 'atomic_count'
+                ]
                 assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
             finally:
                 runtime.close()
@@ -160,7 +164,11 @@ class TestSkillIntegration:
             assert candidate.registered_tool_id is None
             assert 'partial_tool' not in runtime.process.get(pid).tool_table
             assert not [row for row in runtime.store.list_tools() if row['name'] == 'partial_tool']
-            assert not [handle for handle in runtime.tools._handles.values() if handle.name == 'partial_tool']
+            assert not [
+                handle
+                for handle in runtime.tools.loaded_tool_handles()
+                if handle.name == 'partial_tool'
+            ]
         finally:
             runtime.close()
 

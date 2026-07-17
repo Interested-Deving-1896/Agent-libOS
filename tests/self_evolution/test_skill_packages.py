@@ -554,7 +554,7 @@ class TestSkillPackageLoading:
                 runtime.close()
 
     @pytest.mark.parametrize("base_source", ["image", "manual"])
-    def test_unload_legacy_persisted_skill_row_backfills_base_tool_provenance(
+    def test_unload_rejects_noncanonical_persisted_skill_provenance(
         self,
         tmp_path: Path,
         base_source: str,
@@ -575,7 +575,7 @@ class TestSkillPackageLoading:
                     actor='test',
                 )
             runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
-            pid = runtime.process.spawn(image=image_id, goal='legacy Skill provenance migration')
+            pid = runtime.process.spawn(image=image_id, goal='strict Skill provenance')
             if base_source == 'manual':
                 runtime.tools.configure_process_tools(pid, ['echo'], assigned_by='test:manual-base')
             runtime.activate_skill(pid, f'legacy-{base_source}-skill')
@@ -590,17 +590,13 @@ class TestSkillPackageLoading:
 
         reopened = Runtime.open(database)
         try:
-            reopened.unload_skill(pid, f'legacy-{base_source}-skill')
+            with pytest.raises(ValidationError, match='canonical tool provenance'):
+                reopened.unload_skill(pid, f'legacy-{base_source}-skill')
 
             process = reopened.process.get(pid)
+            assert f'legacy-{base_source}-skill' in process.loaded_skills
             assert 'echo' in process.tool_table
             assert 'echo' in process.model_tool_table
-            audit = [
-                record
-                for record in reopened.audit.trace(target=f'process:{pid}')
-                if record.action == 'skill.unload'
-            ]
-            assert audit[-1].decision['legacy_provenance_backfilled'] is True
         finally:
             reopened.close()
 

@@ -69,11 +69,10 @@ short factual runtime note and state sections. `libos_default` preserves the
 native Agent libOS planner envelope and fallback JSON instructions used by the
 built-in images.
 
-Root process spawn never grants image `required_capabilities` in the default
-`manifest_required` mode. Requirements are copied into the Host-authored
+Root process spawn never grants image `required_capabilities`.
+Requirements are copied into the Host-authored
 Task Authority Manifest and reported as satisfied or unmet. Only the
-manifest's `authorized_capabilities` compile into authority. The explicit
-`legacy_image_grants` compatibility mode retains the older bootstrap behavior.
+manifest's `authorized_capabilities` compile into authority.
 `exec_process`, checkpoint-commit image boot, and image-package boot never
 grant requirement declarations automatically.
 Image `required_modules` are always startup prerequisites only: spawn and exec

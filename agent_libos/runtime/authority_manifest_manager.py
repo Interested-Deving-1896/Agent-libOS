@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import CapabilityRight, DataLabels, ResourceBudget, TaskAuthorityManifest
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import AuthorityRepository
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps
 
@@ -19,10 +19,11 @@ class AuthorityManifestManager:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        store: AuthorityRepository,
         capabilities: CapabilityManager,
         audit: Any,
         events: Any,
+        images: Mapping[str, Any],
         *,
         config: AgentLibOSConfig | None = None,
     ) -> None:
@@ -30,11 +31,8 @@ class AuthorityManifestManager:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self._images = images
         self.config = config or DEFAULT_CONFIG
-        self.runtime: Any | None = None
-
-    def bind_runtime(self, runtime: Any) -> None:
-        self.runtime = runtime
 
     def prepare_launch(
         self,
@@ -62,8 +60,6 @@ class AuthorityManifestManager:
             payload = dict(supplied or {})
 
         declared = self._normalize_specs(payload.get("authorized_capabilities", requested))
-        if supplied is None and self.config.runtime.launch_authority_mode == "legacy_image_grants":
-            declared = self._dedupe_specs([*declared, *required])
         if requested and payload:
             for spec in requested:
                 self._require_spec_covered(declared, spec, label="launch request")
@@ -296,8 +292,6 @@ class AuthorityManifestManager:
     def assert_capability_request(self, pid: str, resource: str, rights: Iterable[str]) -> None:
         manifest = self.get_for_process(pid)
         if manifest is None:
-            if self.config.runtime.launch_authority_mode == "legacy_image_grants":
-                return
             raise CapabilityDenied(f"{pid} has no task authority manifest")
         self._require_live(manifest)
         spec = self._normalize_spec({"resource": resource, "rights": list(rights)})
@@ -371,9 +365,7 @@ class AuthorityManifestManager:
         }
 
     def _image(self, image_id: str) -> Any:
-        if self.runtime is None:
-            raise ValidationError("authority manifest manager is not bound to a runtime")
-        image = self.runtime.images.get(image_id)
+        image = self._images.get(image_id)
         if image is None:
             raise NotFound(f"agent image not found: {image_id}")
         return image

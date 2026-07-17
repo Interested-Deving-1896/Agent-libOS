@@ -4,8 +4,11 @@ import hashlib
 from typing import Any
 
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.ports import ProtectedEffectPort
 from agent_libos.utils.serde import dumps, to_jsonable
 
+
+APPROVAL_BINDING_KEY = "approval_binding"
 
 _TRANSIENT_KEYS = frozenset(
     {
@@ -35,7 +38,7 @@ _TRANSIENT_KEYS = frozenset(
 
 
 def canonical_effect_payload(context: dict[str, Any]) -> dict[str, Any]:
-    """Return the stable, payload-safe facts bound by Human approval."""
+    """Return stable, payload-safe facts bound by a human approval."""
 
     return {
         str(key): to_jsonable(value)
@@ -49,9 +52,6 @@ def canonical_effect_hash(context: dict[str, Any]) -> str:
     return hashlib.sha256(dumps(canonical_effect_payload(context)).encode("utf-8")).hexdigest()
 
 
-APPROVAL_BINDING_KEY = "approval_binding"
-
-
 def normalize_approval_binding(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError("approval binding must be an object")
@@ -59,9 +59,7 @@ def normalize_approval_binding(value: Any) -> dict[str, Any]:
     args_hash = str(value.get("canonical_args_hash") or "").strip().lower()
     if not effect_id.startswith("eff_"):
         raise ValidationError("approval binding requires a planned external effect id")
-    if len(args_hash) != 64 or any(
-        character not in "0123456789abcdef" for character in args_hash
-    ):
+    if len(args_hash) != 64 or any(character not in "0123456789abcdef" for character in args_hash):
         raise ValidationError("approval binding requires a canonical SHA-256 argument hash")
     return {
         "effect_id": effect_id,
@@ -70,11 +68,12 @@ def normalize_approval_binding(value: Any) -> dict[str, Any]:
     }
 
 
-def current_approval_effect_binding(store: Any) -> dict[str, Any] | None:
-    """Resolve a reserved one-shot approval to its preallocated effect id."""
+def current_approval_effect_binding(
+    store: ProtectedEffectPort,
+    operation_id: str | None,
+) -> dict[str, Any] | None:
+    """Resolve a reserved one-shot approval from an explicit operation chain."""
 
-    operations = getattr(store, "operation_manager", None)
-    operation_id = operations.current_id() if operations is not None else None
     seen_operations: set[str] = set()
     bindings: dict[str, dict[str, Any]] = {}
     while operation_id is not None and operation_id not in seen_operations:

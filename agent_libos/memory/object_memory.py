@@ -46,9 +46,8 @@ from agent_libos.models import (
     ViewMode,
     AgentObject,
 )
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import UnitOfWork
+from agent_libos.ports import AuditPort, EventPort, OperationPort
 from agent_libos.tools.observability import ensure_json_size
 
 
@@ -146,19 +145,22 @@ class ObjectMemoryManager:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        unit_of_work: UnitOfWork,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus,
+        audit: AuditPort,
+        events: EventPort,
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
+        operations: OperationPort | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
-        self.store = store
+        self.store = unit_of_work.objects
+        self.evidence = unit_of_work.evidence
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
         self.resources = resources
+        self.operations = operations
         self._object_pin_checker: Callable[[str], bool] | None = None
         self._object_change_notifier: Callable[[str, dict[str, Any], str], None] | None = None
         self._object_release_finalizers: list[Callable[[AgentObject, str, str], None]] = []
@@ -178,6 +180,18 @@ class ObjectMemoryManager:
 
     def bind_object_release_finalizer(self, finalizer: Callable[[AgentObject, str, str], None]) -> None:
         self._object_release_finalizers.append(finalizer)
+
+    def unbind_object_release_finalizer(
+        self,
+        finalizer: Callable[[AgentObject, str, str], None],
+    ) -> bool:
+        """Remove one exact host finalizer during module journal rollback."""
+
+        for index in range(len(self._object_release_finalizers) - 1, -1, -1):
+            if self._object_release_finalizers[index] is finalizer:
+                del self._object_release_finalizers[index]
+                return True
+        return False
 
     def create_object(
         self,
@@ -207,8 +221,7 @@ class ObjectMemoryManager:
             selected_provenance = deepcopy(provenance) if provenance is not None else Provenance(
                 created_from_action="memory.create_object"
             )
-            operations = getattr(self.store, "operation_manager", None)
-            operation_id = operations.current_id() if operations is not None else None
+            operation_id = self.operations.current_id() if self.operations is not None else None
             if operation_id is not None and operation_id not in selected_provenance.source_operation_ids:
                 selected_provenance.source_operation_ids.append(operation_id)
             llm_derived = str(selected_provenance.created_from_action or "").startswith("llm.")
@@ -613,8 +626,7 @@ class ObjectMemoryManager:
             else:
                 next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
             next_provenance = current.provenance if patch.provenance is None else deepcopy(patch.provenance)
-            operations = getattr(self.store, "operation_manager", None)
-            operation_id = operations.current_id() if operations is not None else None
+            operation_id = self.operations.current_id() if self.operations is not None else None
             if operation_id is not None and operation_id not in next_provenance.source_operation_ids:
                 next_provenance = deepcopy(next_provenance)
                 next_provenance.source_operation_ids.append(operation_id)
@@ -886,46 +898,47 @@ class ObjectMemoryManager:
         # checks happen inside that boundary, so a revoke/release that commits
         # first is observed and a competing mutation that comes later cannot
         # invalidate the preflight before this link commits.
-        with self._ownership_lock, self.store.transaction():
+        with self._ownership_lock:
             src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
             if not src_decision.allowed:
                 raise CapabilityDenied(src_decision.reason)
             dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
             if not dst_decision.allowed:
                 raise CapabilityDenied(dst_decision.reason)
-            # Revalidate both exact handles after the complete two-sided
-            # preflight.  Besides defending re-entrant Host callbacks, this
-            # ensures the decisions consumed below are the ones valid at the
-            # publication point rather than stale decisions retained across a
-            # second authorization.
-            src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
-            if not src_decision.allowed:
-                raise CapabilityDenied(src_decision.reason)
-            dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
-            if not dst_decision.allowed:
-                raise CapabilityDenied(dst_decision.reason)
-            current_src = self.store.get_object(src.oid)
-            current_dst = self.store.get_object(dst.oid)
-            if current_src is None or current_src.lifecycle_state != ObjectLifecycleState.LIVE:
-                raise NotFound(f"object not found: {src.oid}")
-            if current_dst is None or current_dst.lifecycle_state != ObjectLifecycleState.LIVE:
-                raise NotFound(f"object not found: {dst.oid}")
-            self._consume_one_time_decisions([src_decision, dst_decision])
-            self.store.insert_link(link)
-            event = self.events.emit(
-                EventType.OBJECT_LINKED,
-                source=pid,
-                target=pid,
-                payload={"src": src.oid, "relation": link.relation.value, "dst": dst.oid},
-            )
-            self.audit.record(
-                actor=pid,
-                action="memory.link_objects",
-                target=f"object:{src.oid}",
-                input_refs=[src.oid, dst.oid],
-                capability_refs=[src.capability_id, dst.capability_id],
-                decision={"relation": link.relation.value},
-            )
+            # A re-entrant Host callback may release an object during the
+            # two-sided preflight. Keep that completed release outside the
+            # publication transaction so rejecting the link cannot resurrect
+            # the object. The exact handles are reauthorized again inside the
+            # atomic link/evidence transaction.
+            with self.store.transaction():
+                src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
+                if not src_decision.allowed:
+                    raise CapabilityDenied(src_decision.reason)
+                dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
+                if not dst_decision.allowed:
+                    raise CapabilityDenied(dst_decision.reason)
+                current_src = self.store.get_object(src.oid)
+                current_dst = self.store.get_object(dst.oid)
+                if current_src is None or current_src.lifecycle_state != ObjectLifecycleState.LIVE:
+                    raise NotFound(f"object not found: {src.oid}")
+                if current_dst is None or current_dst.lifecycle_state != ObjectLifecycleState.LIVE:
+                    raise NotFound(f"object not found: {dst.oid}")
+                self._consume_one_time_decisions([src_decision, dst_decision])
+                self.store.insert_link(link)
+                event = self.events.emit(
+                    EventType.OBJECT_LINKED,
+                    source=pid,
+                    target=pid,
+                    payload={"src": src.oid, "relation": link.relation.value, "dst": dst.oid},
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.link_objects",
+                    target=f"object:{src.oid}",
+                    input_refs=[src.oid, dst.oid],
+                    capability_refs=[src.capability_id, dst.capability_id],
+                    decision={"relation": link.relation.value},
+                )
         updated_src = self.store.get_object(src.oid)
         self._notify_object_changed(
             src.oid,
@@ -1415,6 +1428,17 @@ class ObjectMemoryManager:
                 )
                 raise
 
+    def run_object_release_finalizers_trusted(
+        self,
+        obj: AgentObject,
+        *,
+        actor: str,
+        reason: str,
+    ) -> None:
+        """Run host-registered release hooks for an already-authorized object."""
+
+        self._run_object_release_finalizers(obj, actor, reason)
+
     def _notify_object_changed(self, oid: str, change: dict[str, Any], actor_pid: str) -> None:
         if self._object_change_notifier is None:
             return
@@ -1851,7 +1875,7 @@ class ObjectMemoryManager:
             for cap in self.capabilities.matching_capabilities(pid, resource, right)
             if not (cap.metadata.get("object_handle") is True and cap.uses_remaining is not None)
         ]
-        return self.capabilities._decision_from_matches(
+        return self.capabilities.decision_from_matches(
             subject=pid,
             resource=resource,
             requested_right=str(right),
@@ -2011,7 +2035,9 @@ class ObjectMemoryManager:
     def _validate_payload_size(self, payload: Any, label: str) -> None:
         ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, label)
 
-    def _validate_query_limit(self, limit: int) -> int:
+    def _validate_query_limit(self, limit: int | None) -> int:
+        if limit is None:
+            return self.config.memory.query_limit
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValidationError("Object Memory query limit must be an integer")
         selected = limit
@@ -2028,7 +2054,14 @@ class ObjectMemoryManager:
         *,
         force_token_estimate: bool = False,
     ) -> ObjectMetadata:
-        meta = deepcopy(metadata) if metadata is not None else ObjectMetadata()
+        meta = (
+            deepcopy(metadata)
+            if metadata is not None
+            else ObjectMetadata(
+                sensitivity=self.config.memory.metadata_sensitivity,
+                retention_policy=self.config.memory.metadata_retention_policy,
+            )
+        )
         if force_token_estimate or meta.token_estimate is None:
             meta.token_estimate = estimate_tokens(payload)
         return meta
@@ -2040,14 +2073,14 @@ class ObjectMemoryManager:
         seen: set[str] = set()
         while selected_id is not None and selected_id not in seen:
             seen.add(selected_id)
-            links = self.store.list_operation_evidence(
+            links = self.evidence.list_operation_evidence(
                 operation_ids=[selected_id],
                 evidence_types=["context_manifest"],
             )
             if links:
                 oids: set[str] = set()
                 for link in links:
-                    manifest = self.store.get_context_materialization_manifest(link.evidence_id)
+                    manifest = self.evidence.get_context_materialization_manifest(link.evidence_id)
                     if manifest is None:
                         continue
                     oids.update(
@@ -2058,7 +2091,7 @@ class ObjectMemoryManager:
                         and item.get("oid")
                     )
                 return sorted(oids)
-            operation = self.store.get_operation(selected_id)
+            operation = self.evidence.get_operation(selected_id)
             selected_id = operation.parent_operation_id if operation is not None else None
         return []
 

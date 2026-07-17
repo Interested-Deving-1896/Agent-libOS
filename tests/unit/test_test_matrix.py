@@ -26,6 +26,10 @@ def _args(**overrides: object) -> argparse.Namespace:
 
 
 class TestTestMatrix:
+
+    def test_default_lane_timeout_has_headroom_for_full_deterministic_matrix(self) -> None:
+        assert test_matrix.DEFAULT_MAX_LANE_SECONDS == 600.0
+
     def test_pytest_args_default_to_serial_execution(self) -> None:
         command = test_matrix._pytest_args(("tests/runtime",), _args())
 

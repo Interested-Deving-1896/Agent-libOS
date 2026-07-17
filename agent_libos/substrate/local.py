@@ -59,6 +59,7 @@ from agent_libos.substrate.base import (
     SubprocessLimits,
     SubprocessTimeoutExpired,
 )
+from agent_libos.utils.ids import new_id
 from agent_libos.utils.serde import dumps, to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -1605,6 +1606,37 @@ class SdkMcpProvider:
                 self._raise_mcp_transport_limit_error(exc)
                 raise
 
+    def validate_and_call(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
+    ) -> McpProviderCallResult:
+        """Validate and invoke through one MCP session and one wall-clock deadline."""
+
+        with self._stdio_dispatch_snapshot(server, executable_snapshot) as selected_snapshot:
+            try:
+                return _run_mcp_async(
+                    asyncio.wait_for(
+                        self._avalidate_and_call(
+                            server,
+                            tool,
+                            arguments,
+                            timeout_s=timeout_s,
+                            max_response_bytes=max_response_bytes,
+                            executable_snapshot=selected_snapshot,
+                        ),
+                        timeout=timeout_s,
+                    )
+                )
+            except BaseExceptionGroup as exc:
+                self._raise_mcp_transport_limit_error(exc)
+                raise
+
     def resolve_stdio_executable(self, server: McpServerSpec) -> str:
         """Resolve the exact stdio executable used by the local MCP transport."""
 
@@ -1765,6 +1797,97 @@ class SdkMcpProvider:
             response_bytes=min(len(encoded), max_response_bytes),
             duration_s=time.monotonic() - started,
             too_large=too_large,
+        )
+
+    async def _avalidate_and_call(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
+    ) -> McpProviderCallResult:
+        started = time.monotonic()
+        list_request_bytes = len(
+            dumps({"method": "tools/list", "server_id": server.server_id}).encode("utf-8")
+        )
+        call_request_bytes = len(
+            dumps({"name": tool.mcp_name, "arguments": arguments}).encode("utf-8")
+        )
+        async with self._session(
+            server,
+            timeout_s=timeout_s,
+            max_response_bytes=max_response_bytes,
+            executable_snapshot=executable_snapshot,
+        ) as session:
+            live_result = await session.list_tools()
+            live_tools = [
+                McpProviderTool(
+                    name=str(getattr(item, "name", "")),
+                    description=getattr(item, "description", None),
+                    input_schema=dict(
+                        getattr(item, "inputSchema", None)
+                        or getattr(item, "input_schema", None)
+                        or {}
+                    ),
+                    metadata=_mcp_metadata(item),
+                )
+                for item in list(getattr(live_result, "tools", []) or [])
+            ]
+            list_encoded = dumps([to_jsonable(item) for item in live_tools]).encode("utf-8")
+            if len(list_encoded) > max_response_bytes:
+                return McpProviderCallResult(
+                    error="MCP tools/list response exceeded limit",
+                    error_type="ResponseTooLarge",
+                    correlation_id=new_id("corr"),
+                    duration_s=time.monotonic() - started,
+                    list_request_bytes=list_request_bytes,
+                    list_response_bytes=max_response_bytes,
+                    call_request_bytes=call_request_bytes,
+                    call_started=False,
+                )
+            live = next((item for item in live_tools if item.name == tool.mcp_name), None)
+            if live is None or (
+                tool.input_schema
+                and live.input_schema
+                and live.input_schema != tool.input_schema
+            ):
+                return McpProviderCallResult(
+                    error="MCP live tool validation failed",
+                    error_type="LiveToolValidationError",
+                    correlation_id=new_id("corr"),
+                    duration_s=time.monotonic() - started,
+                    list_request_bytes=list_request_bytes,
+                    list_response_bytes=len(list_encoded),
+                    call_request_bytes=call_request_bytes,
+                    call_started=False,
+                )
+            result = await session.call_tool(tool.mcp_name, arguments)
+        content = _jsonable_mcp_value(getattr(result, "content", None))
+        structured = _jsonable_mcp_value(
+            getattr(result, "structuredContent", None)
+            or getattr(result, "structured_content", None)
+        )
+        payload = {"content": _bounded_mcp_content(content), "structured_content": structured}
+        encoded = dumps(payload).encode("utf-8")
+        too_large = len(encoded) > max_response_bytes
+        if too_large:
+            payload = {"content": _mcp_oversize_observation(encoded), "structured_content": None}
+        call_response_bytes = min(len(encoded), max_response_bytes)
+        return McpProviderCallResult(
+            content=payload["content"],
+            structured_content=payload["structured_content"],
+            is_error=bool(getattr(result, "isError", False) or getattr(result, "is_error", False)),
+            response_bytes=call_response_bytes,
+            duration_s=time.monotonic() - started,
+            too_large=too_large,
+            list_request_bytes=list_request_bytes,
+            list_response_bytes=len(list_encoded),
+            call_request_bytes=call_request_bytes,
+            call_response_bytes=call_response_bytes,
+            call_started=True,
         )
 
     @contextlib.asynccontextmanager
@@ -2006,7 +2129,7 @@ class _McpPolicyAsyncHTTPTransport:
     def __init__(self, *, max_response_bytes: int) -> None:
         try:
             import httpcore
-            import httpx
+            import httpx  # noqa: F401
         except ModuleNotFoundError as exc:
             raise ValidationError(
                 "MCP HTTP transport requires httpx/httpcore from the optional MCP dependency; "
@@ -2016,8 +2139,7 @@ class _McpPolicyAsyncHTTPTransport:
             raise ValidationError("MCP HTTP max_response_bytes must be a positive integer")
         self.max_response_bytes = max_response_bytes
         self.limit_error: RuntimeError | None = None
-        self._delegate = httpx.AsyncHTTPTransport(trust_env=False)
-        self._delegate._pool = httpcore.AsyncConnectionPool(  # type: ignore[attr-defined]
+        self._pool = httpcore.AsyncConnectionPool(
             ssl_context=ssl.create_default_context(),
             max_connections=8,
             max_keepalive_connections=0,
@@ -2029,30 +2151,54 @@ class _McpPolicyAsyncHTTPTransport:
         )
 
     async def __aenter__(self) -> "_McpPolicyAsyncHTTPTransport":
-        await self._delegate.__aenter__()
+        with _map_mcp_httpcore_exceptions():
+            await self._pool.__aenter__()
         return self
 
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        await self._delegate.__aexit__(exc_type, exc_value, traceback)
+        with _map_mcp_httpcore_exceptions():
+            await self._pool.__aexit__(exc_type, exc_value, traceback)
 
     async def handle_async_request(self, request: Any) -> Any:
+        import httpcore
+        import httpx
+
         request.headers["Accept-Encoding"] = "identity"
-        response = await self._delegate.handle_async_request(request)
-        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        with _map_mcp_httpcore_exceptions():
+            core_response = await self._pool.handle_async_request(core_request)
+        headers = httpx.Headers(core_response.headers)
+        content_encoding = headers.get("content-encoding", "").strip().lower()
         if content_encoding and content_encoding != "identity":
             error = self._limit_failure(
                 f"MCP HTTP response uses unsupported Content-Encoding={content_encoding}"
             )
-            await response.aclose()
+            with _map_mcp_httpcore_exceptions():
+                await core_response.aclose()
             raise error
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        response.stream = _bounded_mcp_http_stream(
-            response.stream,
-            max_response_bytes=self.max_response_bytes,
-            is_sse=content_type == "text/event-stream",
-            fail=self._limit_failure,
+        content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        return httpx.Response(
+            status_code=core_response.status,
+            headers=headers,
+            stream=_bounded_mcp_http_stream(
+                core_response.stream,
+                max_response_bytes=self.max_response_bytes,
+                is_sse=content_type == "text/event-stream",
+                fail=self._limit_failure,
+            ),
+            extensions=core_response.extensions,
         )
-        return response
 
     def _limit_failure(self, message: str) -> RuntimeError:
         error = RuntimeError(message)
@@ -2060,7 +2206,47 @@ class _McpPolicyAsyncHTTPTransport:
         return error
 
     async def aclose(self) -> None:
-        await self._delegate.aclose()
+        with _map_mcp_httpcore_exceptions():
+            await self._pool.aclose()
+
+
+@contextlib.contextmanager
+def _map_mcp_httpcore_exceptions() -> Iterator[None]:
+    """Translate public httpcore transport errors to their httpx equivalents."""
+
+    try:
+        yield
+    except Exception as exc:
+        import httpcore
+        import httpx
+
+        exception_names = (
+            "TimeoutException",
+            "ConnectTimeout",
+            "ReadTimeout",
+            "WriteTimeout",
+            "PoolTimeout",
+            "NetworkError",
+            "ConnectError",
+            "ReadError",
+            "WriteError",
+            "ProxyError",
+            "UnsupportedProtocol",
+            "ProtocolError",
+            "LocalProtocolError",
+            "RemoteProtocolError",
+        )
+        mapped: type[Exception] | None = None
+        for name in exception_names:
+            source = getattr(httpcore, name)
+            target = getattr(httpx, name)
+            if isinstance(exc, source) and (
+                mapped is None or issubclass(target, mapped)
+            ):
+                mapped = target
+        if mapped is None:
+            raise
+        raise mapped(str(exc)) from exc
 
 
 class _McpHttpResponseLimiter:
@@ -2125,14 +2311,16 @@ def _bounded_mcp_http_stream(
 
     class BoundedMcpHttpStream(httpx.AsyncByteStream):
         async def __aiter__(self):
-            async for chunk in stream:
-                message = limiter.feed(chunk)
-                if message is not None:
-                    raise fail(message)
-                yield chunk
+            with _map_mcp_httpcore_exceptions():
+                async for chunk in stream:
+                    message = limiter.feed(chunk)
+                    if message is not None:
+                        raise fail(message)
+                    yield chunk
 
         async def aclose(self) -> None:
-            await stream.aclose()
+            with _map_mcp_httpcore_exceptions():
+                await stream.aclose()
 
     return BoundedMcpHttpStream()
 

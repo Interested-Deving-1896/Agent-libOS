@@ -100,6 +100,8 @@ class TestCheckpointJit:
             process.loaded_skills['skill:test-jit'] = {
                 'tool_ids': {},
                 'jit_tool_ids': {'isolated_echo': source_handle.tool_id},
+                'base_tool_ids': {},
+                'base_model_tool_ids': {},
             }
             runtime.store.update_process(process)
             checkpoint_id = runtime.checkpoint.create(pid, 'jit registered', actor=pid)
@@ -115,7 +117,7 @@ class TestCheckpointJit:
             fork_handle = runtime.tools.resolve('isolated_echo', pid=fork_pid)
 
             assert fork_handle.tool_id != source_handle.tool_id
-            assert runtime.tools._jit_sources[fork_handle.tool_id] == source
+            assert runtime.tools.jit_source(fork_handle.tool_id) == source
             fork_process = runtime.store.get_process(fork_pid)
             assert (
                 fork_process.loaded_skills['skill:test-jit']['jit_tool_ids']['isolated_echo']
@@ -146,7 +148,7 @@ class TestCheckpointJit:
             with pytest.raises(NotFound):
                 runtime.tools.resolve('isolated_echo', pid=fork_pid)
             assert runtime.tools.resolve('isolated_echo', pid=pid).tool_id == source_handle.tool_id
-            assert runtime.tools._jit_sources[source_handle.tool_id] == source
+            assert runtime.tools.jit_source(source_handle.tool_id) == source
         finally:
             runtime.close()
 
@@ -162,23 +164,21 @@ class TestCheckpointJit:
             runtime.store.update_tool_candidate(candidate)
             handle = runtime.tools.register(pid, candidate_id)
             checkpoint_id = runtime.checkpoint.create(pid, 'jit registered', actor=pid)
-            runtime.tools._jit_sources.pop(handle.tool_id)
-            runtime.tools._handles.pop(handle.tool_id)
+            runtime.tools.forget_loaded_jit(handle.tool_id)
             runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
-            assert runtime.tools._jit_sources[handle.tool_id] == source
+            assert runtime.tools.jit_source(handle.tool_id) == source
             assert runtime.tools.resolve('echo_value', pid=pid).tool_id == handle.tool_id
             with pytest.raises(NotFound):
                 runtime.tools.resolve('echo_value')
             other = runtime.process.spawn(image='base-agent:v0', goal='cannot import restored JIT')
             with pytest.raises(NotFound):
                 runtime.tools.configure_process_tools(other, ['echo_value'], assigned_by='test')
-            runtime.tools._jit_sources.pop(handle.tool_id)
-            runtime.tools._handles.pop(handle.tool_id)
+            runtime.tools.forget_loaded_jit(handle.tool_id)
             runtime.capability.grant(pid, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
             forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
             fork_handle = runtime.tools.resolve('echo_value', pid=forked['fork_root_pid'])
             assert fork_handle.tool_id != handle.tool_id
-            assert runtime.tools._jit_sources[fork_handle.tool_id] == source
+            assert runtime.tools.jit_source(fork_handle.tool_id) == source
         finally:
             runtime.close()
 
@@ -206,8 +206,8 @@ class TestCheckpointJit:
 
             runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
 
-            assert handle.tool_id not in runtime.tools._jit_sources
-            assert handle.tool_id not in runtime.tools._handles
+            assert not runtime.tools.is_jit_tool_id(handle.tool_id)
+            assert runtime.tools.loaded_tool_handle(handle.tool_id) is None
             assert handle.tool_id not in {row['tool_id'] for row in runtime.store.list_tools()}
             with pytest.raises(NotFound):
                 runtime.tools.resolve('late_echo_value', pid=pid)

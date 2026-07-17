@@ -59,6 +59,8 @@ class JsonRpcTransportResult:
     response_bytes: int
     too_large: bool = False
     error: str | None = None
+    error_type: str | None = None
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True)

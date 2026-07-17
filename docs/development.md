@@ -34,7 +34,9 @@ uv run python -m compileall agent_libos tests scripts experiments benchmarks
 uv run python scripts/test_matrix.py --lane unit
 uv run python scripts/test_matrix.py --lane security
 uv run python scripts/test_matrix.py --lane runtime
+uv run python scripts/check_architecture.py
 uv run python scripts/check_test_invariants.py
+uv run python scripts/check_protected_operations.py
 uv run python scripts/test_matrix.py --lane gui
 git diff --check
 ```
@@ -63,6 +65,17 @@ group/tree. CI also keeps an outer job timeout. Run the `gui` lane separately;
 it cleans Electron output before production compilation, excludes generated
 `dist-electron` files from Vitest, and never emits test files into the production
 Electron tree. Install GUI dependencies first with `npm --prefix gui install`.
+
+The architecture check covers the core package and repository-level Runtime
+Modules. It rejects new lower-layer Runtime/API imports,
+Runtime-as-service-locator access (including local aliases), and
+cross-component private access, including dependencies stored in
+underscore-prefixed fields. Literal-name `getattr` access is analyzed as the
+equivalent ordinary attribute access. The check also ratchets existing
+long-function and complexity hotspots, the explicit composition-cycle binding
+set, and Runtime component declarations; stale ceilings are rejected when debt shrinks. Do not
+refresh the allowlist merely to make growth pass; use `--print-baseline` to
+inspect it, then lower or remove only entries justified by the current tree.
 
 Pytest cleans files created under the ignored `agent_outputs/` directory at the
 end of each test session, while preserving anything that existed before the
@@ -322,7 +335,8 @@ llm:
 Set `llm.persist_full_io: false` in a config overlay, or construct a replacement
 `AgentLibOSConfig`, to opt out of full prompt, visible tool schema, model
 output, tool call, reasoning, and raw response persistence. The config
-dataclasses are frozen, so do not mutate `DEFAULT_CONFIG` in place. When full
+dataclasses and their mapping fields are immutable, so do not mutate
+`DEFAULT_CONFIG` in place. When full
 I/O persistence is disabled, the durable row keeps bounded previews, byte
 counts, truncation flags, and hashes instead of the raw values. This policy also
 applies before dispatch to conditional LLM release rows; `request_messages`,

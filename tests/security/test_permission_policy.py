@@ -23,6 +23,36 @@ class TestPermissionPolicy:
     def teardown_method(self) -> None:
         self.runtime.close()
 
+    def test_permission_policy_audit_failure_rolls_back_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='atomic permission policy')
+        resource = self.runtime.filesystem.resource_for(self._path())
+        original_record = self.runtime.audit.record
+
+        def fail_policy_audit(*args: object, **kwargs: object) -> object:
+            if kwargs.get('action') == 'capability.permission_policy':
+                raise RuntimeError('injected permission policy audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_policy_audit)
+
+        with pytest.raises(RuntimeError, match='permission policy audit failure'):
+            self.runtime.capability.set_permission_policy(
+                subject=pid,
+                resource=resource,
+                rights=[CapabilityRight.WRITE],
+                policy=CapabilityManager.ALWAYS_ALLOW,
+                issued_by='test',
+            )
+
+        assert (
+            self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE)
+            == CapabilityManager.MISSING
+        )
+        assert not self.runtime.capability.check(pid, resource, CapabilityRight.WRITE)
+
     def test_request_permission_tool_can_set_always_allow_policy(self) -> None:
         pid = self._spawn_review(goal='request write')
         self._grant_human(pid)

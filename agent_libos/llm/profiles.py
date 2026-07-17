@@ -7,15 +7,13 @@ import os
 import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import Any, Mapping
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
 from agent_libos.llm.client import LLMClient, LLMError
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import NotFound, ValidationError
+from agent_libos.storage import ProcessRepository
 from agent_libos.utils.serde import dumps
-
-if TYPE_CHECKING:
-    from agent_libos.runtime.runtime import Runtime
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _API_MODES = {"auto", "responses", "chat"}
@@ -74,8 +72,13 @@ class LLMProfileRegistry:
     OpenAI-compatible client is first needed.
     """
 
-    def __init__(self, runtime: "Runtime", *, config: AgentLibOSConfig | None = None):
-        self.runtime = runtime
+    def __init__(
+        self,
+        processes: ProcessRepository,
+        *,
+        config: AgentLibOSConfig | None = None,
+    ) -> None:
+        self._processes = processes
         self.config = config or DEFAULT_CONFIG
         self._profiles: dict[str, LLMProfile] = {}
         self._clients: dict[str, Any] = {}
@@ -121,7 +124,9 @@ class LLMProfileRegistry:
         self._shutdown_client(stale)
 
     def resolve_for_process(self, pid: str) -> ResolvedLLMProfile:
-        process = self.runtime.process.get(pid)
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
         profile_id = process.llm_profile_id or self.config.llm.default_profile_id
         return self.resolve(profile_id)
 

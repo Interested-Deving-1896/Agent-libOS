@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 from pathlib import Path
 import socket
 import subprocess
+import threading
+import time
 from typing import Any
 
 import pytest
 
 from agent_libos import Runtime
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
+from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     CapabilityStatus,
     CapabilityRight,
@@ -20,19 +24,23 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     McpProviderCallResult,
     McpProviderTool,
+    McpHttpTransportSpec,
+    McpServerSpec,
+    McpToolSpec,
     McpToolListResult,
     ObjectMetadata,
     ObjectType,
+    ResourceBudget,
     SinkTrustLevel,
     SinkTrustRule,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.substrate import ProviderEffectNotStarted
-from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
 import agent_libos.sdk.protected_operations as protected_operations
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate.local import _allowed_mcp_connect_addresses
-from agent_libos.utils.serde import dumps
+from agent_libos.utils.serde import dumps, to_jsonable
 
 
 def _grant_stdio_spawn(
@@ -55,6 +63,266 @@ def _grant_stdio_spawn(
 
 
 class TestMcpPrimitive:
+    def test_validate_and_call_uses_one_provider_session_and_settles_all_stages(self) -> None:
+        runtime = Runtime.open('local')
+        provider = _ValidatedCallMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                goal='single MCP session',
+                resource_budget=ResourceBudget(max_mcp_bytes=2_200_000),
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('single-session'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:single-session:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            result = runtime.mcp.call_tool(
+                pid,
+                'single-session',
+                'echo',
+                {'text': 'hello'},
+            )
+
+            assert result.ok
+            assert provider.validate_calls == 1
+            assert provider.list_calls == []
+            assert provider.call_args == []
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_request_bytes == 28
+            assert process.resource_usage.mcp_response_bytes == 32
+            reservations = runtime.store.list_resource_usage_reservations(pid=pid)
+            assert len(reservations) == 1
+            assert reservations[0]['status'] == 'settled'
+            assert reservations[0]['settled_usage'].mcp_request_bytes == 28
+            assert reservations[0]['settled_usage'].mcp_response_bytes == 32
+        finally:
+            runtime.close()
+
+    def test_sdk_validate_and_call_uses_one_absolute_deadline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = SdkMcpProvider()
+        tool = McpToolSpec(
+            tool_id="echo",
+            mcp_name="demo.echo",
+            right="read",
+            rollback_class="no_rollback_required",
+            state_mutation=False,
+            information_flow=True,
+        )
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="deadline",
+            transport="streamable_http",
+            tools=[tool],
+            timeout_s=0.04,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
+        )
+        session_entries = 0
+        call_started = threading.Event()
+        call_completed = threading.Event()
+
+        class FakeSession:
+            async def list_tools(self) -> Any:
+                await asyncio.sleep(0.03)
+                item = type(
+                    "LiveTool",
+                    (),
+                    {
+                        "name": "demo.echo",
+                        "description": None,
+                        "inputSchema": {},
+                    },
+                )()
+                return type("LiveTools", (), {"tools": [item]})()
+
+            async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> Any:
+                call_started.set()
+                await asyncio.sleep(0.03)
+                call_completed.set()
+                return type("CallResult", (), {"content": [], "isError": False})()
+
+        @contextlib.asynccontextmanager
+        async def fake_session(*_args: Any, **_kwargs: Any):
+            nonlocal session_entries
+            session_entries += 1
+            yield FakeSession()
+
+        monkeypatch.setattr(provider, "_session", fake_session)
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            provider.validate_and_call(
+                server,
+                tool,
+                {},
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+            )
+        elapsed = time.monotonic() - started
+
+        assert session_entries == 1
+        assert call_started.is_set()
+        assert not call_completed.is_set()
+        assert elapsed < 0.15
+
+    def test_total_mcp_budget_denial_does_not_start_provider(self) -> None:
+        runtime = Runtime.open('local')
+        provider = _ValidatedCallMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                goal='deny MCP before provider',
+                resource_budget=ResourceBudget(max_mcp_bytes=1_000),
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('budget-denied'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:budget-denied:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ResourceLimitExceeded):
+                runtime.mcp.call_tool(pid, 'budget-denied', 'echo', {'text': 'hello'})
+
+            assert provider.validate_calls == 0
+            assert runtime.store.list_resource_usage_reservations(pid=pid) == []
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_request_bytes == 0
+            assert process.resource_usage.mcp_response_bytes == 0
+        finally:
+            runtime.close()
+
+    def test_legacy_provider_does_not_start_call_after_list_exhausts_deadline(self) -> None:
+        runtime = Runtime.open("local")
+
+        class SlowListProvider(_RecordingMcpProvider):
+            def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
+                time.sleep(0.03)
+                return super().list_tools(server, **kwargs)
+
+        provider = SlowListProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(goal="legacy MCP deadline")
+            manifest = _stdio_manifest("legacy-deadline").replace(
+                "timeout_s: 5",
+                "timeout_s: 0.01",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                manifest,
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:legacy-deadline:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            result = runtime.mcp.call_tool(
+                pid,
+                "legacy-deadline",
+                "echo",
+                {"text": "hello"},
+            )
+
+            assert result.ok is False
+            assert result.status.value == "transport_error"
+            assert result.error is not None
+            assert result.error["error_type"] == "McpDeadlineExceeded"
+            assert provider.list_calls == ["legacy-deadline"]
+            assert provider.call_args == []
+            reservation = runtime.store.list_resource_usage_reservations(pid=pid)[0]
+            assert reservation["status"] == "settled"
+            assert reservation["settled_usage"].mcp_request_bytes > 0
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.provider_metadata["outcome"] == "deadline_exhausted_before_call"
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('entry_point', ['async_tool', 'syscall'])
+    def test_async_refresh_uses_async_mcp_facade(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        entry_point: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='async MCP refresh')
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('async-refresh'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp_server:async-refresh',
+                [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+            original_list_tools = runtime.mcp.list_tools
+
+            def guarded_sync_facade(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return original_list_tools(*args, **kwargs)
+                raise AssertionError('sync MCP facade used from active event loop')
+
+            monkeypatch.setattr(runtime.mcp, 'list_tools', guarded_sync_facade)
+
+            if entry_point == 'async_tool':
+                runtime.tools.configure_process_tools(
+                    pid,
+                    ['list_mcp_tools'],
+                    assigned_by='test',
+                )
+                result = asyncio.run(
+                    runtime.tools.acall(
+                        pid,
+                        'list_mcp_tools',
+                        {'server_id': 'async-refresh', 'refresh': True},
+                    )
+                )
+                assert result.ok, result.error
+                assert result.payload['refreshed'] is True
+            else:
+                result = asyncio.run(
+                    LibOSSyscallSession(runtime, pid).handle(
+                        'mcp.tools',
+                        {'server_id': 'async-refresh', 'refresh': True},
+                    )
+                )
+                assert result['refreshed'] is True
+
+            assert provider.list_calls == ['async-refresh']
+        finally:
+            runtime.close()
+
     def test_labeled_arguments_require_matching_trusted_server_identity(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -954,11 +1222,115 @@ class TestMcpPrimitive:
             result = runtime.mcp.call_tool(pid, 'call-failed', 'echo', {'text': 'hello'})
 
             assert result.status.value == 'transport_error'
+            assert 'mcp-provider-secret' not in str(result.error)
+            assert set(result.error or {}) == {'code', 'error_type', 'correlation_id'}
             effect = runtime.store.list_external_effects(pid=pid)[0]
             assert effect.transaction_state == 'unknown'
             assert effect.state_mutation
             assert effect.provider_metadata['outcome'] == 'unknown_provider_exception'
             assert 'mcp-provider-secret' not in str(effect.provider_metadata)
+        finally:
+            runtime.close()
+
+    def test_provider_exception_secret_is_absent_from_all_model_visible_and_durable_surfaces(self) -> None:
+        secret = "MCP_HOST_EXCEPTION_SECRET_SENTINEL"
+        runtime = Runtime.open("local")
+        provider = _FailingCallMcpProvider(secret)
+        runtime.mcp.provider = provider
+
+        class PlannedClient:
+            def __init__(self) -> None:
+                self.actions = [
+                    {
+                        "action": "call_mcp_tool",
+                        "server_id": "secret-surfaces",
+                        "tool_id": "echo",
+                        "arguments": {"text": "hello"},
+                    },
+                    {"action": "process_exit", "payload": {"done": True}},
+                ]
+
+            def complete_action(
+                self,
+                _messages: list[dict[str, str]],
+                _tools: list[dict[str, object]],
+            ) -> LLMCompletion:
+                action = self.actions.pop(0)
+                name = str(action.pop("action"))
+                return LLMCompletion(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": f"secret-surface-{len(self.actions)}",
+                            "name": name,
+                            "arguments": dumps(action),
+                        }
+                    ],
+                )
+
+        try:
+            pid = runtime.process.spawn(goal="provider exception surfaces")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("secret-surfaces"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:secret-surfaces:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+            runtime.tools.configure_process_tools(
+                pid,
+                ["call_mcp_tool", "process_exit"],
+                assigned_by="test",
+            )
+
+            tool_result = runtime.tools.call(
+                pid,
+                "call_mcp_tool",
+                {
+                    "server_id": "secret-surfaces",
+                    "tool_id": "echo",
+                    "arguments": {"text": "hello"},
+                },
+            )
+            syscall_result = asyncio.run(
+                LibOSSyscallSession(runtime, pid).handle(
+                    "mcp.call",
+                    {
+                        "server_id": "secret-surfaces",
+                        "tool_id": "echo",
+                        "arguments": {"text": "hello"},
+                    },
+                )
+            )
+
+            runtime.llm.client = PlannedClient()
+            runtime.run_process_once(pid)
+            runtime.run_process_once(pid)
+
+            observed = dumps(
+                {
+                    "tool_result": to_jsonable(tool_result),
+                    "syscall": syscall_result,
+                    "llm_records": [
+                        to_jsonable(record)
+                        for record in runtime.store.list_llm_calls(pid=pid)
+                    ],
+                    "audit": [to_jsonable(record) for record in runtime.audit.trace()],
+                    "events": [to_jsonable(event) for event in runtime.events.list()],
+                    "effects": [
+                        to_jsonable(effect)
+                        for effect in runtime.store.list_external_effects(pid=pid)
+                    ],
+                }
+            )
+            assert secret not in observed
+            assert "mcp_provider_error" in observed
+            assert "correlation_id" in observed
         finally:
             runtime.close()
 
@@ -1442,7 +1814,9 @@ class TestMcpPrimitive:
                     )
                 returned = runtime.data_flow.current_context()
 
-                assert str(raised.value) == "MCP_PROVIDER_ERROR_SENTINEL"
+                assert "MCP_PROVIDER_ERROR_SENTINEL" not in str(raised.value)
+                assert getattr(raised.value, 'code', None) == 'mcp_provider_error'
+                assert getattr(raised.value, 'correlation_id', None)
                 assert returned.labels.origin == "derived"
                 assert returned.labels.trust_level.value == "untrusted"
                 assert returned.labels.integrity.value == "untrusted"
@@ -1653,13 +2027,19 @@ class TestMcpPrimitive:
             runtime.capability.grant(pid, "mcp_server:demo", [CapabilityRight.READ, CapabilityRight.EXECUTE], issued_by="test")
             _grant_stdio_spawn(runtime, pid)
 
-            with pytest.raises(RuntimeError, match="tools/list failed"):
+            with pytest.raises(Exception) as raised:
                 runtime.mcp.list_tools("demo", actor=pid, refresh=True)
+
+            assert "SECRET_MCP_LIST_TOKEN" not in str(raised.value)
+            assert getattr(raised.value, 'code', None) == 'mcp_provider_error'
+            assert getattr(raised.value, 'correlation_id', None)
 
             assert provider.list_calls == ["demo"]
             process = runtime.process.get(pid)
             assert process.resource_usage.mcp_request_bytes > 0
-            assert process.resource_usage.mcp_response_bytes == 0
+            # Dispatch occurred without an exact response byte count, so the
+            # durable reservation settles at its fail-closed upper bound.
+            assert process.resource_usage.mcp_response_bytes == runtime.config.mcp.max_response_bytes
             effect = [item for item in runtime.store.list_external_effects() if item.provider == "mcp"][0]
             assert effect.operation == "list_tools"
             assert effect.target == "mcp_server:demo"
@@ -1960,6 +2340,32 @@ class _RecordingMcpProvider:
         )
 
 
+class _ValidatedCallMcpProvider(_RecordingMcpProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.validate_calls = 0
+
+    def validate_and_call(
+        self,
+        _server: Any,
+        _tool: Any,
+        arguments: dict[str, Any],
+        **_kwargs: Any,
+    ) -> McpProviderCallResult:
+        self.validate_calls += 1
+        return McpProviderCallResult(
+            structured_content={"echo": dict(arguments)},
+            content=[{"type": "text", "text": "ok"}],
+            response_bytes=19,
+            duration_s=0.02,
+            list_request_bytes=11,
+            list_response_bytes=13,
+            call_request_bytes=17,
+            call_response_bytes=19,
+            call_started=True,
+        )
+
+
 class _SnapshotExecutingMcpProvider(_RecordingMcpProvider):
     supports_executable_snapshots = True
 
@@ -2012,9 +2418,13 @@ class _NotStartedCallMcpProvider(_RecordingMcpProvider):
 
 
 class _FailingCallMcpProvider(_RecordingMcpProvider):
+    def __init__(self, message: str = "mcp-provider-secret") -> None:
+        super().__init__()
+        self.message = message
+
     def call_tool(self, server: Any, tool: Any, arguments: dict[str, Any], **_kwargs: Any) -> McpProviderCallResult:
         self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
-        raise RuntimeError('mcp-provider-secret')
+        raise RuntimeError(self.message)
 
 
 class _CallOnlyClassifierMcpProvider(_RecordingMcpProvider):

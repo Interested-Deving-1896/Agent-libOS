@@ -5,7 +5,7 @@ import builtins
 import hashlib
 import threading
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
@@ -42,20 +42,26 @@ from agent_libos.models import (
     ProcessSignal,
     ProcessStatus,
 )
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.effect_binding import canonical_effect_hash
-from agent_libos.storage import RuntimeStore
+from agent_libos.capability.effect_binding import canonical_effect_hash
+from agent_libos.storage import AuthorityRepository, ProcessRepository
 from agent_libos.substrate import HumanProvider, ProviderEffectNotStarted
 from agent_libos.sdk import (
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
+    ProtectedOperationSDK,
     ProviderPhase,
 )
+from agent_libos.ports import (
+    AuditPort,
+    EventPort,
+    HumanDataFlowPort,
+    OperationPort,
+    ProcessMessagePort,
+)
+from agent_libos.human.delivery import HumanDeliveryService
+from agent_libos.human.presentation import HumanPresentationService
+from agent_libos.human.requests import HumanRequestService
 from agent_libos.utils.serde import dumps, to_jsonable
-
-if TYPE_CHECKING:
-    from agent_libos.runtime.message_manager import ProcessMessageManager
 
 _SENSITIVE_HUMAN_AUDIT_KEYS = frozenset({"answer", "context", "decision", "message", "payload", "question", "reason"})
 _DATA_FLOW_CONTEXT_KEY = "_agent_libos_data_flow_context"
@@ -116,20 +122,40 @@ class HumanObjectManager:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        processes: ProcessRepository,
+        authority: AuthorityRepository,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus,
+        audit: AuditPort,
+        events: EventPort,
         provider: HumanProvider,
+        protected_operations: ProtectedOperationSDK,
+        authority_policy: Any,
+        operations: OperationPort,
+        requests: ProcessRepository,
+        messages: ProcessMessagePort,
+        data_flow: HumanDataFlowPort,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
-        self.store = store
+        self.processes = processes
+        self.authority = authority
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
         self.provider = provider
-        self._messages: ProcessMessageManager | None = None
+        self.protected_operations = protected_operations
+        self.authority_policy = authority_policy
+        self.operations = operations
+        self.data_flow = data_flow
+        self.requests = HumanRequestService(requests)
+        self.delivery = HumanDeliveryService(provider)
+        self.presentation = HumanPresentationService(
+            receipt_limit=(
+                self.config.gui.snapshot_collection_max_items
+                * _PRESENTATION_RECEIPT_PER_REQUEST_MULTIPLIER
+            )
+        )
+        self._messages = messages
         # A terminal is a single human decision stream. Serialize queue-head
         # claims and durable transitions so concurrent drains cannot act on the
         # same request, but never hold this lock across blocking provider I/O.
@@ -137,16 +163,6 @@ class HumanObjectManager:
         # transition lock.
         self._terminal_lock = threading.RLock()
         self._terminal_claims: set[str] = set()
-        self._presentation_receipt_lock = threading.RLock()
-        self._presentation_receipts: dict[
-            tuple[str, str, int],
-            tuple[str, Any],
-        ] = {}
-        self._presentation_receipt_limit = max(
-            1,
-            self.config.gui.snapshot_collection_max_items
-            * _PRESENTATION_RECEIPT_PER_REQUEST_MULTIPLIER,
-        )
         self._data_release_parent_request: ContextVar[str | None] = ContextVar(
             f"agent_libos_human_release_parent_{id(self)}",
             default=None,
@@ -155,9 +171,6 @@ class HumanObjectManager:
             f"agent_libos_human_release_presentation_{id(self)}",
             default=None,
         )
-
-    def bind_messages(self, messages: "ProcessMessageManager") -> None:
-        self._messages = messages
 
     def query(
         self,
@@ -218,16 +231,16 @@ class HumanObjectManager:
         # Request persistence, scheduler suspension, and observability are one
         # commit. A caller may therefore safely restore a reserved one-shot
         # capability if this method raises: no pending request was left behind.
-        with self.store.transaction():
-            process = self.store.get_process(pid)
+        with self.requests.transaction():
+            process = self.processes.get_process(pid)
             if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
                 raise ValidationError(
                     f"terminal process cannot create human requests: {pid} status={process.status.value}"
                 )
-            self.store.insert_human_request(human_request)
+            self.requests.insert(human_request)
             release_parent_id = request.get(_DATA_RELEASE_FOR_REQUEST_KEY)
             if _trusted_data_release and isinstance(release_parent_id, str):
-                release_parent = self.store.get_human_request(release_parent_id)
+                release_parent = self.requests.get(release_parent_id)
                 if release_parent is None:
                     raise ValidationError(
                         f"data release parent Human request not found: {release_parent_id}"
@@ -252,7 +265,7 @@ class HumanObjectManager:
                     links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
                     previous_id = links.get(presentation)
                     if isinstance(previous_id, str) and previous_id != human_request.request_id:
-                        previous = self.store.get_human_request(previous_id)
+                        previous = self.requests.get(previous_id)
                         if previous is not None and previous.status == HumanRequestStatus.PENDING:
                             previous.status = HumanRequestStatus.CANCELLED
                             previous.decision = {
@@ -260,7 +273,7 @@ class HumanObjectManager:
                                 "automatic_retry_disabled": True,
                             }
                             previous.updated_at = utc_now()
-                            self.store.update_human_request(previous)
+                            self.requests.update(previous)
                     links[presentation] = human_request.request_id
                     release_parent.payload[_DATA_RELEASE_REQUESTS_KEY] = links
                 # A presentation release is internal gate state.  It must not
@@ -268,16 +281,14 @@ class HumanObjectManager:
                 # otherwise creating the release would invalidate itself.
                 if not (isinstance(presentation, str) and presentation):
                     release_parent.updated_at = utc_now()
-                self.store.update_human_request(release_parent)
-            operations = getattr(self.store, "operation_manager", None)
-            if operations is not None:
-                operations.expect("approval")
-                operations.link_evidence(
-                    "human_request",
-                    human_request.request_id,
-                    "approval",
-                    metadata={"status": human_request.status.value, "blocking": blocking},
-                )
+                self.requests.update(release_parent)
+            self.operations.expect("approval")
+            self.operations.link_evidence(
+                "human_request",
+                human_request.request_id,
+                "approval",
+                metadata={"status": human_request.status.value, "blocking": blocking},
+            )
             if blocking:
                 # Blocking human requests suspend scheduling for this process until
                 # a terminal queue decision moves it back to RUNNABLE.
@@ -292,7 +303,15 @@ class HumanObjectManager:
                         else f"waiting for human request {human_request.request_id}"
                     )
                     process.updated_at = utc_now()
-                    self.store.update_process(process)
+                    self.processes.patch_process(
+                        process.pid,
+                        {
+                            "status": process.status,
+                            "status_message": process.status_message,
+                            "updated_at": process.updated_at,
+                        },
+                        expected_revision=process.revision,
+                    )
             self.events.emit(
                 EventType.HUMAN_QUERY,
                 source=pid,
@@ -354,7 +373,7 @@ class HumanObjectManager:
         presentation = self._data_release_presentation.get()
         presentation_release = isinstance(presentation, str) and bool(presentation)
         if parent_request_id is not None:
-            parent = self.store.get_human_request(parent_request_id)
+            parent = self.requests.get(parent_request_id)
             if parent is None or (
                 parent.status != HumanRequestStatus.PENDING
                 and not presentation_release
@@ -370,7 +389,7 @@ class HumanObjectManager:
                 else parent.payload.get(_DATA_RELEASE_REQUEST_KEY)
             )
             if isinstance(existing_id, str):
-                existing = self.store.get_human_request(existing_id)
+                existing = self.requests.get(existing_id)
                 if (
                     existing is not None
                     and existing.status == HumanRequestStatus.PENDING
@@ -409,9 +428,7 @@ class HumanObjectManager:
         source_oids: Iterable[str] | None = None,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
-        manifests = getattr(self.store, "authority_manifest_manager", None)
-        if manifests is not None:
-            manifests.assert_capability_request(pid, resource, rights)
+        self.authority_policy.assert_capability_request(pid, resource, rights)
         decision = self.capabilities.require(
             pid,
             f"human:{selected_human}",
@@ -746,7 +763,7 @@ class HumanObjectManager:
                 "process interrupt signals are not state transitions; "
                 "send a durable interrupt process message instead"
             )
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         if sig == ProcessSignal.PAUSE:
@@ -757,7 +774,12 @@ class HumanObjectManager:
             process.status = ProcessStatus.KILLED
         process.status_message = (payload or {}).get("reason")
         process.updated_at = utc_now()
-        self.store.update_process(process)
+        process = self.processes.transition_process(
+            pid,
+            process.status,
+            expected_revision=process.revision,
+            status_message=process.status_message,
+        )
         if process.status in self.TERMINAL_PROCESS_STATUSES:
             self.cancel_pending_for_process(
                 pid,
@@ -791,8 +813,6 @@ class HumanObjectManager:
         subject: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> ProcessMessage:
-        if self._messages is None:
-            raise RuntimeError("HumanObjectManager is not bound to a ProcessMessageManager")
         selected_human = human or self.config.runtime.default_human
         selected_kind = ProcessMessageKind(kind)
         message_payload = dict(payload or {})
@@ -849,7 +869,7 @@ class HumanObjectManager:
             context=flow,
             payload=message,
         )
-        reservation_id = self._reserve_one_time_decision(decision, used_by="human")
+        reservation_id: str | None = None
         request = HumanRequest(
             request_id=new_id("hreq"),
             pid=pid,
@@ -871,48 +891,45 @@ class HumanObjectManager:
         # terminal lock. Exit/cancel can proceed and a late delivery rechecks
         # the durable pending state.
         with self._terminal_lock:
-            try:
-                self.store.insert_human_request(request)
-                operations = getattr(self.store, "operation_manager", None)
-                if operations is not None:
-                    operations.expect("approval")
-                    operations.link_evidence(
-                        "human_request",
-                        request.request_id,
-                        "approval",
-                        metadata={"status": request.status.value, "blocking": request.blocking},
-                    )
-            except Exception:
-                self._restore_one_time_decision(reservation_id)
-                raise
+            with self.requests.transaction():
+                reservation_id = self._reserve_one_time_decision(decision, used_by="human")
+                self.requests.insert(request)
+                self.operations.expect("approval")
+                self.operations.link_evidence(
+                    "human_request",
+                    request.request_id,
+                    "approval",
+                    metadata={"status": request.status.value, "blocking": request.blocking},
+                )
+            # Only publish the in-memory claim after the durable transaction
+            # containing authority, request, and evidence has committed.
             self._terminal_claims.add(request.request_id)
         try:
             try:
                 delivered = self._deliver_output_request(request)
             except Exception:
-                latest = self.store.get_human_request(request.request_id)
-                if latest is None or latest.status == HumanRequestStatus.PENDING:
-                    # A pre-effect failure must not leave a retryable pending
-                    # output after returning its authority to the subject: a
-                    # later terminal drain could otherwise deliver it after the
-                    # restored one-shot grant had been spent elsewhere.
-                    if latest is not None:
-                        latest.status = HumanRequestStatus.CANCELLED
-                        latest.decision = {"delivery_committed": False, "cancelled_before_delivery": True}
-                        latest.updated_at = utc_now()
-                        try:
-                            self.store.update_human_request(latest)
-                        except Exception:
+                with self._terminal_lock:
+                    with self.requests.transaction():
+                        latest = self.requests.get(request.request_id)
+                        if latest is None or latest.status == HumanRequestStatus.PENDING:
+                            # A pre-effect failure must not leave a retryable
+                            # request after returning one-shot authority.
+                            if latest is not None:
+                                latest.status = HumanRequestStatus.CANCELLED
+                                latest.decision = {
+                                    "delivery_committed": False,
+                                    "cancelled_before_delivery": True,
+                                }
+                                latest.updated_at = utc_now()
+                                self.requests.update(latest)
+                            self._restore_one_time_decision(reservation_id)
+                        else:
+                            # The provider boundary was crossed or its outcome
+                            # is unknown. Never resurrect one-shot authority.
                             self._commit_one_time_decision(reservation_id)
-                            raise
-                    self._restore_one_time_decision(reservation_id)
-                else:
-                    # The durable effect intent was committed before provider
-                    # invocation; a provider exception is therefore ambiguous
-                    # and must not resurrect one-shot authority.
-                    self._commit_one_time_decision(reservation_id)
                 raise
-            self._commit_one_time_decision(reservation_id)
+            with self.requests.transaction():
+                self._commit_one_time_decision(reservation_id)
         finally:
             with self._terminal_lock:
                 self._terminal_claims.discard(request.request_id)
@@ -932,7 +949,7 @@ class HumanObjectManager:
         return selected
 
     def get(self, request_id: str) -> HumanRequest:
-        request = self.store.get_human_request(request_id)
+        request = self.requests.get(request_id)
         if request is None:
             raise NotFound(f"human request not found: {request_id}")
         return request
@@ -1018,7 +1035,7 @@ class HumanObjectManager:
             ):
                 release_id = view.get("release_request_id")
                 release = (
-                    self.store.get_human_request(release_id)
+                    self.requests.get(release_id)
                     if isinstance(release_id, str) and release_id
                     else None
                 )
@@ -1057,9 +1074,7 @@ class HumanObjectManager:
     ) -> dict[str, Any]:
         """Return one request only after its presentation Sink authorizes it."""
 
-        selected_presentation = str(presentation).strip().lower()
-        if selected_presentation != "gui":
-            raise ValidationError(f"unsupported Human presentation: {presentation}")
+        selected_presentation = self.presentation.normalize(presentation)
         # Replayed views are not a new Host-to-provider handoff: the exact
         # bytes were already delivered to this provider session.  Still hold
         # the Store lock through the final current-policy/source check and the
@@ -1067,16 +1082,14 @@ class HumanObjectManager:
         # slip between the guard and the returned view.  The first delivery
         # continues through ProtectedOperation below and performs its own
         # dispatch-time revalidation.
-        with self.store.locked():
+        with self.processes.locked():
             fresh = self.get(request.request_id)
             raw = self._raw_public_request_view(fresh)
             if fresh.payload.get("type") == "data_release_approval":
                 return raw
 
             context = self._request_data_flow_context(fresh)
-            manager = getattr(self, "data_flow", None)
-            if manager is None:
-                return self.public_request_view(fresh)
+            manager = self.data_flow
             sink = self._presentation_sink(fresh, selected_presentation)
             view_sha256 = hashlib.sha256(
                 dumps(to_jsonable(raw)).encode("utf-8")
@@ -1141,18 +1154,14 @@ class HumanObjectManager:
         without changing the parent request or its process.
         """
 
-        selected_presentation = str(presentation).strip().lower()
-        if selected_presentation != "gui":
-            raise ValidationError(f"unsupported Human presentation: {presentation}")
+        selected_presentation = self.presentation.normalize(presentation)
         request_id = request.request_id if isinstance(request, HumanRequest) else request
         fresh = self.get(request_id)
         if fresh.payload.get("type") == "data_release_approval":
             return False
 
         context = self._request_data_flow_context(fresh)
-        manager = getattr(self, "data_flow", None)
-        if manager is None:
-            return True
+        manager = self.data_flow
         sink = self._presentation_sink(fresh, selected_presentation)
         outcome = manager.classify_egress_snapshot(
             sink=sink,
@@ -1214,7 +1223,7 @@ class HumanObjectManager:
         presentation: str,
     ) -> HumanRequest | None:
         release_id = self._linked_presentation_release_id(request, presentation)
-        return self.store.get_human_request(release_id) if release_id is not None else None
+        return self.requests.get(release_id) if release_id is not None else None
 
     def _presentation_is_visible(
         self,
@@ -1236,7 +1245,7 @@ class HumanObjectManager:
             or release_id != self._linked_presentation_release_id(request, presentation)
         ):
             return False
-        release = self.store.get_human_request(release_id)
+        release = self.requests.get(release_id)
         if release is None or release.status != HumanRequestStatus.APPROVED:
             return False
         once = release.payload.get("requested_once_capability")
@@ -1244,12 +1253,8 @@ class HumanObjectManager:
             return False
         resource = once.get("resource")
         constraints = once.get("constraints")
-        manager = getattr(self, "data_flow", None)
-        if (
-            manager is None
-            or not isinstance(resource, str)
-            or not isinstance(constraints, Mapping)
-        ):
+        manager = self.data_flow
+        if not isinstance(resource, str) or not isinstance(constraints, Mapping):
             return False
         binding = constraints.get(manager.RELEASE_BINDING_KEY)
         if not manager.is_release_binding_current(
@@ -1267,7 +1272,7 @@ class HumanObjectManager:
             capability.resource == resource
             and capability.constraints == dict(constraints)
             and capability.uses_remaining == 0
-            for capability in self.store.list_capabilities(subject=request.pid)
+            for capability in self.authority.list_capabilities(subject=request.pid)
         )
 
     def _presentation_was_delivered(
@@ -1285,17 +1290,12 @@ class HumanObjectManager:
         current policy remains ALLOW and the public view hash is unchanged.
         """
 
-        key = (presentation, request.request_id, id(provider))
-        with self._presentation_receipt_lock:
-            receipt = self._presentation_receipts.get(key)
-            delivered = bool(
-                receipt is not None
-                and receipt[0] == view_sha256
-                and receipt[1] is provider
-            )
-            if delivered:
-                self._presentation_receipts[key] = self._presentation_receipts.pop(key)
-            return delivered
+        return self.presentation.was_delivered(
+            presentation=presentation,
+            request_id=request.request_id,
+            provider=provider,
+            view_sha256=view_sha256,
+        )
 
     def _mark_presentation_delivered(
         self,
@@ -1305,15 +1305,12 @@ class HumanObjectManager:
         view_sha256: str,
         provider: Any,
     ) -> None:
-        key = (presentation, request.request_id, id(provider))
-        with self._presentation_receipt_lock:
-            self._presentation_receipts.pop(key, None)
-            # Keep a bounded strong reference so CPython object-id reuse can
-            # never make a new provider/session inherit an old receipt.
-            self._presentation_receipts[key] = (view_sha256, provider)
-            while len(self._presentation_receipts) > self._presentation_receipt_limit:
-                oldest = next(iter(self._presentation_receipts))
-                self._presentation_receipts.pop(oldest, None)
+        self.presentation.mark_delivered(
+            presentation=presentation,
+            request_id=request.request_id,
+            provider=provider,
+            view_sha256=view_sha256,
+        )
 
     def _protected_presentation_view(
         self,
@@ -1384,7 +1381,7 @@ class HumanObjectManager:
         )
 
         def mark_visible() -> None:
-            latest = self.store.get_human_request(request.request_id)
+            latest = self.requests.get(request.request_id)
             if latest is None:
                 raise NotFound(f"human request not found: {request.request_id}")
             latest_view = self._raw_public_request_view(latest)
@@ -1404,7 +1401,7 @@ class HumanObjectManager:
             }
             latest.payload = dict(latest.payload)
             latest.payload[_DATA_RELEASE_VISIBLE_KEY] = visible
-            self.store.update_human_request(latest)
+            self.requests.update(latest)
 
         parent_token = self._data_release_parent_request.set(request.request_id)
         presentation_token = self._data_release_presentation.set(presentation)
@@ -1515,9 +1512,7 @@ class HumanObjectManager:
             DataSensitivity.NORMAL
         ):
             return False
-        manager = getattr(self, "data_flow", None)
-        if manager is None:
-            return True
+        manager = self.data_flow
         try:
             trust = manager.resolve_sink_trust(
                 DataSink(
@@ -1541,7 +1536,7 @@ class HumanObjectManager:
         release_request_id = request.payload.get(_DATA_RELEASE_REQUEST_KEY)
         if not isinstance(release_request_id, str) or not release_request_id:
             return False
-        release = self.store.get_human_request(release_request_id)
+        release = self.requests.get(release_request_id)
         if release is None:
             return False
         decision = release.decision or {}
@@ -1570,7 +1565,7 @@ class HumanObjectManager:
             capability.resource == resource
             and capability.constraints == constraints
             and capability.uses_remaining == 0
-            for capability in self.store.list_capabilities(subject=request.pid)
+            for capability in self.authority.list_capabilities(subject=request.pid)
         )
 
     def list(self, pid: str | None = None, *, limit: int | None = None) -> builtins.list[HumanRequest]:
@@ -1579,7 +1574,7 @@ class HumanObjectManager:
         # the newest historical window for observability.
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
             raise ValidationError("Human request list limit must be a positive integer")
-        pending = self.store.list_human_requests(
+        pending = self.requests.list(
             pid=pid,
             status=HumanRequestStatus.PENDING,
             limit=limit,
@@ -1591,7 +1586,7 @@ class HumanObjectManager:
             # The recent window can overlap every selected pending row. Fetch
             # only enough extra rows to fill the requested distinct window.
             recent_limit = min(recent_limit, limit + len(pending))
-        recent = self.store.list_human_requests(
+        recent = self.requests.list(
             pid=pid,
             limit=recent_limit,
             newest=True,
@@ -1601,7 +1596,7 @@ class HumanObjectManager:
         return combined if limit is None else combined[:limit]
 
     def pending(self, human: str | None = None) -> builtins.list[HumanRequest]:
-        return self.store.list_human_requests(
+        return self.requests.list(
             human=human,
             status=HumanRequestStatus.PENDING,
             limit=self.config.tools.human_request_list_limit,
@@ -1611,15 +1606,15 @@ class HumanObjectManager:
         """Cancel every pending request owned by a terminal process."""
         cancelled: builtins.list[str] = []
         with self._terminal_lock:
-            with self.store.transaction():
-                for request in self.store.list_human_requests(
+            with self.requests.transaction():
+                for request in self.requests.list(
                     pid=pid,
                     status=HumanRequestStatus.PENDING,
                 ):
                     request.status = HumanRequestStatus.CANCELLED
                     request.decision = {"cancelled_by": actor, "reason": reason}
                     request.updated_at = utc_now()
-                    self.store.update_human_request(request)
+                    self.requests.update(request)
                     cancelled.append(request.request_id)
                     self.events.emit(
                         EventType.HUMAN_RESPONSE,
@@ -1684,7 +1679,7 @@ class HumanObjectManager:
                 # one-shot release. Never let that implementation detail escape
                 # as an endlessly duplicated queue item.
                 with self._terminal_lock:
-                    release = self.store.get_human_request(exc.request_id)
+                    release = self.requests.get(exc.request_id)
                     if (
                         release is None
                         or release.human != selected_human
@@ -1814,18 +1809,16 @@ class HumanObjectManager:
         *,
         required_presentation: str | None = None,
     ) -> HumanRequest:
-        operations = getattr(self.store, "operation_manager", None)
-        if operations is not None:
-            candidates = operations.operation_for_evidence(("human_request",), request_id)
-            if len(candidates) == 1:
-                with operations.attach(candidates[0].operation_id):
-                    return self._decide_impl(
-                        request_id,
-                        status,
-                        decision,
-                        responder,
-                        required_presentation=required_presentation,
-                    )
+        candidates = self.operations.operation_for_evidence(("human_request",), request_id)
+        if len(candidates) == 1:
+            with self.operations.attach(candidates[0].operation_id):
+                return self._decide_impl(
+                    request_id,
+                    status,
+                    decision,
+                    responder,
+                    required_presentation=required_presentation,
+                )
         return self._decide_impl(
             request_id,
             status,
@@ -1844,13 +1837,13 @@ class HumanObjectManager:
         required_presentation: str | None = None,
     ) -> HumanRequest:
         with self._terminal_lock:
-            with self.store.transaction():
-                request = self.store.get_human_request(request_id)
+            with self.requests.transaction():
+                request = self.requests.get(request_id)
                 if request is None:
                     raise NotFound(f"human request not found: {request_id}")
                 if request.status != HumanRequestStatus.PENDING:
                     raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
-                process = self.store.get_process(request.pid)
+                process = self.processes.get_process(request.pid)
                 if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
                     raise ValidationError(
                         f"terminal process cannot receive a human decision: {request.pid} status={process.status.value}"
@@ -1870,6 +1863,9 @@ class HumanObjectManager:
                     )
                 self._validate_decision_side_effects(request, status, decision)
                 self._apply_decision_side_effects(request, status, decision, responder)
+                # Capability/permission side effects may advance the process
+                # revision.  Never write the pre-side-effect snapshot back.
+                process = self.processes.get_process(request.pid)
                 permission_related = False
                 permission_spec = request.payload.get("requested_permission")
                 if isinstance(permission_spec, dict):
@@ -1881,7 +1877,7 @@ class HumanObjectManager:
                 request.status = status
                 request.decision = decision
                 request.updated_at = utc_now()
-                self.store.update_human_request(request)
+                self.requests.update(request)
                 release_parent = (
                     self._cancel_linked_request_for_release(
                         request,
@@ -1894,7 +1890,7 @@ class HumanObjectManager:
                 if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
                     remaining = [
                         pending
-                        for pending in self.store.list_human_requests(
+                        for pending in self.requests.list(
                             pid=request.pid,
                             status=HumanRequestStatus.PENDING,
                         )
@@ -1926,7 +1922,15 @@ class HumanObjectManager:
                                 else f"human rejected {request_id}"
                             )
                     process.updated_at = utc_now()
-                    self.store.update_process(process)
+                    self.processes.patch_process(
+                        process.pid,
+                        {
+                            "status": process.status,
+                            "status_message": process.status_message,
+                            "updated_at": process.updated_at,
+                        },
+                        expected_revision=process.revision,
+                    )
                 response_evidence = {
                     "request_id": request_id,
                     "status": status.value,
@@ -1973,7 +1977,7 @@ class HumanObjectManager:
         parent_id = release.payload.get(_DATA_RELEASE_FOR_REQUEST_KEY)
         if not isinstance(parent_id, str) or not parent_id:
             return None
-        parent = self.store.get_human_request(parent_id)
+        parent = self.requests.get(parent_id)
         if parent is None or parent.status != HumanRequestStatus.PENDING:
             return None
         parent.status = HumanRequestStatus.CANCELLED
@@ -1985,7 +1989,7 @@ class HumanObjectManager:
             "sensitive_payload_delivered": False,
         }
         parent.updated_at = utc_now()
-        self.store.update_human_request(parent)
+        self.requests.update(parent)
         return parent
 
     def _validate_decision_side_effects(
@@ -2116,7 +2120,11 @@ class HumanObjectManager:
             raise ValidationError(f"{label} must include a string resource")
         subject = spec.get("subject", default_subject)
         if not isinstance(subject, str):
-            subject = default_subject
+            raise ValidationError(f"{label} subject must be a string")
+        if subject != default_subject:
+            raise ValidationError(
+                f"{label} subject must match request process: {default_subject}"
+            )
         rights = spec.get("rights", ["execute"])
         if not isinstance(rights, list):
             rights = ["execute"]
@@ -2400,17 +2408,18 @@ class HumanObjectManager:
         text: str,
         purpose: str,
     ) -> str | None:
-        operations = getattr(self.store, "operation_manager", None)
-        if operations is not None:
-            candidates = operations.operation_for_evidence(("human_request",), request.request_id)
-            if len(candidates) == 1:
-                with operations.attach(candidates[0].operation_id):
-                    return self._terminal_provider_io_impl(
-                        request,
-                        operation=operation,
-                        text=text,
-                        purpose=purpose,
-                    )
+        candidates = self.operations.operation_for_evidence(
+            ("human_request",),
+            request.request_id,
+        )
+        if len(candidates) == 1:
+            with self.operations.attach(candidates[0].operation_id):
+                return self._terminal_provider_io_impl(
+                    request,
+                    operation=operation,
+                    text=text,
+                    purpose=purpose,
+                )
         return self._terminal_provider_io_impl(
             request,
             operation=operation,
@@ -2486,8 +2495,8 @@ class HumanObjectManager:
             nonlocal provider_attempted
             provider_attempted = True
             if operation == "read":
-                return self.provider.read(text)
-            self.provider.write(text)
+                return self.delivery.read(text)
+            self.delivery.write(text)
             return None
 
         release_parent_token = self._data_release_parent_request.set(request.request_id)
@@ -2553,8 +2562,8 @@ class HumanObjectManager:
         evidence: dict[str, Any] | None = None
         latest: HumanRequest | None = None
         with self._terminal_lock:
-            with self.store.transaction():
-                latest = self.store.get_human_request(request.request_id)
+            with self.requests.transaction():
+                latest = self.requests.get(request.request_id)
                 if latest is None or latest.status != HumanRequestStatus.PENDING:
                     return
                 latest.status = HumanRequestStatus.CANCELLED
@@ -2567,18 +2576,18 @@ class HumanObjectManager:
                     "error_type": type(error).__name__,
                 }
                 latest.updated_at = utc_now()
-                self.store.update_human_request(latest)
+                self.requests.update(latest)
                 release_parent = self._cancel_linked_request_for_release(
                     latest,
                     outcome="provider_outcome_unknown",
                     actor="runtime:human-provider",
                 )
 
-                process = self.store.get_process(latest.pid)
+                process = self.processes.get_process(latest.pid)
                 if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
                     remaining = [
                         pending
-                        for pending in self.store.list_human_requests(
+                        for pending in self.requests.list(
                             pid=latest.pid,
                             status=HumanRequestStatus.PENDING,
                         )
@@ -2601,7 +2610,15 @@ class HumanObjectManager:
                                 "manual recovery required"
                             )
                     process.updated_at = utc_now()
-                    self.store.update_process(process)
+                    self.processes.patch_process(
+                        process.pid,
+                        {
+                            "status": process.status,
+                            "status_message": process.status_message,
+                            "updated_at": process.updated_at,
+                        },
+                        expected_revision=process.revision,
+                    )
 
                 evidence = {
                     "request_id": latest.request_id,
@@ -2644,14 +2661,7 @@ class HumanObjectManager:
             pass
 
     def _protected(self) -> Any:
-        sdk = (
-            getattr(self, "protected_operations", None)
-            or getattr(self, "protected_operation_sdk", None)
-            or getattr(self.store, "protected_operation_sdk", None)
-        )
-        if sdk is None:
-            raise ValidationError("Human protected-operation SDK is not attached")
-        return sdk
+        return self.protected_operations
 
     def _protected_terminal_evidence(
         self,
@@ -2806,14 +2816,14 @@ class HumanObjectManager:
 
         def prepare() -> None:
             nonlocal request
-            latest = self.store.get_human_request(request.request_id)
+            latest = self.requests.get(request.request_id)
             if latest is None:
                 raise NotFound(f"human request not found: {request.request_id}")
             if latest.status != HumanRequestStatus.PENDING:
                 raise ValidationError(
                     f"human output request is not pending: {request.request_id} status={latest.status.value}"
                 )
-            process = self.store.get_process(latest.pid)
+            process = self.processes.get_process(latest.pid)
             if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
                 raise ValidationError(
                     f"terminal process cannot deliver human output: {latest.pid} status={process.status.value}"
@@ -2822,10 +2832,10 @@ class HumanObjectManager:
             request.status = HumanRequestStatus.DELIVERED
             request.decision = {"delivery_committed": True}
             request.updated_at = utc_now()
-            self.store.update_human_request(request)
+            self.requests.update(request)
 
         def restore_not_started() -> None:
-            latest = self.store.get_human_request(request.request_id)
+            latest = self.requests.get(request.request_id)
             if latest is not None and latest.status == HumanRequestStatus.DELIVERED:
                 latest.status = HumanRequestStatus.PENDING
                 latest.decision = {
@@ -2833,15 +2843,15 @@ class HumanObjectManager:
                     "provider_not_started": True,
                 }
                 latest.updated_at = utc_now()
-                self.store.update_human_request(latest)
+                self.requests.update(latest)
 
         def settle_success() -> None:
-            latest = self.store.get_human_request(request.request_id)
+            latest = self.requests.get(request.request_id)
             if latest is None:
                 raise NotFound(f"human request not found: {request.request_id}")
             latest.decision = {"delivery_committed": True, "delivered": True}
             latest.updated_at = utc_now()
-            self.store.update_human_request(latest)
+            self.requests.update(latest)
 
         invocation = ProtectedOperationInvocation(
             pid=request.pid,
@@ -2872,7 +2882,7 @@ class HumanObjectManager:
                 def write_once() -> None:
                     nonlocal provider_attempted
                     provider_attempted = True
-                    self.provider.write(message)
+                    self.delivery.write(message)
 
                 protected.call(
                     ProviderPhase("output", state_mutation=True, information_flow=True),
@@ -2896,7 +2906,7 @@ class HumanObjectManager:
             }
             request.updated_at = utc_now()
             try:
-                self.store.update_human_request(request)
+                self.requests.update(request)
             except Exception:
                 pass
             raise
@@ -2907,7 +2917,7 @@ class HumanObjectManager:
         request.decision = {"delivery_committed": True, "delivered": True}
         request.updated_at = utc_now()
         try:
-            self.store.update_human_request(request)
+            self.requests.update(request)
         except Exception:
             pass
         return result
@@ -2919,7 +2929,6 @@ class HumanObjectManager:
         source_oids: Iterable[str] | None = None,
         public_metadata: bool = False,
     ) -> DataFlowContext:
-        manager = getattr(self, "data_flow", None)
         if public_metadata:
             return DataFlowContext(
                 labels=DataLabels(
@@ -2929,9 +2938,7 @@ class HumanObjectManager:
                     origin="runtime:data-release-metadata",
                 )
             )
-        if manager is None:
-            return DataFlowContext()
-        return manager.context_from_source_oids(pid, source_oids)
+        return self.data_flow.context_from_source_oids(pid, source_oids)
 
     def _request_data_flow_context(self, request: HumanRequest) -> DataFlowContext:
         raw = request.payload.get(_DATA_FLOW_CONTEXT_KEY)
@@ -2953,10 +2960,7 @@ class HumanObjectManager:
         context: DataFlowContext,
         payload: Any,
     ) -> None:
-        manager = getattr(self, "data_flow", None)
-        if manager is None:
-            return
-        manager.precheck_egress_clearance(
+        self.data_flow.precheck_egress_clearance(
             pid=pid,
             sink=DataSink(identity=f"human:{human}:{channel}"),
             context=context,
@@ -2964,10 +2968,9 @@ class HumanObjectManager:
         )
 
     def _observe_human_response(self, request_context: DataFlowContext) -> None:
-        manager = getattr(self, "data_flow", None)
-        if manager is None:
-            return
-        manager.observe_ingress(self._human_response_context(request_context))
+        self.data_flow.observe_ingress(
+            self._human_response_context(request_context)
+        )
 
     @staticmethod
     def _human_response_context(request_context: DataFlowContext) -> DataFlowContext:
@@ -2990,7 +2993,7 @@ class HumanObjectManager:
             raise ValidationError(
                 f"prepared Human output is missing request identity: {effect.effect_id}"
             )
-        request = self.store.get_human_request(request_id)
+        request = self.requests.get(request_id)
         if request is None:
             raise NotFound(f"human request not found during prepared recovery: {request_id}")
         if request.status == HumanRequestStatus.PENDING:
@@ -3007,7 +3010,7 @@ class HumanObjectManager:
             "startup_recovered": True,
         }
         request.updated_at = utc_now()
-        self.store.update_human_request(request)
+        self.requests.update(request)
 
     def _default_message_subject(self, kind: ProcessMessageKind) -> str:
         if kind == ProcessMessageKind.INTERRUPT:

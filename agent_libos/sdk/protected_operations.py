@@ -24,7 +24,7 @@ from agent_libos.models import (
     ResourceUsage,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
-from agent_libos.runtime.external_effects import (
+from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     classify_external_effect,
     mark_external_effect_dispatched,
@@ -33,6 +33,7 @@ from agent_libos.runtime.external_effects import (
     require_external_effect_classifier,
 )
 from agent_libos.substrate import ProviderEffectNotStarted
+from agent_libos.ports import EffectAuthorityPort, ProtectedEffectPort
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 
@@ -119,6 +120,7 @@ class ResourceSettlement:
     context: Mapping[str, Any] = field(default_factory=dict)
     allow_overage: bool = True
     kill_on_exceed: bool = True
+    charge_reserved_maximum: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +185,7 @@ class ProtectedOperationInvocation:
     observation: Mapping[str, Any] = field(default_factory=dict)
     idempotency_key: str | None = None
     preflight_usage: ResourceUsage | Mapping[str, Any] | None = None
+    reservation_usage: ResourceUsage | Mapping[str, Any] | None = None
     resource_source: str | None = None
     resource_context: Mapping[str, Any] = field(default_factory=dict)
     prepare: Hook | None = None
@@ -228,7 +231,8 @@ class ProtectedOperationSDK:
     def __init__(
         self,
         *,
-        store: Any,
+        effects: ProtectedEffectPort,
+        authority_policy: EffectAuthorityPort,
         capabilities: Any,
         audit: Any,
         events: Any,
@@ -236,7 +240,8 @@ class ProtectedOperationSDK:
         operations: Any,
         data_flow: Any | None = None,
     ) -> None:
-        self.store = store
+        self.effects = effects
+        self.authority_policy = authority_policy
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
@@ -274,7 +279,7 @@ class ProtectedOperationSDK:
         """Restore local prepare state that never reached a provider phase."""
 
         recovered: list[str] = []
-        for effect in self.store.list_external_effects():
+        for effect in self.effects.list_external_effects():
             if effect.effect_state != "pending" or effect.transaction_state != "prepared":
                 continue
             protected = effect.provider_metadata.get("protected_operation")
@@ -301,7 +306,7 @@ class ProtectedOperationSDK:
                 f"protected operation reserved authority for {contract_name}"
             )
             for reservation_id in raw_reservations:
-                reservation = self.store.get_capability_use_reservation(reservation_id)
+                reservation = self.effects.get_capability_use_reservation(reservation_id)
                 if reservation is None or reservation.get("status") != "reserved":
                     continue
                 if (
@@ -323,7 +328,7 @@ class ProtectedOperationSDK:
                     raise ValidationError(
                         f"prepared recovery handler is not registered: {recovery_name}"
                     )
-            with self.store.transaction():
+            with self.effects.transaction():
                 if handler is not None:
                     handler(effect)
                 for reservation_id in reversed(tuple(raw_reservations)):
@@ -335,7 +340,11 @@ class ProtectedOperationSDK:
                             f"{contract_name}"
                         ),
                     )
-                abandon_external_effect_intent(self.store, effect.effect_id)
+                abandon_external_effect_intent(
+                    self.effects,
+                    effect.effect_id,
+                    operations=self.operations,
+                )
             recovered.append(effect.effect_id)
         return recovered
 
@@ -344,6 +353,24 @@ class ProtectedOperationSDK:
         if current is None or current.sdk_identity != self._identity:
             return None
         return current.contract_name, current.phase_name, current.effect_id
+
+    def activate_boundary(
+        self,
+        *,
+        contract_name: str,
+        phase_name: str,
+        effect_id: str,
+    ) -> Token[_ActiveBoundary | None]:
+        """Enter this SDK instance's provider boundary for one phase."""
+
+        return _CURRENT_BOUNDARY.set(
+            _ActiveBoundary(
+                sdk_identity=self._identity,
+                contract_name=contract_name,
+                phase_name=phase_name,
+                effect_id=effect_id,
+            )
+        )
 
     def start(
         self,
@@ -388,6 +415,7 @@ class ProtectedOperation:
         self._data_flow_registry_generation: int | None = None
         self._data_flow_ingress_observed = False
         self._operation_cm: Any | None = None
+        self._resource_reservation_id: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -576,12 +604,12 @@ class ProtectedOperation:
                 if isinstance(classified_receipt, Mapping)
                 else {}
             )
-            with self.sdk.store.transaction():
+            with self.sdk.effects.transaction():
                 if settle_success is not None:
                     settle_success()
                 event, audit_record = self._persist_evidence(evidence)
                 record_external_effect(
-                    self.sdk.store,
+                    self.sdk.effects,
                     pid=self.invocation.pid,
                     provider=self.contract.provider,
                     operation=self.contract.operation,
@@ -598,11 +626,17 @@ class ProtectedOperation:
                         "provider_receipt": provider_receipt,
                     },
                     intent_effect_id=self.effect_id,
+                    operations=self.sdk.operations,
                 )
             self._terminal = True
         except BaseException as error:
             try:
                 self._run_failure_settlement(error, "completion_settlement")
+                if self._resource_reservation_id is not None:
+                    self._settle_resource_reservation_unknown(
+                        error=error,
+                        phase="completion_settlement",
+                    )
             except BaseException as settlement_error:
                 self._terminal = True
                 raise settlement_error from error
@@ -616,12 +650,10 @@ class ProtectedOperation:
 
     def _prepare(self) -> None:
         self._validate_authority()
-        manifests = getattr(self.sdk.store, "authority_manifest_manager", None)
-        if manifests is not None:
-            manifests.assert_effect(
-                self.invocation.pid,
-                f"{self.contract.provider}.{self.contract.operation}",
-            )
+        self.sdk.authority_policy.assert_effect(
+            self.invocation.pid,
+            f"{self.contract.provider}.{self.contract.operation}",
+        )
         self._preflight_data_flow()
         if self.contract.require_classifier:
             require_external_effect_classifier(self.provider, self.contract.operation)
@@ -644,7 +676,14 @@ class ProtectedOperation:
                 raise ValidationError(
                     "protected operation failure resource settlement requires ResourceManager"
                 )
-        if self.invocation.preflight_usage is not None:
+        if self.invocation.reservation_usage is not None:
+            if self.contract.resource_policy == ResourcePolicy.NONE:
+                raise ValidationError(
+                    f"protected operation contract forbids resource reservation: {self.contract.name}"
+                )
+            if self.sdk.resources is None:
+                raise ValidationError("protected operation resource reservation requires ResourceManager")
+        elif self.invocation.preflight_usage is not None:
             if self.contract.resource_policy == ResourcePolicy.NONE:
                 raise ValidationError(
                     f"protected operation contract forbids resource preflight: {self.contract.name}"
@@ -667,14 +706,14 @@ class ProtectedOperation:
         if not isinstance(observation, dict) or not isinstance(canonical_args, dict):
             raise ValidationError("protected operation contexts must serialize to objects")
         try:
-            with self.sdk.store.transaction():
+            with self.sdk.effects.transaction():
                 if self.invocation.prepare is not None:
                     self.invocation.prepare()
                 self._revalidate_authority()
                 self._revalidate_data_flow()
                 self._reserve_decisions()
                 effect = prepare_external_effect_intent(
-                    self.sdk.store,
+                    self.sdk.effects,
                     pid=self.invocation.pid,
                     provider=self.contract.provider,
                     operation=self.contract.operation,
@@ -693,8 +732,19 @@ class ProtectedOperation:
                     },
                     idempotency_key=self.invocation.idempotency_key,
                     canonical_args=canonical_args,
+                    operations=self.sdk.operations,
+                    authority_policy=self.sdk.authority_policy,
                 )
                 self.effect_id = effect.effect_id
+                if self.invocation.reservation_usage is not None:
+                    assert self.sdk.resources is not None
+                    self._resource_reservation_id = self.sdk.resources.reserve_usage(
+                        self.invocation.pid,
+                        self.invocation.reservation_usage,
+                        source=self.invocation.resource_source or self.contract.name,
+                        context=dict(self.invocation.resource_context),
+                        reserved_by=effect.effect_id,
+                    )
         except BaseException as error:
             self._persist_rolled_back_data_flow_denial(error)
             raise
@@ -782,7 +832,7 @@ class ProtectedOperation:
                         "before protected dispatch"
                     )
                 if not self._reservations_committed:
-                    reservation = self.sdk.store.get_capability_use_reservation(
+                    reservation = self.sdk.effects.get_capability_use_reservation(
                         reservation_id
                     )
                     if (
@@ -1059,12 +1109,12 @@ class ProtectedOperation:
         if self.effect_id is None:
             raise ProtectedOperationProtocolError("protected operation has no prepared effect")
         try:
-            with self.sdk.store.transaction():
+            with self.sdk.effects.transaction():
                 self._revalidate_dispatch_authority()
                 self._revalidate_data_sink_identity()
                 self._revalidate_data_flow(use_reserved_release=True)
-                mark_external_effect_dispatched(self.sdk.store, self.effect_id)
-                current = self.sdk.store.get_external_effect(self.effect_id)
+                mark_external_effect_dispatched(self.sdk.effects, self.effect_id)
+                current = self.sdk.effects.get_external_effect(self.effect_id)
                 if current is None:
                     raise ProtectedOperationProtocolError(
                         "protected operation effect disappeared during dispatch"
@@ -1077,7 +1127,7 @@ class ProtectedOperation:
                         "information_flow": phase.information_flow,
                     },
                 }
-                if not self.sdk.store.transition_external_effect(
+                if not self.sdk.effects.transition_external_effect(
                     self.effect_id,
                     expected_states=("dispatched",),
                     transaction_state="dispatched",
@@ -1096,7 +1146,7 @@ class ProtectedOperation:
     def _record_completed_phase(self, phase: ProviderPhase) -> None:
         if self.effect_id is None:
             raise ProtectedOperationProtocolError("protected operation has no effect for phase completion")
-        current = self.sdk.store.get_external_effect(self.effect_id)
+        current = self.sdk.effects.get_external_effect(self.effect_id)
         if current is None:
             raise ProtectedOperationProtocolError("protected operation effect disappeared after provider call")
         completed = list(current.provider_metadata.get("completed_provider_phases") or [])
@@ -1114,7 +1164,7 @@ class ProtectedOperation:
             "observed_state_mutation": any(bool(item.get("state_mutation")) for item in completed),
             "observed_information_flow": any(bool(item.get("information_flow")) for item in completed),
         }
-        if not self.sdk.store.transition_external_effect(
+        if not self.sdk.effects.transition_external_effect(
             self.effect_id,
             expected_states=("dispatched",),
             transaction_state="dispatched",
@@ -1130,19 +1180,16 @@ class ProtectedOperation:
             raise error
 
     def _activate_boundary(self, phase: ProviderPhase) -> Token[_ActiveBoundary | None]:
-        return _CURRENT_BOUNDARY.set(
-            _ActiveBoundary(
-                sdk_identity=self.sdk._identity,
-                contract_name=self.contract.name,
-                phase_name=phase.name,
-                effect_id=str(self.effect_id),
-            )
+        return self.sdk.activate_boundary(
+            contract_name=self.contract.name,
+            phase_name=phase.name,
+            effect_id=str(self.effect_id),
         )
 
     def _commit_reservations(self) -> None:
         if self._reservations_committed:
             return
-        with self.sdk.store.transaction():
+        with self.sdk.effects.transaction():
             for reservation_id in self._reservation_ids:
                 self.sdk.capabilities.commit_reserved_use(
                     reservation_id,
@@ -1171,11 +1218,16 @@ class ProtectedOperation:
     def _abort_not_started(self, reason: str) -> None:
         if self._terminal:
             return
-        with self.sdk.store.transaction():
+        with self.sdk.effects.transaction():
             if self.invocation.restore_not_started is not None:
                 self.invocation.restore_not_started()
             self._restore_reservations()
-            abandon_external_effect_intent(self.sdk.store, self.effect_id)
+            self._release_resource_reservation(reason)
+            abandon_external_effect_intent(
+                self.sdk.effects,
+                self.effect_id,
+                operations=self.sdk.operations,
+            )
         self._terminal = True
 
     def _handle_not_started(
@@ -1261,10 +1313,10 @@ class ProtectedOperation:
                 evidence,
                 classification_keys=classification.metadata.keys(),
             )
-            with self.sdk.store.transaction():
+            with self.sdk.effects.transaction():
                 event, audit_record = self._persist_evidence(evidence)
                 record_external_effect(
-                    self.sdk.store,
+                    self.sdk.effects,
                     pid=self.invocation.pid,
                     provider=self.contract.provider,
                     operation=self.contract.operation,
@@ -1281,6 +1333,7 @@ class ProtectedOperation:
                         "error_type": classification.metadata.get("error_type"),
                     },
                     intent_effect_id=self.effect_id,
+                    operations=self.sdk.operations,
                 )
             settled = True
         except Exception:
@@ -1288,7 +1341,11 @@ class ProtectedOperation:
             pass
         self._terminal = True
         if settled:
-            self._charge_resource(self._failure_resource_settlement(error, phase))
+            failure_resource = self._failure_resource_settlement(error, phase)
+            if self._resource_reservation_id is not None and failure_resource is None:
+                self._settle_resource_reservation_unknown(error=error, phase=phase)
+            else:
+                self._charge_resource(failure_resource)
         if settlement_error is not None:
             raise settlement_error from error
 
@@ -1297,7 +1354,7 @@ class ProtectedOperation:
         if handler is None or self._failure_settlement_run or not self._dispatched:
             return
         self._failure_settlement_run = True
-        with self.sdk.store.transaction():
+        with self.sdk.effects.transaction():
             handler(error, phase)
 
     def _failure_resource_settlement(
@@ -1311,6 +1368,8 @@ class ProtectedOperation:
             self._validate_resource_settlement(settlement, required=False)
             return settlement
         if self.contract.resource_policy != ResourcePolicy.REQUIRED:
+            return None
+        if self.invocation.reservation_usage is not None:
             return None
         usage = self.invocation.preflight_usage
         if usage is None:
@@ -1353,6 +1412,15 @@ class ProtectedOperation:
             return
         self.sdk.operations.expect("resource_charge")
         assert self.sdk.resources is not None
+        if self._resource_reservation_id is not None:
+            self.sdk.resources.settle_usage_reservation(
+                self._resource_reservation_id,
+                actual_usage=None if resource.charge_reserved_maximum else resource.usage,
+                charge_maximum=resource.charge_reserved_maximum,
+                source=resource.source,
+                context=dict(resource.context),
+            )
+            return
         self.sdk.resources.charge(
             self.invocation.pid,
             resource.usage,
@@ -1360,6 +1428,38 @@ class ProtectedOperation:
             context=dict(resource.context),
             allow_overage=resource.allow_overage,
             kill_on_exceed=resource.kill_on_exceed,
+        )
+
+    def _release_resource_reservation(self, reason: str) -> None:
+        if self._resource_reservation_id is None:
+            return
+        assert self.sdk.resources is not None
+        self.sdk.resources.settle_usage_reservation(
+            self._resource_reservation_id,
+            release=True,
+            source=self.invocation.resource_source or self.contract.name,
+            context={**dict(self.invocation.resource_context), "release_reason": reason},
+        )
+
+    def _settle_resource_reservation_unknown(
+        self,
+        *,
+        error: BaseException,
+        phase: str,
+    ) -> None:
+        assert self._resource_reservation_id is not None
+        assert self.sdk.resources is not None
+        self.sdk.operations.expect("resource_charge")
+        self.sdk.resources.settle_usage_reservation(
+            self._resource_reservation_id,
+            charge_maximum=True,
+            source=self.invocation.resource_source or self.contract.name,
+            context={
+                **dict(self.invocation.resource_context),
+                "failure_phase": phase,
+                "error_type": type(error).__name__,
+                "settlement": "fail_closed_maximum",
+            },
         )
 
     def _phase_metadata(self) -> list[dict[str, Any]]:

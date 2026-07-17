@@ -541,7 +541,13 @@ def _require_authorized_resume_job(
         )
 
 
-def restore_pending_compaction_child_goal(runtime: Any, pending_action: dict[str, Any]) -> None:
+def restore_pending_compaction_child_goal(
+    pending_action: dict[str, Any],
+    *,
+    processes: Any,
+    objects: Any,
+    memory: Any,
+) -> None:
     action = dict(pending_action.get("action") or {})
     if action.get("action") != "compact_process_context":
         return
@@ -551,17 +557,17 @@ def restore_pending_compaction_child_goal(runtime: Any, pending_action: dict[str
     child_pid = str(pending_action.get("child_pid") or job.get("current_child_pid") or "")
     if not child_pid:
         return
-    child = runtime.store.get_process(child_pid)
+    child = processes.get_process(child_pid)
     if child is None or child.status in {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}:
         return
-    if child.goal_oid and runtime.store.get_object(child.goal_oid) is not None:
+    if child.goal_oid and objects.get_object(child.goal_oid) is not None:
         return
     chunks = _entry_chunks(job["source_payload"], int(job["max_chunks"])) or [[]]
     index = int(job.get("stage_index", 0))
     if index >= len(chunks):
         return
     goal = _stage_goal(str(job["caller_pid"]), job, chunks, index)
-    handle = runtime.memory.create_object(
+    handle = memory.create_object(
         pid=child_pid,
         object_type=ObjectType.GOAL,
         payload=goal,
@@ -573,6 +579,14 @@ def restore_pending_compaction_child_goal(runtime: Any, pending_action: dict[str
         name=f"context_compaction_stage:{child_pid}",
     )
     child.goal_oid = handle.oid
-    child.memory_view = runtime.memory.create_view(child_pid, [handle])
+    child.memory_view = memory.create_view(child_pid, [handle])
     child.updated_at = utc_now()
-    runtime.store.update_process(child)
+    processes.patch_process(
+        child_pid,
+        {
+            "goal_oid": child.goal_oid,
+            "memory_view": child.memory_view,
+            "updated_at": child.updated_at,
+        },
+        expected_revision=child.revision,
+    )

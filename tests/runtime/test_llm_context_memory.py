@@ -50,6 +50,29 @@ def _grant_context_compressor_authority(runtime: Runtime, pid: str) -> None:
     runtime.capability.grant(pid, 'image:context-compressor:v0', [CapabilityRight.READ], issued_by='test')
 
 
+def _new_llm_executor(runtime: Runtime) -> LLMProcessExecutor:
+    return LLMProcessExecutor(
+        unit_of_work=runtime.uow,
+        process=runtime.process,
+        operations=runtime.operations,
+        data_flow=runtime.data_flow,
+        tools=runtime.tools,
+        resources=runtime.resources,
+        llms=runtime.llms,
+        memory=runtime.memory,
+        audit=runtime.audit,
+        events=runtime.events,
+        images=runtime.images,
+        messages=runtime.messages,
+        human=runtime.human,
+        skills=runtime.skills,
+        protected_operations=runtime.protected_operations,
+        authority_manifests=runtime.authority_manifests,
+        capabilities=runtime.capability,
+        config=runtime.config,
+    )
+
+
 class TestLLMContextMemory:
 
     def test_llm_quantum_reads_a_store_bounded_event_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -477,19 +500,6 @@ class TestLLMContextMemory:
             finally:
                 runtime.close()
 
-            # Simulate a database produced before the durable watermark column
-            # was populated. Reopen must recover labels from the live context
-            # metadata before runtime-only payload recovery releases the Object.
-            conn = sqlite3.connect(db)
-            try:
-                conn.execute(
-                    "UPDATE llm_context_generations SET labels_json = NULL WHERE pid = ?",
-                    (pid,),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-
             reopened = Runtime.open(db)
             try:
                 process = reopened.process.get(pid)
@@ -544,229 +554,8 @@ class TestLLMContextMemory:
             finally:
                 reopened.close()
 
-    def test_custom_context_prefix_migrates_historical_default_named_context(self) -> None:
-        config = replace(
-            DEFAULT_CONFIG,
-            llm_context=replace(
-                DEFAULT_CONFIG.llm_context,
-                object_name_prefix='custom_context',
-            ),
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db = f'{temp_dir}/runtime.sqlite'
-            runtime = Runtime.open(db)
-            try:
-                pid = runtime.process.spawn(
-                    image='base-agent:v0',
-                    goal='migrate historical default context name',
-                )
-                old_context = runtime.memory.create_object(
-                    pid,
-                    ObjectType.PROCESS_STATE,
-                    {'kind': 'llm_context', 'entries': []},
-                    metadata=ObjectMetadata(
-                        sensitivity='secret',
-                        trust_level='untrusted',
-                        integrity='untrusted',
-                    ),
-                    name=context_object_name(pid),
-                    immutable=False,
-                )
-                old_oid = old_context.oid
-            finally:
-                runtime.close()
 
-            with sqlite3.connect(db) as connection:
-                connection.execute(
-                    """
-                    UPDATE objects
-                       SET lifecycle_state = 'released',
-                           deleted_at = '2000-01-01T00:00:00+00:00'
-                     WHERE oid = ?
-                    """,
-                    (old_context.oid,),
-                )
-                connection.execute(
-                    'ALTER TABLE llm_context_generations DROP COLUMN labels_schema_version'
-                )
-                connection.execute(
-                    'ALTER TABLE llm_context_generations DROP COLUMN labels_json'
-                )
-                connection.commit()
-
-            reopened = Runtime.open(db, config=config)
-            try:
-                history = reopened.store.get_llm_context_label_history(pid)
-                assert history is not None
-                assert history.sensitivity.value == 'secret'
-                assert reopened.store.get_object(old_oid) is None
-
-                process = reopened.process.get(pid)
-                handle = reopened.llm.context_memory.ensure(
-                    pid,
-                    reopened.images[process.image_id],
-                    process,
-                    reopened.tools.visible_tools(pid),
-                )
-                context = reopened.memory.get_object(pid, handle)
-                assert context.name == context_object_name(pid, config=config)
-                assert context.name == f'custom_context:{pid}'
-                assert context.metadata.sensitivity == 'secret'
-            finally:
-                reopened.close()
-
-    def test_custom_context_prefix_migrates_tagged_historical_custom_prefix(self) -> None:
-        legacy_config = replace(
-            DEFAULT_CONFIG,
-            llm_context=replace(
-                DEFAULT_CONFIG.llm_context,
-                object_name_prefix='legacy_custom_context',
-            ),
-        )
-        replacement_config = replace(
-            DEFAULT_CONFIG,
-            llm_context=replace(
-                DEFAULT_CONFIG.llm_context,
-                object_name_prefix='replacement_custom_context',
-            ),
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db = f'{temp_dir}/runtime.sqlite'
-            runtime = Runtime.open(db, config=legacy_config)
-            try:
-                pid = runtime.process.spawn(
-                    image='base-agent:v0',
-                    goal='migrate tagged custom context name',
-                )
-                old_context = runtime.memory.create_object(
-                    pid,
-                    ObjectType.PROCESS_STATE,
-                    {'kind': 'llm_context', 'entries': []},
-                    metadata=ObjectMetadata(
-                        sensitivity='confidential',
-                        tags=['llm_context', 'prompt_cache'],
-                    ),
-                    name=context_object_name(pid, config=legacy_config),
-                    immutable=False,
-                )
-                decoy = runtime.memory.create_object(
-                    pid,
-                    ObjectType.PROCESS_STATE,
-                    {'kind': 'unrelated_process_state'},
-                    metadata=ObjectMetadata(sensitivity='secret'),
-                    name='unrelated_process_state',
-                    immutable=False,
-                )
-            finally:
-                runtime.close()
-
-            with sqlite3.connect(db) as connection:
-                connection.execute(
-                    """
-                    UPDATE objects
-                       SET lifecycle_state = 'released',
-                           deleted_at = '2000-01-01T00:00:00+00:00'
-                     WHERE oid = ?
-                    """,
-                    (old_context.oid,),
-                )
-                connection.execute(
-                    'ALTER TABLE llm_context_generations DROP COLUMN labels_schema_version'
-                )
-                connection.execute(
-                    'ALTER TABLE llm_context_generations DROP COLUMN labels_json'
-                )
-                connection.commit()
-
-            reopened = Runtime.open(db, config=replacement_config)
-            try:
-                history = reopened.store.get_llm_context_label_history(pid)
-                assert history is not None
-                assert history.sensitivity.value == 'confidential'
-                assert reopened.store.get_object(old_context.oid) is None
-                assert reopened.store.get_object(decoy.oid) is None
-
-                process = reopened.process.get(pid)
-                handle = reopened.llm.context_memory.ensure(
-                    pid,
-                    reopened.images[process.image_id],
-                    process,
-                    reopened.tools.visible_tools(pid),
-                )
-                context = reopened.memory.get_object(pid, handle)
-                assert context.name == context_object_name(
-                    pid,
-                    config=replacement_config,
-                )
-                assert context.metadata.sensitivity == 'confidential'
-            finally:
-                reopened.close()
-
-    def test_legacy_unknown_context_labels_migrate_to_conservative_high_water(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db = f'{temp_dir}/runtime.sqlite'
-            runtime = Runtime.open(db)
-            try:
-                pid = runtime.process.spawn(
-                    image='base-agent:v0',
-                    goal='migrate historical custom labels',
-                )
-                context = runtime.memory.create_object(
-                    pid,
-                    ObjectType.PROCESS_STATE,
-                    {'kind': 'llm_context', 'entries': []},
-                    metadata=ObjectMetadata(),
-                    name=context_object_name(pid),
-                    immutable=False,
-                )
-                context_oid = context.oid
-            finally:
-                runtime.close()
-
-            with sqlite3.connect(db) as connection:
-                row = connection.execute(
-                    'SELECT metadata_json FROM objects WHERE oid = ?',
-                    (context_oid,),
-                ).fetchone()
-                metadata = json.loads(row[0])
-                metadata.update(
-                    {
-                        'sensitivity': ['internal'],
-                        'trust_level': 'partner_asserted',
-                        'integrity': 'best_effort',
-                        'origin': '',
-                        'tenant': ' invalid ',
-                        'principal': '',
-                        'declassification_authority': 'mixed',
-                    }
-                )
-                connection.execute(
-                    'UPDATE objects SET metadata_json = ? WHERE oid = ?',
-                    (json.dumps(metadata), context_oid),
-                )
-                connection.execute(
-                    'ALTER TABLE llm_context_generations DROP COLUMN labels_schema_version'
-                )
-                connection.execute(
-                    'ALTER TABLE llm_context_generations DROP COLUMN labels_json'
-                )
-                connection.commit()
-
-            reopened = Runtime.open(db)
-            try:
-                history = reopened.store.get_llm_context_label_history(pid)
-                assert history is not None
-                assert history.sensitivity.value == 'secret'
-                assert history.trust_level.value == 'untrusted'
-                assert history.integrity.value == 'untrusted'
-                assert history.origin == 'derived'
-                assert history.tenant == 'mixed'
-                assert history.principal == 'mixed'
-                assert history.declassification_authority is None
-            finally:
-                reopened.close()
-
-    def test_context_label_backfill_does_not_rewrite_existing_high_water(self) -> None:
+    def test_context_label_history_reopen_does_not_rewrite_existing_high_water(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
             runtime = Runtime.open(db)
@@ -2419,8 +2208,8 @@ class TestLLMContextMemory:
                     'status': 'pending',
                 },
             )
-            first = LLMProcessExecutor(runtime)
-            second = LLMProcessExecutor(runtime)
+            first = _new_llm_executor(runtime)
+            second = _new_llm_executor(runtime)
             runtime.human.send_process_message(pid, 'ready', subject='resume', channel='claim-once')
             dispatch_count = 0
 
@@ -2548,7 +2337,7 @@ class TestLLMContextMemory:
                     and record.target == f'process:{pid}'
                     for record in reopened.audit.trace()
                 )
-                assert pid not in reopened.llm._pending_human_actions
+                assert not reopened.llm.pending.has_memory(pid, "human")
             finally:
                 reopened.close()
 
@@ -2593,7 +2382,7 @@ class TestLLMContextMemory:
             try:
                 assert reopened.process.get(pid).status == ProcessStatus.FAILED
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'resuming'
-                assert pid not in reopened.llm._pending_message_actions
+                assert not reopened.llm.pending.has_memory(pid, "message")
             finally:
                 reopened.close()
 

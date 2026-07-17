@@ -18,28 +18,133 @@ from agent_libos.api.gui.server import (
     create_gui_http_server,
 )
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
+from agent_libos.config import (
+    AgentLibOSConfig,
+    DEFAULT_CONFIG,
+    GuiDefaults,
+    LLMProfile,
+    RuntimeDefaults,
+)
 from agent_libos.models import (
     AuditRecord,
     CapabilityRight,
     Event,
     EventPriority,
     EventType,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     HumanRequest,
     HumanRequestStatus,
     ObjectMetadata,
     ObjectPatch,
     ObjectType,
+    McpProviderTool,
+    McpToolListResult,
     ProcessSignal,
     ProcessStatus,
     SinkTrustLevel,
     SinkTrustRule,
 )
-from agent_libos.models.exceptions import HumanApprovalRequired
+from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
+
+
+def test_gui_validates_user_profiles_before_opening_owned_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profiles = tmp_path / "invalid-profiles.json"
+    profiles.write_text("not-json", encoding="utf-8")
+    opened = False
+    original_open = Runtime.open
+
+    def record_open(*args: object, **kwargs: object) -> Runtime:
+        nonlocal opened
+        opened = True
+        return original_open("local")
+
+    monkeypatch.setattr("agent_libos.api.gui.server.Runtime.open", record_open)
+
+    with pytest.raises(ValidationError, match="invalid LLM profiles JSON"):
+        GuiRuntimeService(db="local", auto_run=False, llm_profiles_file=profiles)
+
+    assert opened is False
+
+
+def test_gui_closes_owned_runtime_when_profile_registration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[Runtime] = []
+    original_open = Runtime.open
+
+    def record_open(*args: object, **kwargs: object) -> Runtime:
+        runtime = original_open("local")
+        opened.append(runtime)
+        return runtime
+
+    def fail_registration(*args: object, **kwargs: object) -> dict[str, Any]:
+        raise RuntimeError("injected profile registration failure")
+
+    monkeypatch.setattr("agent_libos.api.gui.server.Runtime.open", record_open)
+    monkeypatch.setattr(GuiRuntimeService, "_register_user_llm_profiles", fail_registration)
+
+    with pytest.raises(RuntimeError, match="injected profile registration failure"):
+        GuiRuntimeService(
+            db="local",
+            auto_run=False,
+            llm_profiles_file=tmp_path / "missing-profiles.json",
+        )
+
+    assert len(opened) == 1
+    assert opened[0].lifecycle.closed is True
+
+
+def test_gui_rejects_mismatched_config_for_borrowed_runtime(
+    tmp_path: Path,
+) -> None:
+    runtime_config = replace(
+        DEFAULT_CONFIG,
+        llm=replace(
+            DEFAULT_CONFIG.llm,
+            profiles={
+                **DEFAULT_CONFIG.llm.profiles,
+                "runtime-owned": LLMProfile(model="runtime-model"),
+            },
+        ),
+    )
+    runtime = Runtime.open("local", config=runtime_config)
+    profiles = tmp_path / "llm-profiles.json"
+    profiles.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profiles": {
+                    "runtime-owned": {
+                        "model": "shadow-model",
+                        "api_key_env": "SHADOW_API_KEY",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        with pytest.raises(ValidationError, match="must match the supplied Runtime config"):
+            GuiRuntimeService(
+                runtime=runtime,
+                config=DEFAULT_CONFIG,
+                auto_run=False,
+                llm_profiles_file=profiles,
+            )
+        assert runtime.llms.profile("runtime-owned").model == "runtime-model"
+    finally:
+        runtime.shutdown(actor="test", reason="test.cleanup")
 
 class TestGuiServer:
 
@@ -300,10 +405,11 @@ class TestGuiServer:
         old_provider = service._human_presentation_provider
         new_provider = type(old_provider)()
         old_key = ('gui', request_id, id(old_provider))
-        old_receipt = runtime.human._presentation_receipts[old_key]
+        receipts = runtime.human.presentation._receipts
+        old_receipt = receipts[old_key]
         # Deterministically simulate a recycled object-id key.  Receipt
         # identity, not just the integer key, must bind the old session.
-        runtime.human._presentation_receipts[
+        receipts[
             ('gui', request_id, id(new_provider))
         ] = old_receipt
         service._human_presentation_provider = new_provider
@@ -2735,10 +2841,14 @@ class TestGuiServer:
             server.service.shutdown()
             server.server_close()
 
-    def test_config_argument_controls_gui_runtime_defaults(self) -> None:
+    def test_config_argument_controls_gui_runtime_defaults(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        target = str(tmp_path / 'gui-memory.sqlite')
         config = AgentLibOSConfig(
             runtime=RuntimeDefaults(
-                local_store_target='gui-memory',
+                local_store_target=target,
                 default_image_id='configured-gui-base:v0',
                 coding_image_id='configured-gui-coding:v0',
             ),
@@ -2755,8 +2865,8 @@ class TestGuiServer:
         server.service.runtime.object_tasks.wait = fake_wait  # type: ignore[method-assign]
         thread.start()
         try:
-            assert server.service.db == 'gui-memory'
-            assert server.service.runtime.store.path == 'gui-memory'
+            assert server.service.db == target
+            assert server.service.runtime.store.path == target
 
             status, spawned = _request_to_server(server, 'POST', '/api/processes', {'goal': 'custom', 'auto_run': False}, token='custom-token')
             assert status == 200
@@ -2960,6 +3070,94 @@ class TestGuiServer:
 
         assert status == 400
         assert 'arguments must be a JSON object' in body['error']['message']
+
+    def test_mcp_provider_exception_secret_is_absent_from_gui_response(self) -> None:
+        secret = "GUI_MCP_HOST_EXCEPTION_SECRET_SENTINEL"
+
+        class FailingProvider:
+            def list_tools(self, server: Any, **_kwargs: Any) -> McpToolListResult:
+                return McpToolListResult(
+                    server_id=server.server_id,
+                    tools=[
+                        McpProviderTool(
+                            name="demo.echo",
+                            description="Echo",
+                            input_schema={},
+                        )
+                    ],
+                    response_bytes=32,
+                    duration_s=0.01,
+                )
+
+            def call_tool(
+                self,
+                _server: Any,
+                _tool: Any,
+                _arguments: dict[str, Any],
+                **_kwargs: Any,
+            ) -> Any:
+                raise RuntimeError(secret)
+
+            def classify_external_effect(
+                self,
+                _operation: str,
+                _context: dict[str, Any],
+                _result: Any,
+            ) -> ExternalEffectClassification:
+                return ExternalEffectClassification(
+                    rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                    rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                    state_mutation=False,
+                    information_flow=True,
+                )
+
+        runtime = self.server.service.runtime
+        runtime.mcp.provider = FailingProvider()
+        _status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'MCP GUI provider failure', 'auto_run': False},
+        )
+        pid = spawned['pid']
+        runtime.mcp.register_server_from_yaml_text(
+            _gui_mcp_manifest('gui-provider-failure'),
+            actor='test',
+            require_capability=False,
+        )
+        runtime.capability.grant(
+            pid,
+            'mcp:gui-provider-failure:echo',
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        runtime.capability.grant(
+            pid,
+            'process:spawn',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        runtime.capability.grant(
+            pid,
+            runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+            [CapabilityRight.EXECUTE],
+            issued_by='test',
+        )
+
+        status, body = self.request(
+            'POST',
+            '/api/mcp/gui-provider-failure/call',
+            {
+                'pid': pid,
+                'tool_id': 'echo',
+                'arguments': {'text': 'hello'},
+                'confirmed': True,
+            },
+        )
+
+        assert status == 200
+        assert body['ok'] is False
+        assert set(body['error']) == {'code', 'error_type', 'correlation_id'}
+        assert secret not in json.dumps(body, sort_keys=True)
 
     def test_skill_register_without_actor_rejects_host_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

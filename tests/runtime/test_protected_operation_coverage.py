@@ -101,6 +101,53 @@ def test_static_check_rejects_ingress_without_trusted_context(tmp_path: Path) ->
     assert any("missing ingress data-flow descriptor field" in error for error in errors)
 
 
+def test_static_check_resolves_local_invocation_factory(tmp_path: Path) -> None:
+    source = tmp_path / "factory.py"
+    source.write_text(
+        "class SafePrimitive:\n"
+        "    def invocation(self):\n"
+        "        return ProtectedOperationInvocation(\n"
+        "            pid='p', actor='p', target='pty:x',\n"
+        "            data_sink=sink, data_flow_context=context,\n"
+        "            data_flow_payload=payload, data_flow_operation='pty.spawn',\n"
+        "            data_flow_ingress_context=context,\n"
+        "        )\n"
+        "    def call(self):\n"
+        "        invocation = self.invocation()\n"
+        "        return self.protected.start(\n"
+        "            'primitive.pty.spawn', invocation, provider=self.provider\n"
+        "        )\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(source, relative=Path("modules/factory.py"))
+
+    assert not any("data-flow contract" in error for error in errors)
+    assert not any("missing data-flow descriptor" in error for error in errors)
+
+
+def test_static_check_validates_local_invocation_factory(tmp_path: Path) -> None:
+    source = tmp_path / "bad_factory.py"
+    source.write_text(
+        "class UnsafePrimitive:\n"
+        "    def invocation(self):\n"
+        "        return ProtectedOperationInvocation(\n"
+        "            pid='p', actor='p', target='pty:x',\n"
+        "            data_flow_ingress_context=context,\n"
+        "        )\n"
+        "    def call(self):\n"
+        "        invocation = self.invocation()\n"
+        "        return self.protected.start(\n"
+        "            'primitive.pty.spawn', invocation, provider=self.provider\n"
+        "        )\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(source, relative=Path("modules/bad_factory.py"))
+
+    assert any("missing data-flow descriptor fields" in error for error in errors)
+
+
 def test_contract_registry_matches_explainable_external_primitive_boundaries() -> None:
     with temporary_runtime() as runtime:
         contracts = {contract.name for contract in runtime.protected_operations.contracts()}

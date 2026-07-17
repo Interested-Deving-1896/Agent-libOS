@@ -117,6 +117,24 @@ class TestStorageBackendBoundaries:
         assert "pg_try_advisory_lock" in text
         assert "pg_advisory_unlock" in text
 
+    def test_postgres_fresh_store_probe_enumerates_current_schema_relations(self) -> None:
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.sql = ""
+
+            def execute(self, sql: str):
+                self.sql = sql
+                return iter(({"name": "unrelated_table"}, {"name": "unrelated_sequence"}))
+
+        connection = FakeConnection()
+
+        assert PostgresStore._probe_user_schema_objects(connection) == {
+            "unrelated_table",
+            "unrelated_sequence",
+        }
+        assert "pg_catalog.pg_class" in connection.sql
+        assert "current_schema()" in connection.sql
+
     def test_sqlite_runtime_lease_uses_atomic_lockfile_without_fcntl(
         self,
         tmp_path: Path,
@@ -230,3 +248,27 @@ class TestStorageBackendBoundaries:
         cursor.execute("SELECT '?' AS literal, ? AS value, 'it''s ?' AS escaped", ("ok",))
 
         assert fake.calls == [("SELECT '?' AS literal, %s AS value, 'it''s ?' AS escaped", ("ok",))]
+
+    def test_postgres_cursor_preserves_insert_or_ignore_semantics(self) -> None:
+        class FakeCursor:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, ...]] = []
+
+            def execute(self, *args: object) -> None:
+                self.calls.append(args)
+
+        fake = FakeCursor()
+        cursor = _PostgresCursor(fake, _PostgresDialect())
+
+        cursor.execute(
+            "INSERT OR IGNORE INTO runtime_counters (counter_name, value) VALUES (?, ?)",
+            ("external_effect_ledger", 0),
+        )
+
+        assert fake.calls == [
+            (
+                "INSERT INTO runtime_counters (counter_name, value) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING",
+                ("external_effect_ledger", 0),
+            )
+        ]

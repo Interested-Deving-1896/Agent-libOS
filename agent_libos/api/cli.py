@@ -14,7 +14,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
-from agent_libos.models.exceptions import HumanApprovalRequired, NotFound
+from agent_libos.models.exceptions import HumanApprovalRequired, LibOSError, NotFound
 from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.models import (
     CapabilityEffect,
@@ -198,20 +198,19 @@ def main(argv: list[str] | None = None) -> None:
     _add_modules_parser_args(modules_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
     args = parser.parse_args(argv)
-
     selected_config = _load_runtime_config(args.config, parser)
     load_module_manifests = [] if args.command == "modules" and args.modules_command == "verify" else args.module_manifest
     try:
         selected_db_display = display_store_target(args.db, config=selected_config)
-        runtime = Runtime.open(
-            args.db,
-            config=selected_config,
-            module_manifests=load_module_manifests,
-            trusted_modules=args.trusted_module,
-            trusted_module_sha256=args.trusted_module_sha256,
-        )
     except LibOSValidationError as exc:
         parser.error(str(exc))
+    runtime = Runtime.open(
+        args.db,
+        config=selected_config,
+        module_manifests=load_module_manifests,
+        trusted_modules=args.trusted_module,
+        trusted_module_sha256=args.trusted_module_sha256,
+    )
     try:
         if args.command == "init":
             print(f"initialized {selected_db_display}")
@@ -300,6 +299,24 @@ def main(argv: list[str] | None = None) -> None:
             _print_json([request.__dict__ for request in runtime.human.drain_terminal_queue()])
     finally:
         runtime.shutdown(actor="cli", reason="cli.command_complete")
+
+
+def cli(argv: list[str] | None = None) -> None:
+    """Console boundary that maps domain errors to stable JSON and exit codes."""
+
+    try:
+        main(argv)
+    except LibOSError as exc:
+        _print_json(
+            {
+                "schema_version": 1,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        )
+        raise SystemExit(1) from None
 
 
 def _resource_summary(runtime: Runtime, pid: str) -> dict[str, Any]:
@@ -1769,8 +1786,7 @@ def run_demo(runtime: Runtime) -> dict[str, Any]:
     )
     root_proc = runtime.process.get(root)
     assert root_proc.memory_view is not None
-    root_proc.memory_view.roots.append(log_handle)
-    runtime.store.update_process(root_proc)
+    runtime.store.append_process_memory_roots(root, [log_handle])
 
     worker = runtime.process.fork(
         parent=root,
@@ -1786,8 +1802,7 @@ def run_demo(runtime: Runtime) -> dict[str, Any]:
     if worker_result.result is not None:
         root_proc = runtime.process.get(root)
         if root_proc.memory_view is not None:
-            root_proc.memory_view.roots.append(worker_result.result)
-            runtime.store.update_process(root_proc)
+            runtime.store.append_process_memory_roots(root, [worker_result.result])
 
     jit_source = """
 export function run(args, libos) {
@@ -1967,4 +1982,4 @@ def _print_json(value: Any) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli()

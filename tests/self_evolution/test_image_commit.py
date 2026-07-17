@@ -54,6 +54,65 @@ def _commit_tenant_image(runtime: Runtime) -> str:
 
 class TestImageCommit:
 
+    def test_pre_03_checkpoint_is_rejected_before_image_commit_write(self) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='base-agent:v0', goal='old commit source')
+            checkpoint_id = runtime.checkpoint.create(source, 'old commit checkpoint', actor=source)
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            snapshot['version'] = 1
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (json.dumps(snapshot, sort_keys=True), checkpoint_id),
+            )
+            total_changes = runtime.store.conn.total_changes
+
+            with pytest.raises(ValidationError, match='unsupported snapshot version'):
+                runtime.image_registry.commit_from_checkpoint(
+                    actor=source,
+                    checkpoint_id=checkpoint_id,
+                    image_id='must-not-commit:v0',
+                    name='must-not-commit',
+                    require_capability=False,
+                )
+
+            assert runtime.store.conn.total_changes == total_changes
+            assert 'must-not-commit:v0' not in runtime.images
+            assert runtime.store.get_image('must-not-commit:v0') is None
+
+    def test_pre_03_checkpoint_artifact_is_rejected_before_process_write(self) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='base-agent:v0', goal='old artifact source')
+            checkpoint_id = runtime.checkpoint.create(source, 'old artifact', actor=source)
+            runtime.image_registry.grant_register(source, 'old-artifact:v0', issued_by='test')
+            committed = runtime.image_registry.commit_from_checkpoint(
+                actor=source,
+                checkpoint_id=checkpoint_id,
+                image_id='old-artifact:v0',
+                name='old-artifact',
+            )
+            artifact_id = committed.image.boot['artifact_id']
+            found = runtime.store.get_image_artifact(artifact_id)
+            assert found is not None
+            artifact, _metadata = found
+            artifact['artifact_version'] = 1
+            runtime.store._execute(
+                'UPDATE image_artifacts SET artifact_json = ? WHERE artifact_id = ?',
+                (json.dumps(artifact, sort_keys=True), artifact_id),
+            )
+            process_ids = {process.pid for process in runtime.store.list_processes()}
+            total_changes = runtime.store.conn.total_changes
+
+            with pytest.raises(RuntimeError, match='artifact version mismatch'):
+                runtime.process.spawn(image='old-artifact:v0', goal='must not start')
+
+            assert runtime.store.conn.total_changes == total_changes
+            assert {process.pid for process in runtime.store.list_processes()} == process_ids
+            persisted = runtime.store.get_image_artifact(artifact_id)
+            assert persisted is not None
+            assert persisted[0]['artifact_version'] == 1
+
     def test_commit_settles_checkpoint_read_and_image_write_only_with_image_transaction(
         self,
         monkeypatch: pytest.MonkeyPatch,

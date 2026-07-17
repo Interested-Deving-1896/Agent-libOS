@@ -40,7 +40,7 @@ from agent_libos.models import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import UnitOfWork
 
 
 class ProcessManager:
@@ -51,7 +51,7 @@ class ProcessManager:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        unit_of_work: UnitOfWork,
         memory: ObjectMemoryManager,
         capabilities: CapabilityManager,
         audit: AuditManager,
@@ -61,9 +61,12 @@ class ProcessManager:
         llm_profile_resolver: Callable[[str, str | None], str] | None = None,
         authority_manifests: Any | None = None,
         data_flow: Any | None = None,
+        object_task_terminal_notifier: Callable[[str], None] | None = None,
+        owner_instance_id: str = "runtime.local",
     ):
         self.config = config or DEFAULT_CONFIG
-        self.store = store
+        self.store = unit_of_work.processes
+        self.objects = unit_of_work.objects
         self.memory = memory
         self.capabilities = capabilities
         self.audit = audit
@@ -72,11 +75,38 @@ class ProcessManager:
         self._llm_profile_resolver = llm_profile_resolver
         self.authority_manifests = authority_manifests
         self.data_flow = data_flow
+        self._before_spawn_hooks: builtins.list[Callable[[str], None]] = []
         self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
-        self._object_task_terminal_notifier: Callable[[str], None] | None = None
+        self._object_task_terminal_notifier = object_task_terminal_notifier
+        self.owner_instance_id = str(owner_instance_id)
 
     def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
         self._after_spawn_hooks.append(hook)
+
+    def add_before_spawn_hook(self, hook: Callable[[str], None]) -> None:
+        self._before_spawn_hooks.append(hook)
+
+    def preflight_spawn(self, image: str | None = None) -> None:
+        """Validate root image artifacts before an operation row is opened."""
+
+        self._run_before_spawn_hooks(image or self.config.runtime.default_image_id)
+
+    def preflight_fork(self, parent: str, image: str | None = None) -> None:
+        """Validate inherited/explicit child image artifacts before evidence."""
+
+        parent_process = self._require_active_parent(parent, "fork")
+        self._run_before_spawn_hooks(image or parent_process.image_id)
+
+    def preflight_spawn_child(self, parent: str, image: str | None = None) -> None:
+        """Validate a fresh child image artifact before operation evidence."""
+
+        parent_process = self._require_active_parent(parent, "spawn child from")
+        self._run_before_spawn_hooks(image or parent_process.image_id)
+
+    def preflight_exec(self, image: str) -> None:
+        """Validate the replacement image artifact before operation evidence."""
+
+        self._run_before_spawn_hooks(image)
 
     def bind_object_task_terminal_notifier(self, notifier: Callable[[str], None]) -> None:
         self._object_task_terminal_notifier = notifier
@@ -91,11 +121,17 @@ class ProcessManager:
         llm_profile_id: str | None = None,
         authority_manifest: Any | None = None,
     ) -> str:
+        selected_image = image or self.config.runtime.default_image_id
         now = utc_now()
         pid = new_id("pid")
-        selected_image = image or self.config.runtime.default_image_id
         selected_llm_profile = self._resolve_root_llm_profile(selected_image, llm_profile_id)
         cwd = self._normalize_working_directory(working_directory or self.config.process.default_working_directory)
+        publication_id = self._begin_launch_publication(
+            pid=pid,
+            launch_kind="spawn",
+            image_id=selected_image,
+            parent_pid=None,
+        )
         try:
             process = AgentProcess(
                 pid=pid,
@@ -117,15 +153,27 @@ class ProcessManager:
                 llm_profile_id=selected_llm_profile,
             )
             self.store.insert_process(process)
+            self._publication_phase(publication_id, "process_inserted")
             self.memory.ensure_process_namespace(pid)
+            self._publication_phase(publication_id, "namespace_created")
             goal_handle = self._ensure_goal(pid, goal)
+            self._publication_phase(publication_id, "goal_created", goal_oid=goal_handle.oid)
             # A process starts with a mutable view rooted at its goal. Later tool
             # results are appended to this view by the LLM executor.
             view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
+            process = self._get(pid)
             process.goal_oid = goal_handle.oid
             process.memory_view = view
             process.updated_at = utc_now()
-            self.store.update_process(process)
+            process = self.store.patch_process(
+                pid,
+                {
+                    "goal_oid": process.goal_oid,
+                    "memory_view": process.memory_view,
+                    "updated_at": process.updated_at,
+                },
+                expected_revision=process.revision,
+            )
             if self.authority_manifests is not None:
                 manifest = self.authority_manifests.prepare_launch(
                     pid=pid,
@@ -140,38 +188,66 @@ class ProcessManager:
                     process = self._get(pid)
                     process.resource_budget = ResourceBudget(**manifest.resource_budget)
                     process.updated_at = utc_now()
-                    self.store.update_process(process)
+                    process = self.store.patch_process(
+                        pid,
+                        {
+                            "resource_budget": process.resource_budget,
+                            "updated_at": process.updated_at,
+                        },
+                        expected_revision=process.revision,
+                    )
                 self._assert_goal_data_flow(pid, goal_handle)
                 self.authority_manifests.compile_root_capabilities(manifest)
             else:
                 self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
+            self._publication_phase(publication_id, "authority_compiled")
             self._run_after_spawn_hooks(pid, selected_image)
-            process = self._get(pid)
-            process.status = ProcessStatus.RUNNABLE
-            process.updated_at = utc_now()
-            self.store.update_process(process)
-            self.events.emit(
-                EventType.PROCESS_CREATED,
-                source="runtime",
-                target=pid,
-                payload={
-                    "pid": pid,
-                    "image": selected_image,
-                    "goal_oid": goal_handle.oid,
-                    "working_directory": cwd,
-                    "llm_profile_id": selected_llm_profile,
-                },
-            )
-            self.audit.record(
-                actor="runtime",
-                action="process.spawn",
-                target=f"process:{pid}",
-                output_refs=[goal_handle.oid],
-                decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
-            )
+            self._publication_phase(publication_id, "image_configured")
+            with self.store.transaction():
+                process = self._get(pid)
+                process.status = ProcessStatus.RUNNABLE
+                process.updated_at = utc_now()
+                process = self.store.transition_process(
+                    pid,
+                    ProcessStatus.RUNNABLE,
+                    expected_revision=process.revision,
+                    expected_status=ProcessStatus.CREATED,
+                )
+                event = self.events.emit(
+                    EventType.PROCESS_CREATED,
+                    source="runtime",
+                    target=pid,
+                    payload={
+                        "pid": pid,
+                        "image": selected_image,
+                        "goal_oid": goal_handle.oid,
+                        "working_directory": cwd,
+                        "llm_profile_id": selected_llm_profile,
+                    },
+                )
+                audit = self.audit.record(
+                    actor="runtime",
+                    action="process.spawn",
+                    target=f"process:{pid}",
+                    output_refs=[goal_handle.oid],
+                    decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
+                )
+                if not self.store.advance_runtime_publication(
+                    publication_id,
+                    state="committed",
+                    phase="committed",
+                    receipt={
+                        "phase": "committed",
+                        "event_id": event.event_id,
+                        "audit_id": audit.record_id,
+                        "revision": process.revision,
+                    },
+                    expected_states={"applying"},
+                ):
+                    raise ProcessError(f"cannot commit process publication: {publication_id}")
             return pid
-        except Exception:
-            self._cleanup_failed_launch(pid)
+        except Exception as exc:
+            self._rollback_launch_publication(publication_id, pid, exc)
             raise
 
     def fork(
@@ -191,10 +267,9 @@ class ProcessManager:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> str:
-        parent_proc = self._get(parent)
+        parent_proc = self._require_active_parent(parent, "fork")
         fork_mode = ForkMode(mode)
-        if parent_proc.status in self.TERMINAL_STATUSES:
-            raise ProcessError(f"cannot fork terminated process: {parent}")
+        selected_image = image or parent_proc.image_id
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
@@ -203,12 +278,19 @@ class ProcessManager:
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
-        self._reserve_child_budget(parent, child_pid, selected_budget)
+        publication_id = self._begin_launch_publication(
+            pid=child_pid,
+            launch_kind="fork",
+            image_id=selected_image,
+            parent_pid=parent,
+        )
         try:
+            self._reserve_child_budget(parent, child_pid, selected_budget)
+            self._publication_phase(publication_id, "budget_reserved")
             child = AgentProcess(
                 pid=child_pid,
                 parent_pid=parent,
-                image_id=image or parent_proc.image_id,
+                image_id=selected_image,
                 status=ProcessStatus.CREATED,
                 goal_oid=None,
                 memory_view=None,
@@ -225,7 +307,9 @@ class ProcessManager:
                 llm_profile_id=selected_llm_profile,
             )
             self.store.insert_process(child)
+            self._publication_phase(publication_id, "process_inserted")
             self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
+            self._publication_phase(publication_id, "namespace_created")
             goal_handle = self._ensure_goal(
                 child_pid,
                 goal,
@@ -233,6 +317,7 @@ class ProcessManager:
                 source_labels=source_labels,
                 source_context=source_context,
             )
+            self._publication_phase(publication_id, "goal_created", goal_oid=goal_handle.oid)
             requested_specs = [*(capabilities or []), *inherit_specs]
             manifest = None
             if self.authority_manifests is not None:
@@ -260,10 +345,19 @@ class ProcessManager:
                 for root in child_view.roots:
                     self._assert_object_data_flow(child_pid, root.oid)
                 child_view.roots.append(goal_handle)
+                child = self._get(child_pid)
                 child.goal_oid = goal_handle.oid
                 child.memory_view = child_view
                 child.updated_at = utc_now()
-                self.store.update_process(child)
+                child = self.store.patch_process(
+                    child_pid,
+                    {
+                        "goal_oid": child.goal_oid,
+                        "memory_view": child.memory_view,
+                        "updated_at": child.updated_at,
+                    },
+                    expected_revision=child.revision,
+                )
             self._compile_child_authority(
                 parent_pid=parent,
                 child_pid=child_pid,
@@ -272,41 +366,61 @@ class ProcessManager:
                 inherit_specs=inherit_specs,
                 transition_kind="process.fork",
             )
+            self._publication_phase(publication_id, "authority_compiled")
             self._run_after_spawn_hooks(child_pid, child.image_id)
+            self._publication_phase(publication_id, "image_configured")
             self._charge_child_creation(parent)
-            child = self._get(child_pid)
-            child.status = ProcessStatus.RUNNABLE
-            child.updated_at = utc_now()
-            self.store.update_process(child)
-            self.events.emit(
-                EventType.PROCESS_FORKED,
-                source=parent,
-                target=child_pid,
-                payload={
-                    "parent": parent,
-                    "child": child_pid,
-                    "mode": fork_mode.value,
-                    "working_directory": cwd,
-                    "llm_profile_id": selected_llm_profile,
-                },
-            )
-            self.audit.record(
-                actor=parent,
-                action="process.fork",
-                target=f"process:{child_pid}",
-                input_refs=[parent_proc.goal_oid] if parent_proc.goal_oid else [],
-                output_refs=[goal_handle.oid],
-                decision={
-                    "mode": fork_mode.value,
-                    "image": child.image_id,
-                    "working_directory": child.working_directory,
-                    "llm_profile_id": selected_llm_profile,
-                },
-            )
+            with self.store.transaction():
+                child = self._get(child_pid)
+                child.status = ProcessStatus.RUNNABLE
+                child.updated_at = utc_now()
+                child = self.store.transition_process(
+                    child_pid,
+                    ProcessStatus.RUNNABLE,
+                    expected_revision=child.revision,
+                    expected_status=ProcessStatus.CREATED,
+                )
+                event = self.events.emit(
+                    EventType.PROCESS_FORKED,
+                    source=parent,
+                    target=child_pid,
+                    payload={
+                        "parent": parent,
+                        "child": child_pid,
+                        "mode": fork_mode.value,
+                        "working_directory": cwd,
+                        "llm_profile_id": selected_llm_profile,
+                    },
+                )
+                audit = self.audit.record(
+                    actor=parent,
+                    action="process.fork",
+                    target=f"process:{child_pid}",
+                    input_refs=[parent_proc.goal_oid] if parent_proc.goal_oid else [],
+                    output_refs=[goal_handle.oid],
+                    decision={
+                        "mode": fork_mode.value,
+                        "image": child.image_id,
+                        "working_directory": child.working_directory,
+                        "llm_profile_id": selected_llm_profile,
+                    },
+                )
+                if not self.store.advance_runtime_publication(
+                    publication_id,
+                    state="committed",
+                    phase="committed",
+                    receipt={
+                        "phase": "committed",
+                        "event_id": event.event_id,
+                        "audit_id": audit.record_id,
+                        "revision": child.revision,
+                    },
+                    expected_states={"applying"},
+                ):
+                    raise ProcessError(f"cannot commit process publication: {publication_id}")
             return child_pid
-        except Exception:
-            self._cleanup_failed_launch(child_pid)
-            self._release_child_budget(child_pid)
+        except Exception as exc:
+            self._rollback_launch_publication(publication_id, child_pid, exc)
             raise
 
     def spawn_child(
@@ -325,9 +439,8 @@ class ProcessManager:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> str:
-        parent_proc = self._get(parent)
-        if parent_proc.status in self.TERMINAL_STATUSES:
-            raise ProcessError(f"cannot spawn child from terminated process: {parent}")
+        parent_proc = self._require_active_parent(parent, "spawn child from")
+        selected_image = image or parent_proc.image_id
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
@@ -339,12 +452,19 @@ class ProcessManager:
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
-        self._reserve_child_budget(parent, child_pid, selected_budget)
+        publication_id = self._begin_launch_publication(
+            pid=child_pid,
+            launch_kind="spawn_child",
+            image_id=selected_image,
+            parent_pid=parent,
+        )
         try:
+            self._reserve_child_budget(parent, child_pid, selected_budget)
+            self._publication_phase(publication_id, "budget_reserved")
             child = AgentProcess(
                 pid=child_pid,
                 parent_pid=parent,
-                image_id=image or parent_proc.image_id,
+                image_id=selected_image,
                 status=ProcessStatus.CREATED,
                 goal_oid=None,
                 memory_view=None,
@@ -361,7 +481,9 @@ class ProcessManager:
                 llm_profile_id=selected_llm_profile,
             )
             self.store.insert_process(child)
+            self._publication_phase(publication_id, "process_inserted")
             self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
+            self._publication_phase(publication_id, "namespace_created")
             goal_handle = self._ensure_goal(
                 child_pid,
                 goal,
@@ -369,12 +491,22 @@ class ProcessManager:
                 source_labels=source_labels,
                 source_context=source_context,
             )
+            self._publication_phase(publication_id, "goal_created", goal_oid=goal_handle.oid)
             # Unlike fork(), spawn_child() starts from a fresh address-space-like
             # Object Memory view rooted only at the child goal.
+            child = self._get(child_pid)
             child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
             child.goal_oid = goal_handle.oid
             child.updated_at = utc_now()
-            self.store.update_process(child)
+            child = self.store.patch_process(
+                child_pid,
+                {
+                    "goal_oid": child.goal_oid,
+                    "memory_view": child.memory_view,
+                    "updated_at": child.updated_at,
+                },
+                expected_revision=child.revision,
+            )
             requested_specs = [*(capabilities or []), *inherit_specs]
             manifest = None
             if self.authority_manifests is not None:
@@ -397,42 +529,62 @@ class ProcessManager:
                 inherit_specs=inherit_specs,
                 transition_kind="process.spawn_child",
             )
+            self._publication_phase(publication_id, "authority_compiled")
             self._run_after_spawn_hooks(child_pid, child.image_id)
+            self._publication_phase(publication_id, "image_configured")
             self._charge_child_creation(parent)
-            child = self._get(child_pid)
-            child.status = selected_initial_status
-            child.updated_at = utc_now()
-            self.store.update_process(child)
-            self.events.emit(
-                EventType.PROCESS_CREATED,
-                source=parent,
-                target=child_pid,
-                payload={
-                    "parent": parent,
-                    "child": child_pid,
-                    "image": child.image_id,
-                    "goal_oid": goal_handle.oid,
-                    "working_directory": child.working_directory,
-                    "status": child.status.value,
-                    "llm_profile_id": selected_llm_profile,
-                },
-            )
-            self.audit.record(
-                actor=parent,
-                action="process.spawn_child",
-                target=f"process:{child_pid}",
-                output_refs=[goal_handle.oid],
-                decision={
-                    "image": child.image_id,
-                    "working_directory": child.working_directory,
-                    "status": child.status.value,
-                    "llm_profile_id": selected_llm_profile,
-                },
-            )
+            with self.store.transaction():
+                child = self._get(child_pid)
+                child.status = selected_initial_status
+                child.updated_at = utc_now()
+                child = self.store.transition_process(
+                    child_pid,
+                    selected_initial_status,
+                    expected_revision=child.revision,
+                    expected_status=ProcessStatus.CREATED,
+                )
+                event = self.events.emit(
+                    EventType.PROCESS_CREATED,
+                    source=parent,
+                    target=child_pid,
+                    payload={
+                        "parent": parent,
+                        "child": child_pid,
+                        "image": child.image_id,
+                        "goal_oid": goal_handle.oid,
+                        "working_directory": child.working_directory,
+                        "status": child.status.value,
+                        "llm_profile_id": selected_llm_profile,
+                    },
+                )
+                audit = self.audit.record(
+                    actor=parent,
+                    action="process.spawn_child",
+                    target=f"process:{child_pid}",
+                    output_refs=[goal_handle.oid],
+                    decision={
+                        "image": child.image_id,
+                        "working_directory": child.working_directory,
+                        "status": child.status.value,
+                        "llm_profile_id": selected_llm_profile,
+                    },
+                )
+                if not self.store.advance_runtime_publication(
+                    publication_id,
+                    state="committed",
+                    phase="committed",
+                    receipt={
+                        "phase": "committed",
+                        "event_id": event.event_id,
+                        "audit_id": audit.record_id,
+                        "revision": child.revision,
+                    },
+                    expected_states={"applying"},
+                ):
+                    raise ProcessError(f"cannot commit process publication: {publication_id}")
             return child_pid
-        except Exception:
-            self._cleanup_failed_launch(child_pid)
-            self._release_child_budget(child_pid)
+        except Exception as exc:
+            self._rollback_launch_publication(publication_id, child_pid, exc)
             raise
 
     def exec(
@@ -447,6 +599,7 @@ class ProcessManager:
         source_oids: Iterable[str] | None = None,
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
+        _record_evidence: bool = True,
     ) -> None:
         with self.store.transaction(include_object_payloads=True):
             self._exec_uncommitted(
@@ -460,6 +613,7 @@ class ProcessManager:
                 source_oids=source_oids,
                 source_labels=source_labels,
                 source_context=source_context,
+                record_evidence=_record_evidence,
             )
 
     def _exec_uncommitted(
@@ -474,6 +628,7 @@ class ProcessManager:
         source_oids: Iterable[str] | None = None,
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
+        record_evidence: bool = True,
     ) -> None:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
@@ -507,12 +662,11 @@ class ProcessManager:
             process = self._get(pid)
             process.capabilities = kept
         if goal_handle is not None:
-            process.goal_oid = goal_handle.oid
             if preserve_memory:
-                self._add_handle_to_process_view(process, goal_handle)
-                process = self._get(pid)
+                process = self._add_handle_to_process_view(process, goal_handle)
             else:
                 process.memory_view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
+            process.goal_oid = goal_handle.oid
         elif not preserve_memory:
             process.memory_view = None
         process.image_id = image
@@ -520,37 +674,74 @@ class ProcessManager:
             process.llm_profile_id = self._normalize_llm_profile_id(llm_profile_id)
         process.loaded_skills = {}
         process.updated_at = utc_now()
-        self.store.update_process(process)
-        self.events.emit(
+        process = self.store.patch_process(
+            pid,
+            {
+                "image_id": process.image_id,
+                "goal_oid": process.goal_oid,
+                "memory_view": process.memory_view,
+                "capabilities": process.capabilities,
+                "loaded_skills": process.loaded_skills,
+                "llm_profile_id": process.llm_profile_id,
+                "updated_at": process.updated_at,
+            },
+            expected_revision=process.revision,
+        )
+        if record_evidence:
+            self.record_exec_evidence(
+                pid,
+                old_image=old_image,
+                args=args,
+                preserve_memory=preserve_memory,
+                preserve_capabilities=preserve_capabilities,
+                new_goal_oid=goal_handle.oid if goal_handle is not None else None,
+            )
+
+    def record_exec_evidence(
+        self,
+        pid: str,
+        *,
+        old_image: str,
+        args: dict[str, Any] | None,
+        preserve_memory: bool,
+        preserve_capabilities: bool,
+        new_goal_oid: str | None,
+    ) -> tuple[Any, Any]:
+        """Publish exec event/audit after all image boot phases have succeeded."""
+
+        process = self._get(pid)
+        goal_oid = new_goal_oid or process.goal_oid
+        event = self.events.emit(
             EventType.PROCESS_EXEC,
             source=pid,
             target=pid,
             payload={
                 "old_image": old_image,
-                "new_image": image,
+                "new_image": process.image_id,
                 "preserve_memory": preserve_memory,
                 "preserve_capabilities": preserve_capabilities,
-                "goal_oid": goal_handle.oid if goal_handle is not None else process.goal_oid,
+                "goal_oid": goal_oid,
                 "working_directory": process.working_directory,
                 "llm_profile_id": process.llm_profile_id,
             },
         )
-        self.audit.record(
+        audit = self.audit.record(
             actor=pid,
             action="process.exec",
             target=f"process:{pid}",
-            output_refs=[goal_handle.oid] if goal_handle is not None else [],
+            output_refs=[new_goal_oid] if new_goal_oid is not None else [],
             decision={
                 "old_image": old_image,
-                "new_image": image,
+                "new_image": process.image_id,
                 "args": args or {},
-                "goal_oid": goal_handle.oid if goal_handle is not None else process.goal_oid,
+                "goal_oid": goal_oid,
                 "preserve_memory": preserve_memory,
                 "preserve_capabilities": preserve_capabilities,
                 "working_directory": process.working_directory,
                 "llm_profile_id": process.llm_profile_id,
             },
         )
+        return event, audit
 
     def wait(self, pid: str, child: str, timeout: float | None = None) -> ProcessResult:
         with self.store.locked():
@@ -562,14 +753,25 @@ class ProcessManager:
                 parent.status = ProcessStatus.WAITING_EVENT
                 parent.status_message = f"waiting for {child}"
                 parent.updated_at = utc_now()
-                self.store.update_process(parent)
+                parent = self.store.transition_process(
+                    pid,
+                    ProcessStatus.WAITING_EVENT,
+                    expected_revision=parent.revision,
+                    status_message=parent.status_message,
+                )
                 child_proc = self._require_child(parent.pid, child)
                 if child_proc.status not in self.TERMINAL_STATUSES:
                     raise ProcessWaitRequired(child_pid=child, message=f"{pid} is waiting for child process {child}")
                 parent.status = ProcessStatus.RUNNABLE
                 parent.status_message = None
                 parent.updated_at = utc_now()
-                self.store.update_process(parent)
+                parent = self.store.transition_process(
+                    pid,
+                    ProcessStatus.RUNNABLE,
+                    expected_revision=parent.revision,
+                    expected_status=ProcessStatus.WAITING_EVENT,
+                    status_message=None,
+                )
         result_handle = None
         # Keep the receiver-domain check, source ownership transfer, and
         # handle publication under one lock domain so a mutable result cannot
@@ -587,12 +789,18 @@ class ProcessManager:
                     {"read", "materialize", "link", "diff"},
                     issued_by=f"process.wait:{child}",
                 )
-                self._add_handle_to_process_view(parent, result_handle)
+                parent = self._add_handle_to_process_view(parent, result_handle)
             if parent.status == ProcessStatus.WAITING_EVENT and parent.status_message == f"waiting for {child}":
                 parent.status = ProcessStatus.RUNNABLE
                 parent.status_message = None
                 parent.updated_at = utc_now()
-                self.store.update_process(parent)
+                parent = self.store.transition_process(
+                    pid,
+                    ProcessStatus.RUNNABLE,
+                    expected_revision=parent.revision,
+                    expected_status=ProcessStatus.WAITING_EVENT,
+                    status_message=None,
+                )
         self.audit.record(
             actor=pid,
             action="process.wait",
@@ -608,7 +816,14 @@ class ProcessManager:
             raise ProcessError(f"cannot change working directory for terminated process: {pid}")
         process.working_directory = self._normalize_working_directory(path)
         process.updated_at = utc_now()
-        self.store.update_process(process)
+        process = self.store.patch_process(
+            pid,
+            {
+                "working_directory": process.working_directory,
+                "updated_at": process.updated_at,
+            },
+            expected_revision=process.revision,
+        )
         self.audit.record(
             actor=pid,
             action="process.chdir",
@@ -696,10 +911,10 @@ class ProcessManager:
             if selected_policy.include_child_created:
                 candidate_oids.update(
                     obj.oid
-                    for obj in self.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, child)
+                    for obj in self.objects.list_objects_owned_by(ObjectOwnerKind.PROCESS, child)
                 )
             for oid in sorted(candidate_oids):
-                if self.store.get_object(oid) is not None:
+                if self.objects.get_object(oid) is not None:
                     self._assert_object_data_flow(pid, oid)
             result = self.memory.merge_view(pid, child_proc.memory_view, policy=selected_policy)
             parent = self._get(pid)
@@ -880,7 +1095,12 @@ class ProcessManager:
             else:
                 proc.status_message = f"result_oid:{reason_oid}" if reason_oid else None
             proc.updated_at = utc_now()
-            self.store.update_process(proc)
+            proc = self.store.transition_process(
+                proc.pid,
+                proc.status,
+                expected_revision=proc.revision,
+                status_message=proc.status_message,
+            )
             if proc.status in self.TERMINAL_STATUSES:
                 self._release_child_budget(proc.pid)
             self.events.emit(
@@ -910,93 +1130,6 @@ class ProcessManager:
             preserve_oids=preserve_oids,
             context={"signal": signal.value},
         )
-
-    def reconcile_legacy_pending_action_terminal(
-        self,
-        pid: str,
-        *,
-        reason: str,
-        actor: str = "runtime.legacy_pending_migration",
-    ) -> bool:
-        """Finish a fail-closed legacy migration through normal terminal hooks.
-
-        Claiming the migration marker, publishing the terminal transition,
-        releasing resource reservations, and waking the parent commit together.
-        Human/ObjectTask notification and process-memory finalization are then
-        idempotently retried while the durable marker remains ``reconciling``.
-        """
-
-        process: AgentProcess
-        with self.store.transaction():
-            claim = self.store.claim_llm_pending_action_terminal_reconciliation(pid)
-            if claim is None:
-                return False
-            process = self._get(pid)
-            historical_terminal = (
-                process.status in self.TERMINAL_STATUSES
-                and process.status_message != reason
-            )
-            if claim == "claimed" and historical_terminal:
-                self._release_child_budget(pid)
-            elif claim == "claimed":
-                if process.status not in self.TERMINAL_STATUSES:
-                    process.status = ProcessStatus.FAILED
-                    process.status_message = reason
-                    process.updated_at = utc_now()
-                    self.store.update_process(process)
-                elif process.status != ProcessStatus.FAILED:
-                    raise ValidationError(
-                        "legacy pending action terminal marker conflicts with "
-                        f"process {pid} status {process.status.value}"
-                    )
-                self._release_child_budget(pid)
-                self.events.emit(
-                    EventType.PROCESS_EXITED,
-                    source=actor,
-                    target=process.parent_pid,
-                    payload={
-                        "pid": pid,
-                        "status": ProcessStatus.FAILED.value,
-                        "result_oid": None,
-                        "reason": reason,
-                        "legacy_pending_action_reconciled": True,
-                    },
-                )
-                self.audit.record(
-                    actor=actor,
-                    action="process.legacy_pending_action_terminal",
-                    target=f"process:{pid}",
-                    decision={"status": ProcessStatus.FAILED.value, "reason": reason},
-                )
-                self._wake_parent_waiting_on_child(process)
-            elif claim == "resuming":
-                if process.status not in self.TERMINAL_STATUSES:
-                    raise ValidationError(
-                        "legacy pending action reconciliation marker has no matching "
-                        f"terminal process transition: {pid}"
-                    )
-            else:  # pragma: no cover - store implementations own the finite claim modes.
-                raise RuntimeError(f"unknown legacy pending action reconciliation mode: {claim}")
-
-        preserve_oids: set[str] = set()
-        if process.status_message and process.status_message.startswith("result_oid:"):
-            preserve_oids.add(process.status_message.split(":", 1)[1])
-        cleanup_errors = self._complete_terminal_cleanup(
-            process,
-            actor=actor,
-            audit_action="process.legacy_pending_action_finalize_failed",
-            preserve_oids=preserve_oids,
-            context={"reason": reason},
-        )
-        if cleanup_errors:
-            raise RuntimeError(
-                f"legacy pending action terminal cleanup failed for {pid}: {cleanup_errors}"
-            )
-        if not self.store.complete_llm_pending_action_terminal_reconciliation(pid):
-            raise RuntimeError(
-                f"legacy pending action reconciliation completion raced for process {pid}"
-            )
-        return True
 
     def _complete_terminal_cleanup(
         self,
@@ -1113,7 +1246,12 @@ class ProcessManager:
             process.status = ProcessStatus.FAILED if failed else ProcessStatus.EXITED
             process.status_message = f"result_oid:{result.oid}" if result is not None else None
             process.updated_at = utc_now()
-            self.store.update_process(process)
+            process = self.store.transition_process(
+                pid,
+                process.status,
+                expected_revision=process.revision,
+                status_message=process.status_message,
+            )
             self._release_child_budget(pid)
             self.events.emit(
                 EventType.PROCESS_EXITED,
@@ -1214,6 +1352,12 @@ class ProcessManager:
         process = self.store.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
+        return process
+
+    def _require_active_parent(self, pid: str, action: str) -> AgentProcess:
+        process = self._get(pid)
+        if process.status in self.TERMINAL_STATUSES:
+            raise ProcessError(f"cannot {action} terminated process: {pid}")
         return process
 
     def _default_resource_budget(self) -> ResourceBudget:
@@ -1321,6 +1465,11 @@ class ProcessManager:
             return
         self.resources.release_process_reservations(pid)
 
+    def release_child_budget(self, pid: str) -> None:
+        """Release a child reservation after an external launch rollback."""
+
+        self._release_child_budget(pid)
+
     def _charge_child_creation(self, parent_pid: str) -> None:
         if self.resources is None:
             return
@@ -1378,7 +1527,7 @@ class ProcessManager:
         for oid in candidates:
             if oid in seen:
                 continue
-            obj = self.store.get_object(oid)
+            obj = self.objects.get_object(oid)
             if obj is None:
                 if oid in explicit:
                     raise NotFound(f"data-flow source object not found: {oid}")
@@ -1397,7 +1546,7 @@ class ProcessManager:
     ) -> ObjectMetadata:
         labels: list[DataLabels] = []
         for oid in self._normalize_source_oids(source_oids):
-            obj = self.store.get_object(oid)
+            obj = self.objects.get_object(oid)
             if obj is None:
                 raise NotFound(f"data-flow source object not found: {oid}")
             labels.append(DataLabels.from_object_metadata(obj.metadata))
@@ -1435,7 +1584,7 @@ class ProcessManager:
         elif selected_oids:
             metadata: list[ObjectMetadata] = []
             for oid in selected_oids:
-                obj = self.store.get_object(oid)
+                obj = self.objects.get_object(oid)
                 if obj is None:
                     raise NotFound(f"data-flow source object not found: {oid}")
                 metadata.append(obj.metadata)
@@ -1491,7 +1640,7 @@ class ProcessManager:
                     refreshed_metadata.append((supplied_message, dict(message.metadata)))
                     continue
                 existing_oid = str(message.metadata.get("label_carrier_oid") or "").strip()
-                existing = self.store.get_object(existing_oid) if existing_oid else None
+                existing = self.objects.get_object(existing_oid) if existing_oid else None
                 if existing is not None:
                     handle = self.memory.handle_for_oid(
                         pid,
@@ -1504,7 +1653,7 @@ class ProcessManager:
                     source_oids = [
                         oid
                         for oid in self._normalize_source_oids(message.metadata.get("source_oids"))
-                        if self.store.get_object(oid) is not None
+                        if self.objects.get_object(oid) is not None
                     ]
                     metadata = self.flow_metadata(
                         source_oids,
@@ -1569,7 +1718,7 @@ class ProcessManager:
                 ):
                     self._assert_goal_data_flow(pid, goal)
                 return goal
-            source_goal = self.store.get_object(goal.oid)
+            source_goal = self.objects.get_object(goal.oid)
             if source_goal is None:
                 raise NotFound(f"process goal object not found: {goal.oid}")
             if goal.oid not in selected_sources:
@@ -1611,7 +1760,7 @@ class ProcessManager:
     def _assert_object_data_flow(self, pid: str, oid: str) -> None:
         if self.authority_manifests is None:
             return
-        obj = self.store.get_object(oid)
+        obj = self.objects.get_object(oid)
         if obj is not None:
             labels = DataLabels.from_object_metadata(obj.metadata)
         else:
@@ -1620,7 +1769,7 @@ class ProcessManager:
             # domain check must therefore use that Host-written label record
             # before handing the caller a handle whose materialization will
             # still fail. Direct database tampering is outside this boundary.
-            rows = self.store.select_table_rows(
+            rows = self.objects.select_table_rows(
                 "objects",
                 "oid = ? AND lifecycle_state IN (?, ?)",
                 (oid, "live", "released"),
@@ -1680,32 +1829,6 @@ class ProcessManager:
         inherit_specs: list[dict[str, Any]],
         transition_kind: str,
     ) -> None:
-        # The compatibility mode keeps trusted, non-ceiling launch grants on
-        # its legacy path. Every manifest-enforced transition derives the final
-        # declared authority, not merely the duplicate ``capabilities`` input.
-        transition_ceiling = bool(
-            manifest is not None and manifest.metadata.get("transition_ceiling")
-        )
-        if (
-            self.config.runtime.launch_authority_mode == "legacy_image_grants"
-            and not transition_ceiling
-        ):
-            if requested_capabilities:
-                self._grant_specs(
-                    child_pid,
-                    requested_capabilities,
-                    issued_by=f"{transition_kind}:{parent_pid}",
-                )
-            if inherit_specs:
-                self.capabilities.derive_authority(
-                    source_subject=parent_pid,
-                    target_subject=child_pid,
-                    requested_specs=inherit_specs,
-                    transition_kind=f"{transition_kind}.inherit",
-                    ceiling_specs=manifest.authorized_capabilities if manifest is not None else None,
-                )
-            return
-
         selected_specs = (
             list(manifest.authorized_capabilities)
             if manifest is not None
@@ -1762,6 +1885,10 @@ class ProcessManager:
         for hook in self._after_spawn_hooks:
             hook(pid, image_id)
 
+    def _run_before_spawn_hooks(self, image_id: str) -> None:
+        for hook in self._before_spawn_hooks:
+            hook(image_id)
+
     def _cleanup_failed_launch(self, pid: str) -> None:
         with contextlib.suppress(Exception):
             self.memory.release_process_owned(pid)
@@ -1778,10 +1905,165 @@ class ProcessManager:
                 cur.execute("DELETE FROM object_namespaces WHERE namespace = ? AND created_by = ?", (namespace, pid))
                 cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
 
+    def recover_incomplete_publications(self) -> list[str]:
+        """Compensate process launches interrupted before their atomic commit."""
+
+        recovered: list[str] = []
+        nonterminal = self.store.list_runtime_publications(
+            states={"planning", "applying", "rollback_pending"}
+        )
+        for publication in nonterminal:
+            if publication["kind"] != "process_launch":
+                continue
+            publication_id = publication["publication_id"]
+            pid = publication["pid"]
+            self.store.advance_runtime_publication(
+                publication_id,
+                state="rollback_pending",
+                phase="startup_compensation",
+                receipt={"phase": "startup_compensation", "pid": pid},
+                expected_states={"planning", "applying", "rollback_pending"},
+            )
+            try:
+                self._cleanup_failed_launch_strict(pid)
+            except Exception as exc:
+                self.store.advance_runtime_publication(
+                    publication_id,
+                    state="failed",
+                    phase="startup_compensation_failed",
+                    error={"code": "publication_compensation_failed", "error_type": type(exc).__name__},
+                    expected_states={"rollback_pending"},
+                )
+                raise ProcessError(
+                    f"cannot compensate process publication {publication_id}"
+                ) from exc
+            self.store.advance_runtime_publication(
+                publication_id,
+                state="rolled_back",
+                phase="startup_compensated",
+                receipt={"phase": "startup_compensated", "pid": pid},
+                expected_states={"rollback_pending"},
+            )
+            recovered.append(publication_id)
+
+        publication_pids = {
+            publication["pid"]
+            for publication in self.store.list_runtime_publications()
+            if publication["kind"] == "process_launch"
+        }
+        for process in self.store.list_processes_by_status(ProcessStatus.CREATED):
+            if process.pid in publication_pids:
+                continue
+            self.store.transition_process(
+                process.pid,
+                ProcessStatus.FAILED,
+                expected_revision=process.revision,
+                expected_status=ProcessStatus.CREATED,
+                status_message="orphaned_launch",
+            )
+            self.audit.record(
+                actor="runtime.recovery",
+                action="orphaned_launch",
+                target=f"process:{process.pid}",
+                decision={"status": "failed"},
+            )
+        return recovered
+
+    def _begin_launch_publication(
+        self,
+        *,
+        pid: str,
+        launch_kind: str,
+        image_id: str,
+        parent_pid: str | None,
+    ) -> str:
+        publication_id = new_id("publication")
+        self.store.insert_runtime_publication(
+            publication_id=publication_id,
+            kind="process_launch",
+            pid=pid,
+            owner_instance_id=self.owner_instance_id,
+            plan={
+                "launch_kind": launch_kind,
+                "pid": pid,
+                "parent_pid": parent_pid,
+                "image_id": image_id,
+                "artifact_owner": f"publication:{publication_id}",
+            },
+        )
+        return publication_id
+
+    def _publication_phase(
+        self,
+        publication_id: str,
+        phase: str,
+        **receipt: Any,
+    ) -> None:
+        if not self.store.advance_runtime_publication(
+            publication_id,
+            state="applying",
+            phase=phase,
+            receipt={"phase": phase, **receipt},
+            expected_states={"planning", "applying"},
+        ):
+            raise ProcessError(f"process publication is no longer applicable: {publication_id}")
+
+    def _rollback_launch_publication(self, publication_id: str, pid: str, exc: BaseException) -> None:
+        self.store.advance_runtime_publication(
+            publication_id,
+            state="rollback_pending",
+            phase="compensating",
+            error={"code": "process_launch_failed", "error_type": type(exc).__name__},
+            expected_states={"planning", "applying"},
+        )
+        try:
+            self._cleanup_failed_launch_strict(pid)
+        except Exception as cleanup_exc:
+            self.store.advance_runtime_publication(
+                publication_id,
+                state="failed",
+                phase="compensation_failed",
+                error={
+                    "code": "publication_compensation_failed",
+                    "error_type": type(cleanup_exc).__name__,
+                },
+                expected_states={"rollback_pending"},
+            )
+            raise ExceptionGroup(
+                "process launch and compensation failed",
+                [exc, cleanup_exc],
+            ) from exc
+        self.store.advance_runtime_publication(
+            publication_id,
+            state="rolled_back",
+            phase="compensated",
+            receipt={"phase": "compensated", "pid": pid},
+            expected_states={"rollback_pending"},
+        )
+
+    def _cleanup_failed_launch_strict(self, pid: str) -> None:
+        self.memory.release_process_owned(pid)
+        namespace = self.memory.process_namespace(pid)
+        namespace_resource = f"object_namespace:{namespace}"
+        with self.store.transaction(include_object_payloads=True) as cur:
+            cur.execute("DELETE FROM capabilities WHERE subject = ? OR resource = ?", (pid, namespace_resource))
+            cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
+            cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
+            cur.execute("DELETE FROM authority_manifests WHERE pid = ?", (pid,))
+            cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
+            cur.execute("DELETE FROM process_messages WHERE sender = ? OR recipient_pid = ?", (pid, pid))
+            cur.execute("DELETE FROM object_namespaces WHERE namespace = ? AND created_by = ?", (namespace, pid))
+            cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
+
+    def cleanup_failed_launch(self, pid: str) -> None:
+        """Remove partial process state created by a failed external launch."""
+
+        self._cleanup_failed_launch(pid)
+
     def _release_rejected_exit_result(self, pid: str, result: ObjectHandle | None) -> None:
         if result is None:
             return
-        obj = self.store.get_object(result.oid)
+        obj = self.objects.get_object(result.oid)
         if obj is None or obj.owner_kind != ObjectOwnerKind.PROCESS or obj.owner_id != pid:
             return
         self.memory.delete_object_trusted("process", result.oid, reason="terminal_exit_rejected")
@@ -1805,13 +2087,17 @@ class ProcessManager:
                 f"{child_count}/{parent.resource_budget.max_child_processes}"
             )
 
-    def _add_handle_to_process_view(self, process: AgentProcess, handle: ObjectHandle) -> None:
+    def _add_handle_to_process_view(self, process: AgentProcess, handle: ObjectHandle) -> AgentProcess:
+        process = self._get(process.pid)
         if process.memory_view is None:
             process.memory_view = self.memory.create_view(process.pid, [handle], mode=ViewMode.READ_ONLY)
-        elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
-            process.memory_view.roots.append(handle)
-        process.updated_at = utc_now()
-        self.store.update_process(process)
+            process.updated_at = utc_now()
+            return self.store.patch_process(
+                process.pid,
+                {"memory_view": process.memory_view, "updated_at": process.updated_at},
+                expected_revision=process.revision,
+            )
+        return self.store.append_process_memory_roots(process.pid, [handle])
 
     def _wake_parent_waiting_on_child(self, child: AgentProcess) -> None:
         if child.parent_pid is None:
@@ -1826,7 +2112,13 @@ class ProcessManager:
         parent.status = ProcessStatus.RUNNABLE
         parent.status_message = None
         parent.updated_at = utc_now()
-        self.store.update_process(parent)
+        self.store.transition_process(
+            parent.pid,
+            ProcessStatus.RUNNABLE,
+            expected_revision=parent.revision,
+            expected_status=ProcessStatus.WAITING_EVENT,
+            status_message=None,
+        )
         self.audit.record(
             actor="process",
             action="process.wait_wake",

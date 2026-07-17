@@ -5,12 +5,10 @@
 and a real user, workflow controller, or enterprise policy deciding what this
 particular task may receive.
 
-The default `runtime.launch_authority_mode` is `manifest_required`. Image
+`runtime.launch_authority_mode` is fixed to `manifest_required`. Image
 `required_capabilities` are copied into the durable manifest as requirements
 for comparison and Explain output, but they are never granted. Only
-`authorized_capabilities` compile into root capabilities. The explicit
-compatibility mode `legacy_image_grants` retains the older image-auto-grant
-behavior and records the mode in the manifest and audit log.
+`authorized_capabilities` compile into root capabilities.
 
 A manifest records:
 

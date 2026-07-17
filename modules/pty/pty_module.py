@@ -48,9 +48,8 @@ from agent_libos.models.exceptions import (
     ResourceLimitExceeded,
     ValidationError,
 )
-from agent_libos.primitives.shell import ShellAdapter, ShellPolicyDecision
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
+from agent_libos.ports import AuditPort, EventPort
+from agent_libos.primitives.shell import ShellExecutionPolicy, ShellPolicyDecision
 from agent_libos.substrate import (
     ExecutableSnapshot,
     ProviderEffectNotStarted,
@@ -66,7 +65,7 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 from agent_libos.utils.ids import new_id, utc_now
 
 if TYPE_CHECKING:
-    from agent_libos.runtime.runtime import Runtime
+    from agent_libos.modules.context import ModuleHost
 
 _PTY_ADAPTER_ATTR = "_agent_libos_pty_adapter"
 _SAFE_PTY_ENV_KEYS = {
@@ -168,65 +167,88 @@ def _coerce_pty_settings(value: Any) -> PtyModuleSettings:
 
 
 def _validate_pty_settings(settings: PtyModuleSettings) -> None:
-    positive_fields = (
-        "max_sessions_global",
-        "max_sessions_per_process",
-        "buffer_max_chars",
-        "startup_output_max_chars",
-        "read_max_chars",
-        "read_hard_limit_chars",
-        "input_max_chars",
-        "input_hard_limit_chars",
-        "default_cols",
-        "default_rows",
-        "max_cols",
-        "max_rows",
-        "resource_sample_interval_s",
+    _validate_numeric_settings(
+        settings,
+        (
+            "max_sessions_global",
+            "max_sessions_per_process",
+            "buffer_max_chars",
+            "startup_output_max_chars",
+            "read_max_chars",
+            "read_hard_limit_chars",
+            "input_max_chars",
+            "input_hard_limit_chars",
+            "default_cols",
+            "default_rows",
+            "max_cols",
+            "max_rows",
+            "resource_sample_interval_s",
+        ),
+        allow_zero=False,
     )
-    for name in positive_fields:
-        value = getattr(settings, name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
-            raise ValidationError(f"pty module setting {name} must be > 0")
-    timeout_fields = (
-        "startup_timeout_s",
-        "startup_timeout_hard_limit_s",
-        "read_timeout_s",
-        "read_timeout_hard_limit_s",
-        "close_timeout_s",
-        "close_timeout_hard_limit_s",
+    _validate_numeric_settings(
+        settings,
+        (
+            "startup_timeout_s",
+            "startup_timeout_hard_limit_s",
+            "read_timeout_s",
+            "read_timeout_hard_limit_s",
+            "close_timeout_s",
+            "close_timeout_hard_limit_s",
+        ),
+        allow_zero=True,
     )
-    for name in timeout_fields:
-        value = getattr(settings, name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
-            raise ValidationError(f"pty module setting {name} must be >= 0")
     if not settings.session_name_prefix.strip():
         raise ValidationError("pty module setting session_name_prefix must be non-empty")
-    if settings.max_sessions_global < settings.max_sessions_per_process:
-        raise ValidationError("pty module max_sessions_global must be >= max_sessions_per_process")
-    if settings.read_hard_limit_chars < settings.read_max_chars:
-        raise ValidationError("pty module read_hard_limit_chars must be >= read_max_chars")
-    if settings.read_hard_limit_chars < settings.startup_output_max_chars:
-        raise ValidationError("pty module read_hard_limit_chars must be >= startup_output_max_chars")
-    if settings.input_hard_limit_chars < settings.input_max_chars:
-        raise ValidationError("pty module input_hard_limit_chars must be >= input_max_chars")
-    if settings.max_cols < settings.default_cols or settings.max_rows < settings.default_rows:
-        raise ValidationError("pty module max terminal dimensions must cover defaults")
-    if settings.startup_timeout_hard_limit_s < settings.startup_timeout_s:
-        raise ValidationError("pty module startup timeout hard limit must cover default")
-    if settings.read_timeout_hard_limit_s < settings.read_timeout_s:
-        raise ValidationError("pty module read timeout hard limit must cover default")
-    if settings.close_timeout_hard_limit_s < settings.close_timeout_s:
-        raise ValidationError("pty module close timeout hard limit must cover default")
+    _validate_setting_bounds(settings)
 
 
-def initialize_pty(runtime: "Runtime") -> None:
-    if getattr(runtime, _PTY_ADAPTER_ATTR, None) is not None:
+def _validate_numeric_settings(
+    settings: PtyModuleSettings,
+    names: tuple[str, ...],
+    *,
+    allow_zero: bool,
+) -> None:
+    for name in names:
+        value = getattr(settings, name)
+        valid_number = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        )
+        if not valid_number or value < 0 or (not allow_zero and value == 0):
+            qualifier = ">= 0" if allow_zero else "> 0"
+            raise ValidationError(f"pty module setting {name} must be {qualifier}")
+
+
+def _validate_setting_bounds(settings: PtyModuleSettings) -> None:
+    bounds = (
+        ("max_sessions_global", "max_sessions_per_process"),
+        ("read_hard_limit_chars", "read_max_chars"),
+        ("read_hard_limit_chars", "startup_output_max_chars"),
+        ("input_hard_limit_chars", "input_max_chars"),
+        ("max_cols", "default_cols"),
+        ("max_rows", "default_rows"),
+        ("startup_timeout_hard_limit_s", "startup_timeout_s"),
+        ("read_timeout_hard_limit_s", "read_timeout_s"),
+        ("close_timeout_hard_limit_s", "close_timeout_s"),
+    )
+    for ceiling_name, default_name in bounds:
+        if getattr(settings, ceiling_name) < getattr(settings, default_name):
+            raise ValidationError(
+                f"pty module {ceiling_name} must be >= {default_name}"
+            )
+
+
+def initialize_pty(runtime: "ModuleHost") -> None:
+    if runtime.get_runtime_attribute(_PTY_ADAPTER_ATTR) is not None:
         return
     settings = _coerce_pty_settings(getattr(runtime.substrate, "pty_settings", None))
     provider = getattr(runtime.substrate, "pty", None) or LocalPtyProvider(runtime.workspace_root)
     adapter = PtyAdapter(
         runtime,
         runtime.shell,
+        runtime.human,
         runtime.audit,
         runtime.events,
         provider=provider,
@@ -234,11 +256,9 @@ def initialize_pty(runtime: "Runtime") -> None:
         resources=runtime.resources,
     )
     adapter.release_stale_session_objects()
-    setattr(runtime, _PTY_ADAPTER_ATTR, adapter)
-    runtime.memory.bind_object_release_finalizer(_object_release_finalizer(adapter))
-    bind_shutdown = getattr(runtime, "bind_shutdown_finalizer", None)
-    if callable(bind_shutdown):
-        bind_shutdown(adapter.shutdown)
+    runtime.set_runtime_attribute(_PTY_ADAPTER_ATTR, adapter)
+    runtime.bind_object_release_finalizer(_object_release_finalizer(adapter))
+    runtime.bind_shutdown_finalizer(adapter.shutdown)
 
 
 def _object_release_finalizer(adapter: "PtyAdapter"):
@@ -824,22 +844,119 @@ class _PtyRuntimeSession:
         self.close_complete.set()
 
 
+@dataclass(frozen=True)
+class _PtyResourceObservation:
+    wall_seconds: float
+    cpu_seconds_by_process: dict[tuple[int, float], float]
+    memory_bytes: int
+    sampling_error: Exception | None
+
+
+@dataclass(frozen=True)
+class _PtyResourceDelta:
+    wall_seconds: float
+    cpu_seconds: float
+    memory_bytes: int
+    peak_changed: bool
+
+    @property
+    def changed(self) -> bool:
+        return self.wall_seconds > 0 or self.cpu_seconds > 0 or self.peak_changed
+
+
+@dataclass(frozen=True)
+class _PtyClosePlan:
+    session_oid: str
+    session: _PtyRuntimeSession
+    actor: str
+    reason: str
+    force: bool
+    timeout_s: float
+    authority_decision: CapabilityDecision | None
+    data_sink: DataSink | None
+    data_flow_context: DataFlowContext | None
+    data_flow_payload: dict[str, Any] | None
+    effect_context: dict[str, Any]
+
+
+@dataclass
+class _PtyCloseMutationState:
+    attempted: bool = False
+
+
+@dataclass
+class _PtyCreatePlan:
+    pid: str
+    argv: list[str]
+    cwd: str
+    cols: int
+    rows: int
+    startup_timeout_s: float
+    output_chars: int
+    name: str | None
+    resource: str
+    decision: ShellPolicyDecision
+    capability_decision: CapabilityDecision
+    spawn_sink: DataSink
+    executable_identity: str
+    flow_context: DataFlowContext
+    data_flow_payload: dict[str, Any]
+    limits: SubprocessLimits | None
+    intent_record: Any
+    session_id: str
+    effect_context: dict[str, Any]
+
+
+@dataclass
+class _PtySpawnGuards:
+    provider_argv: list[str]
+    failure_phase: str = "provider_resolve"
+    dispatch_pinned: bool = False
+    cleanup_attempted: bool = False
+    cleanup_succeeded: bool = False
+
+    def cleanup_evidence(self) -> dict[str, bool]:
+        return {
+            "attempted": self.cleanup_attempted,
+            "succeeded": self.cleanup_succeeded,
+        }
+
+
+@dataclass
+class _PtySpawnResources:
+    executable_snapshot: ExecutableSnapshot | None = None
+    handle: PtySession | None = None
+    session_oid: str | None = None
+
+
+@dataclass
+class _PtyStartedSession:
+    plan: _PtyCreatePlan
+    protected_cm: Any
+    protected: Any
+    session: _PtyRuntimeSession
+    namespace: str
+    object_name: str
+
+
 class PtyAdapter:
     """Object-bound PTY primitive."""
 
     def __init__(
         self,
-        runtime: "Runtime",
-        shell: ShellAdapter,
-        audit: AuditManager,
-        events: EventBus,
+        host: "ModuleHost",
+        shell_policy: ShellExecutionPolicy,
+        human: Any,
+        audit: AuditPort,
+        events: EventPort,
         provider: PtyProvider,
         *,
         config: PtyModuleConfig | None = None,
         resources: Any | None = None,
     ) -> None:
-        self.runtime = runtime
-        self.shell = shell
+        self.host = host
+        self.shell_policy = shell_policy
+        self.human = human
         self.audit = audit
         self.events = events
         self.provider = provider
@@ -865,52 +982,74 @@ class PtyAdapter:
         name: str | None = None,
         source_oids: Iterable[str] | None = None,
     ) -> PtyCreateResult:
-        checked = self.shell._validate_argv(argv)
-        selected_cols, selected_rows = self._validate_size(cols, rows)
-        selected_startup_timeout = self._validate_timeout(
-            startup_timeout_s,
-            default=self.config.pty.startup_timeout_s,
-            hard_limit=self.config.pty.startup_timeout_hard_limit_s,
-            label="pty startup timeout",
+        plan = self._prepare_create_plan(
+            pid,
+            argv,
+            cwd=cwd,
+            cols=cols,
+            rows=rows,
+            startup_timeout_s=startup_timeout_s,
+            max_output_chars=max_output_chars,
+            name=name,
+            source_oids=source_oids,
         )
-        selected_output_chars = self._validate_char_limit(
-            max_output_chars,
-            default=self.config.pty.startup_output_max_chars,
-            hard_limit=self.config.pty.read_hard_limit_chars,
-            label="pty max_output_chars",
+        started = self._spawn_prepared_session(plan)
+        return self._complete_started_session(started)
+
+    def _prepare_create_plan(
+        self,
+        pid: str,
+        argv: list[str],
+        *,
+        cwd: str,
+        cols: int | None,
+        rows: int | None,
+        startup_timeout_s: float | None,
+        max_output_chars: int | None,
+        name: str | None,
+        source_oids: Iterable[str] | None,
+    ) -> _PtyCreatePlan:
+        (
+            checked,
+            selected_cols,
+            selected_rows,
+            selected_timeout,
+            selected_output_chars,
+        ) = self._validate_create_request(
+            argv,
+            cols=cols,
+            rows=rows,
+            startup_timeout_s=startup_timeout_s,
+            max_output_chars=max_output_chars,
         )
-        resource = self.shell.resource_for(checked)
-        self.shell._enforce_workspace_argv_scope(checked, cwd=cwd)
-        # PTY creation launches an interactive host process. It must reuse the
-        # same shell authority path as shell.run before any provider side effect.
-        decision = self.shell._authorize_operation(
+        resource = self.shell_policy.resource_for(checked)
+        self.shell_policy.enforce_workspace_argv_scope(checked, cwd=cwd)
+        decision = self._authorize_pty_spawn(
             pid,
             checked,
             resource,
-            timeout=selected_startup_timeout,
+            timeout_s=selected_timeout,
             cwd=cwd,
-            adapter="pty",
-            primitive="runtime.pty.spawn",
-            operation="pty.spawn",
-            authority_operation="pty.spawn",
-            include_timeout_in_authority=False,
-            continuous_session=True,
-            extra_context={"startup_timeout_s": selected_startup_timeout},
         )
         if not decision.allowed and not decision.ask_human:
-            raise CapabilityDenied(f"{pid} denied pty spawn on {resource}: {decision.reason}")
-        spawn_sink = self.shell._executable_data_sink(
+            raise CapabilityDenied(
+                f"{pid} denied pty spawn on {resource}: {decision.reason}"
+            )
+        spawn_sink = self.shell_policy.executable_data_sink(
             "pty:spawn",
             checked[0],
             cwd=cwd,
         )
         executable_identity = spawn_sink.identity.split("pty:spawn:", 1)[1]
-        flow_context = self.runtime.data_flow.context_from_source_oids(pid, source_oids)
+        flow_context = self.host.data_flow.context_from_source_oids(
+            pid,
+            source_oids,
+        )
         data_flow_payload = {
             "argv": [executable_identity, *checked[1:]],
             "cwd": cwd,
         }
-        self.runtime.data_flow.authorize_egress(
+        self.host.data_flow.authorize_egress(
             pid=pid,
             sink=spawn_sink,
             context=flow_context,
@@ -923,16 +1062,15 @@ class PtyAdapter:
                 checked,
                 resource,
                 decision,
-                timeout=selected_startup_timeout,
+                timeout=selected_timeout,
                 cwd=cwd,
                 source_oids=source_oids,
             )
         if not decision.allowed:
-            raise CapabilityDenied(f"{pid} denied pty spawn on {resource}: {decision.reason}")
-        limits = self.shell._subprocess_limits(pid)
-        if limits is not None and not bool(getattr(self.provider, "supports_subprocess_limits", False)):
-            raise ValidationError("PTY provider must explicitly support SubprocessLimits before budgeted execution")
-        provider_argv = list(checked)
+            raise CapabilityDenied(
+                f"{pid} denied pty spawn on {resource}: {decision.reason}"
+            )
+        limits = self._pty_subprocess_limits(pid)
         intent_record = self._record_spawn_intent(
             pid,
             resource,
@@ -942,12 +1080,12 @@ class PtyAdapter:
             cols=selected_cols,
             rows=selected_rows,
         )
-        self._reserve_session_capacity(pid)
-        reserved_capacity = True
+        capability_decision = decision.authority_decision
+        if capability_decision is None or not capability_decision.allowed:
+            raise CapabilityDenied(
+                "allowed PTY policy decision is missing its capability authority"
+            )
         session_id = new_id("pty")
-        handle: PtySession | None = None
-        executable_snapshot: ExecutableSnapshot | None = None
-        effect_target = f"pty:{session_id}"
         effect_context = {
             "argv": list(checked),
             "provider_argv": list(data_flow_payload["argv"]),
@@ -957,221 +1095,391 @@ class PtyAdapter:
             "rows": selected_rows,
             "session_id": session_id,
         }
-        capability_decision = decision.authority_decision
-        if capability_decision is None or not capability_decision.allowed:
-            raise CapabilityDenied(
-                "allowed PTY policy decision is missing its capability authority"
-            )
+        return _PtyCreatePlan(
+            pid=pid,
+            argv=checked,
+            cwd=cwd,
+            cols=selected_cols,
+            rows=selected_rows,
+            startup_timeout_s=selected_timeout,
+            output_chars=selected_output_chars,
+            name=name,
+            resource=resource,
+            decision=decision,
+            capability_decision=capability_decision,
+            spawn_sink=spawn_sink,
+            executable_identity=executable_identity,
+            flow_context=flow_context,
+            data_flow_payload=data_flow_payload,
+            limits=limits,
+            intent_record=intent_record,
+            session_id=session_id,
+            effect_context=effect_context,
+        )
 
+    def _validate_create_request(
+        self,
+        argv: list[str],
+        *,
+        cols: int | None,
+        rows: int | None,
+        startup_timeout_s: float | None,
+        max_output_chars: int | None,
+    ) -> tuple[list[str], int, int, float, int]:
+        checked = self.shell_policy.validate_argv(argv)
+        selected_cols, selected_rows = self._validate_size(cols, rows)
+        selected_timeout = self._validate_timeout(
+            startup_timeout_s,
+            default=self.config.pty.startup_timeout_s,
+            hard_limit=self.config.pty.startup_timeout_hard_limit_s,
+            label="pty startup timeout",
+        )
+        selected_output_chars = self._validate_char_limit(
+            max_output_chars,
+            default=self.config.pty.startup_output_max_chars,
+            hard_limit=self.config.pty.read_hard_limit_chars,
+            label="pty max_output_chars",
+        )
+        return (
+            checked,
+            selected_cols,
+            selected_rows,
+            selected_timeout,
+            selected_output_chars,
+        )
+
+    def _pty_subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+        limits = self.shell_policy.subprocess_limits(pid)
+        supports_limits = bool(
+            getattr(self.provider, "supports_subprocess_limits", False)
+        )
+        if limits is not None and not supports_limits:
+            raise ValidationError(
+                "PTY provider must explicitly support SubprocessLimits before "
+                "budgeted execution"
+            )
+        return limits
+
+    def _authorize_pty_spawn(
+        self,
+        pid: str,
+        argv: list[str],
+        resource: str,
+        *,
+        timeout_s: float,
+        cwd: str,
+    ) -> ShellPolicyDecision:
+        return self.shell_policy.authorize_operation(
+            pid,
+            argv,
+            resource,
+            timeout=timeout_s,
+            cwd=cwd,
+            adapter="pty",
+            primitive="runtime.pty.spawn",
+            operation="pty.spawn",
+            authority_operation="pty.spawn",
+            include_timeout_in_authority=False,
+            continuous_session=True,
+            extra_context={"startup_timeout_s": timeout_s},
+        )
+
+    def _spawn_invocation(
+        self,
+        plan: _PtyCreatePlan,
+        guards: _PtySpawnGuards,
+    ) -> ProtectedOperationInvocation:
         def revalidate_spawn_authority() -> tuple[CapabilityDecision, ...]:
-            current = self.shell._authorize_operation(
-                pid,
-                checked,
-                resource,
-                timeout=selected_startup_timeout,
-                cwd=cwd,
-                adapter="pty",
-                primitive="runtime.pty.spawn",
-                operation="pty.spawn",
-                authority_operation="pty.spawn",
-                include_timeout_in_authority=False,
-                continuous_session=True,
-                extra_context={"startup_timeout_s": selected_startup_timeout},
+            current = self._authorize_pty_spawn(
+                plan.pid,
+                plan.argv,
+                plan.resource,
+                timeout_s=plan.startup_timeout_s,
+                cwd=plan.cwd,
             )
             authority = current.authority_decision
             if not current.allowed or current.ask_human or authority is None:
                 raise CapabilityDenied(
-                    f"{pid} PTY authority changed before provider dispatch: {current.reason}"
+                    f"{plan.pid} PTY authority changed before provider dispatch: "
+                    f"{current.reason}"
                 )
             return (authority,)
 
-        spawn_dispatch_pinned = {"value": False}
-
         def revalidate_spawn_sink() -> DataSink:
-            if spawn_dispatch_pinned["value"]:
-                return spawn_sink
-            return self.shell._executable_data_sink(
+            if guards.dispatch_pinned:
+                return plan.spawn_sink
+            return self.shell_policy.executable_data_sink(
                 "pty:spawn",
-                provider_argv[0],
-                cwd=cwd,
+                guards.provider_argv[0],
+                cwd=plan.cwd,
             )
 
-        canonical_args = self.shell._operation_context(
-            pid,
-            checked,
-            resource,
-            timeout=selected_startup_timeout,
-            cwd=cwd,
-            profile=decision.sandbox_profile,
+        canonical_args = self.shell_policy.operation_context(
+            plan.pid,
+            plan.argv,
+            plan.resource,
+            timeout=plan.startup_timeout_s,
+            cwd=plan.cwd,
+            profile=plan.decision.sandbox_profile,
             adapter="pty",
             primitive="runtime.pty.spawn",
             operation="pty.spawn",
             authority_operation="pty.spawn",
             include_timeout=False,
             continuous_session=True,
-            extra={"startup_timeout_s": selected_startup_timeout},
+            extra={"startup_timeout_s": plan.startup_timeout_s},
         )
-        failure_phase = {"name": "provider_resolve"}
-        cleanup_evidence = {"attempted": False, "succeeded": False}
-
-        def spawn_failure_evidence(error: BaseException, phase: str) -> ProtectedOperationEvidence:
-            evidence = self._protected_pty_failure_evidence(
-                pid,
-                session_id,
-                "spawn",
-                error,
-                failure_phase["name"] if phase == "caller_failed_after_provider" else phase,
-                correlation_id=intent_record.record_id,
-                parent_record_id=intent_record.record_id,
-            )
-            return replace(
-                evidence,
-                effect_metadata={
-                    **dict(evidence.effect_metadata),
-                    "cleanup": dict(cleanup_evidence),
-                },
-            )
-
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=effect_target,
-            decisions=(capability_decision,),
+        return ProtectedOperationInvocation(
+            pid=plan.pid,
+            actor=plan.pid,
+            target=f"pty:{plan.session_id}",
+            decisions=(plan.capability_decision,),
             canonical_args=canonical_args,
-            observation=effect_context,
-            data_sink=spawn_sink,
+            observation=plan.effect_context,
+            data_sink=plan.spawn_sink,
             data_sink_revalidator=revalidate_spawn_sink,
-            data_flow_context=flow_context,
-            data_flow_ingress_context=self._pty_ingress_context(flow_context),
-            data_flow_payload=data_flow_payload,
+            data_flow_context=plan.flow_context,
+            data_flow_ingress_context=self._pty_ingress_context(plan.flow_context),
+            data_flow_payload=plan.data_flow_payload,
             data_flow_operation="pty.spawn",
             authority_revalidator=revalidate_spawn_authority,
-            failure_evidence=spawn_failure_evidence,
+            failure_evidence=lambda error, phase: self._spawn_failure_evidence(
+                plan,
+                guards,
+                error,
+                phase,
+            ),
         )
-        protected_cm = self._protected().start(
-            "primitive.pty.spawn", invocation, provider=self.provider
+
+    def _spawn_failure_evidence(
+        self,
+        plan: _PtyCreatePlan,
+        guards: _PtySpawnGuards,
+        error: BaseException,
+        phase: str,
+    ) -> ProtectedOperationEvidence:
+        selected_phase = (
+            guards.failure_phase
+            if phase == "caller_failed_after_provider"
+            else phase
         )
-        protected = None
+        evidence = self._protected_pty_failure_evidence(
+            plan.pid,
+            plan.session_id,
+            "spawn",
+            error,
+            selected_phase,
+            correlation_id=plan.intent_record.record_id,
+            parent_record_id=plan.intent_record.record_id,
+        )
+        return replace(
+            evidence,
+            effect_metadata={
+                **dict(evidence.effect_metadata),
+                "cleanup": guards.cleanup_evidence(),
+            },
+        )
+
+    def _spawn_prepared_session(
+        self,
+        plan: _PtyCreatePlan,
+    ) -> _PtyStartedSession:
+        guards = _PtySpawnGuards(provider_argv=list(plan.argv))
+        resources = _PtySpawnResources()
+        protected_cm: Any | None = None
+        protected: Any | None = None
+        reserved_capacity = False
+        self._reserve_session_capacity(plan.pid)
+        reserved_capacity = True
         try:
-            protected = protected_cm.__enter__()
-            resolver = getattr(self.provider, "resolve_argv", None)
-            if callable(resolver):
-                provider_argv = protected.call(
-                    ProviderPhase("resolve_argv", information_flow=True),
-                    self.shell._resolve_provider_argv,
-                    checked,
-                    cwd=cwd,
-                    provider=self.provider,
-                )
-            failure_phase["name"] = "provider_identity_validation"
-            self.shell._require_provider_executable_identity(
-                provider_argv[0],
-                expected=executable_identity,
-                cwd=cwd,
-            )
-            effect_context["provider_argv"] = list(provider_argv)
-            failure_phase["name"] = "provider_spawn"
-            executable_snapshot = self.shell._snapshot_executable_for_dispatch(
-                pid=pid,
+            invocation = self._spawn_invocation(plan, guards)
+            protected_cm = self._protected().start(
+                "primitive.pty.spawn",
+                invocation,
                 provider=self.provider,
-                requested_argv0=checked[0],
-                provider_argv0=provider_argv[0],
-                cwd=cwd,
-                expected_sink=spawn_sink,
-                expected_executable_identity=executable_identity,
-                flow_context=flow_context,
-                data_flow_payload=data_flow_payload,
             )
-            spawn_kwargs: dict[str, Any] = {
-                "cwd": cwd,
-                "cols": selected_cols,
-                "rows": selected_rows,
-                "limits": limits,
-            }
-            if executable_snapshot is not None:
-                spawn_kwargs["executable_snapshot"] = executable_snapshot
-            handle = protected.call(
-                ProviderPhase("spawn", state_mutation=True, information_flow=True),
-                self.provider.spawn,
-                provider_argv,
-                **spawn_kwargs,
+            protected = protected_cm.__enter__()
+            object_name, namespace = self._dispatch_prepared_spawn(
+                plan,
+                guards,
+                resources,
+                protected,
             )
-            spawn_dispatch_pinned["value"] = True
-            # A successful PTY spawn transfers the snapshot lifetime to the
-            # returned session so script interpreters can reopen it safely.
-            executable_snapshot = None
-            failure_phase["name"] = "session_object_creation"
-            session_oid, object_name, namespace = self._create_session_object(
-                pid,
-                session_id=session_id,
-                argv=checked,
-                cwd=cwd,
-                backend=handle.backend,
-                cols=selected_cols,
-                rows=selected_rows,
-                name=name,
-                data_flow_context=flow_context,
+            if resources.handle is None or resources.session_oid is None:
+                raise ValidationError("PTY provider spawn did not produce a session")
+            session = self._runtime_session_from_spawn(plan, resources)
+            with self._lock:
+                self._sessions[session.session_oid] = session
+                self._release_session_capacity_locked(plan.pid)
+                reserved_capacity = False
+            return _PtyStartedSession(
+                plan=plan,
+                protected_cm=protected_cm,
+                protected=protected,
+                session=session,
+                namespace=namespace,
+                object_name=object_name,
             )
         except BaseException:
-            if executable_snapshot is not None:
-                executable_snapshot.close()
-            if handle is not None:
-                try:
-                    cleanup_evidence["attempted"] = True
-                    if protected is not None and not protected.terminal:
-                        protected.call(
-                            ProviderPhase("cleanup_close", state_mutation=True),
-                            handle.close,
-                            force=True,
-                            timeout_s=self.config.pty.close_timeout_s,
-                        )
-                    cleanup_evidence["succeeded"] = True
-                except Exception:
-                    pass
+            error_info = sys.exc_info()
+            self._cleanup_failed_spawn(plan, guards, resources, protected)
             if reserved_capacity:
-                self._release_session_capacity(pid)
-                reserved_capacity = False
-            if protected is not None:
-                protected_cm.__exit__(*sys.exc_info())
+                self._release_session_capacity(plan.pid)
+            if protected_cm is not None and protected is not None:
+                protected_cm.__exit__(*error_info)
             raise
 
-        session = _PtyRuntimeSession(
-            session_oid=session_oid,
-            session_id=session_id,
-            owner_pid=pid,
-            argv=list(checked),
-            cwd=cwd,
-            backend=handle.backend,
-            handle=handle,
-            cols=selected_cols,
-            rows=selected_rows,
+    def _dispatch_prepared_spawn(
+        self,
+        plan: _PtyCreatePlan,
+        guards: _PtySpawnGuards,
+        resources: _PtySpawnResources,
+        protected: Any,
+    ) -> tuple[str, str]:
+        resolver = getattr(self.provider, "resolve_argv", None)
+        if callable(resolver):
+            guards.provider_argv = protected.call(
+                ProviderPhase("resolve_argv", information_flow=True),
+                self.shell_policy.resolve_provider_argv,
+                plan.argv,
+                cwd=plan.cwd,
+                provider=self.provider,
+            )
+        guards.failure_phase = "provider_identity_validation"
+        self.shell_policy.require_provider_executable_identity(
+            guards.provider_argv[0],
+            expected=plan.executable_identity,
+            cwd=plan.cwd,
+        )
+        plan.effect_context["provider_argv"] = list(guards.provider_argv)
+        guards.failure_phase = "provider_spawn"
+        resources.executable_snapshot = (
+            self.shell_policy.snapshot_executable_for_dispatch(
+                pid=plan.pid,
+                provider=self.provider,
+                requested_argv0=plan.argv[0],
+                provider_argv0=guards.provider_argv[0],
+                cwd=plan.cwd,
+                expected_sink=plan.spawn_sink,
+                expected_executable_identity=plan.executable_identity,
+                flow_context=plan.flow_context,
+                data_flow_payload=plan.data_flow_payload,
+            )
+        )
+        spawn_kwargs: dict[str, Any] = {
+            "cwd": plan.cwd,
+            "cols": plan.cols,
+            "rows": plan.rows,
+            "limits": plan.limits,
+        }
+        if resources.executable_snapshot is not None:
+            spawn_kwargs["executable_snapshot"] = resources.executable_snapshot
+        resources.handle = protected.call(
+            ProviderPhase("spawn", state_mutation=True, information_flow=True),
+            self.provider.spawn,
+            guards.provider_argv,
+            **spawn_kwargs,
+        )
+        guards.dispatch_pinned = True
+        # The returned session owns the executable snapshot after spawn.
+        resources.executable_snapshot = None
+        guards.failure_phase = "session_object_creation"
+        session_oid, object_name, namespace = self._create_session_object(
+            plan.pid,
+            session_id=plan.session_id,
+            argv=plan.argv,
+            cwd=plan.cwd,
+            backend=resources.handle.backend,
+            cols=plan.cols,
+            rows=plan.rows,
+            name=plan.name,
+            data_flow_context=plan.flow_context,
+        )
+        resources.session_oid = session_oid
+        return object_name, namespace
+
+    def _runtime_session_from_spawn(
+        self,
+        plan: _PtyCreatePlan,
+        resources: _PtySpawnResources,
+    ) -> _PtyRuntimeSession:
+        assert resources.handle is not None
+        assert resources.session_oid is not None
+        return _PtyRuntimeSession(
+            session_oid=resources.session_oid,
+            session_id=plan.session_id,
+            owner_pid=plan.pid,
+            argv=list(plan.argv),
+            cwd=plan.cwd,
+            backend=resources.handle.backend,
+            handle=resources.handle,
+            cols=plan.cols,
+            rows=plan.rows,
             started_at=utc_now(),
             started_monotonic=time.monotonic(),
             buffer_max_chars=self.config.pty.buffer_max_chars,
-            data_sink=spawn_sink,
-            data_flow_context=flow_context,
+            data_sink=plan.spawn_sink,
+            data_flow_context=plan.flow_context,
         )
-        with self._lock:
-            self._sessions[session_oid] = session
-            self._release_session_capacity_locked(pid)
-            reserved_capacity = False
+
+    def _cleanup_failed_spawn(
+        self,
+        plan: _PtyCreatePlan,
+        guards: _PtySpawnGuards,
+        resources: _PtySpawnResources,
+        protected: Any | None,
+    ) -> None:
+        if resources.executable_snapshot is not None:
+            resources.executable_snapshot.close()
+        if resources.handle is not None:
+            try:
+                guards.cleanup_attempted = True
+                if protected is not None and not protected.terminal:
+                    protected.call(
+                        ProviderPhase("cleanup_close", state_mutation=True),
+                        resources.handle.close,
+                        force=True,
+                        timeout_s=self.config.pty.close_timeout_s,
+                    )
+                guards.cleanup_succeeded = True
+            except Exception:
+                pass
+        if resources.session_oid is not None:
+            try:
+                self.host.memory.delete_object_trusted(
+                    plan.pid,
+                    resources.session_oid,
+                    reason="pty_create_pre_registration_failure",
+                )
+            except Exception:
+                pass
+
+    def _complete_started_session(
+        self,
+        started: _PtyStartedSession,
+    ) -> PtyCreateResult:
+        plan = started.plan
+        session = started.session
         try:
-            parent_operation_id = self.runtime.operations.current_id()
+            parent_operation_id = self.host.operations.current_id()
             self._start_reader(
                 session,
-                resource=resource,
+                resource=plan.resource,
                 parent_operation_id=parent_operation_id,
             )
-            self._start_monitor(session, resource=resource)
-            if selected_startup_timeout > 0:
-                time.sleep(selected_startup_timeout)
-            output, output_truncated = self._take_output(session, selected_output_chars)
+            self._start_monitor(session, resource=plan.resource)
+            if plan.startup_timeout_s > 0:
+                time.sleep(plan.startup_timeout_s)
+            output, output_truncated = self._take_output(
+                session,
+                plan.output_chars,
+            )
             result = PtyCreateResult(
-                session_oid=session_oid,
-                namespace=namespace,
-                name=object_name,
+                session_oid=session.session_oid,
+                namespace=started.namespace,
+                name=started.object_name,
                 type=ObjectType.EXTERNAL_REF.value,
-                alive=protected.call(
+                alive=started.protected.call(
                     ProviderPhase("spawn_status", information_flow=True),
                     session.handle.is_alive,
                 ),
@@ -1179,42 +1487,50 @@ class PtyAdapter:
                 output_truncated=output_truncated,
                 dropped_chars=session.dropped_chars,
             )
-            spawn_result = {"session_oid": session_oid, "backend": session.backend}
-            protected.complete(
+            result_payload = {
+                "session_oid": session.session_oid,
+                "backend": session.backend,
+            }
+            started.protected.complete(
                 result,
                 self._protected_pty_evidence(
-                    pid,
-                    session_oid,
+                    plan.pid,
+                    session.session_oid,
                     "spawn",
                     {
-                        "argv": checked,
-                        "cwd": cwd,
-                        "resource": resource,
+                        "argv": plan.argv,
+                        "cwd": plan.cwd,
+                        "resource": plan.resource,
                         "backend": session.backend,
-                        "policy_level": decision.policy_level,
-                        "policy_reason": decision.reason,
-                        "risk": decision.risk.value,
-                        "rule_id": decision.rule_id,
-                        "cols": selected_cols,
-                        "rows": selected_rows,
+                        "policy_level": plan.decision.policy_level,
+                        "policy_reason": plan.decision.reason,
+                        "risk": plan.decision.risk.value,
+                        "rule_id": plan.decision.rule_id,
+                        "cols": plan.cols,
+                        "rows": plan.rows,
                     },
-                    output_refs=(session_oid,),
-                    correlation_id=intent_record.record_id,
-                    parent_record_id=intent_record.record_id,
+                    output_refs=(session.session_oid,),
+                    correlation_id=plan.intent_record.record_id,
+                    parent_record_id=plan.intent_record.record_id,
                 ),
                 classification_context={
-                    **effect_context,
+                    **plan.effect_context,
                     "backend": session.backend,
-                    "session_oid": session_oid,
+                    "session_oid": session.session_oid,
                 },
-                classification_result=spawn_result,
+                classification_result=result_payload,
             )
-            protected_cm.__exit__(None, None, None)
+            started.protected_cm.__exit__(None, None, None)
+            return result
         except BaseException:
-            self._cleanup_failed_started_session(session, actor=pid, reason="pty_create_post_spawn_failure")
-            protected_cm.__exit__(*sys.exc_info())
+            error_info = sys.exc_info()
+            self._cleanup_failed_started_session(
+                session,
+                actor=plan.pid,
+                reason="pty_create_post_spawn_failure",
+            )
+            started.protected_cm.__exit__(*error_info)
             raise
-        return result
 
     def read(self, pid: str, session_oid: str, *, timeout_s: float | None = None, max_chars: int | None = None) -> PtyReadResult:
         selected_timeout = self._validate_timeout(
@@ -1267,7 +1583,7 @@ class PtyAdapter:
                 # label. Serialize only final extraction (not the potentially
                 # blocking wait above) with that publication boundary.
                 with session.control_lock:
-                    self.runtime.data_flow.observe_ingress(
+                    self.host.data_flow.observe_ingress(
                         self._session_ingress_context(session)
                     )
                     output, truncated = self._take_output(session, selected_max_chars)
@@ -1585,7 +1901,7 @@ class PtyAdapter:
             }
             # Public close sets the reader stop flag before the protected SDK
             # enters, so reject impossible egress before mutating session state.
-            self.runtime.data_flow.authorize_egress(
+            self.host.data_flow.authorize_egress(
                 pid=pid,
                 sink=data_sink,
                 context=data_flow_context,
@@ -1604,7 +1920,7 @@ class PtyAdapter:
             data_flow_context=data_flow_context,
             data_flow_payload=data_flow_payload,
         )
-        self.runtime.memory.delete_object_trusted(pid, session_oid, reason="pty_close")
+        self.host.memory.delete_object_trusted(pid, session_oid, reason="pty_close")
         return PtyCloseResult(session_oid=session_oid, closed=True, exit_code=exit_code)
 
     def list(self, pid: str) -> list[PtySessionListEntry]:
@@ -1613,7 +1929,7 @@ class PtyAdapter:
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
-            obj = self.runtime.store.get_object(session.session_oid)
+            obj = self.host.store.get_object(session.session_oid)
             if obj is None:
                 continue
             try:
@@ -1639,7 +1955,7 @@ class PtyAdapter:
                     )
                 )
         if returned_contexts:
-            self.runtime.data_flow.observe_ingress(
+            self.host.data_flow.observe_ingress(
                 DataFlowContext.aggregate(returned_contexts)
             )
         self.audit.record(actor=pid, action="primitive.pty.list", target="pty:*", decision={"count": len(entries)})
@@ -1675,20 +1991,20 @@ class PtyAdapter:
             # false local-cleanup claim.
             pass
         try:
-            self.runtime.memory.delete_object_trusted("runtime.pty", session.session_oid, reason=reason)
+            self.host.memory.delete_object_trusted("runtime.pty", session.session_oid, reason=reason)
         except Exception:
             pass
 
     def release_stale_session_objects(self) -> list[str]:
         released: list[str] = []
-        for obj in list(self.runtime.store.list_objects()):
+        for obj in list(self.host.store.list_objects()):
             if obj.type != ObjectType.EXTERNAL_REF:
                 continue
             if not isinstance(obj.payload, dict) or obj.payload.get("kind") != "pty_session":
                 continue
             if obj.oid in self._sessions:
                 continue
-            if self.runtime.memory.delete_object_trusted("runtime.pty", obj.oid, reason="stale_pty_session"):
+            if self.host.memory.delete_object_trusted("runtime.pty", obj.oid, reason="stale_pty_session"):
                 released.append(obj.oid)
         if released:
             self.audit.record(
@@ -1748,7 +2064,7 @@ class PtyAdapter:
             "rows": rows,
             "created_at": utc_now(),
         }
-        handle = self.runtime.memory.create_object(
+        handle = self.host.memory.create_object(
             pid=pid,
             object_type=ObjectType.EXTERNAL_REF,
             payload=payload,
@@ -1760,14 +2076,8 @@ class PtyAdapter:
             immutable=False,
             name=object_name,
         )
-        obj = self.runtime.memory.get_object(pid, handle)
-        with self.runtime.store._lock:
-            process = self.runtime.process.get(pid)
-            if process.memory_view is None:
-                process.memory_view = self.runtime.memory.create_view(pid, [handle], mode=ViewMode.READ_ONLY)
-            elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
-                process.memory_view.roots.append(handle)
-            self.runtime.store.update_process(process)
+        obj = self.host.memory.get_object(pid, handle)
+        self.host.add_handle_to_process_view(pid, handle)
         return handle.oid, obj.name, obj.namespace
 
     @staticmethod
@@ -1793,7 +2103,7 @@ class PtyAdapter:
             )
             session.data_flow_context = combined
 
-        current = self.runtime.store.get_object(session.session_oid)
+        current = self.host.store.get_object(session.session_oid)
         if current is None:
             raise NotFound(f"PTY session Object not found: {session.session_oid}")
         metadata = propagate_object_labels(
@@ -1802,13 +2112,13 @@ class PtyAdapter:
         )
         if metadata == current.metadata:
             return
-        handle = self.runtime.memory.handle_for_oid(
+        handle = self.host.memory.handle_for_oid(
             session.owner_pid,
             session.session_oid,
             required_rights={ObjectRight.WRITE.value},
             issued_by="runtime.pty.data_flow",
         )
-        self.runtime.memory.update_object(
+        self.host.memory.update_object(
             session.owner_pid,
             handle,
             ObjectPatch(metadata=metadata),
@@ -1823,7 +2133,7 @@ class PtyAdapter:
         with session.lock:
             session_context = session.data_flow_context
         return DataFlowContext.aggregate(
-            (self.runtime.data_flow.current_context(), session_context)
+            (self.host.data_flow.current_context(), session_context)
         )
 
     def _session_ingress_context(
@@ -1896,7 +2206,7 @@ class PtyAdapter:
     ) -> None:
         try:
             operation_context = (
-                self.runtime.operations.attach(parent_operation_id)
+                self.host.operations.attach(parent_operation_id)
                 if parent_operation_id is not None
                 else contextlib.nullcontext()
             )
@@ -2017,11 +2327,48 @@ class PtyAdapter:
         with session.lock:
             if session.stop_event.is_set() or session.closing or session.closed:
                 return
+        observation = self._observe_session_resources(session)
+        delta = self._update_session_resource_totals(session, observation)
+        if delta is None:
+            return
+        wall_only_monitoring = self._wall_only_monitoring(
+            session,
+            observation.sampling_error,
+        )
+        if not delta.changed:
+            if observation.sampling_error is not None and not wall_only_monitoring:
+                raise observation.sampling_error
+            return
+        if self._charge_session_resources(session, resource, delta):
+            return
+        if observation.sampling_error is not None and not wall_only_monitoring:
+            raise observation.sampling_error
+
+    def _observe_session_resources(
+        self,
+        session: _PtyRuntimeSession,
+    ) -> _PtyResourceObservation:
         wall_seconds = max(0.0, time.monotonic() - session.started_monotonic)
+        processes, sampling_error = self._process_tree(session.handle.pid)
+        cpu_seconds, memory_bytes, sampling_error = self._process_metrics(
+            processes,
+            sampling_error,
+        )
+        return _PtyResourceObservation(
+            wall_seconds=wall_seconds,
+            cpu_seconds_by_process=cpu_seconds,
+            memory_bytes=memory_bytes,
+            sampling_error=sampling_error,
+        )
+
+    def _process_tree(
+        self,
+        pid: int,
+    ) -> tuple[list[Any], Exception | None]:
         processes: list[Any] = []
         sampling_error: Exception | None = None
         try:
-            proc = psutil.Process(session.handle.pid)
+            proc = psutil.Process(pid)
             processes = [proc]
             try:
                 processes.extend(proc.children(recursive=True))
@@ -2042,7 +2389,13 @@ class PtyAdapter:
             # after charging and the monitor retains its fail-closed behavior.
             sampling_error = exc
             processes = []
+        return processes, sampling_error
 
+    def _process_metrics(
+        self,
+        processes: list[Any],
+        sampling_error: Exception | None,
+    ) -> tuple[dict[tuple[int, float], float], int, Exception | None]:
         observed_cpu: dict[tuple[int, float], float] = {}
         current_memory = 0
         for item in processes:
@@ -2058,38 +2411,68 @@ class PtyAdapter:
                 break
             except psutil.Error:
                 continue
+        return observed_cpu, current_memory, sampling_error
+
+    def _update_session_resource_totals(
+        self,
+        session: _PtyRuntimeSession,
+        observation: _PtyResourceObservation,
+    ) -> _PtyResourceDelta | None:
         with session.lock:
             if session.stop_event.is_set() or session.closing or session.closed:
-                return
-            for identity, total in observed_cpu.items():
+                return None
+            for identity, total in observation.cpu_seconds_by_process.items():
                 previous = session.cpu_seconds_by_process.get(identity, 0.0)
                 session.cpu_seconds_by_process[identity] = max(previous, total)
             cpu_seconds = sum(session.cpu_seconds_by_process.values())
-            wall_delta = max(0.0, wall_seconds - session.last_wall_seconds)
-            cpu_delta = max(0.0, cpu_seconds - session.last_cpu_seconds)
-            peak_delta_changed = current_memory > session.last_peak_memory_bytes
-            session.last_wall_seconds = wall_seconds
-            session.last_cpu_seconds = cpu_seconds
-            session.last_peak_memory_bytes = max(session.last_peak_memory_bytes, current_memory)
-        wall_only_monitoring = False
-        if sampling_error is not None:
-            remaining = self.resources.remaining_budget(session.owner_pid)
-            wall_only_monitoring = (
-                remaining.max_subprocess_wall_seconds is not None
-                and remaining.max_subprocess_cpu_seconds is None
-                and remaining.max_subprocess_memory_bytes is None
+            wall_delta = max(
+                0.0,
+                observation.wall_seconds - session.last_wall_seconds,
             )
-        if wall_delta == 0 and cpu_delta == 0 and not peak_delta_changed:
-            if sampling_error is not None and not wall_only_monitoring:
-                raise sampling_error
-            return
+            cpu_delta = max(0.0, cpu_seconds - session.last_cpu_seconds)
+            peak_delta_changed = (
+                observation.memory_bytes > session.last_peak_memory_bytes
+            )
+            session.last_wall_seconds = observation.wall_seconds
+            session.last_cpu_seconds = cpu_seconds
+            session.last_peak_memory_bytes = max(
+                session.last_peak_memory_bytes,
+                observation.memory_bytes,
+            )
+        return _PtyResourceDelta(
+            wall_seconds=wall_delta,
+            cpu_seconds=cpu_delta,
+            memory_bytes=observation.memory_bytes,
+            peak_changed=peak_delta_changed,
+        )
+
+    def _wall_only_monitoring(
+        self,
+        session: _PtyRuntimeSession,
+        sampling_error: Exception | None,
+    ) -> bool:
+        if sampling_error is None:
+            return False
+        remaining = self.resources.remaining_budget(session.owner_pid)
+        return (
+            remaining.max_subprocess_wall_seconds is not None
+            and remaining.max_subprocess_cpu_seconds is None
+            and remaining.max_subprocess_memory_bytes is None
+        )
+
+    def _charge_session_resources(
+        self,
+        session: _PtyRuntimeSession,
+        resource: str,
+        delta: _PtyResourceDelta,
+    ) -> bool:
         try:
             self.resources.charge(
                 session.owner_pid,
                 ResourceUsage(
-                    subprocess_wall_seconds=wall_delta,
-                    subprocess_cpu_seconds=cpu_delta,
-                    subprocess_peak_memory_bytes=current_memory,
+                    subprocess_wall_seconds=delta.wall_seconds,
+                    subprocess_cpu_seconds=delta.cpu_seconds,
+                    subprocess_peak_memory_bytes=delta.memory_bytes,
                 ),
                 source="primitive.pty.spawn",
                 context={"resource": resource, "session_oid": session.session_oid},
@@ -2113,9 +2496,8 @@ class PtyAdapter:
                     target=f"pty:{session.session_oid}",
                     decision={"reason": str(exc)},
                 )
-            return
-        if sampling_error is not None and not wall_only_monitoring:
-            raise sampling_error
+            return True
+        return False
 
     def _fail_closed_resource_monitor(
         self,
@@ -2133,7 +2515,7 @@ class PtyAdapter:
                 timeout_s=self.config.pty.close_timeout_s,
                 wait_if_closing=True,
             )
-            self.runtime.memory.delete_object_trusted(
+            self.host.memory.delete_object_trusted(
                 "runtime.pty",
                 session.session_oid,
                 reason="resource_monitor_access_denied",
@@ -2169,23 +2551,83 @@ class PtyAdapter:
             session = self._sessions.get(session_oid)
         if session is None:
             return None
-        if authority_decision is not None and (
-            data_sink is None
-            or data_flow_context is None
-            or data_flow_payload is None
-        ):
+        self._validate_close_descriptors(
+            authority_decision,
+            data_sink,
+            data_flow_context,
+            data_flow_payload,
+        )
+        remove_only, exit_code = self._begin_session_close(
+            session,
+            timeout_s=timeout_s,
+            wait_if_closing=wait_if_closing,
+        )
+        if remove_only:
+            self._settle_remove_only_close(
+                session,
+                actor=actor,
+                authority_decision=authority_decision,
+            )
+            return exit_code
+        plan = _PtyClosePlan(
+            session_oid=session_oid,
+            session=session,
+            actor=actor,
+            reason=reason,
+            force=force,
+            timeout_s=timeout_s,
+            authority_decision=authority_decision,
+            data_sink=data_sink,
+            data_flow_context=data_flow_context,
+            data_flow_payload=data_flow_payload,
+            effect_context=self._close_effect_context(
+                session,
+                reason=reason,
+                force=force,
+                timeout_s=timeout_s,
+            ),
+        )
+        try:
+            return self._perform_protected_close(plan)
+        except BaseException:
+            self._mark_close_failed(plan)
+            raise
+
+    def _validate_close_descriptors(
+        self,
+        authority_decision: CapabilityDecision | None,
+        data_sink: DataSink | None,
+        data_flow_context: DataFlowContext | None,
+        data_flow_payload: dict[str, Any] | None,
+    ) -> None:
+        if authority_decision is None:
+            return
+        if data_sink is None or data_flow_context is None or data_flow_payload is None:
             raise ValidationError(
                 "public PTY close requires complete data-flow egress descriptors"
             )
+
+    def _begin_session_close(
+        self,
+        session: _PtyRuntimeSession,
+        *,
+        timeout_s: float,
+        wait_if_closing: bool,
+    ) -> tuple[bool, int | None]:
         wait_for_close: threading.Event | None = None
+        exit_code: int | None = None
         with session.lock:
             if session.close_outcome_unknown:
                 raise ValidationError(
-                    f"PTY session has an unresolved prior close outcome and cannot be retried: {session_oid}"
+                    "PTY session has an unresolved prior close outcome and "
+                    f"cannot be retried: {session.session_oid}"
                 )
             if session.closing:
                 if not wait_if_closing:
-                    raise ValidationError(f"PTY session close is already in progress: {session_oid}")
+                    raise ValidationError(
+                        "PTY session close is already in progress: "
+                        f"{session.session_oid}"
+                    )
                 wait_for_close = session.close_complete
             if session.closed:
                 exit_code = session.exit_code
@@ -2199,175 +2641,218 @@ class PtyAdapter:
                 exit_code = session.exit_code
         if wait_for_close is not None:
             if not wait_for_close.wait(timeout=max(0.0, timeout_s)):
-                raise ValidationError(f"timed out waiting for PTY session close: {session_oid}")
+                raise ValidationError(
+                    f"timed out waiting for PTY session close: {session.session_oid}"
+                )
             with session.lock:
                 if not session.closed:
-                    raise ValidationError(f"PTY session close did not complete: {session_oid}")
+                    raise ValidationError(
+                        f"PTY session close did not complete: {session.session_oid}"
+                    )
                 exit_code = session.exit_code
-        if not remove_only:
-            close_effect_context = {
-                "session_oid": session_oid,
-                "backend": session.backend,
-                "reason": reason,
-                "force": force,
-                "timeout_s": timeout_s,
+        return remove_only, exit_code
+
+    def _settle_remove_only_close(
+        self,
+        session: _PtyRuntimeSession,
+        *,
+        actor: str,
+        authority_decision: CapabilityDecision | None,
+    ) -> None:
+        # Another closer (or natural-exit cleanup) crossed the provider
+        # boundary. This caller may consume DELETE authority, but must not
+        # fabricate another provider effect or intent.
+        if authority_decision is not None:
+            self.host.capability.claim_decision_use(
+                authority_decision,
+                used_by=actor,
+                reason=(
+                    "PTY close completed after another closer crossed the "
+                    "provider boundary"
+                ),
+            )
+        with self._lock:
+            self._sessions.pop(session.session_oid, None)
+
+    def _close_effect_context(
+        self,
+        session: _PtyRuntimeSession,
+        *,
+        reason: str,
+        force: bool,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        return {
+            "session_oid": session.session_oid,
+            "backend": session.backend,
+            "reason": reason,
+            "force": force,
+            "timeout_s": timeout_s,
+            "provider_close_performed": True,
+        }
+
+    def _protected_close_operation(
+        self,
+        plan: _PtyClosePlan,
+        state: _PtyCloseMutationState,
+    ) -> Any:
+
+        def restore_not_started() -> None:
+            with plan.session.lock:
+                plan.session.closing = False
+                plan.session.close_complete.set()
+
+        def failure_evidence(
+            error: BaseException,
+            phase: str,
+        ) -> ProtectedOperationEvidence:
+            return self._protected_pty_failure_evidence(
+                plan.actor,
+                plan.session_oid,
+                "close",
+                error,
+                phase,
+            )
+
+        def settle_ambiguous_close(error: BaseException, _phase: str) -> None:
+            if (
+                plan.data_flow_context is not None
+                and state.attempted
+                and not isinstance(error, ProviderEffectNotStarted)
+            ):
+                self._raise_session_flow(plan.session, plan.data_flow_context)
+
+        if plan.authority_decision is None:
+            invocation = ProtectedOperationInvocation(
+                pid=plan.session.owner_pid,
+                actor=plan.actor,
+                target=f"pty:{plan.session_oid}",
+                canonical_args=plan.effect_context,
+                observation=plan.effect_context,
+                restore_not_started=restore_not_started,
+                failure_evidence=failure_evidence,
+            )
+            operation = "primitive.pty.close.internal"
+        else:
+            assert plan.data_sink is not None
+            assert plan.data_flow_context is not None
+            assert plan.data_flow_payload is not None
+            invocation = ProtectedOperationInvocation(
+                pid=plan.session.owner_pid,
+                actor=plan.actor,
+                target=f"pty:{plan.session_oid}",
+                decisions=(plan.authority_decision,),
+                canonical_args=plan.effect_context,
+                observation=plan.effect_context,
+                data_sink=plan.data_sink,
+                data_flow_context=plan.data_flow_context,
+                data_flow_payload=plan.data_flow_payload,
+                data_flow_operation="pty.close",
+                restore_not_started=restore_not_started,
+                failure_evidence=failure_evidence,
+                failure_settlement=settle_ambiguous_close,
+            )
+            operation = "primitive.pty.close"
+        return self._protected().start(
+            operation,
+            invocation,
+            provider=self.provider,
+        )
+
+    def _close_provider(
+        self,
+        plan: _PtyClosePlan,
+        state: _PtyCloseMutationState,
+    ) -> int | None:
+        state.attempted = True
+        try:
+            exit_code = plan.session.handle.close(
+                force=plan.force,
+                timeout_s=plan.timeout_s,
+            )
+        except ProviderEffectNotStarted:
+            raise
+        except BaseException:
+            plan.session.stop_event.set()
+            raise
+        plan.session.stop_event.set()
+        return exit_code
+
+    def _perform_protected_close(self, plan: _PtyClosePlan) -> int | None:
+        state = _PtyCloseMutationState()
+        protected_operation = self._protected_close_operation(plan, state)
+        with protected_operation as protected:
+            if plan.reason == "process_exit":
+                protected.call(
+                    ProviderPhase("exit_code", information_flow=True),
+                    plan.session.handle.exit_code,
+                )
+            exit_code = protected.call(
+                ProviderPhase(
+                    "close",
+                    state_mutation=True,
+                    information_flow=True,
+                ),
+                self._close_provider,
+                plan,
+                state,
+            )
+            plan.session.stop_event.set()
+            self._join_session_workers(
+                plan.session,
+                timeout_s=min(plan.timeout_s, 1.0),
+            )
+
+            def settle_success() -> None:
+                with plan.session.lock:
+                    plan.session.closed = True
+                    plan.session.closing = False
+                    plan.session.exit_code = exit_code
+                    plan.session.close_complete.set()
+                with self._lock:
+                    self._sessions.pop(plan.session_oid, None)
+
+            result_payload = {
+                "reason": plan.reason,
+                "force": plan.force,
+                "exit_code": exit_code,
+                "closed": True,
                 "provider_close_performed": True,
             }
-
-            def restore_not_started() -> None:
-                with session.lock:
-                    session.closing = False
-                    session.close_complete.set()
-
-            close_mutation_attempted = False
-
-            def close_provider() -> int | None:
-                nonlocal close_mutation_attempted
-                close_mutation_attempted = True
-                try:
-                    exit_code = session.handle.close(force=force, timeout_s=timeout_s)
-                except ProviderEffectNotStarted:
-                    raise
-                except BaseException:
-                    session.stop_event.set()
-                    raise
-                session.stop_event.set()
-                return exit_code
-
-            def settle_ambiguous_close(
-                error: BaseException,
-                _phase: str,
-            ) -> None:
-                if (
-                    data_flow_context is None
-                    or not close_mutation_attempted
-                    or isinstance(error, ProviderEffectNotStarted)
-                ):
-                    return
-                self._raise_session_flow(session, data_flow_context)
-
-            if authority_decision is not None:
-                assert data_sink is not None
-                assert data_flow_context is not None
-                assert data_flow_payload is not None
-                public_invocation = ProtectedOperationInvocation(
-                    pid=session.owner_pid,
-                    actor=actor,
-                    target=f"pty:{session_oid}",
-                    decisions=(authority_decision,),
-                    canonical_args=close_effect_context,
-                    observation=close_effect_context,
-                    data_sink=data_sink,
-                    data_flow_context=data_flow_context,
-                    data_flow_payload=data_flow_payload,
-                    data_flow_operation="pty.close",
-                    restore_not_started=restore_not_started,
-                    failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
-                        actor, session_oid, "close", error, phase
-                    ),
-                    failure_settlement=settle_ambiguous_close,
-                )
-                protected_operation = self._protected().start(
-                    "primitive.pty.close",
-                    public_invocation,
-                    provider=self.provider,
-                )
-            else:
-                internal_invocation = ProtectedOperationInvocation(
-                    pid=session.owner_pid,
-                    actor=actor,
-                    target=f"pty:{session_oid}",
-                    canonical_args=close_effect_context,
-                    observation=close_effect_context,
-                    restore_not_started=restore_not_started,
-                    failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
-                        actor, session_oid, "close", error, phase
-                    ),
-                )
-                protected_operation = self._protected().start(
-                    "primitive.pty.close.internal",
-                    internal_invocation,
-                    provider=self.provider,
-                )
-            try:
-                with protected_operation as protected:
-                    if reason == "process_exit":
-                        protected.call(
-                            ProviderPhase("exit_code", information_flow=True),
-                            session.handle.exit_code,
-                        )
-                    exit_code = protected.call(
-                        ProviderPhase(
-                            "close",
-                            state_mutation=True,
-                            information_flow=True,
-                        ),
-                        close_provider,
-                    )
-                    session.stop_event.set()
-                    self._join_session_workers(session, timeout_s=min(timeout_s, 1.0))
-
-                    def settle_success() -> None:
-                        with session.lock:
-                            session.closed = True
-                            session.closing = False
-                            session.exit_code = exit_code
-                            session.close_complete.set()
-                        with self._lock:
-                            self._sessions.pop(session_oid, None)
-
-                    result_payload = {
-                        "reason": reason,
-                        "force": force,
-                        "exit_code": exit_code,
-                        "closed": True,
-                        "provider_close_performed": True,
-                    }
-                    evidence_operation = "exit" if reason == "process_exit" else "close"
-                    protected.complete(
-                        exit_code,
-                        self._protected_pty_evidence(
-                            actor,
-                            session_oid,
-                            evidence_operation,
-                            result_payload,
-                            input_refs=(session_oid,),
-                        ),
-                        classification_context=close_effect_context,
-                        classification_result=result_payload,
-                        settle_success=settle_success,
-                    )
-            except BaseException:
-                uncertain_close = any(
-                    effect.operation == "close"
-                    and effect.target == f"pty:{session_oid}"
-                    and (
-                        effect.effect_state == "pending"
-                        or effect.transaction_state == "unknown"
-                    )
-                    for effect in self.runtime.store.list_external_effects(
-                        pid=session.owner_pid
-                    )
-                )
-                with session.lock:
-                    session.closing = False
-                    session.close_outcome_unknown = uncertain_close
-                    session.close_complete.set()
-                raise
-        else:
-            # Another closer (or the natural-exit cleanup) already crossed the
-            # provider boundary. This caller still consumes DELETE authority
-            # because it completes the runtime Object release, but it must not
-            # fabricate a second provider effect or intent.
-            if authority_decision is not None:
-                self.runtime.capability.claim_decision_use(
-                    authority_decision,
-                    used_by=actor,
-                    reason="PTY close completed after another closer crossed the provider boundary",
-                )
-            with self._lock:
-                self._sessions.pop(session_oid, None)
+            evidence_operation = (
+                "exit" if plan.reason == "process_exit" else "close"
+            )
+            protected.complete(
+                exit_code,
+                self._protected_pty_evidence(
+                    plan.actor,
+                    plan.session_oid,
+                    evidence_operation,
+                    result_payload,
+                    input_refs=(plan.session_oid,),
+                ),
+                classification_context=plan.effect_context,
+                classification_result=result_payload,
+                settle_success=settle_success,
+            )
         return exit_code
+
+    def _mark_close_failed(self, plan: _PtyClosePlan) -> None:
+        uncertain_close = any(
+            effect.operation == "close"
+            and effect.target == f"pty:{plan.session_oid}"
+            and (
+                effect.effect_state == "pending"
+                or effect.transaction_state == "unknown"
+            )
+            for effect in self.host.store.list_external_effects(
+                pid=plan.session.owner_pid
+            )
+        )
+        with plan.session.lock:
+            plan.session.closing = False
+            plan.session.close_outcome_unknown = uncertain_close
+            plan.session.close_complete.set()
 
     def _session_is_closing_or_closed(self, session: _PtyRuntimeSession) -> bool:
         with session.lock:
@@ -2410,7 +2895,7 @@ class PtyAdapter:
         return session
 
     def _protected(self) -> Any:
-        sdk = getattr(self.runtime, "protected_operations", None)
+        sdk = self.host.protected_operations
         if sdk is None:
             raise ValidationError("PTY protected-operation SDK is not attached")
         return sdk
@@ -2512,7 +2997,7 @@ class PtyAdapter:
                 effect.operation == "close"
                 and effect.target == f"pty:{session.session_oid}"
                 and effect.effect_state == "pending"
-                for effect in self.runtime.store.list_external_effects(pid=session.owner_pid)
+                for effect in self.host.store.list_external_effects(pid=session.owner_pid)
             )
             if pending:
                 raise
@@ -2535,9 +3020,9 @@ class PtyAdapter:
         *,
         consume: bool = True,
     ) -> CapabilityDecision:
-        if self.runtime.store.get_object(oid) is None:
+        if self.host.store.get_object(oid) is None:
             raise NotFound(f"object not found: {oid}")
-        return self.runtime.capability.require(
+        return self.host.capability.require(
             pid,
             f"object:{oid}",
             right,
@@ -2626,7 +3111,7 @@ class PtyAdapter:
                 "high_risk": decision.high_risk,
                 "risk": decision.risk.value,
                 "rule_id": decision.rule_id,
-                "sandbox_profile": self.shell._profile_json(decision.sandbox_profile),
+                "sandbox_profile": self.shell_policy.profile_json(decision.sandbox_profile),
                 "continuous_session": True,
             },
         )
@@ -2642,11 +3127,11 @@ class PtyAdapter:
         cwd: str,
         source_oids: Iterable[str] | None = None,
     ) -> None:
-        if self.shell.human is None:
+        if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for pty spawn on {resource}")
-        request_id = self.shell.human.query(
+        request_id = self.human.query(
             pid=pid,
-            human=self.runtime.config.runtime.default_human,
+            human=self.host.config.runtime.default_human,
             request={
                 "type": "external_operation_approval",
                 "question": f"Allow this process to open an interactive PTY for {argv[0]!r}?",
@@ -2654,7 +3139,7 @@ class PtyAdapter:
                     "subject": pid,
                     "resource": resource,
                     "rights": [CapabilityRight.EXECUTE.value],
-                    "constraints": self.shell._approval_constraints(
+                    "constraints": self.shell_policy.approval_constraints(
                         argv,
                         decision,
                         timeout=timeout,
@@ -2685,7 +3170,7 @@ class PtyAdapter:
                     "risk": decision.risk.value,
                     "rule_id": decision.rule_id,
                     "rule_effect": decision.rule_effect.value,
-                    "sandbox_profile": self.shell._profile_json(decision.sandbox_profile),
+                    "sandbox_profile": self.shell_policy.profile_json(decision.sandbox_profile),
                 },
             },
             blocking=True,
@@ -2959,7 +3444,7 @@ def _runtime(ctx: ToolContext) -> Any:
 
 
 def _pty_adapter(runtime: Any) -> PtyAdapter:
-    adapter = getattr(runtime, _PTY_ADAPTER_ATTR, None)
+    adapter = runtime.module_state.get(_PTY_ADAPTER_ATTR)
     if adapter is None:
         raise ToolExecutionError("PTY module has not initialized.", code=ToolErrorCode.EXECUTION_ERROR)
     return adapter

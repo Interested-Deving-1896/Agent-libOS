@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,17 +19,25 @@ from agent_libos.models import (
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
+    MemoryView,
+    ObjectHandle,
     ProcessStatus,
     ResourceBudget,
     ResourceUsage,
+    ViewMode,
 )
-from agent_libos.models.exceptions import ValidationError
-from agent_libos.runtime.external_effects import (
+from agent_libos.models.exceptions import (
+    ProcessRevisionConflict,
+    UnsupportedStoreVersion,
+    ValidationError,
+)
+from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     record_external_effect,
 )
-from agent_libos.storage import SQLiteStore
+from agent_libos.storage import SQLRuntimeStore, STORE_SCHEMA_VERSION, SQLiteStore
 from agent_libos.storage.postgres import PostgresStore
+from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
 from agent_libos.utils.ids import utc_now
 from tests.support.external_effects import begin_external_effect_intent
 
@@ -294,6 +303,114 @@ def _create_legacy_objects_table(connection: sqlite3.Connection, table: str = "o
 
 
 class TestStoreTransactionRecovery:
+    def test_process_memory_root_append_is_commutative(self) -> None:
+        store = SQLiteStore(":memory:")
+        process = _runnable_process("pid_roots")
+        process.memory_view = MemoryView(
+            view_id="view_roots",
+            owner_pid=process.pid,
+            roots=[],
+            filters=[],
+            rights_policy="attenuate",
+            created_from=None,
+            mode=ViewMode.MUTABLE,
+        )
+        store.insert_process(process)
+        roots = [
+            ObjectHandle(oid="oid_a", rights={"read"}, capability_id="cap_a"),
+            ObjectHandle(oid="oid_b", rights={"read"}, capability_id="cap_b"),
+        ]
+        try:
+            threads = [
+                threading.Thread(
+                    target=store.append_process_memory_roots,
+                    args=(process.pid, [root]),
+                )
+                for root in roots
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            stored = store.get_process(process.pid)
+            assert stored is not None and stored.memory_view is not None
+            assert {root.oid for root in stored.memory_view.roots} == {"oid_a", "oid_b"}
+        finally:
+            store.close()
+
+    def test_terminal_process_cannot_be_resurrected_by_stale_or_fresh_update(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            store.insert_process(_runnable_process("pid_terminal"))
+            stale = store.get_process("pid_terminal")
+            killed = store.get_process("pid_terminal")
+            assert stale is not None and killed is not None
+            killed.status = ProcessStatus.KILLED
+            store.update_process(killed)
+
+            stale.tool_table["late"] = "tool_late"
+            with pytest.raises(ProcessRevisionConflict):
+                store.update_process(stale)
+            terminal = store.get_process("pid_terminal")
+            assert terminal is not None
+            terminal.status = ProcessStatus.RUNNABLE
+            with pytest.raises(ProcessRevisionConflict):
+                store.update_process(terminal)
+            assert store.get_process("pid_terminal").status == ProcessStatus.KILLED  # type: ignore[union-attr]
+        finally:
+            store.close()
+
+    def test_execution_token_fences_stale_quantum_completion(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            store.insert_process(_runnable_process("pid_fenced"))
+            first = store.claim_execution("pid_fenced", owner_id="runtime_first")
+            assert first is not None
+            assert store.complete_execution(first)
+            second = store.claim_execution("pid_fenced", owner_id="runtime_second")
+            assert second is not None
+            assert second.generation > first.generation
+
+            assert store.complete_execution(first) is False
+            running = store.get_process("pid_fenced")
+            assert running is not None
+            assert running.status == ProcessStatus.RUNNING
+            assert running.execution_lease_id == second.lease_id
+            assert store.complete_execution(second)
+        finally:
+            store.close()
+
+    def test_outer_rollback_restores_payload_mutated_by_committed_inner_transaction(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            store.set_object_payload("obj_payload", {"value": "before"})
+
+            with pytest.raises(RuntimeError, match="rollback outer"):
+                with store.transaction():
+                    store.set_object_payload("obj_payload", {"value": "after"})
+                    raise RuntimeError("rollback outer")
+
+            assert store.object_payload("obj_payload") == {"value": "before"}
+        finally:
+            store.close()
+
+    def test_nested_payload_commit_merges_earliest_before_image_into_parent(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            store.set_object_payload("obj_payload", {"value": "before"})
+
+            with pytest.raises(RuntimeError, match="rollback outer"):
+                with store.transaction():
+                    store.set_object_payload("obj_payload", {"value": "middle"})
+                    with store.transaction():
+                        store.set_object_payload("obj_payload", {"value": "after"})
+                    raise RuntimeError("rollback outer")
+
+            assert store.object_payload("obj_payload") == {"value": "before"}
+        finally:
+            store.close()
+
     def test_set_object_payload_sql_failure_restores_previous_payload(self) -> None:
         store = SQLiteStore(":memory:")
         try:
@@ -571,62 +688,185 @@ class TestPostgresRuntimeLeaseIsolation:
             assert unlock_calls == [("SELECT pg_advisory_unlock(?)", (store._runtime_lease_key,))]
 
 
-class TestObjectSchemaMigrationRecovery:
-    def test_objects_rebuild_failure_is_atomic_and_next_open_recovers(
+class TestUnsupportedStoreVersion:
+    def test_v3_schema_manifest_matches_fresh_store(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            assert set(_V3_REQUIRED_COLUMNS) == {
+                "runtime_schema",
+                *store.ALLOWED_TABLES,
+            }
+            for table, expected_columns in _V3_REQUIRED_COLUMNS.items():
+                actual_columns = {
+                    str(row["name"])
+                    for row in store.conn.execute(f"PRAGMA table_info({table})")
+                }
+                assert actual_columns == expected_columns, table
+        finally:
+            store.close()
+
+    def test_interrupted_bootstrap_rolls_back_and_reopens_cleanly(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        db_path = tmp_path / "interrupted-bootstrap.sqlite"
+        original = SQLRuntimeStore._write_store_schema_version
+
+        def interrupt_after_marker(store: SQLRuntimeStore) -> None:
+            original(store)
+            raise RuntimeError("injected bootstrap interruption")
+
+        monkeypatch.setattr(
+            SQLRuntimeStore,
+            "_write_store_schema_version",
+            interrupt_after_marker,
+        )
+        with pytest.raises(RuntimeError, match="bootstrap interruption"):
+            SQLiteStore(db_path)
+        monkeypatch.setattr(
+            SQLRuntimeStore,
+            "_write_store_schema_version",
+            original,
+        )
+
+        connection = sqlite3.connect(db_path)
+        try:
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall() == []
+        finally:
+            connection.close()
+
+        reopened = SQLiteStore(db_path)
+        try:
+            row = reopened.conn.execute(
+                "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
+            ).fetchone()
+            assert row is not None
+            assert row["schema_version"] == STORE_SCHEMA_VERSION
+        finally:
+            reopened.close()
+
+    def test_wrong_schema_marker_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "wrong-version.sqlite"
+        SQLiteStore(db_path).close()
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("UPDATE runtime_schema SET schema_version = 2")
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+
+        with pytest.raises(UnsupportedStoreVersion, match="expected 3"):
+            SQLiteStore(db_path)
+
+        assert db_path.read_bytes() == before
+
+    def test_incomplete_v3_schema_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "incomplete-v3.sqlite"
+        SQLiteStore(db_path).close()
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("DROP TABLE checkpoints")
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+
+        with pytest.raises(UnsupportedStoreVersion, match="incomplete"):
+            SQLiteStore(db_path)
+
+        assert db_path.read_bytes() == before
+
+    def test_incomplete_v3_column_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "incomplete-v3-column.sqlite"
+        SQLiteStore(db_path).close()
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("ALTER TABLE checkpoints DROP COLUMN reason")
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+
+        with pytest.raises(UnsupportedStoreVersion, match="incomplete"):
+            SQLiteStore(db_path)
+
+        assert db_path.read_bytes() == before
+
+    def test_nonempty_unversioned_store_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "unrelated.sqlite"
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("CREATE TABLE unrelated_business_data (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO unrelated_business_data VALUES ('sentinel')")
+            connection.commit()
+        finally:
+            connection.close()
+        db_path.chmod(0o644)
+        before = db_path.read_bytes()
+        before_mode = stat.S_IMODE(db_path.stat().st_mode)
+        opened: SQLiteStore | None = None
+
+        try:
+            with pytest.raises(UnsupportedStoreVersion, match="unversioned"):
+                opened = SQLiteStore(db_path)
+        finally:
+            if opened is not None:
+                opened.close()
+
+        assert db_path.read_bytes() == before
+        assert stat.S_IMODE(db_path.stat().st_mode) == before_mode
+        assert not lease_path.exists()
+
+    def test_legacy_objects_store_is_rejected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "legacy.sqlite"
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
         connection = sqlite3.connect(db_path)
         try:
             _create_legacy_objects_table(connection)
         finally:
             connection.close()
+        db_path.chmod(0o644)
+        before = db_path.read_bytes()
+        before_mode = stat.S_IMODE(db_path.stat().st_mode)
 
-        real_connect = sqlite_backend.sqlite3.connect
-        injected = False
-
-        def connect_with_failure(*args: Any, **kwargs: Any) -> Any:
-            nonlocal injected
-            raw = real_connect(*args, **kwargs)
-            if not injected:
-                injected = True
-                return _ExecuteFailureConnection(raw, marker="DROP TABLE objects_old")
-            return raw
-
-        monkeypatch.setattr(sqlite_backend.sqlite3, "connect", connect_with_failure)
-        with pytest.raises(RuntimeError, match="injected SQL failure"):
+        with pytest.raises(UnsupportedStoreVersion, match="archive-only"):
             SQLiteStore(db_path)
 
-        reopened = SQLiteStore(db_path)
+        assert db_path.read_bytes() == before
+        assert stat.S_IMODE(db_path.stat().st_mode) == before_mode
+        assert not lease_path.exists()
+        connection = sqlite3.connect(db_path)
         try:
-            rows = reopened.select_table_rows("objects", "oid = ?", ("obj_legacy",))
-            assert len(rows) == 1
-            assert rows[0]["namespace"] == "system"
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            assert tables == {"objects"}
         finally:
-            reopened.close()
+            connection.close()
 
-    def test_open_recovers_preexisting_objects_old_without_losing_rows(self, tmp_path: Path) -> None:
+    def test_interrupted_legacy_rebuild_is_rejected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "interrupted.sqlite"
         connection = sqlite3.connect(db_path)
         try:
             _create_legacy_objects_table(connection, table="objects_old")
         finally:
             connection.close()
+        before = db_path.read_bytes()
 
-        store = SQLiteStore(db_path)
-        try:
-            rows = store.select_table_rows("objects", "oid = ?", ("obj_legacy",))
-            assert len(rows) == 1
-            assert rows[0]["name"] == "legacy.object"
-        finally:
-            store.close()
+        with pytest.raises(UnsupportedStoreVersion, match="archive-only"):
+            SQLiteStore(db_path)
 
+        assert db_path.read_bytes() == before
         connection = sqlite3.connect(db_path)
         try:
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'objects_old'"
-            ).fetchone() is None
+            ).fetchone() == ("objects_old",)
         finally:
             connection.close()

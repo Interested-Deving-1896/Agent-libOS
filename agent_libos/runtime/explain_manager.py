@@ -60,9 +60,13 @@ class ExplainManager:
     DEFAULT_EVIDENCE_LIMIT = 200
     EVIDENCE_HARD_LIMIT = 2_000
 
-    def __init__(self, runtime: Any):
-        self.runtime = runtime
-        self.store: RuntimeStore = runtime.store
+    def __init__(
+        self,
+        store: RuntimeStore,
+        authority_manifests: Any | None = None,
+    ) -> None:
+        self.store = store
+        self._authority_manifests = authority_manifests
 
     def list_operations(
         self,
@@ -434,7 +438,7 @@ class ExplainManager:
             OperationOutcome.PENDING.value: f"{selected.name} is still {selected.state.value}.",
         }[outcome]
         authority = None
-        manifests = getattr(self.runtime, "authority_manifests", None)
+        manifests = self._authority_manifests
         if manifests is not None and selected.pid is not None:
             authority = manifests.summary_for_process(selected.pid)
         return {

@@ -12,7 +12,7 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
 )
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.runtime.external_effects import (
+from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     record_external_effect,
 )
@@ -31,7 +31,7 @@ def test_effect_transaction_records_hash_idempotency_dispatch_receipt_and_commit
             pid=pid,
         ):
             intent = begin_external_effect_intent(
-                runtime.store,
+                runtime,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -44,7 +44,7 @@ def test_effect_transaction_records_hash_idempotency_dispatch_receipt_and_commit
             assert intent.transaction_state == "dispatched"
             assert len(intent.canonical_args_hash or "") == 64
             committed = record_external_effect(
-                runtime.store,
+                runtime.uow.protected_effects,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -60,6 +60,7 @@ def test_effect_transaction_records_hash_idempotency_dispatch_receipt_and_commit
                 event=None,
                 metadata={"provider_receipt": {"revision": "2"}},
                 intent_effect_id=intent.effect_id,
+                operations=runtime.operations,
             )
 
         assert committed.transaction_state == "committed"
@@ -67,7 +68,7 @@ def test_effect_transaction_records_hash_idempotency_dispatch_receipt_and_commit
         assert committed.provider_receipt == {"revision": "2"}
         with pytest.raises(ValidationError, match="duplicate external effect dispatch"):
             begin_external_effect_intent(
-                runtime.store,
+                runtime,
                 pid=pid,
                 provider="test",
                 operation="write",
@@ -90,7 +91,7 @@ def test_startup_reconciliation_queries_provider_without_replaying_effect(tmp_pa
     try:
         pid = runtime.process.spawn(goal="pending effect")
         pending = begin_external_effect_intent(
-            runtime.store,
+            runtime,
             pid=pid,
             provider="jsonrpc",
             operation="call",
@@ -135,7 +136,7 @@ def test_startup_reconciliation_failure_keeps_runtime_available_and_effect_unkno
     try:
         pid = runtime.process.spawn(goal="pending reconciliation error")
         pending = begin_external_effect_intent(
-            runtime.store,
+            runtime,
             pid=pid,
             provider="jsonrpc",
             operation="call",
@@ -228,7 +229,7 @@ def test_approval_binding_rejects_changed_arguments_and_target_version() -> None
                 reason="reserve approved effect",
             )
             intent = begin_external_effect_intent(
-                runtime.store,
+                runtime,
                 pid=pid,
                 provider="jsonrpc",
                 operation="call",
@@ -239,8 +240,12 @@ def test_approval_binding_rejects_changed_arguments_and_target_version() -> None
             )
             assert intent.effect_id == binding["effect_id"]
             assert intent.canonical_args_hash == binding["canonical_args_hash"]
-            with runtime.store.transaction():
-                abandon_external_effect_intent(runtime.store, intent.effect_id)
+            with runtime.uow.transaction():
+                abandon_external_effect_intent(
+                    runtime.uow.protected_effects,
+                    intent.effect_id,
+                    operations=runtime.operations,
+                )
                 runtime.capability.commit_reserved_use(
                     reservation_id,
                     committed_by="test.approved_effect",

@@ -959,6 +959,8 @@ class TestJsonRpcPrimitive:
             result = runtime.jsonrpc.call(pid, 'transport-failure', 'echo', {'x': 1})
 
             assert result.status.value == 'transport_error'
+            assert 'transport-secret' not in str(result.error)
+            assert set(result.error or {}) == {'code', 'error_type', 'correlation_id'}
             effect = runtime.store.list_external_effects(pid=pid)[0]
             assert effect.transaction_state == 'unknown'
             assert effect.state_mutation

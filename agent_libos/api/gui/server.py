@@ -582,7 +582,27 @@ class GuiRuntimeService:
         max_quanta: int | None | object = _CONFIG_DEFAULT,
         llm_profiles_file: str | Path | None = None,
     ) -> None:
-        selected_config = config or getattr(runtime, "config", DEFAULT_CONFIG)
+        if runtime is not None:
+            if config is not None and config != runtime.config:
+                raise ValidationError(
+                    "explicit GUI config must match the supplied Runtime config"
+                )
+            selected_config = runtime.config
+        else:
+            selected_config = config or DEFAULT_CONFIG
+        user_llm_profiles = UserLLMProfileStore(
+            llm_profiles_file,
+            config=selected_config,
+        )
+        loaded_user_llm_profiles = user_llm_profiles.load()
+        conflicts = sorted(
+            set(loaded_user_llm_profiles) & set(selected_config.llm.profiles)
+        )
+        if conflicts:
+            raise ValidationError(
+                "user LLM profiles cannot override config profiles: "
+                + ", ".join(conflicts)
+            )
         self._db_target = db
         if runtime is None:
             self.db = display_store_target(db, config=selected_config)
@@ -592,6 +612,27 @@ class GuiRuntimeService:
             self.db = display_store_target(display_target, config=selected_config)
             self.runtime = runtime
         self.owns_runtime = runtime is None
+        try:
+            self._initialize_service_state(
+                token=token,
+                auto_run=auto_run,
+                max_quanta=max_quanta,
+                user_llm_profiles=user_llm_profiles,
+                loaded_user_llm_profiles=loaded_user_llm_profiles,
+            )
+        except BaseException:
+            self._cleanup_failed_initialization()
+            raise
+
+    def _initialize_service_state(
+        self,
+        *,
+        token: str | None,
+        auto_run: bool,
+        max_quanta: int | None | object,
+        user_llm_profiles: UserLLMProfileStore,
+        loaded_user_llm_profiles: dict[str, Any],
+    ) -> None:
         self.token = token or secrets.token_urlsafe(32)
         self._human_presentation_provider = _GuiHumanPresentationProvider()
         self.broadcaster = GuiEventBroadcaster(max_events=self.runtime.config.gui.event_buffer_limit)
@@ -623,9 +664,25 @@ class GuiRuntimeService:
         self._seen_llm_call_ids = _BoundedSeenKeys(
             max(dedupe_limit, self.runtime.config.gui.snapshot_llm_call_limit * 2)
         )
-        self.user_llm_profiles = UserLLMProfileStore(llm_profiles_file, config=self.runtime.config)
-        self._user_llm_profile_cache = self._load_user_llm_profiles()
+        self.user_llm_profiles = user_llm_profiles
+        self._user_llm_profile_cache = self._register_user_llm_profiles(
+            loaded_user_llm_profiles
+        )
         self.publish_runtime_changes("startup")
+
+    def _cleanup_failed_initialization(self) -> None:
+        broadcaster = getattr(self, "broadcaster", None)
+        if broadcaster is not None:
+            broadcaster.close()
+        if not self.owns_runtime:
+            return
+        try:
+            self.runtime.shutdown(
+                actor="gui-server",
+                reason="gui-server.initialization_failed",
+            )
+        except BaseException:
+            pass
 
     @contextmanager
     def runtime_user(self, *, serialize: bool = True) -> Iterator[None]:
@@ -703,6 +760,11 @@ class GuiRuntimeService:
 
     def close(self) -> None:
         self.shutdown()
+
+    @property
+    def closed(self) -> bool:
+        with self._lifecycle:
+            return self._closed
 
     def publish_scheduler_status(self) -> None:
         self.broadcaster.publish("scheduler.status", self.scheduler.status())
@@ -1029,15 +1091,13 @@ class GuiRuntimeService:
             )
         return summaries
 
-    def _load_user_llm_profiles(self) -> dict[str, Any]:
-        profiles = self.user_llm_profiles.load()
-        config_ids = set(self.runtime.config.llm.profiles)
-        conflicts = sorted(set(profiles) & config_ids)
-        if conflicts:
-            raise ValidationError(f"user LLM profiles cannot override config profiles: {', '.join(conflicts)}")
+    def _register_user_llm_profiles(
+        self,
+        profiles: dict[str, Any],
+    ) -> dict[str, Any]:
         for profile_id, profile in profiles.items():
             self.runtime.llms.register_profile(profile_id, profile)
-        return profiles
+        return dict(profiles)
 
     def _llm_profile_summaries(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
@@ -2083,7 +2143,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             for event in self.server.service.broadcaster.replay_after(cursor):
                 self._write_sse(event)
                 cursor = event.seq
-            while not self.server.service._closed:
+            while not self.server.service.closed:
                 events = self.server.service.broadcaster.wait_after(cursor, timeout_s=15)
                 if not events:
                     self.wfile.write(b": ping\n\n")
@@ -2177,7 +2237,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             handle = service.runtime.tools.resolve(tool)
         except NotFound:
             return True
-        return service.runtime.tools._tool_has_side_effects(handle)
+        return service.runtime.tools.has_side_effects(handle)
 
     def _write_json(self, value: Any, *, status: int = HTTPStatus.OK) -> None:
         payload = json.dumps(to_jsonable(value), ensure_ascii=False, default=str).encode("utf-8")

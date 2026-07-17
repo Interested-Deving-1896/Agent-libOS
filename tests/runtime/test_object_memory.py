@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import replace
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, UnsupportedStoreVersion, ValidationError
 from agent_libos.models import CapabilityRight, MemoryView, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType, ViewMode
 
 class TestObjectMemoryName:
@@ -18,6 +18,50 @@ class TestObjectMemoryName:
 
     def teardown_method(self) -> None:
         self.runtime.close()
+
+    def test_runtime_memory_metadata_defaults_are_applied(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            memory=replace(
+                DEFAULT_CONFIG.memory,
+                metadata_sensitivity="secret",
+                metadata_retention_policy="session",
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="configured metadata")
+            handle = runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.ARTIFACT,
+                payload={"configured": True},
+            )
+
+            metadata = runtime.memory.get_object(pid, handle).metadata
+
+            assert metadata.sensitivity == "secret"
+            assert metadata.retention_policy == "session"
+        finally:
+            runtime.close()
+
+    def test_runtime_memory_query_default_uses_active_config(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            memory=replace(DEFAULT_CONFIG.memory, query_limit=1),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="configured query")
+            for index in range(2):
+                runtime.memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.ARTIFACT,
+                    payload={"index": index},
+                )
+
+            assert len(runtime.memory.query_objects(pid, ObjectQuery())) == 1
+        finally:
+            runtime.close()
 
     def test_object_has_unique_name_and_can_be_read_by_name_with_permission(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='name access')
@@ -1715,7 +1759,7 @@ class TestObjectMemoryName:
                 reopened.close()
         self.runtime = Runtime.open('local')
 
-    def test_legacy_name_only_schema_does_not_block_process_namespace(self) -> None:
+    def test_unversioned_name_only_schema_is_rejected_without_mutation(self) -> None:
         self.runtime.close()
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = f'{temp_dir}/legacy.sqlite'
@@ -1726,20 +1770,10 @@ class TestObjectMemoryName:
                 conn.commit()
             finally:
                 conn.close()
-            runtime = Runtime.open(db_path)
-            try:
-                legacy_row = runtime.store.select_table_rows('objects', 'oid = ?', ('obj_legacy',))[0]
-                assert legacy_row['owner_kind'] == ObjectOwnerKind.PROCESS.value
-                assert legacy_row['owner_id'] == 'legacy'
-                assert legacy_row['lifecycle_state'] == 'live'
-                pid = runtime.process.spawn(image='base-agent:v0', goal='legacy migration')
-                runtime.memory.create_namespace(pid, 'legacy')
-                handle = runtime.memory.create_object(pid=pid, object_type=ObjectType.ARTIFACT, payload={'namespaced': True}, name='same.local', namespace='legacy')
-                assert runtime.memory.get_object(pid, handle).namespace == 'legacy'
-                process_handle = runtime.memory.create_object(pid=pid, object_type=ObjectType.ARTIFACT, payload={'process': True}, name='same.local')
-                assert runtime.memory.get_object(pid, process_handle).namespace == runtime.memory.resolve_namespace(pid)
-            finally:
-                runtime.close()
+            before = open(db_path, 'rb').read()
+            with pytest.raises(UnsupportedStoreVersion, match='archive-only'):
+                Runtime.open(db_path)
+            assert open(db_path, 'rb').read() == before
         self.runtime = Runtime.open('local')
 
     def test_process_exit_releases_owned_memory_except_result_object(self) -> None:

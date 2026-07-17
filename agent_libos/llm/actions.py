@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from agent_libos.llm.action_parser import parse_json_action
+from agent_libos.llm.tool_protocol import tool_call_to_action
+from agent_libos.models import ResourceUsage, ToolCallResult
+from agent_libos.models.exceptions import ResourceLimitExceeded
+from agent_libos.storage.repositories import ProcessRepository
+
+
+class LLMActionService:
+    """Parse, validate, and dispatch model-selected actions."""
+
+    def __init__(
+        self,
+        *,
+        processes: ProcessRepository,
+        tools: Any,
+        resources: Any | None,
+        content_preview_chars: int,
+        pre_tool_notice: Callable[[str, str], dict[str, Any] | None],
+        post_tool_notice: Callable[[str], dict[str, Any] | None],
+        publish_result: Callable[[str, Any], None],
+    ) -> None:
+        self._processes = processes
+        self._tools = tools
+        self._resources = resources
+        self._content_preview_chars = content_preview_chars
+        self._pre_tool_notice = pre_tool_notice
+        self._post_tool_notice = post_tool_notice
+        self._publish_result = publish_result
+
+    def completion_to_actions(
+        self,
+        content: str,
+        tool_calls: list[dict[str, Any]],
+        *,
+        parallel_tool_calls: bool,
+        auto_wait_on_empty_tool_calls: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not parallel_tool_calls:
+            if not tool_calls and auto_wait_on_empty_tool_calls:
+                try:
+                    return [parse_json_action(content)], False
+                except Exception:
+                    return [auto_wait_message_action()], True
+            return [self._single_action(content, tool_calls)], False
+        if not tool_calls:
+            try:
+                return [parse_json_action(content)], False
+            except Exception:
+                if auto_wait_on_empty_tool_calls:
+                    return [auto_wait_message_action()], True
+                raise
+        return self._parallel_actions(tool_calls), False
+
+    def _single_action(
+        self,
+        content: str,
+        tool_calls: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        errors: list[str] = []
+        for tool_call in reversed(tool_calls):
+            try:
+                return tool_call_to_action(tool_call)
+            except Exception as exc:
+                errors.append(str(exc))
+        try:
+            return parse_json_action(content)
+        except Exception as exc:
+            detail = f"; invalid tool calls: {errors}" if errors else ""
+            preview = content[: self._content_preview_chars]
+            raise ValueError(
+                f"no valid tool call or fallback JSON action found: {exc}{detail}; "
+                f"content preview: {preview!r}"
+            ) from exc
+
+    @staticmethod
+    def _parallel_actions(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for index, tool_call in enumerate(tool_calls, start=1):
+            try:
+                actions.append(tool_call_to_action(tool_call))
+            except Exception as exc:
+                errors.append(f"{index}: {exc}")
+        if errors:
+            raise ValueError(f"invalid parallel tool calls: {errors}")
+        if not actions:
+            raise ValueError("parallel tool call response did not include any function calls")
+        return actions
+
+    def validate(self, pid: str, action: dict[str, Any]) -> None:
+        name = str(action.get("action") or "").strip()
+        if not name:
+            raise ValueError("selected action has an empty tool name")
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise ValueError(f"selected action process does not exist: {pid}")
+        if name not in process.model_tool_table:
+            raise ValueError(f"selected action is not in this process model tool projection: {name}")
+
+    def preflight_parallel(self, pid: str, actions: list[dict[str, Any]]) -> None:
+        if self._resources is None:
+            return
+        try:
+            self._resources.preflight(
+                pid,
+                ResourceUsage(tool_calls=len(actions)),
+                source="llm.parallel_tool_batch",
+                context={
+                    "action_count": len(actions),
+                    "actions": [str(action.get("action") or "") for action in actions],
+                },
+            )
+        except ResourceLimitExceeded as exc:
+            raise ValueError(
+                f"parallel tool call batch exceeds remaining tool-call budget: {exc}"
+            ) from exc
+
+    def dispatch(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        name, args = split_action(action)
+        if notice := self._pre_tool_notice(pid, name):
+            return notice
+        result = self._tools.call(pid, name, args, context_metadata=context_metadata)
+        return self._result(pid, result)
+
+    async def adispatch(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        name, args = split_action(action)
+        if notice := self._pre_tool_notice(pid, name):
+            return notice
+        result = await self._tools.acall(pid, name, args, context_metadata=context_metadata)
+        return self._result(pid, result)
+
+    def _result(self, pid: str, result: ToolCallResult) -> dict[str, Any]:
+        if result.result_handle is not None:
+            self._publish_result(pid, result.result_handle)
+        notice = self._post_tool_notice(pid)
+        return {
+            "ok": result.ok,
+            "tool_id": result.tool_id,
+            "result_oid": result.result_handle.oid if result.result_handle else None,
+            "payload": result.payload,
+            "error": result.error,
+            "message_notice": notice,
+        }
+
+
+def auto_wait_message_action() -> dict[str, Any]:
+    return {"action": "receive_process_messages"}
+
+
+def split_action(action: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    name = str(action["action"])
+    return name, {key: value for key, value in action.items() if key != "action"}

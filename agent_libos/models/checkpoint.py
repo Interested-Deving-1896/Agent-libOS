@@ -6,6 +6,9 @@ from typing import Any
 from agent_libos.models.base import CheckpointID, PID
 
 
+CHECKPOINT_SNAPSHOT_VERSION = 3
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     checkpoint_id: CheckpointID
@@ -13,5 +16,6 @@ class Checkpoint:
     reason: str
     created_at: str
     created_by: str | None = None
-    snapshot_version: int = 1
+    snapshot_version: int = CHECKPOINT_SNAPSHOT_VERSION
     metadata: dict[str, Any] | None = None
+    effect_ledger_seq: int = 0

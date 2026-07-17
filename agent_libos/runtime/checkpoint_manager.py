@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, Iterable
+from typing import Any, Iterable, MutableMapping
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -27,20 +28,19 @@ from agent_libos.models import (
     ResourceUsage,
     ToolHandle,
 )
-from agent_libos.models.messages import conservative_legacy_process_message_metadata
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ValidationError
+from agent_libos.ports import CheckpointMessagePort
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.external_effects import external_effect_summary, external_effect_to_json
+from agent_libos.evidence import external_effect_summary, external_effect_to_json
+from agent_libos.runtime.snapshots import (
+    ProcessSnapshot,
+    SnapshotCodec,
+    SnapshotCoordinator,
+    SnapshotIdentityMap,
+    SnapshotRemapper,
+)
 from agent_libos.storage import RuntimeStore
-from agent_libos.storage.base import (
-    LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS as _LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS,
-    LEGACY_PENDING_DATA_FLOW_MESSAGE as _LEGACY_PENDING_DATA_FLOW_MESSAGE,
-)
-from agent_libos.storage.gui_visibility import (
-    is_gui_presentation_audit_fields,
-    is_gui_presentation_event_fields,
-)
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
 
@@ -65,8 +65,6 @@ class CheckpointManager:
         ProcessStatus.WAITING_TOOL.value,
         ProcessStatus.WAITING_HUMAN.value,
     }
-    LEGACY_PENDING_DATA_FLOW_STATUS = _LEGACY_PENDING_DATA_FLOW_INVALIDATED_STATUS
-    LEGACY_PENDING_DATA_FLOW_MESSAGE = _LEGACY_PENDING_DATA_FLOW_MESSAGE
 
     def __init__(
         self,
@@ -74,7 +72,15 @@ class CheckpointManager:
         audit: AuditManager,
         events: EventBus,
         capabilities: CapabilityManager | None = None,
+        scheduler: Any | None = None,
+        registry_lifecycle_lock: Any | None = None,
+        memory: Any | None = None,
+        images: MutableMapping[str, AgentImage] | None = None,
+        authority_manifests: Any | None = None,
+        tools: Any | None = None,
+        resources: Any | None = None,
         *,
+        messages: CheckpointMessagePort,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
@@ -82,10 +88,29 @@ class CheckpointManager:
         self.audit = audit
         self.events = events
         self.capabilities = capabilities
-        self.runtime: Any | None = None
+        self._scheduler = scheduler
+        self._registry_lifecycle_lock = registry_lifecycle_lock
+        self._memory = memory
+        self._images = images if images is not None else {}
+        self._authority_manifests = authority_manifests
+        self._tools = tools
+        self._resources = resources
+        self._messages = messages
+        self._modules: Any | None = None
+        self._image_registry: Any | None = None
+        self.snapshots = SnapshotCoordinator(store)
+        self._preflight_artifact: ContextVar[
+            tuple[str, Checkpoint, dict[str, Any], ProcessSnapshot] | None
+        ] = ContextVar(
+            f"agent_libos_checkpoint_preflight_{id(self)}",
+            default=None,
+        )
 
-    def bind_runtime(self, runtime: Any) -> None:
-        self.runtime = runtime
+    def bind_modules(self, modules: Any) -> None:
+        self._modules = modules
+
+    def bind_image_registry(self, image_registry: Any) -> None:
+        self._image_registry = image_registry
 
     def process_resource(self, pid: str) -> str:
         return f"{self.PROCESS_RESOURCE_PREFIX}{pid}"
@@ -143,7 +168,7 @@ class CheckpointManager:
         # checkpoint/head write behind one store transaction so a concurrent
         # mutation cannot produce a row from one instant and a payload from
         # another.
-        with self.store.transaction(include_object_payloads=True):
+        with self.snapshots.capture_scope():
             snapshot = self._build_snapshot(
                 checkpoint_id=checkpoint_id,
                 pid=pid,
@@ -158,7 +183,7 @@ class CheckpointManager:
                 reason=reason,
                 created_at=created_at,
                 created_by=selected_actor,
-                snapshot_version=self.config.checkpoint.snapshot_version,
+                snapshot_version=SnapshotCodec.schema_version,
                 metadata={
                     **(metadata or {}),
                     "subtree_pids": snapshot["subtree_pids"],
@@ -166,6 +191,7 @@ class CheckpointManager:
                     "module_count": len(snapshot.get("modules", [])),
                     "snapshot_bytes": snapshot_bytes,
                 },
+                effect_ledger_seq=self.store.current_effect_ledger_seq(),
             )
             if snapshot_bytes > self.config.checkpoint.snapshot_hard_limit_bytes:
                 raise ValidationError(
@@ -175,9 +201,11 @@ class CheckpointManager:
             self.store.insert_checkpoint(checkpoint, snapshot)
             process = self.store.get_process(pid)
             if process is not None:
-                process.checkpoint_head = checkpoint_id
-                process.updated_at = utc_now()
-                self.store.update_process(process)
+                self.store.patch_process(
+                    pid,
+                    {"checkpoint_head": checkpoint_id},
+                    expected_revision=process.revision,
+                )
             # The checkpoint row/head, its initial read authority, and its
             # creation evidence are one API outcome.  Keeping these writes in
             # the snapshot transaction prevents a caller-visible failure from
@@ -305,12 +333,18 @@ class CheckpointManager:
                 "removed_count": len(removed),
                 "changed_count": len(changed),
             }
+        external_effect_records = self._external_effect_records_since(
+            checkpoint,
+            snapshot=snapshot,
+        )
         return {
             "checkpoint_id": checkpoint_id,
             "pid": checkpoint.pid,
             "tables": tables,
-            "external_effects_since_checkpoint": self._external_effects_since(checkpoint, snapshot=snapshot),
-            "external_effect_summary": self._external_effect_summary_since(checkpoint, snapshot=snapshot),
+            "external_effects_since_checkpoint": [
+                external_effect_to_json(record) for record in external_effect_records
+            ],
+            "external_effect_summary": external_effect_summary(external_effect_records),
             "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
         }
 
@@ -321,70 +355,60 @@ class CheckpointManager:
         *,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        with self._runtime_quiescent_for_restore():
-            # Global image/JIT reconciliation and module lifecycle hooks share
-            # one registry lock. It must be acquired before Object Memory and
-            # store locks to avoid the inverse order used by module rollback.
-            with self._runtime_registry_lifecycle_quiescent():
-                with self._runtime_object_ownership_quiescent():
-                    # Scheduler quiescence stops model quanta. The ownership and
-                    # store locks are the common mutation boundaries for host-side
-                    # process, capability, Object Memory, mailbox, and ObjectTask
-                    # APIs. Keep them from the first preflight read through commit.
-                    with self.store.locked():
-                        # Preflight: every check in this section is required to
-                        # finish before reconstructable state is mutated.
-                        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
-                        restore_right_decisions: list[CapabilityDecision] = []
-                        if require_capability:
-                            checkpoint_decision = self._require_checkpoint_right(
-                                actor,
-                                checkpoint_id,
-                                CapabilityRight.ADMIN,
-                                consume=False,
-                            )
-                            if checkpoint_decision is not None:
-                                restore_right_decisions.append(checkpoint_decision)
-                            restore_right_decisions.extend(
-                                self._require_snapshot_image_restore_rights(
-                                    actor,
-                                    snapshot,
-                                    overwrite_existing=True,
-                                    consume=False,
-                                )
-                            )
-                        reservations = self._reserve_restore_rights(restore_right_decisions, actor=actor)
-                        try:
-                            self._require_snapshot_modules(snapshot)
-                            current_pids = self._subtree_pids(checkpoint.pid)
-                            snapshot_pids = list(snapshot.get("subtree_pids", []))
-                            self._reject_active_object_tasks_for_restore(snapshot, current_pids)
-                            self._validate_snapshot_restore_assets(snapshot)
-                            stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(snapshot, current_pids)
-                            external_effect_pids = self._external_effect_pids(
-                                checkpoint,
-                                snapshot=snapshot,
-                                current_pids=current_pids,
-                            )
-                            external_effects = self._external_effects_since(checkpoint, pids=external_effect_pids)
-                            external_effect_summary = self._external_effect_summary_since(
-                                checkpoint,
-                                pids=external_effect_pids,
-                            )
-                            # Authority settlement and reconstructable-state
-                            # replacement commit together. A failed preflight or
-                            # commit restores the exact composite reservations.
-                            with self.store.transaction(include_object_payloads=True):
-                                self._commit_restore_rights(reservations, actor=actor)
-                                (
-                                    cancelled_human_requests,
-                                    superseded_messages,
-                                    superseded_object_tasks,
-                                    release_finalizer_objects,
-                                ) = self._restore_scoped_rows(snapshot, current_pids, checkpoint)
-                        except BaseException:
-                            self._restore_restore_rights(reservations, actor=actor)
-                            raise
+        with self.snapshots.restore_runtime_scope(
+            self._runtime_quiescent_for_restore,
+        ):
+            with self.snapshots.restore_registry_scope(
+                self._runtime_registry_lifecycle_quiescent,
+            ):
+                checkpoint, snapshot, typed_snapshot = (
+                    self._load_checkpoint_typed(checkpoint_id)
+                )
+                with self.snapshots.restore_atomic_scope(
+                    self._runtime_object_ownership_quiescent,
+                ):
+                    restore_right_decisions = self._restore_right_decisions(
+                        actor,
+                        checkpoint_id,
+                        snapshot,
+                        require_capability=require_capability,
+                    )
+                    prepared, published = self.snapshots.atomic_publish(
+                        typed_snapshot,
+                        reserve=lambda: self._reserve_restore_rights(
+                            restore_right_decisions,
+                            actor=actor,
+                        ),
+                        prepare=lambda typed: self._prepare_restore_publication(
+                            checkpoint,
+                            typed,
+                            snapshot=snapshot,
+                        ),
+                        settle=lambda reservations: self._commit_restore_rights(
+                            reservations,
+                            actor=actor,
+                        ),
+                        publish=lambda typed, plan: self._publish_restore_rows(
+                            checkpoint,
+                            typed,
+                            plan,
+                        ),
+                        compensate=lambda reservations: self._restore_restore_rights(
+                            reservations,
+                            actor=actor,
+                        ),
+                    )
+                    current_pids = prepared["current_pids"]
+                    snapshot_pids = prepared["snapshot_pids"]
+                    stale_tool_ids = prepared["stale_tool_ids"]
+                    external_effects = prepared["external_effects"]
+                    external_effect_summary = prepared["external_effect_summary"]
+                    (
+                        cancelled_human_requests,
+                        superseded_messages,
+                        superseded_object_tasks,
+                        release_finalizer_objects,
+                    ) = published
                 # Registry reconciliation is post-commit but remains inside the
                 # lifecycle lock, so module rollback cannot interleave with the
                 # image and JIT cache/store updates.
@@ -398,20 +422,6 @@ class CheckpointManager:
             # Terminal reconciliation and external release hooks are deliberately
             # outside all registry,
             # ownership, and store locks because they may call host code.
-            try:
-                if self.runtime is not None:
-                    self.runtime._reconcile_legacy_pending_action_terminals(
-                        pids=set(snapshot_pids)
-                    )
-            except Exception as exc:
-                post_commit_failures.append(
-                    self._restore_post_commit_failure(
-                        actor=actor,
-                        checkpoint=checkpoint,
-                        phase="legacy_pending_terminal_reconciliation",
-                        exc=exc,
-                    )
-                )
             post_commit_failures.extend(
                 self._run_restore_object_release_finalizer_phase(
                     actor=actor,
@@ -492,8 +502,109 @@ class CheckpointManager:
                 "restore_external_policy": self.RESTORE_EXTERNAL_POLICY,
             }
 
+    def _restore_right_decisions(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        snapshot: dict[str, Any],
+        *,
+        require_capability: bool,
+    ) -> list[CapabilityDecision]:
+        decisions: list[CapabilityDecision] = []
+        if not require_capability:
+            return decisions
+        checkpoint_decision = self._require_checkpoint_right(
+            actor,
+            checkpoint_id,
+            CapabilityRight.ADMIN,
+            consume=False,
+        )
+        if checkpoint_decision is not None:
+            decisions.append(checkpoint_decision)
+        decisions.extend(
+            self._require_snapshot_image_restore_rights(
+                actor,
+                snapshot,
+                overwrite_existing=True,
+                consume=False,
+            )
+        )
+        return decisions
+
+    def _prepare_restore_publication(
+        self,
+        checkpoint: Checkpoint,
+        typed: ProcessSnapshot,
+        *,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        snapshot = snapshot or self.snapshots.encode(typed)
+        self._require_snapshot_modules(snapshot)
+        self._validate_snapshot_flow_rows(snapshot)
+        current_pids = self._subtree_pids(checkpoint.pid)
+        snapshot_pids = list(typed.subtree_pids)
+        self._reject_active_object_tasks_for_restore(snapshot, current_pids)
+        self._validate_snapshot_restore_assets(snapshot)
+        stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(
+            snapshot,
+            current_pids,
+        )
+        effect_pids = self._external_effect_pids(
+            checkpoint,
+            snapshot=snapshot,
+            current_pids=current_pids,
+        )
+        external_effect_records = self._external_effect_records_since(
+            checkpoint,
+            pids=effect_pids,
+        )
+        return {
+            "snapshot": snapshot,
+            "current_pids": current_pids,
+            "snapshot_pids": snapshot_pids,
+            "stale_tool_ids": stale_tool_ids,
+            "external_effects": [
+                external_effect_to_json(record) for record in external_effect_records
+            ],
+            "external_effect_summary": external_effect_summary(external_effect_records),
+        }
+
+    def _publish_restore_rows(
+        self,
+        checkpoint: Checkpoint,
+        typed: ProcessSnapshot,
+        plan: dict[str, Any],
+    ) -> tuple[Any, Any, Any, Any]:
+        snapshot = plan["snapshot"]
+        if typed.header.checkpoint_id != checkpoint.checkpoint_id:
+            raise ValidationError("checkpoint row and snapshot id do not match")
+        return self._restore_scoped_rows(
+            snapshot,
+            plan["current_pids"],
+            checkpoint,
+        )
+
     def rollback(self, pid: str, checkpoint_id: str) -> dict[str, Any]:
         return self.restore(pid, checkpoint_id, require_capability=False)
+
+    def preflight_checkpoint(self, checkpoint_id: str) -> None:
+        """Reject incompatible immutable artifacts before operation evidence."""
+
+        self._preflight_artifact.set(None)
+        checkpoint, snapshot, typed = self._read_checkpoint_artifact(
+            checkpoint_id
+        )
+        self._preflight_artifact.set(
+            (checkpoint_id, checkpoint, snapshot, typed)
+        )
+
+    def load_checkpoint_artifact(
+        self,
+        checkpoint_id: str,
+    ) -> tuple[Checkpoint, dict[str, Any]]:
+        """Return one strictly decoded checkpoint artifact for an internal service."""
+
+        return self._load_checkpoint(checkpoint_id)
 
     def fork_from_checkpoint(
         self,
@@ -506,9 +617,11 @@ class CheckpointManager:
         # Fork preparation and publication both touch the global JIT/image
         # registries. Keep the lifecycle lock outside every store transaction.
         with self._runtime_registry_lifecycle_quiescent():
+            checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
             return self._fork_from_checkpoint_registry_locked(
                 actor,
-                checkpoint_id,
+                checkpoint,
+                snapshot,
                 parent_pid=parent_pid,
                 require_capability=require_capability,
             )
@@ -516,12 +629,13 @@ class CheckpointManager:
     def _fork_from_checkpoint_registry_locked(
         self,
         actor: str,
-        checkpoint_id: str,
+        checkpoint: Checkpoint,
+        snapshot: dict[str, Any],
         *,
         parent_pid: str | None,
         require_capability: bool,
     ) -> dict[str, Any]:
-        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        checkpoint_id = checkpoint.checkpoint_id
         # Preflight without consuming finite authority. The authoritative
         # checks and any finite-use claims happen again in the same transaction
         # that publishes the fork rows, closing revoke/terminal-state TOCTOU
@@ -540,6 +654,7 @@ class CheckpointManager:
                 consume=False,
             )
         self._require_snapshot_modules(snapshot)
+        self._validate_snapshot_flow_rows(snapshot)
         if require_capability:
             self._require_snapshot_image_restore_rights(
                 actor,
@@ -727,8 +842,8 @@ class CheckpointManager:
             "tool_candidates": self._rows_by_ids("tool_candidates", "pid", subtree_pids),
         }
         object_payloads = self._object_payload_snapshot(object_oids)
-        return {
-            "version": self.config.checkpoint.snapshot_version,
+        snapshot = {
+            "version": SnapshotCodec.schema_version,
             "checkpoint_id": checkpoint_id,
             "pid": pid,
             "reason": reason,
@@ -748,14 +863,15 @@ class CheckpointManager:
             "jit_sources": self._jit_source_snapshot(process_rows),
             "modules": self._module_snapshot(),
         }
+        return self.snapshots.normalize(snapshot)
 
     def _module_snapshot(self) -> list[dict[str, Any]]:
-        if self.runtime is None or not hasattr(self.runtime, "modules"):
+        if self._modules is None:
             return []
-        return self.runtime.modules.loaded_module_summaries()
+        return self._modules.loaded_module_summaries()
 
     def _require_snapshot_modules(self, snapshot: dict[str, Any]) -> None:
-        if self.runtime is None or not hasattr(self.runtime, "modules"):
+        if self._modules is None:
             return
         missing = []
         for module in snapshot.get("modules", []):
@@ -763,25 +879,31 @@ class CheckpointManager:
             source_sha256 = str(module.get("source_sha256", ""))
             if not module_id:
                 continue
-            if not self.runtime.modules.is_loaded(module_id, source_sha256 or None):
+            if not self._modules.is_loaded(module_id, source_sha256 or None):
                 missing.append({"module_id": module_id, "source_sha256": source_sha256})
         if missing:
             raise ValidationError(f"checkpoint requires startup modules that are not loaded: {missing}")
 
+    def require_snapshot_modules(self, snapshot: dict[str, Any]) -> None:
+        """Validate the module contract carried by a snapshot artifact."""
+
+        self._require_snapshot_modules(snapshot)
+
     def _runtime_quiescent_for_restore(self):
-        scheduler = getattr(self.runtime, "scheduler", None) if self.runtime is not None else None
-        quiescent_state = getattr(scheduler, "quiescent_state", None)
+        quiescent_state = getattr(self._scheduler, "quiescent_state", None)
         if callable(quiescent_state):
             return quiescent_state(reason="checkpoint restore")
         return _NullContext()
 
     def _runtime_registry_lifecycle_quiescent(self):
-        lock = getattr(self.runtime, "_registry_lifecycle_lock", None) if self.runtime is not None else None
-        return lock if lock is not None else _NullContext()
+        return (
+            self._registry_lifecycle_lock
+            if self._registry_lifecycle_lock is not None
+            else _NullContext()
+        )
 
     def _runtime_object_ownership_quiescent(self):
-        memory = getattr(self.runtime, "memory", None) if self.runtime is not None else None
-        ownership_locked = getattr(memory, "ownership_locked", None)
+        ownership_locked = getattr(self._memory, "ownership_locked", None)
         if callable(ownership_locked):
             return ownership_locked()
         return _NullContext()
@@ -811,7 +933,7 @@ class CheckpointManager:
         current_pids: list[str],
         checkpoint: Checkpoint,
     ) -> tuple[list[str], list[str], list[str], list[Any]]:
-        rows = self._restore_rows_with_legacy_flow_migration(snapshot["rows"])
+        rows = deepcopy(snapshot["rows"])
         snapshot_object_oids = self._snapshot_owned_object_oids(snapshot)
         current_object_oids = set(self._current_scoped_object_oids(current_pids))
         object_oids = snapshot_object_oids | current_object_oids
@@ -911,67 +1033,24 @@ class CheckpointManager:
             )
         return cancelled_human_requests, superseded_messages, superseded_object_tasks, release_finalizer_objects
 
-    def _restore_rows_with_legacy_flow_migration(
-        self,
-        source_rows: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, list[dict[str, Any]]]:
-        rows = deepcopy(source_rows)
-        invalidated_pids: set[str] = set()
-        conservative_context = dumps(
-            DataFlowContext(
-                labels=DataLabels(
-                    sensitivity="secret",
-                    trust_level="untrusted",
-                    integrity="untrusted",
-                    origin="legacy",
-                )
-            ).to_dict()
-        )
+    def _validate_snapshot_flow_rows(self, snapshot: dict[str, Any]) -> None:
+        rows = snapshot.get("rows", {})
         for pending in rows.get("llm_pending_actions", []):
-            raw_context = pending.get("data_flow_context_json")
-            canonical_context = self._canonical_snapshot_data_flow_context(raw_context)
-            if canonical_context is not None:
-                pending["data_flow_context_json"] = dumps(canonical_context)
-                continue
-            pending["data_flow_context_json"] = conservative_context
-            if str(pending.get("status") or "") in {"pending", "resuming"}:
-                pending["status"] = self.LEGACY_PENDING_DATA_FLOW_STATUS
-                pending["updated_at"] = utc_now()
-                invalidated_pids.add(str(pending.get("pid") or ""))
-
-        for message in rows.get("process_messages", []):
-            raw_metadata = message.get("metadata_json")
-            canonical_metadata = self._canonical_snapshot_message_metadata(raw_metadata)
-            if canonical_metadata is not None:
-                message["metadata_json"] = dumps(canonical_metadata)
-                continue
-            try:
-                decoded_metadata = (
-                    loads(raw_metadata)
-                    if isinstance(raw_metadata, str)
-                    else raw_metadata
-                )
-            except (TypeError, ValueError):
-                decoded_metadata = None
-            message["metadata_json"] = dumps(
-                conservative_legacy_process_message_metadata(
-                    decoded_metadata if isinstance(decoded_metadata, dict) else None
-                )
+            canonical = self._canonical_snapshot_data_flow_context(
+                pending.get("data_flow_context_json")
             )
-
-        for process in rows.get("processes", []):
-            if str(process.get("pid") or "") not in invalidated_pids:
-                continue
-            if str(process.get("status") or "") in {
-                ProcessStatus.EXITED.value,
-                ProcessStatus.FAILED.value,
-                ProcessStatus.KILLED.value,
-            }:
-                continue
-            process["status"] = ProcessStatus.FAILED.value
-            process["status_message"] = self.LEGACY_PENDING_DATA_FLOW_MESSAGE
-            process["updated_at"] = utc_now()
-        return rows
+            if canonical is None:
+                raise ValidationError(
+                    "0.3 checkpoint pending action has no canonical data-flow context"
+                )
+        for message in rows.get("process_messages", []):
+            canonical = self._canonical_snapshot_message_metadata(
+                message.get("metadata_json")
+            )
+            if canonical is None:
+                raise ValidationError(
+                    "0.3 checkpoint process message has no canonical label metadata"
+                )
 
     @staticmethod
     def _canonical_snapshot_data_flow_context(value: Any) -> dict[str, Any] | None:
@@ -980,11 +1059,15 @@ class CheckpointManager:
             if not isinstance(decoded, dict) or not decoded:
                 return None
             labels = decoded.get("labels")
-            if not isinstance(labels, dict) or not {
+            if not isinstance(labels, dict) or set(labels) != {
                 "sensitivity",
                 "trust_level",
                 "integrity",
-            }.issubset(labels):
+                "origin",
+                "tenant",
+                "principal",
+                "declassification_authority",
+            }:
                 return None
             return DataFlowContext.from_dict(decoded).to_dict()
         except (TypeError, ValueError):
@@ -999,11 +1082,17 @@ class CheckpointManager:
         if not isinstance(decoded, dict):
             return None
         labels = decoded.get("data_labels")
-        if not isinstance(labels, dict) or not {
+        if not isinstance(labels, dict) or set(labels) != {
             "sensitivity",
             "trust_level",
             "integrity",
-        }.issubset(labels):
+            "origin",
+            "tenant",
+            "principal",
+            "declassification_authority",
+        }:
+            return None
+        if not isinstance(decoded.get("source_oids"), list):
             return None
         try:
             decoded["data_labels"] = DataLabels.from_dict(labels).to_dict()
@@ -1140,8 +1229,102 @@ class CheckpointManager:
         return failure
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None, root_pid: str) -> dict[str, Any]:
-        original_pids = list(snapshot["subtree_pids"])
-        pid_map = {pid: new_id("pid") for pid in original_pids}
+        rows = deepcopy(snapshot["rows"])
+        identities, non_clonable_object_oids, source_capability_rows = (
+            self._prepare_fork_identities(snapshot, rows)
+        )
+        rows["processes"] = [
+            self._remap_process_row(
+                row,
+                identities,
+                parent_pid,
+                root_pid,
+                non_clonable_object_oids,
+            )
+            for row in rows.get("processes", [])
+        ]
+        rows["object_namespaces"] = [
+            self._remap_namespace_row(row, identities)
+            for row in rows.get("object_namespaces", [])
+            if str(row.get("namespace")) in identities.namespaces
+        ]
+        rows["objects"] = [
+            self._remap_object_row(row, identities)
+            for row in rows.get("objects", [])
+            if str(row.get("oid")) in identities.objects
+        ]
+        rows["object_links"] = [
+            self._remap_link_row(row, identities)
+            for row in rows.get("object_links", [])
+            if row["src_oid"] in identities.objects
+            and row["dst_oid"] in identities.objects
+        ]
+        rows["capabilities"] = [
+            self._remap_capability_row(row, identities)
+            for row in rows.get("capabilities", [])
+            if row["subject"] in identities.pids
+            and not str(row["resource"]).startswith(
+                self.CHECKPOINT_RESOURCE_PREFIX
+            )
+        ]
+        rows["process_resource_reservations"] = [
+            self._remap_resource_reservation_row(row, identities)
+            for row in rows.get("process_resource_reservations", [])
+            if row["parent_pid"] in identities.pids
+            and row["child_pid"] in identities.pids
+        ]
+        rows["process_messages"] = [
+            self._remap_message_row(row, identities)
+            for row in rows.get("process_messages", [])
+            if row["recipient_pid"] in identities.pids
+        ]
+        rows["llm_pending_actions"] = []
+        rows["tool_candidates"] = [
+            self._remap_tool_candidate_row(row, identities)
+            for row in rows.get("tool_candidates", [])
+            if row["pid"] in identities.pids
+        ]
+        rows["tools"] = [self._remap_tool_row(row, identities) for row in rows.get("tools", [])]
+        object_types = {
+            str(row.get("oid")): str(row.get("type"))
+            for row in snapshot.get("rows", {}).get("objects", [])
+        }
+        payloads = {
+            identities.objects[oid]: self._remap_object_payload(
+                payload,
+                object_type=object_types.get(str(oid)),
+                candidate_map=dict(identities.candidates),
+            )
+            for oid, payload in snapshot.get("object_payloads", {}).items()
+            if oid in identities.objects
+        }
+        return {
+            "rows": rows,
+            "object_payloads": payloads,
+            "pid_map": dict(identities.pids),
+            "object_map": dict(identities.objects),
+            "namespace_map": dict(identities.namespaces),
+            "capability_map": dict(identities.capabilities),
+            "tool_map": dict(identities.tools),
+            "candidate_map": dict(identities.candidates),
+            "jit_sources": {
+                identities.tools.get(str(tool_id), str(tool_id)): source
+                for tool_id, source in snapshot.get("jit_sources", {}).items()
+            },
+            "source_capability_rows": source_capability_rows,
+            "source_capability_ids": {
+                target_cap_id: source_cap_id
+                for source_cap_id, target_cap_id in identities.capabilities.items()
+            },
+            "non_clonable_object_oids": non_clonable_object_oids,
+        }
+
+    def _prepare_fork_identities(
+        self,
+        snapshot: dict[str, Any],
+        rows: dict[str, list[dict[str, Any]]],
+    ) -> tuple[SnapshotIdentityMap, set[str], dict[str, dict[str, Any]]]:
+        pid_map = {pid: new_id("pid") for pid in snapshot["subtree_pids"]}
         owned_object_oids = self._snapshot_owned_object_oids(snapshot)
         non_clonable_object_oids = self._non_clonable_object_oids(snapshot)
         object_map = {
@@ -1150,9 +1333,11 @@ class CheckpointManager:
         }
         namespace_map = {
             namespace: self._remap_namespace(namespace, pid_map)
-            for namespace in self._snapshot_owned_namespaces(snapshot, owned_object_oids)
+            for namespace in self._snapshot_owned_namespaces(
+                snapshot,
+                owned_object_oids,
+            )
         }
-        rows = deepcopy(snapshot["rows"])
         tool_map = {
             str(row["tool_id"]): new_id("tool")
             for row in rows.get("tools", [])
@@ -1162,100 +1347,32 @@ class CheckpointManager:
             str(row["candidate_id"]): new_id("tcand")
             for row in rows.get("tool_candidates", [])
         }
-        source_capability_rows = [
+        source_rows = [
             row
             for row in rows.get("capabilities", [])
-            if not self._capability_references_any_object(row, non_clonable_object_oids)
+            if not self._capability_references_any_object(
+                row,
+                non_clonable_object_oids,
+            )
         ]
-        rows["capabilities"] = self._fork_capability_rows(source_capability_rows)
-        filtered_source_capability_rows = {
+        rows["capabilities"] = self._fork_capability_rows(source_rows)
+        source_capability_rows = {
             str(row["cap_id"]): dict(row)
             for row in rows.get("capabilities", [])
         }
-        capability_map = {row["cap_id"]: new_id("cap") for row in rows.get("capabilities", [])}
-        rows["processes"] = [
-            self._remap_process_row(
-                row,
-                pid_map,
-                object_map,
-                capability_map,
-                parent_pid,
-                root_pid,
-                non_clonable_object_oids,
-                tool_map,
-            )
-            for row in rows.get("processes", [])
-        ]
-        rows["object_namespaces"] = [
-            self._remap_namespace_row(row, pid_map, namespace_map)
-            for row in rows.get("object_namespaces", [])
-            if str(row.get("namespace")) in namespace_map
-        ]
-        rows["objects"] = [
-            self._remap_object_row(row, pid_map, object_map, namespace_map)
-            for row in rows.get("objects", [])
-            if str(row.get("oid")) in object_map
-        ]
-        rows["object_links"] = [
-            self._remap_link_row(row, object_map)
-            for row in rows.get("object_links", [])
-            if row["src_oid"] in object_map and row["dst_oid"] in object_map
-        ]
-        rows["capabilities"] = [
-            self._remap_capability_row(row, pid_map, object_map, namespace_map, capability_map)
+        capability_map = {
+            row["cap_id"]: new_id("cap")
             for row in rows.get("capabilities", [])
-            if row["subject"] in pid_map and not str(row["resource"]).startswith(self.CHECKPOINT_RESOURCE_PREFIX)
-        ]
-        rows["process_resource_reservations"] = [
-            self._remap_resource_reservation_row(row, pid_map)
-            for row in rows.get("process_resource_reservations", [])
-            if row["parent_pid"] in pid_map and row["child_pid"] in pid_map
-        ]
-        rows["process_messages"] = [
-            self._remap_message_row(row, pid_map, object_map)
-            for row in rows.get("process_messages", [])
-            if row["recipient_pid"] in pid_map
-        ]
-        rows["llm_pending_actions"] = []
-        rows["tool_candidates"] = [
-            self._remap_tool_candidate_row(row, pid_map, candidate_map, tool_map)
-            for row in rows.get("tool_candidates", [])
-            if row["pid"] in pid_map
-        ]
-        rows["tools"] = [self._remap_tool_row(row, tool_map) for row in rows.get("tools", [])]
-        object_types = {
-            str(row.get("oid")): str(row.get("type"))
-            for row in snapshot.get("rows", {}).get("objects", [])
         }
-        payloads = {
-            object_map[oid]: self._remap_object_payload(
-                payload,
-                object_type=object_types.get(str(oid)),
-                candidate_map=candidate_map,
-            )
-            for oid, payload in snapshot.get("object_payloads", {}).items()
-            if oid in object_map
-        }
-        return {
-            "rows": rows,
-            "object_payloads": payloads,
-            "pid_map": pid_map,
-            "object_map": object_map,
-            "namespace_map": namespace_map,
-            "capability_map": capability_map,
-            "tool_map": tool_map,
-            "candidate_map": candidate_map,
-            "jit_sources": {
-                tool_map.get(str(tool_id), str(tool_id)): source
-                for tool_id, source in snapshot.get("jit_sources", {}).items()
-            },
-            "source_capability_rows": filtered_source_capability_rows,
-            "source_capability_ids": {
-                capability_map[source_cap_id]: source_cap_id
-                for source_cap_id in capability_map
-            },
-            "non_clonable_object_oids": non_clonable_object_oids,
-        }
+        identities = SnapshotIdentityMap(
+            pids=pid_map,
+            objects=object_map,
+            namespaces=namespace_map,
+            capabilities=capability_map,
+            tools=tool_map,
+            candidates=candidate_map,
+        )
+        return identities, non_clonable_object_oids, source_capability_rows
 
     def _non_clonable_object_oids(self, snapshot: dict[str, Any]) -> set[str]:
         candidate_oids = self._snapshot_owned_object_oids(snapshot) | {
@@ -1433,14 +1550,14 @@ class CheckpointManager:
                 # Image/artifact rows and process rows commit together. The
                 # Runtime's in-memory image entries are explicitly discarded
                 # by the caller if this transaction fails.
-                existing_image_ids = set(self.runtime.images) if self.runtime is not None else set()
+                existing_image_ids = set(self._images)
                 try:
                     self._restore_images(image_snapshot, overwrite_existing=False)
                 finally:
-                    if restored_image_ids is not None and self.runtime is not None:
+                    if restored_image_ids is not None:
                         restored_image_ids.extend(
                             image_id
-                            for image_id in self.runtime.images
+                            for image_id in self._images
                             if image_id not in existing_image_ids and image_id not in restored_image_ids
                         )
             if fork_parent_pid is not None and fork_root_pid is not None:
@@ -1479,9 +1596,7 @@ class CheckpointManager:
                 self._charge_fork_parent_child_create(fork_parent_pid)
 
     def _bind_fork_authority_manifests(self, remapped: dict[str, Any], *, actor: str) -> None:
-        if self.runtime is None:
-            return
-        manifests = getattr(self.runtime, "authority_manifests", None)
+        manifests = self._authority_manifests
         if manifests is None:
             return
         rows = [dict(row) for row in remapped["rows"].get("processes", [])]
@@ -1548,20 +1663,15 @@ class CheckpointManager:
         return specs
 
     def _discard_remapped_jit_sources(self, remapped: dict[str, Any]) -> None:
-        if self.runtime is None:
-            return
-        tools = getattr(self.runtime, "tools", None)
+        tools = self._tools
         if tools is None:
             return
         for tool_id in remapped.get("tool_map", {}).values():
-            getattr(tools, "_jit_sources", {}).pop(tool_id, None)
-            getattr(tools, "_handles", {}).pop(tool_id, None)
+            tools.forget_loaded_jit(tool_id)
 
     def _discard_uncommitted_fork_images(self, image_ids: Iterable[str]) -> None:
-        if self.runtime is None:
-            return
         for image_id in image_ids:
-            self.runtime.images.pop(str(image_id), None)
+            self._images.pop(str(image_id), None)
 
     def _revalidate_remapped_fork_capabilities(self, remapped: dict[str, Any]) -> None:
         """Refresh source authority immediately before fork-row insertion.
@@ -1608,7 +1718,7 @@ class CheckpointManager:
             process_row["memory_view_json"] = dumps(view)
 
     def _reserve_fork_parent_child_budget(self, parent_pid: str, fork_root_pid: str, remapped: dict[str, Any]) -> None:
-        resources = getattr(self.runtime, "resources", None) if self.runtime is not None else None
+        resources = self._resources
         if resources is None:
             return
         resources.reserve_child_budget(parent_pid, fork_root_pid, self._fork_root_resource_budget(fork_root_pid, remapped))
@@ -1616,7 +1726,7 @@ class CheckpointManager:
     def _charge_fork_parent_child_create(self, parent_pid: str | None) -> None:
         if parent_pid is None:
             return
-        resources = getattr(self.runtime, "resources", None) if self.runtime is not None else None
+        resources = self._resources
         if resources is None:
             return
         resources.charge(
@@ -1635,10 +1745,29 @@ class CheckpointManager:
         raise NotFound(f"fork root process not found in remapped snapshot: {fork_root_pid}")
 
     def _load_checkpoint(self, checkpoint_id: str) -> tuple[Checkpoint, dict[str, Any]]:
+        checkpoint, snapshot, _typed = self._load_checkpoint_typed(checkpoint_id)
+        return checkpoint, snapshot
+
+    def _load_checkpoint_typed(
+        self,
+        checkpoint_id: str,
+    ) -> tuple[Checkpoint, dict[str, Any], ProcessSnapshot]:
+        cached = self._preflight_artifact.get()
+        self._preflight_artifact.set(None)
+        if cached is not None and cached[0] == checkpoint_id:
+            return cached[1], cached[2], cached[3]
+        return self._read_checkpoint_artifact(checkpoint_id)
+
+    def _read_checkpoint_artifact(
+        self,
+        checkpoint_id: str,
+    ) -> tuple[Checkpoint, dict[str, Any], ProcessSnapshot]:
         found = self.store.get_checkpoint_snapshot(checkpoint_id)
         if found is None:
             raise NotFound(f"checkpoint not found: {checkpoint_id}")
-        return found
+        checkpoint, snapshot = found
+        typed, validated = self.snapshots.canonicalize(snapshot)
+        return checkpoint, validated, typed
 
     def _checkpoint_summary(self, checkpoint: Checkpoint) -> dict[str, Any]:
         return {
@@ -1648,6 +1777,7 @@ class CheckpointManager:
             "created_at": checkpoint.created_at,
             "created_by": checkpoint.created_by,
             "snapshot_version": checkpoint.snapshot_version,
+            "effect_ledger_seq": checkpoint.effect_ledger_seq,
             "metadata": checkpoint.metadata or {},
         }
 
@@ -1721,6 +1851,21 @@ class CheckpointManager:
             purpose="checkpoint image commit read",
         ):
             return
+
+    def checkpoint_or_process_read_scope(
+        self,
+        actor: str,
+        checkpoint: Checkpoint,
+        *,
+        purpose: str = "checkpoint diagnostic read",
+    ) -> Any:
+        """Return the public authority scope used by image/checkpoint readers."""
+
+        return self._checkpoint_or_process_read_scope(
+            actor,
+            checkpoint,
+            purpose=purpose,
+        )
 
     def _validate_fork_parent(
         self,
@@ -1938,29 +2083,23 @@ class CheckpointManager:
         return skill_ids
 
     def _image_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, Any]:
-        runtime = self.runtime
-        if runtime is None:
-            return {}
         image_ids = {row["image_id"] for row in process_rows}
         return {
-            image_id: to_jsonable(runtime.images[image_id])
+            image_id: to_jsonable(self._images[image_id])
             for image_id in sorted(image_ids)
-            if image_id in runtime.images
+            if image_id in self._images
         }
 
     def _image_artifact_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, Any]:
-        runtime = self.runtime
-        if runtime is None:
-            return {}
         artifacts: dict[str, Any] = {}
         for row in process_rows:
-            image = runtime.images.get(row["image_id"])
+            image = self._images.get(row["image_id"])
             if image is None or image.boot.get("kind") not in {"checkpoint_commit", "image_package"}:
                 continue
             artifact_id = str(image.boot.get("artifact_id") or "")
             if not artifact_id:
                 continue
-            found = runtime.store.get_image_artifact(artifact_id)
+            found = self.store.get_image_artifact(artifact_id)
             if found is None:
                 continue
             artifact, metadata = found
@@ -1968,36 +2107,30 @@ class CheckpointManager:
         return artifacts
 
     def _snapshot_image_ids_to_restore(self, snapshot: dict[str, Any], *, overwrite_existing: bool) -> list[str]:
-        runtime = self.runtime
-        if runtime is None:
-            return []
         image_ids: list[str] = []
         for image_id, data in snapshot.get("images", {}).items():
-            if image_id in runtime.images:
+            if image_id in self._images:
                 if not overwrite_existing:
                     continue
-                if to_jsonable(runtime.images[image_id]) == data:
+                if to_jsonable(self._images[image_id]) == data:
                     continue
             image_ids.append(str(image_id))
         return image_ids
 
     def _validate_snapshot_restore_assets(self, snapshot: dict[str, Any]) -> None:
-        runtime = self.runtime
-        if runtime is None:
-            return
-        registry = getattr(runtime, "image_registry", None)
+        registry = self._image_registry
         image_artifacts = snapshot.get("image_artifacts", {})
         tool_rows = {str(row.get("tool_id")) for row in snapshot.get("rows", {}).get("tools", [])}
         for image_id, data in snapshot.get("images", {}).items():
             image = AgentImage(**data)
             if registry is not None:
-                registry._validate_image(image, validate_tools=False)
+                registry.validate_image(image, validate_tools=False)
             boot_kind = str(image.boot.get("kind", "fresh"))
             artifact_id = str(image.boot.get("artifact_id") or "")
             if boot_kind in {"checkpoint_commit", "image_package"}:
                 if not artifact_id:
                     raise ValidationError(f"checkpoint image {image_id} {boot_kind} boot is missing artifact_id")
-                if artifact_id not in image_artifacts and runtime.store.get_image_artifact(artifact_id) is None:
+                if artifact_id not in image_artifacts and self.store.get_image_artifact(artifact_id) is None:
                     raise ValidationError(f"checkpoint image {image_id} requires missing image artifact {artifact_id}")
                 artifact_entry = image_artifacts.get(artifact_id)
                 if artifact_entry is not None:
@@ -2028,9 +2161,9 @@ class CheckpointManager:
         return tool_ids
 
     def _prune_stale_ephemeral_jit_tools(self, tool_ids: set[str], *, scoped_pids: set[str]) -> None:
-        if not tool_ids or self.runtime is None:
+        if not tool_ids:
             return
-        tools = getattr(self.runtime, "tools", None)
+        tools = self._tools
         tool_rows = {str(row.get("tool_id")): row for row in self.store.list_tools()}
         for tool_id in sorted(tool_ids):
             row = tool_rows.get(tool_id)
@@ -2039,8 +2172,7 @@ class CheckpointManager:
             if self._tool_id_used_outside_scope(tool_id, scoped_pids):
                 continue
             if tools is not None:
-                getattr(tools, "_handles", {}).pop(tool_id, None)
-                getattr(tools, "_jit_sources", {}).pop(tool_id, None)
+                tools.forget_loaded_jit(tool_id)
             self.store.delete_tool(tool_id)
 
     def _tool_id_used_outside_scope(self, tool_id: str, scoped_pids: set[str]) -> bool:
@@ -2060,16 +2192,15 @@ class CheckpointManager:
         overwrite_existing: bool,
         consume: bool = True,
     ) -> list[CapabilityDecision]:
-        runtime = self.runtime
-        if self.capabilities is None or runtime is None:
+        if self.capabilities is None:
             return []
-        registry = getattr(runtime, "image_registry", None)
+        registry = self._image_registry
         decisions: list[CapabilityDecision] = []
         for image_id in self._snapshot_image_ids_to_restore(snapshot, overwrite_existing=overwrite_existing):
             resource = registry.resource_for(image_id) if registry is not None else f"image:{image_id}"
             required_right = (
                 CapabilityRight.ADMIN
-                if overwrite_existing and image_id in runtime.images
+                if overwrite_existing and image_id in self._images
                 else CapabilityRight.WRITE
             )
             decisions.append(
@@ -2125,16 +2256,13 @@ class CheckpointManager:
             )
 
     def _restore_images(self, snapshot: dict[str, Any], *, overwrite_existing: bool = True) -> None:
-        runtime = self.runtime
-        if runtime is None:
-            return
         images = snapshot.get("images", {})
-        registry = getattr(runtime, "image_registry", None)
-        atomic_registrations = getattr(registry, "_atomic_image_registrations", None)
+        registry = self._image_registry
+        atomic_registrations = getattr(registry, "atomic_image_registrations", None)
         atomic_scope = (
             atomic_registrations(images)
             if callable(atomic_registrations)
-            else runtime.store.transaction()
+            else self.store.transaction()
         )
         # A restore may reconcile several images and their artifacts. Treat the
         # cache and durable rows as one batch so any failed write restores the
@@ -2142,11 +2270,11 @@ class CheckpointManager:
         with atomic_scope:
             restored_artifact_ids: set[str] | None = set() if not overwrite_existing else None
             for image_id, data in images.items():
-                if not overwrite_existing and image_id in runtime.images:
+                if not overwrite_existing and image_id in self._images:
                     continue
                 image = AgentImage(**data)
-                runtime.images[image_id] = image
-                runtime.store.upsert_image(
+                self._images[image_id] = image
+                self.store.upsert_image(
                     image,
                     registered_by="checkpoint.restore",
                     source=f"checkpoint:{snapshot.get('checkpoint_id')}",
@@ -2159,9 +2287,9 @@ class CheckpointManager:
             for artifact_id, data in snapshot.get("image_artifacts", {}).items():
                 if restored_artifact_ids is not None and artifact_id not in restored_artifact_ids:
                     continue
-                if runtime.store.get_image_artifact(artifact_id) is not None:
+                if self.store.get_image_artifact(artifact_id) is not None:
                     continue
-                runtime.store.insert_image_artifact(
+                self.store.insert_image_artifact(
                     artifact_id=artifact_id,
                     kind=str(data.get("kind", "checkpoint_commit")),
                     artifact=data.get("artifact", {}),
@@ -2187,42 +2315,48 @@ class CheckpointManager:
         return payloads
 
     def _jit_source_snapshot(self, process_rows: list[dict[str, Any]]) -> dict[str, str]:
-        runtime = self.runtime
-        tools = getattr(runtime, "tools", None)
+        tools = self._tools
         if tools is None:
             return {}
-        sources = getattr(tools, "_jit_sources", {})
         tool_ids: set[str] = set()
         for row in process_rows:
             for tool_id in loads(row.get("tool_table_json"), {}).values():
                 tool_ids.add(str(tool_id))
-        return {tool_id: sources[tool_id] for tool_id in sorted(tool_ids) if tool_id in sources}
+        _, sources = tools.snapshot_loaded_tool_state(tool_ids)
+        return sources
 
     def _restore_jit_sources(self, snapshot: dict[str, Any]) -> None:
-        runtime = self.runtime
-        tools = getattr(runtime, "tools", None)
+        tools = self._tools
         if tools is None:
             return
-        sources = getattr(tools, "_jit_sources", None)
-        handles = getattr(tools, "_handles", None)
-        names = getattr(tools, "_tool_ids_by_name", None)
-        if sources is None or handles is None:
-            return
         tool_rows = {row["tool_id"]: row for row in snapshot.get("rows", {}).get("tools", [])}
+        handles: dict[str, ToolHandle] = {}
+        sources: dict[str, str] = {}
         for tool_id, source in snapshot.get("jit_sources", {}).items():
-            sources[tool_id] = source
             row = tool_rows.get(tool_id)
             if row is None:
                 continue
-            handle = ToolHandle(
+            handles[tool_id] = ToolHandle(
                 tool_id=tool_id,
                 name=row["name"],
                 capability_id=None,
                 scope=row["scope"],
             )
-            handles[tool_id] = handle
-            if names is not None and names.get(handle.name) == tool_id:
-                names.pop(handle.name, None)
+            sources[tool_id] = source
+        tools.restore_loaded_jit_state(handles, sources)
+
+    def _external_effect_records_since(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        snapshot: dict[str, Any] | None = None,
+        pids: Iterable[str] | None = None,
+    ) -> list[Any]:
+        selected_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=pids)
+        return self.store.list_external_effects_changed_after(
+            checkpoint.effect_ledger_seq,
+            pids=selected_pids,
+        )
 
     def _external_effects_since(
         self,
@@ -2231,9 +2365,14 @@ class CheckpointManager:
         snapshot: dict[str, Any] | None = None,
         pids: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        selected_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=pids)
-        records = self.store.list_external_effects(created_after=checkpoint.created_at, pids=selected_pids)
-        return [external_effect_to_json(record) for record in records]
+        return [
+            external_effect_to_json(record)
+            for record in self._external_effect_records_since(
+                checkpoint,
+                snapshot=snapshot,
+                pids=pids,
+            )
+        ]
 
     def _external_effect_summary_since(
         self,
@@ -2242,8 +2381,13 @@ class CheckpointManager:
         snapshot: dict[str, Any] | None = None,
         pids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
-        selected_pids = self._external_effect_pids(checkpoint, snapshot=snapshot, current_pids=pids)
-        return external_effect_summary(self.store.list_external_effects(created_after=checkpoint.created_at, pids=selected_pids))
+        return external_effect_summary(
+            self._external_effect_records_since(
+                checkpoint,
+                snapshot=snapshot,
+                pids=pids,
+            )
+        )
 
     def _external_effect_pids(
         self,
@@ -2517,21 +2661,8 @@ class CheckpointManager:
             child = self.store.get_process(child_pid)
             if child is not None and child.status in self.TERMINAL_STATUSES:
                 return ProcessStatus.RUNNABLE, None
-        runtime = getattr(self, "runtime", None)
-        messages = getattr(runtime, "messages", None)
-        if messages is not None:
-            filters = messages._filters_from_wait_status(status_message)
-            if filters is not None and self.store.list_process_messages(
-                pid,
-                status=ProcessMessageStatus.UNREAD,
-                kind=filters.get("kind"),
-                sender=filters.get("sender"),
-                channel=filters.get("channel"),
-                correlation_id=filters.get("correlation_id"),
-                reply_to=filters.get("reply_to"),
-                message_ids=filters.get("message_ids"),
-            ):
-                return ProcessStatus.RUNNABLE, None
+        if self._messages.has_matching_unread_wait(pid, status_message):
+            return ProcessStatus.RUNNABLE, None
         return None, None
 
     def _human_request_ids_from_wait(self, status_message: str | None) -> list[str]:
@@ -2614,14 +2745,17 @@ class CheckpointManager:
         return objects
 
     def _run_object_release_finalizers_for_objects(self, objects: list[Any], *, actor: str, reason: str) -> None:
-        if not objects or self.runtime is None:
+        if not objects or self._memory is None:
             return
-        memory = getattr(self.runtime, "memory", None)
-        run_finalizers = getattr(memory, "_run_object_release_finalizers", None)
+        run_finalizers = getattr(
+            self._memory,
+            "run_object_release_finalizers_trusted",
+            None,
+        )
         if not callable(run_finalizers):
             return
         for obj in objects:
-            run_finalizers(obj, actor, reason)
+            run_finalizers(obj, actor=actor, reason=reason)
 
     def _delete_object_capabilities(self, cur: Any, object_oids: set[str]) -> None:
         if not object_oids:
@@ -2695,25 +2829,7 @@ class CheckpointManager:
 
     def _insert_row(self, cur: Any, table: str, row: dict[str, Any]) -> None:
         table = self.store.validate_table_identifier(table)
-        if table == "objects":
-            item = self._object_row_with_lifecycle_defaults(row)
-        else:
-            item = dict(row)
-        if table == "events" and "gui_snapshot_visible" not in item:
-            item["gui_snapshot_visible"] = int(
-                not is_gui_presentation_event_fields(
-                    item.get("type"),
-                    loads(item.get("payload_json"), {}),
-                )
-            )
-        if table == "audit_records" and "gui_snapshot_visible" not in item:
-            item["gui_snapshot_visible"] = int(
-                not is_gui_presentation_audit_fields(
-                    item.get("action"),
-                    item.get("target"),
-                    loads(item.get("decision_json"), {}),
-                )
-            )
+        item = dict(row)
         columns = list(item)
         for column in columns:
             self.store.validate_column_identifier(table, column)
@@ -2722,29 +2838,6 @@ class CheckpointManager:
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
             tuple(item[column] for column in columns),
         )
-
-    def _object_row_with_lifecycle_defaults(self, row: dict[str, Any]) -> dict[str, Any]:
-        item = dict(row)
-        created_by = str(item.get("created_by", "runtime"))
-        if not item.get("owner_kind"):
-            if created_by.startswith("process_result:"):
-                item["owner_kind"] = ObjectOwnerKind.PROCESS_RESULT.value
-            elif created_by.startswith("object_task:"):
-                item["owner_kind"] = ObjectOwnerKind.OBJECT_TASK.value
-            elif created_by == "runtime" or created_by.startswith("runtime."):
-                item["owner_kind"] = ObjectOwnerKind.RUNTIME.value
-            else:
-                item["owner_kind"] = ObjectOwnerKind.PROCESS.value
-        if not item.get("owner_id"):
-            if created_by.startswith("process_result:"):
-                item["owner_id"] = created_by.split(":", 1)[1]
-            elif created_by.startswith("object_task:"):
-                item["owner_id"] = created_by.split(":", 1)[1]
-            else:
-                item["owner_id"] = created_by
-        item.setdefault("lifecycle_state", "live")
-        item.setdefault("deleted_at", None)
-        return item
 
     def _upsert_row(self, cur: Any, table: str, row: dict[str, Any], key: str) -> None:
         table = self.store.validate_table_identifier(table)
@@ -2775,24 +2868,22 @@ class CheckpointManager:
     def _remap_process_row(
         self,
         row: dict[str, Any],
-        pid_map: dict[str, str],
-        object_map: dict[str, str],
-        capability_map: dict[str, str],
+        identities: SnapshotIdentityMap,
         parent_pid: str | None,
         root_pid: str,
         non_clonable_object_oids: set[str],
-        tool_map: dict[str, str],
     ) -> dict[str, Any]:
-        item = dict(row)
-        old_pid = item["pid"]
-        item["pid"] = pid_map[old_pid]
-        old_parent = item.get("parent_pid")
+        item = SnapshotRemapper.remap_row(row, identities)
+        pid_map = identities.pids
+        object_map = identities.objects
+        capability_map = identities.capabilities
+        tool_map = identities.tools
+        old_pid = str(row["pid"])
+        old_parent = row.get("parent_pid")
         remapped_parent = pid_map.get(old_parent) if old_parent else None
         item["parent_pid"] = remapped_parent if remapped_parent is not None else (parent_pid if old_pid == root_pid else None)
-        if item.get("goal_oid") in non_clonable_object_oids:
+        if row.get("goal_oid") in non_clonable_object_oids:
             item["goal_oid"] = None
-        elif item.get("goal_oid") in object_map:
-            item["goal_oid"] = object_map[item["goal_oid"]]
         item["checkpoint_head"] = None
         if item.get("status") in self.FORK_TRANSIENT_STATUSES:
             item["status"] = ProcessStatus.RUNNABLE.value
@@ -2845,31 +2936,21 @@ class CheckpointManager:
     def _remap_namespace_row(
         self,
         row: dict[str, Any],
-        pid_map: dict[str, str],
-        namespace_map: dict[str, str],
+        identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
-        item = dict(row)
-        item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
-        if item.get("parent_namespace") in namespace_map:
-            item["parent_namespace"] = namespace_map[item["parent_namespace"]]
-        if item.get("created_by") in pid_map:
-            item["created_by"] = pid_map[item["created_by"]]
+        item = SnapshotRemapper.remap_row(row, identities)
         item["updated_at"] = utc_now()
         return item
 
     def _remap_object_row(
         self,
         row: dict[str, Any],
-        pid_map: dict[str, str],
-        object_map: dict[str, str],
-        namespace_map: dict[str, str],
+        identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
-        item = dict(row)
-        original_created_by = str(item.get("created_by") or "")
-        item["oid"] = object_map[item["oid"]]
-        item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
-        if item.get("created_by") in pid_map:
-            item["created_by"] = pid_map[item["created_by"]]
+        item = SnapshotRemapper.remap_row(row, identities)
+        pid_map = identities.pids
+        object_map = identities.objects
+        original_created_by = str(row.get("created_by") or "")
         if item.get("owner_kind") in {ObjectOwnerKind.PROCESS.value, ObjectOwnerKind.PROCESS_RESULT.value}:
             if item.get("owner_id") in pid_map:
                 item["owner_id"] = pid_map[item["owner_id"]]
@@ -2887,29 +2968,24 @@ class CheckpointManager:
         item["updated_at"] = utc_now()
         return item
 
-    def _remap_link_row(self, row: dict[str, Any], object_map: dict[str, str]) -> dict[str, Any]:
-        item = dict(row)
+    def _remap_link_row(
+        self,
+        row: dict[str, Any],
+        identities: SnapshotIdentityMap,
+    ) -> dict[str, Any]:
+        item = SnapshotRemapper.remap_row(row, identities)
         item["id"] = new_id("link")
-        item["src_oid"] = object_map[item["src_oid"]]
-        item["dst_oid"] = object_map[item["dst_oid"]]
         item["created_at"] = utc_now()
         return item
 
     def _remap_capability_row(
         self,
         row: dict[str, Any],
-        pid_map: dict[str, str],
-        object_map: dict[str, str],
-        namespace_map: dict[str, str],
-        capability_map: dict[str, str],
+        identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
-        item = dict(row)
-        item["cap_id"] = capability_map[item["cap_id"]]
-        item["subject"] = pid_map[item["subject"]]
-        if item.get("issuer_cap_id") in capability_map:
-            item["issuer_cap_id"] = capability_map[item["issuer_cap_id"]]
-        if item.get("parent_cap_id") in capability_map:
-            item["parent_cap_id"] = capability_map[item["parent_cap_id"]]
+        item = SnapshotRemapper.remap_row(row, identities)
+        object_map = identities.objects
+        namespace_map = identities.namespaces
         resource = str(item["resource"])
         if resource.startswith("object:"):
             oid = resource.split(":", 1)[1]
@@ -2921,10 +2997,12 @@ class CheckpointManager:
         item["issued_at"] = utc_now()
         return item
 
-    def _remap_resource_reservation_row(self, row: dict[str, Any], pid_map: dict[str, str]) -> dict[str, Any]:
-        item = dict(row)
-        item["parent_pid"] = pid_map[item["parent_pid"]]
-        item["child_pid"] = pid_map[item["child_pid"]]
+    def _remap_resource_reservation_row(
+        self,
+        row: dict[str, Any],
+        identities: SnapshotIdentityMap,
+    ) -> dict[str, Any]:
+        item = SnapshotRemapper.remap_row(row, identities)
         now = utc_now()
         item["created_at"] = now
         item["updated_at"] = now
@@ -2933,14 +3011,11 @@ class CheckpointManager:
     def _remap_message_row(
         self,
         row: dict[str, Any],
-        pid_map: dict[str, str],
-        object_map: dict[str, str],
+        identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
-        item = dict(row)
+        item = SnapshotRemapper.remap_row(row, identities)
+        object_map = identities.objects
         item["message_id"] = new_id("pmsg")
-        item["recipient_pid"] = pid_map[item["recipient_pid"]]
-        if item["sender"] in pid_map:
-            item["sender"] = pid_map[item["sender"]]
         item["payload_json"] = dumps({**loads(item["payload_json"], {}), "forked_from_message_id": row["message_id"]})
         raw_metadata = item.get("metadata_json")
         metadata = (
@@ -2951,11 +3026,11 @@ class CheckpointManager:
         if not isinstance(metadata, dict):
             raise ValidationError("checkpoint process message metadata must be a JSON object")
         canonical_metadata = self._canonical_snapshot_message_metadata(metadata)
-        metadata = (
-            canonical_metadata
-            if canonical_metadata is not None
-            else conservative_legacy_process_message_metadata(metadata)
-        )
+        if canonical_metadata is None:
+            raise ValidationError(
+                "0.3 checkpoint process message has no canonical label metadata"
+            )
+        metadata = canonical_metadata
         carrier_oid = str(metadata.get("label_carrier_oid") or "").strip()
         if carrier_oid:
             remapped_carrier_oid = object_map.get(carrier_oid)
@@ -2973,24 +3048,19 @@ class CheckpointManager:
     def _remap_tool_candidate_row(
         self,
         row: dict[str, Any],
-        pid_map: dict[str, str],
-        candidate_map: dict[str, str],
-        tool_map: dict[str, str],
+        identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
-        item = dict(row)
-        item["candidate_id"] = candidate_map[str(item["candidate_id"])]
-        item["pid"] = pid_map[item["pid"]]
-        registered_tool_id = item.get("registered_tool_id")
-        if registered_tool_id is not None:
-            item["registered_tool_id"] = tool_map.get(str(registered_tool_id), str(registered_tool_id))
+        item = SnapshotRemapper.remap_row(row, identities)
         item["created_at"] = utc_now()
         item["updated_at"] = utc_now()
         return item
 
-    def _remap_tool_row(self, row: dict[str, Any], tool_map: dict[str, str]) -> dict[str, Any]:
-        item = dict(row)
-        item["tool_id"] = tool_map.get(str(item["tool_id"]), str(item["tool_id"]))
-        return item
+    def _remap_tool_row(
+        self,
+        row: dict[str, Any],
+        identities: SnapshotIdentityMap,
+    ) -> dict[str, Any]:
+        return SnapshotRemapper.remap_row(row, identities)
 
     def _remap_object_payload(
         self,

@@ -4,15 +4,101 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from agent_libos import Runtime
+from agent_libos.api.cli import cli as cli_entrypoint
 from agent_libos.api.cli import main as cli_main
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ProcessMessageKind, ProcessStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
+
+def _create_store_with_schema_version(db: Path, version: int) -> None:
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "CREATE TABLE runtime_schema ("
+            "singleton INTEGER PRIMARY KEY, "
+            "schema_version INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO runtime_schema (singleton, schema_version) VALUES (1, ?)",
+            (version,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class TestCLIBuiltinCommand:
+
+    def test_cli_runtime_not_found_uses_structured_error_and_exit_one(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        monkeypatch.setattr("agent_libos.api.cli.Runtime.open", lambda *args, **kwargs: runtime)
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+            cli_entrypoint(["resources", "missing-pid"])
+
+        assert raised.value.code == 1
+        error = json.loads(stdout.getvalue())["error"]
+        assert error == {
+            "type": "NotFound",
+            "message": "process not found: missing-pid",
+        }
+
+    def test_cli_unsupported_store_version_uses_structured_error_and_exit_one(
+        self,
+    ) -> None:
+        message = "unsupported Agent libOS store schema: 2; expected 3"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "unsupported.sqlite"
+            _create_store_with_schema_version(db, 2)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+                pytest.raises(SystemExit) as raised,
+            ):
+                cli_entrypoint(["--db", str(db), "init"])
+
+            assert raised.value.code == 1
+            assert stderr.getvalue() == ""
+            error = json.loads(stdout.getvalue())["error"]
+            assert error == {
+                "type": "UnsupportedStoreVersion",
+                "message": message,
+            }
+
+    def test_python_module_entrypoint_uses_structured_error_boundary(self) -> None:
+        message = "unsupported Agent libOS store schema: 2; expected 3"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "unsupported.sqlite"
+            _create_store_with_schema_version(db, 2)
+
+            result = subprocess.run(
+                [sys.executable, "-m", "agent_libos", "--db", str(db), "init"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        assert result.returncode == 1
+        assert result.stderr == ""
+        error = json.loads(result.stdout)["error"]
+        assert error == {
+            "type": "UnsupportedStoreVersion",
+            "message": message,
+        }
 
     def test_cli_ignores_config_yaml_from_cwd_for_default_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

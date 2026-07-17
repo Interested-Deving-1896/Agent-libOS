@@ -505,7 +505,7 @@ class TestChildProcessTool:
             other = runtime.process.spawn(image='base-agent:v0', goal='unrelated')
             before = runtime.process.get(pid)
             before_tools = dict(before.tool_table)
-            original_configure_skills = runtime._configure_process_skills_for_image
+            original_configure_skills = runtime.image_boot._configure_skills
 
             def fail_after_unrelated_mutation(target_pid: str, image_id: str, assigned_by: str) -> None:
                 other_process = runtime.process.get(other)
@@ -513,7 +513,7 @@ class TestChildProcessTool:
                 runtime.store.update_process(other_process)
                 raise RuntimeError('skill boot failed')
 
-            runtime._configure_process_skills_for_image = fail_after_unrelated_mutation
+            runtime.image_boot._configure_skills = fail_after_unrelated_mutation
 
             with pytest.raises(RuntimeError):
                 runtime.exec_process(pid, 'failing-exec:v0', goal='should not apply')
@@ -524,7 +524,7 @@ class TestChildProcessTool:
             assert after.goal_oid == before.goal_oid
             assert after.tool_table == before_tools
             assert runtime.process.get(other).status_message == 'must survive scoped rollback'
-            runtime._configure_process_skills_for_image = original_configure_skills
+            runtime.image_boot._configure_skills = original_configure_skills
         finally:
             runtime.close()
 

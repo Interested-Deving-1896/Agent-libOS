@@ -187,8 +187,8 @@ class TestJitSecurity:
             assert registered[0].tool_id == resolved[0].tool_id
             tool_id = registered[0].tool_id
             assert self.runtime.process.get(pid).tool_table['atomic_jit_publication'] == tool_id
-            assert tool_id in self.runtime.tools._jit_sources
-            assert tool_id in self.runtime.tools._handles
+            assert self.runtime.tools.is_jit_tool_id(tool_id)
+            assert self.runtime.tools.loaded_tool_handle(tool_id) is not None
             assert any(row['tool_id'] == tool_id for row in self.runtime.store.list_tools())
         finally:
             release_registration.set()
@@ -212,8 +212,8 @@ class TestJitSecurity:
             source_code='export function run(args, libos) { return { ok: true }; }',
         )
         assert self.runtime.tools.validate(candidate_id).ok
-        before_handles = set(self.runtime.tools._handles)
-        before_sources = set(self.runtime.tools._jit_sources)
+        before_handles = self.runtime.tools.loaded_tool_ids()
+        before_sources = self.runtime.tools.loaded_jit_tool_ids()
         original_record = self.runtime.audit.record
 
         def fail_registration_audit(*args: Any, **kwargs: Any) -> Any:
@@ -236,8 +236,8 @@ class TestJitSecurity:
         assert candidate.status.value == 'validated'
         assert candidate.registered_tool_id is None
         assert 'rollback_jit_publication' not in self.runtime.process.get(pid).tool_table
-        assert set(self.runtime.tools._handles) == before_handles
-        assert set(self.runtime.tools._jit_sources) == before_sources
+        assert self.runtime.tools.loaded_tool_ids() == before_handles
+        assert self.runtime.tools.loaded_jit_tool_ids() == before_sources
         assert all(row['name'] != 'rollback_jit_publication' for row in self.runtime.store.list_tools())
 
     def test_jit_proposal_failure_rolls_back_candidate_and_descriptor(
@@ -315,7 +315,11 @@ class TestJitSecurity:
         assert candidate.registered_tool_id is None
         assert 'atomic_jit' not in self.runtime.process.get(owner).tool_table
         assert not [row for row in self.runtime.store.list_tools() if row['name'] == 'atomic_jit']
-        assert not [handle for handle in self.runtime.tools._handles.values() if handle.name == 'atomic_jit']
+        assert not [
+            handle
+            for handle in self.runtime.tools.loaded_tool_handles()
+            if handle.name == 'atomic_jit'
+        ]
 
     def test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
         commands: list[list[str]] = []

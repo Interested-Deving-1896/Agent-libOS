@@ -66,7 +66,7 @@ class TestPtyModule:
                         pattern="pty:spawn:*",
                         trust_level=SinkTrustLevel.TRUSTED,
                         max_sensitivity="secret",
-                        identity_sha256=adapter.shell._executable_data_sink(
+                        identity_sha256=adapter.shell_policy.executable_data_sink(
                             "pty:spawn",
                             "git",
                             cwd=".",
@@ -1743,7 +1743,7 @@ class TestPtyModule:
                         pattern='pty:spawn:*',
                         trust_level=SinkTrustLevel.TRUSTED,
                         max_sensitivity='secret',
-                        identity_sha256=adapter.shell._executable_data_sink(
+                        identity_sha256=adapter.shell_policy.executable_data_sink(
                             'pty:spawn',
                             'git',
                             cwd='.',
@@ -2820,7 +2820,7 @@ class TestPtyModule:
                 release_blocked_audit.set()
                 if shutdown_thread is not None and shutdown_thread.is_alive():
                     shutdown_thread.join(timeout=2.0)
-                if not getattr(runtime, "_closed", False):
+                if not runtime.lifecycle.closed:
                     runtime.close()
 
     def test_pty_reader_drops_old_output_when_buffer_limit_is_reached(self) -> None:
@@ -2866,18 +2866,32 @@ def _open_pty_runtime(
         if line.startswith("sha256:")
     )
     manifest_sha = hashlib.sha256(manifest.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
-    return Runtime.open(
+    runtime = Runtime.open(
         "local",
         substrate=substrate,
-        config=AgentLibOSConfig(
-            runtime=replace(
-                DEFAULT_CONFIG.runtime,
-                launch_authority_mode="legacy_image_grants",
-            )
-        ),
+        config=AgentLibOSConfig(),
         module_manifests=(str(manifest),),
         trusted_modules=(f"agent-libos-pty:v0:{manifest_sha}:{source_sha}",),
     )
+    # This contract harness is the Host launch policy for the bundled image:
+    # it explicitly authorizes the declarations instead of enabling the
+    # removed 0.2 image-auto-grant compatibility mode.
+    original_spawn = runtime.process.spawn
+
+    def host_authorized_spawn(*args: Any, **kwargs: Any) -> str:
+        selected_image = kwargs.get("image", args[0] if args else None)
+        if (
+            selected_image == "pty-agent:v0"
+            and "capabilities" not in kwargs
+            and "authority_manifest" not in kwargs
+        ):
+            kwargs["capabilities"] = list(
+                runtime.get_image("pty-agent:v0").required_capabilities
+            )
+        return original_spawn(*args, **kwargs)
+
+    runtime.process.spawn = host_authorized_spawn
+    return runtime
 
 
 def _module_manifest() -> Path:
@@ -2887,7 +2901,7 @@ def _module_manifest() -> Path:
 
 
 def _pty_adapter(runtime: Runtime) -> Any:
-    return getattr(runtime, "_agent_libos_pty_adapter")
+    return runtime.module_state.get("_agent_libos_pty_adapter")
 
 
 def _grant_exact_pty_once(runtime: Runtime, pid: str, argv: list[str]) -> Any:

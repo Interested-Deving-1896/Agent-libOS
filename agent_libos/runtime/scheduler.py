@@ -13,10 +13,10 @@ from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.utils.ids import utc_now
-from agent_libos.models import ProcessStatus, ResourceUsage
+from agent_libos.models import ProcessExecutionToken, ProcessStatus, ResourceUsage
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import ProcessRepository
 
 
 Quantum = Callable[[str], Any | Awaitable[Any]]
@@ -40,7 +40,7 @@ class AsyncProcessScheduler:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        store: ProcessRepository,
         audit: AuditManager,
         poll_interval_s: float = _SCHEDULER_DEFAULTS.poll_interval_s,
         max_workers: int = _SCHEDULER_DEFAULTS.max_workers,
@@ -49,6 +49,8 @@ class AsyncProcessScheduler:
         resources: Any | None = None,
         skip_pid: Callable[[str], bool] | None = None,
         cancel_process: Callable[[str, str], None] | None = None,
+        blocking_work: Any | None = None,
+        owner_id: str = "scheduler.local",
     ):
         self.store = store
         self.audit = audit
@@ -59,6 +61,8 @@ class AsyncProcessScheduler:
         self.resources = resources
         self._skip_pid = skip_pid
         self._cancel_process = cancel_process
+        self._blocking_work = blocking_work
+        self.owner_id = str(owner_id)
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent-libos-scheduler")
         self._unblock_executor = ThreadPoolExecutor(
             max_workers=max(1, max_workers),
@@ -107,7 +111,7 @@ class AsyncProcessScheduler:
             return sorted({pid for future, pid in self._futures.items() if not future.done()})
 
     async def arun_once(self, quantum: Quantum) -> Any:
-        return await asyncio.to_thread(self.run_once, quantum)
+        return await self._run_blocking(self.run_once, quantum)
 
     def run_once(self, quantum: Quantum) -> Any:
         with self._run_lock:
@@ -118,7 +122,7 @@ class AsyncProcessScheduler:
             return future.result()
 
     async def arun_pid_once(self, pid: str, quantum: Quantum) -> Any:
-        return await asyncio.to_thread(self.run_pid_once, pid, quantum)
+        return await self._run_blocking(self.run_pid_once, pid, quantum)
 
     def run_pid_once(self, pid: str, quantum: Quantum) -> Any:
         """Advance one explicitly selected runnable process by one quantum."""
@@ -135,7 +139,11 @@ class AsyncProcessScheduler:
         return _ACTIVE_QUANTUM.get() == (id(self), pid)
 
     async def arun_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
-        return await asyncio.to_thread(self.run_until_idle, quantum, max_quanta=max_quanta)
+        return await self._run_blocking(
+            self.run_until_idle,
+            quantum,
+            max_quanta=max_quanta,
+        )
 
     def run_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
         with self._run_lock:
@@ -274,7 +282,17 @@ class AsyncProcessScheduler:
         quantum: Quantum,
         max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta,
     ) -> list[Any]:
-        return await asyncio.to_thread(self.run_pid_until_idle, pid, quantum, max_quanta=max_quanta)
+        return await self._run_blocking(
+            self.run_pid_until_idle,
+            pid,
+            quantum,
+            max_quanta=max_quanta,
+        )
+
+    async def _run_blocking(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        if self._blocking_work is None:
+            return await asyncio.to_thread(function, *args, **kwargs)
+        return await self._blocking_work.run(function, *args, **kwargs)
 
     def run_pid_until_idle(
         self,
@@ -324,8 +342,8 @@ class AsyncProcessScheduler:
         return stopped
 
     def _run_quantum(self, pid: str, quantum: Quantum) -> Any:
-        process = self._claim_runnable_process(pid)
-        if process is None:
+        execution_token = self._claim_runnable_process(pid)
+        if execution_token is None:
             return None
         self.audit.record(actor="scheduler", action="scheduler.run_quantum", target=f"process:{pid}")
         started_at = time.perf_counter()
@@ -356,13 +374,13 @@ class AsyncProcessScheduler:
                     )
                 except ResourceLimitExceeded as exc:
                     resource_error = exc
-            latest = self.store.get_process(pid)
-            # A primitive may deliberately set WAITING_HUMAN, EXITED, or another
-            # status during the quantum. Only restore RUNNABLE for plain returns.
-            if latest is not None and latest.status == ProcessStatus.RUNNING:
-                latest.status = ProcessStatus.RUNNABLE
-                latest.updated_at = utc_now()
-                self.store.update_process(latest)
+            # A primitive may deliberately fence this lease by transitioning to
+            # WAITING_HUMAN, EXITED, or another state.  Only the exact execution
+            # token may restore RUNNABLE after a plain return.
+            self.store.complete_execution(
+                execution_token,
+                status=ProcessStatus.RUNNABLE,
+            )
         if error is not None:
             raise error
         if resource_error is not None:
@@ -391,8 +409,8 @@ class AsyncProcessScheduler:
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
-    def _claim_runnable_process(self, pid: str) -> Any | None:
-        return self.store.claim_runnable_process(pid)
+    def _claim_runnable_process(self, pid: str) -> ProcessExecutionToken | None:
+        return self.store.claim_execution(pid, owner_id=self.owner_id)
 
     def _submit(self, pid: str, operation: Callable[[], Any], *, unblock: bool = False) -> Future[Any]:
         # ThreadPoolExecutor does not propagate ContextVars. Capture the host
@@ -422,7 +440,12 @@ class AsyncProcessScheduler:
             process.status = ProcessStatus.FAILED
             process.status_message = f"scheduler task failed: {exc}"
             process.updated_at = utc_now()
-            self.store.update_process(process)
+            self.store.transition_process(
+                pid,
+                ProcessStatus.FAILED,
+                expected_revision=process.revision,
+                status_message=process.status_message,
+            )
         self.audit.record(
             actor="scheduler",
             action="scheduler.process_task_failed",

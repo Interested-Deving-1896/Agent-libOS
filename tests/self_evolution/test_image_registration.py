@@ -786,6 +786,105 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_exec_publication_commit_failure_compensates_before_return(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id='exec-commit-failure:v0',
+                    name='exec-commit-failure',
+                    default_tools=['human_output'],
+                ),
+                actor='test',
+            )
+            pid = runtime.process.spawn(goal='before failed publication commit')
+            runtime.capability.grant(
+                pid,
+                runtime.image_registry.resource_for('exec-commit-failure:v0'),
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            before = runtime.process.get(pid)
+            original_advance = runtime.store.advance_runtime_publication
+
+            def fail_process_exec_commit(publication_id: str, **kwargs: Any) -> bool:
+                if kwargs.get('state') == 'committed':
+                    publication = runtime.store.get_runtime_publication(publication_id)
+                    if publication is not None and publication['kind'] == 'process_exec':
+                        return False
+                return original_advance(publication_id, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.store,
+                'advance_runtime_publication',
+                fail_process_exec_commit,
+            )
+
+            with pytest.raises(ValidationError, match='cannot commit process exec publication'):
+                runtime.exec_process(pid, 'exec-commit-failure:v0', goal='must be compensated')
+
+            after = runtime.process.get(pid)
+            assert after.image_id == before.image_id
+            assert after.goal_oid == before.goal_oid
+            assert after.tool_table == before.tool_table
+            publications = [
+                item
+                for item in runtime.store.list_runtime_publications()
+                if item['kind'] == 'process_exec' and item['pid'] == pid
+            ]
+            assert publications[-1]['state'] == 'rolled_back'
+            assert not [
+                record
+                for record in runtime.audit.trace(actor=pid, target=f'process:{pid}')
+                if record.action == 'process.exec'
+            ]
+            assert not [
+                event
+                for event in runtime.events.list(target=pid)
+                if event.type == EventType.PROCESS_EXEC
+            ]
+        finally:
+            runtime.close()
+
+    def test_failed_exec_inside_claim_preserves_execution_token_for_quantum_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                default_skills=['missing-package-skill'],
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = AcceptingValidationSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(
+                    Path(temp_dir) / 'package-agent',
+                    actor='cli',
+                )
+                pid = runtime.process.spawn(goal='exec rollback keeps scheduler token')
+                runtime.capability.grant(
+                    pid,
+                    runtime.image_registry.resource_for('package-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                token = runtime.store.claim_execution(pid, owner_id='test.runtime')
+                assert token is not None
+
+                with pytest.raises(Exception, match='missing-package-skill'):
+                    runtime.exec_process(pid, 'package-agent:v0', goal='fail in claimed quantum')
+
+                restored = runtime.process.get(pid)
+                assert restored.status == ProcessStatus.RUNNING
+                assert restored.execution_generation == token.generation
+                assert restored.execution_owner_id == token.owner_id
+                assert restored.execution_lease_id == token.lease_id
+                assert runtime.store.complete_execution(token, status=ProcessStatus.RUNNABLE)
+            finally:
+                runtime.close()
+
     def test_exec_process_late_package_failure_cleans_registered_jit_candidate_and_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(
@@ -823,6 +922,123 @@ class TestImageRegistration:
                     if obj.type == ObjectType.TOOL_CANDIDATE
                 ]
                 assert not [row for row in runtime.store.list_tools() if row['name'] == 'package_count']
+            finally:
+                runtime.close()
+
+    def test_failed_exec_preserves_external_borrower_capability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                default_skills=['missing-package-skill'],
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = AcceptingValidationSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                target = runtime.process.spawn(goal='exec target with borrowed object')
+                borrower = runtime.process.spawn(goal='external borrower')
+                shared = runtime.memory.create_object(target, ObjectType.ARTIFACT, {'shared': True})
+                borrower_cap = runtime.capability.issue_trusted(
+                    borrower,
+                    f'object:{shared.oid}',
+                    [CapabilityRight.READ],
+                    issued_by='external.borrower',
+                )
+                runtime.capability.grant(
+                    target,
+                    runtime.image_registry.resource_for('package-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                with pytest.raises(Exception, match='missing-package-skill'):
+                    runtime.exec_process(target, 'package-agent:v0', goal='fail after package install')
+
+                persisted = runtime.store.get_capability(borrower_cap.cap_id)
+                assert persisted is not None and persisted.active
+                assert runtime.store.get_object(shared.oid) is not None
+            finally:
+                runtime.close()
+
+    def test_failed_exec_does_not_resurrect_concurrent_revoke(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                default_skills=['missing-package-skill'],
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = AcceptingValidationSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(goal='exec revoke winner')
+                cap = runtime.capability.grant(
+                    pid,
+                    'custom:concurrent-revoke',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                runtime.capability.grant(
+                    pid,
+                    runtime.image_registry.resource_for('package-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                original_activate = runtime.skills.activate_skill
+
+                def revoke_then_fail(*args: Any, **kwargs: Any) -> Any:
+                    runtime.capability.revoke(
+                        cap.cap_id,
+                        revoked_by='external.concurrent',
+                        reason='concurrent revoke wins',
+                        require_authority=False,
+                    )
+                    return original_activate(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.skills, 'activate_skill', revoke_then_fail)
+                with pytest.raises(Exception, match='missing-package-skill'):
+                    runtime.exec_process(
+                        pid,
+                        'package-agent:v0',
+                        goal='fail after concurrent revoke',
+                        preserve_capabilities=True,
+                    )
+
+                persisted = runtime.store.get_capability(cap.cap_id)
+                assert persisted is not None and not persisted.active
+            finally:
+                runtime.close()
+
+    def test_failed_exec_preserves_external_terminal_process_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                with_jit=True,
+                default_skills=['missing-package-skill'],
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = AcceptingValidationSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(goal='exec terminal winner')
+                runtime.capability.grant(
+                    pid,
+                    runtime.image_registry.resource_for('package-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                original_activate = runtime.skills.activate_skill
+
+                def cancel_then_fail(*args: Any, **kwargs: Any) -> Any:
+                    runtime.process.cancel(pid, 'external terminal mutation')
+                    return original_activate(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.skills, 'activate_skill', cancel_then_fail)
+                with pytest.raises(Exception, match='missing-package-skill'):
+                    runtime.exec_process(pid, 'package-agent:v0', goal='fail after cancellation')
+
+                assert runtime.process.get(pid).status == ProcessStatus.KILLED
             finally:
                 runtime.close()
 

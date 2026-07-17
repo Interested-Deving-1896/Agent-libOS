@@ -7,7 +7,8 @@ from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.storage.sqlite import SQLRuntimeStore
+from agent_libos.storage.engine import split_sql_script
+from agent_libos.storage.sql import SQLRuntimeStore
 
 
 def _postgres_runtime_lock_key(database: str, schema: str) -> int:
@@ -35,8 +36,8 @@ class _PostgresDialect:
         if _PRAGMA_INDEX_LIST.match(text) or _PRAGMA_INDEX_INFO.match(text):
             return "SELECT NULL::text AS name WHERE false"
 
-        was_insert_or_ignore_namespace = bool(
-            re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\s+object_namespaces\b", sql, re.IGNORECASE)
+        was_insert_or_ignore = bool(
+            re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", sql, re.IGNORECASE)
         )
         was_insert_or_replace_skill_trust = bool(
             re.search(r"\bINSERT\s+OR\s+REPLACE\s+INTO\s+skill_trust\b", sql, re.IGNORECASE)
@@ -52,8 +53,8 @@ class _PostgresDialect:
             "INSERT INTO skill_trust",
         )
         transformed = _prepare_parameterized_sql(transformed) if with_params else transformed.replace("?", "%s")
-        if was_insert_or_ignore_namespace and "ON CONFLICT" not in transformed:
-            transformed = f"{transformed.rstrip()} ON CONFLICT (namespace) DO NOTHING"
+        if was_insert_or_ignore and "ON CONFLICT" not in transformed:
+            transformed = f"{transformed.rstrip()} ON CONFLICT DO NOTHING"
         if was_insert_or_replace_skill_trust and "ON CONFLICT" not in transformed:
             transformed = (
                 f"{transformed.rstrip()} "
@@ -129,7 +130,7 @@ class _PostgresConnection:
         self.cursor().executemany(sql, seq_of_params)
 
     def executescript(self, script: str) -> None:
-        for statement in _split_sql_script(script):
+        for statement in split_sql_script(script):
             if statement:
                 self.execute(statement)
 
@@ -157,6 +158,20 @@ class PostgresStore(SQLRuntimeStore):
             self._release_runtime_lease(getattr(self, "conn", None))
         finally:
             super().close()
+
+    @classmethod
+    def _probe_user_schema_objects(cls, conn: Any) -> set[str]:
+        rows = conn.execute(
+            """
+            SELECT relation.relname AS name
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+            """
+        )
+        return {str(row["name"]) for row in rows}
 
     def _acquire_runtime_lease(self, conn: _PostgresConnection) -> None:
         identity = conn.execute(
@@ -223,26 +238,3 @@ def _prepare_parameterized_sql(sql: str) -> str:
             parts.append(char)
         index += 1
     return "".join(parts)
-
-
-def _split_sql_script(script: str) -> list[str]:
-    statements: list[str] = []
-    current: list[str] = []
-    in_quote = False
-    quote_char = ""
-    for char in script:
-        if char in {"'", '"'}:
-            if in_quote and char == quote_char:
-                in_quote = False
-            elif not in_quote:
-                in_quote = True
-                quote_char = char
-        if char == ";" and not in_quote:
-            statements.append("".join(current).strip())
-            current = []
-            continue
-        current.append(char)
-    tail = "".join(current).strip()
-    if tail:
-        statements.append(tail)
-    return statements

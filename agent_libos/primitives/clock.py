@@ -14,11 +14,11 @@ from agent_libos.models import (
     CapabilityRight,
     EventType,
 )
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
+from agent_libos.ports import AuditPort, EventPort
 from agent_libos.sdk import (
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
+    ProtectedOperationSDK,
     ProviderPhase,
 )
 from agent_libos.substrate import ClockProvider, LocalClockProvider
@@ -51,14 +51,17 @@ class ClockPrimitive:
     def __init__(
         self,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus,
+        audit: AuditPort,
+        events: EventPort,
         max_sleep_seconds: float = _TOOL_DEFAULTS.max_sleep_seconds,
         provider: ClockProvider | None = None,
+        *,
+        protected_operations: ProtectedOperationSDK,
     ):
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.protected_operations = protected_operations
         self.max_sleep_seconds = max_sleep_seconds
         self.provider = provider or LocalClockProvider()
 
@@ -173,12 +176,7 @@ class ClockPrimitive:
             )
 
     def _protected(self):
-        sdk = getattr(self, "protected_operations", None) or getattr(
-            self.audit.store, "protected_operation_sdk", None
-        )
-        if sdk is None:
-            raise ValidationError("ClockPrimitive requires ProtectedOperationSDK")
-        return sdk
+        return self.protected_operations
 
     def _evidence(
         self,

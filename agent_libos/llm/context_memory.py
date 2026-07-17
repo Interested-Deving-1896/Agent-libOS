@@ -4,11 +4,12 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
+from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.memory.object_memory import ObjectVersionConflict
-from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
+from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
     AgentImage,
@@ -33,6 +34,11 @@ from agent_libos.memory.data_labels import (
     metadata_from_labels,
     propagate_object_labels,
 )
+from agent_libos.ports import OperationPort, ResourcePort
+from agent_libos.storage import EvidenceRepository, ObjectRepository, ProcessRepository
+
+if TYPE_CHECKING:
+    from agent_libos.memory.object_memory import ObjectMemoryManager
 
 _LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
 LLM_CONTEXT_POLICY = _LLM_CONTEXT_DEFAULTS.policy
@@ -42,11 +48,29 @@ LLM_CONTEXT_SCHEMA_VERSION = _LLM_CONTEXT_DEFAULTS.schema_version
 class LLMContextMemory:
     """Maintains the prompt context as a mutable, append-only Object Memory object."""
 
-    def __init__(self, runtime: Any):
-        self.runtime = runtime
+    def __init__(
+        self,
+        processes: ProcessRepository,
+        objects: ObjectRepository,
+        evidence: EvidenceRepository,
+        memory: "ObjectMemoryManager",
+        capabilities: CapabilityManager,
+        operations: OperationPort,
+        resources: ResourcePort | None,
+        *,
+        config: AgentLibOSConfig | None = None,
+    ) -> None:
+        self._processes = processes
+        self._objects = objects
+        self._evidence = evidence
+        self._memory = memory
+        self._capabilities = capabilities
+        self._operations = operations
+        self._resources = resources
+        self._config = config or DEFAULT_CONFIG
 
     def object_name(self, pid: str) -> str:
-        return context_object_name(pid, config=self.runtime.config)
+        return context_object_name(pid, config=self._config)
 
     def prepare(
         self,
@@ -59,7 +83,7 @@ class LLMContextMemory:
         tools: list[dict[str, Any]],
     ) -> MaterializedContext:
         handle = self.ensure(pid, image, process, tools)
-        obj = self.runtime.memory.get_object(pid, handle)
+        obj = self._memory.get_object(pid, handle)
         payload = self._payload(obj)
         changed = self._append_deltas(
             payload=payload,
@@ -87,13 +111,13 @@ class LLMContextMemory:
             changed = True
         if changed:
             metadata.token_estimate = estimate_tokens(payload)
-            self.runtime.memory.update_object(
+            self._memory.update_object(
                 pid,
                 handle,
                 ObjectPatch(payload=payload, metadata=metadata),
                 _trusted_label_propagation=True,
             )
-            obj = self.runtime.memory.get_object(pid, handle)
+            obj = self._memory.get_object(pid, handle)
         rendered = self.render(obj.payload)
         token_count = estimate_tokens(rendered)
         self._charge_rendered_context(pid, process, obj.oid, token_count)
@@ -122,7 +146,7 @@ class LLMContextMemory:
             budget_tokens=int(source_context.budget_tokens or process.resource_budget.max_context_materialization_tokens),
             rendered_tokens=token_count,
             rendered_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-            context_generation=self.runtime.store.get_llm_context_generation(pid),
+            context_generation=self._processes.get_llm_context_generation(pid),
             context_oid=obj.oid,
             context_version=obj.version,
             objects=object_manifest,
@@ -133,14 +157,14 @@ class LLMContextMemory:
             },
             created_at=utc_now(),
         )
-        self.runtime.store.insert_context_materialization_manifest(manifest)
-        self.runtime.operations.link_evidence(
+        self._evidence.insert_context_materialization_manifest(manifest)
+        self._operations.link_evidence(
             "context_manifest",
             manifest.materialization_id,
             "context",
             metadata={"rendered_tokens": token_count, "object_count": len(object_manifest)},
         )
-        self.runtime.operations.expect("context")
+        self._operations.expect("context")
         return MaterializedContext(
             text=rendered,
             object_refs=[obj.oid, *source_context.object_refs],
@@ -154,7 +178,7 @@ class LLMContextMemory:
         )
 
     def _charge_rendered_context(self, pid: str, process: AgentProcess, context_oid: str, token_count: int) -> None:
-        resources = getattr(self.runtime, "resources", None)
+        resources = self._resources
         if resources is None:
             return
         window_limit = resources.context_materialization_window_limit(pid)
@@ -178,8 +202,8 @@ class LLMContextMemory:
 
     def ensure(self, pid: str, image: AgentImage, process: AgentProcess, tools: list[dict[str, Any]]) -> ObjectHandle:
         name = self.object_name(pid)
-        namespace = self.runtime.memory.resolve_namespace(pid)
-        existing = self.runtime.store.get_object_by_name(name, namespace=namespace)
+        namespace = self._memory.resolve_namespace(pid)
+        existing = self._objects.get_object_by_name(name, namespace=namespace)
         rights = {
             ObjectRight.READ.value,
             ObjectRight.WRITE.value,
@@ -199,7 +223,7 @@ class LLMContextMemory:
                 metadata = propagate_object_labels(metadata, [durable_metadata])
                 payload["label_history"] = labels_for_explain(metadata)
                 metadata.token_estimate = estimate_tokens(payload)
-            handle = self.runtime.memory.create_object(
+            handle = self._memory.create_object(
                 pid=pid,
                 object_type=ObjectType.PROCESS_STATE,
                 payload=payload,
@@ -208,7 +232,7 @@ class LLMContextMemory:
                 name=name,
             )
         else:
-            handle = self.runtime.capability.handle_for_object(
+            handle = self._capabilities.handle_for_object(
                 pid,
                 existing.oid,
                 rights,
@@ -259,7 +283,7 @@ class LLMContextMemory:
         source_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically replace LLM context entries with a validated compact summary."""
-        obj = self.runtime.store.get_object(context_oid)
+        obj = self._objects.get_object(context_oid)
         if obj is None and source_payload is None:
             raise ValidationError(f"LLM context object not found: {context_oid}")
         if obj is not None and obj.version != expected_version:
@@ -268,9 +292,9 @@ class LLMContextMemory:
                 f"expected version {expected_version}, found {obj.version}"
             )
         if obj is None:
-            current = self.runtime.store.get_object_by_name(
+            current = self._objects.get_object_by_name(
                 self.object_name(pid),
-                namespace=self.runtime.memory.resolve_namespace(pid),
+                namespace=self._memory.resolve_namespace(pid),
             )
             if current is not None:
                 raise ValidationError(
@@ -296,7 +320,7 @@ class LLMContextMemory:
         # context payload state. If the replacement is interrupted, the next
         # Responses request resets stateless rather than continuing against a
         # context generation whose exact contents are uncertain.
-        self.runtime.store.set_llm_context_generation(
+        self._processes.set_llm_context_generation(
             pid,
             str(compacted_payload["cache_strategy"]["compacted_at"]),
         )
@@ -338,7 +362,7 @@ class LLMContextMemory:
         compacted_payload["label_history"] = labels_for_explain(metadata)
         metadata.token_estimate = estimate_tokens(compacted_payload)
         if obj is None:
-            handle = self.runtime.memory.create_object(
+            handle = self._memory.create_object(
                 pid=pid,
                 object_type=ObjectType.PROCESS_STATE,
                 payload=compacted_payload,
@@ -346,9 +370,9 @@ class LLMContextMemory:
                 immutable=False,
                 name=self.object_name(pid),
             )
-            updated_obj = self.runtime.memory.get_object(pid, handle)
+            updated_obj = self._memory.get_object(pid, handle)
         else:
-            handle = self.runtime.memory.handle_for_oid(
+            handle = self._memory.handle_for_oid(
                 pid,
                 context_oid,
                 required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
@@ -356,7 +380,7 @@ class LLMContextMemory:
                 issued_by="llm.context.compact",
             )
             try:
-                updated = self.runtime.memory.update_object(
+                updated = self._memory.update_object(
                     pid,
                     handle,
                     ObjectPatch(payload=compacted_payload, metadata=metadata),
@@ -368,8 +392,8 @@ class LLMContextMemory:
                     "LLM context changed during compaction: "
                     f"expected version {exc.expected_version}, found {exc.actual_version}"
                 ) from exc
-            updated_obj = self.runtime.memory.get_object(pid, updated)
-        view_handle = self.runtime.capability.handle_for_object(
+            updated_obj = self._memory.get_object(pid, updated)
+        view_handle = self._capabilities.handle_for_object(
             pid,
             updated_obj.oid,
             {
@@ -660,7 +684,7 @@ class LLMContextMemory:
         return sources
 
     def _durable_context_label_metadata(self, pid: str) -> ObjectMetadata | None:
-        labels = self.runtime.store.get_llm_context_label_history(pid)
+        labels = self._processes.get_llm_context_label_history(pid)
         return metadata_from_labels(labels)
 
     def _persist_context_label_history(
@@ -668,7 +692,7 @@ class LLMContextMemory:
         pid: str,
         metadata: ObjectMetadata,
     ) -> ObjectMetadata:
-        labels = self.runtime.store.merge_llm_context_label_history(
+        labels = self._processes.merge_llm_context_label_history(
             pid,
             DataLabels.from_object_metadata(metadata),
         )
@@ -693,7 +717,7 @@ class LLMContextMemory:
             sources.append(labels)
 
         for oid in dict.fromkeys(source_context.object_refs):
-            obj = self.runtime.store.get_object(oid)
+            obj = self._objects.get_object(oid)
             if obj is not None:
                 # Also merge the live label in case classification increased
                 # after materialization but before provider dispatch.
@@ -705,7 +729,7 @@ class LLMContextMemory:
         return sources
 
     def _object_entry(self, oid: str) -> dict[str, Any]:
-        obj = self.runtime.store.get_object(oid)
+        obj = self._objects.get_object(oid)
         if obj is None:
             return {"oid": oid, "missing": True}
         return {
@@ -719,7 +743,7 @@ class LLMContextMemory:
         }
 
     def _object_signature(self, oid: str) -> dict[str, Any]:
-        obj = self.runtime.store.get_object(oid)
+        obj = self._objects.get_object(oid)
         if obj is None:
             return {"missing": True}
         return {"version": obj.version, "updated_at": obj.updated_at}
@@ -733,16 +757,16 @@ class LLMContextMemory:
         return payload
 
     def _context_oid(self, pid: str) -> str | None:
-        obj = self.runtime.store.get_object_by_name(
+        obj = self._objects.get_object_by_name(
             self.object_name(pid),
-            namespace=self.runtime.memory.resolve_namespace(pid),
+            namespace=self._memory.resolve_namespace(pid),
         )
         return obj.oid if obj is not None else None
 
     def _add_handle_to_view(self, pid: str, handle: ObjectHandle) -> None:
-        process = self.runtime.process.get(pid)
+        process = self._require_process(pid)
         if process.memory_view is None:
-            process.memory_view = self.runtime.memory.create_view(pid, [handle], mode=ViewMode.MUTABLE)
+            process.memory_view = self._memory.create_view(pid, [handle], mode=ViewMode.MUTABLE)
         elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
             process.memory_view.roots.insert(0, handle)
         else:
@@ -751,7 +775,17 @@ class LLMContextMemory:
                 for existing in process.memory_view.roots
             ]
         process.updated_at = utc_now()
-        self.runtime.store.update_process(process)
+        self._processes.patch_process(
+            pid,
+            {"memory_view": process.memory_view, "updated_at": process.updated_at},
+            expected_revision=process.revision,
+        )
+
+    def _require_process(self, pid: str) -> AgentProcess:
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        return process
 
 
 def context_object_name(

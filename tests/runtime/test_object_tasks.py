@@ -72,12 +72,111 @@ class SlowSyncSideEffectTool(SyncAgentTool[EmptyArgs]):
     args_schema = EmptyArgs
     policy = ToolPolicy(side_effects=True, idempotent=False)
 
+    def __init__(self, release: threading.Event | None = None) -> None:
+        self.release = release
+        self.started = threading.Event()
+        self.finished = threading.Event()
+
     def run(self, args: EmptyArgs, ctx: ToolContext) -> dict[str, object]:
-        time.sleep(0.2)
-        return {"ok": True}
+        self.started.set()
+        try:
+            if self.release is None:
+                time.sleep(0.2)
+            else:
+                assert self.release.wait(timeout=2.0)
+            return {"ok": True}
+        finally:
+            self.finished.set()
 
 
 class TestObjectTasks:
+    def test_success_publication_failure_rolls_back_before_marking_task_failed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="atomic object task terminal publication",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            original_emit = runtime.events.emit
+
+            def fail_completed_event(event_type: EventType | str, *args: object, **kwargs: object):
+                if EventType(event_type) == EventType.OBJECT_TASK_COMPLETED:
+                    raise RuntimeError("injected completion event failure")
+                return original_emit(event_type, *args, **kwargs)
+
+            monkeypatch.setattr(runtime.events, "emit", fail_completed_event)
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert completed.status == ObjectTaskStatus.FAILED
+            assert completed.result_oid is None
+            assert completed.notification.status == ObjectTaskNotificationStatus.DELIVERED
+            assert "injected completion event failure" in str(completed.error)
+            assert not any(
+                event.type == EventType.OBJECT_TASK_COMPLETED
+                and event.payload.get("task_id") == task.task_id
+                for event in runtime.events.list()
+            )
+            assert any(
+                event.type == EventType.OBJECT_TASK_FAILED
+                and event.payload.get("task_id") == task.task_id
+                for event in runtime.events.list()
+            )
+            assert not any(
+                record.action == "object_task.completed"
+                and record.target == f"object_task:{task.task_id}"
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_transient_terminal_notification_failure_is_retried_idempotently(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="retry object task notification",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            notifications = runtime.object_tasks._notifications
+            original_notify = notifications.notify
+            attempts = 0
+
+            def fail_once(task: ObjectTask, *, phase: str) -> ObjectTask:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1 and phase == "completed":
+                    raise RuntimeError("injected transient notification failure")
+                return original_notify(task, phase=phase)
+
+            monkeypatch.setattr(notifications, "notify", fail_once)
+            task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.notification.status == ObjectTaskNotificationStatus.DELIVERED
+            assert attempts == 2
+            assert len(
+                [
+                    message
+                    for message in runtime.messages.list(pid)
+                    if message.correlation_id == task.task_id
+                ]
+            ) == 1
+        finally:
+            runtime.close()
+
     def test_runtime_reopen_marks_terminal_result_unavailable_when_payload_was_runtime_only(
         self,
         tmp_path: Path,
@@ -1337,7 +1436,8 @@ class TestObjectTasks:
             _grant_process_spawn(runtime, pid)
             _grant_delegable_clock_sleep(runtime, pid)
             owner = _owner(runtime, pid)
-            original_set_runner_status = runtime.object_tasks._set_runner_status
+            state = runtime.object_tasks._state
+            original_set_runner_status = state.set_runner_status
 
             def delayed_set_runner_status(
                 runner_pid: str,
@@ -1348,7 +1448,7 @@ class TestObjectTasks:
                 assert release_transition.wait(timeout=2)
                 original_set_runner_status(runner_pid, status, message)
 
-            monkeypatch.setattr(runtime.object_tasks, "_set_runner_status", delayed_set_runner_status)
+            monkeypatch.setattr(state, "set_runner_status", delayed_set_runner_status)
             task = runtime.object_tasks.start(
                 pid,
                 owner,
@@ -1482,8 +1582,10 @@ class TestObjectTasks:
             object_tasks=replace(DEFAULT_CONFIG.object_tasks, shutdown_join_timeout_s=0.01),
         )
         runtime = Runtime.open("local", config=config)
+        release = threading.Event()
+        slow_tool = SlowSyncSideEffectTool(release)
         try:
-            handle = runtime.tools.register_tool(SlowSyncSideEffectTool(), registered_by="test", ephemeral=True)
+            handle = runtime.tools.register_tool(slow_tool, registered_by="test", ephemeral=True)
             pid = runtime.process.spawn(image="base-agent:v0", goal="shutdown slow object task")
             _grant_process_spawn(runtime, pid)
             runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
@@ -1494,6 +1596,7 @@ class TestObjectTasks:
                 if time.monotonic() >= deadline:
                     pytest.fail("object task did not enter running state")
                 time.sleep(0.01)
+            assert slow_tool.started.wait(timeout=1.0)
 
             result = runtime.shutdown(actor="test", reason="object-task-slow-drain")
 
@@ -1501,10 +1604,12 @@ class TestObjectTasks:
             assert result["object_tasks_stopped"] is False
             assert runtime.store.get_object_task(task.task_id) is not None
 
-            time.sleep(0.3)
+            release.set()
+            assert slow_tool.finished.wait(timeout=2.0)
             retry = runtime.shutdown(actor="test", reason="object-task-slow-drain-retry")
             assert retry["ok"] is True
         finally:
+            release.set()
             runtime.close()
 
     def test_object_task_per_object_concurrency_limit_is_enforced(self) -> None:

@@ -8,7 +8,7 @@ import subprocess
 import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from agent_libos.capability.manager import CapabilityManager
@@ -27,8 +27,7 @@ from agent_libos.models import (
     SandboxProfile,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ResourceLimitExceeded, ValidationError
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
+from agent_libos.ports import AuditPort, EventPort
 from agent_libos.substrate import (
     CommandMetrics,
     CommandResult,
@@ -45,6 +44,7 @@ from agent_libos.substrate import (
 from agent_libos.sdk import (
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
+    ProtectedOperationSDK,
     ProviderPhase,
     ResourceSettlement,
 )
@@ -79,6 +79,127 @@ class ShellPolicyDecision:
     authority_decision: CapabilityDecision | None = None
 
 
+class ShellExecutionPolicy(Protocol):
+    """Shared launch-policy contract implemented by ``ShellAdapter``.
+
+    Interactive and one-shot process adapters need the same argv validation,
+    authority, data-flow Sink, and provider-identity rules.  The protocol keeps
+    Runtime Modules on a narrow public surface without adding a forwarding
+    object or exposing ``ShellAdapter`` private implementation details.
+    """
+
+    def validate_argv(self, argv: list[str]) -> list[str]:
+        ...
+
+    def resource_for(self, argv: list[str]) -> str:
+        ...
+
+    def enforce_workspace_argv_scope(self, argv: list[str], *, cwd: str) -> None:
+        ...
+
+    def authorize_operation(
+        self,
+        pid: str,
+        argv: list[str],
+        resource: str,
+        *,
+        timeout: float,
+        cwd: str,
+        adapter: str,
+        primitive: str,
+        operation: str,
+        authority_operation: str,
+        include_timeout_in_authority: bool,
+        continuous_session: bool = False,
+        extra_context: dict[str, Any] | None = None,
+    ) -> ShellPolicyDecision:
+        ...
+
+    def executable_data_sink(
+        self,
+        namespace: str,
+        argv0: str,
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> DataSink:
+        ...
+
+    def subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+        ...
+
+    def operation_context(
+        self,
+        pid: str,
+        argv: list[str],
+        resource: str,
+        *,
+        timeout: float,
+        cwd: str,
+        profile: SandboxProfile,
+        adapter: str = "shell",
+        primitive: str = "runtime.shell.run",
+        operation: str = "shell.run",
+        authority_operation: str = "shell.run",
+        include_timeout: bool = True,
+        continuous_session: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        ...
+
+    def resolve_provider_argv(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | os.PathLike[str] | None,
+        provider: Any | None = None,
+    ) -> list[str]:
+        ...
+
+    def require_provider_executable_identity(
+        self,
+        argv0: str,
+        *,
+        expected: str,
+        cwd: str | os.PathLike[str] | None,
+    ) -> None:
+        ...
+
+    def snapshot_executable_for_dispatch(
+        self,
+        *,
+        pid: str,
+        provider: Any,
+        requested_argv0: str,
+        provider_argv0: str,
+        cwd: str | os.PathLike[str] | None,
+        expected_sink: DataSink,
+        expected_executable_identity: str,
+        flow_context: Any,
+        data_flow_payload: Any,
+    ) -> ExecutableSnapshot | None:
+        ...
+
+    def profile_json(
+        self,
+        profile: SandboxProfile | None,
+    ) -> dict[str, Any] | None:
+        ...
+
+    def approval_constraints(
+        self,
+        argv: list[str],
+        decision: ShellPolicyDecision,
+        *,
+        timeout: float,
+        cwd: str,
+        operation: str = "shell.run",
+        include_timeout: bool = True,
+        extra_conditions: dict[str, Any] | None = None,
+        description: str = "one-shot human approval for exact shell argv",
+    ) -> dict[str, Any]:
+        ...
+
+
 class ShellAdapter:
     """Capability-checked shell primitive.
 
@@ -90,8 +211,10 @@ class ShellAdapter:
     def __init__(
         self,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus | None = None,
+        audit: AuditPort,
+        events: EventPort | None = None,
+        *,
+        protected_operations: ProtectedOperationSDK,
         cwd: str | os.PathLike[str] | None = None,
         human: Any | None = None,
         provider: ShellProvider | None = None,
@@ -102,6 +225,7 @@ class ShellAdapter:
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.protected_operations = protected_operations
         self.human = human
         self.resources = resources
         self.provider = provider or LocalShellProvider(cwd or ".")
@@ -118,16 +242,16 @@ class ShellAdapter:
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> CommandResult:
-        checked = self._validate_argv(argv)
+        checked = self.validate_argv(argv)
         selected_timeout = self._validate_timeout(timeout)
         resource = self.resource_for(checked)
         selected_cwd = os.fspath(cwd) if cwd is not None else "."
-        self._enforce_workspace_argv_scope(checked, cwd=selected_cwd)
+        self.enforce_workspace_argv_scope(checked, cwd=selected_cwd)
         decision = self._authorize(pid, checked, resource, timeout=selected_timeout, cwd=selected_cwd)
         if not decision.allowed and not decision.ask_human:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
         dispatch_argv = self._harden_read_only_git_argv(checked)
-        sink = self._executable_data_sink("shell", dispatch_argv[0], cwd=cwd)
+        sink = self.executable_data_sink("shell", dispatch_argv[0], cwd=cwd)
         executable_identity = sink.identity.split(":", 1)[1]
         flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
         data_flow_payload = {
@@ -165,9 +289,9 @@ class ShellAdapter:
             "risk": decision.risk.value,
             "rule_id": decision.rule_id,
             "rule_effect": decision.rule_effect.value,
-            "sandbox_profile": self._profile_json(decision.sandbox_profile),
+            "sandbox_profile": self.profile_json(decision.sandbox_profile),
         }
-        limits = self._subprocess_limits(pid)
+        limits = self.subprocess_limits(pid)
         provider_kwargs = self._provider_run_kwargs(timeout=selected_timeout, cwd=cwd, limits=limits)
         intent_record = self._record_run_intent(
             pid,
@@ -200,14 +324,14 @@ class ShellAdapter:
             return (authority,)
 
         def revalidate_shell_sink() -> DataSink:
-            return self._executable_data_sink("shell", provider_argv[0], cwd=cwd)
+            return self.executable_data_sink("shell", provider_argv[0], cwd=cwd)
 
         invocation = ProtectedOperationInvocation(
             pid=pid,
             actor=pid,
             target=resource,
             decisions=(capability_decision,),
-            canonical_args=self._operation_context(
+            canonical_args=self.operation_context(
                 pid,
                 checked,
                 resource,
@@ -253,17 +377,17 @@ class ShellAdapter:
             if callable(resolver):
                 provider_argv = operation.call(
                     ProviderPhase("resolve_argv", information_flow=True),
-                    self._resolve_provider_argv,
+                    self.resolve_provider_argv,
                     dispatch_argv,
                     cwd=cwd,
                 )
-            self._require_provider_executable_identity(
+            self.require_provider_executable_identity(
                 provider_argv[0],
                 expected=executable_identity,
                 cwd=cwd,
             )
             effect_context["provider_argv"] = list(provider_argv)
-            executable_snapshot = self._snapshot_executable_for_dispatch(
+            executable_snapshot = self.snapshot_executable_for_dispatch(
                 pid=pid,
                 provider=self.provider,
                 requested_argv0=dispatch_argv[0],
@@ -337,7 +461,7 @@ class ShellAdapter:
                     "high_risk": decision.high_risk,
                     "risk": decision.risk.value,
                     "rule_id": decision.rule_id,
-                    "sandbox_profile": self._profile_json(decision.sandbox_profile),
+                    "sandbox_profile": self.profile_json(decision.sandbox_profile),
                     "cwd": os.fspath(cwd) if cwd is not None else None,
                     "metrics": self._metrics_json(proc.metrics),
                     "stdout_truncated": proc.stdout_truncated,
@@ -388,12 +512,7 @@ class ShellAdapter:
         return hardened
 
     def _protected(self):
-        sdk = getattr(self, "protected_operations", None) or getattr(
-            self.audit.store, "protected_operation_sdk", None
-        )
-        if sdk is None:
-            raise ValidationError("ShellAdapter requires ProtectedOperationSDK")
-        return sdk
+        return self.protected_operations
 
     def _data_flow(self) -> Any:
         manager = getattr(self, "data_flow", None) or getattr(
@@ -405,7 +524,7 @@ class ShellAdapter:
             raise ValidationError("shell data-flow manager is not attached")
         return manager
 
-    def _resolve_provider_argv(
+    def resolve_provider_argv(
         self,
         argv: list[str],
         *,
@@ -465,7 +584,7 @@ class ShellAdapter:
                 selected = selected_cwd / argv0
         return Path(selected).resolve(strict=False).as_posix()
 
-    def _executable_data_sink(
+    def executable_data_sink(
         self,
         namespace: str,
         argv0: str,
@@ -499,7 +618,7 @@ class ShellAdapter:
             entries.append(str(resolved))
         return os.pathsep.join(entries)
 
-    def _require_provider_executable_identity(
+    def require_provider_executable_identity(
         self,
         argv0: str,
         *,
@@ -513,7 +632,7 @@ class ShellAdapter:
                 f"expected {expected}, found {actual}"
             )
 
-    def _snapshot_executable_for_dispatch(
+    def snapshot_executable_for_dispatch(
         self,
         *,
         pid: str,
@@ -652,7 +771,7 @@ class ShellAdapter:
         return f"shell:{command}"
 
     def _authorize(self, pid: str, argv: list[str], resource: str, *, timeout: float, cwd: str) -> ShellPolicyDecision:
-        return self._authorize_operation(
+        return self.authorize_operation(
             pid,
             argv,
             resource,
@@ -665,7 +784,7 @@ class ShellAdapter:
             include_timeout_in_authority=True,
         )
 
-    def _authorize_operation(
+    def authorize_operation(
         self,
         pid: str,
         argv: list[str],
@@ -707,7 +826,7 @@ class ShellAdapter:
                 rule_id=rule.rule_id,
                 restrictions=restrictions,
             )
-        operation_context = self._operation_context(
+        operation_context = self.operation_context(
             pid,
             argv,
             resource,
@@ -912,7 +1031,7 @@ class ShellAdapter:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for shell execute on {resource}")
         selected_cwd = os.fspath(cwd) if cwd is not None else "."
-        approval_context = self._operation_context(
+        approval_context = self.operation_context(
             pid,
             argv,
             resource,
@@ -941,7 +1060,7 @@ class ShellAdapter:
                     "subject": pid,
                     "resource": resource,
                     "rights": [CapabilityRight.EXECUTE.value],
-                    "constraints": self._approval_constraints(argv, decision, timeout=timeout, cwd=os.fspath(cwd) if cwd is not None else "."),
+                    "constraints": self.approval_constraints(argv, decision, timeout=timeout, cwd=os.fspath(cwd) if cwd is not None else "."),
                 },
                 "context": approval_context,
             },
@@ -976,7 +1095,7 @@ class ShellAdapter:
                 "high_risk": decision.high_risk,
                 "risk": decision.risk.value,
                 "rule_id": decision.rule_id,
-                "sandbox_profile": self._profile_json(decision.sandbox_profile),
+                "sandbox_profile": self.profile_json(decision.sandbox_profile),
                 "cwd": os.fspath(cwd) if cwd is not None else None,
             },
         )
@@ -1042,7 +1161,7 @@ class ShellAdapter:
     def _is_high_risk(self, risk: AuthorityRisk) -> bool:
         return risk in {AuthorityRisk.HIGH, AuthorityRisk.DESTRUCTIVE}
 
-    def _profile_json(self, profile: SandboxProfile | None) -> dict[str, Any] | None:
+    def profile_json(self, profile: SandboxProfile | None) -> dict[str, Any] | None:
         if profile is None:
             return None
         return {
@@ -1054,7 +1173,7 @@ class ShellAdapter:
             "restrictions": profile.restrictions,
         }
 
-    def _operation_context(
+    def operation_context(
         self,
         pid: str,
         argv: list[str],
@@ -1072,7 +1191,7 @@ class ShellAdapter:
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         argv_json = "\0".join(argv)
-        profile_json = self._profile_json(profile)
+        profile_json = self.profile_json(profile)
         context = {
             "adapter": adapter,
             "primitive": primitive,
@@ -1100,7 +1219,7 @@ class ShellAdapter:
             context.update(extra)
         return context
 
-    def _approval_constraints(
+    def approval_constraints(
         self,
         argv: list[str],
         decision: ShellPolicyDecision,
@@ -1270,7 +1389,7 @@ class ShellAdapter:
                 return False
         return True
 
-    def _validate_argv(self, argv: list[str]) -> list[str]:
+    def validate_argv(self, argv: list[str]) -> list[str]:
         if not isinstance(argv, list) or not argv:
             raise ValidationError("shell argv must be a non-empty list")
         checked: list[str] = []
@@ -1346,7 +1465,7 @@ class ShellAdapter:
                 raise ValidationError("shell provider must accept SubprocessLimits when resource limits are configured")
             raise ValidationError(f"shell provider must accept execution control parameters: {missing}")
 
-    def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+    def subprocess_limits(self, pid: str) -> SubprocessLimits | None:
         if self.resources is None:
             return None
         wall = self.resources.remaining_cumulative(
@@ -1433,7 +1552,7 @@ class ShellAdapter:
     def _argv0_has_path(self, value: str) -> bool:
         return "/" in value or "\\" in value or PurePath(value).is_absolute()
 
-    def _enforce_workspace_argv_scope(self, argv: list[str], *, cwd: str) -> None:
+    def enforce_workspace_argv_scope(self, argv: list[str], *, cwd: str) -> None:
         root = self._provider_workspace_root()
         if root is None:
             return

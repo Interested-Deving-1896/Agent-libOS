@@ -3,20 +3,55 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Container
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any, Protocol
 
 from agent_libos.models import AgentImage
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.modules.schema import ModuleManifest
 from agent_libos.tools.base import BaseAgentTool
 
-if TYPE_CHECKING:
-    from agent_libos.runtime.syscalls import LibOSSyscallSession
-    from agent_libos.runtime.runtime import Runtime
+SyscallHandler = Callable[[Any, dict[str, Any]], Any]
+StartupHook = Callable[["ModuleHost"], Any]
+ProviderHook = Callable[["ModuleHost"], Any]
 
-SyscallHandler = Callable[["LibOSSyscallSession", dict[str, Any]], Any]
-StartupHook = Callable[["Runtime"], Any]
-ProviderHook = Callable[["Runtime"], Any]
+
+class ModuleHost(Protocol):
+    """Explicit host ports passed to provider and startup hooks."""
+
+    config: Any
+    workspace_root: Any
+    audit: Any
+    events: Any
+    shell: Any
+    resources: Any
+    data_flow: Any
+    operations: Any
+    memory: Any
+    process: Any
+    capability: Any
+    protected_operations: Any
+    store: Any
+    substrate: Any
+
+    def register_tool(self, tool: BaseAgentTool, *, ephemeral: bool = False) -> Any: ...
+
+    def register_image(self, image: AgentImage | dict[str, Any], *, source: str | None = None) -> Any: ...
+
+    def register_syscall(self, name: str, handler: SyscallHandler) -> Any: ...
+
+    def register_provider_hook(self, kind: str, hook: ProviderHook) -> None: ...
+
+    def bind_shutdown_finalizer(self, finalizer: Callable[[], Any]) -> None: ...
+
+    def bind_object_release_finalizer(self, finalizer: Callable[..., None]) -> None: ...
+
+    def add_handle_to_process_view(self, pid: str, handle: Any) -> None: ...
+
+    def get_runtime_attribute(self, name: str, default: Any = None) -> Any: ...
+
+    def set_runtime_attribute(self, name: str, value: Any) -> None: ...
+
+    def set_substrate_attribute(self, name: str, value: Any) -> None: ...
 
 
 @dataclass(frozen=True)

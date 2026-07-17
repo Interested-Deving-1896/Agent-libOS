@@ -17,6 +17,8 @@ from agent_libos.config import (
     load_config_file,
     load_config_from_cwd,
 )
+from agent_libos.tools.builtin.jsonrpc import ListJsonRpcEndpointsArgs, ListJsonRpcEndpointsTool
+from agent_libos.tools.builtin.mcp import ListMcpServersArgs, ListMcpServersTool
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
 from agent_libos.models import CapabilityRight, ProcessStatus
@@ -24,6 +26,24 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore, display_store_target, open_store, redact_store_target
 
 class TestConfigDefaults:
+
+    def test_default_profile_map_is_immutable(self) -> None:
+        with pytest.raises(TypeError, match="immutable"):
+            DEFAULT_CONFIG.llm.profiles["mutated"] = LLMProfile()
+
+        assert "mutated" not in AgentLibOSConfig().llm.profiles
+
+    def test_remote_registry_tool_schema_uses_runtime_list_limits(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            jsonrpc=replace(DEFAULT_CONFIG.jsonrpc, list_limit=173),
+            mcp=replace(DEFAULT_CONFIG.mcp, list_limit=181),
+        )
+
+        assert ListJsonRpcEndpointsTool().spec(config=config).input_schema["properties"]["limit"]["maximum"] == 173
+        assert ListMcpServersTool().spec(config=config).input_schema["properties"]["limit"]["maximum"] == 181
+        assert ListJsonRpcEndpointsArgs.model_validate({"limit": 150}).limit == 150
+        assert ListMcpServersArgs.model_validate({"limit": 150}).limit == 150
 
     def test_shell_policy_labels_are_not_configurable_and_rules_require_an_executable(
         self,
@@ -105,6 +125,16 @@ class TestConfigDefaults:
         assert config.runtime.run_until_idle_max_quanta == 3
         assert config.tools.filesystem_read_max_bytes == 123
         assert config.scheduler.max_workers == 2
+
+    def test_checkpoint_snapshot_version_is_not_configurable(self, tmp_path: Path) -> None:
+        path = tmp_path / 'config.yaml'
+        path.write_text(
+            'checkpoint:\n  snapshot_version: 3\n',
+            encoding='utf-8',
+        )
+
+        with pytest.raises(PydanticValidationError, match='snapshot_version'):
+            load_config_file(path)
 
     def test_load_config_file_deep_merges_profile_maps(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
@@ -457,6 +487,10 @@ class TestConfigDefaults:
                     executable_snapshot_sibling_limit=0,
                 )
             )
+
+    def test_config_rejects_unknown_image_grant_mode(self) -> None:
+        with pytest.raises(PydanticValidationError, match="launch_authority_mode"):
+            RuntimeDefaults(launch_authority_mode="image_grants")
 
     def test_sqlite_store_llm_call_limits_use_runtime_config(self) -> None:
         config = AgentLibOSConfig(llm=LLMDefaults(call_record_list_limit=1, call_record_hard_limit=2))

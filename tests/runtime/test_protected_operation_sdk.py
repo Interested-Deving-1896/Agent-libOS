@@ -1233,6 +1233,7 @@ def test_sdk_recovers_prepared_reservation_without_provider_reconciliation(
     database = tmp_path / "prepared-recovery.sqlite"
     runtime = Runtime.open(database)
     operation = None
+    store_closed = False
     try:
         _pid, capability, contract, invocation = _setup(runtime)
         operation = runtime.protected_operations.start(
@@ -1253,7 +1254,7 @@ def test_sdk_recovers_prepared_reservation_without_provider_reconciliation(
         scope.__exit__(type(interrupted), interrupted, interrupted.__traceback__)
         operation._operation_cm = None
         runtime.store.close()
-        runtime._closed = True
+        store_closed = True
 
         reopened = Runtime.open(database)
         try:
@@ -1270,13 +1271,14 @@ def test_sdk_recovers_prepared_reservation_without_provider_reconciliation(
         finally:
             reopened.close()
     finally:
-        if not runtime._closed:
+        if not store_closed:
             runtime.close()
 
 
 def test_sdk_recovery_restores_prepared_human_output_claim(tmp_path: Path) -> None:
     database = tmp_path / "prepared-human.sqlite"
     runtime = Runtime.open(database)
+    store_closed = False
     try:
         pid = runtime.process.spawn(goal="prepared human recovery")
         now = utc_now()
@@ -1333,7 +1335,7 @@ def test_sdk_recovery_restores_prepared_human_output_claim(tmp_path: Path) -> No
         scope.__exit__(type(interrupted), interrupted, interrupted.__traceback__)
         operation._operation_cm = None
         runtime.store.close()
-        runtime._closed = True
+        store_closed = True
 
         reopened = Runtime.open(database)
         try:
@@ -1349,5 +1351,5 @@ def test_sdk_recovery_restores_prepared_human_output_claim(tmp_path: Path) -> No
         finally:
             reopened.close()
     finally:
-        if not runtime._closed:
+        if not store_closed:
             runtime.close()

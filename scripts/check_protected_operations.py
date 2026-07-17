@@ -16,13 +16,17 @@ FORBIDDEN_EFFECT_LIFECYCLE = frozenset(
 )
 ALLOWED_LIFECYCLE_FILES = frozenset(
     {
-        Path("agent_libos/runtime/external_effects.py"),
+        Path("agent_libos/evidence/external_effects.py"),
+        Path("agent_libos/evidence/__init__.py"),
         Path("agent_libos/sdk/protected_operations.py"),
+        Path("agent_libos/storage/repositories.py"),
     }
 )
 SAFE_PROVIDER_CALLS = frozenset(
     {
         (Path("agent_libos/primitives/filesystem.py"), "resolve"),
+        (Path("agent_libos/human/delivery.py"), "read"),
+        (Path("agent_libos/human/delivery.py"), "write"),
     }
 )
 PROVIDER_HANDLE_METHODS = frozenset(
@@ -326,6 +330,57 @@ def _assigned_invocations(
     return assigned
 
 
+def _returned_invocation(
+    function: FunctionNode,
+    parents: dict[ast.AST, ast.AST],
+) -> ast.Call | None:
+    candidates = [
+        node.value
+        for node in ast.walk(function)
+        if isinstance(node, ast.Return)
+        and _nearest_owner(node, parents) is function
+        and isinstance(node.value, ast.Call)
+        and _attribute_path(node.value.func)[-1:] == (
+            "ProtectedOperationInvocation",
+        )
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _factory_invocation(
+    call: ast.Call,
+    owner: FunctionNode | None,
+    call_graph: _CallGraph,
+) -> ast.Call | None:
+    factory = call_graph.resolve(call.func, owner)
+    if factory is None:
+        return None
+    return _returned_invocation(factory, call_graph.parents)
+
+
+def _assigned_factory_invocations(
+    tree: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+    call_graph: _CallGraph,
+) -> dict[tuple[FunctionNode | None, str], ast.Call]:
+    assigned: dict[tuple[FunctionNode | None, str], ast.Call] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        owner = _nearest_owner(node, parents)
+        invocation = _factory_invocation(value, owner, call_graph)
+        if invocation is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assigned[(owner, target.id)] = invocation
+    return assigned
+
+
 def scan_source(path: Path, *, relative: Path) -> list[str]:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(relative))
@@ -338,6 +393,11 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
     }
     call_graph = _CallGraph(tree, parents)
     assigned_invocations = _assigned_invocations(tree, parents)
+    assigned_factory_invocations = _assigned_factory_invocations(
+        tree,
+        parents,
+        call_graph,
+    )
     assigned_contract_names = _assigned_contract_names(tree, parents)
     protected_functions = call_graph.protected_functions(tree)
     provider_handle_names = _provider_handle_names(tree, parents)
@@ -360,7 +420,10 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
             direct_provider_functions.add(owner)
     provider_reaching = call_graph.provider_reaching_functions(direct_provider_functions)
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "agent_libos.runtime.external_effects":
+        if isinstance(node, ast.ImportFrom) and node.module in {
+            "agent_libos.evidence.external_effects",
+            "agent_libos.runtime.external_effects",
+        }:
             for alias in node.names:
                 if alias.name in FORBIDDEN_EFFECT_LIFECYCLE and not lifecycle_allowed:
                     errors.append(
@@ -402,11 +465,22 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
                 if needs_egress or needs_ingress:
                     invocation_node: ast.Call | None = None
                     if len(node.args) >= 2 and isinstance(node.args[1], ast.Call):
-                        invocation_node = node.args[1]
+                        candidate = node.args[1]
+                        if _attribute_path(candidate.func)[-1:] == (
+                            "ProtectedOperationInvocation",
+                        ):
+                            invocation_node = candidate
+                        else:
+                            invocation_node = _factory_invocation(
+                                candidate,
+                                _nearest_owner(node, parents),
+                                call_graph,
+                            )
                     elif len(node.args) >= 2 and isinstance(node.args[1], ast.Name):
-                        invocation_node = assigned_invocations.get(
-                            (_nearest_owner(node, parents), node.args[1].id)
-                        )
+                        key = (_nearest_owner(node, parents), node.args[1].id)
+                        invocation_node = assigned_invocations.get(key)
+                        if invocation_node is None:
+                            invocation_node = assigned_factory_invocations.get(key)
                     if invocation_node is None:
                         errors.append(
                             f"{relative}:{node.lineno}: data-flow contract "

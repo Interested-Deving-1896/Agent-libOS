@@ -224,6 +224,7 @@ Run tests:
 uv run python scripts/test_matrix.py --lane unit
 uv run python scripts/test_matrix.py --lane security
 uv run python scripts/test_matrix.py --lane runtime
+uv run python scripts/check_architecture.py
 uv run python scripts/check_test_invariants.py
 ```
 
@@ -594,7 +595,9 @@ uv sync --frozen --all-groups
 npm --prefix gui install
 uv run python -m compileall agent_libos tests scripts experiments benchmarks
 uv run python scripts/test_matrix.py --lane all --workers 4
+uv run python scripts/check_architecture.py
 uv run python scripts/check_test_invariants.py
+uv run python scripts/check_protected_operations.py
 uv run python scripts/test_matrix.py --lane gui
 git diff --check
 ```

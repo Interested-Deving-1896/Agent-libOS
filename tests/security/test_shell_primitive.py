@@ -125,7 +125,7 @@ class TestShellPrimitive:
                     pattern='shell:*',
                     trust_level=SinkTrustLevel.TRUSTED,
                     max_sensitivity='secret',
-                    identity_sha256=runtime.shell._executable_data_sink(
+                    identity_sha256=runtime.shell.executable_data_sink(
                         'shell', 'git', cwd='.'
                     ).identity_sha256,
                 ),
@@ -179,7 +179,7 @@ class TestShellPrimitive:
                     pattern='shell:*',
                     trust_level=SinkTrustLevel.TRUSTED,
                     max_sensitivity='secret',
-                    identity_sha256=runtime.shell._executable_data_sink(
+                    identity_sha256=runtime.shell.executable_data_sink(
                         'shell', 'git', cwd='.'
                     ).identity_sha256,
                 ),

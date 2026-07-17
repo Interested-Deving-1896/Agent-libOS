@@ -7,12 +7,12 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import AgentRating
 from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.storage import RuntimeStore
+from agent_libos.storage import ProcessRepository
 from agent_libos.utils.ids import new_id, utc_now
 
 
 class AgentRatingManager:
-    def __init__(self, store: RuntimeStore, audit: AuditManager, *, config: AgentLibOSConfig | None = None):
+    def __init__(self, store: ProcessRepository, audit: AuditManager, *, config: AgentLibOSConfig | None = None):
         self.store = store
         self.audit = audit
         self.config = config or DEFAULT_CONFIG

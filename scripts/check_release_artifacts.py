@@ -166,7 +166,7 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             raise ValueError("wheel Requires-Python must remain >=3.11")
         entry_points = archive.read(entry_points_path).decode("utf-8")
         expected_entries = {
-            "agent-libos = agent_libos.api.cli:main",
+            "agent-libos = agent_libos.api.cli:cli",
             "agent-libos-gui-server = agent_libos.api.gui.server:main",
         }
         missing_entries = sorted(entry for entry in expected_entries if entry not in entry_points)

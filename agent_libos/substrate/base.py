@@ -745,6 +745,17 @@ class JsonRpcProvider(Protocol):
 
 
 class McpProvider(Protocol):
+    def validate_and_call(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
+    ) -> McpProviderCallResult: ...
+
     def list_tools(
         self,
         server: McpServerSpec,

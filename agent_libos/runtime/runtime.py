@@ -1,87 +1,77 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import contextlib
-import hashlib
-import inspect
 import os
-import re
-import shutil
-import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
-from agent_libos.capability.manager import CapabilityManager
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.primitives import ClockPrimitive, FilesystemAdapter, JsonRpcPrimitive, McpPrimitive, ShellAdapter
-from agent_libos.human.manager import HumanObjectManager
+from agent_libos.config import AgentLibOSConfig
 from agent_libos.llm.client import LLMClient
-from agent_libos.llm.executor import LLMProcessExecutor
-from agent_libos.llm.profiles import LLMProfileRegistry
-from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
-    DataFlowDirection,
     DataFlowContext,
     DataLabels,
-    EventType,
-    ExternalEffectRollbackClass,
-    ExternalEffectRollbackStatus,
     ForkMode,
     MemoryView,
     MemoryViewSpec,
     ObjectHandle,
     ObjectMetadata,
-    ObjectOwnerKind,
-    ProcessStatus,
-    ResourceUsage,
     SinkTrustRule,
     SinkTrustSpec,
-    ToolCandidate,
-    ToolCandidateStatus,
-    ToolHandle,
-    ToolSpec,
     ViewMode,
     WorkflowRunResult,
 )
 from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ValidationError
-from agent_libos.modules import RuntimeModuleRegistry
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.authority_manifest_manager import AuthorityManifestManager
-from agent_libos.runtime.checkpoint_manager import CheckpointManager
-from agent_libos.runtime.data_flow_manager import DataFlowManager
-from agent_libos.runtime.event_bus import EventBus
-from agent_libos.runtime.external_effects import reconcile_pending_external_effects
-from agent_libos.runtime.explain_manager import ExplainManager
-from agent_libos.runtime.image_registry import ImageRegistryPrimitive
-from agent_libos.runtime.message_manager import ProcessMessageManager
-from agent_libos.runtime.object_tasks import ObjectTaskManager
-from agent_libos.runtime.operation_manager import OperationManager
-from agent_libos.sdk import (
-    AuthorityMode,
-    PostProviderFailureMode,
-    ProtectedOperationContract,
-    ProtectedOperationSDK,
-    ResourcePolicy,
-)
-from agent_libos.runtime.process_manager import ProcessManager
-from agent_libos.runtime.ratings import AgentRatingManager
-from agent_libos.runtime.resource_manager import ResourceManager
-from agent_libos.runtime.scheduler import SimpleScheduler
-from agent_libos.runtime.syscall_router import SyscallRouter
-from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES
-from agent_libos.skills.manager import SkillManager
-from agent_libos.storage import RuntimeStore, open_store
-from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ResourceProviderSubstrate, SdkMcpProvider
-from agent_libos.tools.broker import ToolBroker
-from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.utils.serde import dumps, loads
+from agent_libos.storage import RuntimeStore
+from agent_libos.substrate import ResourceProviderSubstrate
+from agent_libos.utils.ids import utc_now
+
+if TYPE_CHECKING:
+    from agent_libos.capability.manager import CapabilityManager
+    from agent_libos.human.manager import HumanObjectManager
+    from agent_libos.llm.executor import LLMProcessExecutor
+    from agent_libos.llm.profiles import LLMProfileRegistry
+    from agent_libos.memory.object_memory import ObjectMemoryManager
+    from agent_libos.modules import RuntimeModuleRegistry
+    from agent_libos.modules.host import ModuleStateRegistry
+    from agent_libos.primitives import (
+        ClockPrimitive,
+        FilesystemAdapter,
+        JsonRpcPrimitive,
+        McpPrimitive,
+        ShellAdapter,
+    )
+    from agent_libos.runtime.audit_manager import AuditManager
+    from agent_libos.runtime.authority_manifest_manager import AuthorityManifestManager
+    from agent_libos.runtime.checkpoint_image import CheckpointImageInstaller
+    from agent_libos.runtime.checkpoint_manager import CheckpointManager
+    from agent_libos.runtime.data_flow_manager import DataFlowManager
+    from agent_libos.runtime.event_bus import EventBus
+    from agent_libos.runtime.explain_manager import ExplainManager
+    from agent_libos.runtime.image_artifact import ImageArtifactLoader
+    from agent_libos.runtime.image_boot import ImageBootService
+    from agent_libos.runtime.image_package import ImagePackageInstaller
+    from agent_libos.runtime.image_registry import ImageRegistryPrimitive
+    from agent_libos.runtime.lifecycle import RuntimeLifecycle
+    from agent_libos.runtime.message_manager import ProcessMessageManager
+    from agent_libos.runtime.object_tasks import ObjectTaskManager
+    from agent_libos.runtime.operation_manager import OperationManager
+    from agent_libos.runtime.process_launch import ProcessLaunchService
+    from agent_libos.runtime.process_manager import ProcessManager
+    from agent_libos.runtime.ratings import AgentRatingManager
+    from agent_libos.runtime.resource_manager import ResourceManager
+    from agent_libos.runtime.scheduler import SimpleScheduler
+    from agent_libos.runtime.snapshots import ProcessExecStateService
+    from agent_libos.runtime.syscall_router import SyscallRouter
+    from agent_libos.sdk import ProtectedOperationSDK
+    from agent_libos.skills.manager import SkillManager
+    from agent_libos.storage import UnitOfWork
+    from agent_libos.tools.broker import ToolBroker
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,13 +93,67 @@ _HUMAN_RUN_CONTEXT: ContextVar[HumanRunContext] = ContextVar(
 
 
 class Runtime:
-    """Composition root for Agent libOS.
+    """Public host facade over services assembled by :class:`RuntimeBuilder`.
 
-    Runtime wires storage, capability checks, primitives, providers, process
-    scheduling, ToolBroker, Skills, checkpoints, audit, and LLM execution. Host
-    effects should enter through primitives and provider interfaces, not through
-    model-facing tools.
+    Host effects enter through primitives and provider interfaces. Runtime keeps
+    the stable host API while subsystem services own their state machines.
     """
+
+    config: AgentLibOSConfig
+    substrate: ResourceProviderSubstrate
+    workspace_root: Path
+    store: RuntimeStore
+    instance_id: str
+    images: dict[str, AgentImage]
+    module_state: ModuleStateRegistry
+    _registry_lifecycle_lock: Any
+    uow: UnitOfWork
+    operations: OperationManager
+    audit: AuditManager
+    events: EventBus
+    lifecycle: RuntimeLifecycle
+    blocking_work: Any
+    capability: CapabilityManager
+    llms: LLMProfileRegistry
+    ratings: AgentRatingManager
+    resources: ResourceManager
+    syscalls: SyscallRouter
+    provider_hooks: dict[str, list[Any]]
+    authority_manifests: AuthorityManifestManager
+    explain: ExplainManager
+    memory: ObjectMemoryManager
+    data_flow: DataFlowManager
+    protected_operations: ProtectedOperationSDK
+    external_primitive_boundary_names: frozenset[str]
+    process: ProcessManager
+    messages: ProcessMessageManager
+    human: HumanObjectManager
+    clock: ClockPrimitive
+    filesystem: FilesystemAdapter
+    shell: ShellAdapter
+    jsonrpc: JsonRpcPrimitive
+    mcp: McpPrimitive
+    tools: ToolBroker
+    object_tasks: ObjectTaskManager
+    scheduler: SimpleScheduler
+    checkpoint: CheckpointManager
+    skills: SkillManager
+    process_exec_state: ProcessExecStateService
+    image_artifacts: ImageArtifactLoader
+    checkpoint_image_installer: CheckpointImageInstaller
+    image_package_installer: ImagePackageInstaller
+    image_registry: ImageRegistryPrimitive
+    launch: ProcessLaunchService
+    modules: RuntimeModuleRegistry
+    image_boot: ImageBootService
+    llm: LLMProcessExecutor
+    recovered_prepared_operations: list[str]
+    recovered_resource_usage_reservations: list[str]
+    recovered_exec_publications: list[str]
+    recovered_runtime_publications: list[str]
+    recovered_stale_executions: list[str]
+    reconciled_external_effects: list[Any]
+    explainable_boundary_names: frozenset[str]
 
     def __init__(
         self,
@@ -121,506 +165,17 @@ class Runtime:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ):
-        self.config = config or DEFAULT_CONFIG
-        self.substrate = substrate or LocalResourceProviderSubstrate(
-            Path.cwd().resolve(),
-            namespace=self.config.runtime.workspace_namespace,
-        )
-        self.workspace_root = Path(getattr(self.substrate, "workspace_root", self.substrate.workspace_display))
-        self.store = store
-        self.store.config = self.config
-        # Trusted module hooks can snapshot and roll back several runtime
-        # registries at once. All official registry lifecycle mutations share
-        # this re-entrant boundary so a failed rollback cannot clobber a
-        # concurrent successful publication.
-        self._registry_lifecycle_lock = threading.RLock()
-        self.operations = OperationManager(store)
-        self.store.operation_manager = self.operations
-        self.operations.interrupt_stale_running()
-        self.llms = LLMProfileRegistry(self, config=self.config)
-        self.audit = AuditManager(store)
-        self.events = EventBus(store)
-        self.audit.bind_operations(self.operations)
-        self.events.bind_operations(self.operations)
-        self.explain = ExplainManager(self)
-        self.ratings = AgentRatingManager(store, self.audit, config=self.config)
-        self.resources = ResourceManager(store, self.audit, self.events)
-        self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
-        self.provider_hooks: dict[str, list[Any]] = {}
-        self._shutdown_finalizers: list[Any] = []
-        self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
-        self.data_flow = DataFlowManager(
+        from agent_libos.runtime.builder import RuntimeBuilder
+
+        RuntimeBuilder.assemble_existing(
+            self,
             store,
-            self.capability,
-            self.audit,
-            self.events,
-            config=self.config,
-        )
-        self.protected_operations = ProtectedOperationSDK(
-            store=store,
-            capabilities=self.capability,
-            audit=self.audit,
-            events=self.events,
-            resources=self.resources,
-            operations=self.operations,
-            data_flow=self.data_flow,
-        )
-        self.store.protected_operation_sdk = self.protected_operations
-        self._register_protected_operation_contracts()
-        self.memory = ObjectMemoryManager(
-            store,
-            self.capability,
-            self.audit,
-            self.events,
-            config=self.config,
-            resources=self.resources,
-        )
-        self.human = HumanObjectManager(
-            store,
-            self.capability,
-            self.audit,
-            self.events,
-            provider=self.substrate.human,
-            config=self.config,
-        )
-        self.human.protected_operations = self.protected_operations
-        self.protected_operations.register_prepared_recovery(
-            "human_output_delivery",
-            self.human.recover_prepared_output,
-        )
-        self.messages = ProcessMessageManager(store, self.audit, self.events, config=self.config)
-        self.human.bind_messages(self.messages)
-        self.clock = ClockPrimitive(
-            self.capability,
-            self.audit,
-            self.events,
-            max_sleep_seconds=self.config.tools.max_sleep_seconds,
-            provider=self.substrate.clock,
-        )
-        self.clock.protected_operations = self.protected_operations
-        self.filesystem = FilesystemAdapter(
-            self.capability,
-            self.audit,
-            self.events,
-            human=self.human,
-            provider=self.substrate.filesystem,
-            resources=self.resources,
-            config=self.config,
-        )
-        self.filesystem.protected_operations = self.protected_operations
-        self.shell = ShellAdapter(
-            self.capability,
-            self.audit,
-            self.events,
-            cwd=self.workspace_root,
-            human=self.human,
-            provider=self.substrate.shell,
-            config=self.config,
-            resources=self.resources,
-        )
-        self.shell.protected_operations = self.protected_operations
-        self.jsonrpc = JsonRpcPrimitive(
-            store,
-            self.capability,
-            self.audit,
-            self.events,
-            human=self.human,
-            provider=getattr(self.substrate, "jsonrpc", HttpJsonRpcProvider()),
-            config=self.config,
-            resources=self.resources,
-        )
-        self.jsonrpc.protected_operations = self.protected_operations
-        self.mcp = McpPrimitive(
-            store,
-            self.capability,
-            self.audit,
-            self.events,
-            human=self.human,
-            provider=getattr(self.substrate, "mcp", SdkMcpProvider(self.workspace_root)),
-            config=self.config,
-            resources=self.resources,
-        )
-        self.mcp.protected_operations = self.protected_operations
-        self.images: dict[str, AgentImage] = {}
-        self.authority_manifests = AuthorityManifestManager(
-            store,
-            self.capability,
-            self.audit,
-            self.events,
-            config=self.config,
-        )
-        self.authority_manifests.bind_runtime(self)
-        self.store.authority_manifest_manager = self.authority_manifests
-        self.data_flow.bind_runtime(self)
-        self.data_flow.bootstrap_configured_rules()
-        self.tools = ToolBroker(
-            store,
-            self.memory,
-            self.capability,
-            self.human,
-            self.audit,
-            self.events,
-            workspace_root=self.workspace_root,
-            config=self.config,
-            resources=self.resources,
-        )
-        self.tools.runtime = self
-        self.process = ProcessManager(
-            store,
-            self.memory,
-            self.capability,
-            self.audit,
-            self.events,
-            config=self.config,
-            resources=self.resources,
-            llm_profile_resolver=self._resolve_launch_llm_profile_id,
-            authority_manifests=self.authority_manifests,
-            data_flow=self.data_flow,
-        )
-        self.messages.bind_process_manager(self.process)
-        self.resources.bind_process_kill_finalizer(self.process.finalize_killed_processes)
-        self.process.add_after_spawn_hook(self._configure_process_tools_and_capabilities)
-        self.object_tasks = ObjectTaskManager(self, config=self.config)
-        self.memory.bind_object_pin_checker(self.object_tasks.has_active_for_owner)
-        self.memory.bind_object_change_notifier(self.object_tasks.notify_owner_changed)
-        self.messages.bind_object_tasks(self.object_tasks)
-        self.process.bind_object_task_terminal_notifier(self._notify_process_terminal)
-        self.resources.bind_object_task_terminal_notifier(self._notify_process_terminal)
-        try:
-            self.reconciled_legacy_pending_actions = (
-                self._reconcile_legacy_pending_action_terminals()
-            )
-        except BaseException:
-            # ObjectTaskManager owns a live event-loop thread before durable
-            # terminal reconciliation can run. Constructor failure must unwind
-            # that component before Runtime.open closes the shared store.
-            with contextlib.suppress(Exception):
-                self.object_tasks.shutdown()
-            raise
-        self.scheduler = SimpleScheduler(
-            store,
-            self.audit,
-            poll_interval_s=self.config.scheduler.poll_interval_s,
-            max_workers=self.config.scheduler.max_workers,
-            drain_window_s=self.config.scheduler.drain_window_s,
-            shutdown_join_timeout_s=self.config.scheduler.shutdown_join_timeout_s,
-            resources=self.resources,
-            skip_pid=self.object_tasks.is_runner_pid,
-            cancel_process=self.process.cancel,
-        )
-        self.checkpoint = CheckpointManager(store, self.audit, self.events, self.capability, config=self.config)
-        self.checkpoint.bind_runtime(self)
-        self.skills = SkillManager(
-            store,
-            self.capability,
-            self.audit,
-            self.events,
-            human=self.human,
-            config=self.config,
-        )
-        self.skills.bind_runtime(self)
-        self.image_registry = ImageRegistryPrimitive(
-            self.images,
-            self.capability,
-            self.audit,
-            self.events,
-            self.tools.resolve,
-            store=self.store,
-            config=self.config,
-        )
-        self.image_registry.bind_runtime(self)
-        self.llm = LLMProcessExecutor(self, llm_client, config=self.config)
-        self.modules = RuntimeModuleRegistry(self, config=self.config)
-        self.modules.load_core_module()
-        self.modules.load_startup_modules(
-            startup_module_manifests,
+            llm_client=llm_client,
+            substrate=substrate,
+            config=config,
+            startup_module_manifests=startup_module_manifests,
             trusted_modules=trusted_modules,
-            trusted_sha256=trusted_module_sha256,
-        )
-        self.image_registry.load_persisted_images()
-        self._rehydrate_registered_jit_tools()
-        self.modules.run_startup_hooks()
-        self.recovered_prepared_operations = self.protected_operations.recover_prepared()
-        self.reconciled_external_effects = reconcile_pending_external_effects(self.store, self.substrate)
-        self._install_operation_boundaries()
-        self._closed = False
-        self._shutdown_reason: str | None = None
-
-    def _register_protected_operation_contracts(self) -> None:
-        def contract(
-            name: str,
-            provider: str,
-            operation: str,
-            *,
-            resource_policy: ResourcePolicy,
-            **kwargs: Any,
-        ) -> ProtectedOperationContract:
-            return ProtectedOperationContract(
-                name,
-                provider,
-                operation,
-                evidence_roles=("audit", "event", "effect"),
-                resource_policy=resource_policy,
-                **kwargs,
-            )
-
-        contracts = (
-            contract("primitive.filesystem.validate_directory", "filesystem", "state", resource_policy=ResourcePolicy.OPTIONAL, information_flow=True),
-            contract("primitive.filesystem.read_text", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
-            contract("primitive.filesystem.read_bytes", "filesystem", "read_bytes", resource_policy=ResourcePolicy.REQUIRED, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
-            contract(
-                "primitive.filesystem.write_text",
-                "filesystem",
-                "write_text",
-                resource_policy=ResourcePolicy.REQUIRED,
-                state_mutation=True,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.EGRESS,
-            ),
-            contract("primitive.filesystem.read_directory", "filesystem", "list_directory", resource_policy=ResourcePolicy.REQUIRED, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
-            contract("primitive.filesystem.write_directory", "filesystem", "make_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
-            contract("primitive.filesystem.delete_file", "filesystem", "delete_file", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
-            contract("primitive.filesystem.delete_directory", "filesystem", "delete_directory", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
-            contract("primitive.clock.now", "clock", "now", resource_policy=ResourcePolicy.NONE, information_flow=True),
-            contract("primitive.clock.sleep", "clock", "sleep", resource_policy=ResourcePolicy.NONE, information_flow=True),
-            contract(
-                "primitive.shell.run",
-                "shell",
-                "run",
-                resource_policy=ResourcePolicy.OPTIONAL,
-                state_mutation=True,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-            ),
-            contract(
-                "primitive.jsonrpc.call",
-                "jsonrpc",
-                "call",
-                resource_policy=ResourcePolicy.REQUIRED,
-                state_mutation=True,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-                classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
-                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
-                classifier_failure_label="post_call_failure",
-            ),
-            contract(
-                "primitive.mcp.list_tools",
-                "mcp",
-                "list_tools",
-                resource_policy=ResourcePolicy.OPTIONAL,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-                preflight_classifier=True,
-                classifier_failure_rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
-                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
-                classifier_failure_label="post_list_tools_failure",
-            ),
-            contract(
-                "primitive.mcp.list_tools.internal",
-                "mcp",
-                "list_tools",
-                resource_policy=ResourcePolicy.OPTIONAL,
-                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-                internal_reason="host registry refresh is an operator-controlled provider operation",
-                preflight_classifier=True,
-                classifier_failure_rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
-                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
-                classifier_failure_label="post_list_tools_failure",
-            ),
-            contract(
-                "primitive.mcp.call",
-                "mcp",
-                "call_tool",
-                resource_policy=ResourcePolicy.REQUIRED,
-                state_mutation=True,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-                preflight_classifier=True,
-                classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
-                classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
-                classifier_failure_label="post_call_failure",
-            ),
-            contract(
-                "primitive.llm.complete",
-                "llm",
-                "complete",
-                resource_policy=ResourcePolicy.NONE,
-                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
-                state_mutation=True,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-                require_classifier=False,
-                internal_reason=(
-                    "the scheduler owns model selection after process authority and context "
-                    "materialization; DataFlowManager independently gates the provider Sink"
-                ),
-            ),
-            contract(
-                "primitive.human.read",
-                "human",
-                "read",
-                resource_policy=ResourcePolicy.NONE,
-                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
-                post_provider_failure_mode=PostProviderFailureMode.PRESERVE_RESULT,
-                internal_reason="terminal queue already owns an authorized Human request",
-            ),
-            contract(
-                "primitive.human.write",
-                "human",
-                "write",
-                resource_policy=ResourcePolicy.NONE,
-                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
-                state_mutation=True,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.EGRESS,
-                post_provider_failure_mode=PostProviderFailureMode.PRESERVE_RESULT,
-                internal_reason="terminal queue already owns an authorized Human request",
-                prepared_recovery="human_output_delivery",
-            ),
-            contract("primitive.pty.spawn", "pty", "spawn", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.BIDIRECTIONAL),
-            contract("primitive.pty.read", "pty", "read", resource_policy=ResourcePolicy.NONE, state_mutation=False, information_flow=True, data_flow_direction=DataFlowDirection.INGRESS),
-            contract(
-                "primitive.pty.ingest",
-                "pty",
-                "ingest",
-                resource_policy=ResourcePolicy.NONE,
-                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
-                state_mutation=False,
-                information_flow=True,
-                data_flow_direction=DataFlowDirection.INGRESS,
-                internal_reason=(
-                    "runtime continuously drains an already-authorized PTY session so the "
-                    "child process cannot block on its output buffer"
-                ),
-            ),
-            contract("primitive.pty.write", "pty", "write", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
-            contract("primitive.pty.resize", "pty", "resize", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
-            contract("primitive.pty.close", "pty", "close", resource_policy=ResourcePolicy.NONE, state_mutation=True, information_flow=True, data_flow_direction=DataFlowDirection.EGRESS),
-            contract(
-                "primitive.pty.close.internal",
-                "pty",
-                "close",
-                resource_policy=ResourcePolicy.NONE,
-                authority_mode=AuthorityMode.RUNTIME_INTERNAL,
-                state_mutation=True,
-                information_flow=True,
-                internal_reason="runtime lifecycle finalizer owns the PTY session being closed",
-            ),
-        )
-        for contract in contracts:
-            self.protected_operations.register_contract(contract)
-        self.external_primitive_boundary_names = frozenset(
-            contract.name for contract in contracts
-        )
-
-    def _install_operation_boundaries(self) -> None:
-        """Attach explainable scopes to documented protected public boundaries."""
-
-        boundaries: list[tuple[Any, str, str, str, str, str, tuple[str, ...], bool]] = [
-            # Authorization and provider helpers dynamically add decision/effect expectations.
-            (self.filesystem, "read_text", "primitive", "primitive.filesystem.read_text", "pid", "pid", ("audit",), False),
-            (self.filesystem, "read_bytes", "primitive", "primitive.filesystem.read_bytes", "pid", "pid", ("audit",), False),
-            (self.filesystem, "write_text", "primitive", "primitive.filesystem.write_text", "pid", "pid", ("audit",), False),
-            (self.filesystem, "read_directory", "primitive", "primitive.filesystem.read_directory", "pid", "pid", ("audit",), False),
-            (self.filesystem, "write_directory", "primitive", "primitive.filesystem.write_directory", "pid", "pid", ("audit",), False),
-            (self.filesystem, "delete_file", "primitive", "primitive.filesystem.delete_file", "pid", "pid", ("audit",), False),
-            (self.filesystem, "delete_directory", "primitive", "primitive.filesystem.delete_directory", "pid", "pid", ("audit",), False),
-            (self.shell, "run", "primitive", "primitive.shell.run", "pid", "pid", ("audit",), False),
-            (self.jsonrpc, "call", "primitive", "primitive.jsonrpc.call", "pid", "pid", ("audit",), False),
-            (self.mcp, "list_tools", "primitive", "primitive.mcp.list_tools", "actor", "actor", ("audit",), False),
-            (self.mcp, "call_tool", "primitive", "primitive.mcp.call", "pid", "pid", ("audit",), False),
-            (self.clock, "now", "primitive", "primitive.clock.now", "pid", "pid", ("audit",), False),
-            (self.clock, "sleep", "primitive", "primitive.clock.sleep", "pid", "pid", ("audit",), False),
-            # Process and Object Memory state transitions.
-            (self.process, "spawn", "runtime", "process.spawn", "", "", ("audit",), True),
-            (self.process, "fork", "runtime", "process.fork", "parent", "parent", ("audit",), False),
-            (self.process, "spawn_child", "runtime", "process.spawn_child", "parent", "parent", ("audit",), False),
-            (self.process, "exec", "runtime", "process.exec", "pid", "pid", ("audit",), False),
-            (self.process, "set_working_directory", "runtime", "process.chdir", "pid", "pid", ("audit",), False),
-            (self.process, "signal_child", "runtime", "process.signal_child", "pid", "pid", ("audit",), False),
-            (self.process, "signal", "runtime", "process.signal", "target", "target", ("audit",), False),
-            (self.process, "wait", "runtime", "process.wait", "pid", "pid", ("audit",), False),
-            (self.process, "pause", "runtime", "process.pause", "pid", "pid", ("audit",), False),
-            (self.process, "resume", "runtime", "process.resume", "pid", "pid", ("audit",), False),
-            (self.process, "cancel", "runtime", "process.cancel", "pid", "pid", ("audit",), False),
-            (self.process, "exit", "runtime", "process.exit", "pid", "pid", ("audit",), False),
-            (self.memory, "create_object", "runtime", "memory.create_object", "pid", "pid", ("audit",), False),
-            (self.memory, "update_object", "runtime", "memory.update_object", "pid", "pid", ("audit",), False),
-            (self.memory, "append_object_by_name", "runtime", "memory.append_object", "pid", "pid", ("audit",), False),
-            (self.memory, "link_objects", "runtime", "memory.link_objects", "pid", "pid", ("audit",), False),
-            (self.memory, "create_view", "runtime", "memory.create_view", "pid", "pid", ("audit",), False),
-            (self.memory, "fork_view", "runtime", "memory.fork_view", "parent_pid", "parent_pid", ("audit",), False),
-            (self.memory, "merge_view", "runtime", "memory.merge_view", "parent_pid", "parent_pid", ("audit",), False),
-            (self.memory, "snapshot_view", "runtime", "memory.snapshot_view", "pid", "pid", ("audit",), False),
-            (self.memory, "materialize_context", "runtime", "memory.materialize_context", "pid", "pid", ("audit",), False),
-            # Checkpoints and durable workflow coordination.
-            (self.checkpoint, "create", "runtime", "checkpoint.create", "actor", "pid", ("audit",), False),
-            (self.checkpoint, "inspect", "runtime", "checkpoint.inspect", "actor", "actor", ("audit",), False),
-            (self.checkpoint, "diff", "runtime", "checkpoint.diff", "actor", "actor", ("audit",), False),
-            (self.checkpoint, "restore", "runtime", "checkpoint.restore", "actor", "actor", ("audit",), False),
-            (self.checkpoint, "fork_from_checkpoint", "runtime", "checkpoint.fork", "actor", "actor", ("audit",), False),
-            (self.checkpoint, "replay_to_event", "runtime", "checkpoint.replay", "actor", "actor", ("audit",), False),
-            (self.human, "query", "runtime", "human.query", "pid", "pid", ("audit",), False),
-            (self.human, "request_permission", "runtime", "human.request_permission", "pid", "pid", ("audit",), False),
-            (self.human, "ask", "runtime", "human.ask", "pid", "pid", ("audit",), False),
-            (self.human, "output", "runtime", "human.output", "pid", "pid", ("audit",), False),
-            (self.human, "interrupt", "runtime", "human.interrupt", "pid", "pid", ("audit",), False),
-            (self.human, "send_process_message", "runtime", "human.process_message", "human", "recipient_pid", ("audit",), False),
-            (self.messages, "post", "runtime", "process.message.post", "sender", "recipient_pid", ("audit",), False),
-            (self.messages, "send_from_process", "runtime", "process.message.send", "sender_pid", "sender_pid", ("audit",), False),
-            (self.messages, "receive", "runtime", "process.message.receive", "pid", "pid", ("audit",), False),
-            (self.messages, "ack", "runtime", "process.message.ack", "pid", "pid", ("audit",), False),
-            (self.object_tasks, "start", "runtime", "object_task.start", "pid", "pid", ("audit",), False),
-            (self.object_tasks, "watch_owner", "runtime", "object_task.watch", "actor_pid", "actor_pid", ("audit",), False),
-            (self.object_tasks, "cancel", "runtime", "object_task.cancel", "actor_pid", "actor_pid", ("audit",), False),
-            (self.object_tasks, "wait", "runtime", "object_task.wait", "actor_pid", "actor_pid", ("audit",), False),
-            # Capability, Skill, Image, and remote registry mutations.
-            (self.authority_manifests, "prepare_launch", "runtime", "authority_manifest.bind", "issued_by", "pid", ("audit",), False),
-            (self.capability, "issue", "runtime", "capability.issue", "actor", "subject", ("audit",), False),
-            (self.capability, "delegate", "runtime", "capability.delegate", "parent", "parent", ("audit",), False),
-            (self.capability, "derive_authority", "runtime", "capability.derive_authority", "source_subject", "source_subject", ("audit",), False),
-            (self.capability, "revoke", "runtime", "capability.revoke", "revoked_by", "revoked_by", ("audit",), False),
-            (self.tools, "activate_tool_group", "runtime", "tool_group.activate", "pid", "pid", ("audit",), False),
-            (self.skills, "register_skill_package", "runtime", "skill.register", "actor", "actor", ("audit",), False),
-            (self.skills, "activate_skill", "runtime", "skill.activate", "pid", "pid", ("audit",), False),
-            (self.skills, "unload_skill", "runtime", "skill.unload", "pid", "pid", ("audit",), False),
-            (self.skills, "trust_skill_source", "runtime", "skill.trust", "actor", "actor", ("audit",), False),
-            (self.skills, "untrust_skill_source", "runtime", "skill.untrust", "actor", "actor", ("audit",), False),
-            (self.image_registry, "register", "runtime", "image.register", "actor", "actor", ("audit",), False),
-            (self.image_registry, "register_from_package_files", "runtime", "image.register_package", "actor", "actor", ("audit",), False),
-            (self.image_registry, "commit_from_checkpoint", "runtime", "image.commit", "actor", "actor", ("audit",), False),
-            (self.jsonrpc, "register_endpoint", "runtime", "jsonrpc.register", "actor", "actor", ("audit",), False),
-            (self.jsonrpc, "unregister_endpoint", "runtime", "jsonrpc.unregister", "actor", "actor", ("audit",), False),
-            (self.mcp, "register_server", "runtime", "mcp.register", "actor", "actor", ("audit",), False),
-            (self.mcp, "unregister_server", "runtime", "mcp.unregister", "actor", "actor", ("audit",), False),
-        ]
-        for owner, method_name, kind, name, actor_arg, pid_arg, expected_roles, result_pid in boundaries:
-            method = getattr(owner, method_name, None)
-            if method is None:
-                continue
-            parameters = inspect.signature(method).parameters
-            for role, argument in (("actor", actor_arg), ("pid", pid_arg)):
-                if argument and argument not in parameters:
-                    raise RuntimeError(
-                        f"operation boundary {name} declares unknown {role} argument {argument!r}"
-                    )
-            wrapped = self.operations.protected(
-                kind=kind,
-                name=name,
-                actor_arg=actor_arg,
-                pid_arg=pid_arg,
-                expected_roles=expected_roles,
-                result_pid=result_pid,
-            )(method)
-            setattr(owner, method_name, wrapped)
-        self.explainable_boundary_names = frozenset(
-            {name for _, _, _, name, *_ in boundaries}
-            | set(self.external_primitive_boundary_names)
+            trusted_module_sha256=trusted_module_sha256,
         )
 
     @classmethod
@@ -633,95 +188,16 @@ class Runtime:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> "Runtime":
-        selected_config = config or DEFAULT_CONFIG
-        store = open_store(target, config=selected_config)
-        try:
-            return cls(
-                store,
-                substrate=substrate,
-                config=selected_config,
-                startup_module_manifests=module_manifests,
-                trusted_modules=trusted_modules,
-                trusted_module_sha256=trusted_module_sha256,
-            )
-        except Exception:
-            store.close()
-            raise
+        from agent_libos.runtime.builder import RuntimeBuilder
 
-    def _rehydrate_registered_jit_tools(self) -> None:
-        """Restore process-local JIT implementations after a normal runtime reopen.
-
-        SQLite persists process tool tables and tool rows, while the executable
-        TypeScript sources live in ToolBroker's in-memory sandbox table. A
-        registered JIT is valid only when a process table still references its
-        tool id; orphan candidates remain inert and stale references are pruned
-        fail-closed so the model is not shown a tool that cannot run.
-        """
-
-        ephemeral_tool_rows = {
-            str(row["tool_id"]): row
-            for row in self.store.list_tools()
-            if bool(row.get("ephemeral"))
-        }
-        if not ephemeral_tool_rows:
-            return
-
-        candidate_rows = self.store.select_table_rows(
-            "tool_candidates",
-            "status = ?",
-            [ToolCandidateStatus.REGISTERED.value],
-            order_by="updated_at, candidate_id",
-        )
-        candidates_by_tool_id: dict[str, dict[str, Any]] = {}
-        fallback_by_owner_name: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in candidate_rows:
-            spec = loads(row.get("spec_json"), {})
-            name = str(spec.get("name") or "")
-            registered_tool_id = str(row.get("registered_tool_id") or "")
-            if registered_tool_id:
-                candidates_by_tool_id[registered_tool_id] = row
-            elif name:
-                # Best-effort recovery for pre-registered_tool_id rows. New
-                # rows use the exact id binding above to avoid name reuse bugs.
-                fallback_by_owner_name[(str(row["pid"]), name)] = row
-
-        restored: list[dict[str, str]] = []
-        pruned: list[dict[str, str]] = []
-        for process in self.store.list_processes():
-            changed = False
-            for name, raw_tool_id in list(process.tool_table.items()):
-                tool_id = str(raw_tool_id)
-                row = ephemeral_tool_rows.get(tool_id)
-                if row is None:
-                    continue
-                if tool_id in self.tools._tools:
-                    continue
-                candidate = candidates_by_tool_id.get(tool_id) or fallback_by_owner_name.get((process.pid, str(name)))
-                source = str(candidate.get("source_code") or "") if candidate is not None else ""
-                if candidate is None or not source or str(row.get("name") or "") != str(name):
-                    process.tool_table.pop(name, None)
-                    changed = True
-                    pruned.append({"pid": process.pid, "tool_id": tool_id, "name": str(name)})
-                    continue
-                self.tools._jit_sources[tool_id] = source
-                self.tools._handles[tool_id] = ToolHandle(
-                    tool_id=tool_id,
-                    name=str(name),
-                    capability_id=None,
-                    scope=str(row.get("scope") or "ephemeral_process"),
-                )
-                restored.append({"pid": process.pid, "tool_id": tool_id, "name": str(name)})
-            if changed:
-                process.updated_at = utc_now()
-                self.store.update_process(process)
-
-        if restored or pruned:
-            self.audit.record(
-                actor="runtime",
-                action="runtime.jit.rehydrate",
-                target="tool:jits",
-                decision={"restored": restored, "pruned_stale": pruned},
-            )
+        return RuntimeBuilder.configured(
+            cls,
+            config=config,
+            substrate=substrate,
+            module_manifests=module_manifests,
+            trusted_modules=trusted_modules,
+            trusted_module_sha256=trusted_module_sha256,
+        ).open(target)
 
     def shutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:
         """Shut down this host Runtime instance.
@@ -732,166 +208,21 @@ class Runtime:
         the process primitive/tool path, which keeps process authority and audit
         semantics separate from host resource cleanup.
         """
-        if self._closed:
-            return {"ok": True, "already_shutdown": True, "reason": self._shutdown_reason}
-        self._shutdown_reason = reason
-        errors: list[dict[str, str]] = []
-        self.audit.record(
-            actor=actor,
-            action="runtime.shutdown",
-            target="runtime",
-            decision={"reason": reason},
-        )
-        self.events.emit(
-            EventType.RUNTIME_SHUTDOWN,
-            source=actor,
-            target="runtime",
-            payload={"reason": reason},
-        )
-        scheduler = getattr(self, "scheduler", None)
-        if scheduler is not None and not scheduler.shutdown():
-            return {
-                "ok": False,
-                "already_shutdown": False,
-                "reason": reason,
-                "scheduler_stopped": False,
-            }
-        for name, component in [
-            ("object_tasks", getattr(self, "object_tasks", None)),
-        ]:
-            try:
-                if not self._shutdown_component(component):
-                    return {
-                        "ok": False,
-                        "already_shutdown": False,
-                        "reason": reason,
-                        f"{name}_stopped": False,
-                    }
-            except Exception as exc:
-                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
-        for index, finalizer in enumerate(list(self._shutdown_finalizers)):
-            try:
-                if finalizer() is False:
-                    return {
-                        "ok": False,
-                        "already_shutdown": False,
-                        "reason": reason,
-                        f"shutdown_finalizer_{index}_stopped": False,
-                    }
-            except Exception as exc:
-                errors.append({"component": f"shutdown_finalizer:{index}", "error": str(exc), "error_type": type(exc).__name__})
-        for name, component in [
-            ("modules", getattr(self, "modules", None)),
-            ("llms", getattr(self, "llms", None)),
-            ("substrate", self.substrate),
-        ]:
-            try:
-                if not self._shutdown_component(component):
-                    return {
-                        "ok": False,
-                        "already_shutdown": False,
-                        "reason": reason,
-                        f"{name}_stopped": False,
-                    }
-            except Exception as exc:
-                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
-        self._closed = True
-        self.store.close()
-        if errors:
-            raise RuntimeError(f"runtime shutdown completed with component errors: {errors}")
-        return {"ok": True, "already_shutdown": False, "reason": reason}
+        return self.lifecycle.shutdown(actor=actor, reason=reason)
 
     async def ashutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:
         """Async shutdown variant for event-loop hosts."""
-        if self._closed:
-            return {"ok": True, "already_shutdown": True, "reason": self._shutdown_reason}
-        self._shutdown_reason = reason
-        errors: list[dict[str, str]] = []
-        self.audit.record(
-            actor=actor,
-            action="runtime.shutdown",
-            target="runtime",
-            decision={"reason": reason},
-        )
-        self.events.emit(
-            EventType.RUNTIME_SHUTDOWN,
-            source=actor,
-            target="runtime",
-            payload={"reason": reason},
-        )
-        scheduler = getattr(self, "scheduler", None)
-        if scheduler is not None and not scheduler.shutdown():
-            return {
-                "ok": False,
-                "already_shutdown": False,
-                "reason": reason,
-                "scheduler_stopped": False,
-            }
-        for name, component in [
-            ("object_tasks", getattr(self, "object_tasks", None)),
-        ]:
-            try:
-                if not await self._ashutdown_component(component):
-                    return {
-                        "ok": False,
-                        "already_shutdown": False,
-                        "reason": reason,
-                        f"{name}_stopped": False,
-                    }
-            except Exception as exc:
-                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
-        for index, finalizer in enumerate(list(self._shutdown_finalizers)):
-            try:
-                result = finalizer()
-                if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
-                    result = await result
-                if result is False:
-                    return {
-                        "ok": False,
-                        "already_shutdown": False,
-                        "reason": reason,
-                        f"shutdown_finalizer_{index}_stopped": False,
-                    }
-            except Exception as exc:
-                errors.append({"component": f"shutdown_finalizer:{index}", "error": str(exc), "error_type": type(exc).__name__})
-        for name, component in [
-            ("modules", getattr(self, "modules", None)),
-            ("llms", getattr(self, "llms", None)),
-            ("substrate", self.substrate),
-        ]:
-            try:
-                if not await self._ashutdown_component(component):
-                    return {
-                        "ok": False,
-                        "already_shutdown": False,
-                        "reason": reason,
-                        f"{name}_stopped": False,
-                    }
-            except Exception as exc:
-                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
-        self._closed = True
-        self.store.close()
-        if errors:
-            raise RuntimeError(f"runtime shutdown completed with component errors: {errors}")
-        return {"ok": True, "already_shutdown": False, "reason": reason}
+        return await self.lifecycle.ashutdown(actor=actor, reason=reason)
 
-    def close(self) -> None:
+    def close(self) -> dict[str, Any]:
         """Compatibility alias for shutdown(); prefer Runtime.shutdown()."""
-        self.shutdown(actor="runtime.close", reason="runtime.close")
+        return self.shutdown(actor="runtime.close", reason="runtime.close")
 
     def _shutdown_component(self, component: Any) -> bool:
-        if component is None:
-            return True
-        shutdown = getattr(component, "shutdown", None)
-        if callable(shutdown):
-            return shutdown() is not False
-        close = getattr(component, "close", None)
-        if callable(close):
-            close()
-        return True
+        return self.lifecycle.shutdown_component(component)
 
     def bind_shutdown_finalizer(self, finalizer: Any) -> None:
-        self._shutdown_finalizers.append(finalizer)
+        self.lifecycle.bind_finalizer(finalizer)
 
     def _notify_process_terminal(self, pid: str) -> None:
         errors: list[str] = []
@@ -910,56 +241,8 @@ class Runtime:
         if errors:
             raise RuntimeError("terminal process notification failed: " + "; ".join(errors))
 
-    def _reconcile_legacy_pending_action_terminals(
-        self,
-        *,
-        pids: set[str] | None = None,
-    ) -> list[str]:
-        """Complete storage/checkpoint legacy migration through manager hooks."""
-
-        reconciled: list[str] = []
-        errors: list[str] = []
-        for pending in self.store.list_llm_pending_actions_requiring_terminal_reconciliation():
-            pid = str(pending.get("pid") or "")
-            if not pid or (pids is not None and pid not in pids):
-                continue
-            try:
-                if self.process.reconcile_legacy_pending_action_terminal(
-                    pid,
-                    reason=CheckpointManager.LEGACY_PENDING_DATA_FLOW_MESSAGE,
-                ):
-                    reconciled.append(pid)
-            except Exception as exc:
-                errors.append(f"{pid}: {type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeError(
-                "legacy pending action terminal reconciliation failed: "
-                + "; ".join(errors)
-            )
-        return reconciled
-
     async def _ashutdown_component(self, component: Any) -> bool:
-        if component is None:
-            return True
-        ashutdown = getattr(component, "ashutdown", None)
-        if callable(ashutdown):
-            result = ashutdown()
-            if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
-                result = await result
-            return result is not False
-        aclose = getattr(component, "aclose", None)
-        if callable(aclose):
-            result = aclose()
-            if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
-                await result
-            return True
-        shutdown = getattr(component, "shutdown", None)
-        if callable(shutdown):
-            return shutdown() is not False
-        close = getattr(component, "close", None)
-        if callable(close):
-            close()
-        return True
+        return await self.lifecycle.ashutdown_component(component)
 
     def run_process_once(self, pid: str) -> dict[str, Any]:
         if self.scheduler.is_active_quantum(pid):
@@ -1040,7 +323,7 @@ class Runtime:
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
     ) -> list[Any]:
-        return await asyncio.to_thread(
+        return await self.blocking_work.run(
             self._run_until_idle_sync,
             max_quanta=max_quanta,
             process_human_queue=process_human_queue,
@@ -1363,10 +646,19 @@ class Runtime:
         process = self.process.get(pid)
         if process.memory_view is None:
             process.memory_view = self.memory.create_view(pid, [handle], mode=ViewMode.READ_ONLY)
-        elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
-            process.memory_view.roots.append(handle)
-        process.updated_at = utc_now()
-        self.store.update_process(process)
+            process.updated_at = utc_now()
+            self.store.patch_process(
+                pid,
+                {"memory_view": process.memory_view, "updated_at": process.updated_at},
+                expected_revision=process.revision,
+            )
+        else:
+            self.store.append_process_memory_roots(pid, [handle])
+
+    def add_handle_to_process_view(self, pid: str, handle: ObjectHandle) -> None:
+        """Publish an object handle into a process view."""
+
+        self._add_handle_to_process_view(pid, handle)
 
     def _record_workflow_run(self, result: WorkflowRunResult) -> None:
         decision = {
@@ -1491,49 +783,18 @@ class Runtime:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> Any:
-        process = self.process.get(pid)
-        selected_image = self._require_image(image)
-        if image != process.image_id:
-            self._require_process_image_boot_authority(pid, image)
-        self._preflight_process_image_boot(selected_image)
-        previous_state = self._snapshot_process_exec_state(pid)
-        boot_kind = selected_image.boot.get("kind", "fresh")
-        try:
-            self.process.exec(
-                pid,
-                image,
-                args=args,
-                goal=goal,
-                preserve_memory=preserve_memory,
-                preserve_capabilities=preserve_capabilities,
-                llm_profile_id=llm_profile_id,
-                source_oids=source_oids,
-                source_labels=source_labels,
-                source_context=source_context,
-            )
-            # Exec swaps the process image and tool table, but deliberately does
-            # not apply image required_capabilities. Exec may preserve existing
-            # capabilities or shrink them; it never grants new external
-            # authority. Package workspaces are private materialized state, so
-            # they are instantiated here just as they are during spawn.
-            self._configure_process_tools_for_image(pid, image, assigned_by=f"process.exec:{image}")
-            if boot_kind == "checkpoint_commit":
-                self._instantiate_checkpoint_commit_image(pid, selected_image)
-            elif boot_kind == "image_package":
-                self._instantiate_image_package(pid, selected_image)
-            self._configure_process_skills_for_image(pid, image, assigned_by=f"process.exec:{image}")
-        except Exception as exc:
-            if boot_kind == "image_package":
-                self._cleanup_image_package_boot_state(pid, selected_image, reason="image_package_exec_failed")
-            self._restore_process_exec_state(previous_state)
-            self.audit.record(
-                actor="runtime",
-                action="image.boot.failed",
-                target=f"process:{pid}",
-                decision={"image": image, "phase": "process.exec", "error": str(exc), "rolled_back": True},
-            )
-            raise
-        return self.process.get(pid)
+        return self.image_boot.exec(
+            pid,
+            image,
+            args=args,
+            goal=goal,
+            preserve_memory=preserve_memory,
+            preserve_capabilities=preserve_capabilities,
+            llm_profile_id=llm_profile_id,
+            source_oids=source_oids,
+            source_labels=source_labels,
+            source_context=source_context,
+        )
 
     def spawn_child_process(
         self,
@@ -1549,24 +810,13 @@ class Runtime:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> str:
-        parent_process = self.process.get(parent)
-        selected_image = image or parent_process.image_id
-        self._require_process_spawn_authority(parent)
-        if selected_image != parent_process.image_id:
-            self._require_process_image_boot_authority(parent, selected_image)
-        self._require_image(selected_image)
-        selected_cwd = (
-            self.resolve_process_working_directory(parent, working_directory)
-            if working_directory is not None
-            else parent_process.working_directory
-        )
-        return self.process.spawn_child(
-            parent=parent,
-            goal=goal,
-            image=selected_image,
+        return self.launch.spawn_child(
+            parent,
+            goal,
+            image=image,
             inherit_capabilities=inherit_capabilities,
             resource_budget=resource_budget,
-            working_directory=selected_cwd,
+            working_directory=working_directory,
             llm_profile_id=llm_profile_id,
             source_oids=source_oids,
             source_labels=source_labels,
@@ -1590,27 +840,16 @@ class Runtime:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> str:
-        parent_process = self.process.get(parent)
-        selected_image = image or parent_process.image_id
-        self._require_process_spawn_authority(parent)
-        if selected_image != parent_process.image_id:
-            self._require_process_image_boot_authority(parent, selected_image)
-        self._require_image(selected_image)
-        selected_cwd = (
-            self.resolve_process_working_directory(parent, working_directory)
-            if working_directory is not None
-            else parent_process.working_directory
-        )
-        return self.process.fork(
-            parent=parent,
-            goal=goal,
+        return self.launch.fork_child(
+            parent,
+            goal,
             memory_view=memory_view,
             capabilities=capabilities,
             inherit_capabilities=inherit_capabilities,
             resource_budget=resource_budget,
-            image=selected_image,
+            image=image,
             mode=mode,
-            working_directory=selected_cwd,
+            working_directory=working_directory,
             llm_profile_id=llm_profile_id,
             source_oids=source_oids,
             source_labels=source_labels,
@@ -1618,1001 +857,16 @@ class Runtime:
         )
 
     def set_process_working_directory(self, pid: str, path: str) -> Any:
-        relative = self.resolve_process_working_directory(pid, path)
-        return self.process.set_working_directory(pid, relative)
+        return self.launch.set_working_directory(pid, path)
 
     def _require_process_spawn_authority(self, pid: str) -> None:
-        self.capability.require(pid, "process:spawn", CapabilityRight.WRITE)
+        self.launch.require_spawn_authority(pid)
 
     def _require_process_image_boot_authority(self, pid: str, image_id: str) -> None:
-        self.capability.require(pid, self.image_registry.resource_for(image_id), CapabilityRight.READ)
+        self.launch.require_image_boot_authority(pid, image_id)
 
     def _resolve_launch_llm_profile_id(self, image_id: str, explicit_profile_id: str | None) -> str:
-        if explicit_profile_id is not None:
-            selected = str(explicit_profile_id).strip()
-            if not selected:
-                raise ValidationError("LLM profile id must be a non-empty string")
-            return selected
-        image = self.images.get(image_id)
-        if image is not None and image.llm_profile_id:
-            return image.llm_profile_id
-        return self.config.llm.default_profile_id
+        return self.launch.resolve_llm_profile_id(image_id, explicit_profile_id)
 
     def resolve_process_working_directory(self, pid: str, path: str) -> str:
-        current_cwd = self.process.working_directory(pid)
-        return self.filesystem.validate_directory(pid, path, cwd=current_cwd)
-
-    def _configure_process_tools_and_capabilities(self, pid: str, image_id: str) -> None:
-        try:
-            image = self._require_image(image_id)
-        except Exception as exc:
-            self._fail_process_image_boot(pid, image_id, exc, phase="process.spawn")
-            raise
-        try:
-            boot_kind = image.boot.get("kind", "fresh")
-            is_checkpoint_commit = boot_kind == "checkpoint_commit"
-            is_image_package = boot_kind == "image_package"
-            self._preflight_process_image_boot(image)
-            # Tool visibility is fixed from the AgentImage at process creation time.
-            # External-resource authority is still enforced later by the primitives.
-            self._configure_process_tools_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
-            if is_checkpoint_commit:
-                self._instantiate_checkpoint_commit_image(pid, image)
-            elif is_image_package:
-                self._instantiate_image_package(pid, image)
-            process = self.store.get_process(pid)
-        except Exception as exc:
-            self._fail_process_image_boot(pid, image_id, exc, phase="process.spawn")
-            raise
-        try:
-            self._configure_process_skills_for_image(pid, image.image_id, assigned_by=f"image:{image_id}")
-        except Exception as exc:
-            if is_image_package:
-                self._cleanup_image_package_boot_state(
-                    pid,
-                    image,
-                    reason="image_package_default_skills_failed",
-                )
-            self._fail_process_image_boot(pid, image_id, exc, phase="image.default_skills")
-            raise
-        if process is not None:
-            self.checkpoint.grant_process_defaults(pid, issued_by=f"image:{image_id}")
-        if process is not None and process.parent_pid is not None:
-            self.audit.record(
-                actor="runtime",
-                action="image.default_capability_skipped_for_child",
-                target=f"process:{pid}",
-                decision={"image": image_id, "parent_pid": process.parent_pid},
-            )
-            return
-        manifest_summary = self.authority_manifests.summary_for_process(pid)
-        self.audit.record(
-            actor="runtime",
-            action="image.required_capabilities_declared_only",
-            target=f"process:{pid}",
-            decision={
-                "image": image_id,
-                "boot_kind": boot_kind,
-                "required_capabilities": len(image.required_capabilities),
-                "authority_manifest_id": (
-                    manifest_summary.get("manifest_id") if manifest_summary is not None else None
-                ),
-                "missing_required_capabilities": (
-                    manifest_summary.get("missing_required_capabilities", [])
-                    if manifest_summary is not None
-                    else list(image.required_capabilities)
-                ),
-                "reason": "image requirements are declarations; launch manifests own grants",
-            },
-        )
-
-    def _require_image(self, image_id: str) -> AgentImage:
-        image = self.images.get(image_id)
-        if image is None:
-            raise NotFound(f"agent image not found: {image_id}")
-        return image
-
-    def _preflight_process_image_boot(self, image: AgentImage) -> None:
-        self._require_image_modules(image)
-        boot_kind = image.boot.get("kind", "fresh")
-        if boot_kind == "checkpoint_commit":
-            artifact = self._load_image_artifact(image, expected_kind="checkpoint_commit")
-            self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
-        elif boot_kind == "image_package":
-            self._load_image_artifact(image, expected_kind="image_package")
-
-    def _require_image_modules(self, image: AgentImage) -> None:
-        missing = []
-        for module in image.required_modules:
-            module_id = str(module.get("module_id", ""))
-            source_sha256 = str(module.get("source_sha256", ""))
-            if not module_id:
-                continue
-            if not self.modules.is_loaded(module_id, source_sha256 or None):
-                missing.append({"module_id": module_id, "source_sha256": source_sha256})
-        if missing:
-            raise ValidationError(f"image requires startup modules that are not loaded: {missing}")
-
-    def _snapshot_process_exec_state(self, pid: str) -> dict[str, Any]:
-        process_rows = self.store.select_table_rows("processes", "pid = ?", (pid,))
-        if not process_rows:
-            raise NotFound(f"process not found: {pid}")
-        object_rows = self.store.select_table_rows(
-            "objects",
-            "owner_kind = ? AND owner_id = ? AND lifecycle_state = ?",
-            (ObjectOwnerKind.PROCESS.value, pid, "live"),
-            order_by="oid",
-        )
-        object_oids = [str(row["oid"]) for row in object_rows]
-        namespace_rows = self.store.select_table_rows(
-            "object_namespaces",
-            "created_by = ? OR namespace = ?",
-            (pid, self.memory.process_namespace(pid)),
-            order_by="namespace",
-        )
-        tool_ids = set(loads(process_rows[0].get("tool_table_json"), {}).values())
-        return {
-            "pid": pid,
-            "object_oids": object_oids,
-            "namespace_names": [str(row["namespace"]) for row in namespace_rows],
-            "tables": {
-                "processes": process_rows,
-                "object_namespaces": namespace_rows,
-                "objects": object_rows,
-                "object_links": self._exec_object_link_rows(object_oids),
-                "capabilities": self.store.select_table_rows("capabilities", "subject = ?", (pid,), order_by="cap_id"),
-                "llm_pending_actions": self.store.select_table_rows("llm_pending_actions", "pid = ?", (pid,)),
-                "tool_candidates": self.store.select_table_rows("tool_candidates", "pid = ?", (pid,), order_by="candidate_id"),
-                "process_resource_reservations": self.store.select_table_rows(
-                    "process_resource_reservations",
-                    "parent_pid = ? OR child_pid = ?",
-                    (pid, pid),
-                    order_by="parent_pid, child_pid",
-                ),
-            },
-            "object_payloads": self.store.snapshot_object_payloads(object_oids),
-            "tool_ids": tool_ids,
-            "tool_handles": {
-                tool_id: deepcopy(getattr(self.tools, "_handles", {}).get(tool_id))
-                for tool_id in tool_ids
-                if tool_id in getattr(self.tools, "_handles", {})
-            },
-            "jit_sources": {
-                tool_id: deepcopy(getattr(self.tools, "_jit_sources", {}).get(tool_id))
-                for tool_id in tool_ids
-                if tool_id in getattr(self.tools, "_jit_sources", {})
-            },
-        }
-
-    def _restore_process_exec_state(self, state: dict[str, Any]) -> None:
-        pid = state["pid"]
-        tables = state["tables"]
-        current_process = self.store.get_process(pid)
-        current_object_rows = self.store.select_table_rows(
-            "objects",
-            "owner_kind = ? AND owner_id = ? AND lifecycle_state = ?",
-            (ObjectOwnerKind.PROCESS.value, pid, "live"),
-            order_by="oid",
-        )
-        current_object_oids = [str(row["oid"]) for row in current_object_rows]
-        object_oids = sorted(set(state["object_oids"]) | set(current_object_oids))
-        namespace_names = sorted(
-            set(state["namespace_names"])
-            | {
-                str(row["namespace"])
-                for row in self.store.select_table_rows(
-                    "object_namespaces",
-                    "created_by = ? OR namespace = ?",
-                    (pid, self.memory.process_namespace(pid)),
-                    order_by="namespace",
-                )
-            }
-        )
-        current_tool_ids = set(current_process.tool_table.values()) if current_process is not None else set()
-        stale_tool_ids = current_tool_ids - set(state["tool_ids"])
-        with self.store.transaction(include_object_payloads=True) as cur:
-            if object_oids:
-                placeholders = ", ".join("?" for _ in object_oids)
-                cur.execute(
-                    f"DELETE FROM object_links WHERE src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
-                    [*object_oids, *object_oids],
-                )
-                cur.execute(f"DELETE FROM objects WHERE oid IN ({placeholders})", object_oids)
-                cur.execute(
-                    f"DELETE FROM capabilities WHERE resource IN ({placeholders})",
-                    [f"object:{oid}" for oid in object_oids],
-                )
-                for oid in object_oids:
-                    self.store.forget_object_payload(oid)
-            if namespace_names:
-                placeholders = ", ".join("?" for _ in namespace_names)
-                cur.execute(f"DELETE FROM object_namespaces WHERE namespace IN ({placeholders})", namespace_names)
-            cur.execute("DELETE FROM capabilities WHERE subject = ?", (pid,))
-            cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
-            cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
-            cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
-            cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
-            for row in tables["object_namespaces"]:
-                self.checkpoint._insert_row(cur, "object_namespaces", row)
-            for row in tables["objects"]:
-                item = dict(row)
-                oid = str(item["oid"])
-                if oid in state["object_payloads"]:
-                    item["payload_json"] = dumps(state["object_payloads"][oid])
-                else:
-                    item["payload_json"] = dumps(self.store.payload_marker(present=False))
-                self.checkpoint._insert_row(cur, "objects", item)
-                if oid in state["object_payloads"]:
-                    self.store.set_object_payload(oid, deepcopy(state["object_payloads"][oid]))
-            for table in [
-                "object_links",
-                "capabilities",
-                "llm_pending_actions",
-                "tool_candidates",
-                "process_resource_reservations",
-                "processes",
-            ]:
-                for row in tables[table]:
-                    self.checkpoint._insert_row(cur, table, row)
-        for tool_id in stale_tool_ids:
-            if not self._tool_id_used_by_other_process(tool_id, pid):
-                # Exec boot rollback restores the process table, but package JIT
-                # registration may also have inserted ephemeral tool rows. Drop
-                # unreferenced rows so a failed boot cannot leave inert tools in
-                # persistent discovery output.
-                getattr(self.tools, "_handles", {}).pop(tool_id, None)
-                getattr(self.tools, "_jit_sources", {}).pop(tool_id, None)
-                self.store.delete_tool(tool_id)
-        for tool_id, handle in state["tool_handles"].items():
-            self.tools._handles[tool_id] = deepcopy(handle)
-        for tool_id, source in state["jit_sources"].items():
-            self.tools._jit_sources[tool_id] = deepcopy(source)
-
-    def _exec_object_link_rows(self, object_oids: list[str]) -> list[dict[str, Any]]:
-        if not object_oids:
-            return []
-        placeholders = ", ".join("?" for _ in object_oids)
-        return self.store.select_table_rows(
-            "object_links",
-            f"src_oid IN ({placeholders}) OR dst_oid IN ({placeholders})",
-            [*object_oids, *object_oids],
-            order_by="id",
-        )
-
-    def _tool_id_used_by_other_process(self, tool_id: str, pid: str) -> bool:
-        for process in self.store.list_processes():
-            if process.pid == pid:
-                continue
-            if tool_id in process.tool_table.values():
-                return True
-        return False
-
-    def _fail_process_image_boot(self, pid: str, image_id: str, exc: Exception, *, phase: str) -> None:
-        process = self.store.get_process(pid)
-        if process is not None:
-            process.status = ProcessStatus.FAILED
-            process.status_message = str(exc)
-            process.updated_at = utc_now()
-            self.store.update_process(process)
-        self.audit.record(
-            actor="runtime",
-            action="image.boot.failed",
-            target=f"process:{pid}",
-            decision={"image": image_id, "phase": phase, "error": str(exc)},
-        )
-
-    def _configure_process_tools_for_image(self, pid: str, image_id: str, assigned_by: str) -> dict[str, str]:
-        image = self._require_image(image_id)
-        full_table = self.tools.configure_process_tools(pid, sorted(image.default_tools), assigned_by=assigned_by)
-        projected = self.tools.initial_tool_projection(image)
-        self.tools.configure_model_tool_projection(
-            pid,
-            sorted(projected),
-            assigned_by=f"{assigned_by}:model_projection",
-        )
-        return full_table
-
-    def _configure_process_skills_for_image(self, pid: str, image_id: str, assigned_by: str) -> None:
-        process = self.store.get_process(pid)
-        if process is None:
-            return
-        self._apply_loaded_skill_tool_table(pid)
-        image = self._require_image(image_id)
-        for skill_id in image.default_skills:
-            process = self.store.get_process(pid)
-            if process is not None and skill_id in process.loaded_skills:
-                continue
-            self.skills.activate_skill(pid, skill_id, actor=assigned_by, require_capability=False)
-
-    def _instantiate_checkpoint_commit_image(self, pid: str, image: AgentImage) -> None:
-        artifact = self._load_image_artifact(image, expected_kind="checkpoint_commit")
-        self.checkpoint._require_snapshot_modules({"modules": artifact.get("modules", [])})
-        remapped = self._remap_image_artifact_for_process(pid, artifact)
-        self._assert_checkpoint_commit_image_data_flow(pid, remapped)
-        self._insert_committed_memory_rows(remapped)
-        self._restore_committed_registry_rows(artifact)
-        tool_table = self._restore_committed_tool_table(pid, artifact)
-        process = self.process.get(pid)
-        process.working_directory = str(artifact.get("working_directory") or process.working_directory or ".")
-        process.loaded_skills = self._remap_loaded_skills(artifact.get("loaded_skills", {}), tool_table)
-        process.tool_table = tool_table
-        self._merge_committed_memory_view(process, artifact, remapped)
-        process.updated_at = utc_now()
-        self.store.update_process(process)
-        self.audit.record(
-            actor=f"image:{image.image_id}",
-            action="image.boot.checkpoint_commit",
-            target=f"process:{pid}",
-            decision={
-                "image_id": image.image_id,
-                "artifact_id": image.boot.get("artifact_id"),
-                "source_checkpoint_id": artifact.get("source_checkpoint_id"),
-                "objects": len(remapped["object_payloads"]),
-                "tools": sorted(tool_table),
-            },
-        )
-
-    def _instantiate_image_package(self, pid: str, image: AgentImage) -> None:
-        artifact = self._load_image_artifact(image, expected_kind="image_package")
-        workspace_root = None
-        working_directory = None
-        registered_jit: list[str] = []
-        try:
-            workspace_paths = self._materialize_image_package_workspace(pid, image, artifact)
-            if workspace_paths is not None:
-                workspace_root, working_directory = workspace_paths
-            registered_jit = self._register_image_package_jit_tools(pid, image, artifact)
-            process = self.process.get(pid)
-            if workspace_paths is not None:
-                process.working_directory = working_directory
-                process.updated_at = utc_now()
-                self.store.update_process(process)
-                self._grant_image_package_workspace(pid, image, artifact, workspace_root)
-        except Exception:
-            self._remove_registered_image_package_jit_tool_names(pid, registered_jit)
-            self._cleanup_materialized_image_workspace(
-                workspace_root,
-                actor=f"image:{image.image_id}",
-                reason="image_package_boot_failed",
-            )
-            raise
-        self.audit.record(
-            actor=f"image:{image.image_id}",
-            action="image.boot.package",
-            target=f"process:{pid}",
-            decision={
-                "image_id": image.image_id,
-                "artifact_id": image.boot.get("artifact_id"),
-                "package_sha256": artifact.get("package_sha256"),
-                "workspace_root": workspace_root,
-                "working_directory": working_directory,
-                "jit_tools": registered_jit,
-            },
-        )
-
-    def _materialize_image_package_workspace(
-        self,
-        pid: str,
-        image: AgentImage,
-        artifact: dict[str, Any],
-    ) -> tuple[str, str] | None:
-        workspace = artifact.get("workspace") or {}
-        source = workspace.get("source")
-        if not source:
-            return None
-        artifact_id = self._safe_materialized_segment(str(image.boot.get("artifact_id") or "image"))
-        pid_segment = self._safe_materialized_segment(pid)
-        boot_segment = self._safe_materialized_segment(new_id("boot"))
-        root_relative = Path(self.config.image.materialized_workspace_root) / pid_segment / boot_segment / artifact_id / "workspace"
-        root = (self.workspace_root / root_relative).resolve()
-        if self.workspace_root not in root.parents and root != self.workspace_root:
-            raise RuntimeError("image workspace materialization escaped workspace root")
-        files = [
-            record for record in artifact.get("files", [])
-            if self._artifact_path_under(str(record.get("path", "")), str(source))
-        ]
-        total_bytes = sum(int(record.get("size_bytes") or 0) for record in files)
-        usage = ResourceUsage(external_write_bytes=total_bytes)
-        context = {
-            "image_id": image.image_id,
-            "artifact_id": image.boot.get("artifact_id"),
-            "workspace_root": root_relative.as_posix(),
-            "files": len(files),
-            "bytes": total_bytes,
-        }
-        self.resources.preflight(pid, usage, source="image.workspace.materialize", context=context)
-        try:
-            # Workspace materialization is a runtime boot side effect, so keep
-            # it atomic with the rest of package boot and remove partial files
-            # if later validation fails.
-            root.mkdir(parents=True, exist_ok=True)
-            for record in files:
-                package_path = str(record["path"])
-                relative = self._relative_artifact_path(package_path, str(source))
-                target = (root / relative).resolve()
-                if root not in target.parents and target != root:
-                    raise RuntimeError(f"image workspace file escaped materialized root: {package_path}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(self._artifact_file_bytes(record))
-            working_directory = str(workspace.get("working_directory") or ".")
-            cwd = (root / "" if working_directory == "." else root / working_directory).resolve()
-            if root not in cwd.parents and cwd != root:
-                raise RuntimeError("image workspace working_directory escaped materialized root")
-            cwd.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            shutil.rmtree(root, ignore_errors=True)
-            self._prune_empty_materialized_workspace_parents(root.parent)
-            raise
-        self.resources.charge(pid, usage, source="image.workspace.materialize", context=context)
-        return root.relative_to(self.workspace_root).as_posix(), cwd.relative_to(self.workspace_root).as_posix()
-
-    def _cleanup_materialized_image_workspace(
-        self,
-        workspace_root: str | None,
-        *,
-        actor: str,
-        reason: str,
-    ) -> None:
-        if not workspace_root:
-            return
-        relative = Path(workspace_root)
-        materialized_root = Path(self.config.image.materialized_workspace_root)
-        if relative.is_absolute() or ".." in relative.parts:
-            return
-        if relative.parts[: len(materialized_root.parts)] != materialized_root.parts:
-            return
-        root = (self.workspace_root / relative).resolve()
-        if self.workspace_root not in root.parents and root != self.workspace_root:
-            return
-        try:
-            shutil.rmtree(root)
-        except FileNotFoundError:
-            return
-        except Exception as exc:
-            self.audit.record(
-                actor=actor,
-                action="image.workspace.cleanup_failed",
-                target=f"workspace:{workspace_root}",
-                decision={"reason": reason, "error": str(exc), "error_type": type(exc).__name__},
-            )
-            return
-        self._prune_empty_materialized_workspace_parents(root.parent)
-        self.audit.record(
-            actor=actor,
-            action="image.workspace.cleanup",
-            target=f"workspace:{workspace_root}",
-            decision={"reason": reason},
-        )
-
-    def _cleanup_image_package_boot_state(self, pid: str, image: AgentImage, *, reason: str) -> None:
-        process = self.store.get_process(pid)
-        if process is None:
-            return
-        tool_rows = {str(row.get("tool_id")): row for row in self.store.list_tools()}
-        handles: dict[str, ToolHandle] = {}
-        for name, tool_id in list(process.tool_table.items()):
-            row = tool_rows.get(str(tool_id))
-            if row is None or not bool(row.get("ephemeral")):
-                continue
-            if str(row.get("registered_by")) != f"image.package:{image.image_id}":
-                continue
-            handle = getattr(self.tools, "_handles", {}).get(tool_id)
-            handles[name] = handle or ToolHandle(
-                tool_id=tool_id,
-                name=name,
-                capability_id=None,
-                scope=str(row.get("scope") or "ephemeral_process"),
-            )
-        self._remove_registered_image_package_jit_tools(pid, handles)
-        workspace_root = self._materialized_workspace_root_for_cwd(process.working_directory)
-        self._cleanup_materialized_image_workspace(
-            workspace_root,
-            actor=f"image:{image.image_id}",
-            reason=reason,
-        )
-
-    def _materialized_workspace_root_for_cwd(self, cwd: str | None) -> str | None:
-        if not cwd:
-            return None
-        relative = Path(cwd)
-        materialized_root = Path(self.config.image.materialized_workspace_root)
-        if relative.is_absolute() or ".." in relative.parts:
-            return None
-        if relative.parts[: len(materialized_root.parts)] != materialized_root.parts:
-            return None
-        required_parts = len(materialized_root.parts) + 4
-        if len(relative.parts) < required_parts:
-            return None
-        return Path(*relative.parts[:required_parts]).as_posix()
-
-    def _prune_empty_materialized_workspace_parents(self, start: Path) -> None:
-        boundary = (self.workspace_root / self.config.image.materialized_workspace_root).resolve()
-        current = start.resolve()
-        while current != boundary and boundary in current.parents:
-            try:
-                current.rmdir()
-            except OSError:
-                break
-            current = current.parent
-
-    def _grant_image_package_workspace(
-        self,
-        pid: str,
-        image: AgentImage,
-        artifact: dict[str, Any],
-        workspace_root: str,
-    ) -> None:
-        workspace = artifact.get("workspace") or {}
-        granted: list[dict[str, Any]] = []
-        for grant in workspace.get("grants", []):
-            relative = str(grant.get("path") or ".")
-            target = workspace_root if relative == "." else f"{workspace_root.rstrip('/')}/{relative}"
-            rights = [CapabilityRight(right) for right in grant.get("rights", [])]
-            if grant.get("recursive"):
-                cap = self.filesystem.grant_directory(
-                    pid,
-                    target,
-                    rights,
-                    issued_by=f"image.package:{image.image_id}",
-                    delegable=bool(grant.get("delegable", False)),
-                )
-            else:
-                cap = self.filesystem.grant_path(
-                    pid,
-                    target,
-                    rights,
-                    issued_by=f"image.package:{image.image_id}",
-                    delegable=bool(grant.get("delegable", False)),
-                )
-            granted.append({"capability_id": cap.cap_id, "resource": cap.resource, "rights": sorted(cap.rights)})
-        if granted:
-            self.audit.record(
-                actor=f"image:{image.image_id}",
-                action="image.workspace.grants",
-                target=f"process:{pid}",
-                decision={"grants": granted},
-            )
-
-    def _register_image_package_jit_tools(self, pid: str, image: AgentImage, artifact: dict[str, Any]) -> list[str]:
-        process = self.process.get(pid)
-        registered: list[str] = []
-        prepared: list[tuple[str, str]] = []
-        candidate_ids: list[str] = []
-        handles: dict[str, ToolHandle] = {}
-        try:
-            for item in artifact.get("jit_tools", []):
-                name = str(item.get("name") or "")
-                if not name:
-                    continue
-                if name in process.tool_table:
-                    raise RuntimeError(f"image package JIT tool conflicts with visible tool: {name}")
-                if self.tools._name_collides_with_static_tool(name):
-                    raise RuntimeError(f"image package JIT tool conflicts with static tool: {name}")
-                spec = ToolSpec(
-                    name=name,
-                    description=str(item.get("description") or ""),
-                    input_schema=dict(item.get("input_schema") or {}),
-                    output_schema=dict(item.get("output_schema") or {}),
-                    tags=["image", "jit", "package"],
-                    metadata={
-                        "image_id": image.image_id,
-                        "artifact_id": image.boot.get("artifact_id"),
-                        "source_path": item.get("source_path"),
-                        **dict(item.get("metadata") or {}),
-                    },
-                )
-                candidate_id = self.tools.propose(
-                    pid,
-                    spec,
-                    source_code=str(item.get("source") or ""),
-                    tests=[dict(test) for test in item.get("tests", [])],
-                )
-                candidate_ids.append(candidate_id)
-                validation = self.tools.validate(candidate_id, pid=pid)
-                if not validation.ok:
-                    raise ValidationError(
-                        f"image package JIT tool {name} failed validation: {'; '.join(validation.errors)}"
-                    )
-                prepared.append((name, candidate_id))
-            for name, candidate_id in prepared:
-                handle = self.tools.register(pid, candidate_id, approver=f"image.package:{image.image_id}")
-                handles[name] = handle
-                registered.append(name)
-            if registered:
-                current_process = self.store.get_process(pid)
-                if current_process is not None:
-                    current_process.updated_at = utc_now()
-                    self.store.update_process(current_process)
-                self.audit.record(
-                    actor=f"image:{image.image_id}",
-                    action="image.package_jit.register",
-                    target=f"process:{pid}",
-                    decision={"tools": sorted(registered)},
-                )
-        except Exception:
-            self._remove_registered_image_package_jit_tools(pid, handles)
-            for candidate_id in reversed(candidate_ids):
-                self.tools.discard_candidate(
-                    pid,
-                    candidate_id,
-                    discarded_by=f"image.package:{image.image_id}",
-                    reason="image_package_jit_boot_failed",
-                )
-            raise
-        return sorted(registered)
-
-    def _remove_registered_image_package_jit_tools(self, pid: str, handles: dict[str, ToolHandle]) -> None:
-        if not handles:
-            return
-        process = self.store.get_process(pid)
-        if process is not None:
-            for name, handle in handles.items():
-                if process.tool_table.get(name) == handle.tool_id:
-                    process.tool_table.pop(name, None)
-            process.updated_at = utc_now()
-            self.store.update_process(process)
-        for handle in handles.values():
-            candidate_rows = self.store.select_table_rows(
-                "tool_candidates",
-                "pid = ? AND registered_tool_id = ?",
-                (pid, handle.tool_id),
-            )
-            getattr(self.tools, "_jit_sources", {}).pop(handle.tool_id, None)
-            getattr(self.tools, "_handles", {}).pop(handle.tool_id, None)
-            self.store.delete_tool(handle.tool_id)
-            for row in candidate_rows:
-                self.tools.discard_candidate(
-                    pid,
-                    str(row["candidate_id"]),
-                    discarded_by="runtime",
-                    reason="image_package_jit_unpublished",
-                )
-
-    def _remove_registered_image_package_jit_tool_names(self, pid: str, names: list[str]) -> None:
-        if not names:
-            return
-        process = self.store.get_process(pid)
-        if process is None:
-            return
-        handles: dict[str, ToolHandle] = {}
-        for name in names:
-            tool_id = process.tool_table.get(name)
-            if tool_id is None or tool_id not in getattr(self.tools, "_jit_sources", {}):
-                continue
-            handle = getattr(self.tools, "_handles", {}).get(tool_id)
-            handles[name] = handle or ToolHandle(tool_id=tool_id, name=name, capability_id=None, scope="ephemeral_process")
-        self._remove_registered_image_package_jit_tools(pid, handles)
-
-    def _load_image_artifact(self, image: AgentImage, *, expected_kind: str | None = None) -> dict[str, Any]:
-        artifact_id = str(image.boot.get("artifact_id") or "")
-        expected_sha256 = str(image.boot.get("artifact_sha256") or "")
-        expected_kind = expected_kind or str(image.boot.get("kind") or "")
-        found = self.store.get_image_artifact(artifact_id)
-        if found is None:
-            raise NotFound(f"image artifact not found: {artifact_id}")
-        artifact, metadata = found
-        if expected_kind and artifact.get("kind") != expected_kind:
-            raise RuntimeError(f"image artifact kind mismatch: {artifact.get('kind')} != {expected_kind}")
-        expected_version = self.config.image_commit.artifact_version if artifact.get("kind") == "checkpoint_commit" else 1
-        if artifact.get("artifact_version") != expected_version:
-            raise RuntimeError(
-                "image artifact version mismatch: "
-                f"{artifact.get('artifact_version')} != {expected_version}"
-            )
-        actual_sha256 = hashlib.sha256(dumps(artifact).encode("utf-8")).hexdigest()
-        if expected_sha256 and metadata.get("sha256") != expected_sha256:
-            raise RuntimeError(f"image artifact hash mismatch for {artifact_id}")
-        if metadata.get("sha256") != actual_sha256:
-            raise RuntimeError(f"image artifact content hash mismatch for {artifact_id}")
-        return artifact
-
-    def _artifact_file_bytes(self, record: dict[str, Any]) -> bytes:
-        if record.get("kind") == "base64":
-            return base64.b64decode(str(record.get("content_base64") or ""))
-        return str(record.get("content") or "").encode("utf-8")
-
-    def _artifact_path_under(self, path: str, root: str) -> bool:
-        return path == root or path.startswith(f"{root.rstrip('/')}/")
-
-    def _relative_artifact_path(self, path: str, root: str) -> Path:
-        root = root.rstrip("/")
-        if path == root:
-            return Path()
-        if not path.startswith(f"{root}/"):
-            raise RuntimeError(f"artifact path is outside root: {path}")
-        return Path(path[len(root) + 1 :])
-
-    def _safe_materialized_segment(self, value: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.@+-]", "_", value)[:160] or "image"
-
-    def _remap_image_artifact_for_process(self, pid: str, artifact: dict[str, Any]) -> dict[str, Any]:
-        source_pid = str(artifact["source_pid"])
-        old_oids = list(artifact.get("object_oids", []))
-        oid_map = {oid: new_id("obj") for oid in old_oids}
-        namespace_map = {
-            namespace: self._remap_image_artifact_namespace(pid, source_pid, namespace)
-            for namespace in artifact.get("namespaces", [])
-        }
-        cap_rows = artifact.get("rows", {}).get("capabilities", [])
-        cap_map = {row["cap_id"]: new_id("cap") for row in cap_rows}
-        now = utc_now()
-        object_rows = [
-            self._remap_committed_object_row(row, pid, oid_map, namespace_map, now)
-            for row in artifact.get("rows", {}).get("objects", [])
-            if row["oid"] in oid_map
-        ]
-        namespace_rows = [
-            self._remap_committed_namespace_row(row, pid, namespace_map, now)
-            for row in artifact.get("rows", {}).get("object_namespaces", [])
-            if row["namespace"] in namespace_map
-        ]
-        link_rows = [
-            self._remap_committed_link_row(row, oid_map, now)
-            for row in artifact.get("rows", {}).get("object_links", [])
-            if row["src_oid"] in oid_map and row["dst_oid"] in oid_map
-        ]
-        capability_rows = [
-            self._remap_committed_capability_row(row, pid, oid_map, namespace_map, cap_map, now)
-            for row in cap_rows
-            if row["subject"] == source_pid
-        ]
-        payloads = {
-            oid_map[oid]: deepcopy(payload)
-            for oid, payload in artifact.get("object_payloads", {}).items()
-            if oid in oid_map
-        }
-        return {
-            "oid_map": oid_map,
-            "namespace_map": namespace_map,
-            "capability_map": cap_map,
-            "object_namespaces": namespace_rows,
-            "objects": object_rows,
-            "object_links": link_rows,
-            "capabilities": capability_rows,
-            "object_payloads": payloads,
-        }
-
-    def _remap_image_artifact_namespace(self, pid: str, source_pid: str, namespace: str) -> str:
-        source_process_namespace = self.memory.process_namespace(source_pid)
-        if namespace == source_process_namespace:
-            return self.memory.process_namespace(pid)
-        return f"image_commit/{pid}/{namespace}"
-
-    def _remap_committed_namespace_row(
-        self,
-        row: dict[str, Any],
-        pid: str,
-        namespace_map: dict[str, str],
-        now: str,
-    ) -> dict[str, Any]:
-        item = dict(row)
-        item["namespace"] = namespace_map[item["namespace"]]
-        if item.get("parent_namespace") in namespace_map:
-            item["parent_namespace"] = namespace_map[item["parent_namespace"]]
-        elif item["namespace"] == self.memory.process_namespace(pid):
-            item["parent_namespace"] = None
-        item["created_by"] = pid
-        metadata = loads(item.get("metadata_json"), {})
-        if metadata.get("kind") == "process":
-            metadata["pid"] = pid
-        item["metadata_json"] = dumps(metadata)
-        item["updated_at"] = now
-        return item
-
-    def _remap_committed_object_row(
-        self,
-        row: dict[str, Any],
-        pid: str,
-        oid_map: dict[str, str],
-        namespace_map: dict[str, str],
-        now: str,
-    ) -> dict[str, Any]:
-        item = dict(row)
-        old_oid = item["oid"]
-        item["oid"] = oid_map[old_oid]
-        if item.get("name") == old_oid:
-            item["name"] = item["oid"]
-        item["namespace"] = namespace_map.get(item["namespace"], item["namespace"])
-        item["created_by"] = pid
-        item["owner_kind"] = ObjectOwnerKind.PROCESS.value
-        item["owner_id"] = pid
-        item["lifecycle_state"] = "live"
-        item["deleted_at"] = None
-        provenance = loads(item.get("provenance_json"), {})
-        provenance["parent_oids"] = [oid_map.get(oid, oid) for oid in provenance.get("parent_oids", [])]
-        item["provenance_json"] = dumps(provenance)
-        item["payload_json"] = dumps(self.store.payload_marker(present=False))
-        item["created_at"] = now
-        item["updated_at"] = now
-        return item
-
-    def _remap_committed_link_row(self, row: dict[str, Any], oid_map: dict[str, str], now: str) -> dict[str, Any]:
-        item = dict(row)
-        item["id"] = new_id("link")
-        item["src_oid"] = oid_map[item["src_oid"]]
-        item["dst_oid"] = oid_map[item["dst_oid"]]
-        item["created_at"] = now
-        return item
-
-    def _remap_committed_capability_row(
-        self,
-        row: dict[str, Any],
-        pid: str,
-        oid_map: dict[str, str],
-        namespace_map: dict[str, str],
-        cap_map: dict[str, str],
-        now: str,
-    ) -> dict[str, Any]:
-        item = dict(row)
-        item["cap_id"] = cap_map[item["cap_id"]]
-        item["subject"] = pid
-        item["issuer_cap_id"] = cap_map.get(item.get("issuer_cap_id")) if item.get("issuer_cap_id") else None
-        item["parent_cap_id"] = cap_map.get(item.get("parent_cap_id")) if item.get("parent_cap_id") else None
-        resource = str(item["resource"])
-        if resource.startswith("object:"):
-            item["resource"] = f"object:{oid_map[resource.split(':', 1)[1]]}"
-        elif resource.startswith("object_namespace:"):
-            namespace = resource.split(":", 1)[1]
-            item["resource"] = f"object_namespace:{namespace_map[namespace]}"
-        item["issued_by"] = f"image.commit:{item['issued_by']}"
-        item["issued_at"] = now
-        return item
-
-    def _insert_committed_memory_rows(self, remapped: dict[str, Any]) -> None:
-        with self.store.transaction(include_object_payloads=True) as cur:
-            for row in remapped["object_namespaces"]:
-                exists = cur.execute("SELECT 1 FROM object_namespaces WHERE namespace = ?", (row["namespace"],)).fetchone()
-                if exists is None:
-                    self.checkpoint._insert_row(cur, "object_namespaces", row)
-            for row in remapped["objects"]:
-                item = dict(row)
-                oid = str(item["oid"])
-                if oid in remapped["object_payloads"]:
-                    item["payload_json"] = dumps(remapped["object_payloads"][oid])
-                self.checkpoint._insert_row(cur, "objects", item)
-                if oid in remapped["object_payloads"]:
-                    self.store.set_object_payload(oid, deepcopy(remapped["object_payloads"][oid]))
-            for table in ["object_links", "capabilities"]:
-                for row in remapped[table]:
-                    self.checkpoint._insert_row(cur, table, row)
-
-    def _assert_checkpoint_commit_image_data_flow(
-        self,
-        pid: str,
-        remapped: dict[str, Any],
-    ) -> None:
-        """Admit every restored Object to the target process before publication."""
-
-        for row in remapped["objects"]:
-            oid = str(row.get("oid") or "")
-            try:
-                metadata = ObjectMetadata.from_persisted(
-                    loads(row.get("metadata_json"), {})
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValidationError(
-                    f"invalid committed image Object metadata for {oid}: {exc}"
-                ) from exc
-            self.authority_manifests.assert_data_flow_labels(
-                pid,
-                DataLabels.from_object_metadata(metadata),
-            )
-
-    def _restore_committed_registry_rows(self, artifact: dict[str, Any]) -> None:
-        # Loaded Skills are process snapshots carried in ``loaded_skills`` and
-        # are resolved from each loaded record's package_snapshot. The global
-        # Skill registry is mutable host state: booting an old committed image
-        # must not replace the host's current package with a historical row.
-        # External/provider registries and trust decisions are likewise host
-        # state and are never restored here, even for legacy artifacts.
-        return None
-
-    def _restore_committed_tool_table(self, pid: str, artifact: dict[str, Any]) -> dict[str, str]:
-        tool_rows = {row["tool_id"]: row for row in artifact.get("rows", {}).get("tools", [])}
-        old_to_new: dict[str, str] = {}
-        table: dict[str, str] = {}
-        jit_sources = artifact.get("jit_sources", {})
-        for name, old_tool_id in artifact.get("tool_table", {}).items():
-            if old_tool_id in jit_sources:
-                row = tool_rows.get(old_tool_id)
-                if row is None:
-                    raise RuntimeError(f"committed JIT tool row is missing: {old_tool_id}")
-                new_tool_id = new_id("tool")
-                old_to_new[old_tool_id] = new_tool_id
-                spec = ToolSpec(**loads(row["spec_json"], {}))
-                handle = ToolHandle(tool_id=new_tool_id, name=row["name"], capability_id=None, scope=row["scope"])
-                now = utc_now()
-                self.tools._jit_sources[new_tool_id] = jit_sources[old_tool_id]
-                self.tools._handles[new_tool_id] = handle
-                self.store.insert_tool(handle, spec, registered_by=f"image.commit:{pid}", created_at=now, ephemeral=True)
-                self.store.insert_tool_candidate(
-                    ToolCandidate(
-                        candidate_id=new_id("tcand"),
-                        pid=pid,
-                        spec=spec,
-                        source_code=jit_sources[old_tool_id],
-                        tests=[],
-                        requested_capabilities=[],
-                        status=ToolCandidateStatus.REGISTERED,
-                        validation={"ok": True, "source": "image.commit"},
-                        created_at=now,
-                        updated_at=now,
-                        registered_tool_id=new_tool_id,
-                    )
-                )
-                table[name] = new_tool_id
-                continue
-            handle = self.tools.resolve(name)
-            old_to_new[old_tool_id] = handle.tool_id
-            table[name] = handle.tool_id
-        artifact["_tool_id_map"] = old_to_new
-        return table
-
-    def _remap_loaded_skills(self, loaded_skills: dict[str, Any], tool_table: dict[str, str]) -> dict[str, Any]:
-        updated = deepcopy(loaded_skills or {})
-        for loaded in updated.values():
-            if not isinstance(loaded, dict):
-                continue
-            for key in ["tool_ids", "jit_tool_ids", "base_tool_ids", "base_model_tool_ids"]:
-                mapping = loaded.get(key)
-                if not isinstance(mapping, dict):
-                    continue
-                loaded[key] = {
-                    name: tool_table[name]
-                    for name in mapping
-                    if name in tool_table
-                }
-        return updated
-
-    def _merge_committed_memory_view(self, process: Any, artifact: dict[str, Any], remapped: dict[str, Any]) -> None:
-        source = loads(artifact.get("source_process", {}).get("memory_view_json"), {})
-        if not source:
-            return
-        existing_roots = list(process.memory_view.roots) if process.memory_view is not None else []
-        roots = []
-        cap_map = remapped["capability_map"]
-        oid_map = remapped["oid_map"]
-        for root in source.get("roots", []):
-            old_oid = root.get("oid")
-            if old_oid not in oid_map:
-                continue
-            old_cap = root.get("capability_id")
-            new_oid = oid_map[old_oid]
-            rights = set(root.get("rights", []))
-            new_cap = cap_map.get(old_cap)
-            if new_cap is None:
-                handle = self.capability.handle_for_object(subject=process.pid, oid=new_oid, rights=rights, issued_by="image.commit")
-                new_cap = handle.capability_id
-            roots.append(ObjectHandle(oid=new_oid, rights=rights, capability_id=new_cap, expires_at=root.get("expires_at")))
-        for handle in existing_roots:
-            if all(item.oid != handle.oid for item in roots):
-                roots.append(handle)
-        if process.memory_view is None:
-            process.memory_view = self.memory.create_view(process.pid, roots, mode="mutable")
-        else:
-            process.memory_view.roots = roots
-
-    def _apply_loaded_skill_tool_table(self, pid: str) -> None:
-        process = self.store.get_process(pid)
-        if process is None or not process.loaded_skills:
-            return
-        updated = dict(process.tool_table)
-        updated_model = dict(process.model_tool_table)
-        for loaded in process.loaded_skills.values():
-            if not isinstance(loaded, dict):
-                continue
-            for mapping_key in ["tool_ids", "jit_tool_ids"]:
-                mapping = loaded.get(mapping_key)
-                if not isinstance(mapping, dict):
-                    continue
-                for name, tool_id in mapping.items():
-                    if isinstance(name, str) and isinstance(tool_id, str):
-                        updated[name] = tool_id
-                        # Skill activation is an explicit visibility action.
-                        # Its tools must enter the model projection even when
-                        # the base image uses lazy built-in tool groups.
-                        updated_model[name] = tool_id
-        process.tool_table = updated
-        process.model_tool_table = updated_model
-        process.updated_at = utc_now()
-        self.store.update_process(process)
+        return self.launch.resolve_working_directory(pid, path)

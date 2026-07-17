@@ -31,6 +31,7 @@ from agent_libos.models import (
     sink_pattern_matches,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
+from agent_libos.ports import DataReleaseApprovalPort
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 
@@ -73,14 +74,19 @@ class DataFlowManager:
         capabilities: Any,
         audit: Any,
         events: Any,
+        authority_manifests: Any,
+        objects: Any,
         *,
+        memory: Any,
         config: AgentLibOSConfig | None = None,
+        blocking_work_supervisor: Any | None = None,
     ) -> None:
         self.store = store
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
         self.config = config or DEFAULT_CONFIG
+        self.objects = objects
         # A process may host more than one Runtime sequentially or concurrently.
         # Keep ambient taint scoped to this manager so a source reference from a
         # closed Runtime can never leak into another store through ContextVar
@@ -93,15 +99,17 @@ class DataFlowManager:
             f"agent_libos_recovered_source_snapshot_access_{id(self)}",
             default=False,
         )
-        self.memory: Any | None = None
-        self.human: Any | None = None
-        self.authority_manifests: Any | None = None
+        self.memory = memory
+        self.human: DataReleaseApprovalPort | None = None
+        self.authority_manifests = authority_manifests
+        self._blocking_work_supervisor = blocking_work_supervisor
 
-    def bind_runtime(self, runtime: Any) -> None:
-        self.memory = runtime.memory
-        self.human = runtime.human
-        runtime.human.data_flow = self
-        self.authority_manifests = runtime.authority_manifests
+    def bind_human(self, human: DataReleaseApprovalPort) -> None:
+        """Complete the intentional DataFlow/Human construction cycle once."""
+
+        if self.human is not None and self.human is not human:
+            raise RuntimeError("DataFlowManager Human service is already bound")
+        self.human = human
 
     def bootstrap_configured_rules(self) -> None:
         """Reconcile Host configuration with bootstrap-owned durable rules."""
@@ -829,7 +837,11 @@ class DataFlowManager:
             except BaseException as exc:
                 return False, exc, self.current_context()
 
-        succeeded, value, returned_context = await asyncio.to_thread(invoke)
+        supervisor = self._blocking_work_supervisor
+        if supervisor is None:
+            succeeded, value, returned_context = await asyncio.to_thread(invoke)
+        else:
+            succeeded, value, returned_context = await supervisor.run(invoke)
         self.observe_ingress(returned_context)
         if not succeeded:
             assert isinstance(value, BaseException)
@@ -1021,7 +1033,7 @@ class DataFlowManager:
 
         File binding refs are valid data-flow sources but are not Object OIDs.
         Preserve them as provenance ``source_refs`` and recursively recover the
-        immutable binding's Object ancestry for legacy ``parent_oids`` users.
+        immutable binding's Object ancestry for provenance consumers.
         """
 
         parent_oids: dict[str, None] = {}
@@ -1122,8 +1134,8 @@ class DataFlowManager:
         *,
         require_read: bool = True,
     ) -> DataFlowContext:
-        if not oid or self.memory is None:
-            raise ValidationError("data-flow source Objects require a bound Object Memory manager")
+        if not oid:
+            raise ValidationError("data-flow source Objects require a non-empty Object id")
         if require_read:
             self.capabilities.require(
                 pid,
@@ -1132,7 +1144,7 @@ class DataFlowManager:
                 {"operation": "data_flow_source", "oid": oid},
                 consume=False,
             )
-        obj = self.store.get_object(oid)
+        obj = self.objects.get_object(oid)
         if obj is None:
             raise ValidationError(f"data-flow source Object not found: {oid}")
         content_hash = hashlib.sha256(dumps(to_jsonable(obj.payload)).encode("utf-8")).hexdigest()
@@ -1178,9 +1190,9 @@ class DataFlowManager:
                         f"{binding_id}"
                     )
                 continue
-            obj = self.store.get_object(ref.oid)
+            obj = self.objects.get_object(ref.oid)
             if obj is None:
-                rows = self.store.select_table_rows(
+                rows = self.objects.select_table_rows(
                     "objects",
                     "oid = ? AND lifecycle_state IN (?, ?)",
                     (ref.oid, "live", "released"),
@@ -1191,7 +1203,7 @@ class DataFlowManager:
                 if (
                     row.get("lifecycle_state") != "released"
                     or not allow_recovered_source_snapshots
-                    or not self.store.is_recovered_object_payload(ref.oid)
+                    or not self.objects.is_recovered_object_payload(ref.oid)
                 ):
                     return f"data-flow source Object is no longer live: {ref.oid}"
                 # Object payloads are intentionally runtime-local. A durable
@@ -1201,7 +1213,7 @@ class DataFlowManager:
                 # into this narrow resume path.
                 if int(row.get("version") or 0) != ref.version:
                     return f"data-flow source Object changed before dispatch: {ref.oid}"
-                if self.store.has_object_payload(ref.oid):
+                if self.objects.has_object_payload(ref.oid):
                     return f"data-flow source Object payload is unavailable: {ref.oid}"
                 continue
             actual_hash = hashlib.sha256(dumps(to_jsonable(obj.payload)).encode("utf-8")).hexdigest()
@@ -1354,11 +1366,8 @@ class DataFlowManager:
                 "operation": binding.operation,
             },
         }
-        request = getattr(self.human, "request_data_release", None)
-        if not callable(request):
-            raise ValidationError("Human manager does not implement trusted data-release requests")
         return str(
-            request(
+            self.human.request_data_release(
                 pid=pid,
                 human=self.config.runtime.default_human,
                 request=payload,
@@ -1507,12 +1516,7 @@ class DataFlowManager:
         raise DataFlowDenied(decision, sink)
 
     def _manifest_hash(self, pid: str) -> str:
-        manager = self.authority_manifests or getattr(
-            self.store,
-            "authority_manifest_manager",
-            None,
-        )
-        manifest = manager.get_for_process(pid) if manager is not None else None
+        manifest = self.authority_manifests.get_for_process(pid)
         if manifest is not None and getattr(manifest, "manifest_hash", None):
             return str(manifest.manifest_hash)
         return hashlib.sha256(f"no-authority-manifest:{pid}".encode("utf-8")).hexdigest()

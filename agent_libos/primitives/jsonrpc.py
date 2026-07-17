@@ -36,13 +36,13 @@ from agent_libos.models import (
     ResourceUsage,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import RuntimeStore
+from agent_libos.ports import AuditPort, EventPort
+from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import JsonRpcProvider, ProviderEffectNotStarted
 from agent_libos.sdk import (
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
+    ProtectedOperationSDK,
     ProviderPhase,
     ResourceSettlement,
 )
@@ -67,21 +67,25 @@ class JsonRpcPrimitive:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        unit_of_work: UnitOfWork,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus,
+        audit: AuditPort,
+        events: EventPort,
         *,
+        protected_operations: ProtectedOperationSDK,
         human: HumanObjectManager | None,
         provider: JsonRpcProvider,
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
-        self.store = store
+        self.unit_of_work = unit_of_work
+        self.extensions = unit_of_work.extensions
+        self.authority = unit_of_work.authority
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.protected_operations = protected_operations
         self.human = human
         self.provider = provider
         self.resources = resources
@@ -112,8 +116,8 @@ class JsonRpcPrimitive:
                 consume=False,
             )
         now = utc_now()
-        with self.store.transaction():
-            existing = self.store.get_jsonrpc_endpoint(spec.endpoint_id)
+        with self.unit_of_work.transaction():
+            existing = self.extensions.get_jsonrpc_endpoint(spec.endpoint_id)
             if existing is not None and not replace:
                 raise ValidationError(f"JSON-RPC endpoint already exists: {spec.endpoint_id}")
             authority_reservation = self.capabilities.reserve_decision_use(
@@ -121,7 +125,7 @@ class JsonRpcPrimitive:
                 used_by=actor,
                 reason="one-time JSON-RPC endpoint registry authority reserved",
             )
-            self.store.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
+            self.extensions.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
             if existing is not None:
                 self._disable_replaced_endpoint_method_capabilities(spec.endpoint_id, actor=actor)
             self.capabilities.commit_reserved_use(
@@ -202,7 +206,7 @@ class JsonRpcPrimitive:
             self.capabilities.require(actor, self.config.jsonrpc.registry_resource, CapabilityRight.READ)
         selected_limit = self._bounded_list_limit(limit)
         endpoints: list[dict[str, Any]] = []
-        rows = self.store.list_jsonrpc_endpoints(text=text, limit=selected_limit + 1)
+        rows = self.extensions.list_jsonrpc_endpoints(text=text, limit=selected_limit + 1)
         for spec, metadata in rows[:selected_limit]:
             self._validate_endpoint(spec)
             endpoints.append(self._endpoint_to_json(spec, metadata, include_sensitive_fields=False))
@@ -236,7 +240,7 @@ class JsonRpcPrimitive:
                 CapabilityRight.ADMIN,
                 consume=False,
             )
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             self._load_endpoint(endpoint_id)
             authority_reservation = self.capabilities.reserve_decision_use(
                 authority_decision,
@@ -244,7 +248,7 @@ class JsonRpcPrimitive:
                 reason="one-time JSON-RPC endpoint unregister authority reserved",
             )
             self._disable_replaced_endpoint_method_capabilities(endpoint_id, actor=actor)
-            self.store.delete_jsonrpc_endpoint(endpoint_id)
+            self.extensions.delete_jsonrpc_endpoint(endpoint_id)
             self.capabilities.commit_reserved_use(
                 authority_reservation,
                 committed_by=actor,
@@ -379,7 +383,9 @@ class JsonRpcPrimitive:
                         body=b"",
                         elapsed_s=time.monotonic() - started,
                         response_bytes=0,
-                        error=f"{type(exc).__name__}: {exc}",
+                        error="provider transport failed",
+                        error_type=type(exc).__name__,
+                        correlation_id=new_id("corr"),
                     )
 
             transport = protected.call(
@@ -452,12 +458,7 @@ class JsonRpcPrimitive:
         )
 
     def _protected(self):
-        sdk = getattr(self, "protected_operations", None) or getattr(
-            self.store, "protected_operation_sdk", None
-        )
-        if sdk is None:
-            raise ValidationError("JsonRpcPrimitive requires ProtectedOperationSDK")
-        return sdk
+        return self.protected_operations
 
     def _data_flow(self) -> Any:
         manager = getattr(self, "data_flow", None) or getattr(
@@ -719,7 +720,22 @@ class JsonRpcPrimitive:
         transport: JsonRpcTransportResult,
     ) -> JsonRpcCallResult:
         if transport.error and transport.status_code is None:
-            return self._failure(endpoint, method, request_id, JsonRpcCallStatus.TRANSPORT_ERROR, transport, transport.error)
+            return JsonRpcCallResult(
+                endpoint_id=endpoint.endpoint_id,
+                method_id=method.method_id,
+                rpc_method=method.rpc_method,
+                request_id=request_id,
+                status=JsonRpcCallStatus.TRANSPORT_ERROR,
+                http_status=None,
+                ok=False,
+                error={
+                    "code": "jsonrpc_transport_error",
+                    "error_type": transport.error_type or "TransportError",
+                    "correlation_id": transport.correlation_id or new_id("corr"),
+                },
+                response_bytes=transport.response_bytes,
+                duration_s=transport.elapsed_s,
+            )
         if transport.too_large:
             return self._failure(
                 endpoint,
@@ -1166,7 +1182,7 @@ class JsonRpcPrimitive:
 
     def _disable_replaced_endpoint_method_capabilities(self, endpoint_id: str, *, actor: str) -> None:
         prefix = f"jsonrpc:{endpoint_id}:"
-        for cap in self.store.list_capabilities():
+        for cap in self.authority.list_capabilities():
             if not cap.active or cap.revoked:
                 continue
             if cap.resource == f"jsonrpc:{endpoint_id}:*" or cap.resource.startswith(prefix):
@@ -1243,7 +1259,7 @@ class JsonRpcPrimitive:
 
     def _load_endpoint(self, endpoint_id: str) -> tuple[JsonRpcEndpointSpec, dict[str, Any]]:
         self._validate_identifier(endpoint_id, "endpoint_id", self.config.jsonrpc.endpoint_id_max_chars)
-        found = self.store.get_jsonrpc_endpoint(endpoint_id)
+        found = self.extensions.get_jsonrpc_endpoint(endpoint_id)
         if found is None:
             raise NotFound(f"JSON-RPC endpoint not found: {endpoint_id}")
         spec, metadata = found

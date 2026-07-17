@@ -15,6 +15,7 @@ import pytest
 
 from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import (
+    AgentProcess,
     AuditRecord,
     CapabilityRight,
     ContextMaterializationManifest,
@@ -44,10 +45,11 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessMessageStatus,
     ProcessStatus,
+    ResourceBudget,
+    ResourceUsage,
     SinkTrustSpec,
 )
 from agent_libos.runtime.runtime import Runtime
-from agent_libos.storage.base import LEGACY_PENDING_DATA_FLOW_MESSAGE
 from agent_libos.sdk import (
     ProtectedOperationContract,
     ProtectedOperationInvocation,
@@ -67,6 +69,206 @@ PERSISTENT_STORE_BACKENDS = [
     "sqlite-file",
     pytest.param("postgres", marks=pytest.mark.postgres),
 ]
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_reopen_fails_closed_stale_running_execution_with_audit(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        pid = runtime.process.spawn(goal="leave a stale execution lease")
+        token = runtime.store.claim_execution(pid, owner_id="runtime_that_crashed")
+        assert token is not None
+        runtime.close()
+
+        reopened = Runtime.open(target, config=config)
+        try:
+            process = reopened.process.get(pid)
+            assert process.status == ProcessStatus.PAUSED
+            assert process.status_message == "stale_execution_recovery"
+            assert process.execution_owner_id is None
+            assert process.execution_lease_id is None
+            assert process.execution_generation > token.generation
+            records = reopened.audit.trace(target=f"process:{pid}")
+            assert any(record.action == "stale_execution_recovery" for record in records)
+        finally:
+            reopened.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_reopen_compensates_incomplete_process_launch_publication(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        now = utc_now()
+        pid = f"pid-partial-{uuid4().hex}"
+        publication_id = f"publication-partial-{uuid4().hex}"
+        runtime.store.insert_runtime_publication(
+            publication_id=publication_id,
+            kind="process_launch",
+            pid=pid,
+            owner_instance_id="crashed-runtime",
+            plan={"pid": pid, "launch_kind": "spawn", "image_id": "base-agent:v0"},
+        )
+        runtime.store.insert_process(
+            AgentProcess(
+                pid=pid,
+                parent_pid=None,
+                image_id="base-agent:v0",
+                status=ProcessStatus.CREATED,
+                goal_oid=None,
+                memory_view=None,
+                capabilities=[],
+                loaded_skills={},
+                tool_table={},
+                event_cursor=None,
+                checkpoint_head=None,
+                resource_budget=ResourceBudget(),
+                resource_usage=ResourceUsage(),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        runtime.store.advance_runtime_publication(
+            publication_id,
+            state="applying",
+            phase="process_inserted",
+            expected_states={"planning"},
+        )
+        runtime.close()
+
+        reopened = Runtime.open(target, config=config)
+        try:
+            assert reopened.store.get_process(pid) is None
+            publication = reopened.store.get_runtime_publication(publication_id)
+            assert publication is not None
+            assert publication["state"] == "rolled_back"
+            assert publication["phase"] == "startup_compensated"
+        finally:
+            reopened.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_reopen_compensates_incomplete_process_exec_publication(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        pid = runtime.process.spawn(goal="before interrupted exec")
+        before = runtime.process_exec_state.capture(pid)
+        publication_id = f"publication-exec-{uuid4().hex}"
+        runtime.store.insert_runtime_publication(
+            publication_id=publication_id,
+            kind="process_exec",
+            pid=pid,
+            owner_instance_id="crashed-runtime",
+            plan={
+                "pid": pid,
+                "image_id": "coding-agent:v0",
+                "before_snapshot": before.snapshot.to_mapping(),
+                "before_tool_ids": sorted(before.tool_ids),
+            },
+        )
+        process = runtime.process.get(pid)
+        runtime.store.patch_process(
+            pid,
+            {"image_id": "coding-agent:v0"},
+            expected_revision=process.revision,
+        )
+        runtime.store.advance_runtime_publication(
+            publication_id,
+            state="applying",
+            phase="process_exec_applied",
+            expected_states={"planning"},
+        )
+        runtime.close()
+
+        reopened = Runtime.open(target, config=config)
+        try:
+            assert reopened.process.get(pid).image_id == "base-agent:v0"
+            publication = reopened.store.get_runtime_publication(publication_id)
+            assert publication is not None and publication["state"] == "rolled_back"
+        finally:
+            reopened.close()
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_runtime_publication_terminal_phase_preserves_original_error(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        publication_id = f"publication-error-{uuid4().hex}"
+        pid = f"pid-error-{uuid4().hex}"
+        runtime.store.insert_runtime_publication(
+            publication_id=publication_id,
+            kind="process_launch",
+            pid=pid,
+            owner_instance_id="test-runtime",
+            plan={"pid": pid},
+        )
+        assert runtime.store.advance_runtime_publication(
+            publication_id,
+            state="rollback_pending",
+            phase="compensating",
+            error={"code": "launch_failed", "error_type": "InjectedFailure"},
+            expected_states={"planning"},
+        )
+        assert runtime.store.advance_runtime_publication(
+            publication_id,
+            state="rolled_back",
+            phase="compensated",
+            receipt={"phase": "compensated", "pid": pid},
+            expected_states={"rollback_pending"},
+        )
+
+        publication = runtime.store.get_runtime_publication(publication_id)
+        assert publication is not None
+        assert publication["error"] == {
+            "code": "launch_failed",
+            "error_type": "InjectedFailure",
+        }
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_llm_call_limit_selects_latest_window_then_returns_chronologically(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        records = [
+            ("call-old", "pid-a", "2026-01-01T00:00:01+00:00"),
+            ("call-tie-a", "pid-a", "2026-01-01T00:00:02+00:00"),
+            ("call-tie-b", "pid-a", "2026-01-01T00:00:02+00:00"),
+            ("call-new", "pid-a", "2026-01-01T00:00:03+00:00"),
+            ("call-global-new", "pid-b", "2026-01-01T00:00:04+00:00"),
+        ]
+        for call_id, pid, created_at in records:
+            runtime.store.insert_llm_call(
+                LLMCallRecord(
+                    call_id=call_id,
+                    pid=pid,
+                    image_id=None,
+                    purpose="latest-window",
+                    status="ok",
+                    created_at=created_at,
+                )
+            )
+
+        assert [call.call_id for call in runtime.store.list_llm_calls(limit=3)] == [
+            "call-tie-b",
+            "call-new",
+            "call-global-new",
+        ]
+        assert [call.call_id for call in runtime.store.list_llm_calls(pid="pid-a", limit=2)] == [
+            "call-tie-b",
+            "call-new",
+        ]
 
 
 @contextlib.contextmanager
@@ -478,478 +680,6 @@ def test_legacy_process_message_envelope_marker_remains_user_payload(
         assert decoded.metadata["custom"] == "preserved"
 
 
-@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
-def test_legacy_flow_columns_migrate_conservatively(
-    kind: str,
-    tmp_path: Path,
-) -> None:
-    with _persistent_target(kind, tmp_path) as (target, config):
-        assert target is not None
-        runtime = Runtime.open(target, config=config)
-        try:
-            parent_pid = runtime.process.spawn(image="base-agent:v0", goal="legacy durable flow parent")
-            pid = runtime.process.spawn_child(parent_pid, goal="legacy durable flow state")
-            runtime.capability.grant_once(
-                pid,
-                "human:owner",
-                [CapabilityRight.WRITE],
-                issued_by="test",
-            )
-            request_id = runtime.human.ask(pid, "legacy request must not survive migration")
-            with pytest.raises(ProcessWaitRequired):
-                runtime.process.wait(parent_pid, pid)
-            assert runtime.store.list_resource_reservations(child_pid=pid)
-            message = runtime.messages.post(
-                sender="legacy.sender",
-                recipient_pid=pid,
-                subject="legacy message",
-                body="content whose historical classification is unavailable",
-            )
-            runtime.store.upsert_llm_pending_action(
-                pid,
-                {
-                    "resume_token": "legacy-flow-token",
-                    "wait_type": "message",
-                    "filters": {"channel": "legacy"},
-                    "action": {"action": "receive_process_messages", "channel": "legacy"},
-                    "data_flow_context": DataFlowContext(
-                        labels=DataLabels(
-                            sensitivity="secret",
-                            trust_level="untrusted",
-                            integrity="untrusted",
-                        )
-                    ).to_dict(),
-                    "content_preview": "",
-                    "tool_call_count": 1,
-                    "status": "pending",
-                },
-            )
-        finally:
-            runtime.close()
-
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                connection.execute(
-                    "ALTER TABLE llm_pending_actions DROP COLUMN data_flow_context_json"
-                )
-                connection.execute("ALTER TABLE process_messages DROP COLUMN metadata_json")
-                connection.commit()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                connection.execute(
-                    "ALTER TABLE llm_pending_actions DROP COLUMN data_flow_context_json"
-                )
-                connection.execute("ALTER TABLE process_messages DROP COLUMN metadata_json")
-
-        reopened = Runtime.open(target, config=config)
-        try:
-            pending = reopened.store.get_llm_pending_action(pid)
-            assert pending is not None
-            assert pending["status"] == "legacy_data_flow_reconciled"
-            pending_context = DataFlowContext.from_dict(pending["data_flow_context"])
-            assert pending_context.labels.sensitivity.value == "secret"
-            assert pending_context.labels.trust_level.value == "untrusted"
-            assert reopened.process.get(pid).status == ProcessStatus.FAILED
-            assert reopened.process.get(parent_pid).status == ProcessStatus.RUNNABLE
-            assert reopened.store.list_resource_reservations(child_pid=pid) == []
-            assert reopened.human.get(request_id).status == HumanRequestStatus.CANCELLED
-            assert request_id not in {item.request_id for item in reopened.human.pending()}
-            assert pid not in reopened.llm._pending_message_actions
-
-            next_pid = reopened.process.spawn(image="base-agent:v0", goal="later human request")
-            reopened.capability.grant_once(
-                next_pid,
-                "human:owner",
-                [CapabilityRight.WRITE],
-                issued_by="test",
-            )
-            next_request_id = reopened.human.ask(next_pid, "continue after migrated request")
-            processed = reopened.human.process_next_terminal(auto_answer="continue")
-            assert processed is not None
-            assert processed.request_id == next_request_id
-
-            restored_message = reopened.store.get_process_message(message.message_id)
-            assert restored_message is not None
-            assert restored_message.status == ProcessMessageStatus.UNREAD
-            assert restored_message.metadata["data_labels"]["sensitivity"] == "secret"
-            assert restored_message.metadata["data_labels"]["trust_level"] == "untrusted"
-            assert restored_message.metadata["data_labels"]["integrity"] == "untrusted"
-        finally:
-            reopened.close()
-
-
-def test_legacy_pending_terminal_reconciliation_resumes_after_claim(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "legacy-reconciling.sqlite"
-    runtime = Runtime.open(target)
-    try:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="resume legacy cleanup")
-        runtime.capability.grant_once(
-            pid,
-            "human:owner",
-            [CapabilityRight.WRITE],
-            issued_by="test",
-        )
-        request_id = runtime.human.ask(pid, "cancel me after claimed migration")
-        runtime.store.upsert_llm_pending_action(
-            pid,
-            {
-                "resume_token": "legacy-claimed-token",
-                "wait_type": "human",
-                "request_id": request_id,
-                "filters": {},
-                "action": {"action": "ask_human"},
-                "data_flow_context": DataFlowContext().to_dict(),
-                "content_preview": "",
-                "tool_call_count": 1,
-                "status": "pending",
-            },
-        )
-    finally:
-        runtime.close()
-
-    # Simulate a crash after the atomic process transition/claim committed but
-    # before manager cleanup and marker completion.
-    with sqlite3.connect(target) as connection:
-        connection.execute(
-            "UPDATE llm_pending_actions SET status = ? WHERE pid = ?",
-            ("legacy_data_flow_reconciling", pid),
-        )
-        connection.execute(
-            "UPDATE processes SET status = ?, status_message = ? WHERE pid = ?",
-            (ProcessStatus.FAILED.value, LEGACY_PENDING_DATA_FLOW_MESSAGE, pid),
-        )
-        connection.commit()
-
-    reopened = Runtime.open(target)
-    try:
-        pending = reopened.store.get_llm_pending_action(pid)
-        assert pending is not None
-        assert pending["status"] == "legacy_data_flow_reconciled"
-        assert reopened.human.get(request_id).status == HumanRequestStatus.CANCELLED
-        assert request_id not in {item.request_id for item in reopened.human.pending()}
-    finally:
-        reopened.close()
-
-
-def test_historical_terminal_reconciliation_still_runs_manager_cleanup(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "historical-terminal-reconciling.sqlite"
-    runtime = Runtime.open(target)
-    try:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="historical terminal cleanup")
-        runtime.capability.grant_once(
-            pid,
-            "human:owner",
-            [CapabilityRight.WRITE],
-            issued_by="test",
-        )
-        request_id = runtime.human.ask(pid, "cancel after historical terminal crash")
-        runtime.store.upsert_llm_pending_action(
-            pid,
-            {
-                "resume_token": "historical-terminal-token",
-                "wait_type": "human",
-                "request_id": request_id,
-                "filters": {},
-                "action": {"action": "ask_human"},
-                "data_flow_context": DataFlowContext().to_dict(),
-                "content_preview": "",
-                "tool_call_count": 1,
-                "status": "pending",
-            },
-        )
-    finally:
-        runtime.close()
-
-    with sqlite3.connect(target) as connection:
-        connection.execute(
-            "UPDATE llm_pending_actions SET status = ? WHERE pid = ?",
-            ("legacy_data_flow_reconciling", pid),
-        )
-        connection.execute(
-            "UPDATE processes SET status = ?, status_message = ? WHERE pid = ?",
-            (ProcessStatus.KILLED.value, "historical terminal reason", pid),
-        )
-        connection.commit()
-
-    reopened = Runtime.open(target)
-    try:
-        pending = reopened.store.get_llm_pending_action(pid)
-        assert pending is not None
-        assert pending["status"] == "legacy_data_flow_reconciled"
-        assert reopened.human.get(request_id).status == HumanRequestStatus.CANCELLED
-        assert request_id not in {item.request_id for item in reopened.human.pending()}
-    finally:
-        reopened.close()
-
-
-def test_historical_terminal_reconciliation_notifies_waiting_object_task() -> None:
-    runtime = Runtime.open("local")
-    try:
-        creator_pid = runtime.process.spawn(
-            image="base-agent:v0",
-            goal="observe historical child terminal cleanup",
-        )
-        runtime.capability.grant(
-            creator_pid,
-            "process:spawn",
-            [CapabilityRight.WRITE],
-            issued_by="test",
-        )
-        owner = runtime.memory.create_object(
-            creator_pid,
-            ObjectType.ARTIFACT,
-            {"task": "wait for migrated child"},
-            name="historical.terminal.object-task-owner",
-            metadata=ObjectMetadata(title="historical terminal owner"),
-            immutable=False,
-        )
-        task = runtime.object_tasks.start(
-            creator_pid,
-            owner,
-            "receive_process_messages",
-            {"channel": "never"},
-        )
-        waiting = runtime.object_tasks.wait(task.task_id, actor_pid=creator_pid, timeout=2)
-        assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
-        runner_pid = str(waiting.runner_pid)
-        runtime.capability.grant(
-            runner_pid,
-            "process:spawn",
-            [CapabilityRight.WRITE],
-            issued_by="test",
-        )
-        child_pid = runtime.spawn_child_process(
-            runner_pid,
-            "historical terminal child",
-        )
-        runtime.tools.configure_process_tools(
-            runner_pid,
-            ["wait_child_process"],
-            assigned_by="test",
-        )
-        runtime.object_tasks._pending_args[task.task_id] = {"child_pid": child_pid}
-        runtime.store.update_object_task(
-            replace(
-                waiting,
-                status=ObjectTaskStatus.WAITING_PROCESS,
-                tool="wait_child_process",
-                wait={"child_pid": child_pid},
-            )
-        )
-        runtime.store.upsert_llm_pending_action(
-            child_pid,
-            {
-                "resume_token": "historical-object-task-token",
-                "wait_type": "message",
-                "filters": {},
-                "action": {"action": "receive_process_messages"},
-                "data_flow_context": DataFlowContext().to_dict(),
-                "content_preview": "",
-                "tool_call_count": 1,
-                "status": "pending",
-            },
-        )
-        child = runtime.process.get(child_pid)
-        child.status = ProcessStatus.KILLED
-        child.status_message = "historical object-task terminal reason"
-        child.updated_at = utc_now()
-        runtime.store.update_process(child)
-        runtime.store._execute(
-            "UPDATE llm_pending_actions SET status = ? WHERE pid = ?",
-            ("legacy_data_flow_reconciling", child_pid),
-        )
-
-        runtime._reconcile_legacy_pending_action_terminals()
-        completed = runtime.object_tasks.wait(
-            task.task_id,
-            actor_pid=creator_pid,
-            timeout=2,
-        )
-
-        assert completed.status == ObjectTaskStatus.SUCCEEDED
-        assert any(
-            record.action == "object_task.process_resume"
-            and record.target == f"object_task:{task.task_id}"
-            for record in runtime.audit.trace()
-        )
-        pending = runtime.store.get_llm_pending_action(child_pid)
-        assert pending is not None
-        assert pending["status"] == "legacy_data_flow_reconciled"
-    finally:
-        runtime.close()
-
-
-def test_historical_terminal_reconciliation_preserves_result_object() -> None:
-    runtime = Runtime.open("local")
-    try:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="preserve historical result")
-        result = runtime.memory.create_object(
-            pid,
-            ObjectType.SUMMARY,
-            {"result": True},
-            name="historical.result",
-        )
-        transient = runtime.memory.create_object(
-            pid,
-            ObjectType.OBSERVATION,
-            {"transient": True},
-            name="historical.transient",
-        )
-        runtime.store.upsert_llm_pending_action(
-            pid,
-            {
-                "resume_token": "historical-result-token",
-                "wait_type": "message",
-                "filters": {},
-                "action": {"action": "receive_process_messages"},
-                "data_flow_context": DataFlowContext().to_dict(),
-                "content_preview": "",
-                "tool_call_count": 1,
-                "status": "pending",
-            },
-        )
-        process = runtime.process.get(pid)
-        process.status = ProcessStatus.EXITED
-        process.status_message = f"result_oid:{result.oid}"
-        runtime.store.update_process(process)
-        runtime.store._execute(
-            "UPDATE llm_pending_actions SET status = ? WHERE pid = ?",
-            ("legacy_data_flow_reconciling", pid),
-        )
-
-        runtime._reconcile_legacy_pending_action_terminals()
-
-        assert runtime.store.get_object(result.oid) is not None
-        assert runtime.store.get_object(transient.oid) is None
-    finally:
-        runtime.close()
-
-
-def test_legacy_terminal_reconciliation_continues_after_pid_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime = Runtime.open("local")
-    try:
-        pids: list[str] = []
-        request_ids: list[str] = []
-        for index in range(2):
-            pid = runtime.process.spawn(image="base-agent:v0", goal=f"legacy pid {index}")
-            runtime.capability.grant_once(
-                pid,
-                "human:owner",
-                [CapabilityRight.WRITE],
-                issued_by="test",
-            )
-            request_ids.append(runtime.human.ask(pid, f"legacy request {index}"))
-            runtime.store.upsert_llm_pending_action(
-                pid,
-                {
-                    "resume_token": f"legacy-starvation-{index}",
-                    "wait_type": "human",
-                    "request_id": request_ids[-1],
-                    "filters": {},
-                    "action": {"action": "ask_human"},
-                    "data_flow_context": DataFlowContext().to_dict(),
-                    "content_preview": "",
-                    "tool_call_count": 1,
-                    "status": "pending",
-                },
-            )
-            pids.append(pid)
-        runtime.store._execute(
-            "UPDATE llm_pending_actions SET status = ?, updated_at = ? WHERE pid = ?",
-            ("legacy_data_flow_invalidated", "0000", pids[0]),
-        )
-        runtime.store._execute(
-            "UPDATE llm_pending_actions SET status = ?, updated_at = ? WHERE pid = ?",
-            ("legacy_data_flow_invalidated", "9999", pids[1]),
-        )
-        original = runtime.process.reconcile_legacy_pending_action_terminal
-
-        def fail_first(pid: str, **kwargs):
-            if pid == pids[0]:
-                raise RuntimeError("injected first pid cleanup failure")
-            return original(pid, **kwargs)
-
-        monkeypatch.setattr(
-            runtime.process,
-            "reconcile_legacy_pending_action_terminal",
-            fail_first,
-        )
-
-        with pytest.raises(RuntimeError, match="injected first pid cleanup failure"):
-            runtime._reconcile_legacy_pending_action_terminals()
-
-        first = runtime.store.get_llm_pending_action(pids[0])
-        second = runtime.store.get_llm_pending_action(pids[1])
-        assert first is not None and first["status"] == "legacy_data_flow_invalidated"
-        assert second is not None and second["status"] == "legacy_data_flow_reconciled"
-        assert runtime.process.get(pids[1]).status == ProcessStatus.FAILED
-        assert runtime.human.get(request_ids[1]).status == HumanRequestStatus.CANCELLED
-    finally:
-        runtime.close()
-
-
-def test_failed_runtime_open_does_not_leak_object_task_thread(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = tmp_path / "failed-reconciliation.sqlite"
-    runtime = Runtime.open(target)
-    try:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="fail migration open")
-        runtime.store.upsert_llm_pending_action(
-            pid,
-            {
-                "resume_token": "failed-open-token",
-                "wait_type": "message",
-                "filters": {},
-                "action": {"action": "receive_process_messages"},
-                "data_flow_context": DataFlowContext().to_dict(),
-                "content_preview": "",
-                "tool_call_count": 1,
-                "status": "pending",
-            },
-        )
-    finally:
-        runtime.close()
-
-    with sqlite3.connect(target) as connection:
-        connection.execute(
-            "UPDATE llm_pending_actions SET status = ? WHERE pid = ?",
-            ("legacy_data_flow_invalidated", pid),
-        )
-        connection.commit()
-
-    from agent_libos.runtime.process_manager import ProcessManager
-
-    def fail_reconciliation(self, selected_pid: str, **_kwargs):
-        raise RuntimeError(f"injected reconciliation failure for {selected_pid}")
-
-    monkeypatch.setattr(
-        ProcessManager,
-        "reconcile_legacy_pending_action_terminal",
-        fail_reconciliation,
-    )
-    before = sum(
-        thread.name == "agent-libos-object-tasks"
-        for thread in threading.enumerate()
-    )
-
-    with pytest.raises(RuntimeError, match="injected reconciliation failure"):
-        Runtime.open(target)
-
-    after = sum(
-        thread.name == "agent-libos-object-tasks"
-        for thread in threading.enumerate()
-    )
-    assert after == before
 
 
 @pytest.mark.parametrize(
@@ -964,7 +694,6 @@ def test_noncanonical_pending_flow_context_fails_closed_on_reopen(
     kind: str,
     raw_context: str,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with _persistent_target(kind, tmp_path) as (target, config):
         assert target is not None
@@ -993,10 +722,6 @@ def test_noncanonical_pending_flow_context_fails_closed_on_reopen(
                     "UPDATE llm_pending_actions SET data_flow_context_json = ? WHERE pid = ?",
                     (raw_context, pid),
                 )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = ?",
-                    ("llm_pending_action_data_flow_context",),
-                )
                 connection.commit()
         else:
             import psycopg
@@ -1006,36 +731,9 @@ def test_noncanonical_pending_flow_context_fails_closed_on_reopen(
                     "UPDATE llm_pending_actions SET data_flow_context_json = %s WHERE pid = %s",
                     (raw_context, pid),
                 )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = %s",
-                    ("llm_pending_action_data_flow_context",),
-                )
 
-        reopened = Runtime.open(target, config=config)
-        try:
-            assert reopened.process.get(pid).status == ProcessStatus.FAILED
-            pending = reopened.store.get_llm_pending_action(pid)
-            assert pending is not None
-            assert pending["status"] == "legacy_data_flow_reconciled"
-            labels = DataFlowContext.from_dict(pending["data_flow_context"]).labels
-            assert labels.sensitivity.value == "secret"
-            assert labels.trust_level.value == "untrusted"
-            assert labels.integrity.value == "untrusted"
-        finally:
-            reopened.close()
-
-        import agent_libos.storage.sqlite as sqlite_store_module
-
-        def fail_if_rescanned(_context):
-            raise AssertionError("completed pending-context migration rescanned history")
-
-        monkeypatch.setattr(
-            sqlite_store_module,
-            "_canonical_pending_data_flow_context",
-            fail_if_rescanned,
-        )
-        second_reopen = Runtime.open(target, config=config)
-        second_reopen.close()
+        with pytest.raises(ValidationError, match="pending LLM action"):
+            Runtime.open(target, config=config)
 
 
 @pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
@@ -1079,10 +777,6 @@ def test_minimal_complete_pending_flow_context_is_normalized_without_failure(
                     "UPDATE llm_pending_actions SET data_flow_context_json = ? WHERE pid = ?",
                     (minimal, pid),
                 )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = ?",
-                    ("llm_pending_action_data_flow_context",),
-                )
                 connection.commit()
         else:
             import psycopg
@@ -1091,10 +785,6 @@ def test_minimal_complete_pending_flow_context_is_normalized_without_failure(
                 connection.execute(
                     "UPDATE llm_pending_actions SET data_flow_context_json = %s WHERE pid = %s",
                     (minimal, pid),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = %s",
-                    ("llm_pending_action_data_flow_context",),
                 )
 
         reopened = Runtime.open(target, config=config)
@@ -1111,178 +801,6 @@ def test_minimal_complete_pending_flow_context_is_normalized_without_failure(
             reopened.close()
 
 
-@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
-def test_pending_context_migration_resumes_from_durable_cursor(
-    kind: str,
-    tmp_path: Path,
-) -> None:
-    with _persistent_target(kind, tmp_path) as (target, config):
-        assert target is not None
-        runtime = Runtime.open(target, config=config)
-        try:
-            pids = [
-                runtime.process.spawn(
-                    image="base-agent:v0",
-                    goal=f"resume pending-context migration {index}",
-                )
-                for index in range(3)
-            ]
-            for index, pid in enumerate(pids):
-                runtime.store.upsert_llm_pending_action(
-                    pid,
-                    {
-                        "resume_token": f"pending-migration-token-{index}",
-                        "wait_type": "message",
-                        "filters": {},
-                        "action": {"action": "receive_process_messages"},
-                        "data_flow_context": DataFlowContext().to_dict(),
-                        "content_preview": "",
-                        "tool_call_count": 1,
-                        "status": "pending",
-                    },
-                )
-            persisted = {
-                row["pid"]: row["data_flow_context_json"]
-                for row in runtime.store.select_table_rows("llm_pending_actions")
-                if row["pid"] in set(pids)
-            }
-        finally:
-            runtime.close()
-
-        ordered_pids = sorted(pids)
-        cursor = ordered_pids[0]
-        partial_context = json.dumps({"labels": {"trust_level": "trusted"}})
-        now = utc_now()
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                for pid in ordered_pids:
-                    connection.execute(
-                        "UPDATE llm_pending_actions SET data_flow_context_json = ? WHERE pid = ?",
-                        (partial_context, pid),
-                    )
-                connection.execute(
-                    "UPDATE llm_pending_actions SET data_flow_context_json = ? WHERE pid = ?",
-                    (persisted[cursor], cursor),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = ?",
-                    ("llm_pending_action_data_flow_context",),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO storage_migrations (
-                        migration_name, version, cursor_value, completed, updated_at
-                    ) VALUES (?, ?, ?, 0, ?)
-                    """,
-                    ("llm_pending_action_data_flow_context", 1, cursor, now),
-                )
-                connection.commit()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                for pid in ordered_pids:
-                    connection.execute(
-                        "UPDATE llm_pending_actions SET data_flow_context_json = %s WHERE pid = %s",
-                        (partial_context, pid),
-                    )
-                connection.execute(
-                    "UPDATE llm_pending_actions SET data_flow_context_json = %s WHERE pid = %s",
-                    (persisted[cursor], cursor),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = %s",
-                    ("llm_pending_action_data_flow_context",),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO storage_migrations (
-                        migration_name, version, cursor_value, completed, updated_at
-                    ) VALUES (%s, %s, %s, 0, %s)
-                    """,
-                    ("llm_pending_action_data_flow_context", 1, cursor, now),
-                )
-
-        reopened = Runtime.open(target, config=config)
-        try:
-            first = reopened.store.get_llm_pending_action(cursor)
-            assert first is not None and first["status"] == "pending"
-            assert reopened.process.get(cursor).status == ProcessStatus.RUNNABLE
-            for pid in ordered_pids[1:]:
-                pending = reopened.store.get_llm_pending_action(pid)
-                assert pending is not None
-                assert pending["status"] == "legacy_data_flow_reconciled"
-                assert reopened.process.get(pid).status == ProcessStatus.FAILED
-            migration = reopened.store.conn.execute(
-                """
-                SELECT completed, cursor_value
-                  FROM storage_migrations
-                 WHERE migration_name = ?
-                """,
-                ("llm_pending_action_data_flow_context",),
-            ).fetchone()
-            assert migration is not None
-            assert bool(migration["completed"])
-            assert migration["cursor_value"] is None
-        finally:
-            reopened.close()
-
-
-@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
-def test_released_process_result_decodes_legacy_object_metadata(
-    kind: str,
-    tmp_path: Path,
-) -> None:
-    with _persistent_target(kind, tmp_path) as (target, config):
-        assert target is not None
-        runtime = Runtime.open(target, config=config)
-        try:
-            parent = runtime.process.spawn(image="base-agent:v0", goal="wait legacy result")
-            child = runtime.process.spawn_child(parent, "produce legacy result")
-            result = runtime.memory.create_object(
-                child,
-                ObjectType.SUMMARY,
-                {"done": True},
-                name="legacy.process.result",
-            )
-            runtime.process.exit(child, result=result)
-        finally:
-            runtime.close()
-
-        legacy_metadata = json.dumps(
-            {
-                "title": "legacy result",
-                "sensitivity": "historical-top-secret",
-                "trust_level": "historical-trust",
-                "integrity": "historical-integrity",
-                "origin": 42,
-            }
-        )
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                connection.execute(
-                    "UPDATE objects SET metadata_json = ? WHERE oid = ?",
-                    (legacy_metadata, result.oid),
-                )
-                connection.commit()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                connection.execute(
-                    "UPDATE objects SET metadata_json = %s WHERE oid = %s",
-                    (legacy_metadata, result.oid),
-                )
-
-        reopened = Runtime.open(target, config=config)
-        try:
-            waited = reopened.process.wait(parent, child)
-            assert waited.result is not None
-            assert waited.result.oid == result.oid
-            rows = reopened.store.select_table_rows("objects", "oid = ?", (result.oid,))
-            assert rows[0]["lifecycle_state"] == "released"
-        finally:
-            reopened.close()
 
 
 def test_released_process_result_wraps_corrupt_metadata_as_validation_error(
@@ -1321,377 +839,6 @@ def test_released_process_result_wraps_corrupt_metadata_as_validation_error(
         reopened.close()
 
 
-@pytest.mark.parametrize("kind", STORE_BACKENDS)
-def test_incomplete_legacy_message_labels_decode_conservatively(
-    kind: str,
-    tmp_path: Path,
-) -> None:
-    with _runtime_for_backend(kind, tmp_path) as runtime:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="decode partial legacy labels")
-        message = runtime.messages.post(
-            sender="legacy.sender",
-            recipient_pid=pid,
-            metadata={"custom": "preserved"},
-        )
-        runtime.store._execute(
-            "UPDATE process_messages SET metadata_json = ? WHERE message_id = ?",
-            (
-                json.dumps(
-                    {
-                        "custom": "preserved",
-                        "data_labels": {"trust_level": "trusted"},
-                        "label_carrier_oid": "untrusted-legacy-carrier",
-                    }
-                ),
-                message.message_id,
-            ),
-        )
-
-        decoded = runtime.store.get_process_message(message.message_id)
-
-        assert decoded is not None
-        assert decoded.metadata["custom"] == "preserved"
-        assert decoded.metadata["data_labels"]["sensitivity"] == "secret"
-        assert decoded.metadata["data_labels"]["trust_level"] == "untrusted"
-        assert decoded.metadata["data_labels"]["integrity"] == "untrusted"
-        assert "label_carrier_oid" not in decoded.metadata
-
-
-@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
-def test_legacy_message_metadata_migration_preserves_observation_cas(
-    kind: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with _persistent_target(kind, tmp_path) as (target, config):
-        assert target is not None
-        runtime = Runtime.open(target, config=config)
-        try:
-            pid = runtime.process.spawn(
-                image="base-agent:v0",
-                goal="observe migrated legacy message",
-            )
-            message = runtime.messages.post(
-                sender="legacy.sender",
-                recipient_pid=pid,
-                metadata={"custom": "preserved"},
-            )
-        finally:
-            runtime.close()
-
-        legacy_metadata = json.dumps(
-            {
-                "custom": "preserved",
-                "data_labels": {"trust_level": "trusted"},
-                "label_carrier_oid": "untrusted-legacy-carrier",
-            }
-        )
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                connection.execute(
-                    "UPDATE process_messages SET metadata_json = ? WHERE message_id = ?",
-                    (legacy_metadata, message.message_id),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = ?",
-                    ("process_message_metadata",),
-                )
-                connection.commit()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                connection.execute(
-                    "UPDATE process_messages SET metadata_json = %s WHERE message_id = %s",
-                    (legacy_metadata, message.message_id),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = %s",
-                    ("process_message_metadata",),
-                )
-
-        reopened = Runtime.open(target, config=config)
-        try:
-            migrated = reopened.store.get_process_message(message.message_id)
-            assert migrated is not None
-            assert migrated.metadata["custom"] == "preserved"
-            assert migrated.metadata["data_labels"]["sensitivity"] == "secret"
-            assert "label_carrier_oid" not in migrated.metadata
-            persisted = json.loads(
-                reopened.store.select_table_rows(
-                    "process_messages",
-                    "message_id = ?",
-                    (message.message_id,),
-                )[0]["metadata_json"]
-            )
-            assert persisted == migrated.metadata
-
-            observed = reopened.messages.observe_labels(pid, [migrated])
-
-            assert len(observed) == 1
-            stored = reopened.store.get_process_message(message.message_id)
-            assert stored is not None
-            assert stored.metadata["label_carrier_oid"] == observed[0]
-            assert migrated.metadata["label_carrier_oid"] == observed[0]
-        finally:
-            reopened.close()
-
-        import agent_libos.storage.sqlite as sqlite_store_module
-
-        def fail_if_rescanned(_metadata):
-            raise AssertionError("completed message metadata migration rescanned history")
-
-        monkeypatch.setattr(
-            sqlite_store_module,
-            "_canonical_process_message_metadata",
-            fail_if_rescanned,
-        )
-        second_reopen = Runtime.open(target, config=config)
-        second_reopen.close()
-
-
-@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
-def test_message_metadata_migration_resumes_from_durable_cursor(
-    kind: str,
-    tmp_path: Path,
-) -> None:
-    with _persistent_target(kind, tmp_path) as (target, config):
-        assert target is not None
-        runtime = Runtime.open(target, config=config)
-        try:
-            pid = runtime.process.spawn(image="base-agent:v0", goal="resume message migration")
-            messages = [
-                runtime.messages.post(
-                    sender="legacy.sender",
-                    recipient_pid=pid,
-                    metadata={"custom": f"message-{index}"},
-                )
-                for index in range(3)
-            ]
-            persisted = {
-                row["message_id"]: row["metadata_json"]
-                for row in runtime.store.select_table_rows("process_messages")
-                if row["message_id"] in {message.message_id for message in messages}
-            }
-        finally:
-            runtime.close()
-
-        ordered_ids = sorted(message.message_id for message in messages)
-        cursor = ordered_ids[0]
-        partial_by_id = {
-            message_id: json.dumps(
-                {
-                    "custom": json.loads(persisted[message_id])["custom"],
-                    "data_labels": {"trust_level": "trusted"},
-                }
-            )
-            for message_id in ordered_ids
-        }
-        now = utc_now()
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                for message_id in ordered_ids:
-                    connection.execute(
-                        "UPDATE process_messages SET metadata_json = ? WHERE message_id = ?",
-                        (partial_by_id[message_id], message_id),
-                    )
-                connection.execute(
-                    "UPDATE process_messages SET metadata_json = ? WHERE message_id = ?",
-                    (persisted[cursor], cursor),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = ?",
-                    ("process_message_metadata",),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO storage_migrations (
-                        migration_name, version, cursor_value, completed, updated_at
-                    ) VALUES (?, ?, ?, 0, ?)
-                    """,
-                    ("process_message_metadata", 1, cursor, now),
-                )
-                connection.commit()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                for message_id in ordered_ids:
-                    connection.execute(
-                        "UPDATE process_messages SET metadata_json = %s WHERE message_id = %s",
-                        (partial_by_id[message_id], message_id),
-                    )
-                connection.execute(
-                    "UPDATE process_messages SET metadata_json = %s WHERE message_id = %s",
-                    (persisted[cursor], cursor),
-                )
-                connection.execute(
-                    "DELETE FROM storage_migrations WHERE migration_name = %s",
-                    ("process_message_metadata",),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO storage_migrations (
-                        migration_name, version, cursor_value, completed, updated_at
-                    ) VALUES (%s, %s, %s, 0, %s)
-                    """,
-                    ("process_message_metadata", 1, cursor, now),
-                )
-
-        reopened = Runtime.open(target, config=config)
-        try:
-            for message_id in ordered_ids:
-                message = reopened.store.get_process_message(message_id)
-                assert message is not None
-                if message_id == cursor:
-                    assert message.metadata == json.loads(persisted[cursor])
-                else:
-                    assert message.metadata["data_labels"]["sensitivity"] == "secret"
-                    assert message.metadata["data_labels"]["trust_level"] == "untrusted"
-            migration = reopened.store.conn.execute(
-                "SELECT completed, cursor_value FROM storage_migrations WHERE migration_name = ?",
-                ("process_message_metadata",),
-            ).fetchone()
-            assert migration is not None
-            assert bool(migration["completed"])
-            assert migration["cursor_value"] is None
-        finally:
-            reopened.close()
-
-
-@pytest.mark.parametrize(
-    "migration_name",
-    [
-        "llm_pending_action_data_flow_context",
-        "process_message_metadata",
-    ],
-)
-@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
-def test_future_storage_migration_version_fails_without_mutation(
-    kind: str,
-    migration_name: str,
-    tmp_path: Path,
-) -> None:
-    with _persistent_target(kind, tmp_path) as (target, config):
-        assert target is not None
-        runtime = Runtime.open(target, config=config)
-        try:
-            pid = runtime.process.spawn(image="base-agent:v0", goal="future migration version")
-            message = runtime.messages.post(
-                sender="future.sender",
-                recipient_pid=pid,
-                metadata={"custom": "current"},
-            )
-            runtime.store.upsert_llm_pending_action(
-                pid,
-                {
-                    "resume_token": "future-migration-token",
-                    "wait_type": "message",
-                    "filters": {},
-                    "action": {"action": "receive_process_messages"},
-                    "data_flow_context": DataFlowContext().to_dict(),
-                    "content_preview": "",
-                    "tool_call_count": 1,
-                    "status": "pending",
-                },
-            )
-        finally:
-            runtime.close()
-
-        marker_cursor = "future-version-cursor"
-        marker_updated_at = "future-version-marker"
-        if migration_name == "llm_pending_action_data_flow_context":
-            table = "llm_pending_actions"
-            column = "data_flow_context_json"
-            key_column = "pid"
-            key = pid
-            future_value = json.dumps(
-                {"labels": {"trust_level": "trusted"}, "future_field": True}
-            )
-        else:
-            table = "process_messages"
-            column = "metadata_json"
-            key_column = "message_id"
-            key = message.message_id
-            future_value = json.dumps(
-                {
-                    "custom": "future",
-                    "data_labels": {"trust_level": "trusted"},
-                    "future_field": True,
-                }
-            )
-
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                connection.execute(
-                    f"UPDATE {table} SET {column} = ? WHERE {key_column} = ?",
-                    (future_value, key),
-                )
-                connection.execute(
-                    """
-                    UPDATE storage_migrations
-                       SET version = 2, cursor_value = ?, completed = 1, updated_at = ?
-                     WHERE migration_name = ?
-                    """,
-                    (marker_cursor, marker_updated_at, migration_name),
-                )
-                connection.commit()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                connection.execute(
-                    f"UPDATE {table} SET {column} = %s WHERE {key_column} = %s",
-                    (future_value, key),
-                )
-                connection.execute(
-                    """
-                    UPDATE storage_migrations
-                       SET version = 2, cursor_value = %s, completed = 1, updated_at = %s
-                     WHERE migration_name = %s
-                    """,
-                    (marker_cursor, marker_updated_at, migration_name),
-                )
-
-        with pytest.raises(
-            ValidationError,
-            match=rf"storage migration {migration_name} version 2 is newer",
-        ):
-            Runtime.open(target, config=config)
-
-        if kind == "sqlite-file":
-            with sqlite3.connect(target) as connection:
-                persisted_value = connection.execute(
-                    f"SELECT {column} FROM {table} WHERE {key_column} = ?",
-                    (key,),
-                ).fetchone()
-                marker = connection.execute(
-                    """
-                    SELECT version, cursor_value, completed, updated_at
-                      FROM storage_migrations
-                     WHERE migration_name = ?
-                    """,
-                    (migration_name,),
-                ).fetchone()
-        else:
-            import psycopg
-
-            with psycopg.connect(str(target), autocommit=True) as connection:
-                persisted_value = connection.execute(
-                    f"SELECT {column} FROM {table} WHERE {key_column} = %s",
-                    (key,),
-                ).fetchone()
-                marker = connection.execute(
-                    """
-                    SELECT version, cursor_value, completed, updated_at
-                      FROM storage_migrations
-                     WHERE migration_name = %s
-                    """,
-                    (migration_name,),
-                ).fetchone()
-
-        assert persisted_value == (future_value,)
-        assert marker == (2, marker_cursor, 1, marker_updated_at)
 
 
 @pytest.mark.parametrize("kind", STORE_BACKENDS)
@@ -1827,103 +974,6 @@ def test_gui_snapshot_visibility_filters_before_limit_with_stable_ties(
         assert {item[0] for item in audit_specs}.issubset(all_audit_ids)
 
 
-def test_sqlite_gui_snapshot_visibility_legacy_backfill_is_resumable(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "legacy-gui-visibility.sqlite"
-    base_config = AgentLibOSConfig()
-    config = replace(
-        base_config,
-        gui=replace(base_config.gui, snapshot_collection_max_items=2),
-    )
-    runtime = Runtime.open(database, config=config)
-    try:
-        visible_event = runtime.events.emit(
-            EventType.PROCESS_CREATED,
-            source="test",
-            payload={"marker": "visible-event"},
-        )
-        hidden_event = runtime.events.emit(
-            EventType.HUMAN_OUTPUT,
-            source="test",
-            payload={"purpose": "gui_presentation"},
-        )
-        visible_audit = runtime.audit.record(
-            actor="test",
-            action="test.visible",
-            decision={"marker": "visible-audit"},
-        )
-        hidden_audit = runtime.audit.record(
-            actor="test",
-            action="human.output",
-            decision={"purpose": "gui_presentation"},
-        )
-    finally:
-        runtime.close()
-
-    with sqlite3.connect(database) as connection:
-        connection.execute("DROP INDEX IF EXISTS idx_events_gui_snapshot_visible_created")
-        connection.execute("DROP INDEX IF EXISTS idx_audit_gui_snapshot_visible_created")
-        connection.execute("ALTER TABLE events DROP COLUMN gui_snapshot_visible")
-        connection.execute("ALTER TABLE audit_records DROP COLUMN gui_snapshot_visible")
-        # Simulate an interrupted migration that added the nullable sentinel
-        # but did not complete its data backfill or index creation.
-        connection.execute("ALTER TABLE events ADD COLUMN gui_snapshot_visible INTEGER")
-        connection.execute("ALTER TABLE audit_records ADD COLUMN gui_snapshot_visible INTEGER")
-        connection.commit()
-
-    reopened = Runtime.open(database, config=config)
-    try:
-        event_flags = {
-            row["event_id"]: row["gui_snapshot_visible"]
-            for row in reopened.store.select_table_rows("events")
-        }
-        audit_flags = {
-            row["record_id"]: row["gui_snapshot_visible"]
-            for row in reopened.store.select_table_rows("audit_records")
-        }
-
-        assert event_flags[visible_event.event_id] == 1
-        assert event_flags[hidden_event.event_id] == 0
-        assert audit_flags[visible_audit.record_id] == 1
-        assert audit_flags[hidden_audit.record_id] == 0
-        assert None not in event_flags.values()
-        assert None not in audit_flags.values()
-        visible_event_ids = {
-            item.event_id
-            for item in reopened.store.list_events(include_gui_presentation=False)
-        }
-        visible_audit_ids = {
-            item.record_id
-            for item in reopened.store.list_audit(include_gui_presentation=False)
-        }
-        assert visible_event.event_id in visible_event_ids
-        assert hidden_event.event_id not in visible_event_ids
-        assert visible_audit.record_id in visible_audit_ids
-        assert hidden_audit.record_id not in visible_audit_ids
-
-        event_plan = "\n".join(
-            str(row[3])
-            for row in reopened.store.conn.execute(
-                "EXPLAIN QUERY PLAN SELECT * FROM events "
-                "WHERE gui_snapshot_visible = 1 "
-                "ORDER BY created_at DESC, event_id DESC LIMIT ?",
-                (2,),
-            )
-        )
-        audit_plan = "\n".join(
-            str(row[3])
-            for row in reopened.store.conn.execute(
-                "EXPLAIN QUERY PLAN SELECT * FROM audit_records "
-                "WHERE gui_snapshot_visible = 1 "
-                "ORDER BY timestamp DESC, record_id DESC LIMIT ?",
-                (2,),
-            )
-        )
-        assert "idx_events_gui_snapshot_visible_created" in event_plan
-        assert "idx_audit_gui_snapshot_visible_created" in audit_plan
-    finally:
-        reopened.close()
 
 
 def test_sqlite_tree_file_label_query_is_indexed_and_batched(
@@ -2093,6 +1143,7 @@ def test_llm_context_label_history_persists_and_merges_monotonically(
 ) -> None:
     with _persistent_target(kind, tmp_path) as (target, config):
         runtime = Runtime.open(target, config=config)
+        store_closed = False
         try:
             first = runtime.store.merge_llm_context_label_history(
                 "pid-context-labels",
@@ -2335,7 +1386,7 @@ def test_prepared_protected_operation_restores_reservation_across_reopen(
             scope.__exit__(type(interrupted), interrupted, interrupted.__traceback__)
             operation._operation_cm = None
             runtime.store.close()
-            runtime._closed = True
+            store_closed = True
 
             reopened = Runtime.open(target, config=config)
             try:
@@ -2346,5 +1397,5 @@ def test_prepared_protected_operation_restores_reservation_across_reopen(
             finally:
                 reopened.close()
         finally:
-            if not runtime._closed:
+            if not store_closed:
                 runtime.close()

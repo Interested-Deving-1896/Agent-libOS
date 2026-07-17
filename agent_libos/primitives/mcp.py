@@ -41,10 +41,15 @@ from agent_libos.models import (
     McpToolSpec,
     ResourceUsage,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.runtime.audit_manager import AuditManager
-from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import RuntimeStore
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    NotFound,
+    ProviderHostError,
+    ValidationError,
+)
+from agent_libos.ports import AuditPort, EventPort
+from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import (
     ExecutableSnapshot,
     executable_content_sha256,
@@ -56,11 +61,12 @@ from agent_libos.sdk import (
     ProviderEffectNotStartedResult,
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
+    ProtectedOperationSDK,
     ProviderPhase,
     ResourceSettlement,
 )
 from agent_libos.tools.observability import sanitize_for_observability
-from agent_libos.utils.ids import utc_now
+from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
@@ -82,21 +88,26 @@ class McpPrimitive:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        unit_of_work: UnitOfWork,
         capabilities: CapabilityManager,
-        audit: AuditManager,
-        events: EventBus,
+        audit: AuditPort,
+        events: EventPort,
         *,
+        protected_operations: ProtectedOperationSDK,
         human: HumanObjectManager | None,
         provider: McpProvider,
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
-        self.store = store
+        self.unit_of_work = unit_of_work
+        self.extensions = unit_of_work.extensions
+        self.authority = unit_of_work.authority
+        self.processes = unit_of_work.processes
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
+        self.protected_operations = protected_operations
         self.human = human
         self.provider = provider
         self.resources = resources
@@ -181,16 +192,16 @@ class McpPrimitive:
         # Registry mutation, composite one-shot authority settlement, and
         # evidence are one store transaction. Local validation or a sink
         # failure rolls every reservation back to its pre-call state.
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             reservations = self._reserve_registry_authority(
                 authority_decisions,
                 actor=actor,
                 operation="register",
             )
-            existing = self.store.get_mcp_server(spec.server_id)
+            existing = self.extensions.get_mcp_server(spec.server_id)
             if existing is not None and not replace:
                 raise ValidationError(f"MCP server already exists: {spec.server_id}")
-            self.store.upsert_mcp_server(spec, registered_by=actor, created_at=now)
+            self.extensions.upsert_mcp_server(spec, registered_by=actor, created_at=now)
             if existing is not None:
                 self._disable_replaced_server_tool_capabilities(spec.server_id, actor=actor)
             self.events.emit(
@@ -268,7 +279,7 @@ class McpPrimitive:
             self.capabilities.require(actor, self.config.mcp.registry_resource, CapabilityRight.READ)
         selected_limit = self._bounded_list_limit(limit)
         servers: list[dict[str, Any]] = []
-        rows = self.store.list_mcp_servers(text=text, limit=selected_limit + 1)
+        rows = self.extensions.list_mcp_servers(text=text, limit=selected_limit + 1)
         for spec, metadata in rows[:selected_limit]:
             self._validate_server(spec)
             servers.append(self._server_to_json(spec, metadata, include_sensitive_fields=False))
@@ -359,8 +370,11 @@ class McpPrimitive:
                 decisions=tuple(authority_decisions),
                 canonical_args=effect_context,
                 observation=effect_context,
-                preflight_usage=(
-                    ResourceUsage(mcp_request_bytes=request_bytes)
+                reservation_usage=(
+                    ResourceUsage(
+                        mcp_request_bytes=request_bytes,
+                        mcp_response_bytes=spec.max_response_bytes,
+                    )
                     if usage_pid is not None
                     else None
                 ),
@@ -420,7 +434,11 @@ class McpPrimitive:
                     except ProviderEffectNotStarted:
                         raise
                     except Exception as error:
-                        return None, error
+                        return None, ProviderHostError(
+                            code="mcp_provider_error",
+                            error_type=type(error).__name__,
+                            correlation_id=new_id("corr"),
+                        )
 
                 try:
                     result, provider_error = protected.call(
@@ -445,6 +463,7 @@ class McpPrimitive:
                                 usage=ResourceUsage(mcp_request_bytes=request_bytes),
                                 source="primitive.mcp.list_tools",
                                 context={**resource_context, "response_bytes": 0, "status": result_payload["status"]},
+                                charge_reserved_maximum=True,
                             )
                             if usage_pid is not None
                             else None
@@ -483,6 +502,24 @@ class McpPrimitive:
             "response_bytes": live_response_bytes,
         }
 
+    async def alist_tools(
+        self,
+        server_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Async facade that keeps synchronous providers off the active loop."""
+
+        return await self._data_flow().run_sync_in_worker(
+            self.list_tools,
+            server_id,
+            actor=actor,
+            require_capability=require_capability,
+            refresh=refresh,
+        )
+
     def unregister_server(
         self,
         server_id: str,
@@ -500,7 +537,7 @@ class McpPrimitive:
                     consume=False,
                 )
             )
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             reservations = self._reserve_registry_authority(
                 authority_decisions,
                 actor=actor,
@@ -508,7 +545,7 @@ class McpPrimitive:
             )
             self._load_server(server_id)
             self._disable_replaced_server_tool_capabilities(server_id, actor=actor)
-            self.store.delete_mcp_server(server_id)
+            self.extensions.delete_mcp_server(server_id)
             self.events.emit(
                 EventType.EXTERNAL_WRITE,
                 source=actor,
@@ -604,7 +641,33 @@ class McpPrimitive:
         if request_bytes > spec.max_request_bytes:
             raise ValidationError(f"MCP request exceeds max_request_bytes={spec.max_request_bytes}")
         effect_context = self._effect_context(spec, tool, operation_context, request_bytes=request_bytes)
-        resource_context = {"server_id": server_id, "tool_id": tool_id, "request_bytes": request_bytes}
+        list_request_bytes = len(
+            dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8")
+        )
+        resource_context = {
+            "server_id": server_id,
+            "tool_id": tool_id,
+            "request_bytes": request_bytes,
+            "list_request_bytes": list_request_bytes,
+        }
+        resource_progress = {"list_response_bytes": 0}
+
+        def failure_resource(error: BaseException, phase: str) -> ResourceSettlement | None:
+            if not isinstance(error, ProviderEffectNotStarted):
+                return None
+            return ResourceSettlement(
+                usage=ResourceUsage(
+                    mcp_request_bytes=list_request_bytes,
+                    mcp_response_bytes=resource_progress["list_response_bytes"],
+                ),
+                source="primitive.mcp.call",
+                context={
+                    **resource_context,
+                    "failure_phase": phase,
+                    "call_started": False,
+                    "certified_not_started": True,
+                },
+            )
         invocation = ProtectedOperationInvocation(
             pid=pid,
             actor=pid,
@@ -612,9 +675,13 @@ class McpPrimitive:
             decisions=tuple([decision, *auxiliary_decisions]),
             canonical_args=operation_context,
             observation=effect_context,
-            preflight_usage=ResourceUsage(mcp_request_bytes=request_bytes),
+            reservation_usage=ResourceUsage(
+                mcp_request_bytes=list_request_bytes + request_bytes,
+                mcp_response_bytes=spec.max_response_bytes * 2,
+            ),
             resource_source="primitive.mcp.call",
             resource_context=resource_context,
+            failure_resource=failure_resource,
             failure_evidence=lambda error, phase: self._protected_call_failure_evidence(
                 pid, resource, tool, operation_context, error, phase
             ),
@@ -646,14 +713,111 @@ class McpPrimitive:
                 )
 
             started = time.monotonic()
+            deadline = started + spec.timeout_s
 
-            def validate_live_tool() -> Exception | None:
+            validate_and_call = getattr(self.provider, "validate_and_call", None)
+            if callable(validate_and_call):
+                executable_snapshot = self._stdio_snapshot_for_dispatch(
+                    pid=pid,
+                    spec=spec,
+                    expected_identity=stdio_executable_identity,
+                    sink=sink,
+                    context=flow_context,
+                    payload=selected_args,
+                )
+
+                def invoke_validated_tool() -> Any:
+                    try:
+                        provider_kwargs: dict[str, Any] = {
+                            "timeout_s": max(0.001, deadline - time.monotonic()),
+                            "max_response_bytes": spec.max_response_bytes,
+                        }
+                        if executable_snapshot is not None:
+                            provider_kwargs["executable_snapshot"] = executable_snapshot
+                        return validate_and_call(
+                            spec,
+                            tool,
+                            selected_args,
+                            **provider_kwargs,
+                        )
+                    except ProviderEffectNotStarted as error:
+                        return ProviderEffectNotStartedResult(
+                            error=error,
+                            outcome="validate_and_call_not_started",
+                            result=McpProviderCallResult(
+                                error="provider call did not start",
+                                error_type=type(error).__name__,
+                                correlation_id=new_id("corr"),
+                                duration_s=time.monotonic() - started,
+                                call_started=False,
+                            ),
+                        )
+                    except Exception as error:
+                        raise ProviderHostError(
+                            code="mcp_provider_error",
+                            error_type=type(error).__name__,
+                            correlation_id=new_id("corr"),
+                        ) from None
+
                 try:
-                    self._validate_live_tool(
+                    provider_outcome = protected.call(
+                        ProviderPhase(
+                            "provider_validate_and_call",
+                            information_flow=True,
+                        ),
+                        invoke_validated_tool,
+                    )
+                finally:
+                    if executable_snapshot is not None:
+                        executable_snapshot.close()
+                if isinstance(provider_outcome, ProviderEffectNotStartedResult):
+                    return self._call_result_from_provider(
                         spec,
                         tool,
+                        provider_outcome.result,
+                    )
+                provider_result = provider_outcome
+                result = self._call_result_from_provider(spec, tool, provider_result)
+                classification_override = None
+                if not provider_result.call_started:
+                    classification_override = ExternalEffectClassification(
+                        rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                        rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                        state_mutation=False,
+                        information_flow=True,
+                        metadata={
+                            "outcome": "live_validation_failed_before_call",
+                            "phase": "live_validation",
+                        },
+                    )
+                return protected.complete(
+                    result,
+                    self._protected_call_evidence(pid, resource, result, tool, operation_context),
+                    classification_context=effect_context,
+                    classification_result=self._call_effect_result(result),
+                    classification_override=classification_override,
+                    resource=self._mcp_exchange_settlement(
+                        provider_result,
+                        fallback_list_request_bytes=list_request_bytes,
+                        fallback_call_request_bytes=request_bytes,
+                        server_id=server_id,
+                        tool_id=tool_id,
+                        status=result.status.value,
+                    ),
+                )
+
+            live_list_result: McpToolListResult | None = None
+
+            def validate_live_tool() -> Exception | None:
+                nonlocal live_list_result
+                try:
+                    live_list_result = self._validate_live_tool(
+                        spec,
+                        tool,
+                        timeout_s=max(0.001, deadline - time.monotonic()),
                         executable_snapshot=live_executable_snapshot,
                     )
+                    resource_progress["list_response_bytes"] = live_list_result.response_bytes
                 except ProviderEffectNotStarted:
                     raise
                 except Exception as error:
@@ -693,10 +857,33 @@ class McpPrimitive:
                     classification_context=effect_context,
                     classification_result=self._call_effect_result(result),
                     resource=self._mcp_call_settlement(
-                        request_bytes, result, server_id=server_id, tool_id=tool_id
+                        request_bytes,
+                        result,
+                        server_id=server_id,
+                        tool_id=tool_id,
+                        list_request_bytes=list_request_bytes,
+                        list_response_bytes=(
+                            live_list_result.response_bytes if live_list_result is not None else 0
+                        ),
+                        call_started=False,
                     ),
                 )
                 raise validation_error
+
+            deadline_result = self._complete_expired_legacy_exchange(
+                protected=protected,
+                spec=spec,
+                tool=tool,
+                operation_context=operation_context,
+                effect_context=effect_context,
+                live_list_result=live_list_result,
+                deadline=deadline,
+                started=started,
+                list_request_bytes=list_request_bytes,
+                request_bytes=request_bytes,
+            )
+            if deadline_result is not None:
+                return deadline_result
 
             def invoke_tool() -> (
                 tuple[McpProviderCallResult, ExternalEffectClassification | None]
@@ -704,7 +891,7 @@ class McpPrimitive:
             ):
                 try:
                     provider_kwargs: dict[str, Any] = {
-                        "timeout_s": spec.timeout_s,
+                        "timeout_s": max(0.001, deadline - time.monotonic()),
                         "max_response_bytes": spec.max_response_bytes,
                     }
                     if executable_snapshot is not None:
@@ -723,14 +910,18 @@ class McpPrimitive:
                         error=error,
                         outcome="call_tool_not_started_after_live_validation",
                         result=McpProviderCallResult(
-                            error=f"{type(error).__name__}: {error}",
+                            error="provider call did not start",
+                            error_type=type(error).__name__,
+                            correlation_id=new_id("corr"),
                             duration_s=time.monotonic() - started,
                         ),
                     )
                 except Exception as error:
                     return (
                         McpProviderCallResult(
-                            error=f"{type(error).__name__}: {error}",
+                            error="provider call failed",
+                            error_type=type(error).__name__,
+                            correlation_id=new_id("corr"),
                             duration_s=time.monotonic() - started,
                         ),
                         ExternalEffectClassification(
@@ -778,7 +969,18 @@ class McpPrimitive:
                 classification_result=self._call_effect_result(result),
                 classification_override=classification_override,
                 resource=self._mcp_call_settlement(
-                    request_bytes, result, server_id=server_id, tool_id=tool_id
+                    request_bytes,
+                    result,
+                    server_id=server_id,
+                    tool_id=tool_id,
+                    list_request_bytes=list_request_bytes,
+                    list_response_bytes=(
+                        live_list_result.response_bytes if live_list_result is not None else 0
+                    ),
+                    call_started=True,
+                    charge_reserved_maximum=(
+                        classification_override is not None and provider_result.error is not None
+                    ),
                 ),
             )
             return completed
@@ -931,23 +1133,34 @@ class McpPrimitive:
         server: McpServerSpec,
         tool: McpToolSpec,
         *,
+        timeout_s: float | None = None,
         executable_snapshot: ExecutableSnapshot | None = None,
-    ) -> None:
+    ) -> McpToolListResult:
         provider_kwargs: dict[str, Any] = {
-            "timeout_s": server.timeout_s,
+            "timeout_s": server.timeout_s if timeout_s is None else timeout_s,
             "max_response_bytes": server.max_response_bytes,
         }
         if executable_snapshot is not None:
             provider_kwargs["executable_snapshot"] = executable_snapshot
-        result = self.provider.list_tools(
-            server,
-            **provider_kwargs,
-        )
+        try:
+            result = self.provider.list_tools(
+                server,
+                **provider_kwargs,
+            )
+        except ProviderEffectNotStarted:
+            raise
+        except Exception as error:
+            raise ProviderHostError(
+                code="mcp_provider_error",
+                error_type=type(error).__name__,
+                correlation_id=new_id("corr"),
+            ) from None
         live = next((item for item in result.tools if item.name == tool.mcp_name), None)
         if live is None:
             raise ValidationError(f"MCP server {server.server_id} no longer exposes tool {tool.mcp_name}")
         if tool.input_schema and live.input_schema and live.input_schema != tool.input_schema:
             raise ValidationError(f"MCP tool schema changed for {server.server_id}/{tool.tool_id}")
+        return result
 
     def _require_stdio_process_spawn(
         self,
@@ -1032,7 +1245,20 @@ class McpPrimitive:
         provider_result: McpProviderCallResult,
     ) -> McpCallResult:
         if provider_result.error:
-            return self._failure(server, tool, McpCallStatus.TRANSPORT_ERROR, provider_result.error, provider_result)
+            return McpCallResult(
+                server_id=server.server_id,
+                tool_id=tool.tool_id,
+                mcp_name=tool.mcp_name,
+                status=McpCallStatus.TRANSPORT_ERROR,
+                ok=False,
+                error={
+                    "code": "mcp_provider_error",
+                    "error_type": provider_result.error_type or "TransportError",
+                    "correlation_id": provider_result.correlation_id or new_id("corr"),
+                },
+                response_bytes=provider_result.response_bytes,
+                duration_s=provider_result.duration_s,
+            )
         if provider_result.too_large:
             return self._failure(
                 server,
@@ -1086,12 +1312,7 @@ class McpPrimitive:
         )
 
     def _protected(self) -> Any:
-        sdk = getattr(self, "protected_operation_sdk", None) or getattr(
-            self.store, "protected_operation_sdk", None
-        )
-        if sdk is None:
-            raise ValidationError("MCP protected-operation SDK is not attached")
-        return sdk
+        return self.protected_operations
 
     def _data_flow(self) -> Any:
         manager = getattr(self, "data_flow", None) or getattr(
@@ -1364,11 +1585,16 @@ class McpPrimitive:
         *,
         server_id: str,
         tool_id: str,
+        list_request_bytes: int = 0,
+        list_response_bytes: int = 0,
+        call_started: bool = True,
+        charge_reserved_maximum: bool = False,
     ) -> ResourceSettlement:
+        call_request_bytes = request_bytes if call_started else 0
         return ResourceSettlement(
             usage=ResourceUsage(
-                mcp_request_bytes=request_bytes,
-                mcp_response_bytes=result.response_bytes,
+                mcp_request_bytes=list_request_bytes + call_request_bytes,
+                mcp_response_bytes=list_response_bytes + result.response_bytes,
             ),
             source="primitive.mcp.call",
             context={
@@ -1376,8 +1602,111 @@ class McpPrimitive:
                 "tool_id": tool_id,
                 "request_bytes": request_bytes,
                 "response_bytes": result.response_bytes,
+                "list_request_bytes": list_request_bytes,
+                "list_response_bytes": list_response_bytes,
+                "call_started": call_started,
                 "status": result.status.value,
             },
+            charge_reserved_maximum=charge_reserved_maximum,
+        )
+
+    @staticmethod
+    def _mcp_exchange_settlement(
+        result: McpProviderCallResult,
+        *,
+        fallback_list_request_bytes: int,
+        fallback_call_request_bytes: int,
+        server_id: str,
+        tool_id: str,
+        status: str,
+    ) -> ResourceSettlement:
+        list_request_bytes = result.list_request_bytes or fallback_list_request_bytes
+        call_request_bytes = (
+            result.call_request_bytes or fallback_call_request_bytes
+            if result.call_started
+            else 0
+        )
+        call_response_bytes = result.call_response_bytes or result.response_bytes
+        return ResourceSettlement(
+            usage=ResourceUsage(
+                mcp_request_bytes=list_request_bytes + call_request_bytes,
+                mcp_response_bytes=result.list_response_bytes + call_response_bytes,
+            ),
+            source="primitive.mcp.call",
+            context={
+                "server_id": server_id,
+                "tool_id": tool_id,
+                "list_request_bytes": list_request_bytes,
+                "list_response_bytes": result.list_response_bytes,
+                "call_request_bytes": call_request_bytes,
+                "call_response_bytes": call_response_bytes,
+                "call_started": result.call_started,
+                "status": status,
+            },
+        )
+
+    def _complete_expired_legacy_exchange(
+        self,
+        *,
+        protected: Any,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        operation_context: dict[str, Any],
+        effect_context: dict[str, Any],
+        live_list_result: McpToolListResult | None,
+        deadline: float,
+        started: float,
+        list_request_bytes: int,
+        request_bytes: int,
+    ) -> McpCallResult | None:
+        if time.monotonic() < deadline:
+            return None
+        provider_result = McpProviderCallResult(
+            error="MCP exchange deadline exhausted before tool dispatch",
+            error_type="McpDeadlineExceeded",
+            correlation_id=new_id("corr"),
+            duration_s=time.monotonic() - started,
+            list_request_bytes=list_request_bytes,
+            list_response_bytes=(
+                live_list_result.response_bytes
+                if live_list_result is not None
+                else 0
+            ),
+            call_request_bytes=request_bytes,
+            call_started=False,
+        )
+        result = self._call_result_from_provider(spec, tool, provider_result)
+        pid = str(operation_context["pid"])
+        resource = self.tool_resource(spec.server_id, tool.tool_id)
+        return protected.complete(
+            result,
+            self._protected_call_evidence(
+                pid,
+                resource,
+                result,
+                tool,
+                operation_context,
+            ),
+            classification_context=effect_context,
+            classification_result=self._call_effect_result(result),
+            classification_override=ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    "outcome": "deadline_exhausted_before_call",
+                    "phase": "live_validation",
+                },
+            ),
+            resource=self._mcp_exchange_settlement(
+                provider_result,
+                fallback_list_request_bytes=list_request_bytes,
+                fallback_call_request_bytes=request_bytes,
+                server_id=spec.server_id,
+                tool_id=tool.tool_id,
+                status=result.status.value,
+            ),
         )
 
     def _list_tools_success_payload(self, result: McpToolListResult) -> dict[str, Any]:
@@ -1390,20 +1719,29 @@ class McpPrimitive:
         }
 
     def _list_tools_failure_payload(self, exc: Exception, *, duration_s: float) -> dict[str, Any]:
+        safe_error = (
+            exc.to_dict()
+            if isinstance(exc, ProviderHostError)
+            else {
+                "code": "mcp_provider_error",
+                "error_type": type(exc).__name__,
+                "correlation_id": new_id("corr"),
+            }
+        )
         return {
             "ok": False,
             "status": "transport_error",
             "response_bytes": 0,
             "duration_s": duration_s,
             "tool_count": 0,
-            "error": sanitize_for_observability(str(exc)),
-            "error_type": type(exc).__name__,
+            **safe_error,
+            "error_observation": sanitize_for_observability(safe_error),
         }
 
     def _resource_usage_pid(self, actor: str | None) -> str | None:
         if actor is None:
             return None
-        return actor if self.store.get_process(actor) is not None else None
+        return actor if self.processes.get_process(actor) is not None else None
 
     def _list_tools_effect_context(self, server: McpServerSpec, *, request_bytes: int) -> dict[str, Any]:
         return {
@@ -1771,7 +2109,7 @@ class McpPrimitive:
 
     def _disable_replaced_server_tool_capabilities(self, server_id: str, *, actor: str) -> None:
         prefix = f"mcp:{server_id}:"
-        for cap in self.store.list_capabilities():
+        for cap in self.authority.list_capabilities():
             if not cap.active or cap.revoked:
                 continue
             if cap.resource == f"mcp:{server_id}:*" or cap.resource.startswith(prefix):
@@ -1852,7 +2190,7 @@ class McpPrimitive:
 
     def _load_server(self, server_id: str) -> tuple[McpServerSpec, dict[str, Any]]:
         self._validate_identifier(server_id, "server_id", self.config.mcp.server_id_max_chars)
-        found = self.store.get_mcp_server(server_id)
+        found = self.extensions.get_mcp_server(server_id)
         if found is None:
             raise NotFound(f"MCP server not found: {server_id}")
         spec, metadata = found
